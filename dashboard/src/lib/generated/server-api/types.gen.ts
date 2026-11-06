@@ -987,6 +987,8 @@ export type ApiKeptKnowledgeItem = {
     status: string;
     /**
      * Text Preview
+     *
+     * The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.
      */
     text_preview: string;
     /**
@@ -1123,6 +1125,8 @@ export type ApiKnowledgeListItem = {
     status: string;
     /**
      * Text Preview
+     *
+     * The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.
      */
     text_preview: string;
     /**

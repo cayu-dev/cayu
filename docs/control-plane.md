@@ -954,7 +954,13 @@ secret-free. Pending-list previews likewise redact before shortening the text.
 Clients that display pending content can require the flag to distinguish older
 Runtime versions that returned pending content without redaction.
 
-Each entry includes its existing provenance fields and a public preview. A
+Each entry includes its existing provenance fields and a public preview. Both
+lists, kept and pending, carry the entry's `title` and, in `text_preview`, the
+start of its text, whether or not it has a title: at most 200 characters, cut on a
+word boundary and ending with `…` when cut, so two entries with similar titles can
+be told apart from the list. The text is redacted whole before it is cut, so the
+preview never shows more than the entry's detail route would. Older Cayu servers
+put the title in `text_preview` when the entry had one. A
 registered model actor supplies `specialist`; a matching retained source session
 supplies `source_session_id`. Missing or conflicting evidence leaves these fields
 null. `kept_by`, `kept_at` and `kept_by_kind` come from the native activation
@@ -1023,7 +1029,11 @@ remain read-only; mutations always go through the running server.
 
 `--status` is `active` (kept, the default) or `pending`, and `archived` from a
 local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`
-repeats to require several labels. A page with more after it prints the
+repeats to require several labels. The table's preview column shows an entry's
+title, or the start of its text when it has none; `--json` and `--jsonl` give
+each entry's `title` and `text_preview`, the start of its text, as the routes
+return them (a local store's text is redacted the same way before it is cut).
+A page with more after it prints the
 `--cursor` to continue with, for every status. An Agent on a Cayu whose pending list
 has no cursor says only that more proposals exist; deploy it with a newer Cayu to
 page past them. `show` prints an entry of any status with its text,

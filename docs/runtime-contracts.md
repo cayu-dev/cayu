@@ -17472,7 +17472,15 @@ Postgres embedding operational contract:
   group matching entries by kind, label, aspect, impact target, visibility,
   source type, or namespace.
 - `KnowledgeListResult`: copied entry previews plus optional facets/counts for
-  agent navigation before targeted search.
+  agent navigation before targeted search. A `KnowledgeListItem.text_preview` is
+  the start of the entry's text (never its title, which the copied entry carries),
+  at most 200 characters and cut on a word boundary; the list's `max_bytes` then
+  bounds the previews together. Store previews are unredacted, so a cut one carries
+  no ellipsis: the cut stays the preview's last character, where a later redactor
+  can hold back a secret it splits. An excerpt cut by the 200-character limit
+  leaves `text_preview_complete` false but doesn't mark the result `truncated`;
+  only the byte bound does. The server's listings and the CLI redact the whole text
+  and then cut it, ending a cut excerpt with `…`.
 
 `KnowledgeQuery.max_bytes` bounds returned `text_preview` payloads from
 `search(...)`. It does not rewrite the copied `KnowledgeEntry` or

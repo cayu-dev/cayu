@@ -161,7 +161,7 @@ def test_kept_http_attribution_redaction_precedes_preview_truncation(
         result = client.get("/api/knowledge?max_bytes=500")
         assert result.status_code == 200, result.text
         row = result.json()["entries"][0]
-        assert row["text_preview"] == pending[0]["detail"]
+        assert row["text_preview"] == "x" * 199 + "…"
         assert row["kept_by"] == "reviewer"
         assert row["kept_at"] is not None
         assert row["kept_by_kind"] == "reviewer"

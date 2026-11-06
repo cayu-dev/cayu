@@ -112,7 +112,7 @@ class StoreKnowledgeReader:
             {
                 **entry_projection(item.entry),
                 "chunk_count": item.chunk_count,
-                "text_preview": item.text_preview or "",
+                "text_preview": _text_preview(item.entry),
             }
             for item in listed.entries
         ]
@@ -317,6 +317,19 @@ def entry_projection(entry: KnowledgeEntry) -> dict[str, Any]:
         "importance_source": entry.importance_source,
         "confidence": None if entry.confidence is None else str(entry.confidence),
     }
+
+
+def _text_preview(entry: KnowledgeEntry) -> str:
+    """The start of the entry's text, redacted whole first as `show` redacts it.
+
+    The store's own preview is cut before redaction, so a secret it cuts in two could
+    get past the redactor; the server's listings build theirs the same way.
+    """
+
+    from cayu.cli.session import _redact_sensitive
+    from cayu.knowledge._retrieval_results import _knowledge_text_excerpt
+
+    return _knowledge_text_excerpt(_redact_sensitive(entry.text))
 
 
 def _redacted_chunks(chunks: list[KnowledgeChunk]) -> list[dict[str, Any]]:

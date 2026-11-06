@@ -66,7 +66,7 @@ from cayu.runtime.human_attention import (
 from cayu.server._inbox_access import PENDING_KINDS, InboxAccessGate
 from cayu.server._inbox_counts import count_inbox
 from cayu.server._inbox_cursor import InboxCursorSeal
-from cayu.server._knowledge_preview import knowledge_preview
+from cayu.server._knowledge_preview import INBOX_DETAIL_CHARS, knowledge_excerpt
 from cayu.server.contracts import ApiErrorResponse
 from cayu.server.inbox import (
     INBOX_DECISIONS,
@@ -439,12 +439,14 @@ def _state_conflict(state: InboxItemState) -> HTTPException:
 
 
 def _knowledge_item(entry: KnowledgeEntry, cayu_app: Any) -> InboxItem:
-    preview = knowledge_preview(entry.text, cayu_app.redact_json)
+    redacted = cayu_app.redact_json(entry.text)
+    preview = knowledge_excerpt(redacted, INBOX_DETAIL_CHARS)
+    title = cayu_app.redact_json(entry.title) or knowledge_excerpt(redacted)
     return InboxItem(
         id=_knowledge_item_id(_KnowledgeLocator(entry.id, entry.revision)),
         kind="knowledge",
         created_at=entry.updated_at,
-        title=cayu_app.redact_json(entry.title) or "Knowledge proposal",
+        title=title or "Knowledge proposal",
         detail=preview or None,
         knowledge=InboxKnowledgeEntry(entry_id=entry.id, revision=entry.revision, kind=entry.kind),
         decisions=list(INBOX_DECISIONS["knowledge"]),

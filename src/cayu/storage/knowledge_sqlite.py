@@ -3657,17 +3657,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             if remaining <= 0:
                 truncated = True
                 break
-            preview_source = entry.title or entry.text
-            preview_bytes = len(preview_source.encode("utf-8"))
-            preview = _retrieval_results._truncate_text_to_bytes(preview_source, remaining)
+            preview, preview_complete, budget_cut = _retrieval_results._knowledge_list_preview(
+                entry.text, remaining
+            )
             if not preview:
                 truncated = True
                 break
-            returned_bytes = len(preview.encode("utf-8"))
-            preview_complete = returned_bytes == preview_bytes
-            if not preview_complete:
+            if budget_cut:
                 truncated = True
-            remaining -= returned_bytes
+            remaining -= len(preview.encode("utf-8"))
             items.append(
                 KnowledgeListItem(
                     entry=entry,

@@ -620,3 +620,74 @@ def test_show_redacts_a_private_key_that_crosses_the_chunk_byte_bound(
     assert all("BEGIN RSA PRIVATE KEY" not in chunk["text"] for chunk in chunks)
     assert all("secretkeymaterial" not in chunk["text"] for chunk in chunks)
     assert sum(len(chunk["text"].encode()) for chunk in chunks) <= 128_000
+
+
+def _seed_entries(path: Path, *entries: KnowledgeEntry) -> None:
+    async def seed() -> None:
+        store = SQLiteKnowledgeStore(path, access_scope=SCOPE)
+        try:
+            for entry in entries:
+                await store.create_entry(entry, access_scope=SCOPE)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_list_previews_each_entrys_text_beside_its_title(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "cayu.db"
+    invoice = (
+        "Retry failed invoice exports three times with a five minute backoff, then page the "
+        "billing on-call. Exports that fail on a closed accounting period must not be "
+        "retried at all: they need the controller to reopen the period first."
+    )
+    _seed_entries(
+        path,
+        KnowledgeEntry(id="invoice", title="Retry policy", text=invoice, importance=0.9),
+        KnowledgeEntry(
+            id="payroll", title="Retry policy", text="Retry payroll exports once.", importance=0.5
+        ),
+    )
+
+    code, listed = _run(capsys, "list", "--sqlite", str(path), "--json")
+
+    assert code == 0
+    rows = {row["entry_id"]: row for row in listed["entries"]}
+    assert rows["invoice"]["title"] == rows["payroll"]["title"] == "Retry policy"
+    assert rows["invoice"]["text_preview"].startswith("Retry failed invoice exports")
+    assert rows["invoice"]["text_preview"].endswith("…")
+    assert len(rows["invoice"]["text_preview"]) <= 200
+    assert invoice.startswith(rows["invoice"]["text_preview"].removesuffix("…"))
+    assert rows["payroll"]["text_preview"] == "Retry payroll exports once."
+
+    # The table has one preview column: the title, or the text when there is none.
+    code, out = _run(capsys, "list", "--sqlite", str(path))
+    assert code == 0
+    assert "Retry policy" in out
+    assert "Retry failed invoice" not in out
+
+
+def test_list_preview_redacts_a_private_key_before_cutting_the_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "cayu.db"
+    key = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "MIIEsecretkeymaterialXYZ" * 20
+        + "\n-----END RSA PRIVATE KEY-----"
+    )
+    # Cut first, the excerpt would keep the key's start without the END marker the
+    # redactor needs to recognize it.
+    _seed_entries(path, KnowledgeEntry(id="k", title="Deploy key", text="Rotate: " + key))
+
+    code, listed = _run(capsys, "list", "--sqlite", str(path), "--json")
+    assert code == 0
+    [row] = listed["entries"]
+    assert "BEGIN RSA PRIVATE KEY" not in row["text_preview"]
+    assert "secretkeymaterial" not in row["text_preview"]
+
+    code, shown = _run(capsys, "show", "k", "--sqlite", str(path), "--json")
+    assert code == 0
+    assert row["text_preview"] == shown["entry"]["text"]

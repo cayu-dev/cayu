@@ -229,7 +229,7 @@ def register_kept_knowledge(
                 row = serialize_item(item)
                 # Store previews may already truncate across a secret boundary.
                 # Project complete source first, then apply the public preview cap.
-                row["text_preview"] = knowledge_preview(entry.title or entry.text, app.redact_json)
+                row["text_preview"] = knowledge_preview(entry.text, app.redact_json)
                 if entry.source_type == "tool":
                     row["source_id"] = source_session
                 count, last = totals.get((entry.namespace, entry.id), (None, None))

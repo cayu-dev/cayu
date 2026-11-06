@@ -1,13 +1,15 @@
-"""Public knowledge previews shared by Inbox and kept-entry reads."""
+"""Public knowledge previews shared by Inbox and knowledge listings."""
 
 from collections.abc import Callable
 
-_KNOWLEDGE_PREVIEW_CHARS = 500
+from cayu.knowledge._retrieval_results import _knowledge_text_excerpt as knowledge_excerpt
+
+__all__ = ["INBOX_DETAIL_CHARS", "knowledge_excerpt", "knowledge_preview"]
+
+# What an Inbox knowledge proposal shows of its text.
+INBOX_DETAIL_CHARS = 500
 
 
 def knowledge_preview(text: str, redact: Callable[[str], str]) -> str:
-    """Redact complete text before a truncation can split a secret."""
-    preview = redact(text).strip()
-    if len(preview) > _KNOWLEDGE_PREVIEW_CHARS:
-        return preview[: _KNOWLEDGE_PREVIEW_CHARS - 1].rstrip() + "…"
-    return preview
+    """An excerpt of ``text``, redacted whole before the cut so it can't split a secret."""
+    return knowledge_excerpt(redact(text))

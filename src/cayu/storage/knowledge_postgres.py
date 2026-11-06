@@ -83,7 +83,10 @@ from cayu.knowledge._relation_queries import (
     _knowledge_lineage_query_fingerprint,
     _knowledge_relation_query_fingerprint,
 )
-from cayu.knowledge._retrieval_results import _bounded_knowledge_evidence
+from cayu.knowledge._retrieval_results import (
+    _bounded_knowledge_evidence,
+    _knowledge_list_preview,
+)
 from cayu.knowledge._revision_rules import (
     _copy_chunks_for_revision,
     _copy_evidence_for_revision,
@@ -6421,17 +6424,13 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             if remaining <= 0:
                 truncated = True
                 break
-            preview_source = entry.title or entry.text
-            preview_bytes = len(preview_source.encode("utf-8"))
-            preview = _truncate_knowledge_text_to_bytes(preview_source, remaining)
+            preview, preview_complete, budget_cut = _knowledge_list_preview(entry.text, remaining)
             if not preview:
                 truncated = True
                 break
-            returned_bytes = len(preview.encode("utf-8"))
-            preview_complete = returned_bytes == preview_bytes
-            if not preview_complete:
+            if budget_cut:
                 truncated = True
-            remaining -= returned_bytes
+            remaining -= len(preview.encode("utf-8"))
             items.append(
                 KnowledgeListItem(
                     entry=entry,

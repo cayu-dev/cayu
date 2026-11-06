@@ -1694,6 +1694,7 @@
           "type": "string"
         },
         "text_preview": {
+          "description": "The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.",
           "title": "Text Preview",
           "type": "string"
         },
@@ -1956,6 +1957,7 @@
           "type": "string"
         },
         "text_preview": {
+          "description": "The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.",
           "title": "Text Preview",
           "type": "string"
         },

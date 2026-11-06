@@ -66,7 +66,9 @@ def add_knowledge_parser(subparsers: Any) -> None:
         "list",
         help="List knowledge entries.",
         description=(
-            "List knowledge entries with a short preview. `cayu knowledge show ENTRY_ID` "
+            "List knowledge entries with a short preview: an entry's title, or the start "
+            "of its text when it has none. `--json` gives both, as `title` and "
+            "`text_preview` (the start of the text). `cayu knowledge show ENTRY_ID` "
             "prints one with its text."
         ),
     )

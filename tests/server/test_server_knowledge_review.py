@@ -68,7 +68,10 @@ def test_server_exposes_pending_knowledge_review_endpoints() -> None:
     assert [entry["entry_id"] for entry in body["entries"]] == ["pending_git"]
     assert body["entries"][0]["revision"] == 1
     assert body["entries"][0]["title"] == "Remote sandbox Git credentials"
-    assert body["entries"][0]["text_preview"] == "Remote sandbox Git credentials"
+    assert (
+        body["entries"][0]["text_preview"]
+        == "Remote sandbox Git pushes should use a brokered credential proxy."
+    )
     assert body["total_entries_known"] == 1
 
     detail = client.get("/api/knowledge/pending/pending_git")

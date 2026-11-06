@@ -3421,13 +3421,13 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if remaining <= 0:
                 truncated = True
                 break
-            preview_source = entry.title or entry.text
-            preview = _retrieval_results._truncate_text_to_bytes(preview_source, remaining)
+            preview, preview_complete, budget_cut = _retrieval_results._knowledge_list_preview(
+                entry.text, remaining
+            )
             if not preview:
                 truncated = True
                 break
-            preview_complete = len(preview.encode("utf-8")) == len(preview_source.encode("utf-8"))
-            if not preview_complete:
+            if budget_cut:
                 truncated = True
             remaining -= len(preview.encode("utf-8"))
             items.append(

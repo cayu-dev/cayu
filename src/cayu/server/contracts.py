@@ -3512,7 +3512,13 @@ class ApiKnowledgeEntryBase(ApiBaseModel):
 
 class ApiKnowledgeListItem(ApiKnowledgeEntryBase):
     chunk_count: StrictInt = Field(ge=0)
-    text_preview: str
+    text_preview: str = Field(
+        description=(
+            "The start of the entry's text, whether or not it has a title: at most 200 "
+            "characters, cut on a word boundary and ending with an ellipsis when cut. The "
+            "text is redacted whole before it is cut."
+        )
+    )
 
 
 class ApiReviewedKnowledgeEntry(ApiKnowledgeEntryBase):

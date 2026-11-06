@@ -9727,9 +9727,7 @@ def create_router(
         for item in result.entries:
             if await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(item.entry)):
                 row = _serialize_knowledge_list_item(item)
-                row["text_preview"] = knowledge_preview(
-                    item.entry.title or item.entry.text, cayu_app.redact_json
-                )
+                row["text_preview"] = knowledge_preview(item.entry.text, cayu_app.redact_json)
                 preview = _truncate_text_to_bytes(row["text_preview"], remaining)
                 truncated = truncated or preview != row["text_preview"]
                 remaining -= len(preview.encode("utf-8"))

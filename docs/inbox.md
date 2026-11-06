@@ -30,7 +30,7 @@ An item has an `id`, a `kind` (`approval`, `question`, `recovery` or `knowledge`
 | `approval` | A tool call a `ToolPolicy` sent for approval. `detail` is the policy's `reason`; `tool_name` names the tool. | `approve`, `deny` |
 | `question` | An `ask_user` call. `question` and `options` hold what the agent asked. | `answer` |
 | `recovery` | A tool call whose outcome is unknown after an interruption. | `dismiss`, when the session will never continue (see [Dismissing a recovery item](#dismissing-a-recovery-item)); otherwise recover it in the Developer dashboard, with the evidence of what happened |
-| `knowledge` | A knowledge entry waiting for review. `knowledge` names its `entry_id`, `revision` and `kind`. | `keep`, `drop` |
+| `knowledge` | A knowledge entry waiting for review. `knowledge` names its `entry_id`, `revision` and `kind`; `title` is the entry's title, or the start of its text when it has none, and `detail` is the start of its text (up to 500 characters). | `keep`, `drop` |
 
 Approvals, questions and recovery items also carry `session_id` (the public session
 alias), `agent_name` and `attention_id`, the same human-attention identity that

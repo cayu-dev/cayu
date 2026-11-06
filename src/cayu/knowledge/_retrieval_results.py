@@ -204,6 +204,52 @@ def _search_result_from_scored_embeddings(
     )
 
 
+# A listing's text preview is an excerpt of the entry's text, not its whole text: the
+# title is its own field, and a listing's byte bound shouldn't go to one long entry.
+KNOWLEDGE_LIST_EXCERPT_CHARS = 200
+
+
+def _knowledge_text_excerpt(
+    text: str,
+    max_chars: int = KNOWLEDGE_LIST_EXCERPT_CHARS,
+    *,
+    ellipsis: bool = True,
+) -> str:
+    """The start of ``text``, at most ``max_chars`` characters, cut on a word boundary.
+
+    A cut excerpt ends with an ellipsis, counted in ``max_chars``, unless ``ellipsis``
+    is false. A text whose first word alone is longer than half the excerpt is cut
+    inside that word instead.
+    """
+
+    _validate_positive_int(max_chars, "max_chars")
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    head = stripped[: max_chars - 1]
+    if not stripped[max_chars - 1].isspace():
+        boundary = max((head.rfind(space) for space in (" ", "\n", "\t", "\r")), default=-1)
+        if boundary >= max_chars // 2:
+            head = head[:boundary]
+    return head.rstrip() + ("…" if ellipsis else "")
+
+
+def _knowledge_list_preview(text: str, remaining_bytes: int) -> tuple[str, bool, bool]:
+    """A listed entry's text excerpt, fitted to the listing's remaining byte budget.
+
+    Returns the preview, whether it is the entry's complete text (the provenance a
+    later redaction boundary relies on), and whether the byte budget cut it.
+
+    The excerpt is unredacted and has no ellipsis: a later redactor holds back a
+    secret cut in two only while the cut is the preview's last character, and an
+    ellipsis after it would release the fragment.
+    """
+
+    excerpt = _knowledge_text_excerpt(text, ellipsis=False)
+    preview = _truncate_text_to_bytes(excerpt, remaining_bytes)
+    return preview, preview == text, preview != excerpt
+
+
 def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
     if max_bytes <= 0:
         return ""

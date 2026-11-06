@@ -26,7 +26,7 @@ export function KnowledgePage({
   const entries = knowledge.entries.filter(
     (entry) =>
       !needle ||
-      `${entry.text_preview} ${entry.kind} ${entry.specialist ?? ""}`
+      `${entry.title ?? ""} ${entry.text_preview} ${entry.kind} ${entry.specialist ?? ""}`
         .toLowerCase()
         .includes(needle),
   )
@@ -229,6 +229,9 @@ function Entry({ entry }: { entry: ApiKeptKnowledgeItem }) {
   })
   return (
     <article className="min-w-0 space-y-2 px-4 py-3" aria-label={`Knowledge ${entry.entry_id}`}>
+      {entry.title && (
+        <p className="break-words text-sm font-medium [overflow-wrap:anywhere]">{entry.title}</p>
+      )}
       <p className="whitespace-pre-wrap break-words text-sm leading-relaxed [overflow-wrap:anywhere]">
         {entry.text_preview}
       </p>
