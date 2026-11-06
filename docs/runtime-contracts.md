@@ -11043,6 +11043,23 @@ rather than when a long call returns:
   and is not asked again. Calls of the round that hadn't started, including
   parallel calls still waiting for a concurrency slot, are skipped without dispatch (`tool.call.failed`, `reason="limit_reached"`,
   `skipped=true`). After the round, the run stops at the next boundary as before.
+- **Commands.** A tool whose `runner_stop_settles_call` is true, such as
+  `exec_command`, has only its runner command in flight when it is cut. If the
+  runner's cleanup receipts confirm that command stopped (every `kill_command`
+  completed, or `kill_sandbox` completed), nothing about the call is unknown: it
+  ends as an ordinary timed-out `tool.call.failed`, with the content "Tool call
+  stopped after N seconds: the run reached its time limit. The command was
+  stopped before it finished." and `structured={"timed_out": true,
+  "stopped_by": "run_time_limit", "stopped_after_seconds": N}`. The workspace
+  observation that follows records what the command changed, and the run stops
+  or finishes the way `on_limit` says. Without that confirmation (no receipt, a
+  failed kill, or a cleanup failure) the call keeps `outcome_unknown=true` and
+  needs reconciliation as above. To keep the command's output, `exec_command`
+  also shortens a `timeout_s` that would outlive the time left, leaving the
+  runner up to 5 seconds (at most half the time left) to stop the command and
+  return; the result says "shortened from M seconds to fit the run's time
+  limit" and adds `timeout_s` and `requested_timeout_s`. With less than a whole
+  second to give the command, it isn't run (`error="run_time_exhausted"`).
 - **Finishing.** With `on_limit="finish"` and a structured answer requested,
   ordinary tool calls stop `finish_reserve_seconds` before the limit (or before
   `execution_deadline`, whichever comes first), so the finishing step keeps the

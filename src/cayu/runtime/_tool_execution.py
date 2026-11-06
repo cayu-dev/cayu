@@ -23,7 +23,12 @@ from cayu.environments.admission import ExecutionAdmissionError
 from cayu.failure_evidence import FailureEvidence, exception_evidence
 from cayu.resource_access import model_data_access
 from cayu.runners._adapter_identity import trusted_runner_adapter_name
-from cayu.runners.base import RunnerExecutionError, RunnerUnavailableError, runner_error_text
+from cayu.runners.base import (
+    RunnerExecutionError,
+    RunnerUnavailableError,
+    runner_error_text,
+    runner_workspace_mutation_settlement,
+)
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
 from cayu.runtime._durable_subagents import (
@@ -91,6 +96,7 @@ class _ToolTimeoutOwner:
         "_owned_request_consumed",
         "_request_dispatched",
         "_same_task",
+        "_stops_at",
         "_task",
     )
 
@@ -113,10 +119,17 @@ class _ToolTimeoutOwner:
         self._request_dispatched = False
         self._same_task = same_task
         self._owned_request_consumed = False
-        self._handle: asyncio.TimerHandle | None = asyncio.get_running_loop().call_later(
+        loop = asyncio.get_running_loop()
+        self._stops_at = loop.time() + timeout_seconds
+        self._handle: asyncio.TimerHandle | None = loop.call_later(
             timeout_seconds,
             self._expire,
         )
+
+    def stops_at(self) -> float:
+        """The event-loop time at which this owner stops the call."""
+
+        return self._stops_at
 
     def _expire(self) -> None:
         self._handle = None
@@ -547,6 +560,29 @@ def _tool_timer(
     return run_time_left_seconds, True
 
 
+def _runner_confirmed_stop(tool: Tool, cancellation: asyncio.CancelledError) -> bool:
+    """Whether the cancelled call's runner confirmed that the command it ran has stopped.
+
+    Only a tool that declares ``runner_stop_settles_call`` qualifies: its one
+    effect while it waits is that command. The proof is the runner's own
+    cleanup receipts on the cancellation (every ``kill_command`` completed, or
+    a completed ``kill_sandbox``), with no runner cleanup or workspace
+    settlement failure attached as its cause. A missing or failed receipt
+    proves nothing, so the call's outcome stays unknown.
+    """
+
+    try:
+        settles = tool.runner_stop_settles_call
+    except Exception:
+        return False
+    if settles is not True or exception_cause(cancellation) is not None:
+        return False
+    return runner_workspace_mutation_settlement(result=None, error=cancellation) in {
+        "complete",
+        "runner_quiescent",
+    }
+
+
 def _tool_timeout_outcome(
     *,
     tool: Tool,
@@ -554,12 +590,29 @@ def _tool_timeout_outcome(
     timeout_seconds: float | None,
     redactor: SecretRedactor,
     run_time_limited: bool = False,
+    runner_stopped: bool = False,
 ) -> ToolExecutionOutcome:
     message = (
         f"Tool call stopped after {timeout_seconds:g} seconds: the run reached its time limit."
         if run_time_limited and timeout_seconds is not None
         else f"Tool call timed out after {timeout_seconds} seconds."
     )
+    if run_time_limited and runner_stopped and type(tool) is not ProcessIsolatedTool:
+        # The run's own time limit cut the call and its runner confirmed the
+        # command stopped, so nothing of the call is still running or unknown:
+        # it ends as an ordinary timed-out failure, like a command that hit
+        # its own timeout, and the run finishes the way ``on_limit`` says.
+        return _execution_outcome(
+            ToolResult(
+                content=f"{message} The command was stopped before it finished.",
+                structured={
+                    "timed_out": True,
+                    "stopped_by": "run_time_limit",
+                    "stopped_after_seconds": timeout_seconds,
+                },
+                is_error=True,
+            )
+        )
     if type(tool) is ProcessIsolatedTool:
         return _isolated_failure_outcome(
             terminal_outcome="tool_execution_timeout",
@@ -713,13 +766,18 @@ async def _run_tool(
             if type(tool) is not ProcessIsolatedTool:
                 if on_invoke is not None:
                     on_invoke()
+                # A tool such as exec_command fits its own work into the time
+                # the run's limit leaves it, so it can settle before the cut.
+                run_time_stops_at = (
+                    timer.stops_at() if timer is not None and run_time_limited else None
+                )
                 if inference_scope is not None:
                     async with inference_scope.lifetime():
-                        with tool_invocation_lifetime(ctx):
+                        with tool_invocation_lifetime(ctx, run_time_stops_at=run_time_stops_at):
                             async with model_data_access():
                                 with phase_scope("execution"):
                                     return await tool.run(ctx, arguments)
-                with tool_invocation_lifetime(ctx):
+                with tool_invocation_lifetime(ctx, run_time_stops_at=run_time_stops_at):
                     async with model_data_access():
                         with phase_scope("execution"):
                             return await tool.run(ctx, arguments)
@@ -822,6 +880,7 @@ async def _run_tool(
             redactor=_active_redactor(redactor),
             timeout_seconds=timer_seconds,
             run_time_limited=run_time_limited,
+            runner_stopped=_runner_confirmed_stop(tool, exc),
         )
     except IsolatedToolPreDispatchFailure as exc:
         ctx._discard_policy_denials_for(tool)

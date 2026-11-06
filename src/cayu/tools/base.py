@@ -1441,6 +1441,19 @@ class Tool(ABC):
         return True
 
     @property
+    def runner_stop_settles_call(self) -> bool:
+        """Whether the runner's confirmed stop settles a call the run's time limit cut off.
+
+        ``True`` only for a tool whose one effect, while it is cancelled, is the
+        ``ctx.runner`` command it waits on, as for ``exec_command``. When the
+        run's time limit cuts such a call off and the runner's cleanup receipts
+        confirm the command stopped, the call ends as an ordinary timed-out
+        failure. Otherwise a cut-off call with an effect has an unknown outcome.
+        """
+
+        return False
+
+    @property
     def retain_arguments_for_model(self) -> bool:
         """Retain bounded redacted original inputs privately for the same profile.
 

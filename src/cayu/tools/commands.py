@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
@@ -29,6 +30,7 @@ from cayu.runners.base import (
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._invocation_lifetime import run_time_left_for_call
 from cayu.tools._operation_boundary import (
     await_invocation_cancellation_checkpoint,
     await_invocation_operation,
@@ -69,6 +71,10 @@ DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 # to that bound anyway.
 MAX_OUTPUT_LIMIT_BYTES = MAX_TOOL_TERMINAL_PAYLOAD_BYTES
 DEFAULT_TIMEOUT_SECONDS = 60
+# A command the run's time limit would cut off gets a shorter timeout, leaving
+# the runner up to this long (at most half the time left) to stop it and return
+# its output before the runtime stops the call.
+_RUN_TIME_STOP_MARGIN_SECONDS = 5.0
 # ExecCommandTool(max_timeout_seconds=...) raises the default up to the maximum.
 DEFAULT_MAX_TIMEOUT_SECONDS = DEFAULT_MAX_COMMAND_TIMEOUT_SECONDS
 MAX_TIMEOUT_SECONDS = MAX_COMMAND_TIMEOUT_SECONDS
@@ -352,6 +358,11 @@ class ExecCommandTool(Tool):
 
         return self._policy
 
+    @property
+    def runner_stop_settles_call(self) -> bool:
+        # A cancelled call has only its runner command in flight.
+        return True
+
     @bounded_terminal_result
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -383,6 +394,15 @@ class ExecCommandTool(Tool):
             if stdin is not None:
                 require_unicode_scalar_text(stdin, "stdin")
             canonical_cwd = runner.resolve_cwd(cwd)
+        requested_timeout_s = timeout_s
+        run_time_left = run_time_left_for_call(ctx)
+        if run_time_left is not None:
+            fitted_timeout_s = math.floor(
+                run_time_left - min(_RUN_TIME_STOP_MARGIN_SECONDS, run_time_left / 2)
+            )
+            if fitted_timeout_s < 1:
+                return _run_time_exhausted_result(run_time_left)
+            timeout_s = min(timeout_s, fitted_timeout_s)
         return await self._execute_resolved_command(
             ctx,
             command=command,
@@ -390,6 +410,7 @@ class ExecCommandTool(Tool):
             canonical_cwd=canonical_cwd,
             env=env,
             timeout_s=timeout_s,
+            requested_timeout_s=requested_timeout_s,
             stdin=stdin,
             max_output_bytes=max_output_bytes,
             policy_source=self,
@@ -411,6 +432,7 @@ class ExecCommandTool(Tool):
         policy_source: object,
         include_runner_evidence: bool,
         max_result_bytes: int | None = None,
+        requested_timeout_s: int | None = None,
     ) -> ToolResult:
         """Execute one owned request through the canonical command boundary.
 
@@ -427,6 +449,8 @@ class ExecCommandTool(Tool):
                 content="No runner configured for this tool call.",
                 is_error=True,
             )
+        if requested_timeout_s is None:
+            requested_timeout_s = timeout_s
         if canonical_cwd is None:
             canonical_cwd = runner.resolve_cwd(cwd)
         if self._policy is not None:
@@ -493,6 +517,7 @@ class ExecCommandTool(Tool):
                 timed_out=exec_result.timed_out,
                 cancelled=exec_result.cancelled,
                 timeout_s=timeout_s,
+                requested_timeout_s=requested_timeout_s,
                 stdout_truncated=out.truncated,
                 stderr_truncated=err.truncated,
                 mutation_settlement=mutation_settlement,
@@ -518,6 +543,9 @@ class ExecCommandTool(Tool):
                 "cancelled": exec_result.cancelled,
                 "artifacts": copy_json_value(exec_result.artifacts, "artifacts"),
             }
+            if timeout_s < requested_timeout_s:
+                structured["timeout_s"] = timeout_s
+                structured["requested_timeout_s"] = requested_timeout_s
             if include_runner_evidence:
                 structured.update(
                     {
@@ -990,6 +1018,19 @@ def _command_output_label(stream: str, encoding: str) -> str:
     return stream
 
 
+def _run_time_exhausted_result(run_time_left: float) -> ToolResult:
+    """Refuse a command the run's time limit would stop before it could run."""
+
+    return ToolResult(
+        content=(
+            f"Command not run: the run's time limit stops this call in "
+            f"{max(run_time_left, 0.0):.1f} seconds, too little to run a command."
+        ),
+        structured={"error": "run_time_exhausted"},
+        is_error=True,
+    )
+
+
 def _command_content(
     *,
     stdout: str,
@@ -1001,6 +1042,7 @@ def _command_content(
     stdout_truncated: bool,
     stderr_truncated: bool,
     mutation_settlement: RunnerWorkspaceMutationSettlement,
+    requested_timeout_s: int | None = None,
 ) -> str:
     output = stdout.strip()
     error = stderr.strip()
@@ -1016,7 +1058,12 @@ def _command_content(
         ),
     }.get(mutation_settlement, "")
     if timed_out:
-        reason = f"Command timed out after {timeout_s} seconds.{stop}"
+        shortened = (
+            f" (shortened from {requested_timeout_s} seconds to fit the run's time limit)"
+            if requested_timeout_s is not None and timeout_s < requested_timeout_s
+            else ""
+        )
+        reason = f"Command timed out after {timeout_s} seconds{shortened}.{stop}"
         if output and error:
             return f"{reason}\n\nstdout:\n{output}\n\nstderr:\n{error}{suffix}"
         if output:
