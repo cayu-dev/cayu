@@ -128,6 +128,7 @@ from cayu.events import (
     event_with_runtime_generated_id,
     event_with_runtime_payload_authority,
 )
+from cayu.exceptions import TerminalEventPublicationUncertain
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
@@ -136,7 +137,7 @@ from cayu.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
 )
-from cayu.failure_evidence import FailureEvidence, exception_evidence
+from cayu.failure_evidence import FailureEvidence
 from cayu.messages import Message, detach_message
 from cayu.observability.hooks import RuntimeHookPhase
 from cayu.providers.retry_policy import RetryPolicy
@@ -157,6 +158,7 @@ from cayu.runtime._approved_tool_arguments import (
 )
 from cayu.runtime._auxiliary_invocation import AuxiliaryInvocationPolicy
 from cayu.runtime._continuation_environment import ContinuationEnvironment
+from cayu.runtime._continuation_failure import _continuation_failure_payload
 from cayu.runtime._continuation_task_failure import (
     ApprovalTaskFailureIdentity,
     approval_failure_event_id,
@@ -181,7 +183,6 @@ from cayu.runtime._durable_tool_round import (
 )
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
-    exception_failure_payload,
 )
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
@@ -193,7 +194,6 @@ from cayu.runtime._foreground_child_wait import (
     event_with_foreground_child_wait_authority,
 )
 from cayu.runtime._foreground_gate_continuation import ForegroundGatePolicyOwner, GateReplay
-from cayu.runtime._foreground_subagent_recovery import ForegroundSubagentRecoveryRequired
 from cayu.runtime._incomplete_session_recovery import (
     IncompleteSessionRecovery,
     _require_recovery_max_steps,
@@ -548,22 +548,6 @@ def _authoritative_expired_recovery_claim_failure(
     """Preserve fatal/cancellation authority while retaining expired-lease evidence."""
 
     return _authoritative_recovery_ownership_failure(operation_failure, lease_failure)
-
-
-def _continuation_failure_payload(
-    error: BaseException, *, session: Session, redactor: SecretRedactor
-) -> dict[str, Any]:
-    return {
-        **exception_failure_payload(error, redactor=redactor),
-        **(
-            error.interruption_evidence()
-            if isinstance(error, ForegroundSubagentRecoveryRequired)
-            else {}
-        ),
-        "failure_evidence": exception_evidence(error)
-        .model_copy(update={"session_id": session.id, "run_epoch": session.run_epoch})
-        .model_dump(mode="json"),
-    }
 
 
 class _ManualRecoveryInterrupted(RuntimeError):
@@ -5574,6 +5558,8 @@ class RecoveryCoordinator:
                 invocation_context=environment.invocation_context,
             ):
                 yield event
+        except TerminalEventPublicationUncertain:
+            raise
         except Exception as exc:
             if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
                 session = await self._session_store.update_status(
