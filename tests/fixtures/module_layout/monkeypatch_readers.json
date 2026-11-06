@@ -3151,14 +3151,16 @@
     "cayu.storage._postgres_base:_PostgresStoreBase._backfill_interrupted_handoff_generations",
     "cayu.storage._postgres_event_delivery:_lease_claimable_delivery",
     "cayu.storage._postgres_event_publication:append_tool_effect_conflict",
+    "cayu.storage._postgres_locked_reads:decode_checkpoint",
+    "cayu.storage._postgres_locked_reads:operation_record.<locals>.<lambda>",
     "cayu.storage._postgres_model_stage:mark_dispatched",
     "cayu.storage._postgres_model_stage:prepare",
     "cayu.storage._postgres_page_reads:_event_record",
     "cayu.storage._postgres_page_reads:query_latest_events",
     "cayu.storage._postgres_publication:load_attestation",
     "cayu.storage._postgres_publication:load_material",
-    "cayu.storage._postgres_publication:publish_checkpoint_events",
     "cayu.storage._postgres_publication:publish_runtime",
+    "cayu.storage._postgres_publication:publish_runtime.<locals>.<lambda>",
     "cayu.storage._postgres_session_messages:_acceptance_events",
     "cayu.storage._postgres_session_messages:deliver_queued_session_messages",
     "cayu.storage._postgres_session_messages:enqueue_session_message",
@@ -3196,7 +3198,6 @@
     "cayu.storage.knowledge_postgres:_knowledge_relation_from_row",
     "cayu.storage.postgres:PostgresSessionStore._append_event_once_with_cursor",
     "cayu.storage.postgres:PostgresSessionStore._capture_completed_turn_snapshot",
-    "cayu.storage.postgres:PostgresSessionStore._load_checkpoint",
     "cayu.storage.postgres:PostgresSessionStore._load_historical_interaction_settlement_record",
     "cayu.storage.postgres:PostgresSessionStore._load_interaction_transition_receipt_by_event_id",
     "cayu.storage.postgres:PostgresSessionStore._load_session_closure_records.<locals>.<lambda>",
@@ -3534,9 +3535,6 @@
     "cayu.runtime._host_continuation_discovery:_require_session",
     "cayu.sessions._participant_discovery:discover_participant_sessions",
     "cayu.storage.application:_open_postgres_stores"
-  ],
-  "cayu.storage.postgres:datetime": [
-    "PostgresSessionStore._session_store_now"
   ],
   "cayu.storage.sqlite:_SQLITE_SESSION_MIN_REQUIRED_REVISION": [
     "SQLiteSessionStore._initialize_schema"

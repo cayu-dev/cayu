@@ -4,5 +4,6 @@
   "cayu.providers:OpenAISubscriptionProvider": "Read by the generated application's providers.py (cli/scaffold_convention.py), not by Cayu source.",
   "cayu.providers:__all__": "The test extends the public export list itself; no function reads it.",
   "cayu.runtime._temporary_service_execution:datetime": "Patched with raising=False alongside cayu.deadlines so a clock the module may use stays consistent.",
+  "cayu.storage.postgres:datetime": "The test proves side-effect handoff eligibility uses database time, so the patched process clock must have no effect.",
   "cayu.storage.tasks_postgres:datetime": "The test proves reclamation uses database time, so the patched process clock must have no effect."
 }
