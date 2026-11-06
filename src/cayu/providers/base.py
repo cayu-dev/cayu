@@ -983,9 +983,14 @@ class ModelRequest(BaseModel):
             value = value.model_dump(mode="python")
         return ToolDiscoveryProjectionRequest.model_validate(value)
 
-    @field_validator("messages")
+    @field_validator("messages", mode="wrap")
     @classmethod
-    def copy_messages(cls, value):
+    def copy_messages(cls, value, handler):
+        # Detaching validates each message in full. Existing instances skip the
+        # field's own pass, which reruns Message's after-validator and so walks
+        # every message's JSON a second time per request.
+        if type(value) is not list or any(type(message) is not Message for message in value):
+            value = handler(value)
         return [
             projected
             for message in value

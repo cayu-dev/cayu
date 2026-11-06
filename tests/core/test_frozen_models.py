@@ -225,3 +225,35 @@ def test_tool_result_and_context_are_frozen() -> None:
     ctx = ToolContext(session_id="sess_1")
     with pytest.raises(ValidationError):
         ctx.session_id = "sess_2"  # type: ignore[misc]
+
+
+def test_model_requests_validate_each_message_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cayu.messages as messages
+    from cayu.providers.base import ModelRequest
+
+    walks: list[object] = []
+    inspect = messages.inspect_bounded_durable_json
+
+    def counting(value, field_name, **kwargs):
+        if field_name == "transcript.message":
+            walks.append(value)
+        return inspect(value, field_name, **kwargs)
+
+    monkeypatch.setattr(messages, "inspect_bounded_durable_json", counting)
+    message = Message.tool_call(tool_call_id="call_1", tool_name="echo", arguments={"a": 1})
+    walks.clear()
+
+    # A request detaches each message through full validation, once; the field's
+    # own pass would rerun Message's after-validator and walk it again.
+    request = ModelRequest(model="m", messages=[message])
+    assert len(walks) == 1
+    assert request.messages == [message] and request.messages[0] is not message
+
+    # Payloads stay mutable after validation, so each request still checks the
+    # whole message: one grown in place past the nesting bound is rejected.
+    nested: dict = {}
+    for _ in range(62):
+        nested = {"x": nested}
+    message.content[0].arguments["nested"] = nested  # type: ignore[union-attr]
+    with pytest.raises(ValidationError):
+        ModelRequest(model="m", messages=[message])

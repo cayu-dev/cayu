@@ -916,9 +916,13 @@ def _require_complete_tool_round_identity(
         )
 
 
-def _without_structured_output_parts(message: Message) -> Message | None:
-    """Keep original provider history while omitting duplicate display evidence."""
-    copied = detach_message(message)
+def _without_structured_output_parts(message: Message, *, detach: bool = True) -> Message | None:
+    """Keep original provider history while omitting duplicate display evidence.
+
+    detach=False shares a validated message (see `copy_message`), for callers that
+    rebuild every message before it leaves the runtime.
+    """
+    copied = detach_message(message) if detach else copy_message(message)
     parts = tuple(part for part in copied.content if type(part) is not StructuredOutputPart)
     if len(parts) == len(copied.content):
         return copied

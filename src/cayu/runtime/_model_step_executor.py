@@ -1279,6 +1279,9 @@ class ModelStepExecutor:
         model_messages = _model_request_messages(
             messages=context_messages,
             structured_output=structured_output,
+            # Read here, then rebuilt by redaction below; detaching would revalidate
+            # the whole transcript once more for nothing.
+            detach=False,
         )
         discovery_native_tools: tuple[dict[str, Any], ...] = ()
         hosted_discovery_projection: ToolDiscoveryProjectionRequest | None = None
@@ -5656,6 +5659,7 @@ def _model_request_messages(
     messages: list[Message],
     structured_output: StructuredOutputSpec | None,
     targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+    detach: bool = True,
 ) -> list[Message]:
     """Return the complete statically determined message surface for one request."""
 
@@ -5664,7 +5668,7 @@ def _model_request_messages(
     projected = [
         projected
         for message in messages
-        if (projected := _without_structured_output_parts(message)) is not None
+        if (projected := _without_structured_output_parts(message, detach=detach)) is not None
     ]
     if (
         structured_output is not None
