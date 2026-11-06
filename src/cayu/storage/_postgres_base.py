@@ -17,6 +17,7 @@ from cayu.storage import _postgres_eval_schema as postgres_eval_schema
 from cayu.storage import _postgres_knowledge_schema as postgres_knowledge_schema
 from cayu.storage import _postgres_memory_evidence_schema as postgres_memory_evidence_schema
 from cayu.storage import _postgres_producer_schema as postgres_producer_schema
+from cayu.storage import _postgres_public_authority as postgres_public_authority
 from cayu.storage import _postgres_session_schema as postgres_session_schema
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_task_schema as postgres_task_schema
@@ -969,6 +970,8 @@ class _PostgresStoreBase:
                             await postgres_transcript_schema._validate_transcript_message_bytes(
                                 cur, event_content_references=current_state.revision >= 134
                             )
+                        if current_state.revision >= 140:
+                            await postgres_public_authority.validate_alias_check_function(cur)
                         if current_state.revision >= 120:
                             await validate_postgres_agent_snapshot_schema(cur)
                         if self._min_required_revision >= 36:
@@ -1373,6 +1376,8 @@ class _PostgresStoreBase:
             await postgres_transcript_schema._validate_transcript_message_bytes(
                 cur, event_content_references=state.revision >= 134
             )
+        if state.revision >= 140:
+            await postgres_public_authority.validate_alias_check_function(cur)
         if state.revision >= 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if state.revision >= 93:
@@ -1541,6 +1546,8 @@ class _PostgresStoreBase:
             await postgres_transcript_schema._validate_transcript_message_bytes(
                 cur, event_content_references=True
             )
+        if revision.revision == 140:
+            await postgres_public_authority.validate_alias_check_function(cur)
         if revision.revision == 120:
             await validate_postgres_agent_snapshot_schema(cur)
         if revision.revision == 102:

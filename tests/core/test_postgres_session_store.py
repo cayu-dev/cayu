@@ -1107,6 +1107,88 @@ def test_postgres_stale_alias_keyring_fails_pipelined_reads_and_rolls_back_write
     asyncio.run(runner())
 
 
+def test_postgres_single_statement_write_checks_alias_keyring_on_the_server(
+    postgres_dsn: str,
+) -> None:
+    import psycopg
+
+    from cayu.sessions.event_delivery import PersistedEventSideEffectStatus
+    from cayu.storage import _postgres_alias_checks as alias_checks
+    from cayu.storage import _postgres_public_authority as public_authority_ops
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        codec = _public_authority_codec()
+        stale = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=codec,
+        )
+        secondary_key = base64.urlsafe_b64encode(bytes([11]) * 32).decode().rstrip("=")
+        rotated = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=codec.rotated(
+                active_key_id="secondary", key=SecretStr(secondary_key)
+            ),
+        )
+        try:
+            await stale.create(
+                RunRequest(agent_name="assistant", session_id="session", messages=[]),
+                identity=_identity(),
+            )
+            claims = []
+            for event_id in ("first", "second"):
+                claim = await stale.append_event_and_claim_side_effect(
+                    "session",
+                    Event(id=event_id, type=EventType.TURN_COMPLETED, session_id="session"),
+                )
+                assert claim is not None
+                claims.append(claim)
+
+            # A current worker's write is one autocommit statement after the check.
+            async with stale._checked_write_connection() as conn:
+                assert type(conn) is alias_checks.ServerCheckedConnection
+                assert conn.autocommit
+            delivered = await stale.mark_persisted_event_side_effect_delivered(claims[0])
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+
+            # Opening the rotated store moves the active key under the stale one.
+            assert (await rotated.load("session")) is not None
+            with pytest.raises(RuntimeError, match="configuration is stale"):
+                await stale.mark_persisted_event_side_effect_delivered(claims[1])
+            with pytest.raises(RuntimeError, match="configuration is stale"):
+                await stale.defer_persisted_event_side_effect(claims[1])
+            # The stale writes never ran.
+            current = await rotated.get_persisted_event_side_effect_delivery(
+                session_id="session", event_id="second"
+            )
+            assert current is not None
+            assert current.status is PersistedEventSideEffectStatus.LEASED
+            assert current.claim_id == claims[1].claim_id
+            delivered = await rotated.mark_persisted_event_side_effect_delivered(claims[1])
+            assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
+
+            # A caller without a keyring fails against a keyed store.
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+                with pytest.raises(psycopg.Error) as raised:
+                    await conn.execute(
+                        "SELECT cayu_require_public_authority_alias_config(%s, %s)",
+                        (None, None),
+                    )
+            failure = public_authority_ops.configuration_check_failure(raised.value)
+            assert failure is not None and "keyring" in str(failure)
+        finally:
+            await stale.close()
+            await rotated.close()
+
+
 @pytest.mark.parametrize("write", ["transform_checkpoint", "append_events", "operation"])
 def test_postgres_reads_pipelined_with_the_session_lock_run_after_the_lock_wait(
     postgres_dsn: str, write: str

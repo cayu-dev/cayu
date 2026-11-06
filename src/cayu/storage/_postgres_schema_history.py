@@ -704,6 +704,43 @@ POSTGRES_TRANSCRIPT_MESSAGE_BYTES_FUNCTION = """
         $$ LANGUAGE plpgsql
         """
 
+# Revision 140 function: raise unless the alias configuration matches the
+# caller's keyring (or, for a caller without one, unless there is none). A
+# single-statement write runs it first in the same implicit transaction, so a
+# stale worker's write never runs. The SQLSTATEs are the session store's.
+POSTGRES_PUBLIC_AUTHORITY_ALIAS_CHECK_FUNCTION = """
+        CREATE OR REPLACE FUNCTION cayu_require_public_authority_alias_config(
+            expected_active_key_id TEXT,
+            expected_keyring_fingerprint TEXT
+        )
+        RETURNS BOOLEAN AS $$
+        DECLARE
+            configured RECORD;
+        BEGIN
+            SELECT active_key_id, keyring_fingerprint INTO configured
+            FROM cayu_public_authority_alias_config
+            WHERE singleton = TRUE;
+            IF expected_active_key_id IS NULL THEN
+                IF FOUND THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = 'CYA02',
+                        MESSAGE = 'public authority alias keyring required';
+                END IF;
+                RETURN TRUE;
+            END IF;
+            IF NOT FOUND
+                OR configured.active_key_id IS DISTINCT FROM expected_active_key_id
+                OR configured.keyring_fingerprint IS DISTINCT FROM expected_keyring_fingerprint
+            THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = 'CYA01',
+                    MESSAGE = 'public authority alias configuration is stale';
+            END IF;
+            RETURN TRUE;
+        END;
+        $$ LANGUAGE plpgsql STABLE
+        """
+
 # Per-revision forward-migration DDL, keyed by revision number. The baseline
 # (revision 1) is applied from SCHEMA_STATEMENTS, so it is not listed
 # here; future additive/breaking revisions append their ALTER/CREATE statements.
@@ -783,6 +820,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     136: POSTGRES_TASK_STEP_DDL,
     138: POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL,
     139: (),  # Retry-key JSON provenance; compatibility fence only.
+    140: (POSTGRES_PUBLIC_AUTHORITY_ALIAS_CHECK_FUNCTION,),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

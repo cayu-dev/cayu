@@ -191,6 +191,74 @@ def current_configuration_query(
     return None if codec is None and keyring_optional else _CURRENT_CONFIGURATION_QUERY
 
 
+# Raised by cayu_require_public_authority_alias_config (schema revision 140).
+_STALE_CONFIGURATION_SQLSTATE = "CYA01"
+_KEYRING_REQUIRED_SQLSTATE = "CYA02"
+
+
+def server_configuration_check(
+    codec: PublicAuthorityAliasCodec | None, *, keyring_optional: bool = False
+) -> tuple[str, tuple[str | None, str | None]] | None:
+    """The statement that fails on the server where require_current_configuration_row would.
+
+    It checks the same thing as current_configuration_query and
+    require_current_configuration_row, but raises inside the statement's own
+    transaction, so a write that follows it in that transaction never commits
+    for a stale worker. None when there is nothing to check.
+    """
+
+    if codec is None and keyring_optional:
+        return None
+    parameters = (
+        (None, None)
+        if codec is None
+        else (codec.keyring.active_key_id, codec.keyring_fingerprint())
+    )
+    return "SELECT cayu_require_public_authority_alias_config(%s, %s)", parameters
+
+
+def configuration_check_failure(error: BaseException) -> RuntimeError | None:
+    """The store's own error for a failed server_configuration_check, else None."""
+
+    sqlstate = getattr(error, "sqlstate", None)
+    if sqlstate == _STALE_CONFIGURATION_SQLSTATE:
+        return RuntimeError(
+            "Postgres public authority alias key configuration is stale; reopen the store."
+        )
+    if sqlstate == _KEYRING_REQUIRED_SQLSTATE:
+        return RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
+    return None
+
+
+async def validate_alias_check_function(cur: Any) -> None:
+    """Check the function server_configuration_check calls (schema revision 140)."""
+
+    await cur.execute(
+        """
+            SELECT pg_get_functiondef(function_definition.oid)
+            FROM pg_proc AS function_definition
+            JOIN pg_namespace AS namespace ON namespace.oid = function_definition.pronamespace
+            WHERE namespace.nspname = current_schema()
+              AND function_definition.proname = 'cayu_require_public_authority_alias_config'
+              AND pg_get_function_identity_arguments(function_definition.oid)
+                  = 'expected_active_key_id text, expected_keyring_fingerprint text'
+            """
+    )
+    rows = await cur.fetchall()
+    definition = "" if len(rows) != 1 else " ".join(str(rows[0][0]).lower().split())
+    if (
+        "from cayu_public_authority_alias_config where singleton = true" not in definition
+        or "errcode = 'cya01'" not in definition
+        or "errcode = 'cya02'" not in definition
+        or "configured.active_key_id is distinct from expected_active_key_id" not in definition
+        or "configured.keyring_fingerprint is distinct from expected_keyring_fingerprint"
+        not in definition
+    ):
+        raise RuntimeError(
+            "Postgres public authority alias check function is missing or conflicting."
+        )
+
+
 async def require_current_configuration(
     connect: PostgresConnection,
     *,

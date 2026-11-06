@@ -434,7 +434,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 134
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 140
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -1005,6 +1005,38 @@ class PostgresSessionStore(
                 verify=lambda row: public_authority_ops.require_current_configuration_row(
                     row, codec=codec
                 ),
+            )
+
+    @asynccontextmanager
+    async def _checked_write_connection(self) -> AsyncIterator[Any]:
+        """A connection for one single-statement write, checked as `_ensure_ready` checks.
+
+        On an autocommit connection, the write's first statement is pipelined
+        after a check that fails on the server when the alias configuration is
+        stale, in the same implicit transaction (see `ServerCheckedConnection`):
+        one round trip instead of BEGIN, the write and COMMIT. Each later
+        statement is its own transaction, so only the first may write. A
+        read-only store keeps its transactional guard.
+        """
+
+        if self._read_only:
+            async with self._ready_connection() as conn:
+                yield conn
+            return
+        await self._ensure_aliases_reconciled()
+        check = public_authority_ops.server_configuration_check(
+            self.public_authority_alias_codec, keyring_optional=self._alias_keyring_optional
+        )
+        async with self._autocommit_connection() as conn:
+            if check is None:
+                yield conn
+                return
+            query, parameters = check
+            yield alias_checks.ServerCheckedConnection(
+                conn,
+                query=query,
+                parameters=parameters,
+                failure=public_authority_ops.configuration_check_failure,
             )
 
     @asynccontextmanager
@@ -5113,7 +5145,7 @@ class PostgresSessionStore(
         self, claim: PersistedEventSideEffectClaim
     ) -> PersistedEventSideEffectDelivery:
         return await event_delivery_ops.mark_persisted_event_side_effect_delivered(
-            self._ready_connection, claim
+            self._checked_write_connection, claim
         )
 
     async def mark_persisted_event_side_effect_failed(
@@ -5125,7 +5157,7 @@ class PostgresSessionStore(
         retry_delay_seconds: float,
     ) -> PersistedEventSideEffectDelivery:
         return await event_delivery_ops.mark_persisted_event_side_effect_failed(
-            self._ready_connection,
+            self._checked_write_connection,
             claim,
             error=error,
             max_attempts=max_attempts,
@@ -5136,7 +5168,7 @@ class PostgresSessionStore(
         self, claim: PersistedEventSideEffectClaim
     ) -> PersistedEventSideEffectDelivery:
         return await event_delivery_ops.defer_persisted_event_side_effect(
-            self._ready_connection, claim
+            self._checked_write_connection, claim
         )
 
     async def renew_persisted_event_side_effect(

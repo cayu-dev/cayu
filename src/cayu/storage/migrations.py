@@ -582,6 +582,11 @@ REVISIONS: tuple[Revision, ...] = (
     # Retry-key JSON records whether the original budget was implicit. Older
     # readers forbid unknown fields and must refuse before touching task state.
     Revision(revision=139, kind=RevisionKind.BREAKING, compatible_from=139),
+    # A Postgres function that raises when the public authority alias
+    # configuration differs from the caller's keyring, so a single-statement
+    # write can carry the session store's alias check on the server. Older
+    # binaries never call it. Postgres session stores require it.
+    Revision(revision=140, kind=RevisionKind.ADDITIVE, compatible_from=139),
 )
 
 #: The revision an empty database is initialized to.

@@ -457,6 +457,8 @@ async def _finish_persisted_event_side_effect_claim(
     retry_delay_seconds: float | None,
     deferred: bool = False,
 ) -> PersistedEventSideEffectDelivery:
+    # One write: the store may run it on an autocommit connection, where the
+    # follow-up read only explains a write that matched nothing.
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:

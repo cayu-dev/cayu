@@ -741,6 +741,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     136: SQLITE_TASK_STEP_DDL,
     138: SQLITE_EVAL_RUN_TRIAL_SLOT_DDL,
     139: "",  # Retry-key JSON provenance; compatibility fence only.
+    140: "",  # The Postgres alias-check function; SQLite checks in-process.
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

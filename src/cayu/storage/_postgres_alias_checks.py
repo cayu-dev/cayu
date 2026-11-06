@@ -67,6 +67,45 @@ class AliasCheckedConnection:
         await self._run_first(())
 
 
+class ServerCheckedConnection(AliasCheckedConnection):
+    """An autocommit connection whose first statement follows a server-side alias check.
+
+    The check statement raises on the server when the alias configuration is
+    stale (schema revision 140), and it shares one pipeline, so one implicit
+    transaction, with the first statement after it. A write there never runs for
+    a stale worker, so a single-statement write is one round trip instead of
+    three (BEGIN, the write with its check, COMMIT). ``failure`` turns the
+    check's error into the store's own.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        *,
+        query: str,
+        parameters: Any,
+        failure: Callable[[BaseException], BaseException | None],
+    ) -> None:
+        self._connection = connection
+        self._check = (query, parameters)
+        self._failure = failure
+        self._pending = True
+
+    async def _run_first(self, statements: Sequence[Callable[[], Awaitable[Any]]]) -> None:
+        try:
+            async with self._connection.cursor() as checker, self._connection.pipeline():
+                # Before the statements, so a write among them never runs.
+                await checker.execute(*self._check)
+                for statement in statements:
+                    await statement()
+        except Exception as error:
+            failure = self._failure(error)
+            if failure is not None:
+                raise failure from None
+            raise
+        self._pending = False
+
+
 class AliasCheckedCursor:
     def __init__(self, cursor: Any, owner: AliasCheckedConnection, *, named: bool) -> None:
         self._cursor = cursor

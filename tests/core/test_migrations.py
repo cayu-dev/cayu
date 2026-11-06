@@ -788,3 +788,15 @@ def test_retry_budget_provenance_fences_old_readers():
         m.validate_migration_input(m.SchemaState(revision=138, compatible_from=137))[0].revision
         == 139
     )
+
+
+def test_alias_check_function_keeps_older_binaries_working():
+    revision = m.revision(140)
+    assert revision.kind is m.RevisionKind.ADDITIVE
+    m.validate(
+        m.SchemaState(revision=140, compatible_from=139), app_latest=139, app_min_supported=139
+    )
+    assert (
+        m.validate_migration_input(m.SchemaState(revision=139, compatible_from=139))[0].revision
+        == 140
+    )
