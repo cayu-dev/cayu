@@ -16,7 +16,8 @@ from cayu._validation import (
     safe_durable_value_error_bounds,
     safe_durable_value_error_details,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults._credential_shapes import mask_credential_shapes
 
 MAX_DIAGNOSTIC_UTF8_BYTES = 4 * 1024
 # Tool failures are read by the model to recover, so they keep full validation
@@ -343,7 +344,9 @@ def exception_diagnostic(
 
     Exception implementations and their text are caller-controlled. Attribute
     access and rendering are therefore guarded, while durable-value failures
-    retain only their runtime-owned code and path.
+    retain only their runtime-owned code and path. The message loses registered
+    secrets and credential shapes (Authorization values, bearer and Git access
+    tokens, prefixed tokens) before it is bounded.
     """
 
     resolved_redactor = redactor or SecretRedactor()
@@ -393,7 +396,11 @@ def exception_diagnostic(
                 durable_value_error_limit=limit,
                 durable_value_error_observed_lower_bound=observed,
             )
-        message = rendered
+        # The redactor knows only registered secrets; a credential echoed by a
+        # library (a command line in TimeoutExpired, a request's headers) is
+        # masked by its shape. Registered secrets go first, so masking a shape
+        # never cuts one apart and leaves the rest of it.
+        message = mask_credential_shapes(resolved_redactor.redact_text(rendered), REDACTED_SECRET)
     elif preserve_empty_message and not rendering_failed:
         message = ""
     else:

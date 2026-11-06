@@ -20,6 +20,7 @@ import re
 from collections.abc import Sequence
 
 from cayu.vaults import SecretRedactor
+from cayu.vaults._credential_shapes import AUTHORIZATION_HEADER
 
 _MAX_STDERR_BYTES = 1024
 _MAX_SCAN_CHARACTERS = 65536
@@ -70,10 +71,7 @@ _LINE_MAPPING = re.compile(
     r"(?m)^(?P<keep>[ \t]*+(?:-[ \t]++)?(?P<name>[A-Za-z0-9_.-]++):[ \t]++)\S[^\n]*+"
 )
 _HEADERS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r"(?i)(?P<keep>authorization:)\s*+\S++(?:[^\S\n]++\S++)?"),
-        "\\g<keep> ",
-    ),
+    (AUTHORIZATION_HEADER, "\\g<keep> "),
     (re.compile(rf"(?i)(?P<keep>\b(?:{_SECRET_HEADER}):)\s*+\S++"), "\\g<keep> "),
     (re.compile(r"(?i)(?P<keep>\b(?:set-)?cookie:)[^\n]*+"), "\\g<keep> "),
 )

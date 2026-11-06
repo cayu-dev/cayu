@@ -54,6 +54,7 @@ from cayu.providers.request_controls import (
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.records import EventRecord
 from cayu.tools.policy import ToolPolicyDecision
+from cayu.vaults._credential_shapes import mask_credential_shapes
 
 
 @dataclass(frozen=True)
@@ -1496,15 +1497,7 @@ _SENSITIVE_KEYS = frozenset(
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(api[-_ ]?key|auth(?:orization)?|access[-_ ]?token|refresh[-_ ]?token|"
     r"password|secret|credential)\b(\s*[:=]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
-)
-
-
-_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
-
-
-_SECRET_TOKEN_PATTERN = re.compile(
-    r"\b(?:sk|gh[pousr]|github_pat)_[A-Za-z0-9_-]{8,}\b|\bsk-[A-Za-z0-9_-]{8,}\b"
+    r"(?:\"[^\"]*\"|'[^']*'|\[REDACTED\]|[^\s,;]+)"
 )
 
 
@@ -1542,12 +1535,13 @@ def redact_inspection_value(value: Any, *, key: str | None = None) -> Any:
         return [redact_inspection_value(item) for item in value]
     if isinstance(value, str):
         redacted = _PEM_PRIVATE_KEY_PATTERN.sub("[REDACTED PRIVATE KEY]", value)
-        redacted = _BEARER_PATTERN.sub("Bearer [REDACTED]", redacted)
+        # Shapes first: an Authorization value is masked whole (scheme and
+        # credential), before the assignment pattern sees only its first word.
+        redacted = mask_credential_shapes(redacted, "[REDACTED]")
         redacted = _SECRET_ASSIGNMENT_PATTERN.sub(
             lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
             redacted,
         )
-        redacted = _SECRET_TOKEN_PATTERN.sub("[REDACTED]", redacted)
         return _POSTGRES_PASSWORD_PATTERN.sub(r"\1***\3", redacted)
     return value
 
