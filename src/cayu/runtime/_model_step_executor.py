@@ -391,6 +391,7 @@ from cayu.tools.gateway import (
 from cayu.tools.grants import TargetedToolGrantRecord
 from cayu.tools.targeted_projection import (
     TargetedToolProjectionKind,
+    _projection_marker_message,
     openai_targeted_tool_projection,
     persisted_targeted_tool_projection_marker_message,
     resolve_targeted_tool_projection,
@@ -1283,6 +1284,17 @@ class ModelStepExecutor:
             # the whole transcript once more for nothing.
             detach=False,
         )
+        # Bounded context may discard the acquisition marker while retaining
+        # native calls/results. Restore only the active runtime projection's
+        # marker, before replay, for dispatch, counting and cache preparation.
+        # Existing markers stay in place and duplicates still fail validation.
+        if targeted_tool_native is not None and not any(
+            targeted_tool_projection_marker_id(message) == targeted_tool_native.marker_id
+            for message in model_messages
+        ):
+            _insert_after_system_messages(
+                model_messages, _projection_marker_message(targeted_tool_native.marker_id)
+            )
         discovery_native_tools: tuple[dict[str, Any], ...] = ()
         hosted_discovery_projection: ToolDiscoveryProjectionRequest | None = None
         if tool_discovery_projection_kind is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT:
@@ -6384,18 +6396,20 @@ def _actual_input_tokens_from_completed_event(event: Event) -> int | None:
     return input_tokens
 
 
+def _insert_after_system_messages(messages: list[Message], message: Message) -> None:
+    insert_at = next(
+        (i for i, m in enumerate(messages) if m.role is not MessageRole.SYSTEM), len(messages)
+    )
+    messages.insert(insert_at, message)
+
+
 def _with_structured_output_tool_instruction(
     messages: list[Message],
     spec: StructuredOutputSpec,
 ) -> list[Message]:
     copied_messages = copy_context_messages(messages)
     instruction = Message.text(MessageRole.SYSTEM, structured_output_tool_instruction(spec))
-    insert_at = 0
-    while (
-        insert_at < len(copied_messages) and copied_messages[insert_at].role == MessageRole.SYSTEM
-    ):
-        insert_at += 1
-    copied_messages.insert(insert_at, instruction)
+    _insert_after_system_messages(copied_messages, instruction)
     return copied_messages
 
 
