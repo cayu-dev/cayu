@@ -2911,7 +2911,10 @@ def _mcp_manifest_candidates_for_agent(
     *,
     environment_name: str | None,
 ) -> tuple[_McpManifestCandidate, ...]:
-    grouped: dict[int, tuple[McpToolset, list[runtime_records.RegisteredTool]]] = {}
+    # Explicit sources remain auditable even when they advertise no tools.
+    grouped: dict[int, tuple[McpToolset, list[runtime_records.RegisteredTool]]] = {
+        id(toolset): (toolset, []) for toolset in registered_agent.mcp_toolsets
+    }
     for registered_tool in registered_agent.tools.values():
         tool = registered_tool.tool
         if isinstance(tool, McpToolAdapter):
