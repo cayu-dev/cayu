@@ -88,6 +88,7 @@ from cayu.sessions.records import (
     _validate_status_set,
 )
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
+from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_model_stage as model_stage_ops
 from cayu.storage import _postgres_public_authority as public_authority_ops
 from cayu.storage import _postgres_session_queries as session_queries
@@ -234,9 +235,6 @@ async def publish_runtime(
     _model_completion_stage: _ModelCompletionStagePromotionContext | None = None,
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
-    load_for_update: Callable[[Any, str], Awaitable[Session | None]],
-    load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
-    closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
     checkpoint_row_values: Callable[[str, dict[str, Any], datetime], tuple[object, ...]],
     unique_violation: type[Exception],
@@ -258,32 +256,50 @@ async def publish_runtime(
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                loaded_result = await load_for_update(cur, session_id)
+                # The stage records, the receipt and the closure owners follow
+                # the row lock in its round trip (see `_postgres_locked_reads`).
+                follow_reads = []
+                if _model_completion_stage is not None:
+                    follow_reads.append(
+                        locked_reads.FollowRead(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [
+                                    _model_completion_stage.preparation_storage_key,
+                                    _model_completion_stage.terminal_storage_key,
+                                    _model_completion_stage.active_storage_key,
+                                    _model_completion_stage.winner_storage_key,
+                                ],
+                            ),
+                            lambda rows: {
+                                row[0]: model_stage_ops.decode_stage_record(row[1]) for row in rows
+                            },
+                        )
+                    )
+                follow_reads.append(
+                    locked_reads.FollowRead(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, prepared.storage_key),
+                        lambda rows: rows[0] if rows else None,
+                    )
+                )
+                follow_reads.append(locked_reads.closure_owners((session_id,)))
+                loaded_result, followed = await locked_reads.load_session_then_read(
+                    cur, session_id, " FOR UPDATE", follow_reads
+                )
                 if loaded_result is None:
                     raise KeyError(f"Session not found: {session_id}")
                 loaded = loaded_result
+                receipt_row, owners = followed[-2:]
 
                 locked_stage = None
                 active_record = None
                 winner_record = None
                 if _model_completion_stage is not None:
-                    await cur.execute(
-                        "SELECT idempotency_key, record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
-                        (
-                            session_id,
-                            [
-                                _model_completion_stage.preparation_storage_key,
-                                _model_completion_stage.terminal_storage_key,
-                                _model_completion_stage.active_storage_key,
-                                _model_completion_stage.winner_storage_key,
-                            ],
-                        ),
-                    )
-                    stage_records = {
-                        row[0]: model_stage_ops.decode_stage_record(row[1])
-                        for row in await cur.fetchall()
-                    }
+                    stage_records = followed[0]
                     locked_stage = _reconstruct_model_completion_stage(
                         stage_records.get(_model_completion_stage.preparation_storage_key),
                         stage_records.get(_model_completion_stage.terminal_storage_key),
@@ -311,12 +327,6 @@ async def publish_runtime(
                     active_record = stage_records.get(_model_completion_stage.active_storage_key)
                     winner_record = stage_records.get(_model_completion_stage.winner_storage_key)
 
-                await cur.execute(
-                    "SELECT record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = %s",
-                    (session_id, prepared.storage_key),
-                )
-                receipt_row = await cur.fetchone()
                 if receipt_row is not None:
                     receipt_record = decode_record(receipt_row[0])
                     if locked_stage is not None:
@@ -386,22 +396,104 @@ async def publish_runtime(
                         replayed=True,
                     )
 
-                for owner in await closure_owners(cur, (session_id,)):
+                for owner in owners:
                     _check_closure_lineage_owner(owner, (session_id,))
+
+                # The reads below depend only on the request, so they share one
+                # round trip; each keeps its place in the statement order.
+                appended_event_ids = {event.id for event in request.events}
+                referenced_event_ids = set(
+                    _runtime_publication_referenced_event_ids(request.referenced_events)
+                )
+                tool_round_identity = _tool_lifecycle_publication_identity(request)
+                batch: dict[str, locked_reads.FollowRead] = {}
+                if request.operation_record_mutations:
+                    batch["mutation_records"] = locked_reads.FollowRead(
+                        "SELECT idempotency_key, record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s) FOR UPDATE",
+                        (
+                            session_id,
+                            [mutation.key for mutation in request.operation_record_mutations],
+                        ),
+                        lambda rows: {row[0]: pg_support._json_obj(row[1]) for row in rows},
+                    )
+                if request.argument_continuity is not None:
+                    from cayu.sessions._argument_continuity import STORAGE_KEY, append_record
+
+                    batch["continuity"] = locked_reads.FollowRead(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s FOR UPDATE",
+                        (session_id, STORAGE_KEY),
+                        lambda rows: None if not rows else pg_support._json_obj(rows[0][0]),
+                    )
+                batch["transcript_cursor"] = locked_reads.transcript_cursor(session_id)
+                if referenced_event_ids:
+                    batch["references"] = locked_reads.FollowRead(
+                        "SELECT event_id, event FROM cayu_events "
+                        "WHERE session_id = %s AND event_id = ANY(%s) FOR SHARE",
+                        (session_id, list(referenced_event_ids)),
+                        lambda rows: {
+                            row[0]: Event(**pg_support._json_obj(row[1])) for row in rows
+                        },
+                    )
+                batch["checkpoint"] = locked_reads.checkpoint(session_id)
+                if tool_round_identity is not None:
+                    execution_identity, tool_call_ids = tool_round_identity
+                    lookup_keys = [
+                        pending_action_lookup_key(tool_call_id) for tool_call_id in tool_call_ids
+                    ]
+                    lifecycle_event_types = [
+                        str(event_type)
+                        for event_type in sorted(
+                            _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
+                            key=str,
+                        )
+                    ]
+                    batch["lifecycle_events"] = locked_reads.FollowRead(
+                        "SELECT event_id, event FROM cayu_events "
+                        "WHERE session_id = %s "
+                        "AND pending_action_lookup_key = ANY(%s) "
+                        "AND event_type = ANY(%s) "
+                        f"AND ({session_queries.PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
+                        "AND (event -> 'payload' ->> 'tool_round_id' = %s "
+                        "OR (event -> 'payload' ->> 'model_step_id' = %s "
+                        "AND event -> 'payload' ->> 'model_attempt_id' = %s) "
+                        "OR ((event -> 'payload' ->> 'tool_round_id') "
+                        "~ '^tround_[0-9a-f]{32}$') IS NOT TRUE "
+                        "OR ((event -> 'payload' ->> 'model_step_id') "
+                        "~ '^mstep_[0-9a-f]{32}$') IS NOT TRUE "
+                        "OR ((event -> 'payload' ->> 'model_attempt_id') "
+                        "~ '^matt_[0-9a-f]{32}$') IS NOT TRUE) "
+                        "ORDER BY session_order ASC LIMIT %s FOR SHARE",
+                        (
+                            session_id,
+                            lookup_keys,
+                            lifecycle_event_types,
+                            execution_identity.tool_round_id,
+                            execution_identity.model_step_id,
+                            execution_identity.model_attempt_id,
+                            _tool_round_lifecycle_event_limit(tool_call_ids) + 1,
+                        ),
+                        list,
+                    )
+                if request.events:
+                    batch["existing_events"] = locked_reads.FollowRead(
+                        "SELECT event_id FROM cayu_events "
+                        "WHERE session_id = %s AND event_id = ANY(%s)",
+                        (session_id, [event.id for event in request.events]),
+                        lambda rows: rows[0] if rows else None,
+                    )
+                batched = dict(
+                    zip(
+                        batch,
+                        await locked_reads.read_pipelined(cur, tuple(batch.values())),
+                        strict=True,
+                    )
+                )
 
                 operation_mutation_records: dict[str, dict[str, Any]] = {}
                 if request.operation_record_mutations:
-                    mutation_keys = [
-                        mutation.key for mutation in request.operation_record_mutations
-                    ]
-                    await cur.execute(
-                        "SELECT idempotency_key, record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = ANY(%s) FOR UPDATE",
-                        (session_id, mutation_keys),
-                    )
-                    current_mutation_records = {
-                        row[0]: pg_support._json_obj(row[1]) for row in await cur.fetchall()
-                    }
+                    current_mutation_records = batched["mutation_records"]
                     operation_mutation_records = (
                         _apply_runtime_publication_operation_record_mutations(
                             request.operation_record_mutations,
@@ -410,16 +502,8 @@ async def publish_runtime(
                     )
 
                 if request.argument_continuity is not None:
-                    from cayu.sessions._argument_continuity import STORAGE_KEY, append_record
-
-                    await cur.execute(
-                        "SELECT record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = %s FOR UPDATE",
-                        (session_id, STORAGE_KEY),
-                    )
-                    private_row = await cur.fetchone()
                     operation_mutation_records[STORAGE_KEY] = append_record(
-                        None if private_row is None else pg_support._json_obj(private_row[0]),
+                        batched["continuity"],
                         continuity=request.argument_continuity,
                         request_digest=prepared.request_digest,
                         session=loaded,
@@ -469,7 +553,7 @@ async def publish_runtime(
                         "Session source run epoch is stale: expected "
                         f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
                     )
-                transcript_start_cursor = await transcript_ops.transcript_cursor(cur, session_id)
+                transcript_start_cursor = batched["transcript_cursor"]
                 if (
                     prepared.expected_transcript_cursor is not None
                     and transcript_start_cursor != prepared.expected_transcript_cursor
@@ -480,29 +564,15 @@ async def publish_runtime(
                         f"current {transcript_start_cursor}."
                     )
 
-                appended_event_ids = {event.id for event in request.events}
-                referenced_event_ids = set(
-                    _runtime_publication_referenced_event_ids(request.referenced_events)
-                )
                 if appended_event_ids & referenced_event_ids:
                     raise ValueError("Appended and referenced runtime publication events overlap.")
-                durable_references: dict[str, Event] = {}
-                if referenced_event_ids:
-                    await cur.execute(
-                        "SELECT event_id, event FROM cayu_events "
-                        "WHERE session_id = %s AND event_id = ANY(%s) FOR SHARE",
-                        (session_id, list(referenced_event_ids)),
-                    )
-                    durable_references = {
-                        row[0]: Event(**pg_support._json_obj(row[1]))
-                        for row in await cur.fetchall()
-                    }
+                durable_references: dict[str, Event] = batched.get("references", {})
                 _validate_runtime_publication_event_references(
                     request.referenced_events,
                     durable_references,
                     interaction_id=request.interaction_id,
                 )
-                stored_checkpoint = await load_checkpoint(cur, session_id)
+                stored_checkpoint = batched["checkpoint"]
                 current_checkpoint = (
                     stored_checkpoint
                     if checkpoint_decode is None
@@ -521,46 +591,9 @@ async def publish_runtime(
                     current_checkpoint,
                 )
                 durable_tool_events: list[Event] = []
-                tool_round_identity = _tool_lifecycle_publication_identity(request)
                 if tool_round_identity is not None:
-                    execution_identity, tool_call_ids = tool_round_identity
-                    lookup_keys = [
-                        pending_action_lookup_key(tool_call_id) for tool_call_id in tool_call_ids
-                    ]
-                    lifecycle_event_types = [
-                        str(event_type)
-                        for event_type in sorted(
-                            _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
-                            key=str,
-                        )
-                    ]
-                    await cur.execute(
-                        "SELECT event_id, event FROM cayu_events "
-                        "WHERE session_id = %s "
-                        "AND pending_action_lookup_key = ANY(%s) "
-                        "AND event_type = ANY(%s) "
-                        f"AND ({session_queries.PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL}) "
-                        "AND (event -> 'payload' ->> 'tool_round_id' = %s "
-                        "OR (event -> 'payload' ->> 'model_step_id' = %s "
-                        "AND event -> 'payload' ->> 'model_attempt_id' = %s) "
-                        "OR ((event -> 'payload' ->> 'tool_round_id') "
-                        "~ '^tround_[0-9a-f]{32}$') IS NOT TRUE "
-                        "OR ((event -> 'payload' ->> 'model_step_id') "
-                        "~ '^mstep_[0-9a-f]{32}$') IS NOT TRUE "
-                        "OR ((event -> 'payload' ->> 'model_attempt_id') "
-                        "~ '^matt_[0-9a-f]{32}$') IS NOT TRUE) "
-                        "ORDER BY session_order ASC LIMIT %s FOR SHARE",
-                        (
-                            session_id,
-                            lookup_keys,
-                            lifecycle_event_types,
-                            execution_identity.tool_round_id,
-                            execution_identity.model_step_id,
-                            execution_identity.model_attempt_id,
-                            _tool_round_lifecycle_event_limit(tool_call_ids) + 1,
-                        ),
-                    )
-                    rows = await cur.fetchall()
+                    _, tool_call_ids = tool_round_identity
+                    rows = batched["lifecycle_events"]
                     if len(rows) > _tool_round_lifecycle_event_limit(tool_call_ids):
                         raise ValueError(
                             "Tool-round lifecycle evidence exceeds the publication limit."
@@ -572,12 +605,7 @@ async def publish_runtime(
                     durable_tool_events=durable_tool_events,
                 )
                 if request.events:
-                    await cur.execute(
-                        "SELECT event_id FROM cayu_events "
-                        "WHERE session_id = %s AND event_id = ANY(%s)",
-                        (session_id, [event.id for event in request.events]),
-                    )
-                    existing_event_row = await cur.fetchone()
+                    existing_event_row = batched["existing_events"]
                     if existing_event_row is not None:
                         raise ValueError(
                             f"Event already exists for session {session_id}: "
@@ -887,7 +915,6 @@ async def publish_checkpoint_events(
     unique_violation: type[Exception],
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
-    load_for_update: Callable[[Any, str], Awaitable[Session | None]],
     load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
     store_now: Callable[[Any], Awaitable[datetime]],
     closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
@@ -936,12 +963,31 @@ async def publish_checkpoint_events(
                         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (f"context-view-session:{session_id}",),
                     )
-                loaded = await load_for_update(cur, session_id)
+                operation_read = (
+                    operation_transform is not None or store_time_operation_transform is not None
+                )
+                # With no compaction to validate between them, the checkpoint
+                # and operation-record reads join the lock's round trip too.
+                follow_reads = [
+                    locked_reads.store_now(),
+                    locked_reads.closure_owners((session_id,)),
+                    locked_reads.transcript_cursor(session_id),
+                ]
+                if context_view_compaction_cursor is None:
+                    follow_reads.append(locked_reads.checkpoint(session_id))
+                    if operation_read:
+                        assert operation_idempotency_key is not None
+                        follow_reads.append(
+                            locked_reads.operation_record(session_id, operation_idempotency_key)
+                        )
+                loaded, followed = await locked_reads.load_session_then_read(
+                    cur, session_id, " FOR UPDATE", follow_reads
+                )
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
-                updated_at = await store_now(cur)
+                updated_at, owners, current_cursor = followed[:3]
                 _assert_session_run_epoch(session_id, loaded)
-                for owner in await closure_owners(cur, (session_id,)):
+                for owner in owners:
                     _check_closure_lineage_owner(owner, (session_id,))
                 if allowed_statuses is not None and loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
@@ -953,7 +999,6 @@ async def publish_checkpoint_events(
                         f"Session source run epoch is stale: expected {expected_run_epoch}, "
                         f"current {loaded.run_epoch}."
                     )
-                current_cursor = await transcript_ops.transcript_cursor(cur, session_id)
                 if (
                     expected_transcript_cursor is not None
                     and current_cursor != expected_transcript_cursor
@@ -964,23 +1009,24 @@ async def publish_checkpoint_events(
                     )
                 if context_view_compaction_cursor is not None:
                     await validate_compaction(cur, session_id, context_view_compaction_cursor)
-                current_checkpoint = await load_checkpoint(cur, session_id)
+                    current_checkpoint = await load_checkpoint(cur, session_id)
+                else:
+                    current_checkpoint = followed[3]
                 callback_checkpoint = _copy_checkpoint_for_transform(
                     current_checkpoint,
                     session_id=session_id,
                 )
                 operation_records: dict[str, dict[str, Any]] = {}
                 model_completion_stage_release = None
-                if operation_transform is not None or store_time_operation_transform is not None:
-                    await cur.execute(
-                        "SELECT record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = %s",
-                        (session_id, operation_idempotency_key),
-                    )
-                    operation_row = await cur.fetchone()
-                    current_operation = (
-                        None if operation_row is None else pg_support._json_obj(operation_row[0])
-                    )
+                if operation_read:
+                    if context_view_compaction_cursor is None:
+                        current_operation = followed[4]
+                    else:
+                        assert operation_idempotency_key is not None
+                        (current_operation,) = await locked_reads.read_pipelined(
+                            cur,
+                            (locked_reads.operation_record(session_id, operation_idempotency_key),),
+                        )
                     if operation_transform is not None:
                         publication = operation_transform(
                             loaded,

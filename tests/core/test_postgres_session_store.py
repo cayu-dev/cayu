@@ -1107,6 +1107,78 @@ def test_postgres_stale_alias_keyring_fails_pipelined_reads_and_rolls_back_write
     asyncio.run(runner())
 
 
+@pytest.mark.parametrize("write", ["transform_checkpoint", "append_events", "operation"])
+def test_postgres_reads_pipelined_with_the_session_lock_run_after_the_lock_wait(
+    postgres_dsn: str, write: str
+) -> None:
+    """A write's clock and checkpoint reads share the lock's round trip, but not its wait."""
+
+    import psycopg
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id="session", messages=[]),
+                identity=_identity(),
+            )
+            await store.transform_checkpoint("session", lambda _session, _current: {"n": 0})
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as holder:
+                await holder.execute(
+                    "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE", ("session",)
+                )
+                await holder.execute(
+                    "UPDATE cayu_checkpoints SET state = %s WHERE session_id = %s",
+                    (json.dumps({"n": 1}), "session"),
+                )
+                if write == "transform_checkpoint":
+                    blocked = asyncio.create_task(
+                        store.transform_checkpoint(
+                            "session", lambda _session, current: {"n": current["n"] + 1}
+                        )
+                    )
+                elif write == "append_events":
+                    blocked = asyncio.create_task(
+                        store.append_events(
+                            "session",
+                            [Event(id="late", type=EventType.TURN_COMPLETED, session_id="session")],
+                        )
+                    )
+                else:
+                    blocked = asyncio.create_task(
+                        store.publish_session_operation(
+                            "session",
+                            idempotency_key="test:pipelined-reads",
+                            operation_transform=lambda _session, current, _record: (
+                                SessionOperationPublication(
+                                    checkpoint={"n": current["n"] + 1},
+                                    operation_records={"test:pipelined-reads": {"seen": 1}},
+                                )
+                            ),
+                            events=[],
+                        )
+                    )
+                await asyncio.sleep(0.3)
+                assert not blocked.done()
+                cur = await holder.execute("SELECT clock_timestamp()")
+                (released_at,) = await cur.fetchone()
+                await holder.commit()
+                await blocked
+            state = await store.load_state("session")
+            assert state is not None
+            # The clock was read after the lock was granted, not when it was requested.
+            assert state.last_activity_at >= released_at
+            checkpoint = await store.load_checkpoint("session")
+            assert checkpoint is not None
+            # The checkpoint was read after the lock holder committed its change.
+            assert checkpoint["n"] == (1 if write == "append_events" else 2)
+        finally:
+            await store.close()
+
+    asyncio.run(runner())
+
+
 def test_postgres_alias_checked_connection_defers_transaction_settings_and_named_cursors(
     postgres_dsn: str,
 ) -> None:

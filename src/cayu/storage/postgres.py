@@ -54,6 +54,7 @@ from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_context_views as context_view_ops
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
 from cayu.storage import _postgres_event_publication as event_publication_ops
+from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_memory_evidence as memory_evidence_ops
 from cayu.storage import _postgres_model_stage as model_stage_ops
 from cayu.storage import _postgres_page_reads as page_read_ops
@@ -72,7 +73,6 @@ from cayu.storage._context_selection_fence import PostgresContextSelectionFenceM
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
-from cayu.storage._phase_timing import timed_postgres_connection
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
@@ -436,41 +436,14 @@ from cayu.tools.grants import (
 
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 134
 
-_SESSION_LABELS_QUERY = """
-    SELECT key, value
-    FROM cayu_session_labels
-    WHERE session_id = %s
-    ORDER BY key ASC
-"""
+_SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
 
 async def _load_session_with_labels(cur: Any, session_id: str, lock: str) -> Session | None:
-    """The session row and its labels in one round trip.
+    """The session row and its labels in one round trip (see `_postgres_locked_reads`)."""
 
-    The two reads are pipelined, so the server still runs them one after the
-    other: the labels read starts after the row read has taken its lock and
-    reads with a snapshot of its own, as two separate round trips did.
-    """
-
-    labels = timed_postgres_connection(cur.connection).cursor()
-    async with labels:
-        await alias_checks.execute_pipelined(
-            (
-                (
-                    cur,
-                    f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s{lock}",
-                    (session_id,),
-                ),
-                (labels, _SESSION_LABELS_QUERY, (session_id,)),
-            )
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        return pg_support.session_from_row(
-            row,
-            labels={label[0]: label[1] for label in await labels.fetchall()},
-        )
+    session, _ = await locked_reads.load_session_then_read(cur, session_id, lock)
+    return session
 
 
 def _targeted_tool_grant_from_postgres(value: object) -> TargetedToolGrantRecord:
@@ -788,10 +761,7 @@ class PostgresSessionStore(
     @staticmethod
     async def _session_store_now(cur: Any) -> datetime:
         await cur.execute("SELECT clock_timestamp()")
-        row = await cur.fetchone()
-        if row is None or type(row[0]) is not datetime:
-            raise RuntimeError("Postgres did not return authoritative session-store time.")
-        return pg_support.to_utc(row[0])
+        return locked_reads.decode_store_now(await cur.fetchone())
 
     async def register_public_authority_alias(
         self,
@@ -1961,15 +1931,9 @@ class PostgresSessionStore(
     async def _closure_lineage_owners(
         self, cur: Any, targets: Iterable[str]
     ) -> tuple[dict[str, Any], ...]:
-        targets = list(targets)
-        await cur.execute(
-            "SELECT progress_json FROM cayu_session_closure_progress AS p "
-            "WHERE root_session_id = ANY(%s) OR EXISTS "
-            "(SELECT 1 FROM jsonb_array_elements(p.progress_json->'descendants') AS child "
-            "WHERE child->>'session_id' = ANY(%s))",
-            (targets, targets),
-        )
-        return tuple(dict(row[0]) for row in await cur.fetchall())
+        read = locked_reads.closure_owners(targets)
+        await cur.execute(read.query, read.parameters)
+        return locked_reads.decode_closure_owners(await cur.fetchall())
 
     async def claim_session_closure_progress(
         self, progress: dict[str, Any], *, finished_only: bool = False
@@ -4819,20 +4783,34 @@ class PostgresSessionStore(
         events: Sequence[Event],
         *,
         expected_run_epoch: int | None,
+        locked_at: datetime | None = None,
     ) -> None:
-        """Append events and their delivery outbox rows in the caller's transaction."""
+        """Append events and their delivery outbox rows in the caller's transaction.
 
-        # Serialize with every competing session writer before sampling the
-        # liveness timestamp. Sampling database time before this row lock can
-        # backdate activity by the duration of a blocked write and let recovery
-        # steal a run earlier than the configured inactivity duration.
-        await cur.execute(
-            "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
-            (session_id,),
-        )
-        if await cur.fetchone() is None:
-            raise KeyError(f"Session not found: {session_id}")
-        activity_at = await self._session_store_now(cur)
+        ``locked_at`` is store time the caller read after it locked the session
+        row in this transaction; the row is then not locked again.
+        """
+
+        if locked_at is None:
+            # Serialize with every competing session writer before sampling the
+            # liveness timestamp. Sampling database time before this row lock can
+            # backdate activity by the duration of a blocked write and let recovery
+            # steal a run earlier than the configured inactivity duration.
+            locked, activity_at = await locked_reads.read_pipelined(
+                cur,
+                (
+                    locked_reads.FollowRead(
+                        "SELECT 1 FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (session_id,),
+                        bool,
+                    ),
+                    locked_reads.store_now(),
+                ),
+            )
+            if not locked:
+                raise KeyError(f"Session not found: {session_id}")
+        else:
+            activity_at = locked_at
         if expected_run_epoch is None:
             await cur.execute(
                 "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
@@ -4998,8 +4976,7 @@ class PostgresSessionStore(
             session_id,
             events,
             ensure_ready=self._ensure_aliases_reconciled,
-            load_session=self._load_for_update,
-            closure_owners=self._closure_lineage_owners,
+            lock_session_then_read=self._load_for_update_then_read,
             append_events=self._append_events_with_cursor,
             first_existing_event_id=self._first_existing_event_id,
             unique_violation=UniqueViolation,
@@ -5018,8 +4995,7 @@ class PostgresSessionStore(
             session_id,
             [event],
             ensure_ready=self._ensure_aliases_reconciled,
-            load_session=self._load_for_update,
-            closure_owners=self._closure_lineage_owners,
+            lock_session_then_read=self._load_for_update_then_read,
             append_events=self._append_events_with_cursor,
             first_existing_event_id=self._first_existing_event_id,
             unique_violation=UniqueViolation,
@@ -5460,8 +5436,7 @@ class PostgresSessionStore(
             session_id,
             preparation_storage_key,
             terminal_storage_key,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            read_cursor=self._checked_read_cursor,
         )
 
     async def _load_model_completion_stage_settlement_record(
@@ -5472,8 +5447,7 @@ class PostgresSessionStore(
         return await model_stage_ops.load_settlement_record(
             session_id,
             settlement_storage_key,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            read_cursor=self._checked_read_cursor,
         )
 
     async def _load_model_completion_stage_dispatch_record(
@@ -5484,8 +5458,7 @@ class PostgresSessionStore(
         return await model_stage_ops.load_dispatch_record(
             session_id,
             dispatch_storage_key,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            read_cursor=self._checked_read_cursor,
         )
 
     async def _load_active_model_completion_stage_records(
@@ -5510,8 +5483,6 @@ class PostgresSessionStore(
             connect=self._checked_connection,
             ensure_ready=self._ensure_aliases_reconciled,
             load_session=self._load,
-            load_for_update=self._load_for_update,
-            load_checkpoint=self._load_checkpoint,
         )
 
     async def _prepare_model_completion_stage_atomic(
@@ -5522,7 +5493,6 @@ class PostgresSessionStore(
             prepared,
             connect=self._checked_connection,
             ensure_ready=self._ensure_aliases_reconciled,
-            load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             append_events=self._append_events_with_cursor,
             reject_steering=self._reject_new_work_after_steering,
@@ -5537,7 +5507,6 @@ class PostgresSessionStore(
             prepared,
             connect=self._checked_connection,
             ensure_ready=self._ensure_aliases_reconciled,
-            load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             store_now=self._session_store_now,
         )
@@ -5583,9 +5552,6 @@ class PostgresSessionStore(
             _model_completion_stage=_model_completion_stage,
             connect=self._checked_connection,
             ensure_ready=self._ensure_aliases_reconciled,
-            load_for_update=self._load_for_update,
-            load_checkpoint=self._load_checkpoint,
-            closure_owners=self._closure_lineage_owners,
             public_authority_alias_codec=self.public_authority_alias_codec,
             checkpoint_row_values=_checkpoint_row_values,
             unique_violation=UniqueViolation,
@@ -5775,7 +5741,6 @@ class PostgresSessionStore(
             unique_violation=UniqueViolation,
             connect=self._checked_connection,
             ensure_ready=self._ensure_aliases_reconciled,
-            load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             store_now=self._session_store_now,
             closure_owners=self._closure_lineage_owners,
@@ -7695,14 +7660,18 @@ class PostgresSessionStore(
         async with self._ready_connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    session = await self._load_for_update(cur, session_id)
+                    session, (updated_at, owners, current) = await self._load_for_update_then_read(
+                        cur,
+                        session_id,
+                        locked_reads.store_now(),
+                        locked_reads.closure_owners((session_id,)),
+                        locked_reads.checkpoint(session_id),
+                    )
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
-                    updated_at = await self._session_store_now(cur)
                     _assert_session_run_epoch(session_id, session)
-                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                    for owner in owners:
                         _check_closure_lineage_owner(owner, (session_id,))
-                    current = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
                         session,
                         _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -7734,14 +7703,18 @@ class PostgresSessionStore(
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    session = await self._load_for_update(cur, session_id)
+                    session, (owners, current, now) = await self._load_for_update_then_read(
+                        cur,
+                        session_id,
+                        locked_reads.closure_owners((session_id,)),
+                        locked_reads.checkpoint(session_id),
+                        locked_reads.store_now(),
+                    )
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch(session_id, session)
-                    for owner in await self._closure_lineage_owners(cur, (session_id,)):
+                    for owner in owners:
                         _check_closure_lineage_owner(owner, (session_id,))
-                    current = await self._load_checkpoint(cur, session_id)
-                    now = await self._session_store_now(cur)
                     transformed = checkpoint_transform(
                         session,
                         _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -7891,6 +7864,13 @@ class PostgresSessionStore(
     async def _load_for_update(self, cur: Any, session_id: str) -> Session | None:
         return await _load_session_with_labels(cur, session_id, " FOR UPDATE")
 
+    async def _load_for_update_then_read(
+        self, cur: Any, session_id: str, *reads: locked_reads.FollowRead
+    ) -> tuple[Session | None, tuple[Any, ...]]:
+        """Lock and load the session, then run ``reads``, in one round trip."""
+
+        return await locked_reads.load_session_then_read(cur, session_id, " FOR UPDATE", reads)
+
     async def _load_for_key_share(self, cur: Any, session_id: str) -> Session | None:
         """Load immutable parent identity while preventing delete or key replacement."""
 
@@ -7925,14 +7905,9 @@ class PostgresSessionStore(
             )
 
     async def _load_checkpoint(self, cur: Any, session_id: str) -> dict[str, Any] | None:
-        await cur.execute(
-            "SELECT state FROM cayu_checkpoints WHERE session_id = %s",
-            (session_id,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        return copy_durable_json_object(pg_support._json_obj(row[0]), "checkpoint")
+        read = locked_reads.checkpoint(session_id)
+        await cur.execute(read.query, read.parameters)
+        return locked_reads.decode_checkpoint(await cur.fetchall())
 
     async def _upsert_checkpoint(
         self,

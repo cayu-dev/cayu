@@ -32,6 +32,7 @@ from cayu.sessions.mcp_manifest_history import (
 )
 from cayu.sessions.records import Session
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
+from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._postgres_transcript import PostgresConnection
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
@@ -42,8 +43,20 @@ if TYPE_CHECKING:
 
 class EventWriter(Protocol):
     def __call__(
-        self, cur: Any, session_id: str, events: Sequence[Event], *, expected_run_epoch: int | None
+        self,
+        cur: Any,
+        session_id: str,
+        events: Sequence[Event],
+        *,
+        expected_run_epoch: int | None,
+        locked_at: datetime | None = None,
     ) -> Awaitable[None]: ...
+
+
+class LockedSessionReader(Protocol):
+    def __call__(
+        self, cur: Any, session_id: str, *reads: locked_reads.FollowRead
+    ) -> Awaitable[tuple[Session | None, tuple[Any, ...]]]: ...
 
 
 class EventRowInserter(Protocol):
@@ -143,8 +156,7 @@ async def append_events(
     events: list[Event],
     *,
     ensure_ready: Callable[[], Awaitable[None]],
-    load_session: Callable[[Any, str], Awaitable[Session | None]],
-    closure_owners: Callable[[Any, Iterable[str]], Awaitable[tuple[dict[str, Any], ...]]],
+    lock_session_then_read: LockedSessionReader,
     append_events: EventWriter,
     first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     unique_violation: type[UniqueViolation],
@@ -175,19 +187,28 @@ async def append_events(
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                loaded = await load_session(cur, session_id)
+                # The closure owners and the store time follow the row lock in
+                # its round trip, so the writer need not lock and read the
+                # clock again.
+                loaded, (owners, locked_at) = await lock_session_then_read(
+                    cur,
+                    session_id,
+                    locked_reads.closure_owners((session_id,)),
+                    locked_reads.store_now(),
+                )
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if not copied_events:
                     _assert_session_run_epoch(session_id, loaded)
                     return None
-                for owner in await closure_owners(cur, (session_id,)):
+                for owner in owners:
                     _check_closure_lineage_owner(owner, (session_id,))
                 await append_events(
                     cur,
                     session_id,
                     copied_events,
                     expected_run_epoch=expected_run_epoch,
+                    locked_at=locked_at,
                 )
                 if claim_lease_seconds is not None:
                     claim = await event_delivery_ops.claim_appended_event_side_effect(

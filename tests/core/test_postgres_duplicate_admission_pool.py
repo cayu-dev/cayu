@@ -123,6 +123,16 @@ def test_duplicate_event_reuses_rolled_back_connection(monkeypatch, capacity, pu
             "_load_for_update",
             AsyncMock(side_effect=lambda _cur, session_id: sessions[session_id]),
         )
+        monkeypatch.setattr(
+            store,
+            "_load_for_update_then_read",
+            AsyncMock(
+                side_effect=lambda _cur, session_id, *_reads: (
+                    sessions[session_id],
+                    ((), datetime.now(UTC)),
+                )
+            ),
+        )
         monkeypatch.setattr(store, "_require_external_wait_admission", AsyncMock())
 
         async def admit(session):

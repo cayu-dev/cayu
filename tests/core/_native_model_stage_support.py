@@ -378,6 +378,13 @@ async def postgres_composition(postgres_dsn, error):
     async def ensure_ready():
         assert active is None
 
+    @asynccontextmanager
+    async def read_cursor():
+        async with connect() as conn:
+            await conn.set_autocommit(True)
+            async with conn.cursor() as cur:
+                yield cur
+
     async def snapshot():
         results = []
         async with connect() as conn, conn.cursor() as cur:
@@ -405,6 +412,7 @@ async def postgres_composition(postgres_dsn, error):
         dict(
             connect=connect,
             ensure_ready=ensure_ready,
+            read_cursor=read_cursor,
             load_session=partial(PostgresSessionStore._load, readers),
             load_for_update=partial(PostgresSessionStore._load_for_update, readers),
             load_checkpoint=readers._load_checkpoint,

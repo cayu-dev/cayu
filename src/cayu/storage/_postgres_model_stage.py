@@ -7,6 +7,7 @@ SessionStore protocol hooks compose these operations with native collaborators.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -83,6 +84,7 @@ from cayu.sessions._runtime_publication_rules import (
 )
 from cayu.sessions.authority import SessionRunFenced, _runtime_publication_json_equal
 from cayu.sessions.records import Session, SessionStatusConflict
+from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage._postgres_session_messages import EventAppender, SteeringGuard
@@ -106,16 +108,25 @@ def decode_stage_record(value: Any) -> dict[str, Any]:
     return value
 
 
+def _stage_records_read(session_id: str, keys: list[str]) -> locked_reads.FollowRead:
+    return locked_reads.FollowRead(
+        "SELECT idempotency_key, record FROM cayu_session_operations "
+        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+        (session_id, keys),
+        lambda rows: {row[0]: decode_stage_record(row[1]) for row in rows},
+    )
+
+
 async def load_stage_records(
     session_id: str,
     preparation_storage_key: str,
     terminal_storage_key: str,
     *,
-    connect: PostgresConnection,
-    ensure_ready: Callable[[], Awaitable[None]],
+    read_cursor: Callable[[], AbstractAsyncContextManager[Any]],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    await ensure_ready()
-    async with connect() as conn, conn.cursor() as cur:
+    # Autocommit reads, each checked as `_ensure_ready` checks (see
+    # `PostgresSessionStore._checked_read_cursor`).
+    async with read_cursor() as cur:
         await cur.execute(
             "SELECT idempotency_key, record FROM cayu_session_operations "
             "WHERE session_id = %s AND idempotency_key = ANY(%s)",
@@ -134,11 +145,11 @@ async def load_settlement_record(
     session_id: str,
     settlement_storage_key: str,
     *,
-    connect: PostgresConnection,
-    ensure_ready: Callable[[], Awaitable[None]],
+    read_cursor: Callable[[], AbstractAsyncContextManager[Any]],
 ) -> dict[str, Any] | None:
-    await ensure_ready()
-    async with connect() as conn, conn.cursor() as cur:
+    # Autocommit reads, each checked as `_ensure_ready` checks (see
+    # `PostgresSessionStore._checked_read_cursor`).
+    async with read_cursor() as cur:
         await cur.execute(
             "SELECT record FROM cayu_session_operations "
             "WHERE session_id = %s AND idempotency_key = %s",
@@ -157,11 +168,11 @@ async def load_dispatch_record(
     session_id: str,
     dispatch_storage_key: str,
     *,
-    connect: PostgresConnection,
-    ensure_ready: Callable[[], Awaitable[None]],
+    read_cursor: Callable[[], AbstractAsyncContextManager[Any]],
 ) -> dict[str, Any] | None:
-    await ensure_ready()
-    async with connect() as conn, conn.cursor() as cur:
+    # Autocommit reads, each checked as `_ensure_ready` checks (see
+    # `PostgresSessionStore._checked_read_cursor`).
+    async with read_cursor() as cur:
         await cur.execute(
             "SELECT record FROM cayu_session_operations "
             "WHERE session_id = %s AND idempotency_key = %s",
@@ -228,8 +239,6 @@ async def mark_dispatched(
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
     load_session: Callable[[Any, str], Awaitable[Session | None]],
-    load_for_update: Callable[[Any, str], Awaitable[Session | None]],
-    load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
 ) -> ModelCompletionStageDispatch:
     _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
         session_id,
@@ -241,30 +250,34 @@ async def mark_dispatched(
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                loaded = await load_for_update(cur, session_id)
-                if loaded is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                await cur.execute(
-                    "SELECT idempotency_key, record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                (
+                    loaded,
+                    (records, checkpoint, transcript_cursor),
+                ) = await locked_reads.load_session_then_read(
+                    cur,
+                    session_id,
+                    " FOR UPDATE",
                     (
-                        session_id,
-                        [
-                            MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
-                            preparation_key,
-                            terminal_key,
-                            settlement_key,
-                            dispatch_key,
-                        ],
+                        _stage_records_read(
+                            session_id,
+                            [
+                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                                preparation_key,
+                                terminal_key,
+                                settlement_key,
+                                dispatch_key,
+                            ],
+                        ),
+                        locked_reads.checkpoint(session_id),
+                        locked_reads.transcript_cursor(session_id),
                     ),
                 )
-                records = {row[0]: decode_stage_record(row[1]) for row in await cur.fetchall()}
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
                 _validate_model_completion_stage_for_dispatch(
                     session=loaded,
-                    checkpoint=await load_checkpoint(cur, session_id),
-                    current_transcript_cursor=await transcript_ops.transcript_cursor(
-                        cur, session_id
-                    ),
+                    checkpoint=checkpoint,
+                    current_transcript_cursor=transcript_cursor,
                     stage=stage,
                     active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
                     preparation_record=records.get(preparation_key),
@@ -397,7 +410,6 @@ async def prepare(
     *,
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
-    load_for_update: Callable[[Any, str], Awaitable[Session | None]],
     load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
     append_events: EventAppender,
     reject_steering: SteeringGuard,
@@ -408,23 +420,48 @@ async def prepare(
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                loaded = await load_for_update(cur, session_id)
-                if loaded is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                await cur.execute(
-                    "SELECT idempotency_key, record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                # The stage, active-marker and publication-key reads follow the
+                # row lock in its round trip; the active stage's own records
+                # depend on the marker, so they keep a round trip of their own.
+                (
+                    loaded,
+                    (records, active_row, publication_keys),
+                ) = await locked_reads.load_session_then_read(
+                    cur,
+                    session_id,
+                    " FOR UPDATE",
                     (
-                        session_id,
-                        [
-                            prepared.preparation_storage_key,
-                            prepared.terminal_storage_key,
-                            prepared.abandonment_storage_key,
-                            *_model_failover_predecessor_storage_keys(prepared),
-                        ],
+                        _stage_records_read(
+                            session_id,
+                            [
+                                prepared.preparation_storage_key,
+                                prepared.terminal_storage_key,
+                                prepared.abandonment_storage_key,
+                                *_model_failover_predecessor_storage_keys(prepared),
+                            ],
+                        ),
+                        locked_reads.FollowRead(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                            lambda rows: rows[0] if rows else None,
+                        ),
+                        locked_reads.FollowRead(
+                            "SELECT idempotency_key FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (
+                                session_id,
+                                [
+                                    prepared.winner_storage_key,
+                                    prepared.publication_storage_key,
+                                ],
+                            ),
+                            lambda rows: {row[0] for row in rows},
+                        ),
                     ),
                 )
-                records = {row[0]: decode_stage_record(row[1]) for row in await cur.fetchall()}
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
                 stage = _reconstruct_model_completion_stage(
                     records.get(prepared.preparation_storage_key),
                     records.get(prepared.terminal_storage_key),
@@ -441,12 +478,6 @@ async def prepare(
                 if stage is not None:
                     _validate_model_completion_stage_preparation_replay(stage, prepared)
 
-                await cur.execute(
-                    "SELECT record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = %s",
-                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                )
-                active_row = await cur.fetchone()
                 active = None
                 if active_row is not None:
                     active_record = decode_stage_record(active_row[0])
@@ -477,18 +508,6 @@ async def prepare(
                         active_records.get(active_terminal_key),
                         session_id=session_id,
                     )
-                await cur.execute(
-                    "SELECT idempotency_key FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = ANY(%s)",
-                    (
-                        session_id,
-                        [
-                            prepared.winner_storage_key,
-                            prepared.publication_storage_key,
-                        ],
-                    ),
-                )
-                publication_keys = {row[0] for row in await cur.fetchall()}
                 winner_exists = prepared.winner_storage_key in publication_keys
                 receipt_exists = prepared.publication_storage_key in publication_keys
                 if stage is not None:
@@ -689,7 +708,6 @@ async def complete(
     *,
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
-    load_for_update: Callable[[Any, str], Awaitable[Session | None]],
     load_checkpoint: Callable[[Any, str], Awaitable[dict[str, Any] | None]],
     store_now: Callable[[Any], Awaitable[datetime]],
 ) -> ModelCompletionStageResult:
@@ -698,22 +716,31 @@ async def complete(
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
-                loaded = await load_for_update(cur, session_id)
-                if loaded is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                await cur.execute(
-                    "SELECT idempotency_key, record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                # The active marker is read here, with the stage records, and
+                # used below: nothing in between writes it.
+                loaded, (records, active_row) = await locked_reads.load_session_then_read(
+                    cur,
+                    session_id,
+                    " FOR UPDATE",
                     (
-                        session_id,
-                        [
-                            prepared.preparation_storage_key,
-                            prepared.terminal_storage_key,
-                            prepared.settlement_storage_key,
-                        ],
+                        _stage_records_read(
+                            session_id,
+                            [
+                                prepared.preparation_storage_key,
+                                prepared.terminal_storage_key,
+                                prepared.settlement_storage_key,
+                            ],
+                        ),
+                        locked_reads.FollowRead(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                            lambda rows: rows[0] if rows else None,
+                        ),
                     ),
                 )
-                records = {row[0]: decode_stage_record(row[1]) for row in await cur.fetchall()}
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
                 stage = _reconstruct_model_completion_stage(
                     records.get(prepared.preparation_storage_key),
                     records.get(prepared.terminal_storage_key),
@@ -739,12 +766,6 @@ async def complete(
                         dispatch_authorized=False,
                     )
                 if prepared.recovery_fence is not None:
-                    await cur.execute(
-                        "SELECT record FROM cayu_session_operations "
-                        "WHERE session_id = %s AND idempotency_key = %s",
-                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                    )
-                    active_row = await cur.fetchone()
                     await cur.execute(
                         "SELECT record FROM cayu_session_operations "
                         "WHERE session_id = %s AND idempotency_key = %s",
@@ -794,12 +815,6 @@ async def complete(
                     terminal_storage_key=prepared.terminal_storage_key,
                 )
                 assert completed_stage is not None
-                await cur.execute(
-                    "SELECT record FROM cayu_session_operations "
-                    "WHERE session_id = %s AND idempotency_key = %s",
-                    (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
-                )
-                active_row = await cur.fetchone()
                 active_record = None if active_row is None else decode_stage_record(active_row[0])
                 advances_last_activity = _model_completion_terminal_advances_last_activity(
                     active_record,

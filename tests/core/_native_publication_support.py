@@ -278,7 +278,7 @@ async def postgres_publication(postgres_dsn, error):
 
     async with postgres_composition(postgres_dsn, error) as (stages, session, fault, clean, _):
         caps = dict(stages.prepare.keywords)
-        readers = caps["load_for_update"].args[0]
+        readers = caps["load_checkpoint"].args[0]
         readers._connection = caps["connect"]
         readers._load = partial(adapter.PostgresSessionStore._load, readers)
         caps.update(
