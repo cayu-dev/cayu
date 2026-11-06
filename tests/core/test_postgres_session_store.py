@@ -1010,8 +1010,9 @@ def test_postgres_alias_configuration_check_runs_outside_a_transaction(
                 identity=_identity(),
             )
             assert await store.load("session") is not None
-            # Each check was one autocommit statement that left no transaction open.
-            assert len(observed) >= 2
+            # Each standalone check was one autocommit statement that left no
+            # transaction open. (load pipelines its check with the read instead.)
+            assert observed
             assert set(observed) == {(True, 0)}
             async with store._pool.connection() as conn:
                 assert conn.autocommit is False
@@ -1028,6 +1029,188 @@ def test_postgres_alias_configuration_check_runs_outside_a_transaction(
             async with store._pool.connection() as conn:
                 assert conn.autocommit is False
             assert await store.load("session") is not None
+        finally:
+            await store.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_stale_alias_keyring_fails_pipelined_reads_and_rolls_back_writes(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        codec = _public_authority_codec()
+        stale = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=codec,
+        )
+        secondary_key = base64.urlsafe_b64encode(bytes([11]) * 32).decode().rstrip("=")
+        rotated = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=codec.rotated(
+                active_key_id="secondary", key=SecretStr(secondary_key)
+            ),
+        )
+        try:
+            await stale.create(
+                RunRequest(agent_name="assistant", session_id="session", messages=[]),
+                identity=_identity(),
+            )
+            await stale.transform_checkpoint("session", lambda _session, _current: {"marker": 0})
+            assert (await stale.load_state("session")) is not None
+            # Opening the rotated store moves the active key under the stale one.
+            assert (await rotated.load("session")) is not None
+
+            for read in (
+                stale.load_state,
+                stale.load,
+                stale.load_checkpoint,
+                lambda session_id: stale.query_events(EventQuery(session_id=session_id)),
+            ):
+                with pytest.raises(RuntimeError, match="configuration is stale"):
+                    await read("session")
+            with pytest.raises(RuntimeError, match="configuration is stale"):
+                await stale.transform_checkpoint(
+                    "session", lambda _session, _current: {"marker": 1}
+                )
+            with pytest.raises(RuntimeError, match="configuration is stale"):
+                await stale.append_events(
+                    "session",
+                    [
+                        Event(
+                            id="stale-write",
+                            type=EventType.TURN_COMPLETED,
+                            session_id="session",
+                        )
+                    ],
+                )
+
+            # The stale writes ran in transactions that rolled back.
+            checkpoint = await rotated.load_checkpoint("session")
+            assert checkpoint is not None and checkpoint["marker"] == 0
+            events = await rotated.query_events(EventQuery(session_id="session"))
+            assert "stale-write" not in {record.event.id for record in events}
+        finally:
+            await stale.close()
+            await rotated.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_alias_checked_connection_defers_transaction_settings_and_named_cursors(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage import _postgres_alias_checks as alias_checks
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=_public_authority_codec(),
+        )
+        try:
+            await store.ensure_schema()
+            await store._ensure_aliases_reconciled()
+            async with store._checked_connection() as conn:
+                assert isinstance(conn, alias_checks.AliasCheckedConnection)
+                async with conn.cursor() as cur:
+                    # SET TRANSACTION must precede every query, so the check waits.
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    assert conn._pending
+                    await cur.execute("SELECT current_setting('transaction_isolation')")
+                    assert not conn._pending
+                    assert (await cur.fetchone()) == ("repeatable read",)
+                await conn.rollback()
+            async with store._checked_connection() as conn:
+                async with conn.cursor() as cur:
+                    with pytest.raises(Exception, match="cayu_no_such_table"):
+                        await cur.execute("SELECT 1 FROM cayu_no_such_table")
+                    # The failed batch never verified the check, so the next statement pays it.
+                    assert conn._pending
+                await conn.rollback()
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT 2")
+                    assert not conn._pending
+                    assert (await cur.fetchone()) == (2,)
+                await conn.rollback()
+            async with store._checked_connection() as conn:
+                async with conn.cursor(name="checked_named_cursor") as cur:
+                    await cur.execute("SELECT 1")
+                    assert not conn._pending
+                    assert (await cur.fetchone()) == (1,)
+                await conn.rollback()
+        finally:
+            await store.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_pipelined_store_reads_keep_their_timing(postgres_dsn: str) -> None:
+    import psycopg
+
+    from cayu.runtime import _phase_timing as runtime_timing
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def runner() -> None:
+        await _truncate(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=_public_authority_codec(),
+        )
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id="session", messages=[]),
+                identity=_identity(),
+            )
+            read = runtime_timing._Counters()
+            token = runtime_timing._PHASE.set(runtime_timing._Phase(read, None, None))
+            try:
+                assert (await store.load_state("session")) is not None
+            finally:
+                runtime_timing._PHASE.reset(token)
+            # One pipelined autocommit read, timed once.
+            assert read.store_transaction_count == 1
+
+            locked = runtime_timing._Counters()
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as holder:
+                await holder.execute("SELECT 1 FROM cayu_sessions WHERE id = 'session' FOR UPDATE")
+
+                async def transform() -> None:
+                    token = runtime_timing._PHASE.set(runtime_timing._Phase(locked, None, None))
+                    try:
+                        await store.transform_checkpoint(
+                            "session", lambda _session, _current: {"marker": 1}
+                        )
+                    finally:
+                        runtime_timing._PHASE.reset(token)
+
+                task = asyncio.create_task(transform())
+                await asyncio.sleep(0.5)
+                assert not task.done()
+                await holder.rollback()
+                await task
+            # The row lock was waited for when the pipeline synced, and still counts.
+            assert locked.store_lock_wait_seconds >= 0.4
+            assert locked.store_execution_seconds >= 0.4
         finally:
             await store.close()
 

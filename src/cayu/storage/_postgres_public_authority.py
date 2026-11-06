@@ -176,21 +176,39 @@ async def register_alias_row(
         raise ValueError("Public authority alias conflicts with existing private authority.")
 
 
+_CURRENT_CONFIGURATION_QUERY = (
+    "SELECT active_key_id, keyring_fingerprint "
+    "FROM cayu_public_authority_alias_config "
+    "WHERE singleton = TRUE"
+)
+
+
+def current_configuration_query(
+    codec: PublicAuthorityAliasCodec | None, *, keyring_optional: bool = False
+) -> str | None:
+    """The read require_current_configuration_row checks, or None when there is nothing to check."""
+
+    return None if codec is None and keyring_optional else _CURRENT_CONFIGURATION_QUERY
+
+
 async def require_current_configuration(
     connect: PostgresConnection,
     *,
     codec: PublicAuthorityAliasCodec | None,
     keyring_optional: bool = False,
 ) -> None:
-    if codec is None and keyring_optional:
+    query = current_configuration_query(codec, keyring_optional=keyring_optional)
+    if query is None:
         return
     async with connect() as conn, conn.cursor() as cur:
-        await cur.execute(
-            "SELECT active_key_id, keyring_fingerprint "
-            "FROM cayu_public_authority_alias_config "
-            "WHERE singleton = TRUE"
-        )
+        await cur.execute(query)
         row = await cur.fetchone()
+    require_current_configuration_row(row, codec=codec)
+
+
+def require_current_configuration_row(
+    row: tuple[Any, ...] | None, *, codec: PublicAuthorityAliasCodec | None
+) -> None:
     if codec is None:
         if row is not None:
             raise RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))

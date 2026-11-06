@@ -115,7 +115,9 @@ def test_duplicate_event_reuses_rolled_back_connection(monkeypatch, capacity, pu
         store._pool = pool
         store._read_only = False
         store._public_authority_alias_codec = None
+        store._alias_keyring_optional = True
         monkeypatch.setattr(store, "_ensure_ready", AsyncMock())
+        monkeypatch.setattr(store, "_ensure_aliases_reconciled", AsyncMock())
         monkeypatch.setattr(
             store,
             "_load_for_update",

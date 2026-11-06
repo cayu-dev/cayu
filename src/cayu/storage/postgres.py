@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime
 from functools import partial
@@ -48,6 +49,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.records import update_session_annotations
 from cayu.storage import _creation_fence
+from cayu.storage import _postgres_alias_checks as alias_checks
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_context_views as context_view_ops
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
@@ -70,6 +72,7 @@ from cayu.storage._context_selection_fence import PostgresContextSelectionFenceM
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
+from cayu.storage._phase_timing import timed_postgres_connection
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
@@ -432,6 +435,42 @@ from cayu.tools.grants import (
 )
 
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 134
+
+_SESSION_LABELS_QUERY = """
+    SELECT key, value
+    FROM cayu_session_labels
+    WHERE session_id = %s
+    ORDER BY key ASC
+"""
+
+
+async def _load_session_with_labels(cur: Any, session_id: str, lock: str) -> Session | None:
+    """The session row and its labels in one round trip.
+
+    The two reads are pipelined, so the server still runs them one after the
+    other: the labels read starts after the row read has taken its lock and
+    reads with a snapshot of its own, as two separate round trips did.
+    """
+
+    labels = timed_postgres_connection(cur.connection).cursor()
+    async with labels:
+        await alias_checks.execute_pipelined(
+            (
+                (
+                    cur,
+                    f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s{lock}",
+                    (session_id,),
+                ),
+                (labels, _SESSION_LABELS_QUERY, (session_id,)),
+            )
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return pg_support.session_from_row(
+            row,
+            labels={label[0]: label[1] for label in await labels.fetchall()},
+        )
 
 
 def _targeted_tool_grant_from_postgres(value: object) -> TargetedToolGrantRecord:
@@ -940,6 +979,16 @@ class PostgresSessionStore(
         )
 
     async def _ensure_ready(self) -> None:
+        await self._ensure_aliases_reconciled()
+        # Not cached: another process can rotate the alias keys at any time, and
+        # a stale worker must then fail its next read or write.
+        await public_authority_ops.require_current_configuration(
+            self._autocommit_connection,
+            codec=self.public_authority_alias_codec,
+            keyring_optional=self._alias_keyring_optional,
+        )
+
+    async def _ensure_aliases_reconciled(self) -> None:
         await super()._ensure_ready()
         if not self._public_authority_aliases_reconciled:
             async with self._public_authority_alias_backfill_lock:
@@ -952,13 +1001,70 @@ class PostgresSessionStore(
                         acquire_schema_lock=postgres_base._acquire_schema_transaction_lock,
                     )
                     self._public_authority_aliases_reconciled = True
-        # Not cached: another process can rotate the alias keys at any time, and
-        # a stale worker must then fail its next read or write.
-        await public_authority_ops.require_current_configuration(
-            self._autocommit_connection,
-            codec=self.public_authority_alias_codec,
-            keyring_optional=self._alias_keyring_optional,
+
+    @asynccontextmanager
+    async def _ready_connection(self) -> AsyncIterator[Any]:
+        """An operation connection, checked as `_ensure_ready` checks, at its first statement."""
+
+        await self._ensure_aliases_reconciled()
+        async with self._checked_connection() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def _checked_connection(self) -> AsyncIterator[Any]:
+        """A transactional connection whose first statement carries the alias configuration check.
+
+        For an operation that would call `_ensure_ready` and then open its
+        connection: call `_ensure_aliases_reconciled` and open this instead, and
+        the check rides with BEGIN and the first statement (see
+        `_postgres_alias_checks`). The operation must make its first read or write
+        through this connection.
+        """
+
+        codec = self.public_authority_alias_codec
+        query = public_authority_ops.current_configuration_query(
+            codec, keyring_optional=self._alias_keyring_optional
         )
+        async with self._connection() as conn:
+            if query is None:
+                yield conn
+                return
+            yield alias_checks.AliasCheckedConnection(
+                conn,
+                query=query,
+                verify=lambda row: public_authority_ops.require_current_configuration_row(
+                    row, codec=codec
+                ),
+            )
+
+    @asynccontextmanager
+    async def _checked_read_cursor(self) -> AsyncIterator[Any]:
+        """A cursor for one standalone read, checked as `_ensure_ready` checks, in one round trip.
+
+        The read and the alias configuration check are pipelined on an autocommit
+        connection, so they share one implicit transaction and one round trip
+        instead of four (the check, then BEGIN, the read and COMMIT). The check
+        is verified before the read's result reaches the caller, so a stale
+        worker still fails this read. Only for reads: a write here would commit
+        before the check is verified.
+        """
+
+        await self._ensure_aliases_reconciled()
+        codec = self.public_authority_alias_codec
+        check = public_authority_ops.current_configuration_query(
+            codec, keyring_optional=self._alias_keyring_optional
+        )
+        async with self._autocommit_connection() as conn:
+            if check is not None:
+                conn = alias_checks.AliasCheckedConnection(
+                    conn,
+                    query=check,
+                    verify=lambda row: public_authority_ops.require_current_configuration_row(
+                        row, codec=codec
+                    ),
+                )
+            async with conn.cursor() as cur:
+                yield cur
 
     async def create(
         self,
@@ -1534,8 +1640,7 @@ class PostgresSessionStore(
             except ResourceAccessDenied:
                 return None
         session_id = require_clean_nonblank(session_id, "session_id")
-        await self._ensure_ready()
-        async with self._connection() as conn, conn.cursor() as cur:
+        async with self._checked_read_cursor() as cur:
             return await self._load(cur, session_id)
 
     async def load_sessions(self, session_ids: Sequence[str]) -> dict[str, Session]:
@@ -1670,8 +1775,7 @@ class PostgresSessionStore(
 
     async def load_state(self, session_id: str) -> SessionStateSnapshot | None:
         session_id = require_clean_nonblank(session_id, "session_id")
-        await self._ensure_ready()
-        async with self._connection() as conn, conn.cursor() as cur:
+        async with self._checked_read_cursor() as cur:
             await cur.execute(
                 """
                 SELECT id, status, updated_at, last_activity_at
@@ -4885,10 +4989,10 @@ class PostgresSessionStore(
 
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         await event_publication_ops.append_events(
-            self._connection,
+            self._checked_connection,
             session_id,
             events,
-            ensure_ready=self._ensure_ready,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_session=self._load_for_update,
             closure_owners=self._closure_lineage_owners,
             append_events=self._append_events_with_cursor,
@@ -4905,10 +5009,10 @@ class PostgresSessionStore(
         claim_id: str | None = None,
     ) -> PersistedEventSideEffectClaim | None:
         return await event_publication_ops.append_events(
-            self._connection,
+            self._checked_connection,
             session_id,
             [event],
-            ensure_ready=self._ensure_ready,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_session=self._load_for_update,
             closure_owners=self._closure_lineage_owners,
             append_events=self._append_events_with_cursor,
@@ -5285,13 +5389,12 @@ class PostgresSessionStore(
             browser_control_read=True,
         )
         _require_session_export_target(session_id, idempotency_key)
-        await self._ensure_ready()
         checkpoint_root_key = (
             "__cayu_no_checkpoint_root_guard__"
             if checkpoint_root_guard is None
             else checkpoint_root_guard.key
         )
-        async with self._connection() as conn, conn.cursor() as cur:
+        async with self._ready_connection() as conn, conn.cursor() as cur:
             if access_bounds is not None:
                 await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 access_bounds.require_read(await self._load(cur, session_id))
@@ -5399,8 +5502,8 @@ class PostgresSessionStore(
             session_id,
             stage=stage,
             consume_child_session_notifications=consume_child_session_notifications,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            connect=self._checked_connection,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_session=self._load,
             load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
@@ -5412,8 +5515,8 @@ class PostgresSessionStore(
     ) -> ModelCompletionStageResult:
         return await model_stage_ops.prepare(
             prepared,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            connect=self._checked_connection,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             append_events=self._append_events_with_cursor,
@@ -5427,8 +5530,8 @@ class PostgresSessionStore(
     ) -> ModelCompletionStageResult:
         return await model_stage_ops.complete(
             prepared,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            connect=self._checked_connection,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             store_now=self._session_store_now,
@@ -5473,8 +5576,8 @@ class PostgresSessionStore(
         return await publication_ops.publish_runtime(
             prepared,
             _model_completion_stage=_model_completion_stage,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            connect=self._checked_connection,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             closure_owners=self._closure_lineage_owners,
@@ -5665,8 +5768,8 @@ class PostgresSessionStore(
             context_view_compaction_cursor=context_view_compaction_cursor,
             preserve_completion_result_publications=preserve_completion_result_publications,
             unique_violation=UniqueViolation,
-            connect=self._connection,
-            ensure_ready=self._ensure_ready,
+            connect=self._checked_connection,
+            ensure_ready=self._ensure_aliases_reconciled,
             load_for_update=self._load_for_update,
             load_checkpoint=self._load_checkpoint,
             store_now=self._session_store_now,
@@ -7579,8 +7682,7 @@ class PostgresSessionStore(
         session_id = require_clean_nonblank(session_id, "session_id")
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
-        await self._ensure_ready()
-        async with self._connection() as conn:
+        async with self._ready_connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     session = await self._load_for_update(cur, session_id)
@@ -7655,11 +7757,13 @@ class PostgresSessionStore(
 
         access_bounds = await current_data_bounds()
         session_id = require_clean_nonblank(session_id, "session_id")
+        if access_bounds is None:
+            async with self._checked_read_cursor() as cur:
+                return await self._load_checkpoint(cur, session_id)
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
-            if access_bounds is not None:
-                await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                access_bounds.require_action(await self._load(cur, session_id), "inspect_state")
+            await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            access_bounds.require_action(await self._load(cur, session_id), "inspect_state")
             return await self._load_checkpoint(cur, session_id)
 
     async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -7772,56 +7876,18 @@ class PostgresSessionStore(
     # -- internal helpers -------------------------------------------------
 
     async def _load(self, cur: Any, session_id: str) -> Session | None:
-        await cur.execute(
-            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s",
-            (session_id,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        return pg_support.session_from_row(
-            row,
-            labels=await self._load_labels(cur, session_id),
-        )
+        return await _load_session_with_labels(cur, session_id, "")
 
     async def _load_for_update(self, cur: Any, session_id: str) -> Session | None:
-        await cur.execute(
-            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR UPDATE",
-            (session_id,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        return pg_support.session_from_row(
-            row,
-            labels=await self._load_labels(cur, session_id),
-        )
+        return await _load_session_with_labels(cur, session_id, " FOR UPDATE")
 
     async def _load_for_key_share(self, cur: Any, session_id: str) -> Session | None:
         """Load immutable parent identity while preventing delete or key replacement."""
 
-        await cur.execute(
-            f"SELECT {pg_support.SESSION_COLUMNS} FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
-            (session_id,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        return pg_support.session_from_row(
-            row,
-            labels=await self._load_labels(cur, session_id),
-        )
+        return await _load_session_with_labels(cur, session_id, " FOR KEY SHARE")
 
     async def _load_labels(self, cur: Any, session_id: str) -> dict[str, str]:
-        await cur.execute(
-            """
-            SELECT key, value
-            FROM cayu_session_labels
-            WHERE session_id = %s
-            ORDER BY key ASC
-            """,
-            (session_id,),
-        )
+        await cur.execute(_SESSION_LABELS_QUERY, (session_id,))
         return {row[0]: row[1] for row in await cur.fetchall()}
 
     async def _reject_new_work_after_steering(

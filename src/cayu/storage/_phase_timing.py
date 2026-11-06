@@ -288,6 +288,9 @@ class PostgresTimingCursor:
         finally:
             elapsed = max(0, monotonic() - started)
             lock_acquisition = type(query) is str and "FOR UPDATE" in query.upper()
+            pipeline = _TIMED_PIPELINES.get(id(self._connection))
+            if lock_acquisition and pipeline is not None:
+                pipeline.lock_queued = True
             counters.add(
                 store_execution_seconds=elapsed,
                 store_lock_wait_seconds=elapsed if lock_acquisition else 0,
@@ -359,6 +362,9 @@ class PostgresTimingConnection:
             self._connection.transaction(*args, **kwargs), self._connection
         )
 
+    def pipeline(self):
+        return PostgresTimingPipeline(self._connection.pipeline(), self._connection)
+
     async def commit(self):
         counters = current_store_counters()
         if counters is None or _postgres_idle(self._connection):
@@ -368,6 +374,43 @@ class PostgresTimingConnection:
             return await self._connection.commit()
         finally:
             counters.add(store_commit_seconds=max(0, monotonic() - started))
+
+
+# Timed pipelines by connection, while open: a lock taken inside one is waited
+# for when the pipeline syncs, not when its statement is queued.
+_TIMED_PIPELINES: dict[int, PostgresTimingPipeline] = {}
+
+
+class PostgresTimingPipeline:
+    """Time a pipeline's sync, where its queued statements actually run."""
+
+    def __init__(self, scope, connection):
+        self._scope = scope
+        self._connection = connection
+        self._registered = False
+        self.lock_queued = False
+
+    async def __aenter__(self):
+        pipeline = await self._scope.__aenter__()
+        if id(self._connection) not in _TIMED_PIPELINES:
+            _TIMED_PIPELINES[id(self._connection)] = self
+            self._registered = True
+        return pipeline
+
+    async def __aexit__(self, *arguments):
+        counters = current_store_counters()
+        started = monotonic()
+        try:
+            return await self._scope.__aexit__(*arguments)
+        finally:
+            if self._registered:
+                del _TIMED_PIPELINES[id(self._connection)]
+            if counters is not None:
+                elapsed = max(0, monotonic() - started)
+                counters.add(
+                    store_execution_seconds=elapsed,
+                    store_lock_wait_seconds=elapsed if self.lock_queued else 0,
+                )
 
 
 class PostgresTimingTransaction:
