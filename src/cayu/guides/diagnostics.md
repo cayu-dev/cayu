@@ -590,6 +590,14 @@ stored. The server logs these warnings, once per condition:
   minute for over 2 minutes and mostly got the same response back. See
   `cayu guide app-ui` for polling alternatives.
 
+The request log (`cayu.server.request`) has one line per finished request with
+its route template, status and duration, and a warning for a request still
+running after 5 seconds, so one that never answers still shows up. `cayu serve`
+writes it in place of uvicorn's access log; on Cayu Cloud, read it with
+`cayu cloud service logs --application NAME --process web`, and find stalled
+requests with `--grep "still running"`. Change the threshold with
+`[tool.cayu.serve].long_request_seconds`.
+
 ### Leave it idle, measure, fix
 
 Check the cost of an open page before calling UI work done:

@@ -21,7 +21,9 @@ from cayu.cli.serve import (
     _build_serve_app,
     _resolve_serve_project,
     parse_serve_arguments,
+    request_log_covers,
     serve_project_control_plane,
+    serve_uvicorn_options,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +61,9 @@ def run_reload(uvicorn: Any, args: argparse.Namespace, root: Path) -> None:
             reload_dirs=[str(root)],
             lifespan="on",
             timeout_graceful_shutdown=_REQUEST_DRAIN_SECONDS,
+            # Only the child sees the app, so it decides whether Cayu's request log
+            # replaces the access log (`_ReloadServer.run`).
+            **serve_uvicorn_options(uvicorn, covered=False),
         )
         server = _ReloadServer(config)
         with config.bind_socket() as listener:
@@ -81,6 +86,11 @@ class _ReloadServer(Server):
             return
         self.config.app = app
         self.config.factory = False
+        if app.request_log_covers_server:
+            # As without --reload: Cayu's request log has a line for every request, so
+            # uvicorn's access log is left out, now that the app is known.
+            self.config.access_log = False
+            self.config.configure_logging()
         try:
             super().run(sockets=sockets)
         except BaseException as primary:
@@ -121,6 +131,10 @@ class _ReloadApp:
                     "Reload worker and project storage cleanup failed", [primary, cleanup]
                 ) from None
             raise
+
+    @property
+    def request_log_covers_server(self) -> bool:
+        return request_log_covers(self._server)
 
     def close_sync(self) -> None:
         try:

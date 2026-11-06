@@ -194,7 +194,14 @@ def test_serve_modes_preserve_auth_and_project_lifetime(tmp_path, monkeypatch, c
         supervisor.target(sockets=[])
 
     def run(server, **options):
-        assert options == {"host": "127.0.0.1", "port": 8000}
+        assert {key: options.pop(key) for key in ("host", "port")} == {
+            "host": "127.0.0.1",
+            "port": 8000,
+        }
+        # Cayu's request log covers every request, in place of uvicorn's access log.
+        assert options.pop("access_log") is False
+        assert "cayu.server.request" in options.pop("log_config")["loggers"]
+        assert options == {}
         with TestClient(server) as client:
             assert Path.cwd() == tmp_path
             assert client.get("/api/agents").status_code == 401
@@ -213,7 +220,11 @@ def test_serve_modes_preserve_auth_and_project_lifetime(tmp_path, monkeypatch, c
         uvicorn.Server,
         "run",
         lambda self, sockets=None: run(
-            self.config.app, host=self.config.host, port=self.config.port
+            self.config.app,
+            host=self.config.host,
+            port=self.config.port,
+            access_log=self.config.access_log,
+            log_config=self.config.log_config,
         ),
     )
     assert main(["serve", *(["--reload"] if reload else [])]) == 0

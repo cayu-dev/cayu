@@ -458,20 +458,35 @@ class DocsConfig(BaseModel):
     enabled: StrictBool = False
 
 
+#: How long a request runs before the request log reports it as still running.
+DEFAULT_LONG_REQUEST_SECONDS = 5.0
+
+
 class RequestTimingConfig(BaseModel):
-    """Per-request cost recording and development warnings.
+    """Per-request cost recording, the request log, and development warnings.
 
     Records carry the method, route template, status, wall time, apportioned
     process CPU time, response size, and a keyed client hash. They live only in
     a bounded in-memory ring buffer of ``buffer_size`` records. ``warnings``
     controls the ``cayu.server.slow_request``, ``cayu.server.growing_cost``, and
     ``cayu.server.hot_poll`` log warnings; the buffer is kept either way.
+
+    ``request_log`` logs one INFO line per finished request on the
+    ``cayu.server.request`` logger: method, route template, status and duration.
+    ``long_request_seconds`` logs a WARNING on the same logger for a request
+    still running after that long, so one that never answers shows up; ``None``
+    turns that line off. Neither line carries a raw path, query string, header
+    or client address.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     buffer_size: StrictInt = Field(default=10_000, ge=100, le=1_000_000)
     warnings: StrictBool = True
+    request_log: StrictBool = True
+    long_request_seconds: float | None = Field(
+        default=DEFAULT_LONG_REQUEST_SECONDS, gt=0, le=86_400
+    )
     slow_get_threshold_ms: float = Field(default=250.0, gt=0, le=600_000)
     slow_get_window_seconds: float = Field(default=300.0, gt=0, le=86_400)
     slow_get_min_requests: StrictInt = Field(default=5, ge=1, le=10_000)
@@ -490,10 +505,13 @@ class RequestTimingConfig(BaseModel):
         "growing_cost_min_ms",
         "hot_poll_duration_seconds",
         "hot_poll_identical_share",
+        "long_request_seconds",
         mode="before",
     )
     @classmethod
-    def validate_finite_number(cls, value: object, info) -> float:
+    def validate_finite_number(cls, value: object, info) -> float | None:
+        if value is None and info.field_name == "long_request_seconds":
+            return None
         if isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value):
             raise ValueError(f"{info.field_name} must be a finite number.")
         return float(value)

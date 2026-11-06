@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib
+import math
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,6 +51,8 @@ class _ServeSettings:
     # The project's own routes: `module:function` targets, each called with the app and
     # `development=` and returning a FastAPI router served next to Cayu's routes.
     routers: tuple[str, ...] = ()
+    # `RequestTimingConfig` fields the project sets, such as `long_request_seconds`.
+    request_timing: tuple[tuple[str, Any], ...] = ()
 
 
 def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -150,6 +154,11 @@ def _resolve_serve_project(
         raise ServeError(
             "A maintained public service owns its dashboard configuration; "
             "configure its DashboardConfig.runtime_config priceBook in the service factory."
+        )
+    if project.service_target is not None and settings.request_timing:
+        raise ServeError(
+            "[tool.cayu.serve].long_request_seconds is for projects served by their "
+            "factory; a maintained public service keeps the default request log."
         )
     if project.service_target is not None and settings.routers:
         raise ServeError(
@@ -282,8 +291,9 @@ def _build_serve_app(
             recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
         )
         # Request timing is on for every `cayu serve` process so
-        # `cayu diagnostics requests` and support bundles can read it.
-        request_timing = server_module.RequestTimingConfig()
+        # `cayu diagnostics requests` and support bundles can read it, and its
+        # request log replaces uvicorn's access log (`serve_uvicorn_options`).
+        request_timing = server_module.RequestTimingConfig(**dict(settings.request_timing))
         config = (
             server_module.ServerConfig.local_development(
                 lifecycle=lifecycle,
@@ -316,6 +326,42 @@ def _build_serve_app(
         if settings.routers:
             print("Project routes: " + ", ".join(settings.routers))
     return server
+
+
+def request_log_covers(server: Any) -> bool:
+    """Whether Cayu's request log has a line for every request ``server`` answers."""
+
+    return getattr(getattr(server, "state", None), "cayu_request_log_covers_server", False) is True
+
+
+def serve_uvicorn_options(uvicorn: Any, *, covered: bool) -> dict[str, Any]:
+    """Uvicorn's logging for `cayu serve`: Cayu's request log beside uvicorn's own.
+
+    Cayu's request log (``cayu.server.request``) goes to stdout, where uvicorn writes
+    its access log, as ``INFO:     GET /api/sessions/{session_id} 200 18 ms``. When it
+    has a line for every request (``covered``), uvicorn's access log is left out: its
+    lines have no duration and carry raw paths and query strings. The configuration
+    extends uvicorn's own default (``uvicorn.config.LOGGING_CONFIG``); a runner without
+    one is left on its defaults.
+    """
+
+    from cayu.server._request_timing import REQUEST_LOGGER_NAME
+
+    defaults = getattr(getattr(uvicorn, "config", None), "LOGGING_CONFIG", None)
+    if not isinstance(defaults, dict):
+        return {}
+    log_config = copy.deepcopy(defaults)
+    log_config["handlers"]["cayu_request"] = {
+        "formatter": "default",
+        "class": "logging.StreamHandler",
+        "stream": "ext://sys.stdout",
+    }
+    log_config["loggers"][REQUEST_LOGGER_NAME] = {
+        "handlers": ["cayu_request"],
+        "level": "INFO",
+        "propagate": False,
+    }
+    return {"log_config": log_config, "access_log": not covered}
 
 
 def _include_project_routers(
@@ -415,7 +461,12 @@ def run_serve(args: argparse.Namespace) -> int:
                     raise ServeError(
                         f"Serve project startup raised SystemExit with status {status}."
                     ) from exc
-                uvicorn.run(server, host=args.host, port=args.port)
+                uvicorn.run(
+                    server,
+                    host=args.host,
+                    port=args.port,
+                    **serve_uvicorn_options(uvicorn, covered=request_log_covers(server)),
+                )
     except SystemExit as exc:
         exit_code = exc.code if isinstance(exc.code, int) else 1
     except Exception as exc:
@@ -465,6 +516,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
         "startup_recovery_statuses",
         "recovery_inactive_after_seconds",
         "routers",
+        "long_request_seconds",
     }
     if unexpected:
         raise ServeError(
@@ -530,12 +582,31 @@ def _serve_settings(root: Path) -> _ServeSettings:
             f"{discovered.pyproject}: [tool.cayu.serve].routers must be a non-empty array "
             "of MODULE:FUNCTION strings."
         )
+    request_timing: tuple[tuple[str, Any], ...] = ()
+    if "long_request_seconds" in configured:
+        long_request = configured["long_request_seconds"]
+        if long_request is False:
+            request_timing = (("long_request_seconds", None),)
+        elif (
+            isinstance(long_request, bool)
+            or not isinstance(long_request, int | float)
+            or not math.isfinite(long_request)
+            or not 0 < long_request <= 86_400
+        ):
+            raise ServeError(
+                f"{discovered.pyproject}: [tool.cayu.serve].long_request_seconds must be "
+                "a number of seconds above 0 and at most 86400, or false to turn the "
+                "still-running line off."
+            )
+        else:
+            request_timing = (("long_request_seconds", float(long_request)),)
     return _ServeSettings(
         auth_target=None if auth is None else auth.strip(),
         price_book=None if price_book is None else (root / price_book).resolve(),
         startup_recovery_statuses=statuses,
         recovery_inactive_after_seconds=inactivity,
         routers=tuple(target.strip() for target in routers or ()),
+        request_timing=request_timing,
     )
 
 

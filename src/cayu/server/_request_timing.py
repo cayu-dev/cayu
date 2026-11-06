@@ -16,10 +16,17 @@ charged to any request, and background work that overlaps a request (an agent
 run, recovery sweeps) is charged to it, so measure idle UI cost while no agent
 work is running. An event stream stops accruing CPU once its response starts;
 its later chunks are not charged.
+
+The same middleware writes the request log (``RequestTimingConfig.request_log``):
+one ``cayu.server.request`` INFO line per finished request with its method, route
+template, status and duration, and a WARNING for a request still running after
+``long_request_seconds``, so a request that never answers leaves a line. Like the
+records, the lines carry route templates only, never a raw path or query string.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -50,6 +57,11 @@ _LOGGERS = {
     name: logging.getLogger(name)
     for name in (_SLOW_REQUEST_EVENT, _GROWING_COST_EVENT, _HOT_POLL_EVENT)
 }
+#: The request log's logger: finished requests at INFO, long-running ones at WARNING.
+REQUEST_LOGGER_NAME = "cayu.server.request"
+_REQUEST_LOGGER = logging.getLogger(REQUEST_LOGGER_NAME)
+_REQUEST_RUNNING_EVENT = "cayu.server.request_running"
+_MAX_LOGGED_METHOD_CHARS = 16
 
 _BODY_DIGEST_LIMIT_BYTES = 1024 * 1024
 _HOT_POLL_RATE_WINDOW_SECONDS = 60.0
@@ -88,6 +100,21 @@ class PendingRequest:
     started_at: float
     cpu_share_start: float
     cpu_seconds: float | None = None
+
+
+@dataclass(slots=True)
+class _LoggedRequest:
+    """What the request log knows about one request while it runs."""
+
+    method: str
+    scope: Scope
+    entry_app: object
+    entry_root: str
+    pending: PendingRequest
+    status: int | None = None
+    streaming: bool = False
+    #: Set when the request is reported as still running, to tie its lines together.
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +169,11 @@ class RequestTimingRecorder:
             share = self._advance_cpu()
             self._in_flight += 1
             return PendingRequest(started_at=self._clock(), cpu_share_start=share)
+
+    def elapsed(self, pending: PendingRequest) -> float:
+        """Seconds since ``pending`` began, on the recorder's clock."""
+
+        return max(0.0, self._clock() - pending.started_at)
 
     def settle_cpu(self, pending: PendingRequest) -> None:
         """Stop charging CPU to a request that has started a long-lived stream."""
@@ -558,27 +590,35 @@ class RequestTimingMiddleware:
             await self.app(scope, receive, send)
             return
         recorder = self.recorder
+        config = recorder.config
         entry_app = scope.get("app")
         entry_root = scope.get("root_path", "")
         method = scope.get("method", "GET")
         pending = recorder.begin()
         status = 500
         response_bytes = 0
-        streaming = False
         hasher: Any = None
         hashed_bytes = 0
+        logged = _LoggedRequest(method, scope, entry_app, entry_root, pending)
+        watch = self._watch(logged, config.long_request_seconds)
+        outcome: str | None = None
 
         async def timed_send(message: Message) -> None:
-            nonlocal status, response_bytes, streaming, hasher, hashed_bytes
+            nonlocal status, response_bytes, hasher, hashed_bytes
             message_type = message["type"]
+            final_body = False
             if message_type == "http.response.start":
                 status = message["status"]
+                logged.status = status
                 content_type = _header(message.get("headers", ()), b"content-type")
                 if content_type is not None and content_type.lower().startswith(
                     _EVENT_STREAM_MEDIA_TYPE
                 ):
-                    streaming = True
+                    logged.streaming = True
                     recorder.settle_cpu(pending)
+                    # An event stream stays open by design; it is not a stalled request.
+                    if watch is not None:
+                        watch.cancel()
                 elif method == "GET" and 200 <= status < 300:
                     hasher = hashlib.blake2b(digest_size=16)
             elif message_type == "http.response.body":
@@ -588,29 +628,85 @@ class RequestTimingMiddleware:
                     chunk = body[: _BODY_DIGEST_LIMIT_BYTES - hashed_bytes]
                     hasher.update(chunk)
                     hashed_bytes += len(chunk)
+                final_body = not message.get("more_body", False)
             await send(message)
+            # The client has the whole response; a background task the app runs after it
+            # is not a request still running.
+            if final_body and watch is not None:
+                watch.cancel()
 
         try:
             await self.app(scope, receive, timed_send)
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "error"
+            raise
         finally:
+            if watch is not None:
+                watch.cancel()
             try:
                 body_digest = None
                 if hasher is not None:
                     hasher.update(response_bytes.to_bytes(8, "big"))
                     body_digest = hasher.digest()
-                recorder.finish(
+                route = self._route_template(scope, entry_app, entry_root)
+                record = recorder.finish(
                     pending,
                     method=method,
-                    route=self._route_template(scope, entry_app, entry_root),
+                    route=route,
                     status=status,
                     response_bytes=response_bytes,
                     client_key=recorder.client_key(_client_identity(scope)),
-                    streaming=streaming,
+                    streaming=logged.streaming,
                     body_digest=body_digest,
                 )
+                if config.request_log and _REQUEST_LOGGER.isEnabledFor(logging.INFO):
+                    _log_finished(
+                        logged,
+                        route=route,
+                        outcome=outcome,
+                        seconds=(
+                            recorder.elapsed(pending) if record is None else record.wall_seconds
+                        ),
+                    )
             except Exception:
                 # Diagnostics must never change the response or its error.
                 logging.getLogger(__name__).debug("Request timing failed.", exc_info=True)
+
+    def _watch(self, logged: _LoggedRequest, threshold: float | None) -> asyncio.TimerHandle | None:
+        """Report the request if it is still running after ``threshold`` seconds."""
+
+        if threshold is None:
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        return loop.call_later(threshold, self._report_running, logged)
+
+    def _report_running(self, logged: _LoggedRequest) -> None:
+        try:
+            logged.request_id = secrets.token_hex(4)
+            route = self._route_template(logged.scope, logged.entry_app, logged.entry_root)
+            seconds = self.recorder.elapsed(logged.pending)
+            if logged.status is None:
+                state = "no response yet"
+            else:
+                state = f"answered {logged.status} and still sending"
+            method = _logged_method(logged.method)
+            _REQUEST_LOGGER.warning(
+                "%s %s still running after %s, %s (request %s)",
+                method,
+                route,
+                _log_duration(seconds),
+                state,
+                logged.request_id,
+                extra=_request_log_extra(_REQUEST_RUNNING_EVENT, method, route, logged, seconds),
+            )
+        except Exception:
+            logging.getLogger(__name__).debug("Request log failed.", exc_info=True)
 
     def _observed(self, scope: Scope) -> bool:
         prefix = self.observe_prefix
@@ -649,6 +745,65 @@ class RequestTimingMiddleware:
         if len(self._mount_templates) < _MAX_MOUNT_TEMPLATE_CACHE:
             self._mount_templates[mounted] = template
         return template
+
+
+def _log_finished(
+    logged: _LoggedRequest, *, route: str, outcome: str | None, seconds: float
+) -> None:
+    """Log one finished request: method, route template, status and duration."""
+
+    if logged.status is not None:
+        status = str(logged.status) + (" stream" if logged.streaming else "")
+        if outcome is not None:
+            # The response started, then the app raised or the request was cancelled.
+            status += f" {outcome}"
+    else:
+        # No response started: the app raised (the server answers 500), the request
+        # was cancelled, or the app returned without answering.
+        status = {"error": "500 error", "cancelled": "cancelled"}.get(outcome or "", "no response")
+    status += f" {_log_duration(seconds)}"
+    if logged.request_id is not None:
+        status += f" (request {logged.request_id})"
+    method = _logged_method(logged.method)
+    _REQUEST_LOGGER.info(
+        "%s %s %s",
+        method,
+        route,
+        status,
+        extra=_request_log_extra(REQUEST_LOGGER_NAME, method, route, logged, seconds),
+    )
+
+
+def _request_log_extra(
+    event: str, method: str, route: str, logged: _LoggedRequest, seconds: float
+) -> dict[str, object]:
+    return {
+        "cayu_event": event,
+        "cayu_method": method,
+        "cayu_route": route,
+        "cayu_status": logged.status,
+        "cayu_duration_ms": round(seconds * 1000, 3),
+        "cayu_request_id": logged.request_id,
+    }
+
+
+def _logged_method(method: object) -> str:
+    # Servers pass a validated HTTP token; anything else is not repeated.
+    if (
+        isinstance(method, str)
+        and 0 < len(method) <= _MAX_LOGGED_METHOD_CHARS
+        and method.isascii()
+        and method.isalpha()
+    ):
+        return method
+    return "(method)"
+
+
+def _log_duration(seconds: float) -> str:
+    if seconds >= 1:
+        return f"{seconds:.1f} s"
+    milliseconds = seconds * 1000
+    return f"{milliseconds:.0f} ms" if milliseconds >= 10 else f"{milliseconds:.1f} ms"
 
 
 def _header(headers: Any, name: bytes) -> bytes | None:

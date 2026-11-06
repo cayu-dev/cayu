@@ -944,6 +944,12 @@ def _install_request_timing(
         observe_prefix=observe_prefix,
     )
     server.state.cayu_request_timing = recorder
+    # Whether Cayu's request log has a line for every request this server answers, so a
+    # runner such as `cayu serve` can leave out the server's own access log.
+    server.state.cayu_request_log_covers_server = config.request_log and observe_prefix in {
+        None,
+        "/",
+    }
     return recorder
 
 

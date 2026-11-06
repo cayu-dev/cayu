@@ -38,8 +38,12 @@ cayu serve --dev --host 127.0.0.1 --port 8000
 `--dev` uses `ServerConfig.local_development()`. With or without `--dev`,
 `cayu serve` turns on [request timing](server-configuration.md#request-timing),
 so `cayu diagnostics requests` can report per-route cost from the running
-process. Without `--dev`, the command fails closed unless an authentication
-target is configured:
+process, and writes Cayu's [request log](server-configuration.md#request-log) in
+place of uvicorn's access log: one line per request with its route template,
+status and duration, and a WARNING for a request still running after 5 seconds
+(`[tool.cayu.serve].long_request_seconds`, or `false` to turn it off; a project
+served by its `service_factory` keeps the default). Without `--dev`, the command
+fails closed unless an authentication target is configured:
 
 ```toml
 [tool.cayu]

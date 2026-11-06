@@ -315,6 +315,31 @@ process owner:
   default only the mounted Cayu routes are timed; `observe_host_requests=True`
   also times the host application's own routes and opts in to timing.
 
+### Request log
+
+The same middleware writes the request log on the `cayu.server.request` logger:
+
+- With `request_log=True` (the default), one INFO line per finished request
+  with its method, route template, status and duration, such as
+  `GET /api/sessions/{session_id} 200 18 ms`. A request that raised before
+  answering logs `500 error`, a cancelled one `cancelled`, and an event stream
+  `200 stream` with its lifetime.
+- With `long_request_seconds` set (default 5 seconds; `None` turns it off), a
+  WARNING for a request still running after that long, such as
+  `POST /api/inbox/{item_id}/settle still running after 5.0 s, no response yet
+  (request 3fa2b1c9)`. A request that never answers still leaves this line; when
+  it does finish, its INFO line ends with the same `(request ...)` id. Event
+  streams are not reported, since they stay open by design.
+
+Like the records, the lines carry route templates only: no raw path, ID, query
+string, header or client address. `cayu serve` writes them to stdout as
+`INFO:     GET /api/... 200 18 ms` and leaves out uvicorn's access log, whose
+lines have no duration and carry raw paths and query strings. Set
+`[tool.cayu.serve].long_request_seconds` to change the threshold, or `false` to
+turn the line off. An application that runs its own server shows the lines at
+the level its logging configuration gives `cayu.server.request`; without one,
+Python prints only the WARNING lines.
+
 CPU time is process CPU (`time.process_time()`, all threads) apportioned across
 the requests in flight: at each request start and finish the recorder divides
 the CPU used since the previous reading equally among the running requests.
