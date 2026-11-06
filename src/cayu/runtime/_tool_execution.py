@@ -597,7 +597,7 @@ def _tool_timeout_outcome(
         if run_time_limited and timeout_seconds is not None
         else f"Tool call timed out after {timeout_seconds} seconds."
     )
-    if run_time_limited and runner_stopped and type(tool) is not ProcessIsolatedTool:
+    if run_time_limited and runner_stopped and timeout_seconds is not None:
         # The run's own time limit cut the call and its runner confirmed the
         # command stopped, so nothing of the call is still running or unknown:
         # it ends as an ordinary timed-out failure, like a command that hit
@@ -608,7 +608,7 @@ def _tool_timeout_outcome(
                 structured={
                     "timed_out": True,
                     "stopped_by": "run_time_limit",
-                    "stopped_after_seconds": timeout_seconds,
+                    "stopped_after_seconds": round(timeout_seconds, 3),
                 },
                 is_error=True,
             )

@@ -395,14 +395,11 @@ class ExecCommandTool(Tool):
                 require_unicode_scalar_text(stdin, "stdin")
             canonical_cwd = runner.resolve_cwd(cwd)
         requested_timeout_s = timeout_s
-        run_time_left = run_time_left_for_call(ctx)
-        if run_time_left is not None:
-            fitted_timeout_s = math.floor(
-                run_time_left - min(_RUN_TIME_STOP_MARGIN_SECONDS, run_time_left / 2)
-            )
-            if fitted_timeout_s < 1:
-                return _run_time_exhausted_result(run_time_left)
-            timeout_s = min(timeout_s, fitted_timeout_s)
+        # Fit before the policy sees the request, and again at dispatch below.
+        fitted = _fit_timeout_to_run_time(ctx, timeout_s)
+        if isinstance(fitted, ToolResult):
+            return fitted
+        timeout_s = fitted
         return await self._execute_resolved_command(
             ctx,
             command=command,
@@ -449,8 +446,6 @@ class ExecCommandTool(Tool):
                 content="No runner configured for this tool call.",
                 is_error=True,
             )
-        if requested_timeout_s is None:
-            requested_timeout_s = timeout_s
         if canonical_cwd is None:
             canonical_cwd = runner.resolve_cwd(cwd)
         if self._policy is not None:
@@ -491,6 +486,14 @@ class ExecCommandTool(Tool):
             if verdict.decision is not CommandPolicyDecision.ALLOW:
                 return _policy_refusal_result(verdict, ctx=ctx, source=policy_source)
             cwd = canonical_cwd
+        if requested_timeout_s is not None:
+            # exec_command's own request: preflight and policy took time too.
+            fitted = _fit_timeout_to_run_time(ctx, timeout_s)
+            if isinstance(fitted, ToolResult):
+                return fitted
+            timeout_s = fitted
+        else:
+            requested_timeout_s = timeout_s
         try:
             result = await runner.exec(
                 command,
@@ -1018,6 +1021,23 @@ def _command_output_label(stream: str, encoding: str) -> str:
     return stream
 
 
+def _fit_timeout_to_run_time(ctx: ToolContext, timeout_s: int) -> int | ToolResult:
+    """Shorten ``timeout_s`` so the runner stops the command before the run's limit does.
+
+    Returns the timeout to use, or the refusal when too little time is left.
+    """
+
+    run_time_left = run_time_left_for_call(ctx)
+    if run_time_left is None:
+        return timeout_s
+    fitted_timeout_s = math.floor(
+        run_time_left - min(_RUN_TIME_STOP_MARGIN_SECONDS, run_time_left / 2)
+    )
+    if fitted_timeout_s < 1:
+        return _run_time_exhausted_result(run_time_left)
+    return min(timeout_s, fitted_timeout_s)
+
+
 def _run_time_exhausted_result(run_time_left: float) -> ToolResult:
     """Refuse a command the run's time limit would stop before it could run."""
 
@@ -1042,7 +1062,7 @@ def _command_content(
     stdout_truncated: bool,
     stderr_truncated: bool,
     mutation_settlement: RunnerWorkspaceMutationSettlement,
-    requested_timeout_s: int | None = None,
+    requested_timeout_s: int,
 ) -> str:
     output = stdout.strip()
     error = stderr.strip()
@@ -1060,7 +1080,7 @@ def _command_content(
     if timed_out:
         shortened = (
             f" (shortened from {requested_timeout_s} seconds to fit the run's time limit)"
-            if requested_timeout_s is not None and timeout_s < requested_timeout_s
+            if timeout_s < requested_timeout_s
             else ""
         )
         reason = f"Command timed out after {timeout_s} seconds{shortened}.{stop}"

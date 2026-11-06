@@ -11057,7 +11057,10 @@ rather than when a long call returns:
   needs reconciliation as above. To keep the command's output, `exec_command`
   also shortens a `timeout_s` that would outlive the time left, leaving the
   runner up to 5 seconds (at most half the time left) to stop the command and
-  return; the result says "shortened from M seconds to fit the run's time
+  return. It fits the timeout before its command policy sees the request and
+  again when it hands the command to the runner; time the runner itself spends
+  before starting the command (a deferred environment materializing on its
+  first command, for example) still counts against it. The result says "shortened from M seconds to fit the run's time
   limit" and adds `timeout_s` and `requested_timeout_s`. With less than a whole
   second to give the command, it isn't run (`error="run_time_exhausted"`).
 - **Finishing.** With `on_limit="finish"` and a structured answer requested,

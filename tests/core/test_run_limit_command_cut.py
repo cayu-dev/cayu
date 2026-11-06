@@ -30,7 +30,14 @@ from cayu.messages import Message
 from cayu.providers import ModelStreamEvent
 from cayu.runners.base import ExecCommand, ExecResult, Runner, attach_cancellation_artifacts
 from cayu.sessions.requests import RunRequest
-from cayu.tools.commands import ExecCommandTool
+from cayu.tools.base import ToolContext
+from cayu.tools.commands import (
+    CommandPolicy,
+    CommandPolicyDecision,
+    CommandPolicyResult,
+    CommandRequest,
+    ExecCommandTool,
+)
 
 
 def kill_receipt(status: str) -> dict[str, Any]:
@@ -75,7 +82,11 @@ def exec_call() -> list[ModelStreamEvent]:
 
 
 def command_app(
-    provider: SlowStepProvider, runner: Runner, *, tool_timeout_seconds: float | None = None
+    provider: SlowStepProvider,
+    runner: Runner,
+    *,
+    tool_timeout_seconds: float | None = None,
+    policy: CommandPolicy | None = None,
 ) -> CayuApp:
     app = CayuApp(
         config=CayuConfig(
@@ -89,7 +100,7 @@ def command_app(
     )
     app.register_agent(
         AgentSpec(name="reviewer", model="fake"),
-        tools=[ExecCommandTool(max_timeout_seconds=3_600)],
+        tools=[ExecCommandTool(max_timeout_seconds=3_600, policy=policy)],
     )
     return app
 
@@ -249,5 +260,38 @@ def test_command_is_refused_when_the_run_has_no_time_left_for_it(monkeypatch):
         stored = await app.session_store.load_events("command-refused")
         assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in stored)
         only(events, EventType.STRUCTURED_OUTPUT_VALIDATED)
+
+    run_on_virtual_clock(monkeypatch, scenario)
+
+
+class SlowAllowPolicy(CommandPolicy):
+    """Allows every command after a slow decision."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.timeouts: list[int] = []
+
+    async def evaluate(self, ctx: ToolContext, request: CommandRequest) -> CommandPolicyResult:
+        self.timeouts.append(request.timeout_s)
+        await asyncio.sleep(self.seconds)
+        return CommandPolicyResult(decision=CommandPolicyDecision.ALLOW)
+
+
+def test_command_timeout_is_fitted_again_after_a_slow_policy(monkeypatch):
+    runner = TimeoutHonoringRunner()
+    policy = SlowAllowPolicy(seconds=20)
+    provider = SlowStepProvider([exec_call(), verdict_answer()], delays=[])
+    app = command_app(provider, runner, policy=policy)
+
+    async def scenario(loop: VirtualClockLoop) -> None:
+        await run_events(app, finish_request("command-slow-policy"))
+        cutoff = LIMIT_SECONDS - RESERVE_SECONDS
+        # The policy sees the timeout fitted at the start; the runner gets what is left after it.
+        assert policy.timeouts == [cutoff - 5]
+        assert runner.timeouts == [cutoff - 20 - 5]
+        stored = await app.session_store.load_events("command-slow-policy")
+        assert not any(event.type is EventType.TOOL_EFFECT_OUTCOME_UNKNOWN for event in stored)
+        result = await tool_result(app, "command-slow-policy", "call-0")
+        assert result["structured"]["timeout_s"] == cutoff - 20 - 5
 
     run_on_virtual_clock(monkeypatch, scenario)
