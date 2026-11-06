@@ -146,6 +146,8 @@ from cayu.runtime._tool_invocation.cancellation import (
 )
 from cayu.runtime._tool_invocation.context import (
     _environment_name,
+    _event_with_targeted_tool_invocation_authority,
+    _targeted_tool_invocation_payload,
     _workspace_id,
 )
 from cayu.runtime._tool_invocation.hooks import (
@@ -2563,23 +2565,27 @@ class ToolRoundRun:
             ),
             "abnormal_termination": True,
             "result": result.model_dump(),
+            **_targeted_tool_invocation_payload(tool_call),
             **tool_argument_publication.unavailable_argument_projection().payload_fields(),
             **copy_tool_round_identity(tool_round_identity).payload(),
         }
         event = await self._executor._event_writer.emit(
-            _event_with_tool_round_authority(
-                event_with_execution_profile_authority(
-                    Event(
-                        type=EventType.TOOL_CALL_FAILED,
-                        session_id=self._session.id,
-                        agent_name=self._registered_agent.spec.name,
-                        environment_name=self._environment_name,
-                        tool_name=tool_call.name,
-                        payload=payload,
+            _event_with_targeted_tool_invocation_authority(
+                _event_with_tool_round_authority(
+                    event_with_execution_profile_authority(
+                        Event(
+                            type=EventType.TOOL_CALL_FAILED,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            tool_name=tool_call.name,
+                            payload=payload,
+                        ),
+                        self._execution_profile,
                     ),
-                    self._execution_profile,
+                    tool_round_identity,
                 ),
-                tool_round_identity,
+                tool_call,
             )
         )
         return (
