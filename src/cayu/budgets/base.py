@@ -4,6 +4,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from bisect import bisect_right, insort
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, DecimalException, Inexact, localcontext
@@ -1231,7 +1232,7 @@ class BudgetLimit(BaseModel):
     @field_validator("pricing", mode="before")
     @classmethod
     def copy_pricing(cls, value: object) -> object:
-        return revalidate_model_input(value, PriceBook)
+        return _detached_price_book(value)
 
     @field_validator("max_estimated_cost")
     @classmethod
@@ -1260,6 +1261,61 @@ class BudgetLimit(BaseModel):
         if type(value) is not BudgetReservation:
             raise TypeError("reservation must be a BudgetReservation.")
         return copy_budget_reservation(value)
+
+
+_BUDGET_LIMIT_FIELDS = set(BudgetLimit.model_fields)
+# Validated budget limits and their definition digests, by a hash of the limit's
+# JSON form; see _budget_limit_definition_digest.
+_DEFINITION_DIGESTS: OrderedDict[str, tuple[str, BudgetLimit]] = OrderedDict()
+_DEFINITION_DIGESTS_LOCK = Lock()
+_DEFINITION_DIGESTS_MAX = 64
+# Validated price books by a hash of their JSON form; see _detached_price_book.
+_PRICE_BOOK_TEMPLATES: OrderedDict[str, PriceBook] = OrderedDict()
+_PRICE_BOOK_TEMPLATES_LOCK = Lock()
+_PRICE_BOOK_TEMPLATES_MAX = 64
+
+
+def _equals_validated(value: object, validated: object) -> bool:
+    """Whether a caller's value equals one Cayu validated, so validating it gives the same.
+
+    Callers find validated values by the JSON form, which an unvalidated value
+    (one built with ``model_copy(update=...)``, say) can share with a valid one:
+    a dimension of "ab" serializes like ("a", "b"). Such a value differs from the
+    valid one under ``==``, as does a NaN rate or a list where a tuple belongs.
+    """
+
+    try:
+        return bool(value == validated)
+    except Exception:
+        return False
+
+
+def _detached_price_book(value: object) -> object:
+    """Detach a price book from its caller, revalidated as ``revalidate_model_input`` does.
+
+    A model step copies its budget limits many times, and revalidating a price
+    book costs about twice a deep copy of one already validated. A book equal to
+    one validated earlier gets a deep copy of that one instead.
+    """
+
+    if type(value) is not PriceBook:
+        return revalidate_model_input(value, PriceBook)
+    try:
+        key = sha256(value.model_dump_json(warnings=False).encode()).hexdigest()
+    except Exception:
+        return revalidate_model_input(value, PriceBook)
+    with _PRICE_BOOK_TEMPLATES_LOCK:
+        template = _PRICE_BOOK_TEMPLATES.get(key)
+        if template is not None:
+            _PRICE_BOOK_TEMPLATES.move_to_end(key)
+    if template is not None and _equals_validated(value, template):
+        return template.model_copy(deep=True)
+    detached = revalidate_model_input(value, PriceBook)
+    with _PRICE_BOOK_TEMPLATES_LOCK:
+        _PRICE_BOOK_TEMPLATES[key] = detached.model_copy(deep=True)
+        while len(_PRICE_BOOK_TEMPLATES) > _PRICE_BOOK_TEMPLATES_MAX:
+            _PRICE_BOOK_TEMPLATES.popitem(last=False)
+    return detached
 
 
 class _EffectiveBudgetLimit(BudgetLimit):
@@ -3668,7 +3724,8 @@ def _copy_budget_limit_fields(limit: BudgetLimit) -> dict[str, Any]:
     return {
         "scope": limit.scope,
         "max_estimated_cost": limit.max_estimated_cost,
-        "pricing": limit.pricing.model_copy(deep=True),
+        # BudgetLimit's pricing validator detaches the price book.
+        "pricing": limit.pricing,
         "currency": limit.currency,
         "window": limit.window,
         "key": limit.key,
@@ -3740,11 +3797,39 @@ def _effective_budget_limits(
 def _budget_limit_definition_digest(limit: BudgetLimit) -> str:
     """Hash budget semantics independently of Decimal input spelling."""
 
+    # Recomputing the digest revalidates and walks the whole price book, and a
+    # model step copies its limits many times. A limit equal to one validated
+    # earlier has that one's digest.
+    try:
+        key = sha256(
+            limit.model_dump_json(include=_BUDGET_LIMIT_FIELDS, warnings=False).encode()
+        ).hexdigest()
+    except Exception:
+        return _computed_budget_limit_definition_digest(limit)[0]
+    with _DEFINITION_DIGESTS_LOCK:
+        cached = _DEFINITION_DIGESTS.get(key)
+        if cached is not None:
+            _DEFINITION_DIGESTS.move_to_end(key)
+    if cached is not None and all(
+        _equals_validated(getattr(limit, name), getattr(cached[1], name))
+        for name in _BUDGET_LIMIT_FIELDS
+    ):
+        return cached[0]
+    digest, configured = _computed_budget_limit_definition_digest(limit)
+    with _DEFINITION_DIGESTS_LOCK:
+        _DEFINITION_DIGESTS[key] = (digest, configured)
+        while len(_DEFINITION_DIGESTS) > _DEFINITION_DIGESTS_MAX:
+            _DEFINITION_DIGESTS.popitem(last=False)
+    return digest
+
+
+def _computed_budget_limit_definition_digest(limit: BudgetLimit) -> tuple[str, BudgetLimit]:
     configured = BudgetLimit(**_copy_budget_limit_fields(limit))
     python_value = configured.model_dump(mode="python")
     json_value = configured.model_dump(mode="json")
     semantic_value = _semantic_budget_identity_value(python_value, json_value)
-    return sha256(canonical_durable_json_bytes(semantic_value, "budget_limit")).hexdigest()
+    digest = sha256(canonical_durable_json_bytes(semantic_value, "budget_limit")).hexdigest()
+    return digest, configured
 
 
 def _semantic_budget_identity_value(python_value: Any, json_value: Any) -> Any:
