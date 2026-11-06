@@ -537,5 +537,34 @@ which sends `profile_adoption` (see [Approvals across an upgrade](#approvals-acr
 `dismiss` dismisses a recovery item, with the required `--reason`, by abandoning its
 session (see [Dismissing a recovery item](#dismissing-a-recovery-item)).
 
+### What Cloud recorded
+
+Cayu Cloud keeps its own record of every decision it carries to an Agent: who decided
+what, on which item and session, when, and what the Agent answered. `cayu inbox
+decisions --application NAME` lists those records, newest first, so a batch of
+decisions can be checked without reading every item from the Agent. That matters
+after a decision answered `decision_outcome_unknown`, or once a new Release has given
+an item a new id:
+
+```console
+$ cayu inbox decisions --application month-end-close --since 12h --outcome failed --outcome refused
+REQUESTED                  DECISION  OUTCOME  CODE     KIND      ITEM        SESSION    BY
+2026-11-06T06:00:00+00:00  approve   failed   timeout  approval  inbox_...   invoice-7  user_...
+```
+
+`outcome` is `pending` while Cloud is still asking, `settled`, `replayed` (the Agent
+had already recorded that exact decision), `refused` (with the Agent's code, such as
+`already_settled`), or `failed` when Cloud couldn't tell, with why in `code`. A
+`failed` record means its item needs reading (`cayu inbox show`). `--since` and
+`--until` take a span back from now (`90m`, `12h`, `2d`) or an ISO 8601 time;
+`--outcome` (repeat it for several), `--item ITEM_ID` and `--session SESSION_ID`
+narrow the list further. `--limit N` lists up to N records (50 by default, at most
+1000), reading Cloud's pages of up to 100. When more remain, it prints where to go
+on: pass that to `--cursor` with the same filters. `--json` prints the records whole,
+along with the filters Cloud applied. A Cloud too old to apply the filters refuses
+them (`decision_filters_unsupported`) instead of listing records they would have
+left out. These records are Cloud's own, so the command needs `--application`.
+Cloud shows them to anyone who may see the Agent.
+
 The output is a table by default and JSON with `--json`, with a `schema_version`.
 An item someone else settled first is reported with who decided and when.

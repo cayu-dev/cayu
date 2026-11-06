@@ -7,6 +7,7 @@ import getpass
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1125,3 +1126,169 @@ def test_the_local_inbox_pages_every_kind_and_counts_it(tmp_path) -> None:
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+def _record(record_id: str, outcome: str, **fields: Any) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "application_id": "bugs",
+        "item_id": "inbox_a",
+        "item_kind": "approval",
+        "item_title": "Tool approval required",
+        "session_id": "s1",
+        "attention_id": None,
+        "decision": "approve",
+        "with_changes": False,
+        "decided_by": "user_1",
+        "role": "member",
+        "requested_at": "2026-11-06T06:00:00+00:00",
+        "outcome": outcome,
+        "outcome_code": None,
+        "completed_at": "2026-11-06T06:00:31+00:00",
+        "agent_decided_by": None,
+        "agent_decided_at": None,
+        **fields,
+    }
+
+
+class _DecisionsCloud:
+    """Cloud's decision records route, answering ``pages`` in turn."""
+
+    def __init__(self, *pages: dict[str, Any]) -> None:
+        self.pages = list(pages)
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def request(self, method, path, **options):
+        self.calls.append((method, path, options))
+        return self.pages.pop(0)
+
+
+def test_decisions_lists_clouds_records_chosen_by_time_outcome_and_session(
+    monkeypatch, capsys
+) -> None:
+    filters = {
+        "since": "2026-11-05T17:00:00+00:00",
+        "until": None,
+        "outcome": ["failed", "refused"],
+        "item_id": None,
+        "session_id": "s1",
+    }
+    cloud = _DecisionsCloud(
+        {
+            "items": [_record("decision_2", "failed", outcome_code="timeout")],
+            "next_cursor": "c1",
+            "filters": filters,
+        },
+        {
+            "items": [_record("decision_1", "refused", outcome_code="already_settled")],
+            "next_cursor": None,
+            "filters": filters,
+        },
+    )
+    import cayu.cli.cloud as cloud_cli
+
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_kwargs: cloud)
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: f"id-{name}")
+
+    assert (
+        main(
+            [
+                "inbox",
+                "decisions",
+                "--application",
+                "bugs",
+                "--since",
+                "2026-11-05T17:00:00Z",
+                "--outcome",
+                "failed",
+                "--outcome",
+                "refused",
+                "--session",
+                "s1",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    printed = _json(capsys)
+    assert [row["id"] for row in printed["items"]] == ["decision_2", "decision_1"]
+    assert printed["filters"] == filters
+    assert printed["next_cursor"] is None
+    # The same filters go with each page, and the second goes on from the first's cursor.
+    asked = [call[2]["query"] for call in cloud.calls]
+    assert [call[1] for call in cloud.calls] == ["/v1/inbox/decisions"] * 2
+    assert asked[0] == {
+        "since": "2026-11-05T17:00:00+00:00",
+        "outcome": ["failed", "refused"],
+        "session_id": "s1",
+        "application_id": "id-bugs",
+        "limit": "50",
+    }
+    assert asked[1] == {**asked[0], "limit": "49", "cursor": "c1"}
+
+
+def test_decisions_prints_what_the_agent_answered_and_where_to_go_on(monkeypatch, capsys) -> None:
+    cloud = _DecisionsCloud(
+        {
+            "items": [_record("decision_2", "failed", outcome_code="timeout")],
+            "next_cursor": "c1",
+            "filters": {"outcome": [], "since": None, "until": None, "item_id": None},
+        }
+    )
+    import cayu.cli.cloud as cloud_cli
+
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_kwargs: cloud)
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: name)
+
+    assert main(["inbox", "decisions", "--application", "bugs", "--limit", "1"]) == 0
+
+    out, err = capsys.readouterr()
+    header, row = out.splitlines()
+    assert header.split() == [
+        "REQUESTED",
+        "DECISION",
+        "OUTCOME",
+        "CODE",
+        "KIND",
+        "ITEM",
+        "SESSION",
+        "BY",
+    ]
+    assert row.split() == [
+        "2026-11-06T06:00:00+00:00",
+        "approve",
+        "failed",
+        "timeout",
+        "approval",
+        "inbox_a",
+        "s1",
+        "user_1",
+    ]
+    assert "--cursor c1" in err
+    assert cloud.calls[0][2]["query"] == {"application_id": "bugs", "limit": "1"}
+
+
+def test_decisions_refuses_filters_an_older_cloud_would_ignore(monkeypatch, capsys) -> None:
+    cloud = _DecisionsCloud({"items": [_record("decision_1", "settled")], "next_cursor": None})
+    import cayu.cli.cloud as cloud_cli
+
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_kwargs: cloud)
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: name)
+
+    assert (
+        main(["inbox", "decisions", "--application", "bugs", "--outcome", "failed", "--json"]) == 1
+    )
+    assert _json(capsys)["error"]["code"] == "decision_filters_unsupported"
+
+    # Without filters, it lists what that Cloud records.
+    cloud.pages.append({"items": [_record("decision_1", "settled")], "next_cursor": None})
+    assert main(["inbox", "decisions", "--application", "bugs", "--json"]) == 0
+    assert [row["id"] for row in _json(capsys)["items"]] == ["decision_1"]
+
+
+def test_decisions_needs_a_cloud_agent(capsys) -> None:
+    with pytest.raises(SystemExit) as exited:
+        main(["inbox", "decisions"])
+    assert exited.value.code == 2
+    assert "--application" in capsys.readouterr().err

@@ -37,6 +37,10 @@ _PAGE_LIMIT = 100
 #: The page a Cloud listing reads through Cloud at a time: one request to the Agent each.
 _CLOUD_PAGE_LIMIT = 50
 _KINDS = ("approval", "question", "recovery", "knowledge")
+#: What Cloud recorded the Agent answering a decision it carried (`GET /v1/inbox/decisions`).
+DECISION_OUTCOMES = ("pending", "settled", "replayed", "refused", "failed")
+#: The most decision records one request to Cloud reads.
+_DECISIONS_PAGE_LIMIT = 100
 #: How many items an older Cloud left out the CLI reads at once, by id.
 _LEFT_OUT_READS = 8
 #: How often the local client checks whether a continued session is still running.
@@ -77,6 +81,16 @@ class InboxListing:
     #: Why the listing may be incomplete, in plain words.
     notes: list[str] = field(default_factory=list)
     next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class DecisionRecords:
+    """Cloud's records of decisions it carried to an Agent, newest first. ``next_cursor`` goes on
+    after the last one, with the same ``filters`` (those Cloud says it applied)."""
+
+    items: list[dict[str, Any]]
+    next_cursor: str | None
+    filters: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -362,16 +376,62 @@ class CloudInbox:
         idempotency_key: Callable[[], str] = lambda: secrets.token_urlsafe(24),
     ) -> None:
         self._client = client
+        self._application_id = application_id
         self._base = f"/v1/applications/{quote(application_id, safe='')}/inbox"
         self._idempotency_key = idempotency_key
 
     def _request(self, method: str, path: str, **options: Any) -> dict[str, Any]:
+        return self._cloud(method, self._base + path, **options)
+
+    def _cloud(self, method: str, path: str, **options: Any) -> dict[str, Any]:
         from cayu.cli._cloud_api import CloudApiError
 
         try:
-            return self._client.request(method, self._base + path, **options)
+            return self._client.request(method, path, **options)
         except CloudApiError as exc:
             raise _cloud_refusal(exc) from None
+
+    async def decisions(
+        self, *, filters: dict[str, str | list[str]], limit: int, cursor: str | None = None
+    ) -> DecisionRecords:
+        """Cloud's records of the decisions it carried to this Agent, newest first: who decided
+        what, and what the Agent answered. At most ``limit``, following Cloud's cursor a page of
+        up to 100 at a time; ``next_cursor`` goes on when more are left.
+
+        ``filters`` (``since``, ``until``, ``outcome``, ``item_id``, ``session_id``) go with
+        every page. A Cloud that answers without ``filters`` doesn't apply them, so asking it
+        for any is refused rather than listing records they would have left out.
+        """
+
+        items: list[dict[str, Any]] = []
+        applied: dict[str, Any] | None = None
+        followed: set[str] = set()
+        while True:
+            query: dict[str, str | list[str]] = {
+                **filters,
+                "application_id": self._application_id,
+                "limit": str(min(_DECISIONS_PAGE_LIMIT, limit - len(items))),
+            }
+            if cursor is not None:
+                query["cursor"] = cursor
+            answer = await asyncio.to_thread(self._cloud, "GET", "/v1/inbox/decisions", query=query)
+            said = answer.get("filters")
+            if filters and not isinstance(said, dict):
+                raise InboxClientError(
+                    "decision_filters_unsupported",
+                    "This Cayu Cloud can't choose decision records by time, outcome, item or "
+                    "session yet. List them without --since, --until, --outcome, --item or "
+                    "--session.",
+                )
+            applied = said if isinstance(said, dict) else applied
+            items.extend(row for row in answer.get("items", []) if isinstance(row, dict))
+            cursor = answer.get("next_cursor")
+            if not isinstance(cursor, str) or not cursor or cursor in followed:
+                # A Cloud that keeps answering with the same cursor would never end.
+                cursor = None
+            if cursor is None or len(items) >= limit:
+                return DecisionRecords(items[:limit], cursor, applied)
+            followed.add(cursor)
 
     async def list_items(
         self,

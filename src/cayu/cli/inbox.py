@@ -18,11 +18,13 @@ import sys
 import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from cayu.cli._inbox_client import (
     _KINDS,
+    DECISION_OUTCOMES,
     CloudInbox,
     InboxClient,
     InboxClientError,
@@ -48,6 +50,9 @@ _DISMISSABLE = frozenset({"recovery", "approval", "question"})
 #: The Runtime's bound on one inbox page, and the page --cursor alone reads.
 _MAX_PAGE_LIMIT = 200
 _DEFAULT_PAGE_LIMIT = 50
+#: How many of Cloud's decision records `cayu inbox decisions` lists at most, and by default.
+_MAX_DECISIONS = 1000
+_DEFAULT_DECISIONS = 50
 
 
 def add_inbox_parser(subparsers: Any) -> None:
@@ -191,6 +196,67 @@ def add_inbox_parser(subparsers: Any) -> None:
     )
     _add_target_options(dismiss)
 
+    decisions = commands.add_parser(
+        "decisions",
+        help="List the decisions Cayu Cloud carried to an Agent and what it answered.",
+        description=(
+            "List Cayu Cloud's records of the decisions it carried to a Cloud Agent's inbox, "
+            "newest first: who decided what on which item and session, and what the Agent "
+            "answered (settled, replayed, refused with its code, or failed when Cloud couldn't "
+            "tell, as after a decision_outcome_unknown). Use it to see what happened to a batch "
+            "of decisions without reading every item again, including items whose id changed "
+            "with a new Release (choose them by --session). Cloud-only: it needs --application."
+        ),
+    )
+    decisions.add_argument(
+        "--since",
+        type=_record_time,
+        help="Asked at or after this time: a span back from now (90m, 12h, 2d) or ISO 8601.",
+    )
+    decisions.add_argument(
+        "--until",
+        type=_record_time,
+        help="Asked before this time: a span back from now or an ISO 8601 time.",
+    )
+    decisions.add_argument(
+        "--outcome",
+        action="append",
+        choices=DECISION_OUTCOMES,
+        help="Only this outcome; repeat it for several.",
+    )
+    decisions.add_argument("--item", metavar="ITEM_ID", help="Only decisions on this item.")
+    decisions.add_argument(
+        "--session", metavar="SESSION_ID", help="Only decisions on this session's items."
+    )
+    decisions.add_argument(
+        "--limit",
+        type=_decisions_limit,
+        default=_DEFAULT_DECISIONS,
+        help=f"List at most this many (1 to {_MAX_DECISIONS}, default {_DEFAULT_DECISIONS}).",
+    )
+    decisions.add_argument(
+        "--cursor", help="Go on from a listing: the next_cursor it printed, with the same filters."
+    )
+    where = decisions.add_argument_group("where the inbox is")
+    where.add_argument(
+        "--application",
+        metavar="NAME",
+        required=True,
+        help="The Cayu Cloud Agent's name or slug, read with your `cayu cloud login`.",
+    )
+    where.add_argument(
+        "--context",
+        type=Path,
+        help="Private Cayu Cloud context JSON (default: the selected one).",
+    )
+    where.add_argument(
+        "--timeout-seconds",
+        type=_positive_seconds,
+        default=60.0,
+        help="How long one Cayu Cloud request may take (default 60).",
+    )
+    add_output_options(decisions, formats=("json", "table"), default="table")
+
 
 def _add_item_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -272,8 +338,11 @@ async def _run(args: argparse.Namespace) -> int:
         reason = getattr(args, "reason", None)
         if reason is not None:
             _check_reason(reason)
-        if args.application is not None and args.reviewer is not None:
+        if args.application is not None and getattr(args, "reviewer", None) is not None:
             raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
+        if args.inbox_command == "decisions":
+            async with _inbox(args) as inbox:
+                return await _decisions(args, inbox)
         if args.inbox_command != "list" and (args.item_id is None) == (args.session is None):
             raise ValueError("Name the item with ITEM_ID or its session with --session.")
         if getattr(args, "adopt_profile", False) and reason is None:
@@ -417,6 +486,58 @@ async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
         )
     elif not listing.complete:
         print("note: this listing may not hold every item.", file=sys.stderr)
+    return 0
+
+
+async def _decisions(args: argparse.Namespace, inbox: InboxClient) -> int:
+    assert isinstance(inbox, CloudInbox)
+    filters: dict[str, str | list[str]] = {
+        name: value
+        for name, value in (
+            ("since", None if args.since is None else args.since.isoformat()),
+            ("until", None if args.until is None else args.until.isoformat()),
+            ("outcome", args.outcome),
+            ("item_id", args.item),
+            ("session_id", args.session),
+        )
+        if value is not None
+    }
+    records = await inbox.decisions(filters=filters, limit=args.limit, cursor=args.cursor)
+    if args.output_format == "json":
+        _print_json(
+            {
+                "where": inbox.where,
+                "items": records.items,
+                "next_cursor": records.next_cursor,
+                "filters": records.filters,
+            }
+        )
+        return 0
+    if not records.items:
+        print("Cayu Cloud has no decision records that match.")
+    else:
+        _print_table(
+            ("requested", "decision", "outcome", "code", "kind", "item", "session", "by"),
+            [
+                {
+                    "requested": row.get("requested_at"),
+                    "decision": row.get("decision"),
+                    "outcome": row.get("outcome"),
+                    "code": row.get("outcome_code"),
+                    "kind": row.get("item_kind"),
+                    "item": row.get("item_id"),
+                    "session": row.get("session_id"),
+                    "by": row.get("decided_by"),
+                }
+                for row in records.items
+            ],
+        )
+    if records.next_cursor is not None:
+        print(
+            "note: more decisions follow; list them with the same filters and "
+            f"--cursor {_plain(records.next_cursor)}",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -843,6 +964,24 @@ def _positive_seconds(value: str) -> float:
     if not 0 < seconds <= 3600:
         raise argparse.ArgumentTypeError("seconds must be more than 0 and at most 3600.")
     return seconds
+
+
+def _record_time(value: str) -> datetime:
+    """A time as `cayu cloud service logs` takes it: a span back from now or ISO 8601."""
+
+    from cayu.cli._cloud_service_logs import log_time
+
+    return log_time(value)
+
+
+def _decisions_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
+    if not 1 <= limit <= _MAX_DECISIONS:
+        raise argparse.ArgumentTypeError(f"the limit must be 1 to {_MAX_DECISIONS}.")
+    return limit
 
 
 def _page_limit(value: str) -> int:
