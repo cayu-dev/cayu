@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, cast
+from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import StringConstraints, ValidationError
 
 from cayu.knowledge._retrieval_results import _truncate_text_to_bytes as truncate_text_to_bytes
@@ -16,6 +17,10 @@ from cayu.knowledge.activation_contracts import (
     KnowledgeActivationSource,
 )
 from cayu.knowledge.base import KnowledgeStore
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationConflict,
+    copy_knowledge_publication_receipt,
+)
 from cayu.knowledge.records import (
     KnowledgeActorType,
     KnowledgeEntry,
@@ -38,12 +43,15 @@ from cayu.server.contracts import (
 from cayu.sessions.event_queries import EventQueryResultTooLarge
 from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.knowledge_usage import retained_knowledge_usage
+from cayu.storage._knowledge_rejection import KnowledgeReviewMaterialTooLarge
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 
 
+#: The reviewer version a knowledge decision made through these routes records.
+KNOWLEDGE_REVIEWER_VERSION = "1"
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 # Chunks are read whole up to this many bytes, then redacted, then bounded for the caller.
 _CHUNK_READ_BYTES = 1_048_576
@@ -436,8 +444,25 @@ def register_kept_knowledge(
     async def retire_knowledge(
         entry_id: NonBlankString,
         body: RetireKnowledgeRequest,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=256),
+        ] = None,
         auth_context: AuthContext | None = auth_default,
     ):
+        """Archive one kept entry, so knowledge search no longer finds it.
+
+        With a ``reason`` or an ``Idempotency-Key`` the retirement records its reviewer and
+        reason on the archived revision, and a retry under the same key replays it.
+        """
+
+        from cayu.server.routes import _knowledge_reviewer_attribution
+
+        reviewed = body.reason is not None or idempotency_key is not None
+        if not reviewed and body.expected_revision is None:
+            raise HTTPException(
+                422, "Name expected_revision, or give a reason or an Idempotency-Key."
+            )
         owner = workflow()
         store = cast("KnowledgeStore", owner.store)
         try:
@@ -445,6 +470,31 @@ def register_kept_knowledge(
             if entry is None:
                 raise HTTPException(404, "Knowledge entry not found.")
             await gate.require_knowledge(auth_context, entry)
+            if reviewed:
+                operation_id = idempotency_key or f"server-knowledge-retire-{uuid4().hex}"
+                revision = await reviewed_decision_revision(
+                    owner,
+                    entry,
+                    operation_id,
+                    expected_revision=body.expected_revision,
+                    from_status=KnowledgeStatus.ACTIVE,
+                )
+                identity, annotations = _knowledge_reviewer_attribution(auth_context)
+                archived = await owner.archive_reviewed(
+                    entry_id,
+                    expected_revision=revision,
+                    operation_id=operation_id,
+                    reviewer_identity=identity,
+                    reviewer_version=KNOWLEDGE_REVIEWER_VERSION,
+                    reason=app.redact_json(body.reason),
+                    annotations=annotations,
+                )
+                return {
+                    "entry_id": entry_id,
+                    "revision": archived.entry.revision,
+                    "status": "archived",
+                    "reason": app.redact_json(archived.decision.reason),
+                }
             # Preserve hidden-item responses before binding the authorized revision.
             if entry.revision != body.expected_revision:
                 raise HTTPException(
@@ -462,11 +512,55 @@ def register_kept_knowledge(
             return {"entry_id": entry_id, "revision": retired.revision, "status": "archived"}
         except NotImplementedError:
             raise HTTPException(501, "This store does not support knowledge retirement.") from None
+        except KnowledgeReviewMaterialTooLarge:
+            raise HTTPException(
+                413,
+                "This entry is too large to retire with a recorded reason; retire it by "
+                "expected_revision alone.",
+            ) from None
         except KeyError:
             raise HTTPException(404, "Knowledge entry not found.") from None
         except PermissionError:
             raise HTTPException(403, "Knowledge access denied.") from None
-        except (KnowledgeRevisionConflict, KnowledgeActivationConflict, ValueError):
+        except (
+            KnowledgeRevisionConflict,
+            KnowledgeActivationConflict,
+            KnowledgePublicationConflict,
+            ValueError,
+        ):
             raise HTTPException(
                 409, "Knowledge retirement conflicts with its current revision or scope."
             ) from None
+
+
+async def reviewed_decision_revision(
+    owner: KnowledgeReviewWorkflow,
+    entry: KnowledgeEntry,
+    operation_id: str,
+    *,
+    expected_revision: int | None,
+    from_status: KnowledgeStatus,
+) -> int:
+    """The revision a reviewed drop or retirement under ``operation_id`` archives.
+
+    The revision an earlier attempt under the same operation recorded, so a retry replays
+    it instead of conflicting with the archived revision it wrote; otherwise the entry's
+    current revision, which must be in ``from_status``. ``expected_revision`` must match
+    it when given. Raises ``KnowledgePublicationConflict`` otherwise.
+    """
+
+    raw = await owner.store.load_entry_publication_receipt(
+        operation_id, access_scope=owner.access_scope
+    )
+    if raw is not None:
+        receipt = copy_knowledge_publication_receipt(raw)
+        if receipt.entry_id != entry.id or receipt.expected_revision is None:
+            raise KnowledgePublicationConflict("operation_mismatch")
+        revision = receipt.expected_revision
+    elif entry.status is not from_status:
+        raise KnowledgePublicationConflict("entry_unavailable")
+    else:
+        revision = entry.revision
+    if expected_revision is not None and expected_revision != revision:
+        raise KnowledgePublicationConflict("revision_mismatch")
+    return revision

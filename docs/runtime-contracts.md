@@ -17967,6 +17967,12 @@ preserves evidence, and records matching publication and activation receipts wit
 immutable reviewer attribution. An exact retry
 returns the original approval without rerunning generation, evaluation, or an
 automatic activation policy. It is not a model-facing tool.
+`reject_reviewed` archives a pending proposal and `archive_reviewed` archives a
+kept (active) revision; both publish the archived successor through
+`publish_entry_revision` with the reviewer, version, optional reason and
+annotations in its metadata (`cayu:review_rejection` or `cayu:review_archive`),
+authenticated by the publication receipt of the operation ID, so an exact retry
+replays and a different decision under that ID conflicts.
 
 The packaged server/dashboard uses the same workflow when `CayuApp` is
 constructed with `knowledge_store=...`; `knowledge_review_namespace` and

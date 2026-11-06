@@ -996,10 +996,30 @@ Full-access callers can retire an entry with
 atomically transitions that exact active revision to archived, preserving its
 content and durable evidence. A stale revision or incompatible lifecycle returns
 409. The response contains the entry ID, new revision and archived status. This
-operation does not promise idempotent acknowledgement replay: after a lost
+form does not promise idempotent acknowledgement replay: after a lost
 response, inspect canonical state; repeating the old revision can return 409.
-Members cannot retire entries. Retirement does not replace Keep or Drop for
-pending proposals.
+
+Give a `reason` (up to 4,096 characters), an `Idempotency-Key` header, or both, and
+the retirement is recorded: the archived revision carries the reviewer (the verified
+`AuthContext.subject`, as for Keep) and the redacted reason in its
+`cayu:review_archive` metadata, bound to the publication receipt of that key. The
+response then also returns the recorded `reason`. `expected_revision` becomes optional;
+without it the server fences against the revision it reads. A retry under the same key
+and the same reason replays the retirement, returning the same revision even though
+the entry is now archived; another reason under that key, or a different revision,
+returns 409. Members cannot retire entries. Retirement does not replace Keep or Drop
+for pending proposals: a pending entry returns 409.
+
+`POST /api/knowledge/{entry_id}/approve` and `/reject` take an optional JSON body
+`{"reason": "..."}`, and both take `Idempotency-Key`. Keep records the redacted reason
+in its activation receipt's reviewer annotations, where the inbox's Keep records it.
+A Drop with a reason or a key is a reviewed rejection, the same as the inbox's Drop:
+the archived revision records the reviewer and reason in its `cayu:review_rejection`
+metadata, and a retry under the same key replays it. The inbox then shows that proposal
+as dropped, with its reviewer and reason, once it verifies the drop's publication
+receipt. A Drop with neither archives the
+proposal as before, without attribution. Both responses carry the recorded `reason`,
+or null.
 
 `cayu knowledge list` and `cayu knowledge show ENTRY_ID` read the same entries
 from the command line, from a local store (`--sqlite`, `--postgres`, or the
@@ -1013,20 +1033,33 @@ cayu knowledge list --status pending --namespace reviews --json
 cayu knowledge show ENTRY_ID
 ```
 
-To review proposals against a running server:
+To review proposals, and archive kept entries, against a running server or a Cloud
+Agent (`--application NAME`):
 
 ```bash
 cayu knowledge list --status pending --server-url http://127.0.0.1:8000 --json
-cayu knowledge keep ENTRY_ID --operation-id review-2026-10-29 --json
-cayu knowledge drop ENTRY_ID --json
+cayu knowledge keep ENTRY_ID --operation-id review-2026-10-29 --reason "Matches the runbook" --json
+cayu knowledge drop ENTRY_ID --operation-id drop-2026-10-29 --reason "Duplicates ENTRY_ID2" --json
+cayu knowledge archive ENTRY_ID --reason "The worker now runs three processes" --json
 ```
 
 Keep calls the existing approval workflow with an explicit idempotency key;
 repeating that key returns the approved-entry projection using the durable
 activation receipt. Keep records authenticated reviewer attribution. Drop archives
-a pending proposal through the existing rejection workflow; it does not record
-reviewer attribution. Both preserve the server's review scope and permissions. Local store options
-remain read-only; mutations always go through the running server.
+a pending proposal through the rejection workflow. Archive retires a kept (active)
+entry, so `search_knowledge` no longer finds it, and requires `--reason`; `--revision N`
+archives only if the entry is still at revision N. All three take `--operation-id`
+(required for keep) and `--reason`; with either, drop and archive record the reviewer
+and reason on the archived revision, and repeating the same command with the same
+operation ID replays it instead of reporting a conflict. Archive needs full access; on
+a Cloud Agent the CLI uses the Agent's operator login, which has it. An Agent on a Cayu
+from before reasons makes the keep or drop without one, and the CLI warns that it
+wasn't recorded. All preserve the server's review scope and permissions. Local store
+options remain read-only; mutations always go through the running server.
+`cayu knowledge show` on a local store prints who archived or dropped an entry and
+why (`archived_by`, `archived_reason`, `dropped_by`, `dropped_reason`); a Cloud Agent's
+API serves only kept and pending entries, so read an archived entry's reason from the
+archive command's answer.
 
 `--status` is `active` (kept, the default) or `pending`, and `archived` from a
 local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`

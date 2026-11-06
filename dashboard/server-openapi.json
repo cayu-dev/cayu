@@ -2813,6 +2813,17 @@
             "title": "Namespace",
             "type": "string"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
           "revision": {
             "maximum": 2147483647.0,
             "minimum": 1.0,
@@ -27646,6 +27657,26 @@
         "title": "KeptKnowledgeListResponse",
         "type": "object"
       },
+      "KnowledgeReviewDecisionRequest": {
+        "additionalProperties": false,
+        "description": "An optional body for `approve` and `reject`: why the reviewer decided so.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "KnowledgeReviewDecisionRequest",
+        "type": "object"
+      },
       "KnowledgeVisibility": {
         "enum": [
           "global",
@@ -38628,17 +38659,34 @@
       },
       "RetireKnowledgeRequest": {
         "additionalProperties": false,
+        "description": "Which kept revision to retire, and optionally why.\n\n``expected_revision`` fences the retirement to the revision the caller saw. It may\nbe left out only together with a ``reason`` or an ``Idempotency-Key``: that retirement\nis recorded with its reviewer, and a retry under the same key replays it.",
         "properties": {
           "expected_revision": {
-            "maximum": 2147483647.0,
-            "minimum": 1.0,
-            "title": "Expected Revision",
-            "type": "integer"
+            "anyOf": [
+              {
+                "maximum": 2147483647.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Revision"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
           }
         },
-        "required": [
-          "expected_revision"
-        ],
         "title": "RetireKnowledgeRequest",
         "type": "object"
       },
@@ -38648,6 +38696,17 @@
           "entry_id": {
             "title": "Entry Id",
             "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
           },
           "revision": {
             "maximum": 2147483647.0,
@@ -56140,6 +56199,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/KnowledgeReviewDecisionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -56178,8 +56254,43 @@
               "title": "Entry Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/KnowledgeReviewDecisionRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -56207,6 +56318,7 @@
     },
     "/api/knowledge/{entry_id}/retire": {
       "post": {
+        "description": "Archive one kept entry, so knowledge search no longer finds it.\n\nWith a ``reason`` or an ``Idempotency-Key`` the retirement records its reviewer and\nreason on the archived revision, and a retry under the same key replays it.",
         "operationId": "retire_knowledge_api_knowledge__entry_id__retire_post",
         "parameters": [
           {
@@ -56217,6 +56329,24 @@
               "minLength": 1,
               "title": "Entry Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
             }
           }
         ],

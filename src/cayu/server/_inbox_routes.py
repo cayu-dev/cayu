@@ -66,6 +66,7 @@ from cayu.runtime.human_attention import (
 from cayu.server._inbox_access import PENDING_KINDS, InboxAccessGate
 from cayu.server._inbox_counts import count_inbox
 from cayu.server._inbox_cursor import InboxCursorSeal
+from cayu.server._kept_knowledge import KNOWLEDGE_REVIEWER_VERSION
 from cayu.server._knowledge_preview import INBOX_DETAIL_CHARS, knowledge_excerpt
 from cayu.server.contracts import ApiErrorResponse
 from cayu.server.inbox import (
@@ -109,6 +110,7 @@ from cayu.sessions.pending_action_contracts import (
 from cayu.sessions.pending_actions import manual_recovery_action_id, manual_recovery_identity
 from cayu.sessions.queries import decode_session_cursor
 from cayu.sessions.records import EventRecord, PendingActionKind, Session, SessionStatusConflict
+from cayu.storage._knowledge_rejection import DROP_OPERATION_ANNOTATION, REJECTION_METADATA_KEY
 
 if TYPE_CHECKING:
     from fastapi.params import Depends
@@ -149,7 +151,6 @@ _CLAIM_SCAN_PAGES = 20
 _PENDING_SCAN_LIMIT = 200
 _KNOWLEDGE_PAGE_MAX_BYTES = 262_144
 _KNOWLEDGE_SCAN_PAGES = 10
-_KNOWLEDGE_REVIEWER_VERSION = "1"
 _NO_STORE = {"Cache-Control": "private, no-store"}
 _NOT_FOUND = "Inbox item not found."
 
@@ -524,6 +525,18 @@ def _proposal_content(entry: KnowledgeEntry) -> dict[str, Any]:
     """Everything a status change leaves as it was."""
 
     return entry.model_dump(exclude={"revision", "status", "updated_at"})
+
+
+def _named_drop_operation(entry: KnowledgeEntry) -> str | None:
+    """The operation a reviewed drop through the knowledge routes recorded it under.
+
+    Unauthenticated on its own: the caller reads the receipt it names before trusting it.
+    """
+
+    decision = entry.metadata.get(REJECTION_METADATA_KEY)
+    annotations = decision.get("annotations") if isinstance(decision, dict) else None
+    named = annotations.get(DROP_OPERATION_ANNOTATION) if isinstance(annotations, dict) else None
+    return named if type(named) is str and named.strip() else None
 
 
 def _pending_state(item: InboxItem) -> InboxItemState:
@@ -1212,6 +1225,18 @@ def register_inbox_routes(
                 return None
             except (KnowledgePublicationConflict, TypeError, ValueError):
                 return InboxItemState(id=item_id, kind="knowledge", status="unavailable"), proposal
+            named = _named_drop_operation(successor)
+            if reviewed is None and named is not None:
+                # A drop through `/knowledge/{id}/reject` names its own operation; only the
+                # store's receipt for it, matching this exact successor, makes it a drop.
+                try:
+                    reviewed = await workflow.load_review_rejection(
+                        locator.entry_id, expected_revision=locator.revision, operation_id=named
+                    )
+                except PermissionError:
+                    return None
+                except (KnowledgePublicationConflict, TypeError, ValueError):
+                    reviewed = None
             if reviewed is not None:
                 settlement = InboxSettlement(
                     decision="drop",
@@ -1260,7 +1285,7 @@ def register_inbox_routes(
                     locator.entry_id,
                     operation_id=_knowledge_operation_id(locator),
                     reviewer_identity=identity,
-                    reviewer_version=_KNOWLEDGE_REVIEWER_VERSION,
+                    reviewer_version=KNOWLEDGE_REVIEWER_VERSION,
                     annotations=annotations,
                     expected_revision=locator.revision,
                 )
@@ -1270,7 +1295,7 @@ def register_inbox_routes(
                     expected_revision=locator.revision,
                     operation_id=_knowledge_operation_id(locator, "drop"),
                     reviewer_identity=identity,
-                    reviewer_version=_KNOWLEDGE_REVIEWER_VERSION,
+                    reviewer_version=KNOWLEDGE_REVIEWER_VERSION,
                     reason=cayu_app.redact_json(body.reason),
                     annotations=annotations,
                 )

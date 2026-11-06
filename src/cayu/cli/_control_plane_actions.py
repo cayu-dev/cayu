@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._validation import require_durable_clean_nonblank, require_durable_nonblank
 from cayu.cli._cloud_agent_api import (
     CayuApi,
     CayuApiError,
@@ -137,6 +137,13 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
         or result["revision"] < 1
     ):
         raise invalid
+    elif body.get("reason") is not None and "reason" not in result:
+        # An Agent on a Cayu from before reasons: the decision stands, without the reason.
+        print(
+            "warning: this Agent's Cayu doesn't record review reasons; the decision was "
+            "made without it. Deploy it with a newer Cayu to record reasons.",
+            file=sys.stderr,
+        )
     return _redact_sensitive(result)
 
 
@@ -260,8 +267,14 @@ def run_action(args: argparse.Namespace) -> int:
                             "payload": json_object_file(args.payload_file),
                         }
                 else:
-                    action = "approve" if args.knowledge_command == "keep" else "reject"
+                    action = {"keep": "approve", "drop": "reject", "archive": "retire"}[
+                        args.knowledge_command
+                    ]
                     path, body = f"/knowledge/{quote(args.entry_id, safe='')}/{action}", {}
+                    if args.reason is not None:
+                        body["reason"] = require_durable_nonblank(args.reason, "--reason")
+                    if getattr(args, "revision", None) is not None:
+                        body["expected_revision"] = args.revision
                 api = open_action_api(args)
                 replay_record: Path | None = None
                 if args.command == "task" and args.task_command == "replay":

@@ -1409,6 +1409,10 @@ export type ApiReviewedKnowledgeEntry = {
      */
     namespace: string;
     /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
      * Revision
      */
     revision: number;
@@ -13382,6 +13386,18 @@ export type KeptKnowledgeListResponse = {
 };
 
 /**
+ * KnowledgeReviewDecisionRequest
+ *
+ * An optional body for `approve` and `reject`: why the reviewer decided so.
+ */
+export type KnowledgeReviewDecisionRequest = {
+    /**
+     * Reason
+     */
+    reason?: string | null;
+};
+
+/**
  * KnowledgeVisibility
  */
 export type KnowledgeVisibility = 'global' | 'organization' | 'project' | 'workspace' | 'user' | 'session' | 'task';
@@ -18963,12 +18979,22 @@ export type ResumeBody = {
 
 /**
  * RetireKnowledgeRequest
+ *
+ * Which kept revision to retire, and optionally why.
+ *
+ * ``expected_revision`` fences the retirement to the revision the caller saw. It may
+ * be left out only together with a ``reason`` or an ``Idempotency-Key``: that retirement
+ * is recorded with its reviewer, and a retry under the same key replays it.
  */
 export type RetireKnowledgeRequest = {
     /**
      * Expected Revision
      */
-    expected_revision: number;
+    expected_revision?: number | null;
+    /**
+     * Reason
+     */
+    reason?: string | null;
 };
 
 /**
@@ -18979,6 +19005,10 @@ export type RetireKnowledgeResponse = {
      * Entry Id
      */
     entry_id: string;
+    /**
+     * Reason
+     */
+    reason?: string | null;
     /**
      * Revision
      */
@@ -29159,7 +29189,10 @@ export type GetPendingKnowledgeApiKnowledgePendingEntryIdGetResponses = {
 export type GetPendingKnowledgeApiKnowledgePendingEntryIdGetResponse = GetPendingKnowledgeApiKnowledgePendingEntryIdGetResponses[keyof GetPendingKnowledgeApiKnowledgePendingEntryIdGetResponses];
 
 export type ApproveKnowledgeApiKnowledgeEntryIdApprovePostData = {
-    body?: never;
+    /**
+     * Body
+     */
+    body?: KnowledgeReviewDecisionRequest | null;
     headers?: {
         /**
          * Idempotency-Key
@@ -29195,7 +29228,16 @@ export type ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponses = {
 export type ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse = ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponses[keyof ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponses];
 
 export type RejectKnowledgeApiKnowledgeEntryIdRejectPostData = {
-    body?: never;
+    /**
+     * Body
+     */
+    body?: KnowledgeReviewDecisionRequest | null;
+    headers?: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key'?: string | null;
+    };
     path: {
         /**
          * Entry Id
@@ -29226,6 +29268,12 @@ export type RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse = RejectKnowled
 
 export type RetireKnowledgeApiKnowledgeEntryIdRetirePostData = {
     body: RetireKnowledgeRequest;
+    headers?: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key'?: string | null;
+    };
     path: {
         /**
          * Entry Id

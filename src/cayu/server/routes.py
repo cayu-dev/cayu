@@ -127,11 +127,13 @@ from cayu.execution_profiles import (
 )
 from cayu.knowledge._retrieval_results import _truncate_text_to_bytes
 from cayu.knowledge.activation_contracts import KnowledgeActivationConflict, KnowledgeReviewApproval
+from cayu.knowledge.publication_contracts import KnowledgePublicationConflict
 from cayu.knowledge.records import (
     MAX_KNOWLEDGE_ACTIVATION_IDENTITY_BYTES,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeRevisionConflict,
+    KnowledgeStatus,
     KnowledgeVisibility,
 )
 from cayu.knowledge.search import KnowledgeListItem, encode_knowledge_list_cursor
@@ -208,7 +210,11 @@ from cayu.server._inbox_access import InboxAccessGate
 from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
-from cayu.server._kept_knowledge import register_kept_knowledge
+from cayu.server._kept_knowledge import (
+    KNOWLEDGE_REVIEWER_VERSION,
+    register_kept_knowledge,
+    reviewed_decision_revision,
+)
 from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._model_check_routes import register_model_check_route
@@ -295,6 +301,7 @@ from cayu.server.contracts import (
     ClientGenerationContract,
     EnvironmentsResponse,
     HealthResponse,
+    KnowledgeReviewDecisionRequest,
     ListSessionEventsResponse,
     ListSessionInteractionsResponse,
     ListSessionsResponse,
@@ -447,6 +454,7 @@ from cayu.sessions.topology import (
 from cayu.sessions.trace import SessionTraceReader
 from cayu.sessions.transcript_queries import TranscriptQuery
 from cayu.sessions.usage import UsageRollupQuery
+from cayu.storage._knowledge_rejection import DROP_OPERATION_ANNOTATION, KnowledgeReviewRejection
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.queries import TaskOrder, TaskQuery
@@ -9654,8 +9662,19 @@ def create_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        entry = result.entry if isinstance(result, KnowledgeReviewApproval) else result
-        return _serialize_reviewed_knowledge_entry(entry)
+        reason = None
+        if isinstance(result, KnowledgeReviewApproval):
+            recorded = result.receipt.authority.decision.annotations.get("reason")
+            reason = recorded if type(recorded) is str else None
+            entry = result.entry
+        elif isinstance(result, KnowledgeReviewRejection):
+            reason, entry = result.decision.reason, result.entry
+        else:
+            entry = result
+        return {
+            **_serialize_reviewed_knowledge_entry(entry),
+            "reason": cayu_app.redact_json(reason),
+        }
 
     @router.get(
         "/knowledge/pending",
@@ -9758,6 +9777,7 @@ def create_router(
     )
     async def approve_knowledge(
         entry_id: NonBlankString,
+        body: KnowledgeReviewDecisionRequest | None = None,
         idempotency_key: Annotated[
             str | None,
             Header(alias="Idempotency-Key", min_length=1, max_length=256),
@@ -9768,12 +9788,15 @@ def create_router(
         await _require_knowledge_access(auth_context, workflow, entry_id)
         operation_id = idempotency_key or f"server-knowledge-review-{uuid4().hex}"
         reviewer_identity, reviewer_annotations = _knowledge_reviewer_attribution(auth_context)
+        if body is not None and body.reason is not None:
+            # Where the inbox's keep records its reason too.
+            reviewer_annotations["reason"] = cayu_app.redact_json(body.reason)
         return await _apply_knowledge_review_action(
             lambda item_id: workflow.approve(
                 item_id,
                 operation_id=operation_id,
                 reviewer_identity=reviewer_identity,
-                reviewer_version="1",
+                reviewer_version=KNOWLEDGE_REVIEWER_VERSION,
                 annotations=reviewer_annotations,
             ),
             entry_id,
@@ -9785,11 +9808,61 @@ def create_router(
     )
     async def reject_knowledge(
         entry_id: NonBlankString,
+        body: KnowledgeReviewDecisionRequest | None = None,
+        idempotency_key: Annotated[
+            str | None,
+            Header(alias="Idempotency-Key", min_length=1, max_length=256),
+        ] = None,
         auth_context: AuthContext | None = optional_auth_context,
     ):
         workflow = _knowledge_review_workflow()
         await _require_knowledge_access(auth_context, workflow, entry_id)
-        return await _apply_knowledge_review_action(workflow.reject, entry_id)
+        reason = None if body is None else body.reason
+        if reason is None and idempotency_key is None:
+            return await _apply_knowledge_review_action(workflow.reject, entry_id)
+        # A reason or a retry key: archive the proposal with its reviewer and reason bound
+        # to the archived revision, as the inbox's drop does, so a retry replays it.
+        operation_id = idempotency_key or f"server-knowledge-drop-{uuid4().hex}"
+        reviewer_identity, reviewer_annotations = _knowledge_reviewer_attribution(auth_context)
+
+        async def reject_reviewed(item_id: str) -> KnowledgeReviewRejection:
+            entry = await workflow.get_entry(item_id)
+            if entry is None:
+                raise KeyError(f"Knowledge entry {item_id!r} does not exist.")
+            try:
+                revision = await reviewed_decision_revision(
+                    workflow,
+                    entry,
+                    operation_id,
+                    expected_revision=None,
+                    from_status=KnowledgeStatus.PENDING,
+                )
+                rejected = await workflow.reject_reviewed(
+                    item_id,
+                    expected_revision=revision,
+                    operation_id=operation_id,
+                    reviewer_identity=reviewer_identity,
+                    reviewer_version=KNOWLEDGE_REVIEWER_VERSION,
+                    reason=cayu_app.redact_json(reason),
+                    # Named so the inbox can verify this drop by its receipt.
+                    annotations={
+                        **reviewer_annotations,
+                        DROP_OPERATION_ANNOTATION: operation_id,
+                    },
+                )
+            except KnowledgePublicationConflict as exc:
+                raise ValueError(
+                    f"Knowledge entry {item_id!r} can't be dropped under this operation ID: "
+                    "it isn't pending, or the operation recorded a different decision."
+                ) from exc
+            except NotImplementedError:
+                raise HTTPException(
+                    status_code=501,
+                    detail="This store can't record a reason or replay a drop.",
+                ) from None
+            return rejected
+
+        return await _apply_knowledge_review_action(reject_reviewed, entry_id)
 
     register_kept_knowledge(
         bounded_control_plane_router,

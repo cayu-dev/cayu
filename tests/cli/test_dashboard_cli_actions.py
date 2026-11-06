@@ -43,6 +43,8 @@ def test_graph_http_admits_once_and_rejects_changed_content():
         ["task", "cancel", "one", "--reason", "No longer needed"],
         ["knowledge", "keep", "one", "--operation-id", "review"],
         ["knowledge", "drop", "one"],
+        ["knowledge", "drop", "one", "--operation-id", "drop-one", "--reason", "Duplicate"],
+        ["knowledge", "archive", "one", "--reason", "Stale"],
     ],
 )
 def test_actions_use_server_api(command, monkeypatch, capsys):
@@ -60,6 +62,8 @@ def test_actions_use_server_api(command, monkeypatch, capsys):
             "revision": 2,
             "status": "active" if command[1] == "keep" else "archived",
         }
+        if "--reason" in command:
+            receipt["reason"] = command[command.index("--reason") + 1]
     monkeypatch.setattr(
         CayuApi,
         "mutate",
@@ -300,6 +304,163 @@ def test_cli_real_knowledge_review_and_existing_pending_listing(monkeypatch, cap
         )
 
 
+@pytest.mark.parametrize(
+    ("command", "path", "body", "key"),
+    [
+        (["keep", "one", "--operation-id", "k"], "/knowledge/one/approve", {}, "k"),
+        (
+            ["keep", "one", "--operation-id", "k", "--reason", "Checked"],
+            "/knowledge/one/approve",
+            {"reason": "Checked"},
+            "k",
+        ),
+        (["drop", "one"], "/knowledge/one/reject", {}, None),
+        (
+            ["drop", "one", "--operation-id", "d", "--reason", "Duplicate"],
+            "/knowledge/one/reject",
+            {"reason": "Duplicate"},
+            "d",
+        ),
+        (
+            ["archive", "one", "--reason", "Stale", "--revision", "3"],
+            "/knowledge/one/retire",
+            {"reason": "Stale", "expected_revision": 3},
+            None,
+        ),
+        (
+            ["archive", "one", "--reason", "Stale", "--operation-id", "a"],
+            "/knowledge/one/retire",
+            {"reason": "Stale"},
+            "a",
+        ),
+    ],
+)
+def test_knowledge_decisions_send_reason_and_operation_id(command, path, body, key, monkeypatch):
+    from cayu.cli._cloud_agent_api import CayuApi
+
+    calls = []
+    receipt = {
+        "entry_id": "one",
+        "revision": 4,
+        "status": "active" if command[0] == "keep" else "archived",
+        "reason": body.get("reason"),
+    }
+    monkeypatch.setattr(
+        CayuApi,
+        "mutate",
+        lambda self, path, body, **kw: calls.append((path, body, kw)) or receipt,
+        raising=False,
+    )
+    assert main(["knowledge", *command, "--server-url", "http://127.0.0.1:8123", "--json"]) == 0
+    assert calls == [(path, body, {"resource": "knowledge", "operation_id": key})]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["archive", "one"],
+        ["archive", "one", "--reason", "  "],
+        ["archive", "one", "--reason", "Stale", "--revision", "0"],
+        ["keep", "one"],
+    ],
+)
+def test_knowledge_decisions_refuse_missing_or_blank_inputs(command, monkeypatch):
+    from cayu.cli import _control_plane_actions
+
+    seen = []
+    monkeypatch.setattr(_control_plane_actions, "open_action_api", lambda args: seen.append(args))
+    try:
+        assert main(["knowledge", *command, "--json"]) != 0
+    except SystemExit as exc:
+        assert exc.code != 0
+    assert seen == []
+
+
+def test_reason_an_older_agent_ignores_is_reported(monkeypatch, capsys):
+    from cayu.cli._cloud_agent_api import CayuApi
+
+    monkeypatch.setattr(
+        CayuApi,
+        "mutate",
+        lambda self, path, body, **kw: {"entry_id": "one", "revision": 2, "status": "archived"},
+        raising=False,
+    )
+    assert (
+        main(
+            [
+                "knowledge",
+                "drop",
+                "one",
+                "--reason",
+                "Duplicate",
+                "--server-url",
+                "http://127.0.0.1:8123",
+            ]
+        )
+        == 0
+    )
+    assert "doesn't record review reasons" in capsys.readouterr().err
+
+
+def test_cli_archives_a_kept_entry_with_its_reason_and_retries(tmp_path, monkeypatch, capsys):
+    from cayu.cli import _control_plane_actions
+    from cayu.cli._cloud_agent_api import CayuApi
+    from cayu.knowledge.records import KnowledgeEntry, KnowledgeStatus
+    from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.storage import SQLiteKnowledgeStore
+
+    scope = KnowledgeAccessScope.privileged()
+    path = tmp_path / "knowledge.sqlite"
+    store = SQLiteKnowledgeStore(path, access_scope=scope)
+    for name in ("stale", "dup"):
+        asyncio.run(
+            store.create_entry(
+                KnowledgeEntry(id=name, text="Made-up entry", status=KnowledgeStatus.PENDING),
+                access_scope=scope,
+            )
+        )
+    app = CayuApp(knowledge_store=store, enable_logging=False)
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "open_action_api",
+            lambda args: CayuApi("http://testserver", http=client),
+        )
+
+        def run(*args):
+            assert main(["knowledge", *args, "--json"]) == 0
+            return json.loads(capsys.readouterr().out)
+
+        kept = run("keep", "stale", "--operation-id", "keep-stale", "--reason", "Was right")
+        assert kept["result"]["reason"] == "Was right"
+        dropped = run("drop", "dup", "--operation-id", "drop-dup", "--reason", "Duplicate")
+        assert dropped["result"]["status"] == "archived"
+        assert run("drop", "dup", "--operation-id", "drop-dup", "--reason", "Duplicate") == (
+            dropped
+        )
+        archive = ("archive", "stale", "--operation-id", "archive-stale", "--reason", "Stale now")
+        archived = run(*archive)
+        assert archived["result"] == {
+            "entry_id": "stale",
+            "revision": 3,
+            "status": "archived",
+            "reason": "Stale now",
+        }
+        assert archived["operation_id"] == "archive-stale"
+        assert run(*archive) == archived
+        assert main(["knowledge", *archive[:4], "--reason", "Other", "--json"]) == 1
+        assert "HTTP 409" in json.loads(capsys.readouterr().out)["error"]["message"]
+        assert client.get("/api/knowledge").json()["entries"] == []
+    asyncio.run(store.close())
+    # The local store shows who archived it and why.
+    assert main(["knowledge", "show", "stale", "--sqlite", str(path)]) == 0
+    shown = capsys.readouterr().out
+    assert "archived_reason" in shown and "Stale now" in shown
+    assert main(["knowledge", "show", "dup", "--sqlite", str(path)]) == 0
+    shown = capsys.readouterr().out
+    assert "dropped_reason" in shown and "Duplicate" in shown
+
+
 @pytest.mark.parametrize("status", [401, 403, 409, 422])
 def test_cli_refusal_does_not_echo_remote_body_or_credentials(status, monkeypatch, capsys):
     import httpx
@@ -383,6 +544,11 @@ def test_unwritable_output_is_reported_without_dispatch(tmp_path, monkeypatch, c
             "Drop a pending knowledge proposal",
             "cayu knowledge show ENTRY_ID",
         ),
+        (
+            ["knowledge", "archive"],
+            "Archive a kept (active) knowledge entry",
+            "cayu knowledge show ENTRY_ID",
+        ),
     ],
 )
 def test_mutation_help_explains_purpose_and_inspection(command, purpose, next_step, capsys):
@@ -459,3 +625,35 @@ def test_output_preserves_explicit_cloud_context(tmp_path, monkeypatch, capsys):
     assert context.read_bytes() == original
     assert calls == []
     assert "input file" in capsys.readouterr().err
+
+
+def test_archive_reaches_a_cloud_agent_through_its_api(monkeypatch, capsys):
+    from cayu.cli import _control_plane_actions
+    from cayu.cli._cloud_agent_api import CayuApi
+
+    opened, calls = [], []
+    monkeypatch.setattr(
+        _control_plane_actions,
+        "open_cloud_agent_api",
+        lambda name, **kw: opened.append(name) or CayuApi("https://agent.example"),
+    )
+    monkeypatch.setattr(
+        CayuApi,
+        "mutate",
+        lambda self, path, body, **kw: (
+            calls.append((path, body, kw))
+            or {"entry_id": "one", "revision": 3, "status": "archived", "reason": "Stale"}
+        ),
+        raising=False,
+    )
+    command = ["knowledge", "archive", "one", "--reason", "Stale", "--operation-id", "a"]
+    assert main([*command, "--application", "cayu-scout", "--json"]) == 0
+    assert opened == ["cayu-scout"]
+    assert calls == [
+        (
+            "/knowledge/one/retire",
+            {"reason": "Stale"},
+            {"resource": "knowledge", "operation_id": "a"},
+        )
+    ]
+    assert json.loads(capsys.readouterr().out)["result"]["reason"] == "Stale"

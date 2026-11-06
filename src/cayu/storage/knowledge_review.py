@@ -50,6 +50,8 @@ from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
 from cayu.storage._knowledge_rejection import (
     KnowledgeRejectionDecision,
     KnowledgeReviewRejection,
+    archive_reviewed,
+    load_review_archive,
     load_review_rejection,
     reject_reviewed,
 )
@@ -448,6 +450,42 @@ class KnowledgeReviewWorkflow:
     ) -> KnowledgeReviewRejection | None:
         """Read only rejection annotations authenticated by exact publication evidence."""
         return await load_review_rejection(self, entry_id, expected_revision, operation_id)
+
+    async def archive_reviewed(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        operation_id: str,
+        reviewer_identity: str,
+        reviewer_version: str,
+        reason: str | None = None,
+        annotations: dict[str, object] | None = None,
+    ) -> KnowledgeReviewRejection:
+        """Archive one exact kept (active) revision with the reviewer's decision bound to it.
+
+        The archived successor keeps the entry's content, chunks and evidence, and records
+        the reviewer, the reason and the annotations in its metadata, authenticated by the
+        publication receipt ``operation_id`` names. Repeating the same decision under the
+        same ``operation_id`` replays it; a different decision under it conflicts.
+        """
+        decision = KnowledgeRejectionDecision(
+            reviewer_identity=reviewer_identity,
+            reviewer_version=reviewer_version,
+            reason=reason,
+            annotations={} if annotations is None else annotations,
+        )
+        return await archive_reviewed(self, entry_id, expected_revision, operation_id, decision)
+
+    async def load_review_archive(
+        self,
+        entry_id: str,
+        *,
+        expected_revision: int,
+        operation_id: str,
+    ) -> KnowledgeReviewRejection | None:
+        """Read a reviewed archive authenticated by its exact publication evidence."""
+        return await load_review_archive(self, entry_id, expected_revision, operation_id)
 
     async def reject(
         self,

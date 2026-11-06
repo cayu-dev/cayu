@@ -28,6 +28,7 @@ from cayu._time_buckets import TimeSeriesSpec, time_buckets
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     json_utf8_size_within_limit,
+    require_durable_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.approvals.actors import ResolutionActorSource
@@ -3523,6 +3524,8 @@ class ApiKnowledgeListItem(ApiKnowledgeEntryBase):
 
 class ApiReviewedKnowledgeEntry(ApiKnowledgeEntryBase):
     text_preview: str
+    #: The reason the keep or drop recorded, redacted; null when none was recorded.
+    reason: str | None = None
 
 
 class ApiKeptKnowledgeItem(ApiKnowledgeListItem):
@@ -3544,14 +3547,40 @@ class KeptKnowledgeListResponse(ApiBaseModel):
     usage_unavailable_reason: Literal["access_limited", "unsupported", "source_incomplete"] | None
 
 
+#: The longest reason a knowledge review decision (keep, drop or retire) records.
+KNOWLEDGE_REVIEW_REASON_MAX_CHARS = 4096
+
+
+class _KnowledgeReviewReason(ApiBaseModel):
+    reason: str | None = Field(default=None, max_length=KNOWLEDGE_REVIEW_REASON_MAX_CHARS)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None) -> str | None:
+        return None if value is None else require_durable_nonblank(value, "reason")
+
+
+class KnowledgeReviewDecisionRequest(_KnowledgeReviewReason):
+    """An optional body for `approve` and `reject`: why the reviewer decided so."""
+
+
 class RetireKnowledgeResponse(ApiBaseModel):
     entry_id: str
     revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
     status: Literal["archived"]
+    #: The reason recorded with the retirement, redacted; null when none was given.
+    reason: str | None = None
 
 
-class RetireKnowledgeRequest(ApiBaseModel):
-    expected_revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)
+class RetireKnowledgeRequest(_KnowledgeReviewReason):
+    """Which kept revision to retire, and optionally why.
+
+    ``expected_revision`` fences the retirement to the revision the caller saw. It may
+    be left out only together with a ``reason`` or an ``Idempotency-Key``: that retirement
+    is recorded with its reviewer, and a retry under the same key replays it.
+    """
+
+    expected_revision: StrictInt | None = Field(default=None, ge=1, le=MAX_KNOWLEDGE_REVISION)
 
 
 class PendingKnowledgeListResponse(ApiBaseModel):

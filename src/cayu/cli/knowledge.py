@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any
+from typing import Any, cast
 
 from cayu.cli._cloud_agent_api import open_cloud_agent_api
 from cayu.cli._knowledge_readers import (
@@ -33,7 +33,7 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
     knowledge = subparsers.add_parser(
         "knowledge",
-        help="Inspect knowledge and keep or drop proposals.",
+        help="Inspect knowledge, keep or drop proposals, and archive kept entries.",
         description=(
             "Read knowledge entries from a local store (--sqlite, --postgres, or the "
             "project's store) or from a Cayu Cloud Agent (--application NAME). Start with "
@@ -44,21 +44,60 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
     from cayu.cli._control_plane_actions import add_action_target_options
 
-    for name in ("keep", "drop"):
+    for name, summary, detail in (
+        (
+            "keep",
+            "Keep a pending knowledge proposal.",
+            "Keep a pending knowledge proposal, so knowledge search finds it.",
+        ),
+        (
+            "drop",
+            "Drop a pending knowledge proposal.",
+            "Drop a pending knowledge proposal: it's archived, never used.",
+        ),
+        (
+            "archive",
+            "Archive a kept knowledge entry, with the reason.",
+            "Archive a kept (active) knowledge entry that is stale or wrong, so knowledge "
+            "search no longer finds it. The archived entry records the reason and who "
+            "archived it.",
+        ),
+    ):
         action = commands.add_parser(
             name,
-            help=f"{name.capitalize()} a pending knowledge proposal.",
+            help=summary,
             description=(
-                f"{name.capitalize()} a pending knowledge proposal. Inspect it first with "
-                "`cayu knowledge show ENTRY_ID`. Mutations use the running agent's review permissions."
+                f"{detail} Inspect it first with `cayu knowledge show ENTRY_ID`. "
+                "Mutations use the running agent's review permissions."
             ),
         )
         action.add_argument("entry_id")
-        if name == "keep":
+        action.add_argument(
+            "--operation-id",
+            # Keep has always required one; drop and archive take one to make a retry safe.
+            required=name == "keep",
+            help=(
+                "Retain this ID to retry the same operation: a retry replays it instead of "
+                "reporting a conflict."
+            ),
+        )
+        action.add_argument(
+            "--reason",
+            required=name == "archive",
+            help=(
+                "Why the entry is archived, recorded with it."
+                if name == "archive"
+                else f"Why you {name} it, recorded with the decision."
+            ),
+        )
+        if name == "archive":
             action.add_argument(
-                "--operation-id",
-                required=True,
-                help="Retain this ID to retry the same keep operation.",
+                "--revision",
+                type=_revision,
+                help=(
+                    "Archive only if the entry is still at this revision (from "
+                    "`cayu knowledge show`)."
+                ),
             )
         add_action_target_options(action)
 
@@ -116,7 +155,7 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
 
 def run_knowledge(args: argparse.Namespace) -> int:
-    if args.knowledge_command in {"keep", "drop"}:
+    if args.knowledge_command in {"keep", "drop", "archive"}:
         from cayu.cli._control_plane_actions import run_action
 
         return run_action(args)
@@ -239,14 +278,13 @@ async def _show_entry(args: argparse.Namespace, reader: KnowledgeReader) -> int:
         "updated_at",
         "expires_at",
     )
-    print_table(
-        ("field", "value"),
-        [
-            {"field": name, "value": _display(entry.get(name))}
-            for name in fields
-            if entry.get(name) not in (None, {}, [])
-        ],
-    )
+    rows = [
+        {"field": name, "value": _display(entry.get(name))}
+        for name in fields
+        if entry.get(name) not in (None, {}, [])
+    ]
+    rows.extend(_review_rows(entry.get("metadata")))
+    print_table(("field", "value"), rows)
     text = entry.get("text")
     if isinstance(text, str) and text:
         print("\nText")
@@ -255,6 +293,28 @@ async def _show_entry(args: argparse.Namespace, reader: KnowledgeReader) -> int:
     if isinstance(chunks, list) and len(chunks) > 1:
         print(f"\n{len(chunks)} chunks; --json prints each.")
     return 0
+
+
+# Where an archived revision records the reviewed drop or archive that wrote it.
+_REVIEW_METADATA = (("cayu:review_archive", "archived"), ("cayu:review_rejection", "dropped"))
+
+
+def _review_rows(metadata: object) -> list[dict[str, Any]]:
+    """Who archived or dropped the entry and why, as its archived revision records it."""
+
+    if not isinstance(metadata, dict):
+        return []
+    recorded = cast("dict[str, Any]", metadata)
+    for key, verb in _REVIEW_METADATA:
+        decision = recorded.get(key)
+        if not isinstance(decision, dict):
+            continue
+        return [
+            {"field": f"{verb}_{name}", "value": _display(decision.get(field))}
+            for name, field in (("by", "reviewer_identity"), ("reason", "reason"))
+            if isinstance(decision.get(field), str)
+        ]
+    return []
 
 
 def _table_row(entry: dict[str, Any]) -> dict[str, Any]:
@@ -276,6 +336,16 @@ def _display(value: object) -> str:
     if isinstance(value, dict):
         return ",".join(f"{key}={item}" for key, item in sorted(value.items()))
     return "" if value is None else str(value)
+
+
+def _revision(value: str) -> int:
+    try:
+        revision = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer") from None
+    if revision < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return revision
 
 
 def _page_limit(value: str) -> int:
