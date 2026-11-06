@@ -2442,6 +2442,14 @@ class ToolRoundRun:
                         current_cancellation,
                         current_cancellation_cause,
                     )
+            elif _contains_process_signal(exc_group):
+                # Caller cancellation above remains authoritative over cleanup
+                # failures. Otherwise, propagate the supervisory leaf directly.
+                raise next(
+                    candidate
+                    for candidate in iter_exception_tree(exc_group)
+                    if isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
+                ) from exc_group
             elif any(
                 isinstance(candidate, BaseExceptionGroup)
                 and is_current_runner_cancellation_group(candidate)
