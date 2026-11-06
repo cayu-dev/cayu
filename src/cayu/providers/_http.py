@@ -490,11 +490,7 @@ class SharedAsyncClient:
     def get(self) -> httpx.AsyncClient:
         client = self._client
         if client is None or client.is_closed:
-            client = (
-                new_async_client()
-                if self._keepalive_expiry_s is None
-                else new_async_client(keepalive_expiry_s=self._keepalive_expiry_s)
-            )
+            client = new_async_client(keepalive_expiry_s=self._keepalive_expiry_s)
             self._client = client
         return client
 

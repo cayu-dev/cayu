@@ -1029,11 +1029,8 @@ def test_new_async_client_keeps_idle_connections_for_the_requested_time(
 
     assert new_async_client(keepalive_expiry_s=42) is not None
     # Only the keep-alive changes; the pool sizes stay httpx's defaults.
-    default_limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
     assert captured["limits"] == httpx.Limits(
-        max_connections=default_limits.max_connections,
-        max_keepalive_connections=default_limits.max_keepalive_connections,
-        keepalive_expiry=42.0,
+        max_connections=100, max_keepalive_connections=20, keepalive_expiry=42.0
     )
 
 
