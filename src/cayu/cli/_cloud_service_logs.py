@@ -3,7 +3,10 @@
 Without options it prints the Agent's newest lines. `--process` (`web`, `worker`, `migrate`,
 `storage-audit` or `schedule:NAME`), `--release`, `--since`, `--until` and `--grep` choose lines;
 `--limit` says how many. Without `--since` the page holds the newest lines; with it, the first
-ones after it, oldest first, and the command says how to go on when more follow. `--follow`
+ones after it, oldest first, and the command says how to go on when more follow. Cloud answers a
+wide search (a `--grep` over a day or more) a page at a time, each covering what it could search
+in a few seconds, so while a page comes back short with more to read, the command follows its
+cursor, for up to `--search-for` (two minutes), and then says which span it searched. `--follow`
 prints the page, then polls Cloud every two seconds for the lines after the last one printed,
 until Ctrl-C. `--json` prints the JSON envelope the other `cayu cloud` commands print; with
 `--follow`, one per page that has lines, then one with the cursor to go on from.
@@ -17,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,6 +31,7 @@ from cayu.cli._cloud_settings import _cell
 
 DEFAULT_LIMIT = 100
 POLL_SECONDS = 2.0
+DEFAULT_SEARCH_SECONDS = 120.0
 _DURATION = re.compile(r"(\d+)([smhd])")
 _UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 # What Cloud sends is printed whole, control characters replaced: Cloud bounds it.
@@ -50,6 +55,17 @@ def log_time(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def search_seconds(value: str) -> float:
+    """A time for `--search-for`: a span (`90s`, `5m`, `1h`), or 0 for one page."""
+
+    if value == "0":
+        return 0.0
+    duration = _DURATION.fullmatch(value)
+    if duration is None:
+        raise argparse.ArgumentTypeError(f"{value!r} is neither 0 nor a span like 90s, 5m or 1h")
+    return timedelta(**{_UNITS[duration[2]]: int(duration[1])}).total_seconds()
+
+
 def add_service_logs_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--process",
@@ -70,6 +86,16 @@ def add_service_logs_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--cursor", help="Go on after a page, from its next_cursor.")
     parser.add_argument(
+        "--search-for",
+        type=search_seconds,
+        default=DEFAULT_SEARCH_SECONDS,
+        metavar="SPAN",
+        help=(
+            "While a page comes back short and more may follow (a wide --grep), go on reading "
+            "for up to this long: 90s, 5m, 1h, or 0 for one page (2m)."
+        ),
+    )
+    parser.add_argument(
         "--follow",
         action="store_true",
         help="Keep printing new lines until Ctrl-C.",
@@ -83,6 +109,7 @@ def service_logs(
     client: CloudApiClient,
     application_id: str,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     path = f"/v1/applications/{application_id}/service/logs"
     asked = {name: value for name in _FILTERS if (value := getattr(arguments, name)) is not None}
@@ -93,10 +120,73 @@ def service_logs(
         return _follow(
             arguments, client=client, path=path, query=query, ignored=ignored, sleep=sleep
         )
+    deadline = monotonic() + arguments.search_for
     page = _page(client, path, query, ignored=ignored)
     if "lines" not in page:
         return {"operation": "service.logs", "result": {"items": _items(page)}}
+    page = _search(client, path, query, page, ignored=ignored, go_on=lambda: monotonic() < deadline)
     return {"operation": "service.logs", "result": page}
+
+
+def _search(
+    client: CloudApiClient,
+    path: str,
+    query: dict[str, str],
+    page: dict[str, Any],
+    *,
+    ignored: list[str],
+    go_on: Callable[[], bool],
+) -> dict[str, Any]:
+    """The page, and those its cursor leads to while each came back short of the limit with
+    more to read (Cloud stopped searching to answer in time), and ``go_on`` says to: one page of
+    their lines, the last one's cursor, and the span they searched together. Ctrl-C stops the
+    search at the last page read."""
+
+    limit = int(query["limit"])
+    following = {name: value for name, value in query.items() if name not in {"since", "cursor"}}
+    # The last page merged, every line so far and the first span searched: replaced whole once a
+    # page is merged, so wherever Ctrl-C stops the search, the cursor goes on after the lines.
+    read: tuple[dict[str, Any], list[dict[str, Any]], Mapping[str, Any] | None] = (
+        page,
+        list(page["lines"]),
+        _searched(page),
+    )
+    try:
+        while True:
+            last, lines, started = read
+            if not (
+                last["more"] and last["next_cursor"] is not None and len(lines) < limit and go_on()
+            ):
+                break
+            ask = {**following, "cursor": last["next_cursor"], "limit": str(limit - len(lines))}
+            got = _page(client, path, ask, ignored=ignored)
+            seen = {line.get("id") for line in lines}
+            fresh = [line for line in got["lines"] if line.get("id") not in seen]
+            read = (got, [*lines, *fresh], started or _searched(got))
+    except KeyboardInterrupt:
+        pass
+    last, lines, started = read
+    if last is page:
+        return page
+    ended = _searched(last)
+    searched = None if started is None or ended is None else {**ended, "from": started["from"]}
+    return {
+        **last,
+        "items": [line.get("message") for line in lines],
+        "lines": lines,
+        "searched": searched,
+    }
+
+
+def _searched(page: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The span a page says it searched, when it says one."""
+
+    searched = page.get("searched")
+    if not isinstance(searched, dict):
+        return None
+    if not (isinstance(searched.get("from"), str) and isinstance(searched.get("to"), str)):
+        return None
+    return searched
 
 
 def _page(
@@ -170,7 +260,15 @@ def render_logs(result: Mapping[str, Any]) -> str:
     text = _lines(page["lines"])
     if page["more"] and page["next_cursor"] is not None:
         cursor = _cell(page["next_cursor"], limit=_WHOLE)
-        note = f"More lines follow; go on with --cursor {cursor}."
+        searched = _searched(page)
+        if searched is None:
+            note = f"More lines follow; go on with --cursor {cursor}."
+        else:
+            # A search Cloud or `--search-for` stopped says how far it got.
+            note = (
+                f"Searched {_time(searched['from'])} to {_time(searched['to'])}; more may "
+                f"follow. Go on with --cursor {cursor}."
+            )
         text = f"{text}\n{note}" if text else note
     return text
 

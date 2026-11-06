@@ -4414,7 +4414,13 @@ def _service(
             "This Cayu Cloud can't pause Agents yet.",
         )
     elif action == "logs":
-        return service_logs(arguments, client=client, application_id=application_id, sleep=sleep)
+        return service_logs(
+            arguments,
+            client=client,
+            application_id=application_id,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
     elif action == "check":
         return service_check(
             arguments,

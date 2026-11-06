@@ -33,17 +33,20 @@ def _line(line_id: str, message: str, *, process: str | None = "worker") -> dict
 
 
 def _page(
-    *lines: dict[str, Any], next_cursor: str | None = "c-end", more: bool = False
+    *lines: dict[str, Any],
+    next_cursor: str | None = "c-end",
+    more: bool = False,
+    searched: tuple[str, str] | None = None,
 ) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "items": [line["message"] for line in lines],
-            "lines": list(lines),
-            "next_cursor": next_cursor,
-            "more": more,
-        },
-    )
+    body: dict[str, Any] = {
+        "items": [line["message"] for line in lines],
+        "lines": list(lines),
+        "next_cursor": next_cursor,
+        "more": more,
+    }
+    if searched is not None:
+        body["searched"] = {"from": searched[0], "to": searched[1]}
+    return httpx.Response(200, json=body)
 
 
 class _Cloud:
@@ -178,6 +181,7 @@ def test_since_takes_a_span_back_from_now(cloud: Callable[..., _Cloud]) -> None:
     [
         (["--since", "yesterday"], "neither a span"),
         (["--limit", "5000"], "between 1 and 1000"),
+        (["--search-for", "soon"], "neither 0 nor a span"),
     ],
 )
 def test_options_cayu_cant_read_are_refused_before_asking(
@@ -211,7 +215,7 @@ def test_json_prints_the_envelope_with_the_page(
 ) -> None:
     cloud(_page(_line("1", "task 7 started"), more=True, next_cursor="c1"))
 
-    assert _logs("--json") == 0
+    assert _logs("--json", "--search-for", "0") == 0
 
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["ok"] is True
@@ -228,13 +232,135 @@ def test_a_page_with_more_after_it_says_how_to_go_on(
         _page(_line("2", "task 8 started")),
     )
 
-    assert _logs("--since", "2h") == 0
+    assert _logs("--since", "2h", "--search-for", "0") == 0
     assert capsys.readouterr().out.splitlines()[-1] == (
         "More lines follow; go on with --cursor c1."
     )
     assert _logs("--cursor", "c1") == 0
     assert "task 8 started" in capsys.readouterr().out
     assert fake.queries[1] == {"cursor": "c1", "limit": "100"}
+
+
+_DAY = (
+    ("2026-11-05T17:00:00.000+00:00", "2026-11-05T23:00:00.000+00:00"),
+    ("2026-11-05T23:00:00.000+00:00", "2026-11-06T05:00:00.000+00:00"),
+    ("2026-11-06T05:00:00.000+00:00", "2026-11-06T17:00:00.000+00:00"),
+)
+
+
+def test_a_wide_search_follows_short_pages_until_it_has_read_the_window(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Cloud answers each page with what it searched in a few seconds: none, then one match.
+    fake = cloud(
+        _page(more=True, next_cursor="c1", searched=_DAY[0]),
+        _page(
+            _line("1", "decision_outcome_unknown"), more=True, next_cursor="c2", searched=_DAY[1]
+        ),
+        _page(_line("2", "decision_outcome_unknown"), next_cursor=None, searched=_DAY[2]),
+    )
+
+    assert _logs("--since", "24h", "--grep", "decision_outcome_unknown", "--json") == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert [line["id"] for line in result["lines"]] == ["1", "2"]
+    assert result["items"] == ["decision_outcome_unknown"] * 2
+    assert result["searched"] == {"from": _DAY[0][0], "to": _DAY[2][1]}
+    assert result["next_cursor"] is None
+    assert result["more"] is False
+    # Each page goes on from the one before, for the lines still missing from the limit.
+    assert [query.get("cursor") for query in fake.queries] == [None, "c1", "c2"]
+    assert [query["limit"] for query in fake.queries] == ["100", "100", "99"]
+    assert all(query["grep"] == "decision_outcome_unknown" for query in fake.queries)
+    assert "since" not in fake.queries[1]
+
+
+def test_a_search_stops_at_its_limit(cloud: Callable[..., _Cloud]) -> None:
+    fake = cloud(
+        _page(_line("1", "a"), more=True, next_cursor="c1", searched=_DAY[0]),
+        _page(_line("2", "b"), more=True, next_cursor="c2", searched=_DAY[1]),
+    )
+
+    assert _logs("--since", "24h", "--limit", "2") == 0
+
+    assert len(fake.queries) == 2
+    assert fake.pages == []
+
+
+def test_a_search_out_of_time_says_which_span_it_searched() -> None:
+    pages = [
+        {
+            "items": [],
+            "lines": [],
+            "next_cursor": f"c{n}",
+            "more": True,
+            "searched": {"from": start, "to": end},
+        }
+        for n, (start, end) in enumerate(_DAY[:2], start=1)
+    ]
+
+    class Client:
+        def request(self, method: str, path: str, **_kwargs: object) -> dict[str, Any]:
+            if path == "/v1/applications":
+                return {"items": [{"id": "my-agent", "name": "My Agent"}]}
+            clock[0] += 50
+            return pages.pop(0)
+
+    clock = [0.0]
+    options = dict.fromkeys(("process", "release", "until", "limit", "cursor"))
+    result = cloud_cli._service(
+        SimpleNamespace(
+            application="my-agent",
+            service_command="logs",
+            follow=False,
+            json=False,
+            since=datetime(2026, 11, 5, 17, tzinfo=UTC),
+            grep="decision_outcome_unknown",
+            search_for=60.0,
+            **options,
+        ),
+        client=Client(),
+        monotonic=lambda: clock[0],
+    )
+
+    # The second page ended past the minute: the search stops there.
+    assert pages == []
+    assert result["result"]["searched"] == {"from": _DAY[0][0], "to": _DAY[1][1]}
+    assert _cloud_service_logs.render_logs(result) == (
+        "Searched 2026-11-05T17:00:00.000Z to 2026-11-06T05:00:00.000Z; more may follow. "
+        "Go on with --cursor c2."
+    )
+
+
+def test_ctrl_c_stops_a_search_after_the_last_page_it_merged(
+    cloud: Callable[..., _Cloud],
+) -> None:
+    fake = cloud(
+        _page(_line("1", "a"), more=True, next_cursor="c1", searched=_DAY[0]),
+        _page(_line("2", "b"), more=True, next_cursor="c2", searched=_DAY[1]),
+        KeyboardInterrupt(),
+    )
+    options = dict.fromkeys(("process", "release", "until", "grep", "limit", "cursor"))
+
+    result = cloud_cli._service(
+        SimpleNamespace(
+            application="my-agent",
+            service_command="logs",
+            follow=False,
+            json=True,
+            since=datetime(2026, 11, 5, 17, tzinfo=UTC),
+            search_for=60.0,
+            **options,
+        ),
+        client=CloudApiClient(api_url="https://cloud.example", api_key="login-token"),
+    )
+
+    page = result["result"]
+    # It goes on after the second page, whose lines it holds.
+    assert [line["id"] for line in page["lines"]] == ["1", "2"]
+    assert (page["next_cursor"], page["more"]) == ("c2", True)
+    assert page["searched"] == {"from": _DAY[0][0], "to": _DAY[1][1]}
+    assert len(fake.queries) == 3
 
 
 def test_follow_prints_each_new_line_once_until_interrupted(

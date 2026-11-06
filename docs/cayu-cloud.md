@@ -1436,14 +1436,23 @@ first lines after that time, oldest first, and when more follow it ends with
 filters) for the next lines. To read a failed worker task's traceback, find the time with
 `--process worker --grep Traceback`, then read from there with `--since`.
 
+A wide search, such as a `--grep` over a day or more of a busy Agent's lines, takes Cloud more
+than one request: it answers each page with what it found in a few seconds and the span it
+searched. While a page comes back with fewer lines than `--limit` and more to read, the command
+follows its cursor itself, for up to `--search-for` (`2m` by default; `90s`, `10m`, or `0` for
+one page), and prints the lines of every page it read. When it stops before the end of the
+window, it ends with `Searched FROM to TO; more may follow. Go on with --cursor CURSOR`, so the
+part it covered is never in doubt; Ctrl-C stops the search early the same way.
+
 `--follow` prints the lines, then asks Cloud every two seconds for the lines after the last one
 printed, until Ctrl-C, which ends it without an error. It shows each line once. Cloud holds back
 the last 10 seconds of lines, so a line that reaches it late is still shown. With `--until`, it
 stops once that time has been read.
 
 `--json` prints the usual envelope, whose `result.lines` carry `id`, `timestamp`, `process`,
-`release`, `instance` (the ECS task or Kubernetes pod) and `message`, with `next_cursor` and
-`more`. With `--follow`, it prints one envelope per page that has lines, then one with the
+`release`, `instance` (the ECS task or Kubernetes pod) and `message`, with `next_cursor`,
+`more` and `searched` (`from` inclusive, `to` exclusive, of every page read; `null` for the
+newest lines). With `--follow`, it prints one envelope per page that has lines, then one with the
 cursor to go on from.
 
 Cloud redacts credential-shaped text (`[redacted]`) and removes terminal control sequences
