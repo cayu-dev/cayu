@@ -254,8 +254,9 @@ class BrokeredSandboxReuse:
     ``setup_commands`` installed (they run once per sandbox), and anything a
     session wrote elsewhere, and a process a session left running in the
     background, which may still write into the workspace. So reuse suits
-    trusted sessions of one Agent that may see each other's leftovers; it
-    isn't a boundary between them.
+    trusted sessions of one Agent that may see each other's leftovers (or,
+    with a ``BrokeredSandboxPool(share_across_agents=True)``, of one
+    application's Agents); it isn't a boundary between them.
     """
 
     max_idle: int = 1
@@ -282,8 +283,9 @@ class _IdleSandbox:
     sandbox: SandboxRecord
     keeper: SandboxLeaseKeeper
     loop: asyncio.AbstractEventLoop
-    # The Agent, environment (or, in a shared pool, the sandbox configuration) and
-    # execution requirements of the sessions it may serve.
+    # The Agent (empty in a pool shared across Agents), environment (or, in a
+    # shared pool, the sandbox configuration) and execution requirements of the
+    # sessions it may serve.
     key: tuple[str, str, str]
     broker: SandboxBrokerClient
     expiry: asyncio.Task[None] | None = None
@@ -303,9 +305,24 @@ class BrokeredSandboxPool:
     source directory for each session of one workspace slot. The pool counts
     ``max_idle`` across all of them, and a kept sandbox keeps the labels it was
     allocated with.
+
+    With ``share_across_agents=True`` the Agent no longer matters either: a
+    kept sandbox serves the next session of any Agent with the same execution
+    requirements on a factory of the pool whose sandboxes are built alike. That
+    suits one application whose Agents take turns on one workspace slot, such
+    as a hunter, then a verifier, then a fixer. Since sandboxes built alike
+    share their broker, application and credential, it never crosses from one
+    application to another. Everything else about reuse holds, the reset of
+    ``/workspace`` included, but what one Agent's session left outside
+    ``/workspace`` (files, installed packages, a background process) is there
+    for the next Agent's session. So share across Agents only within one
+    trusted application whose Agents may see each other's leftovers.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, share_across_agents: bool = False) -> None:
+        if type(share_across_agents) is not bool:
+            raise TypeError("share_across_agents must be a bool.")
+        self._share_across_agents = share_across_agents
         self._idle: list[_IdleSandbox] = []
         # Sandboxes sessions hold now, by ID, while their runner lives.
         self._in_use: weakref.WeakValueDictionary[str, BrokeredSandboxRunner] = (
@@ -313,6 +330,12 @@ class BrokeredSandboxPool:
         )
         # Idle sandboxes a create took and is still preparing for its session.
         self._checking_out: set[str] = set()
+
+    @property
+    def share_across_agents(self) -> bool:
+        """Whether a kept sandbox may serve another Agent's session, not only its own Agent's."""
+
+        return self._share_across_agents
 
 
 class BrokeredSandboxCodingBinding(SyncBinding):
@@ -605,8 +628,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     (or ``close_idle_resources`` at shutdown) destroys the waiting ones. With
     a ``toolchain_profile`` a reused sandbox is admitted again before use.
     Factories given one ``reuse_pool`` (a ``BrokeredSandboxPool``) share the
-    waiting sandboxes across environments and sources (see the pool); without
-    one, each factory keeps its own.
+    waiting sandboxes across environments and sources, and with its
+    ``share_across_agents`` across an application's Agents too (see the
+    pool); without one, each factory keeps its own.
 
     With ``queue_seconds`` (default 0, up to ``MAX_QUEUE_SECONDS``) a create
     over one of Cloud's limits waits in Cloud's queue for up to that long
@@ -1203,8 +1227,10 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         fingerprint = sha256(requirements.model_dump_json().encode()).hexdigest()
         if self.reuse_pool is None:
             return request.agent_name, request.environment_name, fingerprint
-        # A shared pool serves any of its factories whose sandboxes are built alike.
-        return request.agent_name, self._sandbox_fingerprint, fingerprint
+        # A shared pool serves any of its factories whose sandboxes are built alike,
+        # and, shared across Agents, any Agent's session; no Agent's name is empty.
+        agent = "" if self.reuse_pool.share_across_agents else request.agent_name
+        return agent, self._sandbox_fingerprint, fingerprint
 
     async def _take_idle(
         self, key: tuple[str, str, str]
@@ -1691,6 +1717,9 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
         if factory.reuse_pool is not None:
             # In a shared pool, one may also come from another environment's session.
             material["reuse"]["shared_pool"] = True
+            if factory.reuse_pool.share_across_agents:
+                # And from another Agent's.
+                material["reuse"]["shared_across_agents"] = True
     return (
         "sha256:"
         + sha256(

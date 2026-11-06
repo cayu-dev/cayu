@@ -131,11 +131,13 @@ class FakeSandbox:
     owner_epoch: int = 1
     # Operations still to answer 503 sandbox_handover before the new owner serves them.
     handover_answers: int = 0
+    # The application whose routes serve it.
+    application: str = APPLICATION
 
     def record(self) -> dict[str, Any]:
         return {
             "id": self.id,
-            "application_id": APPLICATION,
+            "application_id": self.application,
             "image": self.body["image"],
             "egress": self.body["egress"],
             "status": self.status,
@@ -236,11 +238,13 @@ class FakeBroker:
         self.install_in_use_elsewhere = 0
         # A body ``/capacity`` returns as is, in place of the computed one.
         self.capacity_body: Any = None
+        # Applications whose routes the broker serves; each sees only its own sandboxes.
+        self.applications = {APPLICATION}
 
     def client(self, **settings: Any) -> SandboxBrokerClient:
         return SandboxBrokerClient(
             SandboxBrokerSettings(
-                api_url=API_URL, application_id=APPLICATION, token=TOKEN, **settings
+                **{"api_url": API_URL, "application_id": APPLICATION, "token": TOKEN, **settings}
             ),
             transport=httpx.MockTransport(self.transport),
         )
@@ -312,7 +316,15 @@ class FakeBroker:
         if request.headers.get("authorization") != f"Bearer {TOKEN}":
             return httpx.Response(401, json={"error": {"code": "x", "message": "", "detail": {}}})
         path = request.url.path
-        prefix = f"/v1/applications/{APPLICATION}/sandboxes"
+        application = next(
+            (
+                name
+                for name in self.applications
+                if path.startswith(f"/v1/applications/{name}/sandboxes")
+            ),
+            APPLICATION,
+        )
+        prefix = f"/v1/applications/{application}/sandboxes"
         self.calls.append((request.method, path.removeprefix(prefix) or "/"))
         if path == "/v1/sandbox-images":
             return httpx.Response(
@@ -334,11 +346,15 @@ class FakeBroker:
             return self._capacity(request)
         if not parts or parts == [""]:
             if request.method == "POST":
-                return self._create(json.loads(request.content))
-            items = [sandbox.record() for sandbox in self.sandboxes.values()]
+                return self._create(json.loads(request.content), application)
+            items = [
+                sandbox.record()
+                for sandbox in self.sandboxes.values()
+                if sandbox.application == application
+            ]
             return httpx.Response(200, json={"items": items, "next_cursor": None})
         sandbox = self.sandboxes.get(parts[0])
-        if sandbox is None:
+        if sandbox is None or sandbox.application != application:
             return httpx.Response(404, json={"error": {"code": "x", "message": "", "detail": {}}})
         action = parts[1:]
         if request.method == "GET" and not action:
@@ -504,7 +520,7 @@ class FakeBroker:
             if sandbox.status == "provisioning" and sandbox.queued_until is not None
         ]
 
-    def _create(self, body: dict[str, Any]) -> httpx.Response:
+    def _create(self, body: dict[str, Any], application: str) -> httpx.Response:
         if self.refuse_create is not None:
             status, code = self.refuse_create
             detail = {"scope": "agent", "limit": 8} if code == "sandbox_quota_exceeded" else {}
@@ -573,6 +589,7 @@ class FakeBroker:
             archive_encodings=self.archive_encodings,
             image_identity=self.image_identities.get(body["image"]),
             queued_until=queued_until,
+            application=application,
         )
         self.sandboxes[sandbox_id] = sandbox
         self.by_key[key] = sandbox_id

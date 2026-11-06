@@ -915,6 +915,22 @@ kept sandbox keeps the labels it was allocated with, and
 `release_idle_resources()` on any of the factories destroys every sandbox
 waiting in the pool. `with_source_workspace` keeps the factory's shared pool.
 
+A shared pool still keeps each Agent's sandboxes for that Agent.
+`BrokeredSandboxPool(share_across_agents=True)` lets a kept sandbox serve the
+next session of any Agent with the same execution requirements on a factory of
+the pool whose sandboxes are built alike. That suits one application whose
+Agents take turns on one workspace slot, such as a hunter, then a verifier,
+then a fixer, where a per-Agent pool would reuse a sandbox only between two
+sessions of the same role. Sandboxes built alike share their broker,
+application and broker credential, so a sandbox never passes from one
+application to another, and everything above still holds: the reset of
+`/workspace`, the requirements match, loop affinity, `max_idle`,
+`idle_seconds` and `min_lifetime_seconds`. What it changes is who sees the
+leftovers: whatever one Agent's session left outside `/workspace`, such as
+files under `/tmp`, packages it installed or a background process, is there
+for the next Agent's session. Share across Agents only within one trusted
+application whose Agents may see each other's leftovers.
+
 On its own,
 `BrokeredSandboxRunner.detach()` closes a runner without destroying its sandbox
 and returns the lease keeper, for a new runner over the same sandbox, and

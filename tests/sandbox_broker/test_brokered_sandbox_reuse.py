@@ -797,3 +797,139 @@ def test_a_shared_pool_needs_reuse_and_is_kept_by_a_rebuilt_factory(tmp_path: Pa
         shared.execution_profile_identity.implementation_version
         != own.execution_profile_identity.implementation_version
     )
+
+
+def test_a_pool_shared_across_agents_hands_a_sandbox_to_another_agent(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    moved = shutil.copytree(source, tmp_path / "slot-1-verify")
+    (moved / "calc.py").write_bytes(b"def add(a, b):\n    return a + b\n")
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool(share_across_agents=True)
+    read = {}
+
+    async def leave_traces(bound) -> None:
+        await bound.workspace.write_bytes("found.txt", b"hunter's note\n")
+
+    async def read_calc(bound) -> None:
+        read["calc"] = (await bound.workspace.read_bytes("calc.py")).content
+        read["found"] = await _shell(bound.runner, "test -e found.txt && echo yes || echo no")
+
+    async def scenario():
+        hunt = _factory(broker, source, reuse_pool=pool, sync_back="never")
+        verify = _factory(broker, moved, reuse_pool=pool)
+        first, _ = await _session(
+            hunt, "one", environment_name="slot-1-hunt", agent_name="hunter", work=leave_traces
+        )
+        second, bound = await _session(
+            verify, "two", environment_name="slot-1-verify", agent_name="verifier", work=read_calc
+        )
+        await verify.close_idle_resources()
+        return first, second, bound
+
+    first, second, bound = asyncio.run(scenario())
+    assert second.metadata["sandbox_reused"] is True
+    assert second.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    # The verifier saw its own source in /workspace, nothing the hunter wrote there.
+    assert read == {"calc": b"def add(a, b):\n    return a + b\n", "found": "no\n"}
+    assert bound.metadata["sync_binding"]["copy_in_scope"] == "changed"
+    assert len(broker.sandboxes) == 1 and broker.live() == []
+
+
+def test_a_shared_pool_keeps_each_agents_sandboxes_for_that_agent_by_default(
+    tmp_path: Path,
+) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool()
+    assert pool.share_across_agents is False
+
+    async def scenario():
+        hunt = _factory(broker, source, reuse=BrokeredSandboxReuse(max_idle=2), reuse_pool=pool)
+        verify = _factory(broker, source, reuse=BrokeredSandboxReuse(max_idle=2), reuse_pool=pool)
+        first, _ = await _session(hunt, "one", environment_name="hunt", agent_name="hunter")
+        other, _ = await _session(verify, "two", environment_name="verify", agent_name="verifier")
+        again, _ = await _session(hunt, "three", environment_name="hunt", agent_name="hunter")
+        await hunt.close_idle_resources()
+        return first, other, again
+
+    first, other, again = asyncio.run(scenario())
+    assert other.metadata["sandbox_reused"] is False
+    assert other.metadata["sandbox_id"] != first.metadata["sandbox_id"]
+    assert again.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    assert broker.live() == []
+
+
+def test_a_pool_shared_across_agents_matches_execution_requirements(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool(share_across_agents=True)
+
+    async def scenario():
+        factory = _factory(broker, source, reuse_pool=pool)
+        first, _ = await _session(factory, "one", agent_name="hunter")
+        stricter = ExecutionRequirements.trusted(network_access="deny_by_default")
+        other, _ = await _session(
+            factory, "two", agent_name="verifier", execution_requirements=stricter
+        )
+        untrusted = ExecutionRequirements.untrusted(network_access="unrestricted")
+        strict = await factory.create(
+            _request("three", agent_name="fixer", execution_requirements=untrusted)
+        )
+        await strict.release(EnvironmentFactoryReleaseAction.DISCARD)
+        same, _ = await _session(factory, "four", agent_name="fixer")
+        await factory.close_idle_resources()
+        return first, other, strict, same
+
+    first, other, strict, same = asyncio.run(scenario())
+    assert other.metadata["sandbox_reused"] is False
+    assert other.metadata["sandbox_id"] != first.metadata["sandbox_id"]
+    assert strict.metadata["sandbox_reused"] is False
+    # The hunter's sandbox waited on, and a fixer with its requirements took it.
+    assert same.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    assert broker.live() == []
+
+
+def test_a_pool_shared_across_agents_never_crosses_applications(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.applications.add("other-app")
+    pool = BrokeredSandboxPool(share_across_agents=True)
+
+    async def scenario():
+        mine = _factory(broker, source, reuse_pool=pool)
+        theirs = BrokeredSandboxCodingEnvironmentFactory(
+            broker=broker.client(application_id="other-app"),
+            source_workspace=LocalWorkspace(source, workspace_id="project"),
+            egress="none",
+            sandbox_excluded_directory_names=("node_modules",),
+            reuse=BrokeredSandboxReuse(),
+            reuse_pool=pool,
+        )
+        first, _ = await _session(mine, "one", agent_name="hunter")
+        other, _ = await _session(theirs, "two", agent_name="verifier")
+        again, _ = await _session(mine, "three", agent_name="verifier")
+        await mine.close_idle_resources()
+        return first, other, again
+
+    first, other, again = asyncio.run(scenario())
+    assert other.metadata["sandbox_reused"] is False
+    assert other.metadata["sandbox_id"] != first.metadata["sandbox_id"]
+    assert broker.sandboxes[other.metadata["sandbox_id"]].application == "other-app"
+    assert again.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    assert broker.live() == []
+
+
+def test_sharing_across_agents_is_a_bool_and_part_of_the_configuration(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    with pytest.raises(TypeError, match="share_across_agents"):
+        BrokeredSandboxPool(share_across_agents="yes")
+    across = _factory(broker, source, reuse_pool=BrokeredSandboxPool(share_across_agents=True))
+    per_agent = _factory(broker, source, reuse_pool=BrokeredSandboxPool())
+    assert across._sandbox_fingerprint == per_agent._sandbox_fingerprint
+    assert (
+        across.execution_profile_identity.implementation_version
+        != per_agent.execution_profile_identity.implementation_version
+    )
+    rebuilt = across.with_source_workspace(LocalWorkspace(source, workspace_id="project"))
+    assert rebuilt is not None and rebuilt.reuse_pool is across.reuse_pool
