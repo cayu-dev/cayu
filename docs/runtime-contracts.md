@@ -1849,7 +1849,18 @@ external tool effect, retaining the uncertain receipt evidence and releasing its
 environment without another tool or model call. When that call ran under a resolved
 approval or an answered user-input pause, the gate and its resolution claim leave
 resumable work with the round, so the gate cannot be resolved afterwards; a gate
-still awaiting its decision has no unknown outcome and is never abandoned. The
+still awaiting its decision has no unknown outcome and is never abandoned. When the
+session's environment isn't registered in this application (a per-run environment
+another process registered, or one an earlier release had), the interrupted session
+is abandoned without it: the same fenced transition fails it from `interrupted` at
+the same run epoch, without reconnecting the environment or checking the execution
+profile, and terminal evidence is published while the environment binding stays
+recorded for recovery where the environment is registered. Without the environment
+only a plain round of unknown outcomes is abandoned; a session that isn't
+interrupted, waits on an approval, a question or a wake, has child sessions other
+than forks that haven't ended, changed since recovery read it, holds another
+recovery's live claim, or had activity within `inactive_for_seconds` of store time
+raises `SessionStatusConflict`. The
 task attached to the round counts as one of the session's tasks even after a
 restart detached it. Its abandonment record is immutable
 runtime authority and survives ordinary checkpoint replacement. With a task store,

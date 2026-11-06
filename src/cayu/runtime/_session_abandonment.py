@@ -396,11 +396,26 @@ class SessionAbandonment:
         )
         passes = [] if prior is None else [prior]
         if not abandoned:
-            passes.append(
-                await self._session_recovery.recover_incomplete_session(
-                    request, abandon_unknown_tool_effects=True
+            try:
+                passes.append(
+                    await self._session_recovery.recover_incomplete_session(
+                        request, abandon_unknown_tool_effects=True
+                    )
                 )
-            )
+            except KeyError:
+                # Recovery reconnects the session's environment, so it can't run here
+                # without a registration of it. Abandoning continues nothing and
+                # needs no environment.
+                if not await self._environment_unregistered(session_id):
+                    raise
+                passes.append(
+                    await self._abandon_without_environment(
+                        session,
+                        reason=reason,
+                        metadata=metadata,
+                        inactive_for_seconds=inactive_for_seconds,
+                    )
+                )
             if IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT not in passes[-1].actions:
                 return _merged_recovery_results(passes)
         # A second, ordinary pass publishes the terminal evidence and finalizes
@@ -423,6 +438,68 @@ class SessionAbandonment:
             )
         )
         return _merged_recovery_results(passes)
+
+    async def _environment_unregistered(self, session_id: str) -> bool:
+        """Whether the session exists and names an environment this application lacks."""
+
+        session = await self._session_store.load(session_id)
+        if session is None or session.environment_name is None:
+            return False
+        try:
+            self._resolve_registered_environment(session.environment_name)
+        except KeyError:
+            return True
+        return False
+
+    async def _abandon_without_environment(
+        self,
+        session: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        inactive_for_seconds: int,
+    ) -> IncompleteSessionRecoveryResult:
+        """Abandon a session whose environment ordinary recovery couldn't resolve here.
+
+        ``session`` is the session as read before ordinary recovery, which refused a
+        live owner or active work in this process before it needed the environment.
+        Child sessions other than forks that haven't ended are refused, since
+        without its environment the parent's wait on them can't be checked; see
+        ``IncompleteSessionRecovery.abandon_without_environment`` for the rest.
+        """
+
+        if not self._agent_registered(session.agent_name):
+            raise SessionStatusConflict(
+                f"The session's agent {session.agent_name!r} isn't registered in this "
+                "application; abandon it from the application that runs that agent."
+            )
+        if any(
+            # A fork is an independent run; nothing waits on it.
+            child.invocation.source is not SessionExecutionSource.FORK
+            for child in await self._open_children(session.id)
+        ):
+            raise SessionStatusConflict(
+                f"The session's environment {session.environment_name!r} isn't registered "
+                "in this application, and the session has child sessions that haven't "
+                "ended; end them first."
+            )
+        abandoned = await self._incomplete_recovery.abandon_without_environment(
+            session,
+            reason=reason,
+            metadata=metadata,
+            inactive_for_seconds=inactive_for_seconds,
+        )
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=SessionStatus.INTERRUPTED,
+            status=abandoned.status,
+            actions=(IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT,),
+            message=(
+                "Abandoned the session; its unknown tool outcomes were not dispatched "
+                f"again. Its environment {session.environment_name!r} isn't registered in "
+                "this application, so its binding is left to be released where it is."
+            ),
+        )
 
     async def close(
         self,

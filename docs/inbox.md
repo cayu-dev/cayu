@@ -337,6 +337,16 @@ A session that abandonment doesn't end is refused with 409 `not_settleable` and 
 item stays pending: one with a live execution owner, a task that isn't finished, or a
 pause other than an unknown tool outcome (such as a question it is still waiting on).
 
+The process that settles the item doesn't need the session's environment. A session
+that ran in an environment this application doesn't register, such as a per-run
+environment only the worker that ran it registered, or one an earlier release had,
+is still dismissed: abandoning continues nothing, so the session fails without
+reconnecting its environment, and its environment binding stays recorded for
+recovery where that environment is registered. Such a session must be interrupted on
+its unknown tool outcomes, with no approval or question, no unfinished child
+session other than a fork, and no other recovery holding it; anything else is
+refused with 409 `not_settleable`.
+
 ### Dismissing an approval or a question
 
 An approval or a question whose session can never resume, for example one stranded

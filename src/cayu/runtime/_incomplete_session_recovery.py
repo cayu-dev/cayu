@@ -267,6 +267,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
+    _active_unexpired_incomplete_recovery_claim_id,
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.store import SessionStore
@@ -1742,6 +1743,10 @@ class IncompleteSessionRecovery:
                 or unsettled_environment_lifecycle
                 or bool(pending_allocations)
             )
+            abandoned = (
+                session.status is SessionStatus.FAILED
+                and abandoned_session_from_checkpoint(checkpoint) is not None
+            )
             if (
                 not has_pending_work
                 and active_invocation_profile is not None
@@ -1749,10 +1754,7 @@ class IncompleteSessionRecovery:
                     # An abandoned session was interrupted, which released its
                     # profile, before it failed. Its binding still owns the
                     # environment, so finalize it as for any failed run.
-                    (
-                        session.status is SessionStatus.FAILED
-                        and abandoned_session_from_checkpoint(checkpoint) is not None
-                    )
+                    abandoned
                     or not active_invocation_execution_profile_is_released(
                         active_invocation_profile,
                         session_id=session.id,
@@ -1760,15 +1762,26 @@ class IncompleteSessionRecovery:
                     )
                 )
             ):
-                terminal_binding_finalization = (
-                    await self._environment_lifecycle.prepare_terminal_binding_finalization(
-                        session=session,
-                        execution_profile=active_invocation_profile.profile,
-                        registered_environment=self._resolve_registered_environment(
-                            session.environment_name
-                        ),
+                try:
+                    registered_for_binding = self._resolve_registered_environment(
+                        session.environment_name
                     )
-                )
+                except KeyError:
+                    if not abandoned:
+                        raise
+                    # Nothing runs an abandoned session again, so its terminal
+                    # evidence doesn't wait on an environment this application
+                    # doesn't register (an earlier release's, or another
+                    # process's per-run one). The binding stays recorded and is
+                    # finalized by recovery where the environment is registered.
+                else:
+                    terminal_binding_finalization = (
+                        await self._environment_lifecycle.prepare_terminal_binding_finalization(
+                            session=session,
+                            execution_profile=active_invocation_profile.profile,
+                            registered_environment=registered_for_binding,
+                        )
+                    )
                 if terminal_binding_finalization is not None:
                     pending_completion_finalization = terminal_binding_finalization.marker()
                     has_pending_work = True
@@ -4762,6 +4775,7 @@ class IncompleteSessionRecovery:
         metadata: dict[str, Any],
         pending_approval: PendingToolApproval | None = None,
         pending_user_input: PendingUserInput | None = None,
+        admit: Callable[[Session, dict[str, Any] | None, datetime], None] | None = None,
     ) -> Session | None:
         """Fail an interrupted session whose round holds unknown tool outcomes.
 
@@ -4813,11 +4827,28 @@ class IncompleteSessionRecovery:
             )
             return copied
 
+        if admit is None:
+            return await self._commit_abandonment(
+                session,
+                task_id=task_id,
+                from_statuses={SessionStatus.INTERRUPTED},
+                checkpoint_transform=abandon,
+            )
+
+        def admitted_abandon(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            store_now: datetime,
+        ) -> dict[str, Any]:
+            # Checked in the same store transaction as the transition, at store time.
+            admit(current_session, checkpoint, store_now)
+            return abandon(current_session, checkpoint)
+
         return await self._commit_abandonment(
             session,
             task_id=task_id,
             from_statuses={SessionStatus.INTERRUPTED},
-            checkpoint_transform=abandon,
+            store_time_checkpoint_transform=admitted_abandon,
         )
 
     async def _unknown_tool_calls(
@@ -4847,7 +4878,12 @@ class IncompleteSessionRecovery:
         *,
         task_id: str | None,
         from_statuses: set[SessionStatus],
-        checkpoint_transform: Callable[[Session, dict[str, Any] | None], dict[str, Any]],
+        checkpoint_transform: Callable[[Session, dict[str, Any] | None], dict[str, Any]]
+        | None = None,
+        store_time_checkpoint_transform: Callable[
+            [Session, dict[str, Any] | None, datetime], dict[str, Any]
+        ]
+        | None = None,
     ) -> Session:
         """Freeze the session's task set, then fail it with its abandonment evidence."""
 
@@ -4893,6 +4929,7 @@ class IncompleteSessionRecovery:
                     from_statuses=from_statuses,
                     to_status=SessionStatus.FAILED,
                     checkpoint_transform=checkpoint_transform,
+                    store_time_checkpoint_transform=store_time_checkpoint_transform,
                 )
         except BaseException as failure:
             await self._recovery_ownership.run_cleanup_steps(
@@ -5040,6 +5077,140 @@ class IncompleteSessionRecovery:
         except RuntimeError as exc:
             # A pause that changed under the close is a conflict for the caller.
             raise SessionStatusConflict(str(exc)) from exc
+
+    async def abandon_without_environment(
+        self,
+        expected: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        inactive_for_seconds: int,
+    ) -> Session:
+        """Abandon an interrupted session whose environment isn't registered here.
+
+        For ``SessionAbandonment.abandon`` once ordinary recovery refused the
+        session because this application has no registration of its environment,
+        such as a per-run environment only the process that ran the session
+        registered, or one an earlier release had. Abandoning continues nothing,
+        so it needs neither the environment nor the session's execution profile:
+        the session fails in the same fenced transition as an abandonment by
+        recovery, from ``interrupted`` at the same run epoch, and each unknown
+        call keeps its ``outcome_unknown`` record. Recovery then publishes the
+        terminal evidence; the environment binding stays recorded, to be released
+        where the environment is registered.
+
+        ``expected`` is the session as it was read before ordinary recovery
+        refused it; a session that changed since (another recovery claimed it, for
+        example) is not abandoned. A live owner, a live recovery claim, or activity
+        within ``inactive_for_seconds`` of store time refuses it, checked atomically
+        before the abandonment claims the task set, and the transition checks the
+        claim again. Only a plain round of unknown tool outcomes is
+        abandoned this way. A session that is not interrupted, sleeps, waits on an
+        approval or a question, or holds no unknown outcome raises
+        ``SessionStatusConflict``, as do the refusals above.
+        """
+
+        session = await self._session_store.load(expected.id)
+        if session is None:
+            raise KeyError(f"Session not found: {expected.id}")
+        if (session.instance_id, session.run_epoch) != (expected.instance_id, expected.run_epoch):
+            raise SessionStatusConflict("Session changed before it was abandoned.")
+        unavailable = (
+            f"The session's environment {session.environment_name!r} isn't registered in "
+            "this application"
+        )
+        if session.status is not SessionStatus.INTERRUPTED:
+            raise SessionStatusConflict(
+                f"{unavailable}, and only an interrupted session can be abandoned without "
+                f"it; this one is {session.status.value}."
+            )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict("Session was already abandoned.")
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if (
+            pending_round is None
+            or PENDING_WAKE_CHECKPOINT_KEY in (checkpoint or {})
+            or PENDING_USER_INPUT_CHECKPOINT_KEY in (checkpoint or {})
+            or pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in (checkpoint or {})
+        ):
+            raise SessionStatusConflict(
+                f"{unavailable}, and without it only a session stopped on unknown tool "
+                "outcomes can be abandoned; this one waits on something else."
+            )
+
+        checked_activity: datetime | None = None
+
+        def check(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            nonlocal checked_activity
+            unclaimed(current_session, current, store_now)
+            checked_activity = current_session.last_activity_at
+            return None  # Writes nothing.
+
+        def unclaimed(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            if (current_session.instance_id, current_session.run_epoch) != (
+                session.instance_id,
+                session.run_epoch,
+            ):
+                raise RuntimeError("Session changed before it was abandoned.")
+            if _active_unexpired_incomplete_recovery_claim_id(current, now=store_now):
+                raise RuntimeError("Another recovery owns the session; it was left alone.")
+
+        def admit(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            unclaimed(current_session, current, store_now)
+            if inactive_for_seconds and current_session.last_activity_at != checked_activity:
+                # Activity since the store-time check. Refusing here, after the task set
+                # was claimed, retires that claim, so this session is then left to
+                # recovery where its environment is registered; it takes a write within
+                # the moment between the check and this transition.
+                raise RuntimeError(
+                    f"Session had activity within the last {inactive_for_seconds} seconds."
+                )
+
+        # Refuse a live owner, a live recovery claim or recent activity at store time
+        # before the abandonment claims the session's task set: a refusal after that
+        # claim retires it, and the unchanged session couldn't claim it again.
+        try:
+            await self._session_store.reserve_stalled_run_recovery(
+                session.id,
+                statuses={SessionStatus.INTERRUPTED},
+                inactive_for_seconds=inactive_for_seconds,
+                checkpoint_transform=check,
+            )
+        except RuntimeError as exc:
+            raise SessionStatusConflict(str(exc)) from exc
+        if checked_activity is None:
+            raise SessionStatusConflict(
+                f"Session had activity within the last {inactive_for_seconds} seconds, or "
+                "changed before it was abandoned."
+            )
+        try:
+            abandoned = await self._abandon_unknown_tool_round(
+                session=session,
+                pending_round=pending_round,
+                reason=reason,
+                metadata=metadata,
+                admit=admit,
+            )
+        except RuntimeError as exc:
+            # The session resumed, its pause changed, or another recovery claimed it.
+            raise SessionStatusConflict(str(exc)) from exc
+        if abandoned is None:
+            raise SessionStatusConflict(
+                f"{unavailable}, and its paused round holds no unknown tool outcome to abandon."
+            )
+        return abandoned
 
     async def deny_stranded_approval(
         self,

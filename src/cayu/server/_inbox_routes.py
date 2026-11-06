@@ -1044,8 +1044,17 @@ def register_inbox_routes(
                     reason=_DISMISSAL_REASON,
                     metadata={"reason": body.reason, "resolved_by": resolved_by},
                 )
-            except KeyError:
-                raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
+            except KeyError as exc:
+                if await session_store.load(item.session.id) is None:
+                    raise HTTPException(status_code=404, detail=_NOT_FOUND) from None
+                # Something the session needs is missing here, not the item itself.
+                missing = exc.args[0] if exc.args and isinstance(exc.args[0], str) else ""
+                raise _conflict(
+                    "not_settleable",
+                    "This recovery item's session can't be abandoned here"
+                    + (f": {cayu_app.redact_json(missing)}" if missing else "."),
+                    await session_item_state(item),
+                ) from exc
             except (RuntimeError, SessionStatusConflict) as exc:
                 raise _conflict("not_settleable", str(exc), await session_item_state(item)) from exc
             refusal = None if result.message is None else cayu_app.redact_json(result.message)
