@@ -1299,7 +1299,11 @@ class HttpxUpstream:
                     "Upstream response content encoding is unsupported."
                 ) from exc
             content_length = response.headers.get("content-length")
-            if content_length is not None:
+            # Bodyless responses can describe a representation rather than a
+            # body to be received. Actual received bytes are still bounded below.
+            if content_length is not None and not _response_has_no_body(
+                request.method, response.status_code
+            ):
                 with contextlib.suppress(ValueError):
                     if int(content_length) > limits.max_response_bytes:
                         raise _UpstreamResponseTooLargeError(
@@ -2524,12 +2528,7 @@ class TransparentEgressBroker:
         still produces its specific denial instead of a truncated stream.
         """
 
-        if (
-            request.method == "HEAD"
-            or head.body
-            or head.status_code < 200
-            or head.status_code in {204, 205, 304}
-        ):
+        if _response_has_no_body(request.method, head.status_code) or head.body:
             return None
         content_type = _header_get(head.headers, "content-type") or ""
         if content_type.split(";", 1)[0].strip().lower() not in _STREAMED_RESPONSE_MEDIA_TYPES:
@@ -2969,6 +2968,10 @@ def _approved_destination_map(
         destination.authority: destination
         for destination in validate_approved_destinations(destinations)
     }
+
+
+def _response_has_no_body(method: str, status_code: int) -> bool:
+    return method == "HEAD" or status_code < 200 or status_code in {204, 205, 304}
 
 
 def _header_get(headers: Mapping[str, str], name: str) -> str | None:

@@ -1481,6 +1481,35 @@ def test_httpx_upstream_rejects_malformed_or_truncated_encoding(encoded: bytes) 
         _send_direct(upstream)
 
 
+@pytest.mark.parametrize(
+    ("method", "status"),
+    [("HEAD", 200), ("GET", 103), ("GET", 204), ("GET", 205), ("GET", 304)],
+)
+@pytest.mark.parametrize("body", [b"", b"123456789"])
+def test_httpx_upstream_bodyless_response_limits_received_bytes(
+    method: str, status: int, body: bytes
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers={"Content-Length": "9"}, content=body)
+
+    upstream = HttpxUpstream(
+        max_response_bytes=8,
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    request = CapturedRequest(method=method, host="web.archive.org", path="/")
+
+    if body:
+        # Even a nominally bodyless response must not bypass the read limit
+        # when a transport actually supplies bytes.
+        with pytest.raises(RuntimeError, match="exceeded the configured byte limit"):
+            asyncio.run(upstream.send(request))
+    else:
+        response = asyncio.run(upstream.send(request))
+        assert response.status_code == status
+        assert response.body == b""
+
+
 def test_httpx_upstream_accepts_empty_body_with_announced_coding() -> None:
     response = _send_direct(_encoded_upstream(b"", content_encoding="gzip"))
 
