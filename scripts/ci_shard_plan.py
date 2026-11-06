@@ -41,7 +41,9 @@ _STORES = frozenset({"memory", "sqlite", "postgres"})
 _KEPT_STORE = "sqlite"
 _MASK = "<store>"
 
-GENERAL_MARKER = "not (stress or qualification or postgres or browser_docker or host_journey)"
+GENERAL_MARKER = (
+    "not (stress or qualification or postgres or browser_docker or host_journey or fault_injection)"
+)
 POSTGRES_MARKER = "postgres and not (stress or qualification or host_journey)"
 
 # Unit and shard sizes are in seconds of single-worker test time.

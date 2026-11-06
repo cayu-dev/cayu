@@ -62,6 +62,13 @@ _SQLITE_EXACT_PATHS = {
     "tests/core/test_subagent_cancellation.py",
     "tests/core/test_task_wait.py",
 }
+# The fault-injection scenarios run CayuApp over the Runtime, so they cover the
+# SQLite cancellation lane's Runtime inventory (including tests/runtime/, whose
+# provider support the harness imports) plus CayuApp's helpers and the harness.
+_FAULT_INJECTION_PREFIXES = (
+    "src/cayu/_application_",
+    "tests/fault_injection/",
+)
 _DASHBOARD_EXACT_PATHS = {
     ".gitattributes",
     "scripts/build_b2b_web.py",
@@ -113,6 +120,7 @@ class VerificationScope:
     dashboard: bool
     release_artifacts: bool
     sqlite_cancellation: bool
+    fault_injection: bool
 
     def render_github_outputs(self) -> str:
         return "\n".join(
@@ -120,6 +128,7 @@ class VerificationScope:
                 f"dashboard={str(self.dashboard).lower()}",
                 f"release_artifacts={str(self.release_artifacts).lower()}",
                 f"sqlite_cancellation={str(self.sqlite_cancellation).lower()}",
+                f"fault_injection={str(self.fault_injection).lower()}",
             )
         )
 
@@ -137,6 +146,9 @@ def select_pull_request_jobs(changed_paths: Iterable[str]) -> VerificationScope:
         sqlite_cancellation=scope_definition_changed
         or dependency_changed
         or any(_affects_sqlite_cancellation(path) for path in paths),
+        fault_injection=scope_definition_changed
+        or dependency_changed
+        or any(_affects_fault_injection(path) for path in paths),
     )
 
 
@@ -152,6 +164,10 @@ def _affects_sqlite_cancellation(path: str) -> bool:
             and any(component in path for component in ("sqlite", "session_store"))
         )
     )
+
+
+def _affects_fault_injection(path: str) -> bool:
+    return _affects_sqlite_cancellation(path) or path.startswith(_FAULT_INJECTION_PREFIXES)
 
 
 def _affects_dashboard(path: str) -> bool:

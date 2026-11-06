@@ -294,6 +294,26 @@ def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
     ) in _RUNNER["_SQLITE_CANCELLATION_TESTS"]
 
 
+def test_fault_injection_lane_runs_the_sample_unless_exhaustive() -> None:
+    sample = _dry_runner()
+    _RUNNER["_run_fault_injection"](sample, exhaustive=False)
+    exhaustive = _dry_runner()
+    _RUNNER["_run_fault_injection"](exhaustive, exhaustive=True)
+
+    assert [item.status for item in sample.evidence] == ["PLANNED"] * 3
+    assert [item.status for item in exhaustive.evidence] == ["PLANNED"] * 3
+    assert (
+        "-m 'fault_injection and not fault_injection_exhaustive' tests/fault_injection"
+        in sample.evidence[-1].command
+    )
+    assert "-m fault_injection tests/fault_injection" in exhaustive.evidence[-1].command
+    assert f"-n {sample.test_workers}" in sample.evidence[-1].command
+    assert not _RUNNER["_parse_args"]([]).exhaustive_fault_injection
+    assert _RUNNER["_parse_args"](
+        ["--lane", "fault-injection", "--exhaustive-fault-injection"]
+    ).exhaustive_fault_injection
+
+
 def test_package_plan_skips_publication_policy_unless_explicit(
     tmp_path: Path,
 ) -> None:
@@ -500,13 +520,14 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
         head_sha="b" * 40,
         merge_base="a" * 40,
         changed_paths=("src/cayu/tasks/base.py",),
-        scope=VerificationScope(True, True, True),
+        scope=VerificationScope(True, True, True, True),
         source_untracked=("?? local-proof.md",),
         execution_untracked=("?? generated-output.txt",),
         open_file_limits=(256, 8192),
         jobs=2,
         stores="all",
         publishing=False,
+        exhaustive_fault_injection=False,
         evidence=(
             CommandEvidence(
                 label="Publishing only: Verify immutable release state",
@@ -525,6 +546,7 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
     assert "Status: **PASS**" in rendered
     assert "`0 passed`, `0 failed`, `1 skipped`, `0 planned`" in rendered
     assert "`publishing=false`" in rendered
+    assert "`fault_injection_points=sample`" in rendered
     assert "32 general Python shards (all stores)" in rendered
     assert "### SKIP: Publishing only: Verify immutable release state" in rendered
     assert "Commit tested: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`" in rendered
@@ -599,7 +621,7 @@ def test_pr_gate_keeps_process_regressions_and_release_waits_for_qualification()
     _run_general_shard(general, 1)
     assert "--ci-shard general-1" in general.evidence[-1].command
     assert _RUNNER["ci_shard_plan"].family("general").marker == (
-        "not (stress or qualification or postgres or browser_docker or host_journey)"
+        "not (stress or qualification or postgres or browser_docker or host_journey or fault_injection)"
     )
     qualification = _dry_runner()
     _run_specialist_lane(qualification, "qualification-1")

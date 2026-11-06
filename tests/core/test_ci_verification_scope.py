@@ -23,6 +23,7 @@ def test_unrelated_pull_request_keeps_expensive_jobs_skipped() -> None:
         dashboard=False,
         release_artifacts=False,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
 
 
@@ -31,6 +32,7 @@ def test_sqlite_regression_path_selects_only_cross_version_lane() -> None:
         dashboard=False,
         release_artifacts=False,
         sqlite_cancellation=True,
+        fault_injection=True,
     )
     assert select_pull_request_jobs(["tests/examples/test_sqlite_example_paths.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/_task_wait.py"]) == expected
@@ -44,12 +46,33 @@ def test_sqlite_regression_path_selects_only_cross_version_lane() -> None:
     )
 
 
-def test_runtime_change_selects_sqlite_and_dashboard_contract_lanes() -> None:
+def test_runtime_change_selects_sqlite_dashboard_and_fault_injection_lanes() -> None:
     assert select_pull_request_jobs(["src/cayu/sessions/base.py"]) == VerificationScope(
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=True,
+        fault_injection=True,
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/cayu/runtime/_session_engine.py",
+        "src/cayu/tasks/worker.py",
+        "src/cayu/storage/sqlite.py",
+        "src/cayu/sessions/memory.py",
+        "src/cayu/applications.py",
+        "src/cayu/_application_task_creation.py",
+        "src/cayu/approvals/tools.py",
+        "src/cayu/tools/rounds.py",
+        "src/cayu/budgets/limits.py",
+        "tests/runtime/runtime_provider_support.py",
+        "tests/fault_injection/harness.py",
+    ],
+)
+def test_runtime_store_and_harness_changes_select_fault_injection(path: str) -> None:
+    assert select_pull_request_jobs([path]).fault_injection
 
 
 def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes() -> None:
@@ -57,18 +80,21 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
 
     dashboard_only = VerificationScope(
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
     assert select_pull_request_jobs(["scripts/generate_dashboard_api_types.py"]) == dashboard_only
     assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == VerificationScope(
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
     assert select_pull_request_jobs(["tests/browser_client/client.test.mjs"]) == dashboard_only
@@ -77,12 +103,15 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
     # and ships in the package.
     assert select_pull_request_jobs(
         ["src/cayu/cli/templates/b2b_web/src/app.tsx"]
-    ) == VerificationScope(dashboard=True, release_artifacts=True, sqlite_cancellation=False)
+    ) == VerificationScope(
+        dashboard=True, release_artifacts=True, sqlite_cancellation=False, fault_injection=False
+    )
     assert select_pull_request_jobs(["scripts/build_b2b_web.py"]) == dashboard_only
     assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
 
 
@@ -91,6 +120,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         dashboard=False,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
     assert select_pull_request_jobs(["LICENSE"]) == expected
     assert select_pull_request_jobs(["README.md"]) == expected
@@ -121,6 +151,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=True,
+        fault_injection=True,
     )
     assert select_pull_request_jobs(["tests/cli/test_scaffold_docker_live.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/guides/evals-first.md"]) == expected
@@ -128,6 +159,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
     assert select_pull_request_jobs(
         ["src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"]
@@ -135,6 +167,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
 
 
@@ -143,6 +176,7 @@ def test_cloud_cli_changes_select_release_artifact_lane() -> None:
         dashboard=False,
         release_artifacts=True,
         sqlite_cancellation=False,
+        fault_injection=False,
     )
     assert select_pull_request_jobs(["src/cayu/cli/cloud.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/cli/_cloud_project.py"]) == expected
@@ -153,6 +187,7 @@ def test_dependency_or_scope_changes_fail_open() -> None:
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=True,
+        fault_injection=True,
     )
     assert select_pull_request_jobs(["pyproject.toml"]) == all_jobs
     assert select_pull_request_jobs([".github/workflows/ci.yml"]) == all_jobs
@@ -170,8 +205,9 @@ def test_github_outputs_are_stable_lowercase_booleans() -> None:
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=True,
+        fault_injection=False,
     ).render_github_outputs() == (
-        "dashboard=true\nrelease_artifacts=false\nsqlite_cancellation=true"
+        "dashboard=true\nrelease_artifacts=false\nsqlite_cancellation=true\nfault_injection=false"
     )
 
 
@@ -206,6 +242,7 @@ def test_public_export_and_layout_changes_select_all_contract_lanes(path: str) -
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=True,
+        fault_injection=True,
     )
 
 
@@ -231,4 +268,5 @@ def test_new_concept_helpers_keep_runtime_ci_coverage(package: str, helper: str)
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=True,
+        fault_injection=True,
     )

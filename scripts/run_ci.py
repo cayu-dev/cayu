@@ -24,7 +24,7 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
@@ -106,6 +106,7 @@ class VerificationScope:
     dashboard: bool
     release_artifacts: bool
     sqlite_cancellation: bool
+    fault_injection: bool
 
 
 _PACKAGE_VERIFICATION_GROUPS = (
@@ -380,7 +381,7 @@ def _resolve_scope(root: Path, base_sha: str, head_sha: str) -> VerificationScop
         if not separator or raw_value not in {"true", "false"}:
             raise RuntimeError(f"unexpected CI scope output: {line!r}")
         values[name] = raw_value == "true"
-    expected = {"dashboard", "release_artifacts", "sqlite_cancellation"}
+    expected = {"dashboard", "release_artifacts", "sqlite_cancellation", "fault_injection"}
     if values.keys() != expected:
         raise RuntimeError(f"unexpected CI scope keys: {sorted(values)}")
     return VerificationScope(**values)
@@ -827,6 +828,31 @@ def _run_sqlite_cancellation(runner: LocalCiRunner) -> None:
         _run_sqlite_cancellation_version(runner, python_version)
 
 
+# Pull requests inject at one point per distinct Runtime call site; main, tags
+# and release PRs add every other point.
+_FAULT_INJECTION_SAMPLE_MARKER = "fault_injection and not fault_injection_exhaustive"
+_FAULT_INJECTION_EXHAUSTIVE_MARKER = "fault_injection"
+
+
+def _run_fault_injection(runner: LocalCiRunner, *, exhaustive: bool) -> None:
+    _sync_python_test_environment(runner, browser=False)
+    runner.run(
+        f"Fault injection over Runtime scenarios ({'every point' if exhaustive else 'sample'})",
+        (
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "-q",
+            "-n",
+            str(runner.test_workers),
+            "-m",
+            _FAULT_INJECTION_EXHAUSTIVE_MARKER if exhaustive else _FAULT_INJECTION_SAMPLE_MARKER,
+            "tests/fault_injection",
+        ),
+    )
+
+
 def _run_dashboard(runner: LocalCiRunner) -> None:
     runner.run("Install Python 3.11 for dashboard", ("uv", "python", "install", "3.11"))
     runner.run(
@@ -1040,6 +1066,7 @@ def _write_proof(
     jobs: int,
     stores: str,
     publishing: bool,
+    exhaustive_fault_injection: bool,
     evidence: Sequence[CommandEvidence],
     error: str | None,
 ) -> None:
@@ -1074,6 +1101,8 @@ def _write_proof(
         f"- `dashboard={str(scope.dashboard).lower()}`",
         f"- `release_artifacts={str(scope.release_artifacts).lower()}`",
         f"- `sqlite_cancellation={str(scope.sqlite_cancellation).lower()}`",
+        f"- `fault_injection={str(scope.fault_injection).lower()}`",
+        f"- `fault_injection_points={'every' if exhaustive_fault_injection else 'sample'}`",
         f"- `publishing={str(publishing).lower()}`",
         "",
         "## Changed paths",
@@ -1133,6 +1162,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "general",
             "specialist",
             "sqlite-cancellation",
+            "fault-injection",
             "dashboard",
             "package",
         ),
@@ -1194,6 +1224,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--python-version",
         choices=_SQLITE_PYTHON_VERSIONS,
         help="SQLite cancellation lane Python version",
+    )
+    parser.add_argument(
+        "--exhaustive-fault-injection",
+        action="store_true",
+        help="inject faults at every point instead of the pull-request sample",
     )
     parser.add_argument(
         "--base",
@@ -1284,6 +1319,8 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             if args.python_version is None:
                 raise ValueError("--lane sqlite-cancellation requires --python-version")
             _run_sqlite_cancellation_version(runner, args.python_version)
+        elif args.lane == "fault-injection":
+            _run_fault_injection(runner, exhaustive=args.exhaustive_fault_injection)
         elif args.lane == "dashboard":
             _run_dashboard(runner)
         elif args.lane == "package":
@@ -1346,16 +1383,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             if initial_execution_untracked:
                 raise RuntimeError("isolated CI worktree unexpectedly contains untracked paths")
             scope = (
-                VerificationScope(True, True, True)
+                VerificationScope(True, True, True, True)
                 if args.all
                 else _resolve_scope(execution_root, base_sha, head_sha)
             )
-            if args.publishing and not scope.release_artifacts:
-                scope = VerificationScope(
-                    dashboard=scope.dashboard,
-                    release_artifacts=True,
-                    sqlite_cancellation=scope.sqlite_cancellation,
-                )
+            # A release runs every fault-injection point, as tag CI does.
+            if args.publishing:
+                scope = replace(scope, release_artifacts=True, fault_injection=True)
+            exhaustive_fault_injection = args.exhaustive_fault_injection or args.publishing
 
             print(f"Repository: {source_root}")
             print(f"Execution:  isolated detached worktree at {head_sha}")
@@ -1366,6 +1401,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"dashboard={scope.dashboard} "
                 f"release_artifacts={scope.release_artifacts} "
                 f"sqlite_cancellation={scope.sqlite_cancellation} "
+                f"fault_injection={scope.fault_injection} "
+                f"fault_injection_points={'every' if exhaustive_fault_injection else 'sample'} "
                 f"publishing={args.publishing} jobs={args.jobs}"
             )
             print(f"Open files: soft limit {open_file_limits[0]} -> {open_file_limits[1]}")
@@ -1394,6 +1431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _run_python_suite(runner, jobs=args.jobs)
                     if scope.sqlite_cancellation:
                         _run_sqlite_cancellation(runner)
+                    if scope.fault_injection:
+                        _run_fault_injection(runner, exhaustive=exhaustive_fault_injection)
                     if scope.dashboard:
                         _run_dashboard(runner)
                     if scope.release_artifacts:
@@ -1445,6 +1484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 jobs=args.jobs,
                 stores=runner.stores,
                 publishing=args.publishing,
+                exhaustive_fault_injection=exhaustive_fault_injection,
                 evidence=runner.evidence,
                 error=error,
             )

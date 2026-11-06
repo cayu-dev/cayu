@@ -65,6 +65,7 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
             "static",
             "python-tests",
             "sqlite-cancellation",
+            "fault-injection",
             "package-build",
             "package",
             "release-qualification",
@@ -88,6 +89,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
         "static",
         "python-tests",
         "sqlite-cancellation",
+        "fault-injection",
         "package-build",
         "package",
         "release-qualification",
@@ -103,7 +105,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
     scope = _job_block(workflow, "verification-scope")
     assert "python3 scripts/select_ci_jobs.py" in scope
     assert 'test "$EVENT_NAME" != "pull_request"' in scope
-    for output in ("dashboard", "release_artifacts", "sqlite_cancellation"):
+    for output in ("dashboard", "release_artifacts", "sqlite_cancellation", "fault_injection"):
         assert f'echo "{output}=true"' in scope
         assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
 
@@ -147,7 +149,10 @@ def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     assert "CAYU_TEST_STORES: ${{ inputs.stores }}" in shards
     assert "needs:" not in shards
     assert 'scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"' in shards
-    assert '"not (stress or qualification or postgres or browser_docker or host_journey)"' in plan
+    assert (
+        '"not (stress or qualification or postgres or browser_docker or host_journey or fault_injection)"'
+        in plan
+    )
     assert '"postgres and not (stress or qualification or host_journey)"' in plan
     assert '"host_journey and not (stress or qualification)"' in plan
     assert '"stress or qualification"' in plan
@@ -296,8 +301,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, python-tests, sqlite-cancellation, package-build, package, "
-        "dashboard, release-qualification]" in publish
+        "needs: [static, python-tests, sqlite-cancellation, fault-injection, package-build, "
+        "package, dashboard, release-qualification]" in publish
     )
     assert (
         "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in github_release
@@ -365,11 +370,25 @@ def test_selected_high_value_jobs_preserve_premerge_and_manual_contracts() -> No
     runner = _CI_RUNNER.read_text()
     package_manifest = _PACKAGE_MANIFEST.read_text()
     sqlite = _job_block(workflow, "sqlite-cancellation")
+    fault_injection = _job_block(workflow, "fault-injection")
     package = _job_block(workflow, "package-build")
     dashboard = _job_block(workflow, "dashboard")
 
     assert "needs: verification-scope" in sqlite
     assert "needs.verification-scope.outputs.sqlite_cancellation == 'true'" in sqlite
+    assert "needs: verification-scope" in fault_injection
+    assert "needs.verification-scope.outputs.fault_injection == 'true'" in fault_injection
+    assert "scripts/run_ci.py --lane fault-injection" in fault_injection
+    # Pull requests run the sample; every other event and release PRs every point.
+    assert (
+        "(github.event_name != 'pull_request' || "
+        "needs.verification-scope.outputs.release_candidate == 'true') && "
+        "'--exhaustive-fault-injection' || ''"
+    ) in fault_injection
+    assert (
+        "timeout-minutes: ${{ (github.event_name != 'pull_request' || "
+        "needs.verification-scope.outputs.release_candidate == 'true') && 90 || 40 }}"
+    ) in fault_injection
     # The archives build beside the scope; the contracts consuming them wait for it.
     assert "needs:" not in package
     assert "needs: verification-scope" in dashboard
@@ -459,7 +478,7 @@ def test_draft_prs_skip_every_independent_worker_before_allocation() -> None:
         assert draft_guard in block
         start = block.index("runs-on:") if "runs-on:" in block else block.index("uses:")
         assert block.index(draft_guard) < start
-    for name in ("sqlite-cancellation", "dashboard"):
+    for name in ("sqlite-cancellation", "fault-injection", "dashboard"):
         assert "needs: verification-scope" in _job_block(workflow, name)
     assert "needs: [verification-scope, package-build]" in _job_block(workflow, "package")
 
@@ -500,7 +519,8 @@ def test_private_release_prs_force_validation_without_enabling_publication(tmp_p
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     (scripts / "select_ci_jobs.py").write_text(
-        'print("dashboard=false\\nrelease_artifacts=false\\nsqlite_cancellation=false")\n'
+        'print("dashboard=false\\nrelease_artifacts=false\\nsqlite_cancellation=false'
+        '\\nfault_injection=false")\n'
     )
     for event, candidate, forced in (
         ("pull_request", "true", True),
@@ -527,6 +547,7 @@ def test_private_release_prs_force_validation_without_enabling_publication(tmp_p
             "dashboard": str(forced).lower(),
             "release_artifacts": str(forced).lower(),
             "sqlite_cancellation": str(forced).lower(),
+            "fault_injection": str(forced).lower(),
         }
     tests = _job_block(workflow, "python-tests")
     assert "needs: verification-scope" in tests

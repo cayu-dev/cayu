@@ -220,6 +220,8 @@ markers = [
   "postgres_recovery: real process-death coverage requiring the Postgres lane",
   "sigkill_recovery: real process-death recovery coverage run in its own lane",
   "stress: deterministic concurrency and fault-injection coverage",
+  "fault_injection: Runtime fault injection, run in its own CI job on Runtime, application, approval, task, session and storage changes",
+  "fault_injection_exhaustive: the fault-injection points outside the pull-request sample, run on main, tags and release PRs",
   "qualification: full-scale evidence, capacity, and end-to-end acceptance checks",
   "store_semantics: keep every store variant in PR CI",
 ]
