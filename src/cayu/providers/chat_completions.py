@@ -42,6 +42,7 @@ from cayu.providers._credential_boundary import (
 )
 from cayu.providers._http import (
     _PROVIDER_ERROR_WORKLOAD_REDACTOR,
+    MODEL_PROVIDER_KEEPALIVE_EXPIRY_S,
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
@@ -378,7 +379,7 @@ class HttpxChatCompletionsTransport:
         if type(allow_http) is not bool:
             raise TypeError("allow_http must be a bool.")
         self.allow_http = allow_http
-        self._client = SharedAsyncClient()
+        self._client = SharedAsyncClient(keepalive_expiry_s=MODEL_PROVIDER_KEEPALIVE_EXPIRY_S)
 
     async def aclose(self) -> None:
         await self._client.aclose()

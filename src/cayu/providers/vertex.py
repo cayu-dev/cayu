@@ -17,6 +17,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    MODEL_PROVIDER_KEEPALIVE_EXPIRY_S,
     SharedAsyncClient,
     aclose_transport,
     credential_safe_error_event,
@@ -189,7 +190,7 @@ class HttpxVertexTransport:
     """
 
     def __init__(self) -> None:
-        self._client = SharedAsyncClient()
+        self._client = SharedAsyncClient(keepalive_expiry_s=MODEL_PROVIDER_KEEPALIVE_EXPIRY_S)
 
     async def aclose(self) -> None:
         await self._client.aclose()

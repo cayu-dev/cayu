@@ -51,6 +51,7 @@ from cayu.providers import (
 )
 from cayu.providers._credential_boundary import ProviderStreamCleanupError
 from cayu.providers._http import (
+    MODEL_PROVIDER_KEEPALIVE_EXPIRY_S,
     SharedAsyncClient,
     _trusted_sse_retry_after_s,
     bind_provider_error_workload_redactor,
@@ -1012,6 +1013,126 @@ def test_new_async_client_fails_closed_when_extra_ca_is_blank(
         match="`CAYU_PROVIDER_CA_BUNDLE` cannot be blank",
     ):
         new_async_client()
+
+
+def test_new_async_client_keeps_idle_connections_for_the_requested_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def make_client(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.delenv("CAYU_PROVIDER_CA_BUNDLE", raising=False)
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", make_client)
+
+    assert new_async_client(keepalive_expiry_s=42) is not None
+    # Only the keep-alive changes; the pool sizes stay httpx's defaults.
+    default_limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    assert captured["limits"] == httpx.Limits(
+        max_connections=default_limits.max_connections,
+        max_keepalive_connections=default_limits.max_keepalive_connections,
+        keepalive_expiry=42.0,
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan"), True, "60"])
+def test_shared_async_client_rejects_invalid_keepalive(value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        SharedAsyncClient(keepalive_expiry_s=value)  # type: ignore[arg-type]
+
+
+def _pool_keepalive_expiry(client: httpx.AsyncClient) -> float | None:
+    return client._transport._pool._keepalive_expiry  # type: ignore[attr-defined]
+
+
+@pytest.mark.anyio
+async def test_shared_async_client_default_keeps_httpx_keepalive() -> None:
+    shared = SharedAsyncClient()
+    try:
+        assert _pool_keepalive_expiry(shared.get()) == 5.0
+    finally:
+        await shared.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "transport_type",
+    [
+        HttpxOpenAITransport,
+        HttpxAnthropicTransport,
+        HttpxChatCompletionsTransport,
+        HttpxVertexTransport,
+    ],
+)
+async def test_model_provider_transports_keep_connections_across_tool_rounds(
+    transport_type: Callable[[], Any],
+) -> None:
+    # A model call usually follows a tool round longer than httpx's 5 s idle
+    # limit; the provider's connection must still be pooled for it.
+    transport = transport_type()
+    try:
+        client = transport._client.get()
+        assert _pool_keepalive_expiry(client) == MODEL_PROVIDER_KEEPALIVE_EXPIRY_S
+        assert MODEL_PROVIDER_KEEPALIVE_EXPIRY_S >= 30
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.anyio
+async def test_provider_client_reuses_one_connection_after_an_idle_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections = 0
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    (
+                        int(line.split(b":", 1)[1])
+                        for line in head.split(b"\r\n")
+                        if line.lower().startswith(b"content-length:")
+                    ),
+                    0,
+                )
+                await reader.readexactly(length)
+                writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n")
+                writer.write(b"content-length: 2\r\n\r\n{}")
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    # httpcore reads the clock to expire idle connections; jump it past
+    # httpx's 5 s default between the two calls instead of sleeping.
+    import time
+
+    import httpcore._async.http11 as httpcore_http11
+
+    offset = 0.0
+    monkeypatch.setattr(
+        httpcore_http11,
+        "time",
+        SimpleNamespace(monotonic=lambda: time.monotonic() + offset),
+    )
+    shared = SharedAsyncClient(keepalive_expiry_s=MODEL_PROVIDER_KEEPALIVE_EXPIRY_S)
+    try:
+        client = shared.get()
+        url = f"http://127.0.0.1:{port}/v1/responses"
+        assert (await client.post(url, json={"n": 1})).status_code == 200
+        offset = 20.0
+        assert (await client.post(url, json={"n": 2})).status_code == 200
+        assert connections == 1
+    finally:
+        await shared.aclose()
+        server.close()
+        await server.wait_closed()
 
 
 class _StreamContext:

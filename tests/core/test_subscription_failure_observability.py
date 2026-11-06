@@ -119,7 +119,7 @@ def test_http_failure_survives_subscription_and_storage(
 
     monkeypatch.setattr(
         "cayu.providers._http.new_async_client",
-        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        lambda **_: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     _assert_durable_failure(tmp_path, HttpxOpenAITransport(), exception_type.__name__, retryable)
 

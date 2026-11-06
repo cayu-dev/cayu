@@ -60,6 +60,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    MODEL_PROVIDER_KEEPALIVE_EXPIRY_S,
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     _accept_sse_terminal,
@@ -626,7 +627,7 @@ class HttpxOpenAITransport:
         if type(allow_http) is not bool:
             raise TypeError("allow_http must be a bool.")
         self.allow_http = allow_http
-        self._client = SharedAsyncClient()
+        self._client = SharedAsyncClient(keepalive_expiry_s=MODEL_PROVIDER_KEEPALIVE_EXPIRY_S)
 
     async def aclose(self) -> None:
         await self._client.aclose()

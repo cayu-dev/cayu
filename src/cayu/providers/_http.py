@@ -30,6 +30,7 @@ import httpx
 from cayu._exception_state import exception_state_contains
 from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.providers._api_error_diagnostics import api_error_diagnostic_fields
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     _contains_fatal_signal,
@@ -102,6 +103,16 @@ _PROVIDER_ERROR_REQUEST_REDACTORS: WeakKeyDictionary[ModelProviderError, SecretR
 )
 _PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
 _POST_TERMINAL_DRAIN_SECONDS = 0.05
+# httpx closes a pooled connection after 5 idle seconds. An agent's next model
+# call usually follows a tool round longer than that (half of a coding hunt's
+# calls did), so each such call paid a new TCP and TLS handshake (about 0.14 s to
+# an endpoint 60 ms away). Model provider transports keep idle connections for a
+# minute instead; servers that close sooner are detected before reuse, and a
+# connection lost mid-request fails as a retryable transport error.
+MODEL_PROVIDER_KEEPALIVE_EXPIRY_S = 60.0
+# httpx's defaults, restated because a custom keep-alive needs a full Limits.
+_HTTPX_MAX_CONNECTIONS = 100
+_HTTPX_MAX_KEEPALIVE_CONNECTIONS = 20
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
 _RaiseContextOverflowFromStatus = Callable[[int], None]
 
@@ -423,7 +434,7 @@ _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
 )
 
 
-def new_async_client() -> httpx.AsyncClient:
+def new_async_client(*, keepalive_expiry_s: float | None = None) -> httpx.AsyncClient:
     """Build an httpx.AsyncClient with explicit, optionally augmented CA trust.
 
     Per-request timeouts are passed at call time (see :func:`post_json` and
@@ -434,6 +445,9 @@ def new_async_client() -> httpx.AsyncClient:
     set ``CAYU_PROVIDER_CA_BUNDLE`` to a PEM bundle for a private provider or
     virtual-egress broker. That bundle augments certifi rather than replacing
     it, and invalid configuration fails while the lazy client is created.
+
+    ``keepalive_expiry_s`` keeps idle pooled connections open that long
+    instead of httpx's 5 seconds; httpx's other pool limits stay as they are.
     """
     context = ssl.create_default_context(cafile=certifi.where())
     extra_ca_bundle = os.environ.get(_PROVIDER_CA_BUNDLE_ENV)
@@ -441,7 +455,16 @@ def new_async_client() -> httpx.AsyncClient:
         context.load_verify_locations(
             cafile=require_nonblank(extra_ca_bundle, _PROVIDER_CA_BUNDLE_ENV)
         )
-    return httpx.AsyncClient(verify=context)
+    if keepalive_expiry_s is None:
+        return httpx.AsyncClient(verify=context)
+    return httpx.AsyncClient(
+        verify=context,
+        limits=httpx.Limits(
+            max_connections=_HTTPX_MAX_CONNECTIONS,
+            max_keepalive_connections=_HTTPX_MAX_KEEPALIVE_CONNECTIONS,
+            keepalive_expiry=positive_finite_seconds(keepalive_expiry_s, "keepalive_expiry_s"),
+        ),
+    )
 
 
 class SharedAsyncClient:
@@ -456,13 +479,22 @@ class SharedAsyncClient:
     (e.g. after ``aclose``) is transparently recreated on the next request.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, keepalive_expiry_s: float | None = None) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._keepalive_expiry_s = (
+            None
+            if keepalive_expiry_s is None
+            else positive_finite_seconds(keepalive_expiry_s, "keepalive_expiry_s")
+        )
 
     def get(self) -> httpx.AsyncClient:
         client = self._client
         if client is None or client.is_closed:
-            client = new_async_client()
+            client = (
+                new_async_client()
+                if self._keepalive_expiry_s is None
+                else new_async_client(keepalive_expiry_s=self._keepalive_expiry_s)
+            )
             self._client = client
         return client
 
@@ -1637,6 +1669,7 @@ def sanitize_provider_cancellation(
 __all__ = [
     "MAX_PROVIDER_ERROR_BODY_BYTES",
     "MAX_PROVIDER_ERROR_BODY_CHARS",
+    "MODEL_PROVIDER_KEEPALIVE_EXPIRY_S",
     "OMITTED_PROVIDER_ERROR_BODY",
     "PUBLIC_PROVIDER_ERROR_MESSAGE_BYTES",
     "SharedAsyncClient",
