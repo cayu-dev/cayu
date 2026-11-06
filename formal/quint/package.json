@@ -1,0 +1,14 @@
+{
+  "name": "cayu-formal-models",
+  "private": true,
+  "version": "0.0.0",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "check": "node check.mjs"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.1"
+  }
+}

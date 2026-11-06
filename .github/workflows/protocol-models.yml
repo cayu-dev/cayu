@@ -1,0 +1,53 @@
+name: Protocol models
+
+# Model-checks the session settlement and task lease models in formal/quint/.
+# The checks run only the models, never src/cayu: the Runtime paths are
+# included so a change to the protocols the models describe shows their checks
+# beside it, and its author can update the model (formal/quint/README.md).
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'formal/quint/**'
+      - 'src/cayu/applications.py'
+      - 'src/cayu/runtime/**'
+      - 'src/cayu/sessions/**'
+      - 'src/cayu/storage/**'
+      - 'src/cayu/tasks/**'
+      - '.github/workflows/protocol-models.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: protocol-models-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Protocol models
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: formal/quint/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      # Quint downloads the Apalache distribution (which contains TLC) into
+      # ~/.quint on first use; its version follows the locked Quint version.
+      - name: Cache the Apalache distribution
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.quint
+          key: quint-${{ runner.os }}-${{ hashFiles('formal/quint/package-lock.json') }}
+      - name: Install Quint
+        run: npm ci --prefix formal/quint
+      - name: Check the models
+        timeout-minutes: 15
+        run: npm run --prefix formal/quint check
