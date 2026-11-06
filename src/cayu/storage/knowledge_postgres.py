@@ -222,6 +222,7 @@ from cayu.knowledge.scopes import (
     _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
     _knowledge_access_snapshot_json,
+    _KnowledgeAccessSnapshot,
     _parse_knowledge_access_snapshot_json,
     copy_knowledge_access_scope,
 )
@@ -391,6 +392,70 @@ async def _lock_knowledge_change_sequence(cur: Any) -> None:
     await cur.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended('cayu-knowledge-change-sequence', 0))"
     )
+
+
+def _activation_retirement_from_row(row: Any) -> _KnowledgeActivationRetirement:
+    try:
+        retirement = _parse_knowledge_activation_retirement_json(row[3])
+        if (
+            retirement.entry_id != row[0]
+            or retirement.entry_revision != row[1]
+            or retirement.retired_at != row[2]
+        ):
+            raise ValueError("Activation retirement columns disagree with its envelope.")
+    except Exception:
+        raise KnowledgeActivationConflict("malformed_retirement") from None
+    return retirement
+
+
+def _activation_receipt_in_scope(
+    row: Any,
+    snapshot: _KnowledgeAccessSnapshot,
+    *,
+    current_exists: bool,
+    current_allowed: bool,
+    retirement: _KnowledgeActivationRetirement | None,
+    access_scope: KnowledgeAccessScope,
+    now: datetime,
+    deny_inaccessible: bool,
+) -> KnowledgeActivationReceipt | None:
+    """Apply current-entry and retirement access to one receipt row, then decode it.
+
+    ``row`` holds the receipt columns in their selected order; ``current_allowed``
+    is whether the current entry passes ``access_scope`` in SQL.
+    """
+
+    if current_exists:
+        if retirement is not None:
+            raise KnowledgeActivationConflict("malformed_retirement")
+    else:
+        current_allowed = _knowledge_scope_allows_activation_receipt(
+            access_scope,
+            snapshot,
+            None,
+            retirement=retirement,
+            entry_id=str(row[1]),
+            entry_revision=int(row[2]),
+            now=now,
+        )
+    if not current_allowed:
+        if deny_inaccessible:
+            raise KnowledgeAccessDenied("load_activation_receipt")
+        return None
+    try:
+        receipt = KnowledgeActivationReceipt.model_validate_json(row[6])
+        if (
+            receipt.operation_id != row[0]
+            or receipt.entry_id != row[1]
+            or receipt.entry_revision != row[2]
+            or receipt.expected_revision != row[3]
+            or receipt.publication_request_sha256 != row[4]
+            or receipt.committed_at != row[5]
+        ):
+            raise ValueError("Activation receipt columns disagree with its JSON envelope.")
+    except Exception:
+        raise KnowledgeActivationConflict("malformed_receipt") from None
+    return receipt
 
 
 class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
@@ -1175,6 +1240,25 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
                 cur, rows[0][0], access_scope=scope, deny_inaccessible=False
             )
         return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
+    async def load_entry_activation_receipts(
+        self,
+        revisions: Sequence[tuple[str, int]],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> dict[tuple[str, int], KnowledgeActivationReceipt | None]:
+        scope = self._operation_access_scope(access_scope)
+        checked: list[tuple[str, int]] = []
+        for entry_id, revision in revisions:
+            _validate_knowledge_revision(revision, "revision")
+            checked.append((_knowledge_entry_id(entry_id), revision))
+        if not checked:
+            return {}
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            return await self._load_entry_activation_receipts(cur, checked, access_scope=scope)
 
     @runtime_knowledge_operation("read")
     async def load_activation_receipt(
@@ -4472,40 +4556,109 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         current_access = await cur.fetchone()
         if current_access is None:
             raise KnowledgeActivationConflict("malformed_receipt")
-        current_exists = bool(current_access[0])
         retirement = await self._load_activation_retirement(cur, str(row[1]))
-        if current_exists:
-            if retirement is not None:
-                raise KnowledgeActivationConflict("malformed_retirement")
-            current_allowed = bool(current_access[1])
-        else:
-            current_allowed = _knowledge_scope_allows_activation_receipt(
-                access_scope,
+        return _activation_receipt_in_scope(
+            row,
+            snapshot,
+            current_exists=bool(current_access[0]),
+            current_allowed=bool(current_access[1]),
+            retirement=retirement,
+            access_scope=access_scope,
+            now=cutoff,
+            deny_inaccessible=deny_inaccessible,
+        )
+
+    async def _load_entry_activation_receipts(
+        self,
+        cur: Any,
+        revisions: Sequence[tuple[str, int]],
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> dict[tuple[str, int], KnowledgeActivationReceipt | None]:
+        """``load_entry_activation_receipt`` for several revisions in three reads."""
+
+        receipts: dict[tuple[str, int], KnowledgeActivationReceipt | None] = dict.fromkeys(
+            revisions
+        )
+        await cur.execute(
+            """
+            SELECT receipt.operation_id, receipt.entry_id, receipt.entry_revision,
+                   receipt.expected_revision, receipt.publication_request_sha256,
+                   receipt.committed_at, receipt.receipt_json, receipt.access_snapshot::text
+            FROM cayu_knowledge_activation_receipts AS receipt
+            JOIN unnest(%s::text[], %s::integer[]) AS wanted(entry_id, entry_revision)
+              ON receipt.entry_id = wanted.entry_id
+             AND receipt.entry_revision = wanted.entry_revision
+            """,
+            (
+                [entry_id for entry_id, _ in receipts],
+                [revision for _, revision in receipts],
+            ),
+        )
+        rows: dict[tuple[str, int], Any] = {}
+        for row in await cur.fetchall():
+            if (row[1], row[2]) in rows:
+                raise KnowledgeActivationConflict("malformed_receipt")
+            rows[(row[1], row[2])] = row
+        cutoff = datetime.now(UTC)
+        readable: list[tuple[Any, _KnowledgeAccessSnapshot]] = []
+        for row in rows.values():
+            try:
+                snapshot = _parse_knowledge_access_snapshot_json(row[7])
+            except Exception:
+                raise KnowledgeActivationConflict("malformed_receipt") from None
+            if _knowledge_scope_allows_snapshot(access_scope, snapshot, now=cutoff):
+                readable.append((row, snapshot))
+        if not readable:
+            return receipts
+        entry_ids = list(dict.fromkeys(str(row[1]) for row, _ in readable))
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
+            access_scope,
+            now=cutoff,
+        )
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT
+                    wanted.id,
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_current_entries AS e
+                        WHERE e.id = wanted.id
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_current_entries AS e
+                        WHERE e.id = wanted.id
+                        {access_sql}
+                    )
+                FROM unnest(%s::text[]) AS wanted(id)
+                """,
+            ),
+            # The access filter sits in the select list, before the unnest.
+            (*access_params, entry_ids),
+        )
+        current_access = {row[0]: (bool(row[1]), bool(row[2])) for row in await cur.fetchall()}
+        retirements = await self._load_activation_retirements(cur, entry_ids)
+        for row, snapshot in readable:
+            current = current_access.get(row[1])
+            if current is None:
+                raise KnowledgeActivationConflict("malformed_receipt")
+            receipt = _activation_receipt_in_scope(
+                row,
                 snapshot,
-                None,
-                retirement=retirement,
-                entry_id=str(row[1]),
-                entry_revision=int(row[2]),
+                current_exists=current[0],
+                current_allowed=current[1],
+                retirement=retirements.get(row[1]),
+                access_scope=access_scope,
                 now=cutoff,
+                deny_inaccessible=False,
             )
-        if not current_allowed:
-            if deny_inaccessible:
-                raise KnowledgeAccessDenied("load_activation_receipt")
-            return None
-        try:
-            receipt = KnowledgeActivationReceipt.model_validate_json(row[6])
-            if (
-                receipt.operation_id != row[0]
-                or receipt.entry_id != row[1]
-                or receipt.entry_revision != row[2]
-                or receipt.expected_revision != row[3]
-                or receipt.publication_request_sha256 != row[4]
-                or receipt.committed_at != row[5]
-            ):
-                raise ValueError("Activation receipt columns disagree with its JSON envelope.")
-        except Exception:
-            raise KnowledgeActivationConflict("malformed_receipt") from None
-        return receipt
+            receipts[(row[1], row[2])] = (
+                None if receipt is None else copy_knowledge_activation_receipt(receipt)
+            )
+        return receipts
 
     async def _load_activation_retirement(
         self,
@@ -4518,19 +4671,19 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             (entry_id,),
         )
         row = await cur.fetchone()
-        if row is None:
-            return None
-        try:
-            retirement = _parse_knowledge_activation_retirement_json(row[3])
-            if (
-                retirement.entry_id != row[0]
-                or retirement.entry_revision != row[1]
-                or retirement.retired_at != row[2]
-            ):
-                raise ValueError("Activation retirement columns disagree with its envelope.")
-        except Exception:
-            raise KnowledgeActivationConflict("malformed_retirement") from None
-        return retirement
+        return None if row is None else _activation_retirement_from_row(row)
+
+    async def _load_activation_retirements(
+        self,
+        cur: Any,
+        entry_ids: Sequence[str],
+    ) -> dict[str, _KnowledgeActivationRetirement]:
+        await cur.execute(
+            "SELECT entry_id, entry_revision, retired_at, retirement_json "
+            "FROM cayu_knowledge_activation_retirements WHERE entry_id = ANY(%s::text[])",
+            (list(entry_ids),),
+        )
+        return {row[0]: _activation_retirement_from_row(row) for row in await cur.fetchall()}
 
     async def _insert_activation_retirement(
         self,

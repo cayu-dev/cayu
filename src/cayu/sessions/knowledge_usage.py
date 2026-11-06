@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 
 from cayu.events import EventType
@@ -14,11 +15,23 @@ from cayu.sessions.store import SessionStore
 async def retained_knowledge_usage(
     store: SessionStore, identities: set[tuple[str, str]]
 ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+    """Lookup totals for these ``(namespace, entry_id)`` pairs from one stable snapshot.
+
+    Each lookup event counts once per distinct pair it returned. The returned
+    sequence describes the snapshot's maximum, not a complete globally committed
+    insertion prefix. The store chooses how to count: natively for the requested
+    pairs, or by folding every retained lookup (``fold_knowledge_lookup_totals``).
+    """
+    return await store.knowledge_lookup_totals(identities)
+
+
+async def fold_knowledge_lookup_totals(
+    store: SessionStore, identities: Collection[tuple[str, str]]
+) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
     """Fold bounded pages from one stable retained visibility snapshot.
 
-    The returned sequence describes the snapshot's maximum, not a complete
-    globally committed insertion prefix. Accumulated values are published only
-    after the native owner has completed successfully and released its snapshot.
+    Accumulated values are published only after the native owner has completed
+    successfully and released its snapshot.
     """
     totals: dict[tuple[str, str], tuple[int, datetime | None]] = {
         identity: (0, None) for identity in identities

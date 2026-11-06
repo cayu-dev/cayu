@@ -1884,6 +1884,11 @@ class PostgresSessionStore(
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
         return await session_queries.inspect_identity(self._ready_connection, session_id)
 
+    async def inspect_identities(
+        self, session_ids: Collection[str]
+    ) -> dict[str, SessionInspectionIdentity]:
+        return await session_queries.inspect_identities(self._ready_connection, session_ids)
+
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         if not isinstance(status, SessionStatus):
@@ -6212,6 +6217,11 @@ class PostgresSessionStore(
             max_bytes=max_bytes,
             max_pages=max_pages,
         )
+
+    async def knowledge_lookup_totals(
+        self, identities: Collection[tuple[str, str]]
+    ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+        return await session_queries.knowledge_lookup_totals(self._ready_connection, identities)
 
     async def query_events_bounded(
         self,

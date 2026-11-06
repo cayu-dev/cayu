@@ -12,6 +12,7 @@ from pydantic import StringConstraints, ValidationError
 from cayu.knowledge._retrieval_results import _truncate_text_to_bytes as truncate_text_to_bytes
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationConflict,
+    KnowledgeActivationReceipt,
     KnowledgeActivationSource,
 )
 from cayu.knowledge.base import KnowledgeStore
@@ -99,6 +100,37 @@ def register_kept_knowledge(
             else None
         )
 
+    def source_session_to_verify(
+        entry: KnowledgeEntry, specialist: str | None, *, limited: bool
+    ) -> str | None:
+        """The session a tool entry names, when this caller may see it verified."""
+
+        if entry.source_type != "tool" or not entry.source_id or not specialist or limited:
+            return None
+        return entry.source_id
+
+    async def page_source_identities(
+        entries: list[KnowledgeEntry], *, limited: bool
+    ) -> dict[str, SessionInspectionIdentity | None]:
+        """The source sessions a page's tool entries name, in one store read."""
+
+        wanted = list(
+            dict.fromkeys(
+                session_id
+                for entry in entries
+                if (
+                    session_id := source_session_to_verify(
+                        entry, specialist_of(entry), limited=limited
+                    )
+                )
+                is not None
+            )
+        )
+        if not wanted:
+            return {}
+        found = await app.session_store.inspect_identities(wanted)
+        return {session_id: found.get(session_id) for session_id in wanted}
+
     async def tool_source_session(
         entry: KnowledgeEntry,
         specialist: str | None,
@@ -112,29 +144,40 @@ def register_kept_knowledge(
         belongs to the specialist that created the entry.
         """
 
-        if entry.source_type != "tool" or not entry.source_id or not specialist or limited:
+        source_id = source_session_to_verify(entry, specialist, limited=limited)
+        if source_id is None:
             return None
-        if entry.source_id not in identities:
+        if source_id not in identities:
             try:
-                identities[entry.source_id] = await app.session_store.inspect_identity(
-                    entry.source_id
-                )
+                identities[source_id] = await app.session_store.inspect_identity(source_id)
             except KeyError:
-                identities[entry.source_id] = None
-        source = identities[entry.source_id]
+                identities[source_id] = None
+        source = identities[source_id]
         if source is None or source.agent_name != specialist:
             return None
         return app.project_session_id_for_exposure(source.id)
 
-    async def attribution(
-        store: KnowledgeStore, entry: KnowledgeEntry, scope: KnowledgeAccessScope
-    ):
+    async def page_receipts(
+        store: KnowledgeStore, entries: list[KnowledgeEntry], scope: KnowledgeAccessScope
+    ) -> dict[tuple[str, int], KnowledgeActivationReceipt | None] | None:
+        """The page's activation receipts in one store read; None when unsupported."""
+
+        if not entries:
+            return {}
         try:
-            receipt = await store.load_entry_activation_receipt(
-                entry.id, revision=entry.revision, access_scope=scope
+            return await store.load_entry_activation_receipts(
+                [(entry.id, entry.revision) for entry in entries], access_scope=scope
             )
         except NotImplementedError:
+            return None
+
+    def attribution(
+        entry: KnowledgeEntry,
+        receipts: dict[tuple[str, int], KnowledgeActivationReceipt | None] | None,
+    ):
+        if receipts is None:
             return None, None, None, "unsupported"
+        receipt = receipts.get((entry.id, entry.revision))
         if receipt is None:
             return None, None, None, "not_recorded"
         if receipt.entry_id != entry.id or receipt.entry_revision != entry.revision:
@@ -216,12 +259,12 @@ def register_kept_knowledge(
                 except (EventQueryResultTooLarge, ValueError):
                     reason = "source_incomplete"
             rows = []
-            source_identities: dict[str, SessionInspectionIdentity | None] = {}
+            page_entries = [item.entry for item in visible]
+            receipts = await page_receipts(store, page_entries, owner.access_scope)
+            source_identities = await page_source_identities(page_entries, limited=limited)
             for item in visible:
                 entry = item.entry
-                kept_by, kept_at, kept_kind, unavailable = await attribution(
-                    store, entry, owner.access_scope
-                )
+                kept_by, kept_at, kept_kind, unavailable = attribution(entry, receipts)
                 specialist = specialist_of(entry)
                 source_session = await tool_source_session(
                     entry, specialist, limited=limited, identities=source_identities

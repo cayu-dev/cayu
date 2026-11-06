@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, LiteralString, cast
@@ -59,7 +59,12 @@ from cayu.sessions.environment_activity import (
     environment_activity_snapshot,
 )
 from cayu.sessions.event_delivery import restore_persisted_event_authority
-from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge, copy_event_query
+from cayu.sessions.event_queries import (
+    EventOrder,
+    EventQuery,
+    EventQueryResultTooLarge,
+    copy_event_query,
+)
 from cayu.sessions.inspection import SESSION_INSPECTION_LABEL_LIMIT, SessionInspectionIdentity
 from cayu.sessions.interactions import _validate_interaction_page
 from cayu.sessions.lineage import (
@@ -164,21 +169,50 @@ def event_record_from_row(row: tuple[Any, Any] | None) -> EventRecord | None:
     return EventRecord(sequence=row[0], event=Event(**pg_support._json_obj(row[1])))
 
 
+_INSPECTION_IDENTITY_COLUMNS = """
+    id, agent_name, provider_name, model, parent_session_id,
+    causal_budget_id, runtime_name, runtime_version, environment_name,
+    status, created_at, updated_at, last_activity_at, run_epoch,
+    metadata -> 'cayu:runtime_build_provenance' AS runtime_build_provenance
+"""
+
+
+def _inspection_identity_from_rows(
+    row: Any, label_rows: list[Any], label_count: int
+) -> SessionInspectionIdentity:
+    return SessionInspectionIdentity(
+        id=row[0],
+        agent_name=row[1],
+        provider_name=row[2],
+        model=row[3],
+        parent_session_id=row[4],
+        causal_budget_id=row[5],
+        runtime_name=row[6],
+        runtime_version=row[7],
+        runtime_build_provenance=(
+            pg_support.runtime_build_provenance_from_session_metadata(
+                {} if row[14] is None else {"cayu:runtime_build_provenance": row[14]}
+            )
+        ),
+        environment_name=row[8],
+        status=SessionStatus(row[9]),
+        created_at=pg_support.to_utc(row[10]),
+        updated_at=pg_support.to_utc(row[11]),
+        last_activity_at=pg_support.to_utc(row[12]),
+        run_epoch=row[13],
+        labels={label_row[0]: label_row[1] for label_row in label_rows},
+        label_count=label_count,
+        labels_truncated=label_count > len(label_rows),
+    )
+
+
 async def inspect_identity(
     connect: PostgresConnection, session_id: str
 ) -> SessionInspectionIdentity:
     session_id = require_clean_nonblank(session_id, "session_id")
     async with connect() as conn, conn.cursor() as cur:
         await cur.execute(
-            """
-            SELECT id, agent_name, provider_name, model, parent_session_id,
-                   causal_budget_id, runtime_name, runtime_version, environment_name,
-                   status, created_at, updated_at, last_activity_at, run_epoch,
-                   metadata -> 'cayu:runtime_build_provenance'
-                       AS runtime_build_provenance
-            FROM cayu_sessions
-            WHERE id = %s
-            """,
+            f"SELECT {_INSPECTION_IDENTITY_COLUMNS} FROM cayu_sessions WHERE id = %s",
             (session_id,),
         )
         row = await cur.fetchone()
@@ -199,30 +233,58 @@ async def inspect_identity(
         )
         label_rows = await cur.fetchall()
         label_count = 0 if not label_rows else label_rows[0][2]
-        return SessionInspectionIdentity(
-            id=row[0],
-            agent_name=row[1],
-            provider_name=row[2],
-            model=row[3],
-            parent_session_id=row[4],
-            causal_budget_id=row[5],
-            runtime_name=row[6],
-            runtime_version=row[7],
-            runtime_build_provenance=(
-                pg_support.runtime_build_provenance_from_session_metadata(
-                    {} if row[14] is None else {"cayu:runtime_build_provenance": row[14]}
-                )
-            ),
-            environment_name=row[8],
-            status=SessionStatus(row[9]),
-            created_at=pg_support.to_utc(row[10]),
-            updated_at=pg_support.to_utc(row[11]),
-            last_activity_at=pg_support.to_utc(row[12]),
-            run_epoch=row[13],
-            labels={label_row[0]: label_row[1] for label_row in label_rows},
-            label_count=label_count,
-            labels_truncated=label_count > len(label_rows),
+        return _inspection_identity_from_rows(row, label_rows, label_count)
+
+
+async def inspect_identities(
+    connect: PostgresConnection, session_ids: Collection[str]
+) -> dict[str, SessionInspectionIdentity]:
+    """``inspect_identity`` for several sessions in two reads; missing ones are left out."""
+
+    wanted = list(
+        dict.fromkeys(
+            require_clean_nonblank(session_id, "session_id") for session_id in session_ids
         )
+    )
+    if not wanted:
+        return {}
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute(
+            f"SELECT {_INSPECTION_IDENTITY_COLUMNS} FROM cayu_sessions WHERE id = ANY(%s::text[])",
+            (wanted,),
+        )
+        rows = {row[0]: row for row in await cur.fetchall()}
+        if not rows:
+            return {}
+        await cur.execute(
+            """
+            SELECT session_id, key, value, label_count
+            FROM (
+                SELECT session_id, key, value,
+                       COUNT(*) OVER (PARTITION BY session_id) AS label_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id ORDER BY key COLLATE "C" ASC
+                       ) AS position
+                FROM cayu_session_labels
+                WHERE session_id = ANY(%s::text[])
+            ) AS ranked
+            WHERE position <= %s
+            ORDER BY session_id, position
+            """,
+            (list(rows), SESSION_INSPECTION_LABEL_LIMIT),
+        )
+        labels: dict[str, list[Any]] = {}
+        label_counts: dict[str, int] = {}
+        for session_id, key, value, label_count in await cur.fetchall():
+            labels.setdefault(session_id, []).append((key, value))
+            label_counts[session_id] = label_count
+    return {
+        session_id: _inspection_identity_from_rows(
+            rows[session_id], labels.get(session_id, []), label_counts.get(session_id, 0)
+        )
+        for session_id in wanted
+        if session_id in rows
+    }
 
 
 async def load_events(
@@ -676,6 +738,101 @@ async def fold_event_snapshot(
             )
 
         return await fold_snapshot_async(fold, read, consume)
+
+
+@runtime_session_query
+async def knowledge_lookup_totals(
+    connect: PostgresConnection, identities: Collection[tuple[str, str]]
+) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+    """Count retained lookups for the requested pairs in SQL, inside one snapshot.
+
+    Matches ``fold_knowledge_lookup_totals``: an event counts when its JSON type is
+    ``knowledge.lookup``, its payload namespace is a string and its ``entry_ids``
+    is an array holding the entry ID as a string, once per event however often the
+    ID repeats. The sequence is the snapshot's newest event of any type.
+    """
+
+    wanted = list(dict.fromkeys(identities))
+    totals: dict[tuple[str, str], tuple[int, datetime | None]] = dict.fromkeys(wanted, (0, None))
+    newest_plan = session_store_sql.build_event_query_sql(
+        EventQuery(limit=1, order_by=EventOrder.SEQUENCE_DESC), dialect=SQL_DIALECT
+    )
+    lookup_plan = session_store_sql.build_event_query_sql(
+        EventQuery(after_sequence=0, limit=1, event_type=EventType.KNOWLEDGE_LOOKUP),
+        dialect=SQL_DIALECT,
+        extra_after_sequence_clauses=(
+            session_store_sql.SqlClause(
+                "cayu_events.event ->> 'type' = %s", (str(EventType.KNOWLEDGE_LOOKUP),)
+            ),
+            session_store_sql.SqlClause(
+                "jsonb_typeof(cayu_events.event -> 'payload' -> 'namespace') = 'string'", ()
+            ),
+            session_store_sql.SqlClause(
+                "jsonb_typeof(cayu_events.event -> 'payload' -> 'entry_ids') = 'array'", ()
+            ),
+            session_store_sql.SqlClause(
+                "cayu_events.event -> 'payload' ->> 'namespace' = ANY(%s::text[])",
+                (list(dict.fromkeys(namespace for namespace, _ in wanted)),),
+            ),
+            session_store_sql.SqlClause(
+                "(cayu_events.event -> 'payload' -> 'entry_ids') ?| %s::text[]",
+                (list(dict.fromkeys(entry_id for _, entry_id in wanted)),),
+            ),
+        ),
+    )
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT cayu_events.sequence
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {newest_plan.where_sql}
+                ORDER BY cayu_events.sequence DESC
+                LIMIT 1
+                """,
+            ),
+            newest_plan.params,
+        )
+        newest = await cur.fetchone()
+        if not wanted:
+            return totals, 0 if newest is None else newest[0]
+        # The pairs and their filters are bound values; the SQL text is fixed.
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                WITH lookup AS (
+                    SELECT cayu_events.sequence,
+                           cayu_events.event -> 'payload' ->> 'namespace' AS namespace,
+                           cayu_events.event -> 'payload' -> 'entry_ids' AS entry_ids,
+                           cayu_events.timestamp AS looked_up_at
+                    FROM cayu_events
+                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                    {lookup_plan.where_sql}
+                )
+                SELECT wanted.namespace, wanted.entry_id,
+                       COUNT(DISTINCT lookup.sequence), MAX(lookup.looked_up_at)
+                FROM lookup
+                CROSS JOIN LATERAL jsonb_array_elements(lookup.entry_ids) AS returned(value)
+                JOIN unnest(%s::text[], %s::text[]) AS wanted(namespace, entry_id)
+                  ON wanted.namespace = lookup.namespace
+                 AND jsonb_typeof(returned.value) = 'string'
+                 AND wanted.entry_id = returned.value #>> '{{}}'
+                GROUP BY wanted.namespace, wanted.entry_id
+                """,
+            ),
+            (
+                *lookup_plan.params,
+                [namespace for namespace, _ in wanted],
+                [entry_id for _, entry_id in wanted],
+            ),
+        )
+        for namespace, entry_id, count, last in await cur.fetchall():
+            totals[(namespace, entry_id)] = int(count), pg_support.to_utc(last)
+    return totals, 0 if newest is None else newest[0]
 
 
 async def _query_events_bounded_snapshot(

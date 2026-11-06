@@ -1071,6 +1071,22 @@ class SessionStore(ABC):
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
         """Load bounded session identity without materializing session metadata."""
 
+    async def inspect_identities(
+        self, session_ids: Collection[str]
+    ) -> dict[str, SessionInspectionIdentity]:
+        """``inspect_identity`` for several sessions, leaving out the ones that don't exist.
+
+        This default reads them one at a time; a native store may answer them in a
+        bounded number of reads.
+        """
+        identities: dict[str, SessionInspectionIdentity] = {}
+        for session_id in dict.fromkeys(session_ids):
+            try:
+                identities[session_id] = await self.inspect_identity(session_id)
+            except KeyError:
+                continue
+        return identities
+
     @abstractmethod
     async def update_status(self, session_id: str, status: SessionStatus) -> Session:
         """Update session status and return the updated session."""
@@ -4894,6 +4910,20 @@ class SessionStore(ABC):
         ``query.limit`` bounds each page; ``max_pages`` optionally bounds work.
         """
         raise NotImplementedError("This SessionStore has no exact event snapshot fold.")
+
+    async def knowledge_lookup_totals(
+        self, identities: Collection[tuple[str, str]]
+    ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+        """Count retained ``knowledge.lookup`` events for these ``(namespace, entry_id)`` pairs.
+
+        Returns each pair's lookup count and latest lookup time (UTC), plus the
+        snapshot's maximum sequence, as ``retained_knowledge_usage`` describes.
+        This default folds every retained lookup through ``fold_event_snapshot``;
+        a native store may count only the requested pairs in its own query.
+        """
+        from cayu.sessions.knowledge_usage import fold_knowledge_lookup_totals
+
+        return await fold_knowledge_lookup_totals(self, identities)
 
     async def query_events_bounded(
         self,

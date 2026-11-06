@@ -299,6 +299,27 @@ class KnowledgeStore(ABC):
         """
         raise NotImplementedError("This KnowledgeStore cannot discover activation attribution.")
 
+    async def load_entry_activation_receipts(
+        self,
+        revisions: Sequence[tuple[str, int]],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> dict[tuple[str, int], KnowledgeActivationReceipt | None]:
+        """Read the attribution of several exact revisions, keyed by ``(entry_id, revision)``.
+
+        Each value is what ``load_entry_activation_receipt`` returns for that
+        revision, under the same access policy and errors. This default reads them
+        one at a time; a native store may answer a whole page in a bounded number
+        of reads.
+        """
+        receipts: dict[tuple[str, int], KnowledgeActivationReceipt | None] = {}
+        for entry_id, revision in revisions:
+            if (entry_id, revision) not in receipts:
+                receipts[(entry_id, revision)] = await self.load_entry_activation_receipt(
+                    entry_id, revision=revision, access_scope=access_scope
+                )
+        return receipts
+
     async def load_activation_receipt(
         self,
         operation_id: str,

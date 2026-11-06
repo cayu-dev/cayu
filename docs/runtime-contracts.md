@@ -21273,6 +21273,14 @@ after successful return; failure or cancellation invalidates it. Native stores
 finish owned read cleanup before propagating cancellation. Cloud registration limits, payload fitting and reporting
 windows are unchanged.
 
+The kept-knowledge listing reads a page's lookup totals, source sessions and
+activation receipts through three batch methods: `SessionStore.knowledge_lookup_totals`,
+`SessionStore.inspect_identities` and `KnowledgeStore.load_entry_activation_receipts`.
+Their defaults fold the snapshot or call the single-item method once per item, so
+a custom store stays correct without overriding them. The PostgreSQL stores answer
+each with a fixed number of queries, so a page costs the same number of database
+round trips at any size.
+
 ### Tool presentation declarations
 
 `ToolDisplay` is an optional frozen declaration on `ToolSpec.display`. Its

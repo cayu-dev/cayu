@@ -982,7 +982,8 @@ query, path and header parameters (body failures still don't say which field).
 
 `lookups` is a decimal string counting each namespace/entry identity once per
 retained `knowledge.lookup` event. `last_used_at` is the latest such timestamp.
-The native reader holds one stable retained-event snapshot while traversing
+The native reader counts inside one stable retained-event snapshot: PostgreSQL
+counts only the page's entries in one query, and other stores traverse
 byte-bounded event pages completely. `usage_through_sequence` describes that
 snapshot's maximum sequence; it is not a globally committed insertion frontier. Counts describe retained history, not events pruned from storage.
 They are null with `usage_unavailable_reason` when access is limited, the event
