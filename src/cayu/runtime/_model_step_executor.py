@@ -4552,9 +4552,12 @@ class ModelStepRun:
             initial_identity=initial_model_attempt_identity,
             attempt_variant=request_variant,
         )
+        completion_observed = False
         try:
             try:
                 async for event, result in attempt_events:
+                    if event is not None and event.type is EventType.MODEL_COMPLETED:
+                        completion_observed = True
                     yield (
                         event,
                         ModelStepFlowOutcome(assistant_step_result=result)
@@ -4575,6 +4578,9 @@ class ModelStepRun:
                     assert isinstance(caught.failure.cause, ModelContextOverflowError)
                     exc = caught.failure.cause
                 else:
+                    # Late provider failures retain their raw exception after publication.
+                    if completion_observed:
+                        raise
                     exc = caught
                 if overflow_policy is None:
                     raise
