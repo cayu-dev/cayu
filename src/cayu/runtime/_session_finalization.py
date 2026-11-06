@@ -1280,6 +1280,29 @@ class SessionFinalization:
         self._resolve_registered_agent = resolve_registered_agent
         self._resolve_registered_environment = resolve_registered_environment
         self.interaction_publication_authority = object()
+        # Interactions whose terminal summary this runtime refused to publish.
+        # Their durable run state stays open for recovery or reconciliation.
+        self._refused_interaction_publications: set[tuple[str, str]] = set()
+
+    def interaction_publication_refused(self, session_id: str, interaction_id: str) -> bool:
+        return (session_id, interaction_id) in self._refused_interaction_publications
+
+    def forget_refused_interaction_publications(self, session_id: str) -> None:
+        self._refused_interaction_publications = {
+            refused
+            for refused in self._refused_interaction_publications
+            if refused[0] != session_id
+        }
+
+    def _refuse_interaction_publication(
+        self, session_id: str, interaction_id: str
+    ) -> InteractionLifecyclePublicationRejected:
+        self._refused_interaction_publications.add((session_id, interaction_id))
+        return _runtime_interaction_lifecycle_publication_rejected(
+            session_id=session_id,
+            interaction_id=interaction_id,
+            runtime_authority=self.interaction_publication_authority,
+        )
 
     def schedule_background_interruption_cascade(
         self,
@@ -1549,11 +1572,7 @@ class SessionFinalization:
             )
         except ValidationError as exc:
             if terminal and observed_at < start_evidence.started_at:
-                raise _runtime_interaction_lifecycle_publication_rejected(
-                    session_id=session.id,
-                    interaction_id=interaction_id,
-                    runtime_authority=self.interaction_publication_authority,
-                ) from exc
+                raise self._refuse_interaction_publication(session.id, interaction_id) from exc
             raise
         event_payload = evidence.model_dump(mode="json")
         event = event_with_runtime_payload_authority(
@@ -1611,11 +1630,7 @@ class SessionFinalization:
         if observed_at is None:
             observed_at = self._clock()
         if observed_at < start_evidence.started_at:
-            raise _runtime_interaction_lifecycle_publication_rejected(
-                session_id=session.id,
-                interaction_id=interaction_id,
-                runtime_authority=self.interaction_publication_authority,
-            )
+            raise self._refuse_interaction_publication(session.id, interaction_id)
         return observed_at
 
     async def emit_interaction_state(

@@ -7625,10 +7625,12 @@ def test_declared_quiescent_task_claim_settles_before_cancellation_returns() -> 
 
         assert worker.cancelling() == 1
         assert worker.cancelled()
+        # The claim committed with the cancellation; the worker never started
+        # it, so it returns the claim before its cancellation returns.
         persisted = await task_store.load_task(task.id)
         assert persisted is not None
-        assert persisted.status is TaskStatus.CLAIMED
-        assert persisted.worker_id == "quiescent-claim-settlement-worker"
+        assert persisted.status is TaskStatus.PENDING
+        assert persisted.worker_id is None
 
     asyncio.run(scenario())
 
@@ -7912,9 +7914,10 @@ def test_runtime_admission_and_worker_parking_store_failures_are_detached(
                 max_tasks=1,
             )
         errors.append(exc.value)
-        claimed = await task_store.load_task(worker_task.id)
-        assert claimed is not None
-        assert claimed.status is TaskStatus.CLAIMED
+        # Parking failed before the claim started, so the worker returned it.
+        released = await task_store.load_task(worker_task.id)
+        assert released is not None
+        assert released.status is TaskStatus.PENDING
         return errors
 
     with warnings.catch_warnings(record=True) as caught_warnings:

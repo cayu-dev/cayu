@@ -122,6 +122,12 @@ from cayu.tasks._event_budget_warnings import EventBudgetCheck, with_event_budge
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._group_maintenance import TaskGroupMaintenance
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at, observe_schedule_wakeup
+from cayu.tasks._task_run_settlement import (
+    UnstartedClaim,
+    acknowledge_stopped_handler,
+    cancellation_carried_by,
+    release_unstarted_claims,
+)
 from cayu.tasks._terminalization import (
     _terminalize_claimed_task,
     _terminalize_claimed_task_or_detect_peer_winner,
@@ -1118,11 +1124,33 @@ async def run_task_worker(
                     lease_seconds=lease_seconds,
                 )
 
-            claim = await poller.claim(
-                claim_next_task,
-                before_claim=prepare_claim,
-                maximum_active_s=lease_seconds,
-            )
+            claimed_by_call: list[UnstartedClaim] = []
+            claim_dispatched = False
+
+            async def recorded_claim() -> Task | None:
+                nonlocal claim_dispatched
+                claim_dispatched = True
+                claimed_task = await claim_next_task()
+                if claimed_task is not None:
+                    claimed_by_call.append(UnstartedClaim.of(claimed_task))
+                return claimed_task
+
+            try:
+                claim = await poller.claim(
+                    recorded_claim,
+                    before_claim=prepare_claim,
+                    maximum_active_s=lease_seconds,
+                )
+            except BaseException as claim_failure:
+                # The claim may have committed with its acknowledgement lost.
+                if claim_dispatched:
+                    await release_unstarted_claims(
+                        task_store,
+                        worker_id,
+                        claim_failure,
+                        claims=claimed_by_call or (None if concurrency == 1 else []),
+                    )
+                raise
             task = claim.value
             # The poller's wrapper aliases the task. Drop it before fallible task
             # handling so detached failures cannot retain a second task reference.
@@ -1183,73 +1211,80 @@ async def run_task_worker(
                     next_claim_at=schedule_deadline,
                     activity=meaningful_activity,
                 )
-            record_task_admission_to_claim_latency(
-                poller.metrics,
-                admitted_at=task.created_at,
-                claimed_at=datetime.now(UTC),
-            )
-            task = copy_task(task)
-            if task.work_contract is not None:
-                task_id = task.id
-                contract = task.work_contract
-                lease_expires_at = task.lease_expires_at
-                if lease_expires_at is None:  # pragma: no cover - claim contract
-                    raise TaskClaimLost("Contracted task claim has no worker lease.")
-                parking_outcome = await capture_task_store_operation(
-                    lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
-                        task_store.hold_claimed_work_contract_task(
-                            task_id,
-                            worker_id=worker_id,
-                            lease_expires_at=lease_expires_at,
-                            contract=contract,
-                        )
-                    ),
-                    operation_name="Contracted task parking",
-                    redactor=app._secret_redactor,
-                    mutation_store=task_store,
-                    mutation_method_name="hold_claimed_work_contract_task",
+            claimed = UnstartedClaim.of(task)
+            try:
+                record_task_admission_to_claim_latency(
+                    poller.metrics,
+                    admitted_at=task.created_at,
+                    claimed_at=datetime.now(UTC),
                 )
-                if parking_outcome.failure is not None:
-                    failure = parking_outcome.failure
-                    del contract, lease_expires_at, parking_outcome, task, task_id
-                    raise_task_store_operation_failure(failure)
-                del contract, parking_outcome, task_id
+                task = copy_task(task)
+                if task.work_contract is not None:
+                    task_id = task.id
+                    contract = task.work_contract
+                    lease_expires_at = task.lease_expires_at
+                    if lease_expires_at is None:  # pragma: no cover - claim contract
+                        raise TaskClaimLost("Contracted task claim has no worker lease.")
+                    parking_outcome = await capture_task_store_operation(
+                        lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
+                            task_store.hold_claimed_work_contract_task(
+                                task_id,
+                                worker_id=worker_id,
+                                lease_expires_at=lease_expires_at,
+                                contract=contract,
+                            )
+                        ),
+                        operation_name="Contracted task parking",
+                        redactor=app._secret_redactor,
+                        mutation_store=task_store,
+                        mutation_method_name="hold_claimed_work_contract_task",
+                    )
+                    if parking_outcome.failure is not None:
+                        failure = parking_outcome.failure
+                        del contract, lease_expires_at, parking_outcome, task, task_id
+                        raise_task_store_operation_failure(failure)
+                    del contract, parking_outcome, task_id
+                    return DurableWorkerStep(
+                        handled=handled_this_step + 1,
+                        continue_immediately=True,
+                        activity=True,
+                    )
+                poller.metrics.handler_started()
+                try:
+                    async with maintained_while_busy():
+                        await _handle_with_heartbeat(
+                            app,
+                            task_store,
+                            task,
+                            handler,
+                            worker_id,
+                            lease_seconds,
+                            unstarted_claim=claimed,
+                            execution_timeout_s=execution_timeout_s,
+                            execution_grace_s=execution_grace_s,
+                            event_budget_check=event_budget_check,
+                        )
+                finally:
+                    poller.metrics.handler_finished()
+                rescan_released_handoffs()
+                next_interrupted_continuation_scan_at = 0.0
+                if (
+                    until_idle is not None
+                    and recovered_interrupted_task_handler is not None
+                    and await _may_await_continuation(app, task_store, task)
+                ):
+                    # The handler may have handed off its session for continuation. A
+                    # parked handoff is not: only its own trigger, a task, continues it.
+                    until_idle.continuations_pending = True
                 return DurableWorkerStep(
                     handled=handled_this_step + 1,
                     continue_immediately=True,
                     activity=True,
                 )
-            poller.metrics.handler_started()
-            try:
-                async with maintained_while_busy():
-                    await _handle_with_heartbeat(
-                        app,
-                        task_store,
-                        task,
-                        handler,
-                        worker_id,
-                        lease_seconds,
-                        execution_timeout_s=execution_timeout_s,
-                        execution_grace_s=execution_grace_s,
-                        event_budget_check=event_budget_check,
-                    )
-            finally:
-                poller.metrics.handler_finished()
-            rescan_released_handoffs()
-            next_interrupted_continuation_scan_at = 0.0
-            if (
-                until_idle is not None
-                and recovered_interrupted_task_handler is not None
-                and await _may_await_continuation(app, task_store, task)
-            ):
-                # The handler may have handed off its session for continuation. A
-                # parked handoff is not: only its own trigger, a task, continues it.
-                until_idle.continuations_pending = True
-            return DurableWorkerStep(
-                handled=handled_this_step + 1,
-                continue_immediately=True,
-                activity=True,
-            )
+            except BaseException as claim_exit:
+                # No handler owns a claim before its execution starts.
+                await release_unstarted_claims(task_store, worker_id, claim_exit, claims=[claimed])
+                raise
 
         subscribe_to_admissions = getattr(task_store, "_task_admission_wakeup", None)
         admission_wakeup = None
@@ -1462,6 +1497,7 @@ async def _handle_with_heartbeat(
     lease_seconds: int,
     *,
     recover_interrupted_authority_loss: bool = False,
+    unstarted_claim: UnstartedClaim | None = None,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
     event_budget_check: EventBudgetCheck | None = None,
@@ -1478,6 +1514,7 @@ async def _handle_with_heartbeat(
             lease_seconds,
             settlement=settlement,
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
+            unstarted_claim=unstarted_claim,
             execution_timeout_s=execution_timeout_s,
             execution_grace_s=execution_grace_s,
             event_budget_check=event_budget_check,
@@ -1513,6 +1550,7 @@ async def _handle_with_heartbeat_owned(
     *,
     settlement: TaskExecutionSettlement,
     recover_interrupted_authority_loss: bool,
+    unstarted_claim: UnstartedClaim | None,
     execution_timeout_s: float | None,
     execution_grace_s: float | None,
     event_budget_check: EventBudgetCheck | None = None,
@@ -1565,6 +1603,7 @@ async def _handle_with_heartbeat_owned(
         worker_id,
         lease_seconds,
         settlement=settlement,
+        unstarted_claim=unstarted_claim,
     )
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -1917,6 +1956,7 @@ async def _renew_task_claim_before_dispatch(
     lease_seconds: int,
     *,
     settlement: TaskExecutionSettlement,
+    unstarted_claim: UnstartedClaim | None,
 ) -> tuple[Task, float, bool, bool]:
     """Prove that an acknowledged lease can still authorize handler dispatch."""
 
@@ -1928,6 +1968,8 @@ async def _renew_task_claim_before_dispatch(
         handoff_id=task.interrupted_handoff_id,
         extend_seconds=lease_seconds,
     )
+    if unstarted_claim is not None:
+        unstarted_claim.renewed(renewed)
     claim_deadline_monotonic = _conservative_task_lease_deadline(
         renewal_started,
         lease_seconds,
@@ -1960,6 +2002,8 @@ async def _renew_task_claim_before_dispatch(
                 handoff_id=renewed.interrupted_handoff_id,
                 extend_seconds=lease_seconds,
             )
+            if unstarted_claim is not None:
+                unstarted_claim.renewed(renewed)
             claim_deadline_monotonic = _conservative_task_lease_deadline(
                 renewal_started,
                 lease_seconds,
@@ -2091,13 +2135,59 @@ async def _await_task_handler(
     async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
         try:
             result = await invoke_handler()
-        finally:
+        except BaseException as handler_failure:
             callback_done.set_result(None)
+            # Raising also proves the callback stopped: settle its execution.
+            await acknowledge_stopped_handler(settlement, settlement_authority, handler_failure)
+            raise
+        finally:
+            if not callback_done.done():
+                callback_done.set_result(None)
         settlement.observe(settlement_authority, result)
         # Storage acknowledgement is not part of the callback outcome. Ordinary
         # settlement failures stay owned until after result disposition.
         await settlement.attempt()
         return result
+
+    async def settle_ordinary_cancellation(
+        owner_cancellation: asyncio.CancelledError,
+        *,
+        code: str = "task_worker_owner_cancelled",
+    ) -> None:
+        owner_task = asyncio.current_task()
+        assert owner_task is not None
+        # Only a fresh root attempt can be requeued. A continuation of an
+        # interrupted session keeps its handoff and settles like any other.
+        if (
+            task.restartable
+            and task.interrupted_handoff_id is None
+            and owner_task.cancelling() > cancellation_baseline
+        ):
+            await _restart_task_handler_after_shutdown(
+                task_store,
+                task,
+                worker_id,
+                handler_task,
+                heartbeat_task,
+                stop_heartbeat,
+                lease_authority=lease_authority,
+                lease_seconds=lease_seconds,
+                owner_cancellation=owner_cancellation,
+            )
+            return
+        await _drain_ordinary_task_handler_under_cancellation_fence(
+            task_store,
+            task,
+            worker_id,
+            handler_task,
+            heartbeat_task,
+            stop_heartbeat,
+            lease_authority=lease_authority,
+            lease_seconds=lease_seconds,
+            cancellation_error={"code": code},
+            primary_failure=owner_cancellation,
+            owner_cancellation=owner_cancellation,
+        )
 
     with bind_task_lease_authority(lease_authority):
         handler_task = asyncio.ensure_future(owned_handler())
@@ -2277,10 +2367,26 @@ async def _await_task_handler(
             )
         return await handler_task
     except BaseExceptionGroup as grouped_failure:
-        if task.retry_series is None or exception_tree_contains(
-            grouped_failure,
-            (KeyboardInterrupt, SystemExit, GeneratorExit),
-        ):
+        if task.retry_series is None:
+            grouped_cancellation = cancellation_carried_by(
+                grouped_failure, cancellation_baseline=cancellation_baseline
+            )
+            if grouped_cancellation is None or isinstance(grouped_failure, Exception):
+                raise
+            # A cancellation grouped with cleanup failures settles the claim
+            # exactly as the bare cancellation would, then keeps its group.
+            # Only a delivered one is the owner's; otherwise the handler's own.
+            owner_task = asyncio.current_task()
+            await settle_ordinary_cancellation(
+                grouped_cancellation,
+                code=(
+                    "task_worker_owner_cancelled"
+                    if owner_task is not None and owner_task.cancelling() > cancellation_baseline
+                    else "task_handler_cancelled"
+                ),
+            )
+            raise
+        if exception_tree_contains(grouped_failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise
         owner_task = asyncio.current_task()
         if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -2351,38 +2457,7 @@ async def _await_task_handler(
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
             ) from None
-        # Only a fresh root attempt can be requeued. A continuation of an
-        # interrupted session keeps its handoff and settles like any other.
-        if (
-            task.restartable
-            and task.interrupted_handoff_id is None
-            and owner_task.cancelling() > cancellation_baseline
-        ):
-            await _restart_task_handler_after_shutdown(
-                task_store,
-                task,
-                worker_id,
-                handler_task,
-                heartbeat_task,
-                stop_heartbeat,
-                lease_authority=lease_authority,
-                lease_seconds=lease_seconds,
-                owner_cancellation=owner_cancellation,
-            )
-            raise owner_cancellation from exception_cause(owner_cancellation)
-        await _drain_ordinary_task_handler_under_cancellation_fence(
-            task_store,
-            task,
-            worker_id,
-            handler_task,
-            heartbeat_task,
-            stop_heartbeat,
-            lease_authority=lease_authority,
-            lease_seconds=lease_seconds,
-            cancellation_error={"code": "task_worker_owner_cancelled"},
-            primary_failure=owner_cancellation,
-            owner_cancellation=owner_cancellation,
-        )
+        await settle_ordinary_cancellation(owner_cancellation)
         raise owner_cancellation from exception_cause(owner_cancellation)
 
 

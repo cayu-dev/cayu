@@ -121,6 +121,7 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import timed_phase, timed_tool_round
+from cayu.runtime._run_exit import classify_run_exit
 from cayu.runtime._run_limits import (
     LimitEvaluation,
     RunLimitGate,
@@ -2415,6 +2416,17 @@ class ToolRoundRun:
                 child_cancellations=child_cancellations,
                 tool_calls=tool_calls,
             )
+            supervisory = [
+                leaf
+                for leaf in classify_run_exit(
+                    exc_group, cancellation_baseline=cancellation_baseline
+                ).supervisory
+                if isinstance(leaf, (KeyboardInterrupt, SystemExit))
+            ]
+            if supervisory:
+                # Process control outranks caller cancellation and is never
+                # sanitized into a runner failure.
+                raise supervisory[0] from exc_group
             if parent_task is not None and parent_task.cancelling() > cancellation_baseline:
                 current_cancellation = _authoritative_task_cancellation(
                     parent_task,
@@ -2445,12 +2457,12 @@ class ToolRoundRun:
                         current_cancellation_cause,
                     )
             elif _contains_process_signal(exc_group):
-                # Caller cancellation above remains authoritative over cleanup
-                # failures. Otherwise, propagate the supervisory leaf directly.
+                # Caller cancellation above remains authoritative over a closing
+                # stream. Otherwise, propagate the GeneratorExit leaf directly.
                 raise next(
                     candidate
                     for candidate in iter_exception_tree(exc_group)
-                    if isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit))
+                    if isinstance(candidate, GeneratorExit)
                 ) from exc_group
             elif any(
                 isinstance(candidate, BaseExceptionGroup)

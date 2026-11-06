@@ -58,6 +58,13 @@ from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
 )
 from cayu.runtime._resume_configuration import invocation_configuration
+from cayu.runtime._run_settlement import (
+    OutcomeStage,
+    RunLedger,
+    RunSettlement,
+    current_cancellation_requests,
+    drain_event_stream,
+)
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
     _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
@@ -869,6 +876,45 @@ def _model_step_completion_published(
     )
 
 
+def _recovery_owns_run_failure(
+    error: BaseException,
+    *,
+    session_id: str,
+    runtime_authority: object,
+) -> bool:
+    """Whether a run body deliberately left its invocation open for recovery.
+
+    Uncertain terminal evidence, an unsettled durable child submission, or a
+    lifecycle publication the runtime refused (also when it is only the cause
+    of the exit, as after a refused abandonment) leave the session RUNNING. A
+    refusal counts only with this runtime's provenance: extension code can
+    construct the public exception, and must not keep a session open with it.
+    """
+
+    interaction_id = _current_session_interaction_id(session_id)
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(
+            candidate, TerminalEventPublicationUncertain
+        ) or _is_runtime_interaction_lifecycle_publication_rejection(
+            candidate,
+            session_id=session_id,
+            interaction_id=interaction_id,
+            runtime_authority=runtime_authority,
+        ):
+            return True
+        pending.extend(iter_exception_tree(candidate))
+        cause = exception_cause(candidate)
+        if cause is not None:
+            pending.append(cause)
+    return is_durable_subagent_submission_unsettled(error, parent_session_id=session_id)
+
+
 def _failure_carries_interaction_publication_rejection(
     failure: Exception,
     *,
@@ -1021,6 +1067,22 @@ class SessionEngine:
         self._session_finalization = session_finalization
         self._foreground_gate_policy_owner = foreground_gate_policy_owner
         self._terminal_event_publication = terminal_event_publication
+        self._run_settlement = RunSettlement(
+            session_store=session_store,
+            session_finalization=session_finalization,
+            environment_lifecycle=environment_lifecycle,
+            recovery_ownership=recovery_ownership,
+            recovery_owns_failure=lambda error, ledger: (
+                session_finalization.interaction_publication_refused(
+                    ledger.session_id, ledger.invocation_context.binding.interaction_id
+                )
+                or _recovery_owns_run_failure(
+                    error,
+                    session_id=ledger.session_id,
+                    runtime_authority=session_finalization.interaction_publication_authority,
+                )
+            ),
+        )
         if type(recovery_cleanup_supervisor) is not RecoveryCleanupSupervisor:
             raise TypeError("recovery_cleanup_supervisor must be a RecoveryCleanupSupervisor.")
         self._recovery_cleanup_supervisor = recovery_cleanup_supervisor
@@ -2011,9 +2073,20 @@ class SessionEngine:
                     creation_command, external_execution
                 )
             else:
-                created = await self.session_store.apply_invocation_lifecycle_command(
-                    creation_command
-                )
+                admission_baseline = current_cancellation_requests()
+                try:
+                    created = await self.session_store.apply_invocation_lifecycle_command(
+                        creation_command
+                    )
+                except BaseException as admission_failure:
+                    await self._settle_lost_admission(
+                        admission_failure,
+                        target_active_profile=active_profile,
+                        prepared_context=invocation_context,
+                        structured_output_pending=request.structured_output is not None,
+                        cancellation_baseline=admission_baseline,
+                    )
+                    raise
             if type(created) is not InvocationMutationResult:
                 raise RuntimeError("Invocation create returned an invalid result.")
             session = created.session
@@ -2123,6 +2196,7 @@ class SessionEngine:
                 defer_interaction_source=True,
                 allow_pending_initial_interaction=True,
             )
+            admission_baseline = current_cancellation_requests()
             try:
                 admission_result = await self.session_store.apply_invocation_lifecycle_command(
                     admission_command
@@ -2146,552 +2220,580 @@ class SessionEngine:
                         current_checkpoint.clear()
                     current_checkpoint = None
                 raise admission_fence
+            except BaseException as admission_failure:
+                await self._settle_lost_admission(
+                    admission_failure,
+                    target_active_profile=prepared_active_profile,
+                    prepared_context=prepared_invocation_context,
+                    structured_output_pending=request.structured_output is not None,
+                    cancellation_baseline=admission_baseline,
+                )
+                raise
             if type(admission_result) is not InvocationMutationResult:
                 raise RuntimeError("Invocation admission returned an invalid result.")
             session = admission_result.session
             invocation_context = prepared_invocation_context.with_admitted_session(session)
         if invocation_context is None:
             raise AssertionError("Invocation admission produced no frozen context.")
-        if on_admitted is not None:
-            on_admitted(session)
-        _activate_session_interaction(session.id, interaction_id)
-        targeted_tool_projection = resolve_targeted_tool_projection(
-            registered_agent.targeted_tool_mode,
-            provider=registered_provider.provider,
-            model=session.model,
+        ledger = RunLedger(
+            session_id=session.id,
+            run_epoch=invocation_context.binding.run_epoch,
+            invocation_context=invocation_context,
+            structured_output_pending=request.structured_output is not None,
+            before_abandonment=self._deferred_input_publication(invocation_context),
         )
-        current_task = asyncio.current_task()
-        active_factory_run: ActiveSessionRun[SessionUsageTracker] | None = None
-        if current_task is not None:
-            active_factory_run = self._session_control.register_active_task(
-                session.id,
-                current_task,
-                task_id=request.task_id,
-                task_started=False,
-                task_finished=False,
+        # Every exit after admission, at any await or yield, ends in one
+        # settlement of this invocation, including the run body's prelude.
+        async with self._run_settlement.settling(ledger):
+            if on_admitted is not None:
+                on_admitted(session)
+            _activate_session_interaction(session.id, interaction_id)
+            targeted_tool_projection = resolve_targeted_tool_projection(
+                registered_agent.targeted_tool_mode,
+                provider=registered_provider.provider,
+                model=session.model,
             )
-            active_factory_run.structured_output_pending = request.structured_output is not None
-        # The run fence belongs to this pre-run setup until control is handed to
-        # _run_session. Every earlier exit must revoke it, including cancellation
-        # and failures while recording the original setup failure.
-        release_before_run = True
-        pre_run_task_started = False
-        interaction_started = True
-        messages: list[Message] | None = None
-        prompt_contribution_manifest: PromptContributionManifest | None = None
-        try:
-            await self._session_control.execution_presence.ensure(session, task_id=request.task_id)
-            await _require_tool_discovery_view(
-                self.session_store,
-                session,
-                registered_agent,
-                tool_capability_ceiling,
-                require_empty=True,
-            )
-            (
-                targeted_tool_grant_records,
-                targeted_tool_grant_events,
-            ) = await self._issue_targeted_tool_grants(
-                session=session,
-                interaction_id=interaction_id,
-                task_id=request.task_id,
-                prepared=targeted_tool_grants,
-                issued_at=interaction_started_event.timestamp,
-            )
-            await self._event_writer.fan_out_persisted([interaction_started_event])
-            if targeted_tool_grant_events:
-                await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
-            yield interaction_started_event
-            for targeted_tool_grant_event_record in targeted_tool_grant_events:
-                yield targeted_tool_grant_event_record
-            factory_started_event = await self._environment_lifecycle.emit_factory_started(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-            )
-            if factory_started_event is not None:
-                yield factory_started_event
-                async for queued_event in self._session_control.drain_out_of_band_events(
-                    session.id
-                ):
-                    yield queued_event
-                if request.task_id is not None:
-                    task = await self._session_tasks.start_task(
-                        task_id=request.task_id,
-                        session=session,
-                        worker_id=request.task_worker_id,
-                        lease_expires_at=request.task_lease_expires_at,
-                    )
-                    pre_run_task_started = True
-                    if active_factory_run is not None:
-                        active_factory_run.task_started = True
-                    yield await self._event_writer.emit(
-                        _task_event(
-                            event_type=EventType.TASK_STARTED,
-                            task=task,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
-                    )
-            resolution = await self._environment_lifecycle.resolve_factory(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                started_event=factory_started_event,
-                operation=EnvironmentFactoryOperation.CREATE,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-            )
-            registered_environment = resolution.registered_environment
-            if registered_environment is not None:
-                invocation_context = invocation_context.with_registered_environment(
-                    registered_environment,
-                    validated_profile=execution_profile,
+            current_task = asyncio.current_task()
+            active_factory_run: ActiveSessionRun[SessionUsageTracker] | None = None
+            if current_task is not None:
+                active_factory_run = self._session_control.register_active_task(
+                    session.id,
+                    current_task,
+                    task_id=request.task_id,
+                    task_started=False,
+                    task_finished=False,
                 )
-            for event in resolution.events:
-                yield event
-                async for queued_event in self._session_control.drain_out_of_band_events(
-                    session.id
-                ):
-                    yield queued_event
-            async for queued_event in self._session_control.drain_out_of_band_events(session.id):
-                yield queued_event
-            if resolution.error is not None:
-                raise resolution.error
-
-            if workspace_instructions is None:
-                workspace_instructions = (
-                    await self._environment_lifecycle.load_workspace_instructions(
-                        registered_environment,
-                    )
+                active_factory_run.structured_output_pending = request.structured_output is not None
+            # The run fence belongs to this pre-run setup until control is handed to
+            # _run_session. Every earlier exit must revoke it, including cancellation
+            # and failures while recording the original setup failure.
+            release_before_run = True
+            pre_run_task_started = False
+            interaction_started = True
+            messages: list[Message] | None = None
+            prompt_contribution_manifest: PromptContributionManifest | None = None
+            try:
+                await self._session_control.execution_presence.ensure(
+                    session, task_id=request.task_id
                 )
-            (
-                resolved_system_prompt,
-                resolved_prompt_contributions,
-            ) = render_initial_system_prompt_with_contributions(
-                agent_system_prompt=registered_agent.spec.system_prompt,
-                workspace_instructions=workspace_instructions,
-            )
-            if resolved_system_prompt != rendered_system_prompt:
-                raise RuntimeError(
-                    "The durable system projection changed after the invocation profile "
-                    "was frozen; session setup fails closed."
+                await _require_tool_discovery_view(
+                    self.session_store,
+                    session,
+                    registered_agent,
+                    tool_capability_ceiling,
+                    require_empty=True,
                 )
-            prompt_contributions = resolved_prompt_contributions
-            if self._request_footprint.enabled:
-                prompt_contribution_manifest = build_prompt_contribution_manifest(
-                    rendered_system_prompt=rendered_system_prompt,
-                    contributions=prompt_contributions,
-                    config=self._request_footprint,
-                )
-            targeted_projection_marker = (
-                targeted_tool_projection_marker_message(
-                    targeted_tool_grants,
+                (
+                    targeted_tool_grant_records,
+                    targeted_tool_grant_events,
+                ) = await self._issue_targeted_tool_grants(
+                    session=session,
                     interaction_id=interaction_id,
-                    generation_id=targeted_tool_view_generation_id(
-                        session_id=session.id,
-                        root_invocation_id=session.invocation.root_invocation_id,
-                    ),
+                    task_id=request.task_id,
+                    prepared=targeted_tool_grants,
+                    issued_at=interaction_started_event.timestamp,
                 )
-                if targeted_tool_grants
-                and targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
-                else None
-            )
-            initial_source_messages = [
-                *request.messages,
-                *(() if targeted_projection_marker is None else (targeted_projection_marker,)),
-            ]
-            messages = transcript_helpers.initial_messages(
-                system_prompt=rendered_system_prompt,
-                request_messages=initial_source_messages,
-            )
-            if targeted_projection_marker is None:
-                # Preserve the established call shape for stores that do not
-                # participate in native targeted-tool projection.
-                await self.session_store.replace_initial_transcript_messages(
-                    session.id,
-                    request.messages,
-                    messages,
-                )
-            else:
-                await self.session_store.replace_initial_transcript_messages(
-                    session.id,
-                    request.messages,
-                    messages,
-                    runtime_suffix_count=1,
-                )
-            if pause_after_initial_transcript:
-                # Native fixture preparation admits the exact transcript and
-                # closes its interaction before any model-loop/provider work.
-                # Keep setup ownership until normal terminal/fence cleanup.
-                # This entrance returns before _run_session emits the origin;
-                # retain that runtime-owned evidence before closing setup so a
-                # later resume remains capturable as a complete trajectory.
-                start_event = Event(
-                    type=EventType.SESSION_STARTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload={
-                        "agent_name": registered_agent.spec.name,
-                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
-                            request,
-                            message_start_index=(len(messages) - len(initial_source_messages)),
-                        ),
-                        **(
-                            {}
-                            if prompt_contribution_manifest is None
-                            else {
-                                "prompt_contribution_manifest": (
-                                    prompt_contribution_manifest.model_dump(mode="json")
-                                )
-                            }
-                        ),
-                        **(
-                            {}
-                            if prepared_session_authority is None
-                            else {
-                                "dispatch_operation_id": (
-                                    prepared_session_authority.dispatch_operation_id
-                                ),
-                                "queue_task_id": prepared_session_authority.queue_task_id,
-                                "durable_subagent_submission_sha256": (
-                                    prepared_session_authority.submission_sha256
-                                ),
-                            }
-                        ),
-                        **_session_trace_event_fields(session, request.metadata),
-                        **release_event_fields(self._event_writer.release_identity),
-                    },
-                )
-                lineage_fields = (
-                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
-                    *(
-                        field_name
-                        for field_name, expected in (
-                            ("parent_session_id", session.parent_session_id),
-                            ("causal_budget_id", session.causal_budget_id),
-                        )
-                        if expected is not None and start_event.payload.get(field_name) == expected
-                    ),
-                )
-                yield await self._event_writer.emit(
-                    event_with_runtime_payload_authority(start_event, *lineage_fields)
-                )
-                async for event in self._session_finalization.handle_session_interrupted(
+                await self._event_writer.fan_out_persisted([interaction_started_event])
+                if targeted_tool_grant_events:
+                    await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
+                yield interaction_started_event
+                for targeted_tool_grant_event_record in targeted_tool_grant_events:
+                    yield targeted_tool_grant_event_record
+                factory_started_event = await self._environment_lifecycle.emit_factory_started(
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
-                ):
+                )
+                if factory_started_event is not None:
+                    yield factory_started_event
+                    async for queued_event in self._session_control.drain_out_of_band_events(
+                        session.id
+                    ):
+                        yield queued_event
+                    if request.task_id is not None:
+                        task = await self._session_tasks.start_task(
+                            task_id=request.task_id,
+                            session=session,
+                            worker_id=request.task_worker_id,
+                            lease_expires_at=request.task_lease_expires_at,
+                        )
+                        pre_run_task_started = True
+                        if active_factory_run is not None:
+                            active_factory_run.task_started = True
+                        yield await self._event_writer.emit(
+                            _task_event(
+                                event_type=EventType.TASK_STARTED,
+                                task=task,
+                                session=session,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                            )
+                        )
+                resolution = await self._environment_lifecycle.resolve_factory(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    started_event=factory_started_event,
+                    operation=EnvironmentFactoryOperation.CREATE,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                )
+                registered_environment = resolution.registered_environment
+                if registered_environment is not None:
+                    invocation_context = invocation_context.with_registered_environment(
+                        registered_environment,
+                        validated_profile=execution_profile,
+                    )
+                    ledger.rebind(invocation_context)
+                for event in resolution.events:
                     yield event
-                return
-            release_before_run = False
-        except asyncio.CancelledError as cancellation:
-            if await self._session_control.interrupt_requested(session.id):
+                    async for queued_event in self._session_control.drain_out_of_band_events(
+                        session.id
+                    ):
+                        yield queued_event
+                async for queued_event in self._session_control.drain_out_of_band_events(
+                    session.id
+                ):
+                    yield queued_event
+                if resolution.error is not None:
+                    raise resolution.error
+
+                if workspace_instructions is None:
+                    workspace_instructions = (
+                        await self._environment_lifecycle.load_workspace_instructions(
+                            registered_environment,
+                        )
+                    )
+                (
+                    resolved_system_prompt,
+                    resolved_prompt_contributions,
+                ) = render_initial_system_prompt_with_contributions(
+                    agent_system_prompt=registered_agent.spec.system_prompt,
+                    workspace_instructions=workspace_instructions,
+                )
+                if resolved_system_prompt != rendered_system_prompt:
+                    raise RuntimeError(
+                        "The durable system projection changed after the invocation profile "
+                        "was frozen; session setup fails closed."
+                    )
+                prompt_contributions = resolved_prompt_contributions
+                if self._request_footprint.enabled:
+                    prompt_contribution_manifest = build_prompt_contribution_manifest(
+                        rendered_system_prompt=rendered_system_prompt,
+                        contributions=prompt_contributions,
+                        config=self._request_footprint,
+                    )
+                targeted_projection_marker = (
+                    targeted_tool_projection_marker_message(
+                        targeted_tool_grants,
+                        interaction_id=interaction_id,
+                        generation_id=targeted_tool_view_generation_id(
+                            session_id=session.id,
+                            root_invocation_id=session.invocation.root_invocation_id,
+                        ),
+                    )
+                    if targeted_tool_grants
+                    and targeted_tool_projection
+                    is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                    else None
+                )
+                initial_source_messages = [
+                    *request.messages,
+                    *(() if targeted_projection_marker is None else (targeted_projection_marker,)),
+                ]
+                messages = transcript_helpers.initial_messages(
+                    system_prompt=rendered_system_prompt,
+                    request_messages=initial_source_messages,
+                )
+                if targeted_projection_marker is None:
+                    # Preserve the established call shape for stores that do not
+                    # participate in native targeted-tool projection.
+                    await self.session_store.replace_initial_transcript_messages(
+                        session.id,
+                        request.messages,
+                        messages,
+                    )
+                else:
+                    await self.session_store.replace_initial_transcript_messages(
+                        session.id,
+                        request.messages,
+                        messages,
+                        runtime_suffix_count=1,
+                    )
+                if pause_after_initial_transcript:
+                    # Native fixture preparation admits the exact transcript and
+                    # closes its interaction before any model-loop/provider work.
+                    # Keep setup ownership until normal terminal/fence cleanup.
+                    # This entrance returns before _run_session emits the origin;
+                    # retain that runtime-owned evidence before closing setup so a
+                    # later resume remains capturable as a complete trajectory.
+                    start_event = Event(
+                        type=EventType.SESSION_STARTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload={
+                            "agent_name": registered_agent.spec.name,
+                            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
+                                request,
+                                message_start_index=(len(messages) - len(initial_source_messages)),
+                            ),
+                            **(
+                                {}
+                                if prompt_contribution_manifest is None
+                                else {
+                                    "prompt_contribution_manifest": (
+                                        prompt_contribution_manifest.model_dump(mode="json")
+                                    )
+                                }
+                            ),
+                            **(
+                                {}
+                                if prepared_session_authority is None
+                                else {
+                                    "dispatch_operation_id": (
+                                        prepared_session_authority.dispatch_operation_id
+                                    ),
+                                    "queue_task_id": prepared_session_authority.queue_task_id,
+                                    "durable_subagent_submission_sha256": (
+                                        prepared_session_authority.submission_sha256
+                                    ),
+                                }
+                            ),
+                            **_session_trace_event_fields(session, request.metadata),
+                            **release_event_fields(self._event_writer.release_identity),
+                        },
+                    )
+                    lineage_fields = (
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+                        *(
+                            field_name
+                            for field_name, expected in (
+                                ("parent_session_id", session.parent_session_id),
+                                ("causal_budget_id", session.causal_budget_id),
+                            )
+                            if expected is not None
+                            and start_event.payload.get(field_name) == expected
+                        ),
+                    )
+                    yield await self._event_writer.emit(
+                        event_with_runtime_payload_authority(start_event, *lineage_fields)
+                    )
+                    async for event in self._session_finalization.handle_session_interrupted(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    return
+                release_before_run = False
+            except asyncio.CancelledError as cancellation:
+                if await self._session_control.interrupt_requested(session.id):
+                    if interaction_started:
+                        await self.session_store.materialize_deferred_interaction_input(session.id)
+                    async for event in self._session_finalization.handle_session_interrupted(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                    ):
+                        yield event
+                    return
+
+                async def settle_pre_run_deadline_task() -> None:
+                    await self._session_tasks.fail_task_for_execution_deadline(
+                        task_id=request.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_lease_expires_at=request.task_lease_expires_at,
+                        task_handoff_id=None,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=cancellation,
+                    steps=(
+                        (
+                            "cancelled pre-run session finalization",
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
+                                session.id,
+                                propagate_interaction_publication_rejection=True,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile,
+                                invocation_context=invocation_context,
+                                active_run=active_factory_run,
+                            ),
+                        ),
+                        (
+                            "cancelled pre-run task deadline finalization",
+                            settle_pre_run_deadline_task,
+                        ),
+                    ),
+                )
+                raise
+            except TerminalEventPublicationUncertain:
+                raise
+            except Exception as exc:
+                if is_durable_subagent_submission_unsettled(
+                    exc,
+                    parent_session_id=session.id,
+                ):
+                    raise
+                if _failure_carries_interaction_publication_rejection(
+                    exc,
+                    session_id=session.id,
+                    interaction_id=_current_session_interaction_id(session.id),
+                    runtime_authority=self._session_finalization.interaction_publication_authority,
+                ):
+                    raise
+                ledger.failure_owned_by_body = True
+                try:
+                    failure_interaction_observed_at = (
+                        await self._session_finalization.failure_interaction_observed_at(session)
+                    )
+                except Exception as preflight_failure:
+                    _raise_primary_with_secondary_failure(
+                        exc,
+                        preflight_failure,
+                        group_message=(
+                            "Run failure evidence and interaction terminalization preflight failure."
+                        ),
+                    )
+                failure_diagnostic = exception_diagnostic(
+                    exc,
+                    redactor=self._secret_redactor,
+                )
                 if interaction_started:
                     await self.session_store.materialize_deferred_interaction_input(session.id)
-                async for event in self._session_finalization.handle_session_interrupted(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                ):
-                    yield event
-                return
-
-            async def settle_pre_run_deadline_task() -> None:
-                await self._session_tasks.fail_task_for_execution_deadline(
+                (
+                    task_failure_event,
+                    task_failure_error,
+                ) = await self._session_tasks.fail_task_for_run_setup_error(
                     task_id=request.task_id,
                     task_worker_id=request.task_worker_id,
-                    task_lease_expires_at=request.task_lease_expires_at,
                     task_handoff_id=None,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    diagnostic=failure_diagnostic,
                 )
-
-            await self._recovery_ownership.run_cleanup_steps(
-                authoritative_failure=cancellation,
-                steps=(
-                    (
-                        "cancelled pre-run session finalization",
-                        lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                            session.id,
-                            propagate_interaction_publication_rejection=True,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
-                            active_run=active_factory_run,
-                        ),
-                    ),
-                    (
-                        "cancelled pre-run task deadline finalization",
-                        settle_pre_run_deadline_task,
-                    ),
-                ),
-            )
-            raise
-        except TerminalEventPublicationUncertain:
-            raise
-        except Exception as exc:
-            if is_durable_subagent_submission_unsettled(
-                exc,
-                parent_session_id=session.id,
-            ):
-                raise
-            if _failure_carries_interaction_publication_rejection(
-                exc,
-                session_id=session.id,
-                interaction_id=_current_session_interaction_id(session.id),
-                runtime_authority=self._session_finalization.interaction_publication_authority,
-            ):
-                raise
-            try:
-                failure_interaction_observed_at = (
-                    await self._session_finalization.failure_interaction_observed_at(session)
-                )
-            except Exception as preflight_failure:
-                _raise_primary_with_secondary_failure(
-                    exc,
-                    preflight_failure,
-                    group_message=(
-                        "Run failure evidence and interaction terminalization preflight failure."
-                    ),
-                )
-            failure_diagnostic = exception_diagnostic(
-                exc,
-                redactor=self._secret_redactor,
-            )
-            if interaction_started:
-                await self.session_store.materialize_deferred_interaction_input(session.id)
-            (
-                task_failure_event,
-                task_failure_error,
-            ) = await self._session_tasks.fail_task_for_run_setup_error(
-                task_id=request.task_id,
-                task_worker_id=request.task_worker_id,
-                task_handoff_id=None,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                diagnostic=failure_diagnostic,
-            )
-            # Settle setup failure before yielding: closing in this exception
-            # handler cannot reach the sibling GeneratorExit handler.
-            failure_events: list[Event] = []
-            if task_failure_event is not None:
-                failure_events.append(task_failure_event)
-            (
-                session,
-                interaction_failed_event,
-                _,
-            ) = await self._session_finalization.publish_sibling_interaction_transition(
-                session=session,
-                invocation_context=invocation_context,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=_environment_name(registered_environment),
-                to_status=SessionStatus.FAILED,
-                observed_at=failure_interaction_observed_at,
-                execution_profile=execution_profile,
-            )
-            if interaction_failed_event is not None:
-                failure_events.append(interaction_failed_event)
-            failure_payload = exception_failure_payload(
-                exc,
-                diagnostic=failure_diagnostic,
-                redactor=self._secret_redactor,
-            )
-            if task_failure_error is not None:
-                failure_payload.update(
-                    task_update_error_payload(
-                        task_failure_error,
-                        redactor=self._secret_redactor,
-                    )
-                )
-            async for event in self._terminal_event_publication.emit(
-                event=Event(
-                    type=EventType.SESSION_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload=failure_payload,
-                ),
-                phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                execution_profile=execution_profile,
-                invocation_context=invocation_context,
-            ):
-                failure_events.append(event)
-                async for queued_event in self._session_control.drain_out_of_band_events(
-                    session.id
-                ):
-                    failure_events.append(queued_event)
-            for event in failure_events:
-                yield event
-            return
-        except BaseExceptionGroup as exc:
-            if binding_finalize_explicit_cancellation(exc) is not None:
-
-                async def prepare_interruption() -> None:
-                    if interaction_started:
-                        await self.session_store.materialize_deferred_interaction_input(session.id)
-
+                # Settle setup failure before yielding: closing in this exception
+                # handler cannot reach the sibling GeneratorExit handler.
+                failure_events: list[Event] = []
+                if task_failure_event is not None:
+                    failure_events.append(task_failure_event)
                 (
-                    _interruption_events,
-                    propagated_failure,
-                ) = await self._interruption_cleanup.handle_session_interrupted_preserving_failure(
-                    authoritative_failure=exc,
+                    session,
+                    interaction_failed_event,
+                    _,
+                ) = await self._session_finalization.publish_sibling_interaction_transition(
+                    session=session,
+                    invocation_context=invocation_context,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                    to_status=SessionStatus.FAILED,
+                    observed_at=failure_interaction_observed_at,
+                    execution_profile=execution_profile,
+                )
+                if interaction_failed_event is not None:
+                    failure_events.append(interaction_failed_event)
+                failure_payload = exception_failure_payload(
+                    exc,
+                    diagnostic=failure_diagnostic,
+                    redactor=self._secret_redactor,
+                )
+                if task_failure_error is not None:
+                    failure_payload.update(
+                        task_update_error_payload(
+                            task_failure_error,
+                            redactor=self._secret_redactor,
+                        )
+                    )
+                async for event in self._terminal_event_publication.emit(
+                    event=Event(
+                        type=EventType.SESSION_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload=failure_payload,
+                    ),
+                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
                     session=session,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
-                    prepare_interruption=prepare_interruption,
-                )
-                if propagated_failure is exc:
-                    raise
-                raise propagated_failure from None
-            raise
-        except GeneratorExit as abandonment:
-            # The producer closes in its original task and Context. Only this
-            # fresh interruption operation runs separately: its cancellation
-            # normalization must not consume the stream caller's requests.
-            source_task = asyncio.current_task()
-            terminal_events: list[Event] = []
-            setup_prepared = False
-
-            async def finalize_closed_setup() -> None:
-                nonlocal setup_prepared
-                await self.session_store.materialize_deferred_interaction_input(session.id)
-                current_session = await self.session_store.load(session.id)
-                if current_session is None:
-                    return
-                setup_prepared = True
-                async for event in self._session_finalization.handle_session_interrupted(
-                    session=current_session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                    terminal_finalization_handoff_source_task=source_task,
                 ):
-                    if event.type in {
-                        EventType.SESSION_COMPLETED,
-                        EventType.SESSION_FAILED,
-                        EventType.SESSION_INTERRUPTED,
-                    }:
-                        terminal_events.append(event)
+                    failure_events.append(event)
+                    async for queued_event in self._session_control.drain_out_of_band_events(
+                        session.id
+                    ):
+                        failure_events.append(queued_event)
+                for event in failure_events:
+                    yield event
+                return
+            except BaseExceptionGroup as exc:
+                if binding_finalize_explicit_cancellation(exc) is not None:
 
-            try:
-                await _settle_setup_interruption(finalize_closed_setup)
-            except Exception as finalization_failure:
-                if not setup_prepared:
-                    # aclose() suppresses GeneratorExit, including its cause.
-                    # Preparation errors must escape if interruption was never
-                    # attempted; retain the existing finalization contract below.
-                    raise finalization_failure from abandonment
-                _raise_primary_with_secondary_failure(
-                    abandonment,
-                    finalization_failure,
-                    group_message=(
-                        "Setup stream abandonment and interaction terminalization failure."
-                    ),
-                )
-            finally:
-                for event in terminal_events:
-                    _mark_session_invocation_terminal_event(event)
-            raise
-        finally:
-            finalizer_failure = sys.exception()
-            if finalizer_failure is not None and (
-                isinstance(finalizer_failure, asyncio.CancelledError)
-                or workspace_observation_pending_cancellation_requests(finalizer_failure)
-            ):
-                finalizer_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = ()
-                if release_before_run:
-                    finalizer_steps = (
-                        (
-                            "Pre-run environment setup abort",
-                            lambda: self._environment_lifecycle.abort_environment_setup(
-                                session_id=session.id,
-                                original_error=finalizer_failure,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                            ),
-                        ),
-                        (
-                            "Pre-run environment run-fence release",
-                            lambda: (
-                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                    session_id=session.id,
-                                    execution_profile=execution_profile,
-                                    invocation_context=invocation_context,
-                                )
-                            ),
+                    async def prepare_interruption() -> None:
+                        if interaction_started:
+                            await self.session_store.materialize_deferred_interaction_input(
+                                session.id
+                            )
+
+                    (
+                        _interruption_events,
+                        propagated_failure,
+                    ) = await self._interruption_cleanup.handle_session_interrupted_preserving_failure(
+                        authoritative_failure=exc,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        prepare_interruption=prepare_interruption,
+                    )
+                    if propagated_failure is exc:
+                        raise
+                    raise propagated_failure from None
+                raise
+            except GeneratorExit as abandonment:
+                # The producer closes in its original task and Context. Only this
+                # fresh interruption operation runs separately: its cancellation
+                # normalization must not consume the stream caller's requests.
+                source_task = asyncio.current_task()
+                terminal_events: list[Event] = []
+                setup_prepared = False
+
+                async def finalize_closed_setup() -> None:
+                    nonlocal setup_prepared
+                    await self.session_store.materialize_deferred_interaction_input(session.id)
+                    current_session = await self.session_store.load(session.id)
+                    if current_session is None:
+                        return
+                    setup_prepared = True
+                    async for event in self._session_finalization.handle_session_interrupted(
+                        session=current_session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                        execution_profile=execution_profile,
+                        invocation_context=invocation_context,
+                        terminal_finalization_handoff_source_task=source_task,
+                    ):
+                        if event.type in {
+                            EventType.SESSION_COMPLETED,
+                            EventType.SESSION_FAILED,
+                            EventType.SESSION_INTERRUPTED,
+                        }:
+                            terminal_events.append(event)
+
+                try:
+                    await _settle_setup_interruption(finalize_closed_setup)
+                except Exception as finalization_failure:
+                    if not setup_prepared:
+                        # aclose() suppresses GeneratorExit, including its cause.
+                        # Preparation errors must escape if interruption was never
+                        # attempted; retain the existing finalization contract below.
+                        raise finalization_failure from abandonment
+                    _raise_primary_with_secondary_failure(
+                        abandonment,
+                        finalization_failure,
+                        group_message=(
+                            "Setup stream abandonment and interaction terminalization failure."
                         ),
                     )
-                propagated_finalizer_failure = await self._interruption_cleanup.settle_session_finalizer_preserving_interruption_failure(
-                    authoritative_failure=finalizer_failure,
-                    steps=finalizer_steps,
-                )
-                if release_before_run:
-                    # The owned child receives a copied context. Retire the
-                    # caller's corresponding token after that child settles.
-                    _deactivate_session_run_fence(session.id)
-                try:
-                    if current_task is not None and active_factory_run is not None:
-                        self._session_control.unregister_active_task(
-                            session.id,
-                            current_task,
-                        )
                 finally:
+                    for event in terminal_events:
+                        _mark_session_invocation_terminal_event(event)
+                raise
+            finally:
+                finalizer_failure = sys.exception()
+                if finalizer_failure is not None and (
+                    isinstance(finalizer_failure, asyncio.CancelledError)
+                    or workspace_observation_pending_cancellation_requests(finalizer_failure)
+                ):
+                    finalizer_steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = ()
                     if release_before_run:
-                        _deactivate_session_interaction(session.id)
-                if propagated_finalizer_failure is not finalizer_failure:
-                    raise propagated_finalizer_failure from None
-            else:
-                try:
-                    if release_before_run:
-                        await self._environment_lifecycle.abort_environment_setup(
-                            session_id=session.id,
-                            original_error=finalizer_failure,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
+                        finalizer_steps = (
+                            (
+                                "Pre-run environment setup abort",
+                                lambda: self._environment_lifecycle.abort_environment_setup(
+                                    session_id=session.id,
+                                    original_error=finalizer_failure,
+                                    execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
+                                ),
+                            ),
+                            (
+                                "Pre-run environment run-fence release",
+                                lambda: (
+                                    self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                        session_id=session.id,
+                                        execution_profile=execution_profile,
+                                        invocation_context=invocation_context,
+                                    )
+                                ),
+                            ),
                         )
-                finally:
+                    propagated_finalizer_failure = await self._interruption_cleanup.settle_session_finalizer_preserving_interruption_failure(
+                        authoritative_failure=finalizer_failure,
+                        steps=finalizer_steps,
+                    )
+                    if release_before_run:
+                        # The owned child receives a copied context. Retire the
+                        # caller's corresponding token after that child settles.
+                        _deactivate_session_run_fence(session.id)
+                    try:
+                        if current_task is not None and active_factory_run is not None:
+                            self._session_control.unregister_active_task(
+                                session.id,
+                                current_task,
+                            )
+                    finally:
+                        if release_before_run:
+                            _deactivate_session_interaction(session.id)
+                    if propagated_finalizer_failure is not finalizer_failure:
+                        raise propagated_finalizer_failure from None
+                else:
                     try:
                         if release_before_run:
-                            await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                            await self._environment_lifecycle.abort_environment_setup(
                                 session_id=session.id,
+                                original_error=finalizer_failure,
                                 execution_profile=execution_profile,
                                 invocation_context=invocation_context,
                             )
                     finally:
                         try:
-                            if current_task is not None and active_factory_run is not None:
-                                self._session_control.unregister_active_task(
-                                    session.id,
-                                    current_task,
+                            if release_before_run:
+                                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                    session_id=session.id,
+                                    execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
                                 )
                         finally:
-                            if release_before_run:
-                                _deactivate_session_interaction(session.id)
+                            try:
+                                if current_task is not None and active_factory_run is not None:
+                                    self._session_control.unregister_active_task(
+                                        session.id,
+                                        current_task,
+                                    )
+                            finally:
+                                if release_before_run:
+                                    _deactivate_session_interaction(session.id)
 
-        try:
             if messages is None:
                 raise RuntimeError("Initial transcript was not finalized during setup.")
             session_stream = self._run_session(
@@ -2760,74 +2862,153 @@ class SessionEngine:
                 },
                 start_task_on_enter=not pre_run_task_started,
                 tool_completion=request.tool_completion,
+                run_ledger=ledger,
             )
-        except BaseException as exc:
+            forwarded_stream = self._session_control.stream_with_out_of_band_events(
+                session.id,
+                session_stream,
+            )
+            billing_identity_cancellation: asyncio.CancelledError | None = None
+            billing_identity_cancellation_group: BaseExceptionGroup | None = None
+            propagated_cancellation: asyncio.CancelledError | None = None
+            propagated_cancellation_group: BaseExceptionGroup | None = None
             try:
-                await self._environment_lifecycle.abort_environment_setup(
-                    session_id=session.id,
-                    original_error=exc,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
+                async for event in forwarded_stream:
+                    yield event
+            except asyncio.CancelledError as exc:
+                billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
+                if billing_identity_cancellation is None:
+                    propagated_cancellation = _detach_provider_cancellation_for_public(exc) or exc
+            except BaseExceptionGroup as exc:
+                billing_identity_cancellation_group = detach_billing_identity_cancellation_group(
+                    exc
                 )
-            finally:
-                try:
-                    await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                        session_id=session.id,
+                if billing_identity_cancellation_group is None:
+                    propagated_cancellation_group = exc
+            except GeneratorExit:
+                # The forwarding iterator owns closure of the inner run stream.
+                # Retain and close that layer so its finalizer cannot race a direct
+                # close of the same inner generator.
+                await _close_async_iterator(forwarded_stream)
+                raise
+
+            del forwarded_stream, session_stream
+            # A registered provider can retain live credentials in its repr. Drop it
+            # before any fallible interruption-store work and before raising a fresh
+            # provider-free cancellation.
+            del registered_provider
+            ledger.provider_free_exit = (
+                billing_identity_cancellation is not None
+                or billing_identity_cancellation_group is not None
+            )
+
+            if billing_identity_cancellation is not None:
+                interruption_check_failed = False
+                interruption_requested = False
+                if self._session_control.is_interruption_request_active(session.id):
+                    try:
+                        interruption_requested = await self._session_control.interrupt_requested(
+                            session.id
+                        )
+                    except Exception:
+                        interruption_check_failed = True
+                if interruption_check_failed:
+                    raise RuntimeError(
+                        "Session interruption state check failed after provider billing cancellation"
+                    ) from None
+                if interruption_requested:
+                    interruption_transition_failed = False
+                    try:
+                        async for event in self._session_finalization.handle_session_interrupted(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=_environment_name(registered_environment),
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                        ):
+                            yield event
+                    except Exception:
+                        interruption_transition_failed = True
+                    if interruption_transition_failed:
+                        raise RuntimeError(
+                            "Session interruption transition failed after provider billing cancellation"
+                        ) from None
+                    return
+                raise billing_identity_cancellation
+
+            if billing_identity_cancellation_group is not None:
+                interruption_load_failed = False
+                persisted_session = None
+                if self._session_control.is_interruption_request_active(session.id):
+                    try:
+                        persisted_session = await self.session_store.load(session.id)
+                    except Exception:
+                        interruption_load_failed = True
+                if interruption_load_failed:
+                    raise RuntimeError(
+                        "Session interruption state load failed after provider billing cancellation"
+                    ) from None
+                if (
+                    persisted_session is not None
+                    and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
+                ):
+                    interruption_transition_failed = False
+                    try:
+                        async for event in self._session_finalization.handle_session_interrupted(
+                            session=persisted_session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=_environment_name(registered_environment),
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                        ):
+                            yield event
+                    except Exception:
+                        interruption_transition_failed = True
+                    if interruption_transition_failed:
+                        raise RuntimeError(
+                            "Session interruption transition failed after provider billing cancellation"
+                        ) from None
+                raise billing_identity_cancellation_group
+
+            if (
+                expired_execution_deadline() is not None
+                and invocation_context.work_attempt is None
+                and (
+                    propagated_cancellation is not None or propagated_cancellation_group is not None
+                )
+            ):
+
+                async def settle_expired_task() -> None:
+                    await self._session_finalization.finalize_abandoned_session_by_id(
+                        session.id,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
                     )
-                finally:
-                    _deactivate_session_interaction(session.id)
-            raise
-        forwarded_stream = self._session_control.stream_with_out_of_band_events(
-            session.id,
-            session_stream,
-        )
-        billing_identity_cancellation: asyncio.CancelledError | None = None
-        billing_identity_cancellation_group: BaseExceptionGroup | None = None
-        propagated_cancellation: asyncio.CancelledError | None = None
-        propagated_cancellation_group: BaseExceptionGroup | None = None
-        try:
-            async for event in forwarded_stream:
-                yield event
-        except asyncio.CancelledError as exc:
-            billing_identity_cancellation = _detach_billing_cancellation_for_public(exc)
-            if billing_identity_cancellation is None:
-                propagated_cancellation = _detach_provider_cancellation_for_public(exc) or exc
-        except BaseExceptionGroup as exc:
-            billing_identity_cancellation_group = detach_billing_identity_cancellation_group(exc)
-            if billing_identity_cancellation_group is None:
-                propagated_cancellation_group = exc
-        except GeneratorExit:
-            # The forwarding iterator owns closure of the inner run stream.
-            # Retain and close that layer so its finalizer cannot race a direct
-            # close of the same inner generator.
-            await _close_async_iterator(forwarded_stream)
-            raise
-
-        del forwarded_stream, session_stream
-        # A registered provider can retain live credentials in its repr. Drop it
-        # before any fallible interruption-store work and before raising a fresh
-        # provider-free cancellation.
-        del registered_provider
-
-        if billing_identity_cancellation is not None:
-            interruption_check_failed = False
-            interruption_requested = False
-            if self._session_control.is_interruption_request_active(session.id):
-                try:
-                    interruption_requested = await self._session_control.interrupt_requested(
-                        session.id
+                    await self._session_tasks.fail_task_for_execution_deadline(
+                        task_id=request.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_lease_expires_at=request.task_lease_expires_at,
+                        task_handoff_id=None,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                     )
-                except Exception:
-                    interruption_check_failed = True
-            if interruption_check_failed:
-                raise RuntimeError(
-                    "Session interruption state check failed after provider billing cancellation"
-                ) from None
-            if interruption_requested:
-                interruption_transition_failed = False
-                try:
+
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=propagated_cancellation or propagated_cancellation_group,
+                    steps=(
+                        ("expired task finalization after stream cleanup", settle_expired_task),
+                    ),
+                )
+
+            if propagated_cancellation is not None:
+                if self._session_control.is_interruption_request_active(
+                    session.id
+                ) and await self._session_control.interrupt_requested(session.id):
                     async for event in self._session_finalization.handle_session_interrupted(
                         session=session,
                         registered_agent=registered_agent,
@@ -2837,97 +3018,49 @@ class SessionEngine:
                         invocation_context=invocation_context,
                     ):
                         yield event
-                except Exception:
-                    interruption_transition_failed = True
-                if interruption_transition_failed:
-                    raise RuntimeError(
-                        "Session interruption transition failed after provider billing cancellation"
-                    ) from None
-                return
-            raise billing_identity_cancellation
+                    return
+                raise propagated_cancellation
 
-        if billing_identity_cancellation_group is not None:
-            interruption_load_failed = False
-            persisted_session = None
-            if self._session_control.is_interruption_request_active(session.id):
-                try:
-                    persisted_session = await self.session_store.load(session.id)
-                except Exception:
-                    interruption_load_failed = True
-            if interruption_load_failed:
-                raise RuntimeError(
-                    "Session interruption state load failed after provider billing cancellation"
-                ) from None
-            if (
-                persisted_session is not None
-                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
-            ):
-                interruption_transition_failed = False
-                try:
-                    async for event in self._session_finalization.handle_session_interrupted(
-                        session=persisted_session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=_environment_name(registered_environment),
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    ):
-                        yield event
-                except Exception:
-                    interruption_transition_failed = True
-                if interruption_transition_failed:
-                    raise RuntimeError(
-                        "Session interruption transition failed after provider billing cancellation"
-                    ) from None
-            raise billing_identity_cancellation_group
+            if propagated_cancellation_group is not None:
+                raise propagated_cancellation_group
 
-        if (
-            expired_execution_deadline() is not None
-            and invocation_context.work_attempt is None
-            and (propagated_cancellation is not None or propagated_cancellation_group is not None)
-        ):
-
-            async def settle_expired_task() -> None:
-                await self._session_finalization.finalize_abandoned_session_by_id(
-                    session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                )
-                await self._session_tasks.fail_task_for_execution_deadline(
-                    task_id=request.task_id,
-                    task_worker_id=request.task_worker_id,
-                    task_lease_expires_at=request.task_lease_expires_at,
-                    task_handoff_id=None,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
-
-            await self._recovery_ownership.run_cleanup_steps(
-                authoritative_failure=propagated_cancellation or propagated_cancellation_group,
-                steps=(("expired task finalization after stream cleanup", settle_expired_task),),
+    async def _settle_lost_admission(
+        self,
+        error: BaseException,
+        *,
+        target_active_profile: ActiveInvocationExecutionProfile,
+        prepared_context: InvocationContext,
+        structured_output_pending: bool,
+        cancellation_baseline: int,
+    ) -> None:
+        def ledger_for(session: Session) -> RunLedger:
+            context = prepared_context.with_admitted_session(session)
+            return RunLedger(
+                session_id=session.id,
+                run_epoch=context.binding.run_epoch,
+                invocation_context=context,
+                structured_output_pending=structured_output_pending,
+                cancellation_baseline=cancellation_baseline,
+                before_abandonment=self._deferred_input_publication(context),
             )
 
-        if propagated_cancellation is not None:
-            if self._session_control.is_interruption_request_active(
-                session.id
-            ) and await self._session_control.interrupt_requested(session.id):
-                async for event in self._session_finalization.handle_session_interrupted(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                ):
-                    yield event
-                return
-            raise propagated_cancellation
+        await self._run_settlement.settle_lost_admission(
+            error,
+            target_active_profile=target_active_profile,
+            ledger_for=ledger_for,
+            cancellation_baseline=cancellation_baseline,
+        )
 
-        if propagated_cancellation_group is not None:
-            raise propagated_cancellation_group
+    def _deferred_input_publication(
+        self, context: InvocationContext
+    ) -> Callable[[], Awaitable[None]]:
+        async def publish() -> None:
+            await self.session_store.materialize_deferred_interaction_input(
+                context.binding.session_id,
+                interaction_id=context.binding.interaction_id,
+            )
+
+        return publish
 
     async def refresh_foreground_child_action(
         self,
@@ -3127,6 +3260,7 @@ class SessionEngine:
         invocation_context: InvocationContext | None = None,
         predecessor_settlement_event: Event | None = None,
         before_successor_admission: Callable[[], Awaitable[None]] | None = None,
+        on_successor: Callable[[InvocationContext], None] | None = None,
     ) -> tuple[list[Event], InvocationContext | None]:
         if invocation_context is not None and invocation_context.work_attempt is not None:
             # Acceptance may have come from another app without this TaskStore.
@@ -3298,6 +3432,10 @@ class SessionEngine:
                     interaction_started_event=interaction_started_event,
                 )
                 _activate_session_interaction(session_id, delivery_interaction_id)
+                if on_successor is not None:
+                    # The successor owns the run from this commit on. Install
+                    # it before any await, so every exit settles the successor.
+                    on_successor(invocation_context)
             if batch.events:
                 await self._event_writer.fan_out_persisted(list(batch.events))
                 delivered_events.extend(batch.events)
@@ -3406,6 +3544,7 @@ class SessionEngine:
         predecessor_settlement_event: Event | None = None,
         task_id: str | None = None,
         participant_context: CollaborationAccessContext | None = None,
+        on_successor: Callable[[InvocationContext], None] | None = None,
     ) -> AsyncGenerator[Event | _QueuedCompletionResult, None]:
         async def admit_successor() -> None:
             from cayu.runtime._producer_output_store import producer_owns_invocation
@@ -3488,6 +3627,7 @@ class SessionEngine:
                 predecessor_settlement_event=predecessor_settlement_event,
                 before_successor_admission=admit_successor,
                 reject_only=(max_steps is not None and step >= max_steps),
+                on_successor=on_successor,
             )
             events.extend(drained_events)
             if len(messages) != message_count:
@@ -5320,9 +5460,21 @@ class SessionEngine:
                     admission_command, prepared_invocation_context
                 )
             elif continuation_handoff is None:
-                admission_result = await self.session_store.apply_invocation_lifecycle_command(
-                    admission_command
-                )
+                admission_baseline = current_cancellation_requests()
+                try:
+                    admission_result = await self.session_store.apply_invocation_lifecycle_command(
+                        admission_command
+                    )
+                except BaseException as admission_failure:
+                    if not continuing_recovery_boundary:
+                        await self._settle_lost_admission(
+                            admission_failure,
+                            target_active_profile=target_active_profile,
+                            prepared_context=prepared_invocation_context,
+                            structured_output_pending=request.structured_output is not None,
+                            cancellation_baseline=admission_baseline,
+                        )
+                    raise
             else:
                 admission_result = await continuation_handoff.admit(
                     admission_command, prepared_invocation_context
@@ -5365,19 +5517,48 @@ class SessionEngine:
                 _deactivate_session_interaction(loaded_session.id)
             raise
         invocation_context = prepared_invocation_context.with_admitted_session(session)
-        if on_admitted is not None:
-            on_admitted(session)
-        if task_id is not None and required_task_session_instance_id is not None:
-            try:
-                await self._session_tasks.require_linked_continuation_task_authority(
-                    task_id=task_id,
-                    task_worker_id=request.task_worker_id,
-                    task_handoff_id=request.task_handoff_id,
-                    session_id=session.id,
-                    session_instance_id=required_task_session_instance_id,
-                )
-            except BaseException as authority_failure:
+        ledger = RunLedger(
+            session_id=session.id,
+            run_epoch=invocation_context.binding.run_epoch,
+            invocation_context=invocation_context,
+            structured_output_pending=request.structured_output is not None,
+        )
+
+        async def recovery_input_stays_private() -> bool:
+            # Recovery still owns deferred input while a model stage or tool
+            # round from the recovered boundary remains open.
+            if await self.session_store.load_active_model_completion_stage(session.id) is not None:
+                return True
+            _, open_round = await pending_round_reader.load_pending_tool_round(
+                self.session_store,
+                session.id,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+                runtime_session=session,
+            )
+            return open_round is not None
+
+        async def publish_recovery_input() -> None:
+            if not await recovery_input_stays_private():
+                await self.session_store.materialize_deferred_interaction_input(session.id)
+
+        if continuing_recovery_boundary:
+            ledger.before_abandonment = publish_recovery_input
+        # Every exit after admission, at any await or yield, ends in one
+        # settlement of this invocation.
+        async with self._run_settlement.settling(ledger):
+            if on_admitted is not None:
+                on_admitted(session)
+            if task_id is not None and required_task_session_instance_id is not None:
                 try:
+                    await self._session_tasks.require_linked_continuation_task_authority(
+                        task_id=task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_handoff_id=request.task_handoff_id,
+                        session_id=session.id,
+                        session_instance_id=required_task_session_instance_id,
+                    )
+                except BaseException as authority_failure:
                     await self._recovery_ownership.run_cleanup_steps(
                         authoritative_failure=authority_failure,
                         steps=(
@@ -5405,277 +5586,130 @@ class SessionEngine:
                             ),
                         ),
                     )
-                finally:
-                    if continuing_recovery_boundary:
-                        _deactivate_session_interaction(session.id)
-                raise
-        if not continuing_recovery_boundary:
-            if interaction_id is None:
-                raise RuntimeError("New interaction admission produced no interaction identity.")
-            _activate_session_interaction(session.id, interaction_id)
-        try:
-            if continuation_handoff is not None:
-                await continuation_handoff.after_admission(invocation_context)
-            (
-                issued_targeted_tool_grant_records,
-                targeted_tool_grant_events,
-            ) = await self._issue_targeted_tool_grants(
-                session=session,
-                interaction_id=interaction_id,
-                task_id=task_id,
-                prepared=prepared_targeted_tool_grants,
-                issued_at=(
-                    self._clock()
-                    if interaction_started_event is None
-                    else interaction_started_event.timestamp
-                ),
-            )
-            (
-                reconstructed_targeted_tool_grant_records,
-                reconstructed_targeted_tool_grant_events,
-            ) = (
-                await self._reconstruct_targeted_tool_grants(
+                    raise
+            if not continuing_recovery_boundary:
+                if interaction_id is None:
+                    raise RuntimeError(
+                        "New interaction admission produced no interaction identity."
+                    )
+                _activate_session_interaction(session.id, interaction_id)
+            try:
+                if continuation_handoff is not None:
+                    await continuation_handoff.after_admission(invocation_context)
+                (
+                    issued_targeted_tool_grant_records,
+                    targeted_tool_grant_events,
+                ) = await self._issue_targeted_tool_grants(
                     session=session,
                     interaction_id=interaction_id,
                     task_id=task_id,
-                    registered_agent=registered_agent,
-                    capability_ceiling=effective_tool_capability_ceiling,
-                    observed_at=self._clock(),
-                    preserve_native_projection_snapshot=(
-                        targeted_tool_projection
-                        is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                    prepared=prepared_targeted_tool_grants,
+                    issued_at=(
+                        self._clock()
+                        if interaction_started_event is None
+                        else interaction_started_event.timestamp
                     ),
                 )
-                if continuing_recovery_boundary
-                else ((), ())
-            )
-            targeted_tool_grant_records = (
-                reconstructed_targeted_tool_grant_records
-                if continuing_recovery_boundary
-                else issued_targeted_tool_grant_records
-            )
-            if session.run_epoch != loaded_session.run_epoch + 1:
-                # Another complete invocation won admission after our preflight
-                # snapshot. Refresh the adjacent profile while this invocation
-                # owns the run fence so phase continuity follows durable order.
-                previous_tool_exposure_profile_id = await self._latest_tool_exposure_profile_id(
-                    session.id
-                )
-            admission_events = [
-                event
-                for event in (
-                    (
-                        None
-                        if execution_profile_decision is None
-                        else execution_profile_decision.event
-                    ),
-                    model_transition_event,
-                    interaction_started_event,
-                )
-                if event is not None
-            ]
-            if admission_events:
-                await self._event_writer.fan_out_persisted(admission_events)
-                for admission_event in admission_events:
-                    # Exact reuse is durable audit evidence but not a new public
-                    # resume-stream boundary. Keep the long-standing stream
-                    # ordering for ordinary exact resumes while still exposing
-                    # changed-profile decisions and explicit idempotent replays.
-                    if (
-                        execution_profile_decision is not None
-                        and execution_profile_decision.kind
-                        is ExecutionProfileDecisionKind.EXACT_REUSE
-                        and admission_event.id == execution_profile_decision.event.id
-                    ):
-                        continue
-                    yield admission_event
-            if targeted_tool_grant_events:
-                await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
-                for targeted_tool_grant_event_record in targeted_tool_grant_events:
-                    yield targeted_tool_grant_event_record
-            for reconstructed_event in reconstructed_targeted_tool_grant_events:
-                yield reconstructed_event
-            model_boundary = (
-                await self._model_completion_recovery.reconcile_model_completion_boundary(
-                    session,
-                    invocation_context=invocation_context,
-                    registered_agent=registered_agent,
-                    registered_provider=registered_provider,
-                    registered_environment=registered_environment,
-                )
-            )
-            session = model_boundary.session
-            for recovery_event in model_boundary.recovery_events:
-                yield copy_event(recovery_event)
-            if (
-                model_boundary.state == "provider_operation_reconciled"
-                and model_boundary.completion_event is not None
-            ):
-                yield copy_event(model_boundary.completion_event)
-            if model_boundary.state in {
-                "provider_operation_pending",
-                "provider_operation_unavailable",
-            }:
-                # A queued dispatch must retain its exact queue/session handoff
-                # until either provider reconciliation publishes the pinned
-                # terminal event or terminal-evidence recovery transfers it to
-                # a receipt. Clearing it before the following status write can
-                # make acknowledgement loss look like a never-admitted failure
-                # and terminally fail the queue task while provider work lives.
-                if queue_task_id is None:
-                    await self._terminal_event_publication.clear_run_operation(
-                        session_id=session.id,
-                        operation_id=run_operation_id,
-                    )
                 (
-                    session,
-                    pending_interaction_event,
-                    _,
-                ) = await self._session_finalization.publish_sibling_interaction_transition(
-                    session=session,
-                    invocation_context=invocation_context,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    to_status=SessionStatus.INTERRUPTED,
-                    execution_profile=invocation_profile,
-                )
-                if pending_interaction_event is not None:
-                    yield pending_interaction_event
-                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                    session_id=session.id,
-                    execution_profile=invocation_profile,
-                    invocation_context=invocation_context,
-                )
-                _deactivate_session_interaction(session.id)
-                return
-            projection_cursor = max(
-                session_model_projection_cursor(session), loaded_projection_cursor
-            )
-            admitted_selection = model_failover_progress_for_session(
-                session=session,
-                execution_profile=invocation_profile,
-                checkpoint=(
-                    await self.session_store.load_checkpoint(session.id)
-                    if model_failover is not None
-                    else None
-                ),
-            )
-            if admitted_selection is not None:
-                projection_cursor = max(projection_cursor, admitted_selection.projection_cursor)
-            if projection_cursor:
-                transcript_snapshot = await self.session_store.load_transcript_snapshot(session.id)
-                try:
-                    transcript = list(
-                        _transcript._project_model_target_snapshot(
-                            transcript_snapshot,
-                            projection_cursor,
-                        ).messages
-                    )
-                finally:
-                    del transcript_snapshot
-            else:
-                transcript = await self.session_store.load_transcript(session.id)
-            transcript, transcript_is_valid = session_request_boundary.redact_transcript(
-                transcript,
-                redactor=self._secret_redactor,
-                field_name="session.transcript",
-            )
-            if not transcript_is_valid:
-                raise ValueError(
-                    "Session transcript contains a workload secret in execution authority "
-                    "and cannot be resumed."
-                ) from None
-        except (asyncio.CancelledError, GeneratorExit) as abandonment:
-            try:
-                await self._recovery_ownership.run_cleanup_steps(
-                    authoritative_failure=abandonment,
-                    steps=(
-                        (
-                            "abandoned resume setup finalization",
-                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                                session.id,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                execution_profile=invocation_profile,
-                                invocation_context=invocation_context,
-                                structured_output_pending=request.structured_output is not None,
-                            ),
+                    reconstructed_targeted_tool_grant_records,
+                    reconstructed_targeted_tool_grant_events,
+                ) = (
+                    await self._reconstruct_targeted_tool_grants(
+                        session=session,
+                        interaction_id=interaction_id,
+                        task_id=task_id,
+                        registered_agent=registered_agent,
+                        capability_ceiling=effective_tool_capability_ceiling,
+                        observed_at=self._clock(),
+                        preserve_native_projection_snapshot=(
+                            targeted_tool_projection
+                            is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
                         ),
-                        (
-                            "abandoned resume run-fence release",
-                            lambda: (
-                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                    session_id=session.id,
-                                    execution_profile=invocation_profile,
-                                    invocation_context=invocation_context,
-                                )
-                            ),
-                        ),
-                    ),
-                )
-            finally:
-                _deactivate_session_interaction(session.id)
-            raise
-        except Exception as exc:
-            if is_durable_subagent_submission_unsettled(
-                exc,
-                parent_session_id=session.id,
-            ):
-                raise
-            try:
-                keep_recovery_interaction_open = False
-                if continuing_recovery_boundary:
-                    materialization_is_safe = False
-                    try:
-                        active_model_stage = (
-                            await self.session_store.load_active_model_completion_stage(session.id)
-                        )
-                        if active_model_stage is not None:
-                            keep_recovery_interaction_open = True
-                        else:
-                            (
-                                _failure_checkpoint,
-                                pending_failure_round,
-                            ) = await pending_round_reader.load_pending_tool_round(
-                                self.session_store,
-                                session.id,
-                                redactor=self._secret_redactor,
-                                consume_on_rejection=True,
-                                runtime_session=session,
-                            )
-                            materialization_is_safe = pending_failure_round is None
-                            keep_recovery_interaction_open = pending_failure_round is not None
-                    except Exception as inspection_error:
-                        keep_recovery_interaction_open = True
-                        exc.add_note(
-                            "Deferred resume input remained private because recovery-state "
-                            "inspection failed: "
-                            f"{type(inspection_error).__name__}: {inspection_error}"
-                        )
-                    if materialization_is_safe:
-                        try:
-                            await self.session_store.materialize_deferred_interaction_input(
-                                session.id
-                            )
-                        except Exception as materialization_error:
-                            keep_recovery_interaction_open = True
-                            exc.add_note(
-                                "Deferred resume input remained private because materialization "
-                                "failed: "
-                                f"{type(materialization_error).__name__}: "
-                                f"{materialization_error}"
-                            )
-                if keep_recovery_interaction_open:
-                    session = await self.session_store.update_status(
-                        session.id,
-                        SessionStatus.FAILED,
                     )
-                    interaction_failed_event = None
-                else:
+                    if continuing_recovery_boundary
+                    else ((), ())
+                )
+                targeted_tool_grant_records = (
+                    reconstructed_targeted_tool_grant_records
+                    if continuing_recovery_boundary
+                    else issued_targeted_tool_grant_records
+                )
+                if session.run_epoch != loaded_session.run_epoch + 1:
+                    # Another complete invocation won admission after our preflight
+                    # snapshot. Refresh the adjacent profile while this invocation
+                    # owns the run fence so phase continuity follows durable order.
+                    previous_tool_exposure_profile_id = await self._latest_tool_exposure_profile_id(
+                        session.id
+                    )
+                admission_events = [
+                    event
+                    for event in (
+                        (
+                            None
+                            if execution_profile_decision is None
+                            else execution_profile_decision.event
+                        ),
+                        model_transition_event,
+                        interaction_started_event,
+                    )
+                    if event is not None
+                ]
+                if admission_events:
+                    await self._event_writer.fan_out_persisted(admission_events)
+                    for admission_event in admission_events:
+                        # Exact reuse is durable audit evidence but not a new public
+                        # resume-stream boundary. Keep the long-standing stream
+                        # ordering for ordinary exact resumes while still exposing
+                        # changed-profile decisions and explicit idempotent replays.
+                        if (
+                            execution_profile_decision is not None
+                            and execution_profile_decision.kind
+                            is ExecutionProfileDecisionKind.EXACT_REUSE
+                            and admission_event.id == execution_profile_decision.event.id
+                        ):
+                            continue
+                        yield admission_event
+                if targeted_tool_grant_events:
+                    await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
+                    for targeted_tool_grant_event_record in targeted_tool_grant_events:
+                        yield targeted_tool_grant_event_record
+                for reconstructed_event in reconstructed_targeted_tool_grant_events:
+                    yield reconstructed_event
+                model_boundary = (
+                    await self._model_completion_recovery.reconcile_model_completion_boundary(
+                        session,
+                        invocation_context=invocation_context,
+                        registered_agent=registered_agent,
+                        registered_provider=registered_provider,
+                        registered_environment=registered_environment,
+                    )
+                )
+                session = model_boundary.session
+                for recovery_event in model_boundary.recovery_events:
+                    yield copy_event(recovery_event)
+                if (
+                    model_boundary.state == "provider_operation_reconciled"
+                    and model_boundary.completion_event is not None
+                ):
+                    yield copy_event(model_boundary.completion_event)
+                if model_boundary.state in {
+                    "provider_operation_pending",
+                    "provider_operation_unavailable",
+                }:
+                    # A queued dispatch must retain its exact queue/session handoff
+                    # until either provider reconciliation publishes the pinned
+                    # terminal event or terminal-evidence recovery transfers it to
+                    # a receipt. Clearing it before the following status write can
+                    # make acknowledgement loss look like a never-admitted failure
+                    # and terminally fail the queue task while provider work lives.
+                    if queue_task_id is None:
+                        await self._terminal_event_publication.clear_run_operation(
+                            session_id=session.id,
+                            operation_id=run_operation_id,
+                        )
                     (
                         session,
-                        interaction_failed_event,
+                        pending_interaction_event,
                         _,
                     ) = await self._session_finalization.publish_sibling_interaction_transition(
                         session=session,
@@ -5683,167 +5717,261 @@ class SessionEngine:
                         registered_agent=registered_agent,
                         registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
-                        to_status=SessionStatus.FAILED,
+                        to_status=SessionStatus.INTERRUPTED,
                         execution_profile=invocation_profile,
                     )
-                if interaction_failed_event is not None:
-                    yield interaction_failed_event
-                failure_event = await self._terminal_event_publication.bind_to_run_operation(
-                    Event(
-                        type=EventType.SESSION_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=_environment_name(registered_environment),
-                        payload=exception_failure_payload(
-                            exc,
-                            redactor=self._secret_redactor,
-                        ),
-                    ),
-                    session=session,
-                )
-                persisted_failure = await self._event_writer.emit(failure_event)
-                try:
-                    await self._terminal_event_publication.clear_run_operation(
-                        session_id=session.id,
-                        operation_id=run_operation_id,
-                        terminal_evidence_durable=True,
-                    )
-                except Exception as cleanup_failure:
-                    logger.warning(
-                        "Terminal evidence is durable but session run operation cleanup "
-                        "remains pending: session_id=%s event_id=%s error_type=%s",
-                        session.id,
-                        persisted_failure.id,
-                        type(cleanup_failure).__name__,
-                    )
-                yield persisted_failure
-            finally:
-                try:
+                    # Committed: any exit from here on still owes its release.
+                    ledger.decided()
+                    if pending_interaction_event is not None:
+                        yield pending_interaction_event
                     await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                         session_id=session.id,
                         execution_profile=invocation_profile,
                         invocation_context=invocation_context,
                     )
-                finally:
-                    _deactivate_session_interaction(session.id)
-            return
-        except BaseException:
-            try:
-                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                    session_id=session.id,
-                    execution_profile=invocation_profile,
-                    invocation_context=invocation_context,
+                    return
+                projection_cursor = max(
+                    session_model_projection_cursor(session), loaded_projection_cursor
                 )
-            finally:
-                _deactivate_session_interaction(session.id)
-            raise
-        reconciled_pending_round = model_boundary.pending_tool_round or pending_round
-        messages = (
-            transcript + interaction_source_messages if continuing_recovery_boundary else transcript
-        )
-        session_stream = self._run_session(
-            session=session,
-            participant_context=participant_context,
-            invocation_context=invocation_context,
-            execution_to_wait=execution_to_wait,
-            model_failover=model_failover,
-            messages=messages,
-            messages_to_append=(
-                interaction_source_messages if continuing_recovery_boundary else request.messages
-            ),
-            max_steps=request.max_steps,
-            limits=request.limits,
-            budget_limits=request.budget_limits,
-            retry_policy=self._effective_retry_policy(request.retry_policy),
-            structured_output=request.structured_output,
-            thinking=request.thinking,
-            request_metadata=request.metadata,
-            request_trace_metadata=(
-                request.metadata
-                if required_foreground_wait is not None
-                else _runtime_resume_transport_metadata(request) or request.metadata
-            ),
-            foreground_wait=required_foreground_wait,
-            targeted_tool_grants=targeted_tool_grant_footprint(
-                targeted_tool_grant_records,
-                projection=targeted_tool_projection,
-            ),
-            task_id=task_id,
-            task_worker_id=request.task_worker_id,
-            task_lease_expires_at=None,
-            task_handoff_id=request.task_handoff_id,
-            start_event_type=EventType.SESSION_RESUMED,
-            start_event_payload={
-                "agent_name": registered_agent.spec.name,
-                "appended_messages": len(request.messages),
-                **(
-                    {
-                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
-                            session_input_contract_evidence(
-                                request,
-                                message_start_index=(
-                                    len(transcript) - len(interaction_source_messages)
-                                ),
-                            )
+                admitted_selection = model_failover_progress_for_session(
+                    session=session,
+                    execution_profile=invocation_profile,
+                    checkpoint=(
+                        await self.session_store.load_checkpoint(session.id)
+                        if model_failover is not None
+                        else None
+                    ),
+                )
+                if admitted_selection is not None:
+                    projection_cursor = max(projection_cursor, admitted_selection.projection_cursor)
+                if projection_cursor:
+                    transcript_snapshot = await self.session_store.load_transcript_snapshot(
+                        session.id
+                    )
+                    try:
+                        transcript = list(
+                            _transcript._project_model_target_snapshot(
+                                transcript_snapshot,
+                                projection_cursor,
+                            ).messages
                         )
-                    }
-                    if not continuing_recovery_boundary and request.messages
-                    else {}
-                ),
-                **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
-            },
-            start_task_on_enter=start_task_on_enter,
-            messages_already_persisted=not continuing_recovery_boundary,
-            messages_deferred=continuing_recovery_boundary,
-            new_terminal_invocation=(
-                loaded_session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
-                and not continuing_recovery_boundary
-            ),
-            deliver_queued_input_before_first_step=not continuing_recovery_boundary,
-            pending_tool_round_source_transcript_cursor=(
-                None
-                if reconciled_pending_round is None
-                else reconciled_pending_round.source_transcript_cursor
-            ),
-            run_limit_accounting=(
-                required_foreground_continuation.run_limit_accounting
-                if required_foreground_continuation is not None
-                else pending_round.run_limit_accounting
-                if required_foreground_wait is not None and pending_round is not None
-                else None
-            ),
-            previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
-            egress_environment_handoff=egress_environment_handoff,
-            parked_egress_factory_result=parked_egress_factory_result,
-            tool_completion=request.tool_completion,
-        )
-        authoritative_failure: BaseExceptionGroup | None = None
-        try:
-            try:
-                if (
-                    model_boundary.state == "promoted"
-                    and model_boundary.completion_event is not None
+                    finally:
+                        del transcript_snapshot
+                else:
+                    transcript = await self.session_store.load_transcript(session.id)
+                transcript, transcript_is_valid = session_request_boundary.redact_transcript(
+                    transcript,
+                    redactor=self._secret_redactor,
+                    field_name="session.transcript",
+                )
+                if not transcript_is_valid:
+                    raise ValueError(
+                        "Session transcript contains a workload secret in execution authority "
+                        "and cannot be resumed."
+                    ) from None
+            except Exception as exc:
+                if is_durable_subagent_submission_unsettled(
+                    exc,
+                    parent_session_id=session.id,
                 ):
-                    yield copy_event(model_boundary.completion_event)
-                async for event in session_stream:
-                    yield event
-            except BaseExceptionGroup as exc:
-                detached_failure = detach_billing_identity_cancellation_group(exc)
-                authoritative_failure = exc if detached_failure is None else detached_failure
-            if authoritative_failure is None:
+                    raise
+                ledger.failure_owned_by_body = True
+                try:
+                    keep_recovery_interaction_open = False
+                    if continuing_recovery_boundary:
+                        materialization_is_safe = False
+                        try:
+                            keep_recovery_interaction_open = await recovery_input_stays_private()
+                            materialization_is_safe = not keep_recovery_interaction_open
+                        except Exception as inspection_error:
+                            keep_recovery_interaction_open = True
+                            exc.add_note(
+                                "Deferred resume input remained private because recovery-state "
+                                "inspection failed: "
+                                f"{type(inspection_error).__name__}: {inspection_error}"
+                            )
+                        if materialization_is_safe:
+                            try:
+                                await self.session_store.materialize_deferred_interaction_input(
+                                    session.id
+                                )
+                            except Exception as materialization_error:
+                                keep_recovery_interaction_open = True
+                                exc.add_note(
+                                    "Deferred resume input remained private because materialization "
+                                    "failed: "
+                                    f"{type(materialization_error).__name__}: "
+                                    f"{materialization_error}"
+                                )
+                    if keep_recovery_interaction_open:
+                        session = await self.session_store.update_status(
+                            session.id,
+                            SessionStatus.FAILED,
+                        )
+                        interaction_failed_event = None
+                    else:
+                        (
+                            session,
+                            interaction_failed_event,
+                            _,
+                        ) = await self._session_finalization.publish_sibling_interaction_transition(
+                            session=session,
+                            invocation_context=invocation_context,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=_environment_name(registered_environment),
+                            to_status=SessionStatus.FAILED,
+                            execution_profile=invocation_profile,
+                        )
+                    if interaction_failed_event is not None:
+                        yield interaction_failed_event
+                    failure_event = await self._terminal_event_publication.bind_to_run_operation(
+                        Event(
+                            type=EventType.SESSION_FAILED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=_environment_name(registered_environment),
+                            payload=exception_failure_payload(
+                                exc,
+                                redactor=self._secret_redactor,
+                            ),
+                        ),
+                        session=session,
+                    )
+                    persisted_failure = await self._event_writer.emit(failure_event)
+                    try:
+                        await self._terminal_event_publication.clear_run_operation(
+                            session_id=session.id,
+                            operation_id=run_operation_id,
+                            terminal_evidence_durable=True,
+                        )
+                    except Exception as cleanup_failure:
+                        logger.warning(
+                            "Terminal evidence is durable but session run operation cleanup "
+                            "remains pending: session_id=%s event_id=%s error_type=%s",
+                            session.id,
+                            persisted_failure.id,
+                            type(cleanup_failure).__name__,
+                        )
+                    yield persisted_failure
+                finally:
+                    await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                        session_id=session.id,
+                        execution_profile=invocation_profile,
+                        invocation_context=invocation_context,
+                    )
                 return
-            # A registered provider can retain live credentials in its repr.
-            # Drop the registration before the detached failure crosses the
-            # public resume boundary. Grouped interruption settlement already
-            # ran inside _run_session while its run-fence and interaction
-            # authority were still live.
-            del registered_provider
-            raise authoritative_failure from None
-        except GeneratorExit:
-            await session_stream.aclose()
-            raise
-        finally:
-            _deactivate_session_interaction(session.id)
+            reconciled_pending_round = model_boundary.pending_tool_round or pending_round
+            messages = (
+                transcript + interaction_source_messages
+                if continuing_recovery_boundary
+                else transcript
+            )
+            session_stream = self._run_session(
+                session=session,
+                participant_context=participant_context,
+                invocation_context=invocation_context,
+                execution_to_wait=execution_to_wait,
+                model_failover=model_failover,
+                messages=messages,
+                messages_to_append=(
+                    interaction_source_messages
+                    if continuing_recovery_boundary
+                    else request.messages
+                ),
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=self._effective_retry_policy(request.retry_policy),
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                request_metadata=request.metadata,
+                request_trace_metadata=(
+                    request.metadata
+                    if required_foreground_wait is not None
+                    else _runtime_resume_transport_metadata(request) or request.metadata
+                ),
+                foreground_wait=required_foreground_wait,
+                targeted_tool_grants=targeted_tool_grant_footprint(
+                    targeted_tool_grant_records,
+                    projection=targeted_tool_projection,
+                ),
+                task_id=task_id,
+                task_worker_id=request.task_worker_id,
+                task_lease_expires_at=None,
+                task_handoff_id=request.task_handoff_id,
+                start_event_type=EventType.SESSION_RESUMED,
+                start_event_payload={
+                    "agent_name": registered_agent.spec.name,
+                    "appended_messages": len(request.messages),
+                    **(
+                        {
+                            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                session_input_contract_evidence(
+                                    request,
+                                    message_start_index=(
+                                        len(transcript) - len(interaction_source_messages)
+                                    ),
+                                )
+                            )
+                        }
+                        if not continuing_recovery_boundary and request.messages
+                        else {}
+                    ),
+                    **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
+                },
+                start_task_on_enter=start_task_on_enter,
+                messages_already_persisted=not continuing_recovery_boundary,
+                messages_deferred=continuing_recovery_boundary,
+                new_terminal_invocation=(
+                    loaded_session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+                    and not continuing_recovery_boundary
+                ),
+                deliver_queued_input_before_first_step=not continuing_recovery_boundary,
+                pending_tool_round_source_transcript_cursor=(
+                    None
+                    if reconciled_pending_round is None
+                    else reconciled_pending_round.source_transcript_cursor
+                ),
+                run_limit_accounting=(
+                    required_foreground_continuation.run_limit_accounting
+                    if required_foreground_continuation is not None
+                    else pending_round.run_limit_accounting
+                    if required_foreground_wait is not None and pending_round is not None
+                    else None
+                ),
+                previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
+                egress_environment_handoff=egress_environment_handoff,
+                parked_egress_factory_result=parked_egress_factory_result,
+                tool_completion=request.tool_completion,
+                run_ledger=ledger,
+            )
+            authoritative_failure: BaseExceptionGroup | None = None
+            try:
+                try:
+                    if (
+                        model_boundary.state == "promoted"
+                        and model_boundary.completion_event is not None
+                    ):
+                        yield copy_event(model_boundary.completion_event)
+                    async for event in session_stream:
+                        yield event
+                except BaseExceptionGroup as exc:
+                    detached_failure = detach_billing_identity_cancellation_group(exc)
+                    authoritative_failure = exc if detached_failure is None else detached_failure
+                if authoritative_failure is None:
+                    return
+                # A registered provider can retain live credentials in its repr.
+                # Drop the registration before the detached failure crosses the
+                # public resume boundary. Grouped interruption settlement already
+                # ran inside _run_session while its run-fence and interaction
+                # authority were still live.
+                del registered_provider
+                ledger.provider_free_exit = detached_failure is not None
+                raise authoritative_failure from None
+            except GeneratorExit:
+                await session_stream.aclose()
+                raise
 
     async def continue_run(
         self,
@@ -6242,6 +6370,7 @@ class SessionEngine:
         producer_replay: _ProducerCompletionReplay | None = None,
         tool_completion_replay: ToolCompletionResult | None = None,
         retain_completion_controls: bool = False,
+        run_ledger: RunLedger | None = None,
     ) -> AsyncGenerator[Event, None]:
         outcome_state = SessionOutcomeState(session=session)
 
@@ -6523,6 +6652,17 @@ class SessionEngine:
                 completion_finalization_marker,
                 tool_completion_result,
             )
+
+        owed_completion: AsyncGenerator[Event, None] | None = None
+
+        def owe_completion(session_completed: bool) -> None:
+            # A committed completion owes task and terminal publication. The
+            # body publishes it below; settlement finishes it after any exit.
+            nonlocal owed_completion
+            if session_completed and run_ledger is not None:
+                owed = complete_session(outcome_state.session, completion_finalization_marker)
+                owed_completion = owed
+                run_ledger.decided(lambda: drain_event_stream(owed))
 
         # A fresh run means any earlier interrupt was fully handled before the
         # session transitioned back to RUNNING; drop a stale signal so it does
@@ -7003,6 +7143,8 @@ class SessionEngine:
                     registered_environment,
                     validated_profile=execution_profile,
                 )
+                if run_ledger is not None:
+                    run_ledger.rebind(invocation_context)
             environment_name = _environment_name(registered_environment)
             if active_run is not None:
                 active_run.turn_environment_name = environment_name
@@ -7071,6 +7213,8 @@ class SessionEngine:
                     registered_environment,
                     validated_profile=execution_profile,
                 )
+                if run_ledger is not None:
+                    run_ledger.rebind(invocation_context)
             environment_name = _environment_name(registered_environment)
             if active_run is not None:
                 active_run.turn_environment_name = environment_name
@@ -7407,6 +7551,7 @@ class SessionEngine:
                     task_id=task_id,
                     tool_completion_result=tool_completion_result,
                 )
+                owe_completion(session_completed)
                 if interaction_completed_event is not None:
                     yield interaction_completed_event
                 if not session_completed:
@@ -7464,6 +7609,8 @@ class SessionEngine:
                             tool_completion = None
                         tool_completion_result = None
                     invocation_context = rebound_invocation_context
+                    if run_ledger is not None:
+                        run_ledger.rebind(invocation_context)
                     for event in queued_completion.events:
                         yield event
                     if queued_completion.outcome in {"stopped", "complete"}:
@@ -7791,6 +7938,8 @@ class SessionEngine:
                 model_step_run.rebind_queued_interaction(rebound)
                 tool_round_runner.rebind_queued_interaction(rebound)
                 invocation_context = rebound
+                if run_ledger is not None:
+                    run_ledger.rebind(rebound)
 
             if foreground_wait is not None:
                 from cayu.runtime._foreground_child_continuation import (
@@ -8285,6 +8434,7 @@ class SessionEngine:
                             task_id=task_id,
                             tool_completion_result=None,
                         )
+                        owe_completion(session_completed)
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
                         if not session_completed:
@@ -8426,6 +8576,7 @@ class SessionEngine:
                                     task_id=task_id,
                                     tool_completion_result=None,
                                 )
+                                owe_completion(session_completed)
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
                                 if not session_completed:
@@ -8654,6 +8805,7 @@ class SessionEngine:
                         task_id=task_id,
                         tool_completion_result=None,
                     )
+                    owe_completion(session_completed)
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
                     if not session_completed:
@@ -8680,6 +8832,7 @@ class SessionEngine:
                                 invocation_context=invocation_context,
                                 predecessor_settlement_event=interaction_completed_event,
                                 task_id=task_id,
+                                on_successor=install_queued_invocation_context,
                             )
                         ) as queued_stream:
                             async for queued_item in queued_stream:
@@ -8765,6 +8918,7 @@ class SessionEngine:
                         task_id=task_id,
                         tool_completion_result=tool_completion_result,
                     )
+                    owe_completion(session_completed)
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
                     if not session_completed:
@@ -8791,6 +8945,7 @@ class SessionEngine:
                                 invocation_context=invocation_context,
                                 predecessor_settlement_event=interaction_completed_event,
                                 task_id=task_id,
+                                on_successor=install_queued_invocation_context,
                             )
                         ) as queued_stream:
                             async for queued_item in queued_stream:
@@ -8831,6 +8986,13 @@ class SessionEngine:
                         yield event
                     return
 
+            if run_ledger is not None and owed_completion is not None:
+                # Not closed here: after a close at any of its yields, the
+                # run's settlement drains this same publication to its end.
+                async for event in owed_completion:
+                    yield event
+                run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+                return
             async with contextlib.aclosing(
                 self._session_outcomes.complete_session(
                     outcome_context(),
@@ -9405,6 +9567,8 @@ class SessionEngine:
                 # unrelated terminal session that the pending disposition cannot
                 # finish after restart.
                 raise
+            if run_ledger is not None:
+                run_ledger.failure_owned_by_body = True
             async with contextlib.aclosing(
                 self._session_outcomes.fail(
                     outcome_context(),
@@ -9490,6 +9654,12 @@ class SessionEngine:
             raise propagated_failure from None
         finally:
             finalizer_failure = sys.exception()
+            # A decided outcome still owed to the run's settlement keeps its
+            # environment, fence and interaction until settlement finishes it.
+            settlement_owed = run_ledger is not None and (
+                run_ledger.settlement_finishes_remainder(finalizer_failure)
+            )
+            release_run_fence_on_exit = release_run_fence_on_exit and not settlement_owed
             if finalizer_failure is not None and (
                 isinstance(finalizer_failure, asyncio.CancelledError)
                 or workspace_observation_pending_cancellation_requests(finalizer_failure)
@@ -9500,19 +9670,23 @@ class SessionEngine:
 
                 finalizer_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
                     (
-                        "Session environment setup abort",
-                        lambda: self._environment_lifecycle.abort_environment_setup(
-                            session_id=outcome_state.session.id,
-                            original_error=finalizer_failure,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
-                        ),
-                    ),
-                    (
                         "Session interrupt-signal cleanup",
                         discard_interrupt_signal,
                     ),
                 ]
+                if not settlement_owed:
+                    finalizer_steps.insert(
+                        0,
+                        (
+                            "Session environment setup abort",
+                            lambda: self._environment_lifecycle.abort_environment_setup(
+                                session_id=outcome_state.session.id,
+                                original_error=finalizer_failure,
+                                execution_profile=execution_profile,
+                                invocation_context=invocation_context,
+                            ),
+                        ),
+                    )
                 if release_run_fence_on_exit:
                     finalizer_steps.append(
                         (
@@ -9541,18 +9715,20 @@ class SessionEngine:
                             current_task,
                         )
                 finally:
-                    _clear_session_interaction_settlement(outcome_state.session.id)
-                    _deactivate_session_interaction(outcome_state.session.id)
+                    if not settlement_owed:
+                        _clear_session_interaction_settlement(outcome_state.session.id)
+                        _deactivate_session_interaction(outcome_state.session.id)
                 if propagated_finalizer_failure is not finalizer_failure:
                     raise propagated_finalizer_failure from None
             else:
                 try:
-                    await self._environment_lifecycle.abort_environment_setup(
-                        session_id=outcome_state.session.id,
-                        original_error=finalizer_failure,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    )
+                    if not settlement_owed:
+                        await self._environment_lifecycle.abort_environment_setup(
+                            session_id=outcome_state.session.id,
+                            original_error=finalizer_failure,
+                            execution_profile=execution_profile,
+                            invocation_context=invocation_context,
+                        )
                 finally:
                     self._session_control.discard_interrupt_signal(outcome_state.session.id)
                     try:
@@ -9570,8 +9746,9 @@ class SessionEngine:
                                     current_task,
                                 )
                         finally:
-                            _clear_session_interaction_settlement(outcome_state.session.id)
-                            _deactivate_session_interaction(outcome_state.session.id)
+                            if not settlement_owed:
+                                _clear_session_interaction_settlement(outcome_state.session.id)
+                                _deactivate_session_interaction(outcome_state.session.id)
 
     async def _stop_session_for_model_step_limit(
         self,

@@ -1895,8 +1895,6 @@ class RecoveryCoordinator:
             after_admission=after_admission,
             invocation_context=invocation_context,
         )
-        if resumed_event is not None:
-            yield resumed_event
         if claimed_intent is None:
             raise RuntimeError("User-input recovery claim completed without durable intent.")
         invocation_context = invocation_context.with_rebound_session(
@@ -1916,6 +1914,8 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
             )
             try:
+                if resumed_event is not None:
+                    yield resumed_event
                 async with contextlib.aclosing(environment.reconnect()) as preparation:
                     async for _ in preparation:
                         pass
@@ -1987,7 +1987,11 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
         )
         authoritative_failure: BaseException | None = None
+        inner_started = False  # Once started, the recovery stream owns its cleanup.
         try:
+            if resumed_event is not None:
+                yield resumed_event
+            inner_started = True
             async for event in recovery_stream:
                 yield event
         except BaseException as exc:
@@ -2000,8 +2004,8 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=False,
-                release_run_fence=False,
+                finalize_abandoned=not inner_started,
+                release_run_fence=not inner_started,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
             )
@@ -2865,8 +2869,6 @@ class RecoveryCoordinator:
         )
         if pending_approval is None or pending_round is None:
             raise RuntimeError("Tool approval recovery claim completed without approval state.")
-        if resumed_event is not None:
-            yield resumed_event
         invocation_context = invocation_context.with_rebound_session(
             session,
             active_profile=execution_profile_snapshot.model_copy(
@@ -2890,7 +2892,11 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
         )
         authoritative_failure: BaseException | None = None
+        inner_started = False  # Once started, the recovery stream owns its cleanup.
         try:
+            if resumed_event is not None:
+                yield resumed_event
+            inner_started = True
             async for event in recovery_stream:
                 yield event
         except BaseException as exc:
@@ -2903,8 +2909,8 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=False,
-                release_run_fence=False,
+                finalize_abandoned=not inner_started,
+                release_run_fence=not inner_started,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
             )

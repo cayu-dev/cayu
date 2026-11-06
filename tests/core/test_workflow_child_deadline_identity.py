@@ -234,10 +234,13 @@ async def test_deadline_at_create_acknowledgement(tmp_path, monkeypatch, sqlite,
             e for e in await store.load_events(child_id) if e.type == EventType.SESSION_INTERRUPTED
         )
         assert evidence.session_id == child_id
-        assert evidence.run_epoch == created_epoch
-        # Pre-start recovery currently emits a terminal without an executing
-        # epoch. Do not manufacture a run-to-terminal association from status.
-        assert "failure_evidence" not in terminal.payload
+        # The run settled and released the invocation its create admitted
+        # before the workflow authenticated the child, so the step names the
+        # epoch it authenticated, as after any settled create.
+        assert evidence.run_epoch == child.run_epoch > created_epoch
+        # The terminal carries the admitted epoch's own evidence; it is not
+        # the authenticated epoch's, so the step does not claim it.
+        assert terminal.payload["failure_evidence"]["run_epoch"] == created_epoch
         assert evidence.terminal_event_id is None
     if sqlite:
         await store.close()

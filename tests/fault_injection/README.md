@@ -148,21 +148,13 @@ points unless the fault says otherwise.
 
 | Finding | Faults, scenarios | Points | Invariant broken | Where |
 |---|---|---|---|---|
-| `resume-admission` | grouped-cancel: resume | 19 | session running without owner | from the `admit_session_invocation` commit in `_session_engine.resume` through the first event fan-out |
-| `resume-admission-cancel` | cancel: resume | 1 | session running without owner | right after `admit_session_invocation` commits |
-| `task-close-completed` | stream-close: task, task-group | 2 | task fails although its session completed | closing at `interaction.completed` |
 | `task-completion-cancel` | grouped-cancel: task, task-group | 14 | task stays running under a completed session | between `_complete_session_if_no_queued_messages` and `terminalize_task` |
-| `task-grouped-abandon` | grouped-cancel: task, task-group | 11 | task held by the exited worker | from `claim_task` through `mark_claimed_task_execution_started` |
-| `group-obligation-raised` | grouped-cancel: task-group | 235 | group execution obligation never settled (the group stays draining) | the member's run is cancelled anywhere after its execution was recorded |
 | `task-session-grouped-recovery` | grouped-cancel: task, task-group | 68 | session running, owner lost, even after recovery | a task-backed run's model steps and tool round; recovery then fails with `TaskClaimLost` because the task was already settled |
-| `run-entrance-create` | cancel, grouped-cancel: run, tool-round, task, task-group | 6 | session running without owner | right after `create` commits in `_session_engine.run`, before execution is claimed |
-| `public-projection-cancel` | cancel, grouped-cancel: run, tool-round, task, task-group | 6 | session running, owner lost | `CayuApp._project_emitted_event_for_public_api` projecting the first event |
 | `approval-grouped-continuation` | grouped-cancel: approval | 1 | session running without owner | right after the approval continuation commits `transition_status_and_checkpoint` |
-| `grouped-group-retention` | grouped-cancel: task, task-group | 4 | session running under an `executing` task-worker lease | `_task_group_invocation.prepare` |
 | `grouped-model-stage` | grouped-cancel: run, tool-round, resume, approval | 12 | cannot continue after recovery ("no authoritative open interaction") | right after `complete_model_completion_stage` commits in `_assistant_model_publication` |
-| `trailing-fence-cancel` | cancel, grouped-cancel: run, tool-round, resume, approval | 27 | completed session fenced forever (`SessionRunFenced`) | trailing fence release in `_settle_quiescent_invocation_fence`, and for approval `cleanup_recovery_handoff` |
+| `trailing-fence-cancel` | cancel, grouped-cancel: approval | 9 | completed session fenced forever (`SessionRunFenced`) | the approval continuation's trailing fence release in `cleanup_recovery_handoff` |
 | `trailing-fence-crash` | crash: run, tool-round, resume, approval | 30 | completed session fenced forever; abandoned-session recovery skips completed sessions | between the interaction's completion and `release_session_invocation` |
-| `task-claim-cancel` | cancel: task, task-group | 13 | task claimed by the exited worker until its lease expires | from `claim_task` through `mark_claimed_task_execution_started` |
+| `task-claim-cancel` | cancel, grouped-cancel: task, task-group | 8 | task claimed by the exited worker until the next worker recovers it | while `mark_claimed_task_execution_started` is in flight; the claim waits for its pending execution-entry settlement |
 | `task-crash-terminalize` | crash: task, task-group | 6 | task running forever under a completed session | between session completion and `terminalize_task` |
 | `group-crash-conflict` | crash: task-group | 50 | task running forever: the next worker's continuation raises `TaskGroupConflict: Prior group execution is still unsettled` | a crash anywhere in the member's run |
 | `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled | a crash after the member completed, before `_settle_task_group_execution` |

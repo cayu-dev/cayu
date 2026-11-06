@@ -71,3 +71,72 @@ def test_parallel_grouped_cancellation_preserves_sibling_system_exit():
         assert [leaf.code for leaf in process_exits] == [7], repr(failure)
 
     asyncio.run(scenario())
+
+
+def test_parallel_caller_cancellation_preserves_sibling_system_exit():
+    async def scenario():
+        started = asyncio.Event()
+        owner = asyncio.current_task()
+        assert owner is not None
+
+        class BlockingTool(Tool):
+            spec = ToolSpec(name="block", effect=ToolEffect.NONE)
+
+            async def run(self, ctx, args):
+                started.set()
+                await asyncio.Event().wait()
+
+        class ExitingTool(Tool):
+            spec = ToolSpec(name="exit", effect=ToolEffect.NONE)
+
+            async def run(self, ctx, args):
+                await started.wait()
+                # The caller cancels the round; this sibling's cleanup then asks
+                # the process to stop. Caller cancellation must not sanitize it.
+                owner.cancel()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    raise BaseExceptionGroup("process stopping", [SystemExit(7)]) from None
+
+        app = CayuApp(enable_logging=False)
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="blocked", name="block", arguments={}),
+                        ModelStreamEvent.tool_call(id="exiting", name="exit", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[BlockingTool(), ExitingTool()],
+        )
+        failure = None
+        try:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="parallel-cancelled-process-control",
+                    messages=[Message.text("user", "run both")],
+                )
+            ):
+                pass
+        except BaseException as exc:
+            failure = exc
+        while owner.cancelling():
+            owner.uncancel()
+        assert failure is not None
+        process_exits = [
+            leaf for leaf in iter_exception_tree(failure) if isinstance(leaf, SystemExit)
+        ]
+        assert [leaf.code for leaf in process_exits] == [7], repr(failure)
+
+    async def outer():
+        await asyncio.create_task(scenario())
+
+    asyncio.run(outer())

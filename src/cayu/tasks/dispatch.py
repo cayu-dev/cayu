@@ -1492,6 +1492,15 @@ class TaskStoreDispatcher(Dispatcher):
                     raise RuntimeError("Admitted group execution still awaits exact release.")
             return False
 
+        async def verify_rejected_dispatch_return() -> bool:
+            # The rejection itself may be that the dispatch's authority is
+            # gone (session, incarnation or receipt replaced). No admission can
+            # exist under an authority that does not, which proves it here.
+            try:
+                return await verify_dispatch_return()
+            except _QueuedDispatchAuthorityRejected:
+                return True
+
         try:
             try:
 
@@ -1603,6 +1612,11 @@ class TaskStoreDispatcher(Dispatcher):
                 _QueuedDispatchAuthorityRejected,
                 TaskCompletionDecisionRequired,
             ) as exc:
+                # A permanent rejection still entered this execution: prove its
+                # non-admission and acknowledge it before relinquishing the claim.
+                await execution_settlement.verify_returned_execution(
+                    task, verify_rejected_dispatch_return, DispatchStatus.SUBMITTED
+                )
                 return await self._reject_claimed_dispatch(
                     durable_runtime,
                     task=task,

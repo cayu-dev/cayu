@@ -22,6 +22,7 @@ from cayu.execution_profiles import (
     execution_profile_runtime_component,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._admission_outcome import mark_invocation_command_not_committed
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime.invocation_release import InvocationReleaseEvidence
 from cayu.runtime.loop_policies import LoopPolicy
@@ -1335,10 +1336,11 @@ async def apply_invocation_lifecycle_command(
                     result_checkpoint_transform=record_create_result,
                     operation_initializer=initialize_operations,
                 )
-        except Exception:
+        except Exception as failure:
             replay = await _replay_invocation_lifecycle_command(store, copied)
             if replay is not None:
                 return replay
+            mark_invocation_command_not_committed(failure)
             raise
         return InvocationMutationResult(
             session=session,
@@ -1434,10 +1436,11 @@ async def apply_invocation_lifecycle_command(
                         temporary_service_admission=temporary_service,
                     ),
                 )
-        except Exception:
+        except Exception as failure:
             replay = await _replay_invocation_lifecycle_command(store, copied)
             if replay is not None:
                 return replay
+            mark_invocation_command_not_committed(failure)
             raise
         return InvocationMutationResult(
             session=session,
@@ -1517,10 +1520,11 @@ async def apply_invocation_lifecycle_command(
                         checkpoint_transform=rebind_checkpoint,
                         result_checkpoint_transform=record_rebind_result,
                     )
-        except Exception:
+        except Exception as failure:
             replay = await _replay_invocation_lifecycle_command(store, copied)
             if replay is not None:
                 return replay
+            mark_invocation_command_not_committed(failure)
             raise
         return InvocationMutationResult(
             session=session,
