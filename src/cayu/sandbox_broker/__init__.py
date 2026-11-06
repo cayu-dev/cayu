@@ -69,6 +69,7 @@ from cayu.sandbox_broker.coding import (
     BrokeredCodingBackendOptions,
     BrokeredSandboxCodingBinding,
     BrokeredSandboxCodingEnvironmentFactory,
+    BrokeredSandboxPool,
     BrokeredSandboxReuse,
 )
 from cayu.sandbox_broker.lease import SandboxLeaseKeeper
@@ -95,6 +96,7 @@ __all__ = [
     "BrokeredCodingBackendOptions",
     "BrokeredSandboxCodingBinding",
     "BrokeredSandboxCodingEnvironmentFactory",
+    "BrokeredSandboxPool",
     "BrokeredSandboxReuse",
     "BrokeredSandboxRunner",
     "BrokeredSandboxWorkspace",

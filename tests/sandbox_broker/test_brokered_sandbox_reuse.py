@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
 from tests.core.test_human_review import identity
 from tests.core.test_workspace_mutation_receipts import _SingleToolProvider
-from tests.sandbox_broker.fake_broker import FakeBroker
+from tests.sandbox_broker.fake_broker import API_URL, APPLICATION, FakeBroker
 from tests.sandbox_broker.test_brokered_sandbox import _project
 
 from cayu import AgentSpec, CayuApp, EventType, Message, ResumeRequest, RunRequest
@@ -26,17 +27,24 @@ from cayu.runtime.public_authority import PublicAuthorityAliasCodec, PublicAutho
 from cayu.sandbox_broker import (
     BrokeredCodingBackendOptions,
     BrokeredSandboxCodingEnvironmentFactory,
+    BrokeredSandboxPool,
     BrokeredSandboxReuse,
     BrokeredSandboxRunner,
+    SandboxBrokerClient,
+    SandboxBrokerSettings,
 )
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces import LocalWorkspace
 
 
-def _request(session_id: str = "coding", **options) -> EnvironmentFactoryRequest:
+def _request(
+    session_id: str = "coding", environment_name: str = "sandbox", **options
+) -> EnvironmentFactoryRequest:
     options.setdefault("agent_name", "coder")
-    return EnvironmentFactoryRequest(session_id=session_id, environment_name="sandbox", **options)
+    return EnvironmentFactoryRequest(
+        session_id=session_id, environment_name=environment_name, **options
+    )
 
 
 def _factory(
@@ -53,23 +61,28 @@ def _factory(
     return BrokeredSandboxCodingEnvironmentFactory(**options)
 
 
-async def _bind(result, session_id: str = "coding"):
+async def _bind(result, session_id: str = "coding", environment_name: str = "sandbox"):
     return await result.environment.binding.bind(
         result.environment.workspace,
         result.environment.runner,
         session_id=session_id,
         agent_name="coder",
-        environment_name="sandbox",
+        environment_name=environment_name,
     )
 
 
 async def _session(
-    factory, session_id: str, outcome: str = "completed", work=None, **request_options
+    factory,
+    session_id: str,
+    outcome: str = "completed",
+    work=None,
+    environment_name: str = "sandbox",
+    **request_options,
 ):
     """Create, bind, run ``work`` on the bound workspace, and finalize one session."""
 
-    result = await factory.create(_request(session_id, **request_options))
-    bound = await _bind(result, session_id)
+    result = await factory.create(_request(session_id, environment_name, **request_options))
+    bound = await _bind(result, session_id, environment_name)
     if work is not None:
         try:
             await work(bound)
@@ -457,7 +470,7 @@ def test_a_sandbox_being_taken_is_spared_by_unreachable_discard(tmp_path: Path) 
         assert not await factory.discard_unreachable_allocation(_request("one"), first.metadata)
         assert len(broker.live()) == 1
         sandbox, keeper = taken
-        factory._checking_out.discard(sandbox.id)
+        factory._pool._checking_out.discard(sandbox.id)
         await keeper.stop()
         await factory.broker.destroy(sandbox.id)
 
@@ -652,3 +665,135 @@ def test_kept_paths_too_many_for_one_command_are_all_copied(
     sync = asyncio.run(scenario()).metadata["sync_binding"]
     assert (sync["transferred_files"], sync["unchanged_files"]) == (2, 0)
     assert broker.live() == []
+
+
+def test_factories_sharing_a_pool_reuse_a_sandbox_across_environments_and_sources(
+    tmp_path: Path,
+) -> None:
+    source = _project(tmp_path)
+    moved = shutil.copytree(source, tmp_path / "slot-1-2")
+    (moved / "calc.py").write_bytes(b"def add(a, b):\n    return a + b\n")
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool()
+    read = {}
+
+    async def read_calc(bound) -> None:
+        read["calc"] = (await bound.workspace.read_bytes("calc.py")).content
+
+    async def scenario():
+        first_factory = _factory(broker, source, reuse_pool=pool)
+        next_factory = _factory(broker, moved, reuse_pool=pool)
+        first, _ = await _session(first_factory, "one", environment_name="slot-1-1")
+        second, bound = await _session(
+            next_factory, "two", environment_name="slot-1-2", work=read_calc
+        )
+        await next_factory.close_idle_resources()
+        return first, second, bound, read["calc"]
+
+    first, second, bound, calc = asyncio.run(scenario())
+    assert second.metadata["sandbox_reused"] is True
+    assert second.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    # The reset made /workspace the second factory's source, and sent only what differs.
+    assert calc == b"def add(a, b):\n    return a + b\n"
+    sync = bound.metadata["sync_binding"]
+    assert (sync["copy_in_scope"], sync["transferred_files"]) == ("changed", 1)
+    assert len(broker.sandboxes) == 1 and broker.live() == []
+
+
+def test_without_a_shared_pool_each_factory_keeps_sandboxes_for_its_own_environment(
+    tmp_path: Path,
+) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+
+    async def scenario():
+        first_factory = _factory(broker, source)
+        next_factory = _factory(broker, source)
+        first, _ = await _session(first_factory, "one", environment_name="slot-1-1")
+        other, _ = await _session(next_factory, "two", environment_name="slot-1-2")
+        elsewhere, _ = await _session(first_factory, "three", environment_name="slot-1-2")
+        again, _ = await _session(first_factory, "four", environment_name="slot-1-1")
+        for factory in (first_factory, next_factory):
+            await factory.close_idle_resources()
+        return first, other, elsewhere, again
+
+    first, other, elsewhere, again = asyncio.run(scenario())
+    assert other.metadata["sandbox_reused"] is False
+    assert elsewhere.metadata["sandbox_reused"] is False
+    assert again.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+    assert broker.live() == []
+
+
+def test_a_shared_pool_never_hands_a_sandbox_to_a_factory_built_differently(
+    tmp_path: Path,
+) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool()
+
+    async def scenario():
+        plain = _factory(broker, source, reuse_pool=pool)
+        installing = _factory(
+            broker, source, reuse_pool=pool, setup_commands=("echo setup >> /tmp/setup-runs",)
+        )
+        first, _ = await _session(plain, "one", environment_name="slot-1-1")
+        other, _ = await _session(installing, "two", environment_name="slot-1-2")
+        await plain.close_idle_resources()
+        return first, other
+
+    first, other = asyncio.run(scenario())
+    assert other.metadata["sandbox_reused"] is False
+    assert other.metadata["sandbox_id"] != first.metadata["sandbox_id"]
+    assert broker.live() == []
+
+
+def test_a_sandbox_another_factory_of_the_pool_holds_is_spared_by_unreachable_discard(
+    tmp_path: Path,
+) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool()
+
+    async def scenario():
+        first_factory = _factory(broker, source, reuse_pool=pool)
+        next_factory = _factory(broker, source, reuse_pool=pool)
+        first, _ = await _session(first_factory, "one", environment_name="slot-1-1")
+        held = await next_factory.create(_request("two"))
+        assert held.metadata["sandbox_id"] == first.metadata["sandbox_id"]
+        spared = await first_factory.discard_unreachable_allocation(_request("one"), first.metadata)
+        await held.release(EnvironmentFactoryReleaseAction.DISCARD)
+        return spared
+
+    assert asyncio.run(scenario()) is False
+    assert broker.live() == []
+
+
+def test_a_shared_pool_needs_reuse_and_is_kept_by_a_rebuilt_factory(tmp_path: Path) -> None:
+    source = _project(tmp_path)
+    broker = FakeBroker(tmp_path / "cloud")
+    pool = BrokeredSandboxPool()
+    with pytest.raises(ValueError, match="reuse_pool needs reuse"):
+        _factory(broker, source, reuse=None, reuse_pool=pool)
+    with pytest.raises(TypeError, match="reuse_pool"):
+        _factory(broker, source, reuse_pool=object())
+    shared = _factory(broker, source, reuse_pool=pool)
+    rebuilt = shared.with_source_workspace(LocalWorkspace(source, workspace_id="project"))
+    assert rebuilt is not None and rebuilt.reuse_pool is pool
+    own = _factory(broker, source)
+    assert own.reuse_pool is None
+    # A kept lease renews with the credential it was allocated with.
+    rotated = BrokeredSandboxCodingEnvironmentFactory(
+        broker=SandboxBrokerClient(
+            SandboxBrokerSettings(api_url=API_URL, application_id=APPLICATION, token="rotated")
+        ),
+        source_workspace=LocalWorkspace(source, workspace_id="project"),
+        egress="none",
+        sandbox_excluded_directory_names=("node_modules",),
+        reuse=BrokeredSandboxReuse(),
+        reuse_pool=pool,
+    )
+    assert rotated._sandbox_fingerprint != shared._sandbox_fingerprint
+    assert (
+        shared.execution_profile_identity.implementation_version
+        != own.execution_profile_identity.implementation_version
+    )

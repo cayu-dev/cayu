@@ -899,7 +899,23 @@ that is no longer `ready` is replaced, and with a toolchain profile a reused
 sandbox is admitted again. `release_idle_resources()` destroys the waiting
 sandboxes, and `close_idle_resources()` (which
 `CayuApp.close_idle_environment_resources` calls at shutdown) also stops keeping
-new ones. `BrokeredCodingBackendOptions` takes `reuse` too. On its own,
+new ones. `BrokeredCodingBackendOptions` takes `reuse` too.
+
+Each factory keeps its own waiting sandboxes, for its own environments. To
+share them, give several factories one `reuse_pool=BrokeredSandboxPool()`
+(with `reuse` set): a sandbox one of them kept then serves the next session of
+the same Agent and execution requirements on any of them whose sandboxes are
+built alike, meaning the same broker and broker credential, image, egress, git repositories, lease,
+`setup_commands` and toolchain profile, whatever its environment name or
+source workspace. That suits an Agent that registers a new environment over a
+new source directory for each session of one workspace slot, since a
+factory's own pool never matches a new environment. The reset still makes
+`/workspace` the new session's source, `max_idle` counts across the pool, a
+kept sandbox keeps the labels it was allocated with, and
+`release_idle_resources()` on any of the factories destroys every sandbox
+waiting in the pool. `with_source_workspace` keeps the factory's shared pool.
+
+On its own,
 `BrokeredSandboxRunner.detach()` closes a runner without destroying its sandbox
 and returns the lease keeper, for a new runner over the same sandbox, and
 `BrokeredSandboxCodingBinding(release_sandbox=...)` takes the runner in place of

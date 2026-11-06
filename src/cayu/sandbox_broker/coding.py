@@ -134,6 +134,7 @@ __all__ = [
     "BrokeredCodingBackendOptions",
     "BrokeredSandboxCodingBinding",
     "BrokeredSandboxCodingEnvironmentFactory",
+    "BrokeredSandboxPool",
     "BrokeredSandboxReuse",
     "brokered_coding_backend",
 ]
@@ -276,14 +277,42 @@ class BrokeredSandboxReuse:
 
 @dataclass(eq=False)
 class _IdleSandbox:
-    """A sandbox waiting for the factory's next session, its lease still renewed."""
+    """A sandbox waiting for the pool's next session, its lease still renewed."""
 
     sandbox: SandboxRecord
     keeper: SandboxLeaseKeeper
     loop: asyncio.AbstractEventLoop
-    # The Agent, environment and execution requirements of the sessions it may serve.
+    # The Agent, environment (or, in a shared pool, the sandbox configuration) and
+    # execution requirements of the sessions it may serve.
     key: tuple[str, str, str]
+    broker: SandboxBrokerClient
     expiry: asyncio.Task[None] | None = None
+
+
+class BrokeredSandboxPool:
+    """Sandboxes kept for reuse, shared by every factory given the same pool.
+
+    By default each ``BrokeredSandboxCodingEnvironmentFactory`` with ``reuse``
+    keeps its own pool, and a kept sandbox serves only the next session of the
+    same Agent and environment. Factories given one pool as ``reuse_pool`` hand
+    sandboxes to each other instead: a sandbox one of them kept serves the next
+    session of the same Agent and execution requirements on any of them whose
+    sandboxes are built alike (the same broker and credential, image, egress, git repositories,
+    lease, ``setup_commands`` and toolchain profile), whatever its environment
+    or source. That suits an Agent that registers a new environment over a new
+    source directory for each session of one workspace slot. The pool counts
+    ``max_idle`` across all of them, and a kept sandbox keeps the labels it was
+    allocated with.
+    """
+
+    def __init__(self) -> None:
+        self._idle: list[_IdleSandbox] = []
+        # Sandboxes sessions hold now, by ID, while their runner lives.
+        self._in_use: weakref.WeakValueDictionary[str, BrokeredSandboxRunner] = (
+            weakref.WeakValueDictionary()
+        )
+        # Idle sandboxes a create took and is still preparing for its session.
+        self._checking_out: set[str] = set()
 
 
 class BrokeredSandboxCodingBinding(SyncBinding):
@@ -575,6 +604,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     finalization still destroys the sandbox, and ``release_idle_resources``
     (or ``close_idle_resources`` at shutdown) destroys the waiting ones. With
     a ``toolchain_profile`` a reused sandbox is admitted again before use.
+    Factories given one ``reuse_pool`` (a ``BrokeredSandboxPool``) share the
+    waiting sandboxes across environments and sources (see the pool); without
+    one, each factory keeps its own.
 
     With ``queue_seconds`` (default 0, up to ``MAX_QUEUE_SECONDS``) a create
     over one of Cloud's limits waits in Cloud's queue for up to that long
@@ -670,11 +702,17 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         workspace_repository: str | None = None,
         reuse: BrokeredSandboxReuse | None = None,
+        reuse_pool: BrokeredSandboxPool | None = None,
     ) -> None:
         if not isinstance(broker, SandboxBrokerClient):
             raise TypeError("broker must be a SandboxBrokerClient.")
         if reuse is not None and type(reuse) is not BrokeredSandboxReuse:
             raise TypeError("reuse must be a BrokeredSandboxReuse or None.")
+        if reuse_pool is not None:
+            if not isinstance(reuse_pool, BrokeredSandboxPool):
+                raise TypeError("reuse_pool must be a BrokeredSandboxPool or None.")
+            if reuse is None:
+                raise ValueError("reuse_pool needs reuse, which says how sandboxes are kept.")
         # The concrete environment's validation, once, before any allocation.
         knowledge = Environment(
             EnvironmentSpec(name="coding"),
@@ -768,13 +806,9 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.archive_compression: ArchiveCompressionMode = owned_archive_compression
         #: Whether and how sandboxes outlive their sessions; ``None`` destroys each.
         self.reuse = reuse
-        self._idle: list[_IdleSandbox] = []
-        # Sandboxes sessions hold now, by ID, while their runner lives.
-        self._in_use: weakref.WeakValueDictionary[str, BrokeredSandboxRunner] = (
-            weakref.WeakValueDictionary()
-        )
-        # Idle sandboxes a create took and is still preparing for its session.
-        self._checking_out: set[str] = set()
+        #: The pool shared with other factories, or ``None`` when this factory keeps its own.
+        self.reuse_pool = reuse_pool
+        self._pool = BrokeredSandboxPool() if reuse_pool is None else reuse_pool
         self._reuse_closed = False
         owned_sandbox_exclusions = tuple(sandbox_excluded_directory_names)
         names = {
@@ -798,6 +832,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             behavior_version="1",
             implementation_version=_configuration_fingerprint(self),
         )
+        self._sandbox_fingerprint = _sandbox_fingerprint(self)
         # Everything but the source, for with_source_workspace: the values this
         # factory owns, so a caller changing what it passed changes neither.
         self._source_independent_arguments: dict[str, Any] = {
@@ -828,6 +863,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             "knowledge_store": self._knowledge_store,
             "knowledge_access_scope": self._knowledge_access_scope,
             "reuse": self.reuse,
+            # A rebuilt factory shares a pool it was given, and keeps its own otherwise.
+            "reuse_pool": self.reuse_pool,
         }
 
     @property
@@ -1015,7 +1052,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         reused = None
         reuse_key = self._reuse_key(request)
         if reuse_key is not None:
-            with environment_phase_step("sandbox_reuse", when=bool(self._idle)):
+            with environment_phase_step("sandbox_reuse", when=bool(self._pool._idle)):
                 reused = await self._take_idle(reuse_key)
         if reused is None:
             with environment_phase_step("sandbox_allocation"):
@@ -1069,13 +1106,13 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 knowledge_access_scope=self._knowledge_access_scope,
             )
         except BaseException as original:
-            self._checking_out.discard(sandbox.id)
+            self._pool._checking_out.discard(sandbox.id)
             await self._discard(sandbox, keeper, runner, original)
             raise
         owned_runner = runner
         if self.reuse is not None:
-            self._in_use[sandbox.id] = owned_runner
-            self._checking_out.discard(sandbox.id)
+            self._pool._in_use[sandbox.id] = owned_runner
+            self._pool._checking_out.discard(sandbox.id)
 
         async def release(action: EnvironmentFactoryReleaseAction) -> None:
             # A brokered sandbox cannot be reattached, so every release destroys it,
@@ -1120,12 +1157,14 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         if type(sandbox_id) is not str or not sandbox_id.strip():
             return False
         if self.reuse is not None:
-            holder = self._in_use.get(sandbox_id)
-            if sandbox_id in self._checking_out or (holder is not None and not holder.is_closed):
+            holder = self._pool._in_use.get(sandbox_id)
+            if sandbox_id in self._pool._checking_out or (
+                holder is not None and not holder.is_closed
+            ):
                 # A reused sandbox another session of this process holds or is taking.
                 return False
-            for entry in [entry for entry in self._idle if entry.sandbox.id == sandbox_id]:
-                self._idle.remove(entry)
+            for entry in [entry for entry in self._pool._idle if entry.sandbox.id == sandbox_id]:
+                self._pool._idle.remove(entry)
                 self._cancel_expiry(entry)
                 await entry.keeper.stop()
         with contextlib.suppress(SandboxNotFoundError):
@@ -1133,13 +1172,16 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         return True
 
     async def release_idle_resources(self) -> None:
-        """Destroy the sandboxes waiting for reuse; later sessions may keep sandboxes again."""
+        """Destroy the sandboxes waiting for reuse; later sessions may keep sandboxes again.
+
+        With a shared ``reuse_pool`` that is every sandbox waiting in the pool.
+        """
 
         loop = asyncio.get_running_loop()
-        for entry in [entry for entry in self._idle if entry.loop is loop]:
+        for entry in [entry for entry in self._pool._idle if entry.loop is loop]:
             # Another create or the idle timer may have taken it meanwhile.
-            if entry in self._idle:
-                self._idle.remove(entry)
+            if entry in self._pool._idle:
+                self._pool._idle.remove(entry)
                 await self._destroy_idle(entry)
 
     async def close_idle_resources(self) -> None:
@@ -1159,7 +1201,10 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         ):
             return None
         fingerprint = sha256(requirements.model_dump_json().encode()).hexdigest()
-        return request.agent_name, request.environment_name, fingerprint
+        if self.reuse_pool is None:
+            return request.agent_name, request.environment_name, fingerprint
+        # A shared pool serves any of its factories whose sandboxes are built alike.
+        return request.agent_name, self._sandbox_fingerprint, fingerprint
 
     async def _take_idle(
         self, key: tuple[str, str, str]
@@ -1174,27 +1219,28 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         while True:
             # The keeper renews on its own event loop, so only that loop's sandboxes qualify.
             entry = next(
-                (entry for entry in self._idle if entry.loop is loop and entry.key == key), None
+                (entry for entry in self._pool._idle if entry.loop is loop and entry.key == key),
+                None,
             )
             if entry is None:
                 return None
-            self._idle.remove(entry)
+            self._pool._idle.remove(entry)
             self._cancel_expiry(entry)
             if not self._reusable(entry.sandbox, entry.keeper):
                 await self._destroy_idle(entry)
                 continue
-            self._checking_out.add(entry.sandbox.id)
+            self._pool._checking_out.add(entry.sandbox.id)
             try:
                 record = await self.broker.get(entry.sandbox.id)
             except SandboxBrokerError:
                 record = None
             except BaseException:
                 # Cancelled while asking: the sandbox waits on.
-                self._checking_out.discard(entry.sandbox.id)
+                self._pool._checking_out.discard(entry.sandbox.id)
                 self._park(entry)
                 raise
             if record is None or record.status != "ready":
-                self._checking_out.discard(entry.sandbox.id)
+                self._pool._checking_out.discard(entry.sandbox.id)
                 await self._destroy_idle(entry)
                 continue
             return record, entry.keeper
@@ -1204,8 +1250,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     ) -> None:
         """Keep a finalized session's sandbox for the next session like it, or destroy it."""
 
-        if self._in_use.get(runner.sandbox_id) is runner:
-            del self._in_use[runner.sandbox_id]
+        if self._pool._in_use.get(runner.sandbox_id) is runner:
+            del self._pool._in_use[runner.sandbox_id]
         reuse = self.reuse
         keeper = runner.lease_keeper
         loop = asyncio.get_running_loop()
@@ -1214,7 +1260,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             or self._reuse_closed
             or keeper is None
             or not self._reusable(runner.sandbox, keeper)
-            or sum(entry.loop is loop for entry in self._idle) >= reuse.max_idle
+            or sum(entry.loop is loop for entry in self._pool._idle) >= reuse.max_idle
         ):
             await runner.close()
             return
@@ -1223,7 +1269,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         except RuntimeError:
             await runner.close()
             return
-        self._park(_IdleSandbox(runner.sandbox, keeper, loop, key))
+        self._park(_IdleSandbox(runner.sandbox, keeper, loop, key, self.broker))
 
     def _park(self, entry: _IdleSandbox) -> None:
         reuse = self.reuse
@@ -1232,12 +1278,12 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
             self._expire_idle(entry, reuse.idle_seconds),
             name=f"sandbox-idle:{entry.sandbox.id}",
         )
-        self._idle.append(entry)
+        self._pool._idle.append(entry)
 
     async def _expire_idle(self, entry: _IdleSandbox, idle_seconds: int) -> None:
         await asyncio.sleep(idle_seconds)
-        if entry in self._idle:
-            self._idle.remove(entry)
+        if entry in self._pool._idle:
+            self._pool._idle.remove(entry)
             entry.expiry = None
             await self._destroy_idle(entry)
 
@@ -1252,7 +1298,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         try:
             await entry.keeper.stop()
             with contextlib.suppress(SandboxNotFoundError):
-                await self.broker.destroy(entry.sandbox.id)
+                # The broker that allocated it, which in a shared pool may be another factory's.
+                await entry.broker.destroy(entry.sandbox.id)
         except Exception as error:
             # Renewal has stopped, so the broker destroys it when its lease lapses.
             _LOGGER.warning(
@@ -1641,11 +1688,47 @@ def _configuration_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory)
             "idle_seconds": factory.reuse.idle_seconds,
             "min_lifetime_seconds": factory.reuse.min_lifetime_seconds,
         }
+        if factory.reuse_pool is not None:
+            # In a shared pool, one may also come from another environment's session.
+            material["reuse"]["shared_pool"] = True
     return (
         "sha256:"
         + sha256(
             canonical_durable_json_bytes(material, "brokered_sandbox_coding_configuration")
         ).hexdigest()
+    )
+
+
+def _sandbox_fingerprint(factory: BrokeredSandboxCodingEnvironmentFactory) -> str:
+    """What makes a kept sandbox fit another factory's session in a shared pool.
+
+    The broker it lives in and the credential its lease is renewed with, how it
+    was allocated and set up, and how its lease is kept; not the source, the
+    copy-in or what runs in ``/workspace``, which every session resets.
+    """
+
+    material = {
+        "schema": "cayu.brokered_sandbox_reuse_fit.v1",
+        "api_url": factory.broker.settings.api_url,
+        "application_id": factory.broker.settings.application_id,
+        # The kept lease keeper renews with the credential it was allocated with.
+        "token_sha256": sha256(factory.broker.settings.token.encode()).hexdigest(),
+        "image": factory.image,
+        "egress": factory.egress,
+        "egress_hosts": None if factory.egress_hosts is None else list(factory.egress_hosts),
+        "git_repositories": (
+            None if factory.git_repositories is None else list(factory.git_repositories)
+        ),
+        "lease_seconds": factory.lease_seconds,
+        "renew_every_s": factory.renew_every_s,
+        "setup_commands_sha256": setup_commands_sha256(factory.setup_commands),
+        "toolchain_profile_fingerprint": (
+            None if factory.toolchain_profile is None else factory.toolchain_profile.fingerprint
+        ),
+    }
+    return (
+        "sha256:"
+        + sha256(canonical_durable_json_bytes(material, "brokered_sandbox_reuse_fit")).hexdigest()
     )
 
 
