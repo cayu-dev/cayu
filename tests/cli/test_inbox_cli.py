@@ -752,7 +752,11 @@ def test_items_an_older_cloud_left_out_as_earlier_are_read_by_id_and_listed(
     # The filters go to Cloud, and are applied here too for a Cloud that ignores them.
     assert main(["inbox", "list", "--application", "bugs", "--session", "s2", "--json"]) == 0
     assert [item["id"] for item in _json(capsys)["items"]] == ["inbox_e2"]
-    assert ("GET", "/v1/applications/bugs/inbox", {"query": {"session_id": "s2"}}) in (cloud.calls)
+    assert (
+        "GET",
+        "/v1/applications/bugs/inbox",
+        {"query": {"session_id": "s2", "limit": 50}},
+    ) in cloud.calls
 
     # One that can't be read makes the listing incomplete and says so.
     cloud.routes[("GET", "/inbox_e2")] = unreadable
@@ -928,3 +932,196 @@ def test_session_show_names_no_item_for_a_session_id_output_would_redact(tmp_pat
     reader = StoreSessionReader.__new__(StoreSessionReader)
     secret = "sk-ant-api03-" + "A" * 40
     assert _run(reader._inbox_items(f"session-{secret}")) is None
+
+
+class _PagedCloud(_Cloud):
+    """A Cayu Cloud that pages an Agent's inbox: one page per request, and its counts."""
+
+    def __init__(self, items, *, counts=True):
+        super().__init__({})
+        self.items = items
+        self.counted = counts
+
+    def request(self, method, path, **options):
+        self.calls.append((method, path, options))
+        query = options.get("query") or {}
+        if path.endswith("/inbox/counts"):
+            if not self.counted:
+                raise CloudApiError("api_request_rejected", "HTTP 404.", status_code=404)
+            counts = dict.fromkeys(("approval", "question", "recovery", "knowledge"), 0)
+            for item in self.items:
+                counts[item["kind"]] += 1
+            return {"counts": counts, "total_count": len(self.items), "complete": True}
+        wanted = [item for item in self.items if query.get("kind") in (None, item["kind"])]
+        start = int(query.get("cursor", 0))
+        end = start + int(query["limit"])
+        more = end < len(wanted)
+        return {
+            "items": wanted[start:end],
+            "agents": [{"state": "read", "issues": [], "earlier_release_items": []}],
+            "complete": not more,
+            "next_cursor": str(end) if more else None,
+            "has_more": more,
+        }
+
+
+def _waiting() -> list[dict]:
+    """Seven items in the Agent's own order, which isn't oldest first."""
+
+    kinds = ["approval", "recovery", "recovery", "approval", "recovery", "knowledge", "knowledge"]
+    return [
+        {
+            **_PENDING,
+            "id": f"inbox_{index}",
+            "kind": kind,
+            "session_id": f"s{index}",
+            "created_at": f"2026-11-0{7 - index}T10:00:00Z",
+            "asked_before_release": index == 2,
+        }
+        for index, kind in enumerate(kinds)
+    ]
+
+
+def test_a_large_cloud_inbox_is_listed_whole_page_by_page(monkeypatch, capsys) -> None:
+    import cayu.cli._inbox_client as inbox_client
+
+    monkeypatch.setattr(inbox_client, "_CLOUD_PAGE_LIMIT", 2)
+    items = _waiting()
+    cloud = _PagedCloud(items)
+    _cloud_cli(monkeypatch, {})
+    monkeypatch.setattr("cayu.cli.cloud.cloud_client", lambda **_kwargs: cloud)
+
+    assert main(["inbox", "list", "--application", "bugs", "--json"]) == 0
+    listing = _json(capsys)
+    # Every item, oldest first, from four pages, each one request to Cloud.
+    assert [item["id"] for item in listing["items"]] == [f"inbox_{n}" for n in range(6, -1, -1)]
+    assert (listing["complete"], listing["next_cursor"]) == (True, None)
+    assert [call[2]["query"].get("cursor") for call in cloud.calls] == [None, "2", "4", "6"]
+    # Counted from the whole listing, without another request.
+    assert listing["counts"] == {"approval": 2, "question": 0, "recovery": 3, "knowledge": 2}
+    assert not any(path.endswith("/counts") for _method, path, _options in cloud.calls)
+
+    # Each kind is listed whole the same way.
+    cloud.calls.clear()
+    assert main(["inbox", "list", "--application", "bugs", "--kind", "recovery", "--json"]) == 0
+    recovery = _json(capsys)
+    assert [item["id"] for item in recovery["items"]] == ["inbox_4", "inbox_2", "inbox_1"]
+    assert recovery["complete"] is True and recovery["counts"] == {"recovery": 3}
+    assert {call[2]["query"]["kind"] for call in cloud.calls} == {"recovery"}
+    assert len(cloud.calls) == 2
+
+    # The table keeps the items asked before the Release in their own section.
+    assert main(["inbox", "list", "--application", "bugs"]) == 0
+    out = capsys.readouterr().out
+    current, earlier = out.split("Asked before the Agent's current Release (1).")
+    assert "inbox_2" in earlier and "inbox_2" not in current
+    assert "Waiting: approval 2, question 0, recovery 3, knowledge 2." in out
+
+
+def test_a_cloud_inbox_is_paged_with_a_limit_and_cursor_in_a_stable_order(
+    monkeypatch, capsys
+) -> None:
+    items = _waiting()
+    cloud = _PagedCloud(items)
+    _cloud_cli(monkeypatch, {})
+    monkeypatch.setattr("cayu.cli.cloud.cloud_client", lambda **_kwargs: cloud)
+
+    pages: list[list[str]] = []
+    cursor = None
+    for _ in range(10):
+        command = ["inbox", "list", "--application", "bugs", "--limit", "3", "--json"]
+        assert main(command + (["--cursor", cursor] if cursor else [])) == 0
+        page = _json(capsys)
+        pages.append([item["id"] for item in page["items"]])
+        # A page can't count what waits, so the inbox counts it.
+        assert page["counts"] == {"approval": 2, "question": 0, "recovery": 3, "knowledge": 2}
+        cursor = page["next_cursor"]
+        assert page["complete"] is (cursor is None)
+        if cursor is None:
+            break
+    # Pages in the Agent's own order, each item once.
+    assert pages == [
+        ["inbox_0", "inbox_1", "inbox_2"],
+        ["inbox_3", "inbox_4", "inbox_5"],
+        ["inbox_6"],
+    ]
+
+    # A kind pages the same way, the filter going to Cloud with each page.
+    assert (
+        main(["inbox", "list", "--application", "bugs", "--kind", "recovery", "--limit", "2"]) == 0
+    )
+    captured = capsys.readouterr()
+    assert "inbox_1" in captured.out and "inbox_4" not in captured.out
+    assert "more items follow; list them with --cursor 2" in captured.err
+
+    # A Cloud that can't count says so, and the page is listed anyway.
+    cloud.counted = False
+    assert main(["inbox", "list", "--application", "bugs", "--limit", "3", "--json"]) == 0
+    page = _json(capsys)
+    assert (page["counts"], page["counts_unavailable_reason"]) == (None, "not_served")
+    assert len(page["items"]) == 3
+
+
+def test_an_older_cloud_without_paging_still_lists_its_bounded_read(monkeypatch, capsys) -> None:
+    # It reads `counts` as an item id, which isn't one.
+    not_an_item = CloudApiError("api_request_rejected", "HTTP 422.", status_code=422)
+    _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", ""): {"items": [_PENDING], "agents": [{"state": "read"}], "complete": False},
+            ("GET", "/counts"): not_an_item,
+        },
+    )
+    assert main(["inbox", "list", "--application", "bugs", "--json"]) == 0
+    listing = _json(capsys)
+    assert [item["id"] for item in listing["items"]] == ["inbox_a"]
+    assert (listing["complete"], listing["next_cursor"], listing["counts"]) == (False, None, None)
+    # Asked for a page, it says the answer is that bounded read.
+    assert main(["inbox", "list", "--application", "bugs", "--limit", "5", "--json"]) == 0
+    page = _json(capsys)
+    assert [item["id"] for item in page["items"]] == ["inbox_a"]
+    assert "doesn't page an Agent's inbox yet" in page["notes"][-1]
+
+
+def test_the_local_inbox_pages_every_kind_and_counts_it(tmp_path) -> None:
+    from tests.server.test_inbox_paging import APPROVALS, PROPOSALS, RECOVERIES, large_inbox
+
+    from cayu.cli._inbox_client import LocalInbox
+
+    app = large_inbox(tmp_path)
+
+    async def scenario() -> None:
+        inbox = LocalInbox(app, reviewer="local:me")
+        try:
+            whole = await inbox.list_items(kind=None, session_id=None, agent_name=None)
+            assert whole.complete and whole.next_cursor is None
+            assert len(whole.items) == APPROVALS + RECOVERIES + PROPOSALS
+            created = [str(item["created_at"]) for item in whole.items]
+            assert created == sorted(created)
+            for kind in (None, "approval", "recovery", "knowledge"):
+                paged: list[str] = []
+                cursor = None
+                while True:
+                    page = await inbox.list_items(
+                        kind=kind, session_id=None, agent_name=None, limit=4, cursor=cursor
+                    )
+                    assert len(page.items) <= 4
+                    paged.extend(item["id"] for item in page.items)
+                    cursor = page.next_cursor
+                    if cursor is None:
+                        assert page.complete
+                        break
+                expected = {item["id"] for item in whole.items if kind in (None, item["kind"])}
+                assert len(paged) == len(set(paged)) and set(paged) == expected
+            counts = await inbox.counts(session_id=None, agent_name=None)
+            assert counts.counts == {
+                "approval": APPROVALS,
+                "question": 0,
+                "recovery": RECOVERIES,
+                "knowledge": PROPOSALS,
+            }
+        finally:
+            await inbox.aclose()
+            await app.aclose()
+
+    asyncio.run(scenario())

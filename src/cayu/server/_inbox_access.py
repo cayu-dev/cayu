@@ -118,6 +118,16 @@ class InboxAccessGate:
             sessions[session_id] = await self._session_store.load(session_id)
         return sessions[session_id]
 
+    async def _load_sessions(
+        self, session_ids: list[str], sessions: dict[str, Session | None]
+    ) -> None:
+        """Read every session of one page not read yet in one store read, gone ones as None."""
+
+        missing = list(dict.fromkeys(sid for sid in session_ids if sid not in sessions))
+        if missing:
+            loaded = await self._session_store.load_sessions(missing)
+            sessions.update({sid: loaded.get(sid) for sid in missing})
+
     async def pending_scope(
         self, action: PendingActionRecord, sessions: dict[str, Session | None]
     ) -> InboxItemScope | None:
@@ -317,6 +327,8 @@ class InboxAccessGate:
             page = await self._session_store.query_pending_actions(
                 query.model_copy(update={"cursor": cursor})
             )
+            # One read for the page's sessions, not one per action.
+            await self._load_sessions([action.session.id for action in page.actions], sessions)
             for action in page.actions:
                 if (
                     len(permitted) >= query.limit

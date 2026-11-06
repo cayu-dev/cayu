@@ -383,6 +383,20 @@ class Event(BaseModel):
             {id(self.payload): payload, id(stamp): _durable_payload_stamp(payload)}
         )
 
+    def _copy_without_payload(self) -> Event:
+        """A detached copy with an empty payload, made without reading the payload.
+
+        Every other field and private attribute is copied as ``model_copy(deep=True)``
+        copies it; the payload and its validation stamp are replaced, not copied.
+        """
+
+        payload: dict[str, Any] = {}
+        memo: dict[int, Any] = {id(self.payload): payload}
+        stamp = self._payload_validation_stamp
+        if stamp is not None:
+            memo[id(stamp)] = _durable_payload_stamp(payload)
+        return super().__deepcopy__(memo)
+
     def __eq__(self, other: object) -> bool:
         """Compare only public durable fields, never private projection metadata."""
 

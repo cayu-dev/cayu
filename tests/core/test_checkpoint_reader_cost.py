@@ -186,3 +186,104 @@ def test_index_state_preserves_independent_approval_lookup(change):
         assert ids == (
             frozenset() if change == "invalid_retained" else frozenset({approval.approval_id})
         )
+
+
+@pytest.mark.parametrize("size", [0, 1000])
+def test_classifying_a_pending_source_admits_its_checkpoint_once(monkeypatch, size):
+    """A pending-action read classifies every candidate; the checkpoint is copied once for it."""
+
+    from datetime import UTC, datetime
+
+    from cayu.sessions.pending_actions import pending_action_source_is_invalid
+    from cayu.sessions.records import PendingActionSession, SessionStatus
+
+    pending = PendingToolRound(
+        model_step_id="mstep_" + "1" * 32,
+        model_attempt_id="matt_" + "2" * 32,
+        tool_round_id="tround_" + "3" * 32,
+        agent_name="worker",
+        tool_calls=[PendingToolCallApproval(tool_call_id="call-1", tool_name="echo")],
+    )
+    checkpoint = {
+        "pending_tool_round": pending.model_dump(mode="json"),
+        "retained": [{"text": "history"}] * size,
+    }
+    now = datetime.now(UTC)
+    session = PendingActionSession(
+        id="session-1",
+        agent_name="worker",
+        provider_name="fake",
+        model="fake-model",
+        causal_budget_id="session-1",
+        runtime_name="cayu",
+        status=SessionStatus.FAILED,
+        created_at=now,
+        updated_at=now,
+    )
+    visits = []
+    walk = validation._walk_bounded_durable_json
+
+    def count(value, field_name, **kwargs):
+        if field_name == "checkpoint":
+            visits.append(value)
+        return walk(value, field_name, **kwargs)
+
+    monkeypatch.setattr(validation, "_walk_bounded_durable_json", count)
+    # A round with no recorded start resumes on its own: a valid source without an action.
+    assert pending_action_source_is_invalid(session, checkpoint, None, []) is False
+    assert len(visits) == 1
+
+
+def test_a_pending_actions_source_reference_never_copies_the_payload(monkeypatch):
+    """Each listed action keeps its source event without the payload, which isn't copied."""
+
+    import cayu.events as events
+    from cayu.events import Event, EventType
+    from cayu.sessions.pending_actions import _pending_action_source_reference
+    from cayu.sessions.records import EventRecord
+
+    source = Event(
+        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        session_id="session-1",
+        agent_name="worker",
+        tool_name="write_file",
+        payload={"approval": {"arguments": {"content": "x" * 10_000}}, "tool_call_id": "call-1"},
+    )
+    record = EventRecord(sequence=7, event=source)
+    source = record.event
+    copied = []
+    copy_payload = events._copy_prevalidated_payload
+
+    def copy(payload, stamp):
+        if payload:
+            copied.append(payload)
+        return copy_payload(payload, stamp)
+
+    monkeypatch.setattr(events, "_copy_prevalidated_payload", copy)
+    # A generic deep copy of the event copies the payload's validation stamp node by node.
+    stamp_copy = events._PayloadIdentity.__deepcopy__
+
+    def copy_stamp(identity, memo):
+        copied.append(identity.value)
+        return stamp_copy(identity, memo)
+
+    monkeypatch.setattr(events._PayloadIdentity, "__deepcopy__", copy_stamp)
+    walk = validation._walk_bounded_durable_json
+
+    def count(value, field_name, **kwargs):
+        if field_name == "payload" and value:
+            copied.append(value)
+        return walk(value, field_name, **kwargs)
+
+    monkeypatch.setattr(validation, "_walk_bounded_durable_json", count)
+    reference = _pending_action_source_reference(record).event
+    assert copied == []
+    assert reference.payload == {} and source.payload["tool_call_id"] == "call-1"
+    assert (reference.id, reference.type, reference.timestamp, reference.tool_name) == (
+        source.id,
+        source.type,
+        source.timestamp,
+        source.tool_name,
+    )
+    reference.payload["changed"] = True
+    assert "changed" not in source.payload

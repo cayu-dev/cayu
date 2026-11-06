@@ -158,6 +158,16 @@ def pending_action_evidence_round_from_checkpoint(
 
     if checkpoint is None:
         return None
+    return _pending_action_evidence_round(*_pending_checkpoint_candidates(checkpoint))
+
+
+def _pending_checkpoint_candidates(
+    checkpoint: dict[str, Any],
+) -> tuple[
+    PendingToolApproval | None, PendingUserInput | None, pending_rounds.PendingToolRound | None
+]:
+    """The checkpoint's approval, question and tool round, parsed from one owned copy."""
+
     # All three readers share this one call-local snapshot. Public reader entry
     # points still validate and detach complete documents independently.
     from cayu.approvals.user_input import _user_input_lifecycle_authority_from_owned_checkpoint
@@ -168,7 +178,7 @@ def pending_action_evidence_round_from_checkpoint(
     pending_round = pending_round_reader._pending_tool_round_from_owned_checkpoint(
         checkpoint, owned
     )
-    return _pending_action_evidence_round(approval, pending_input, pending_round)
+    return approval, pending_input, pending_round
 
 
 def _pending_tool_action_kind(
@@ -771,10 +781,7 @@ def pending_action_event_projection_bytes(record: EventRecord) -> int | None:
 
 def _pending_action_source_reference(record: EventRecord) -> EventRecord:
     """Keep stable source identity without duplicating its arbitrary payload."""
-    return EventRecord(
-        sequence=record.sequence,
-        event=record.event.model_copy(update={"payload": {}}, deep=True),
-    )
+    return EventRecord(sequence=record.sequence, event=record.event._copy_without_payload())
 
 
 def _pending_action_source_linkage(
@@ -1711,11 +1718,12 @@ def pending_action_source_is_invalid(
         # A contradictory/missing child link is not evidence that an ordinary
         # manual tool replay is appropriate. Keep it diagnostically fail-closed.
         return True
+    assert checkpoint is not None
     try:
-        pending_approval = pending_approval_reader.pending_approval_from_checkpoint(checkpoint)
-        pending_input, _ = user_input_lifecycle_authority_from_checkpoint(checkpoint)
-        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
-        evidence_round = pending_action_evidence_round_from_checkpoint(checkpoint)
+        pending_approval, pending_input, pending_round = _pending_checkpoint_candidates(checkpoint)
+        evidence_round = _pending_action_evidence_round(
+            pending_approval, pending_input, pending_round
+        )
     except (TypeError, ValueError, ValidationError):
         return True
     if evidence_round is not None:

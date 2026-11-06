@@ -22,9 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from cayu.cli._inbox_client import (
+    _KINDS,
     CloudInbox,
     InboxClient,
     InboxClientError,
+    InboxCounts,
     LocalInbox,
 )
 from cayu.cli._output import add_output_options, output_destination
@@ -38,12 +40,14 @@ from cayu.cli.project import (
 )
 
 CLI_SCHEMA_VERSION = "1"
-_KINDS = ("approval", "question", "recovery", "knowledge")
 #: The purpose `ToolArgumentReview` accepts unless it is configured otherwise.
 _DEFAULT_PURPOSE = "approvals"
 _REASON_MAX_CHARS = 4096
 _CELL_MAX_CHARS = 60
 _DISMISSABLE = frozenset({"recovery", "approval", "question"})
+#: The Runtime's bound on one inbox page, and the page --cursor alone reads.
+_MAX_PAGE_LIMIT = 200
+_DEFAULT_PAGE_LIMIT = 50
 
 
 def add_inbox_parser(subparsers: Any) -> None:
@@ -67,15 +71,32 @@ def add_inbox_parser(subparsers: Any) -> None:
         "list",
         help="List what is waiting, oldest first.",
         description=(
-            "List what is waiting, oldest first. Use an item's id with `cayu inbox show`. "
-            "With --session it reads that session's pending actions directly. On a Cloud "
-            "Agent, items asked before the Agent's current Release are listed in their own "
-            "section (asked_before_release in --json): they can still be read and settled."
+            "List what is waiting, oldest first, reading the inbox page by page until every "
+            "item is listed. Use an item's id with `cayu inbox show`. With --limit it lists one "
+            "page in the inbox's own order (approvals, questions and recovery items, then "
+            "knowledge proposals) and prints where the next one starts; pass that to --cursor, "
+            "with the same filters, until there is none. It also says how many items of each "
+            "kind wait (counts in --json). With --session it reads that session's pending "
+            "actions directly. On a Cloud Agent, items asked before the Agent's current "
+            "Release are listed in their own section (asked_before_release in --json): they "
+            "can still be read and settled."
         ),
     )
     listing.add_argument("--kind", choices=_KINDS, help="Only items of this kind.")
     listing.add_argument("--agent", help="Only this agent's items (exact name).")
     listing.add_argument("--session", help="Only this session's items (public session id).")
+    listing.add_argument(
+        "--limit",
+        type=_page_limit,
+        help=f"List one page of at most this many items (1 to {_MAX_PAGE_LIMIT}).",
+    )
+    listing.add_argument(
+        "--cursor",
+        help=(
+            "Go on from a page: the next_cursor an earlier page printed. It lists one page "
+            f"(of --limit items, {_DEFAULT_PAGE_LIMIT} without it)."
+        ),
+    )
     _add_target_options(listing)
 
     show = commands.add_parser(
@@ -335,7 +356,28 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
 
 
 async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
-    listing = await inbox.list_items(kind=args.kind, session_id=args.session, agent_name=args.agent)
+    # A cursor goes on from a page, so it lists one page too.
+    limit = _DEFAULT_PAGE_LIMIT if args.limit is None and args.cursor is not None else args.limit
+    listing = await inbox.list_items(
+        kind=args.kind,
+        session_id=args.session,
+        agent_name=args.agent,
+        limit=limit,
+        cursor=args.cursor,
+    )
+    if limit is None:
+        # A whole listing counts what it listed: every kind, or the one --kind names.
+        counts = (
+            InboxCounts.of(listing.items, kinds=None if args.kind is None else (args.kind,))
+            if listing.complete
+            else InboxCounts(None, "listing_incomplete")
+        )
+    else:
+        # One page can't say how many wait; the inbox counts them without listing them.
+        try:
+            counts = await inbox.counts(session_id=args.session, agent_name=args.agent)
+        except InboxClientError as exc:
+            counts = InboxCounts(None, exc.code)
     if args.output_format == "json":
         _print_json(
             {
@@ -343,6 +385,9 @@ async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
                 "items": listing.items,
                 "complete": listing.complete,
                 "notes": listing.notes,
+                "next_cursor": listing.next_cursor,
+                "counts": counts.counts,
+                "counts_unavailable_reason": counts.unavailable_reason,
             }
         )
         return 0
@@ -360,9 +405,17 @@ async def _list(args: argparse.Namespace, inbox: InboxClient) -> int:
             "resume: show and settle them by id, or dismiss the ones that won't."
         )
         _print_items(earlier)
+    if counts.counts is not None:
+        waiting = ", ".join(f"{kind} {number}" for kind, number in counts.counts.items())
+        print(f"\nWaiting: {waiting}.")
     for note in listing.notes:
         print(f"note: {_plain(note)}", file=sys.stderr)
-    if not listing.complete:
+    if listing.next_cursor is not None:
+        print(
+            f"note: more items follow; list them with --cursor {_plain(listing.next_cursor)}",
+            file=sys.stderr,
+        )
+    elif not listing.complete:
         print("note: this listing may not hold every item.", file=sys.stderr)
     return 0
 
@@ -790,6 +843,16 @@ def _positive_seconds(value: str) -> float:
     if not 0 < seconds <= 3600:
         raise argparse.ArgumentTypeError("seconds must be more than 0 and at most 3600.")
     return seconds
+
+
+def _page_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
+    if not 1 <= limit <= _MAX_PAGE_LIMIT:
+        raise argparse.ArgumentTypeError(f"the limit must be 1 to {_MAX_PAGE_LIMIT}.")
+    return limit
 
 
 def _wait_seconds(value: str) -> float:

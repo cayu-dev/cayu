@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 #: The most items one listing reads, however many pages that takes; it lists the oldest.
 MAX_LISTED_ITEMS = 10_000
 _PAGE_LIMIT = 100
+#: The page a Cloud listing reads through Cloud at a time: one request to the Agent each.
+_CLOUD_PAGE_LIMIT = 50
+_KINDS = ("approval", "question", "recovery", "knowledge")
 #: How many items an older Cloud left out the CLI reads at once, by id.
 _LEFT_OUT_READS = 8
 #: How often the local client checks whether a continued session is still running.
@@ -63,12 +66,49 @@ class InboxClientError(RuntimeError):
 
 @dataclass(frozen=True)
 class InboxListing:
-    """The items waiting, oldest first, and whether the listing holds all of them."""
+    """The items waiting and whether the listing holds all of them.
+
+    A whole listing is oldest first. One page (``limit``) is in the inbox's own order, and
+    ``next_cursor`` is where the next page starts.
+    """
 
     items: list[dict[str, Any]]
     complete: bool
     #: Why the listing may be incomplete, in plain words.
     notes: list[str] = field(default_factory=list)
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class InboxCounts:
+    """How many items of each kind wait, or ``None`` with why the inbox couldn't say."""
+
+    counts: dict[str, int] | None
+    unavailable_reason: str | None = None
+
+    @classmethod
+    def read(cls, answer: dict[str, Any]) -> InboxCounts:
+        counts = answer.get("counts")
+        if (
+            answer.get("complete") is not True
+            or not isinstance(counts, dict)
+            or any(type(counts.get(kind, 0)) is not int for kind in _KINDS)
+        ):
+            reason = answer.get("unavailable_reason")
+            return cls(None, reason if isinstance(reason, str) else "unavailable")
+        return cls({kind: counts.get(kind, 0) for kind in _KINDS})
+
+    @classmethod
+    def of(
+        cls, items: list[dict[str, Any]], *, kinds: tuple[str, ...] | None = None
+    ) -> InboxCounts:
+        """Counted from a complete listing of ``kinds`` (every kind by default)."""
+
+        counts = dict.fromkeys(_KINDS if kinds is None else kinds, 0)
+        for item in items:
+            if item.get("kind") in counts:
+                counts[item["kind"]] += 1
+        return cls(counts)
 
 
 class InboxClient(Protocol):
@@ -78,8 +118,20 @@ class InboxClient(Protocol):
     purpose: str | None
 
     async def list_items(
-        self, *, kind: str | None, session_id: str | None, agent_name: str | None
-    ) -> InboxListing: ...
+        self,
+        *,
+        kind: str | None,
+        session_id: str | None,
+        agent_name: str | None,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ) -> InboxListing:
+        """Every item, oldest first; with ``limit`` one page, from ``cursor``."""
+        ...
+
+    async def counts(self, *, session_id: str | None, agent_name: str | None) -> InboxCounts:
+        """How many items of each kind wait, without listing them."""
+        ...
 
     async def item(self, item_id: str) -> dict[str, Any]:
         """The item's state: ``pending`` with the item, ``settled`` with who decided, and so on."""
@@ -212,26 +264,41 @@ class LocalInbox:
         return body
 
     async def list_items(
-        self, *, kind: str | None, session_id: str | None, agent_name: str | None
+        self,
+        *,
+        kind: str | None,
+        session_id: str | None,
+        agent_name: str | None,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> InboxListing:
         filters = _filters(kind, session_id, agent_name)
         items: list[dict[str, Any]] = []
         notes: list[str] = []
-        cursor: str | None = None
         while True:
-            params: dict[str, Any] = {**filters, "limit": _PAGE_LIMIT}
+            params: dict[str, Any] = {**filters, "limit": limit or _PAGE_LIMIT}
             if cursor is not None:
                 params["cursor"] = cursor
             page = await self._json("GET", "/inbox", params=params)
             items.extend(row for row in page.get("items", []) if isinstance(row, dict))
             notes.extend(_issue_note(issue) for issue in page.get("issues", []))
             cursor = page.get("next_cursor")
+            if limit is not None:
+                return InboxListing(
+                    items, complete=cursor is None and not notes, notes=notes, next_cursor=cursor
+                )
             if cursor is not None and len(items) >= MAX_LISTED_ITEMS:
                 notes.append(f"Only the oldest {MAX_LISTED_ITEMS} of the items read are listed.")
             if cursor is None or len(items) >= MAX_LISTED_ITEMS:
                 # The inbox pages by session activity; list oldest first, as Cloud does.
                 items.sort(key=_oldest_first)
                 return InboxListing(items[:MAX_LISTED_ITEMS], complete=not notes, notes=notes)
+
+    async def counts(self, *, session_id: str | None, agent_name: str | None) -> InboxCounts:
+        answer = await self._json(
+            "GET", "/inbox/counts", params=_filters(None, session_id, agent_name)
+        )
+        return InboxCounts.read(answer)
 
     async def item(self, item_id: str) -> dict[str, Any]:
         return await self._json("GET", f"/inbox/{quote(item_id, safe='')}")
@@ -307,9 +374,19 @@ class CloudInbox:
             raise _cloud_refusal(exc) from None
 
     async def list_items(
-        self, *, kind: str | None, session_id: str | None, agent_name: str | None
+        self,
+        *,
+        kind: str | None,
+        session_id: str | None,
+        agent_name: str | None,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> InboxListing:
         """Every item Cloud reads from the Agent, including those asked before its Release.
+
+        Cloud reads one page of the Agent's inbox per request (``limit``, ``cursor``), and the
+        CLI follows ``next_cursor`` until the last page, so a large inbox is read whole. With
+        ``limit`` it is that one page. An older Cloud answers with one bounded read instead.
 
         The filters go to Cloud too, so a Cloud that reads one session's items directly
         does; an older one answers with every item and the CLI filters them here. Items
@@ -319,7 +396,38 @@ class CloudInbox:
         """
 
         query = _filters(kind, session_id, agent_name)
-        answer = await asyncio.to_thread(self._request, "GET", "", query=query or None)
+        rows: list[Any] = []
+        agents: list[dict[str, Any]] = []
+        complete = True
+        paged = True
+        followed: set[str] = set()
+        while True:
+            paging: dict[str, Any] = {"limit": limit or _CLOUD_PAGE_LIMIT}
+            if cursor is not None:
+                paging["cursor"] = cursor
+            answer = await asyncio.to_thread(self._request, "GET", "", query={**query, **paging})
+            rows.extend(answer.get("items", []))
+            read = [agent for agent in answer.get("agents", []) if isinstance(agent, dict)]
+            agents.extend(read)
+            # An older Cloud answers with one bounded read and no cursor.
+            paged = paged and "next_cursor" in answer
+            cursor = answer.get("next_cursor")
+            if not isinstance(cursor, str) or not cursor:
+                cursor = None
+            elif cursor in followed:
+                # A Cloud that keeps answering with the same cursor would never end.
+                cursor, complete = None, False
+            if cursor is None:
+                complete = complete and answer.get("complete") is True
+                break
+            followed.add(cursor)
+            # A page that goes on is whole when the Agent was read and named no issues.
+            complete = complete and all(
+                agent.get("state") == "read" and not agent.get("issues") for agent in read
+            )
+            if limit is not None or len(rows) >= MAX_LISTED_ITEMS:
+                complete = False
+                break
 
         def wanted(row: object) -> bool:
             if not isinstance(row, dict):
@@ -331,13 +439,21 @@ class CloudInbox:
                 and (agent_name is None or row.get("agent_name") == agent_name)
             )
 
-        items = [row for row in answer.get("items", []) if wanted(row)]
-        agents = [agent for agent in answer.get("agents", []) if isinstance(agent, dict)]
-        notes = [
-            str(agent.get("detail") or agent.get("reason") or agent.get("state"))
-            for agent in agents
-            if agent.get("state") != "read"
-        ]
+        items = [row for row in rows if wanted(row)]
+        notes = list(
+            dict.fromkeys(
+                str(agent.get("detail") or agent.get("reason") or agent.get("state"))
+                for agent in agents
+                if agent.get("state") != "read"
+            )
+        )
+        if limit is None and cursor is not None:
+            notes.append(f"Only the first {len(rows)} items read are listed.")
+        if limit is not None and not paged:
+            notes.append(
+                "This Cayu Cloud doesn't page an Agent's inbox yet, so this is its one bounded "
+                "read, oldest first."
+            )
         for agent in agents:
             notes.extend(_issue_note(issue) for issue in agent.get("issues", []))
         listed = {row.get("id") for row in items}
@@ -354,10 +470,26 @@ class CloudInbox:
                 f"{unread} item(s) asked before the Agent's current Release couldn't be read; "
                 "list the inbox again."
             )
-        items.sort(key=_oldest_first)
+        if limit is None or not paged:
+            items.sort(key=_oldest_first)
         return InboxListing(
-            items, complete=answer.get("complete") is True and not unread, notes=notes
+            items, complete=complete and not unread, notes=notes, next_cursor=cursor
         )
+
+    async def counts(self, *, session_id: str | None, agent_name: str | None) -> InboxCounts:
+        try:
+            answer = await asyncio.to_thread(
+                self._request,
+                "GET",
+                "/counts",
+                query=_filters(None, session_id, agent_name) or None,
+            )
+        except InboxClientError as exc:
+            # A Cloud without the route reads `counts` as an item id.
+            if exc.status_code in {404, 422}:
+                return InboxCounts(None, "not_served")
+            raise
+        return InboxCounts.read(answer)
 
     async def _read_left_out(self, item_ids: list[str]) -> tuple[list[dict[str, Any]], int]:
         """The pending items among ids an older Cloud left out, and how many weren't read."""

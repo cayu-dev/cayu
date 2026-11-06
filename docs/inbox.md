@@ -471,6 +471,17 @@ $ cayu inbox approve --session invoice-7 --reason "Checked."
 
 `dismiss` takes recovery items, approvals and questions, as described above.
 
+`list` reads the inbox page by page until every item is listed, then prints them
+oldest first, so a large inbox is listed whole. `--limit N` (1 to 200) lists one page
+instead, in the inbox's own order (approvals, questions and recovery items, then
+knowledge proposals; the same order on every read), and prints where the next page
+starts (`next_cursor` in `--json`); pass it to `--cursor`, with the same filters, until
+there is none. `--kind` lists one kind whole, or page by page with `--limit`. `list`
+also says how many items of each kind wait (`counts` in `--json`): a whole listing
+counts what it listed, and a page asks `GET /api/inbox/counts`, so `cayu inbox list
+--limit 1` answers whether anything is waiting without listing every item. When the
+inbox can't count exactly, `counts` is null and `counts_unavailable_reason` says why.
+
 `show`, `approve`, `deny` and `dismiss` take the item's id, or `--session ID` instead:
 the session's pending actions are then read directly (as `list --session` reads them,
 not through the paged listing), and the command acts on the session's one item of
@@ -496,7 +507,10 @@ as you, so it needs Cloud sign-in on the Agent, and the Agent continues on its o
 (`asked_before_release: true` in `--json`): they may well resume, so show and settle
 them like the others, or dismiss the ones that won't. A Cloud that leaves those items
 out of its listing and names only their ids has each one read by its id; one that
-can't be read makes the listing incomplete, with a note.
+can't be read makes the listing incomplete, with a note. Each page is one request
+through Cloud to the Agent, so the listing isn't bounded by what one request can read;
+a Cloud that doesn't page answers with its own bounded read, which says whether it is
+complete.
 
 `show` prints the item and, for a pending approval or question, the
 [human review](human-review.md) the application's policy builds for you: the
