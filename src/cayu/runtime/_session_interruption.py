@@ -157,6 +157,17 @@ def _store_time_checkpoint_with_claimed_pending_session_interrupt(
     return transform
 
 
+# Sessions whose paused interaction an interruption closes and releases at once: those a
+# caller ran directly, which no task, workflow step or parent session owns.
+_RELEASED_PAUSE_SOURCES = frozenset(
+    {
+        SessionExecutionSource.HTTP_RUN,
+        SessionExecutionSource.SDK_RUN,
+        SessionExecutionSource.FORK,
+    }
+)
+
+
 def _sleeping_call(checkpoint: dict[str, Any] | None) -> PendingUserInput | None:
     """The round a still-asleep wake parks; an interruption supersedes it like a pause."""
 
@@ -1032,6 +1043,59 @@ class SessionInterruption:
                 ),
             )
 
+        async def release_settled_pause_epoch() -> None:
+            # Closing a pause settles its interaction with no run left to release
+            # the epoch that settlement claimed, so release it here as a run's own
+            # cleanup would. Otherwise the session refuses a new message, and reads
+            # as continuing its closed interaction, until incomplete-session recovery
+            # of interrupted sessions repairs its terminal ownership. It runs before
+            # this interruption releases its finalization claim, for the epoch and
+            # invocation its own settled decision names, and the release is bound to
+            # them, so a successor's epoch is never released. A session with an
+            # environment keeps waiting for that recovery, which disposes what the
+            # environment still holds before releasing the epoch, and a store without
+            # lifecycle commands can't release it, so both keep that behavior.
+            # Only a session that was paused when this request arrived: no run, here or
+            # in another process, still holds the epoch. An interruption that adopted
+            # another's pending stop of a running session leaves the release to that
+            # run, which releases it when it unwinds. A task's, workflow step's or
+            # subagent's session keeps waiting for recovery, which settles what its
+            # owner holds with it.
+            if (
+                loaded_session.status is not SessionStatus.INTERRUPTED
+                or adopted_user_input_interrupt_payload is not None
+                or loaded_session.invocation.source not in _RELEASED_PAUSE_SOURCES
+            ):
+                return
+            releases = getattr(
+                self.session_store, "_supports_invocation_lifecycle_command_protocol", None
+            )
+            if not callable(releases) or releases() is not True:
+                return
+            settled = await self.session_store.load(loaded_session.id)
+            checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            decision = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+            if (
+                settled is None
+                or settled.instance_id != loaded_session.instance_id
+                or settled.environment_name is not None
+                or settled.status is not SessionStatus.INTERRUPTED
+                or active_profile is None
+                or decision is None
+                or decision.outcome is not InvocationTerminalOutcome.INTERRUPTED
+                or decision.interruption_request_id != interruption_request_id
+                or decision.session_instance_id != settled.instance_id
+                or decision.interaction_id != active_profile.interaction_id
+                or not decision.run_epoch == active_profile.run_epoch == settled.run_epoch
+            ):
+                return
+            await self._environment_lifecycle.release_settled_invocation(
+                session_id=settled.id,
+                expected_session_instance_id=settled.instance_id,
+                expected_active_profile=active_profile,
+            )
+
         offline_transition_claim_id = finalization.transition_claim_id
         offline_terminal_decision: InvocationTerminalDecision | None = None
         if (
@@ -1288,6 +1352,8 @@ class SessionInterruption:
             else:
                 async for event in finalize_terminal_interruption(session):
                     yield event
+            if provider_operation_profile is None:
+                await release_settled_pause_epoch()
         finally:
             try:
                 await release_offline_provider_interruption(

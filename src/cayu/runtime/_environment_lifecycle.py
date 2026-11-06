@@ -224,6 +224,7 @@ from cayu.sessions._checkpoint_mutations import (
 from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._interaction_transitions import (
@@ -2448,6 +2449,48 @@ class EnvironmentLifecycle:
                 del tasks[key]
                 if events is not None:
                     events.pop(key, None)
+
+    async def release_settled_invocation(
+        self,
+        *,
+        session_id: str,
+        expected_session_instance_id: str,
+        expected_active_profile: ActiveInvocationExecutionProfile,
+    ) -> bool:
+        """Release exactly this settled invocation's epoch, for an owner with no run.
+
+        The release is bound to ``expected_active_profile`` and its epoch, so a
+        successor that rebound the session first keeps its own epoch: that is a
+        no-op, as is an invocation with no settlement receipt. While this process
+        still owns environment cleanup for the session nothing is released, and
+        incomplete-session recovery releases it later. Returns whether it released.
+        """
+
+        if self._has_retained_environment_cleanup(session_id):
+            return False
+        try:
+            transition = await self._session_store.load_invocation_settlement_transition(
+                session_id,
+                expected_session_instance_id=expected_session_instance_id,
+                expected_active_invocation_profile=expected_active_profile,
+            )
+            if transition is None:
+                return False
+            await self._session_store.apply_invocation_lifecycle_command(
+                _release_invocation_command_with_cleanup_authority(
+                    ReleaseInvocationCommand(
+                        session_id=session_id,
+                        expected_session_instance_id=expected_session_instance_id,
+                        expected_run_epoch=expected_active_profile.run_epoch,
+                        expected_active_profile=expected_active_profile,
+                        settlement_transition=transition,
+                    )
+                )
+            )
+        except SessionRunFenced:
+            # Another owner holds the session's authority now; it releases its own.
+            return False
+        return True
 
     async def release_run_fence_after_environment_cleanup(
         self,

@@ -4837,7 +4837,16 @@ which returns `SessionExecutionProfiles`, built by the pure
   store holds an active model-completion stage for the session; or when the
   active invocation has not released its run epoch (it is still running, or it
   was interrupted and recovery will continue it). `resume` when the active
-  invocation released its run epoch and nothing is pending. `null` when the
+  invocation released its run epoch and nothing is pending, as after an
+  operator interruption, including one that closed a pending approval or
+  question: that interruption releases the epoch its settlement claimed before
+  it gives up its finalization claim, and a later `resume` starts a new
+  interaction in which the closed round's calls never run or appear in the
+  transcript. This holds for a session a caller ran directly with no
+  environment; one with an environment, or one a task, workflow step or parent
+  session owns, stays at `continuation` until incomplete-session recovery
+  settles what its owner or environment still holds and releases the epoch.
+  `null` when the
   profile that boundary needs is missing (for example a session created before
   execution profiles, which has no issue) or an issue is reported.
 - `expected`: the session's current expected profile, compared at `resume`.

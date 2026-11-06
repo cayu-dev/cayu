@@ -992,17 +992,29 @@ class ModelCompletionRecovery:
             retired_pause = (
                 pending_pause is None
                 and pointer.assistant_message_deferred
-                and transcript_window.cursor == pointer.transcript_end_cursor
-                and await self._model_pause_retired_by_terminal_decision(
-                    session=session,
-                    checkpoint=checkpoint,
-                    pointer=pointer,
-                    completed_stage=completed_stage,
+                and (
+                    (
+                        transcript_window.cursor == pointer.transcript_end_cursor
+                        and await self._model_pause_retired_by_terminal_decision(
+                            session=session,
+                            checkpoint=checkpoint,
+                            pointer=pointer,
+                            completed_stage=completed_stage,
+                        )
+                    )
+                    or await self._model_pause_retired_by_published_stop(
+                        session=session,
+                        pointer=pointer,
+                        completed_stage=completed_stage,
+                    )
                 )
             )
             if retired_pause:
-                # The elected stop atomically retired an unpublished human gate.
-                # Preserve model accounting, but never recreate executable work.
+                # An operator stop retired an unpublished human gate: while it is
+                # being elected, or once published, when later interactions may have
+                # appended to the transcript. Its tool calls were never published, so
+                # nothing after it closes them. Preserve model accounting, but never
+                # recreate executable work.
                 pass
             elif transcript_window.cursor == pointer.transcript_end_cursor:
                 if pending_pause is None:
@@ -1265,62 +1277,77 @@ class ModelCompletionRecovery:
             )
         ):
             return False
-        approval_intent = payload.get(approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY)
-        input_intent = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
-        if (approval_intent is None) == (input_intent is None):
-            return False
-        if input_intent is not None:
-            if (
-                await self._user_input_evidence.validated_user_input_supersession_interrupt_payload(
-                    session=session, pending_interrupt_payload=payload
-                )
-                is None
-            ):
-                return False
-            intent = input_intent
-        else:
-            intent = approval_intent
-            if (
-                type(intent) is not dict
-                or set(intent)
-                != {
-                    "approval_id",
-                    "tool_call_id",
-                    "tool_round_id",
-                    "model_step_id",
-                    "model_attempt_id",
-                }
-                or any(type(value) is not str or not value.strip() for value in intent.values())
-            ):
-                return False
-        publication = completed_stage.publication
-        if publication is None:
-            return False
-        source_round = pending_round_reader.pending_tool_round_from_checkpoint(
-            {
-                operation.key: operation.value
-                for operation in publication.mutation.operations
-                if operation.key == pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY
-                and operation.action == "set"
-            }
-        )
-        return (
-            type(intent) is dict
-            and source_round is not None
-            and source_round.assistant_message_state == "quarantined"
-            and source_round.source_run_epoch == completed_stage.source_run_epoch
-            and source_round.source_model_step_id == pointer.logical_step_id
-            and source_round.source_transcript_cursor == pointer.source_transcript_cursor
-            and source_round.tool_round_id == pointer.tool_round_id
-            and sum(
-                call.tool_call_id == intent.get("tool_call_id") for call in source_round.tool_calls
+        if payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY) is not None and (
+            await self._user_input_evidence.validated_user_input_supersession_interrupt_payload(
+                session=session, pending_interrupt_payload=payload
             )
-            == 1
-            and intent.get("tool_round_id") == pointer.tool_round_id
-            and intent.get("model_step_id") == pointer.logical_step_id
-            and intent.get("model_attempt_id") == completed_stage.intent.get("model_attempt_id")
-            and publication.interaction_id == decision.interaction_id
+            is None
+        ):
+            return False
+        intent = _retiring_stop_intent(payload)
+        return intent is not None and _stop_retires_round(
+            intent,
+            pointer=pointer,
+            completed_stage=completed_stage,
+            interaction_id=decision.interaction_id,
         )
+
+    async def _model_pause_retired_by_published_stop(
+        self,
+        *,
+        session: Session,
+        pointer: model_completion_publication.ModelStepPublicationCheckpoint,
+        completed_stage: ModelCompletionStage,
+    ) -> bool:
+        """Recognize a published operator stop that retired this unpublished model round.
+
+        Once the stop's invocation is released, its decision leaves the checkpoint. The
+        evidence is then the round's interaction ending as interrupted and the stop's own
+        `session.interrupted` event, which carries the exact intent it closed.
+        """
+        publication = completed_stage.publication
+        if (
+            publication is None
+            or publication.interaction_id is None
+            or pointer.assistant_message_published
+        ):
+            return False
+        interaction_id = publication.interaction_id
+        ended = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                event_types=(EventType.INTERACTION_INTERRUPTED,),
+                limit=1,
+            )
+        )
+        if not ended:
+            return False
+        # The stop publishes its `session.interrupted` right after the interaction it
+        # ended, so the first one after that is exactly it, however many later runs
+        # were interrupted before a model step of their own.
+        stops = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=(EventType.SESSION_INTERRUPTED,),
+                after_sequence=ended[0].sequence,
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=1,
+            )
+        )
+        for record in stops:
+            payload = record.event.payload
+            if payload.get("interruption_type") != _INTERRUPTION_TYPE_OPERATOR_REQUESTED:
+                continue
+            intent = _retiring_stop_intent(payload)
+            if intent is not None and _stop_retires_round(
+                intent,
+                pointer=pointer,
+                completed_stage=completed_stage,
+                interaction_id=interaction_id,
+            ):
+                return True
+        return False
 
     async def reconcile_published_model_budget(
         self,
@@ -2323,3 +2350,62 @@ class ModelCompletionRecovery:
             invocation_context=invocation_context,
             model_execution_selection=model_execution_selection,
         )
+
+
+_APPROVAL_CLOSE_INTENT_FIELDS = frozenset(
+    {"approval_id", "tool_call_id", "tool_round_id", "model_step_id", "model_attempt_id"}
+)
+
+
+def _retiring_stop_intent(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The exact approval or question an operator stop's payload says it closed."""
+
+    approval_intent = payload.get(approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY)
+    input_intent = payload.get(USER_INPUT_SUPERSESSION_INTENT_KEY)
+    if (approval_intent is None) == (input_intent is None):
+        return None
+    if input_intent is not None:
+        return input_intent if type(input_intent) is dict else None
+    if (
+        type(approval_intent) is not dict
+        or set(approval_intent) != _APPROVAL_CLOSE_INTENT_FIELDS
+        or any(type(value) is not str or not value.strip() for value in approval_intent.values())
+    ):
+        return None
+    return approval_intent
+
+
+def _stop_retires_round(
+    intent: Mapping[str, Any],
+    *,
+    pointer: model_completion_publication.ModelStepPublicationCheckpoint,
+    completed_stage: ModelCompletionStage,
+    interaction_id: str,
+) -> bool:
+    """Whether a stop's intent names exactly this model step's quarantined round."""
+
+    publication = completed_stage.publication
+    if publication is None:
+        return False
+    source_round = pending_round_reader.pending_tool_round_from_checkpoint(
+        {
+            operation.key: operation.value
+            for operation in publication.mutation.operations
+            if operation.key == pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY
+            and operation.action == "set"
+        }
+    )
+    return (
+        source_round is not None
+        and source_round.assistant_message_state == "quarantined"
+        and source_round.source_run_epoch == completed_stage.source_run_epoch
+        and source_round.source_model_step_id == pointer.logical_step_id
+        and source_round.source_transcript_cursor == pointer.source_transcript_cursor
+        and source_round.tool_round_id == pointer.tool_round_id
+        and sum(call.tool_call_id == intent.get("tool_call_id") for call in source_round.tool_calls)
+        == 1
+        and intent.get("tool_round_id") == pointer.tool_round_id
+        and intent.get("model_step_id") == pointer.logical_step_id
+        and intent.get("model_attempt_id") == completed_stage.intent.get("model_attempt_id")
+        and publication.interaction_id == interaction_id
+    )

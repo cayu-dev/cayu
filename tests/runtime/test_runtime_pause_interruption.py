@@ -10,6 +10,7 @@ from tests.runtime.runtime_recovery_support import FailingAfterPendingToolRoundC
 from tests.runtime.runtime_session_support import (
     collect_events,
     collect_interrupt_events,
+    collect_resume_events,
     collect_user_input_events,
 )
 from tests.runtime.runtime_tool_support import RequireApprovalPolicy, SideEffectTool
@@ -18,19 +19,28 @@ from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import PendingToolApproval
 from cayu.approvals.user_input import UserInputResponse
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.events import EventType
-from cayu.messages import Message
+from cayu.execution_profiles import ExecutionProfileAdmissionBoundary
+from cayu.messages import Message, ToolCallPart
 from cayu.providers.base import ModelStreamEvent
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime._event_projection import public_event_linkage_id, public_event_sequence
 from cayu.runtime._interruption_coordinator import suppress_interruption_cascade
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import Session, SessionStatus
-from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
-from cayu.sessions.requests import InterruptSessionRequest, RunRequest
+from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionsRecoveryRequest,
+)
+from cayu.sessions.requests import InterruptSessionRequest, ResumeRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.tools.policy import ToolPolicyDecision, ToolPolicyRequest, ToolPolicyResult
 from cayu.tools.user_input import UserInputTool
@@ -1091,5 +1101,273 @@ def test_process_loss_after_ambiguous_approval_clear_recovers_exact_interrupt_cl
         assert final_session is not None
         assert final_session.status is SessionStatus.INTERRUPTED
         assert tool.calls == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("pause", ["approval", "user_input"])
+def test_a_session_whose_pause_was_interrupted_resumes_at_its_resume_boundary(
+    tmp_path,
+    backend,
+    pause,
+) -> None:
+    async def run() -> None:
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "pause-release.sqlite")
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        if pause == "approval":
+            call = ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={})
+            tool = SideEffectTool()
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[tool],
+                tool_policy=RequireApprovalPolicy(),
+            )
+        else:
+            call = ModelStreamEvent.tool_call(
+                id="call_ask", name="ask_user", arguments={"question": "Continue?"}
+            )
+            tool = None
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"), tools=[UserInputTool()]
+            )
+        provider = FakeProvider(
+            [
+                [call, ModelStreamEvent.completed({"finish_reason": "tool_calls"})],
+                [
+                    ModelStreamEvent.text_delta("Starting over."),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app.register_provider(provider, default=True)
+        session_id = f"sess_interrupt_{pause}_pause"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        paused = await app.inspect_session_execution_profiles(session_id)
+        assert paused.boundary is ExecutionProfileAdmissionBoundary.CONTINUATION
+
+        interrupted = await collect_interrupt_events(
+            app,
+            InterruptSessionRequest(session_id=session_id, reason="nobody will answer"),
+        )
+        assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        stopped = await app.inspect_session_execution_profiles(session_id)
+        assert stopped.issues == ()
+        assert stopped.boundary is ExecutionProfileAdmissionBoundary.RESUME
+        assert stopped.active_invocation is not None
+        assert stopped.active_invocation.released is True
+        swept = await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(statuses={SessionStatus.INTERRUPTED})
+        )
+        assert not any(
+            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP in result.actions
+            for result in swept.results
+        )
+        repeated = await collect_interrupt_events(
+            app,
+            InterruptSessionRequest(session_id=session_id, reason="nobody will answer"),
+        )
+        assert repeated[-1].id == interrupted[-1].id
+        assert (await store.load(session_id)).run_epoch == session.run_epoch
+
+        # The next message starts a new interaction; the closed round never runs.
+        resumed = await collect_resume_events(
+            app,
+            ResumeRequest(session_id=session_id, messages=[Message.text("user", "Start over.")]),
+        )
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert tool is None or tool.calls == []
+        transcript = await store.load_transcript(session_id)
+        assert [message.role.value for message in transcript] == ["user", "user", "assistant"]
+        assert not any(
+            type(part) is ToolCallPart for message in transcript for part in message.content
+        )
+
+    asyncio.run(run())
+
+
+def test_releasing_a_settled_invocation_leaves_a_successor_epoch_alone() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SideEffectTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+        app.register_provider(
+            FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("Starting over."),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            ),
+            default=True,
+        )
+        session_id = "sess_settled_release_successor"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        await collect_interrupt_events(
+            app, InterruptSessionRequest(session_id=session_id, reason="nobody will answer")
+        )
+        stopped = await app.inspect_session_execution_profiles(session_id)
+        assert stopped.active_invocation is not None
+        settled = active_invocation_execution_profile_from_checkpoint(
+            await store.load_checkpoint(session_id)
+        )
+        assert settled is not None
+        await collect_resume_events(
+            app,
+            ResumeRequest(session_id=session_id, messages=[Message.text("user", "Start over.")]),
+        )
+        successor = await store.load(session_id)
+        assert successor is not None
+
+        released = await app._environment_lifecycle.release_settled_invocation(
+            session_id=session_id,
+            expected_session_instance_id=successor.instance_id,
+            expected_active_profile=settled,
+        )
+
+        assert released is False
+        assert (await store.load(session_id)).run_epoch == successor.run_epoch
+
+    asyncio.run(run())
+
+
+def test_a_resume_finds_the_stop_that_closed_its_round_after_many_stopped_resumes() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        tool = SideEffectTool()
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+            tool_policy=RequireApprovalPolicy(),
+        )
+        app.register_provider(
+            FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("Starting over."),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            ),
+            default=True,
+        )
+        session_id = "sess_interrupt_then_stopped_resumes"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        await collect_interrupt_events(
+            app, InterruptSessionRequest(session_id=session_id, reason="nobody will answer")
+        )
+        # Each of these stops before a model step of its own and publishes another
+        # session.interrupted after the one that closed the round.
+        for attempt in range(20):
+            stream = app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", f"attempt {attempt}")],
+                )
+            )
+            async for event in stream:
+                if event.type is EventType.SESSION_RESUMED:
+                    break
+            await stream.aclose()
+            assert (await store.load(session_id)).status is SessionStatus.INTERRUPTED
+
+        resumed = await collect_resume_events(
+            app,
+            ResumeRequest(session_id=session_id, messages=[Message.text("user", "Start over.")]),
+        )
+
+        assert resumed[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == []
+
+    asyncio.run(run())
+
+
+def test_interrupting_a_pause_with_an_environment_leaves_its_release_to_recovery() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SideEffectTool()],
+            tool_policy=RequireApprovalPolicy(),
+        )
+        app.register_provider(
+            FakeProvider(
+                [
+                    ModelStreamEvent.tool_call(id="call_1", name="side_effect", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ),
+            default=True,
+        )
+        session_id = "sess_interrupt_pause_with_environment"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        await collect_interrupt_events(
+            app, InterruptSessionRequest(session_id=session_id, reason="nobody will answer")
+        )
+
+        # Recovery disposes what the environment still holds before it releases the epoch.
+        stopped = await app.inspect_session_execution_profiles(session_id)
+        assert stopped.boundary is ExecutionProfileAdmissionBoundary.CONTINUATION
+        swept = await app.recover_incomplete_sessions(
+            IncompleteSessionsRecoveryRequest(statuses={SessionStatus.INTERRUPTED})
+        )
+        assert any(
+            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP in result.actions
+            for result in swept.results
+        )
+        repaired = await app.inspect_session_execution_profiles(session_id)
+        assert repaired.boundary is ExecutionProfileAdmissionBoundary.RESUME
 
     asyncio.run(run())
