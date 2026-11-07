@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 import asyncio
 import importlib
+import re
 import sys
 import time
 import uuid
@@ -290,17 +291,236 @@ def test_every_member_route_is_a_control_plane_route() -> None:
     assert _READ_AND_DECIDE_ROUTES - routes == set()
 
 
+#: Control-plane routes that change state and stay with admins and developers, by the
+#: server feature that registers them. With `_READ_AND_DECIDE_ROUTES` they name every such
+#: route, so a new one is a decision about members rather than one left closed (or opened)
+#: by default.
+_FULL_ACCESS_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
+    "default": frozenset(
+        {
+            ("DELETE", "/sessions/{session_id}"),
+            ("PATCH", "/sessions/{session_id}/labels"),
+            ("PATCH", "/sessions/{session_id}/metadata"),
+            ("POST", "/diagnostics/model-check"),
+            ("POST", "/knowledge/{entry_id}/retire"),
+            ("POST", "/provider-operations/resolve"),
+            ("POST", "/resume"),
+            ("POST", "/run"),
+            ("POST", "/sessions/{session_id}/close"),
+            ("POST", "/sessions/{session_id}/compact"),
+            ("POST", "/sessions/{session_id}/interrupt"),
+            ("POST", "/sessions/{session_id}/messages"),
+            ("POST", "/sessions/{session_id}/messages/source-snapshot"),
+            ("POST", "/sessions/{session_id}/messages/{queue_id}/quarantine"),
+            ("POST", "/sessions/{session_id}/messages/{queue_id}/withdraw"),
+            ("POST", "/shared-allocations/release"),
+            ("POST", "/task-graphs"),
+            ("POST", "/tasks"),
+            ("POST", "/tasks/schedule/cancel"),
+            ("POST", "/tasks/schedule/reschedule"),
+            ("POST", "/tasks/scrub-errors"),
+            ("POST", "/tasks/{task_id}/block"),
+            ("POST", "/tasks/{task_id}/cancel"),
+            ("POST", "/tasks/{task_id}/needs-attention"),
+            ("POST", "/tasks/{task_id}/pause"),
+            ("POST", "/tasks/{task_id}/replay"),
+            ("POST", "/tasks/{task_id}/resume"),
+            ("POST", "/tasks/{task_id}/scrub-error"),
+            ("POST", "/tool-approvals/recover"),
+            ("POST", "/tool-rounds/recover"),
+            ("POST", "/user-input/recover"),
+        }
+    ),
+    "evals": frozenset(
+        {
+            ("POST", "/evals/comparisons"),
+            ("POST", "/evals/corpora"),
+            ("POST", "/evals/judge-calibrations"),
+            ("POST", "/evals/judge-calibrations/preview"),
+            ("POST", "/evals/memory-reports"),
+            ("POST", "/evals/memory-reports/report.html"),
+            ("POST", "/evals/promotion/sessions/{session_id}/export"),
+            ("POST", "/evals/promotion/sessions/{session_id}/preview"),
+            ("POST", "/evals/result-comparisons"),
+            ("POST", "/evals/results/{result_revision}/baseline"),
+            ("POST", "/evals/runs"),
+            ("POST", "/evals/runs/{run_id}/cancel"),
+            ("POST", "/evals/runs/{run_id}/scenario-approval"),
+            ("POST", "/evals/scenarios"),
+            ("POST", "/evals/scenarios/artifacts/{requirement_id}/materialize"),
+            ("POST", "/evals/scenarios/preview"),
+            ("POST", "/evals/scenarios/{scenario_revision}/runs"),
+            ("POST", "/evals/sessions/{session_id}/additions"),
+            ("POST", "/evals/sessions/{session_id}/additions/preview"),
+            ("POST", "/evals/sessions/{session_id}/evaluation/export"),
+            ("POST", "/evals/sessions/{session_id}/evaluation/launch"),
+            ("POST", "/evals/sessions/{session_id}/evaluation/preview"),
+            ("POST", "/evals/sessions/{session_id}/evaluation/save"),
+            ("POST", "/evals/suites"),
+            ("POST", "/evals/suites/preview"),
+            ("POST", "/evals/suites/{suite_revision}/runs"),
+            ("POST", "/evals/suites/{suite_revision}/runs/preview"),
+        }
+    ),
+    "tool_authorization_grants": frozenset(
+        {
+            ("POST", "/tool-authorization-grants/approve"),
+            ("POST", "/tool-authorization-grants/{grant_id}/reconcile"),
+            ("POST", "/tool-authorization-grants/{grant_id}/revoke"),
+        }
+    ),
+    "browser_control": frozenset(
+        {
+            ("POST", "/browser-control/handback"),
+            ("POST", "/browser-control/input-ticket"),
+            ("POST", "/browser-control/operator-session"),
+            ("POST", "/browser-control/pages"),
+            ("POST", "/browser-control/renew"),
+            ("POST", "/browser-control/sensitive-entry"),
+            ("POST", "/browser-control/takeover"),
+            ("POST", "/browser-control/view-ticket"),
+        }
+    ),
+}
+#: Routes that change state under their own credential rather than the control-plane
+#: login, so no role reaches them: an eval reporter's grant and an enrolled fork
+#: controller's token.
+_OWN_CREDENTIAL_MUTATIONS = frozenset(
+    {
+        ("POST", "/evals/reports"),
+        ("POST", "/fork-controller/events/query"),
+        ("POST", "/fork-controller/fork"),
+        ("POST", "/fork-controller/resume"),
+        ("POST", "/fork-controller/supervision-events/query"),
+    }
+)
+
+
+@pytest.fixture
+def feature_servers(jwks, tmp_path, monkeypatch) -> dict[str, FastAPI]:
+    """A server for each feature that registers routes of its own, all behind proxy
+    identity. Cayu Cloud's reader routes only read, so none is built for them."""
+
+    from pydantic import SecretBytes
+    from tests.core.test_browser_control import operator_purpose
+    from tests.core.test_browser_control_authorization import Policy
+    from tests.runtime.authorization_grant_support import Harness, _command_turn
+
+    from cayu.agents import AgentSpec
+    from cayu.evals.execution import CorpusTarget
+    from cayu.server import BrowserControlServerConfig, DashboardConfig
+    from cayu.server.authorization_grants import ToolAuthorizationGrantServer
+    from cayu.server.config import EvalsConfig, EvaluationPromotionConfig
+    from cayu.sessions.requests import RunRequest
+    from cayu.storage.evals_sqlite import SQLiteEvalStore
+    from cayu.tools.browser_control_config import BrowserControlConfig
+
+    def config(**features: Any) -> ServerConfig:
+        auth = _auth(jwks, fallback=BasicAuth(username=OPERATOR[0], password=OPERATOR[1]))
+        return ServerConfig.protected(auth, dashboard=DashboardConfig(enabled=False), **features)
+
+    evals_app = CayuApp(enable_logging=False)
+    evals_app.register_agent(AgentSpec(name="assistant", model="made-up-model"))
+    target = CorpusTarget(
+        key="assistant.default",
+        app=evals_app,
+        request_base=RunRequest(agent_name="assistant", messages=[], max_steps=1),
+        application_release_id="release-1",
+    )
+    # An enrolled fork controller, which the process environment configures.
+    monkeypatch.setenv("CAYU_FORK_CONTROLLER_NAME", "guard")
+    monkeypatch.setenv("CAYU_FORK_CONTROLLER_AGENTS", "assistant")
+    monkeypatch.setenv("CAYU_FORK_CONTROLLER_TOKEN_SHA256", "0" * 64)
+    evals = create_server(
+        evals_app,
+        config=config(
+            evals=EvalsConfig(target=target, store=SQLiteEvalStore(tmp_path / "evals.db")),
+            evaluation_promotion=EvaluationPromotionConfig(
+                target_key="assistant.default",
+                source_agent_name="assistant",
+                application_release_id="release-1",
+            ),
+        ),
+    )
+    monkeypatch.delenv("CAYU_FORK_CONTROLLER_NAME")
+    monkeypatch.delenv("CAYU_FORK_CONTROLLER_AGENTS")
+    monkeypatch.delenv("CAYU_FORK_CONTROLLER_TOKEN_SHA256")
+
+    harness = Harness(tmp_path, turns=_command_turn("call_1", ["ls"]))
+
+    async def no_reads(principal, grant) -> bool:
+        return False
+
+    browser_app = CayuApp(
+        enable_logging=False,
+        browser_control=BrowserControlConfig(
+            purpose=operator_purpose(),
+            policy=Policy(True),
+            guest_endpoint="wss://127.0.0.1:9/api/browser-control/guest",
+        ),
+    )
+    return {
+        "default": create_server(CayuApp(), config=config()),
+        "evals": evals,
+        "tool_authorization_grants": create_server(
+            harness.app,
+            config=config(),
+            tool_authorization_grants=ToolAuthorizationGrantServer(
+                harness.service, authorize_read=no_reads
+            ),
+        ),
+        "browser_control": create_server(
+            browser_app,
+            config=config(
+                browser_control=BrowserControlServerConfig(
+                    operator_origin="https://operator.test", signing_key=SecretBytes(b"k" * 32)
+                )
+            ),
+        ),
+    }
+
+
+def _mutating_routes(server: FastAPI) -> set[tuple[str, str]]:
+    return {
+        (method, route.path.removeprefix("/api"))
+        for route in server.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/")
+        for method in route.methods
+        if method not in {"GET", "HEAD", "OPTIONS"}
+    }
+
+
+def test_every_mutating_route_says_whether_members_may_use_it(feature_servers) -> None:
+    mutating = set().union(*(_mutating_routes(server) for server in feature_servers.values()))
+    full_access = frozenset().union(*_FULL_ACCESS_MUTATIONS.values())
+
+    unnamed = mutating - _READ_AND_DECIDE_ROUTES - full_access - _OWN_CREDENTIAL_MUTATIONS
+    assert unnamed == set(), (
+        "Name each route in `_READ_AND_DECIDE_ROUTES` (cayu/server/proxy_identity.py) if "
+        "members may use it, or in `_FULL_ACCESS_MUTATIONS` here if only admins and "
+        "developers may. A route a new server feature registers needs that feature in "
+        "`feature_servers` too."
+    )
+    named = (_READ_AND_DECIDE_ROUTES, *_FULL_ACCESS_MUTATIONS.values(), _OWN_CREDENTIAL_MUTATIONS)
+    assert (full_access | _OWN_CREDENTIAL_MUTATIONS) - mutating == set()
+    assert sum(len(routes) for routes in named) == len(set().union(*named))
+
+
+def test_a_member_may_not_use_a_full_access_mutation(feature_servers, signing_key) -> None:
+    member = _as(_token(signing_key, role="member"))
+    for feature, routes in _FULL_ACCESS_MUTATIONS.items():
+        with TestClient(feature_servers[feature]) as client:
+            for method, template in sorted(routes):
+                path = "/api" + re.sub(r"\{[^}]+\}", "missing", template)
+                response = client.request(method, path, headers=member)
+                assert response.status_code == 403, (feature, method, path, response.text)
+                assert response.json()["detail"]["code"] == "role_forbidden", (method, path)
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        ("POST", "/api/run"),
-        ("POST", "/api/resume"),
-        ("POST", "/api/sessions/missing/interrupt"),
-        ("POST", "/api/sessions/missing/messages"),
-        ("DELETE", "/api/sessions/missing"),
-        ("PATCH", "/api/sessions/missing/labels"),
-        ("POST", "/api/tasks/task-1/pause"),
-        ("POST", "/api/tool-approvals/recover"),
+        # Each route that changes state is in `test_a_member_may_not_use_a_full_access_mutation`.
         ("GET", "/api/system/diagnostics"),
         ("GET", "/api/recovery/startup"),
     ],

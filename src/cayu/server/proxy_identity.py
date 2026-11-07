@@ -126,7 +126,10 @@ _SAME_ORIGIN_FETCH_SITES: Final = frozenset({"same-origin", "none"})
 #: path and matched against the whole route template: reads and queries, and
 #: the human decisions (approve, deny and answer approvals and questions, settle
 #: inbox items and knowledge proposals). Every entry names a route
-#: ``create_server`` registers; tests check that none is left without one.
+#: ``create_server`` registers; tests check that none is left without one, and that
+#: every route that changes state, with each optional server feature on, is either listed
+#: here, named as full access only, or takes its own credential
+#: (``tests/server/test_proxy_identity.py``), so a new one is classified on purpose.
 _READ_AND_DECIDE_ROUTES: Final = frozenset(
     {
         ("GET", route)
