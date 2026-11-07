@@ -45,6 +45,19 @@ _DEBIAN_SUITE = "bookworm"
 _GIT_PACKAGE = "1:2.39.5-0+deb12u2"
 _RIPGREP_PACKAGE = "13.0.0-4+b2"
 
+# Responses and stalls of the snapshot archive that a later attempt can survive.
+_TRANSIENT_SNAPSHOT_FAILURES = (
+    "No healthy backends",
+    "502  Bad Gateway",
+    "503  Service Unavailable",
+    "504  Gateway Timeout",
+    "Connection timed out",
+    "Connection reset by peer",
+    "Connection failed",
+    "Could not connect",
+    "Temporary failure resolving",
+)
+
 pytestmark = pytest.mark.process
 
 
@@ -212,7 +225,9 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
         timeout=120,
     )
     assert locked.returncode == 0, (locked.stdout + locked.stderr)[-4000:]
-    build_deadline = time.monotonic() + 300
+    # A healthy build takes about two minutes; most of it is fetching packages from
+    # snapshot.debian.org, which is slow under load and drops requests.
+    build_deadline = time.monotonic() + 600
     for attempt in range(3):
         built = subprocess.run(
             [sys.executable, "build_coding_image.py"],
@@ -224,15 +239,17 @@ def test_built_wheel_generated_docker_path_fails_repairs_passes_and_copies_back(
             timeout=max(0.001, build_deadline - time.monotonic()),
         )
         build_output = built.stdout + built.stderr
-        transient_snapshot_failure = (
-            "snapshot.debian.org" in build_output and "503  No healthy backends" in build_output
+        transient_snapshot_failure = "snapshot.debian.org" in build_output and any(
+            marker in build_output for marker in _TRANSIENT_SNAPSHOT_FAILURES
         )
         if built.returncode == 0 or not transient_snapshot_failure or attempt == 2:
             break
-        # Retry only the observed transient mirror response within one build budget.
-        if time.monotonic() + 1 >= build_deadline:
+        # The image's apt already retried each fetch; retry the whole build only
+        # for a transient mirror failure, with backoff, within one build budget.
+        backoff = 10 * (attempt + 1)
+        if time.monotonic() + backoff >= build_deadline:
             break
-        time.sleep(1)
+        time.sleep(backoff)
     assert built.returncode == 0, (built.stdout + built.stderr)[-4000:]
     image_configuration = json.loads(
         (project / "docker-coding-image.json").read_text(encoding="utf-8")

@@ -18,6 +18,18 @@ runs:
         # Fresh runners can still be running unattended-upgrades. Persist this
         # setting so later apt users, including Playwright, also wait for dpkg.
         echo 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/99-cayu-lock-timeout >/dev/null
+        # The lock timeout covers only dpkg's lock, not apt's download lock, which
+        # unattended-upgrades also holds while it fetches. Stop it from starting
+        # again, then wait, bounded, for a run already under way to finish. The
+        # services stop without blocking: stopping waits out a running upgrade,
+        # which only the loop below may do.
+        sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+        sudo systemctl --no-block stop apt-daily.service apt-daily-upgrade.service \
+          unattended-upgrades.service >/dev/null 2>&1 || true
+        for _ in $(seq 1 36); do
+          pgrep -x 'apt|apt-get|dpkg|unattended-upgr' >/dev/null || break
+          sleep 5
+        done
     - name: Use Ubuntu's primary archive
       shell: bash
       run: |

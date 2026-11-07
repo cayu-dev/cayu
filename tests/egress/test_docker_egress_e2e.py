@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 
 import httpx
 import pytest
@@ -73,6 +74,44 @@ pytestmark = [
         reason="Docker daemon not available for virtual-egress E2E.",
     ),
 ]
+
+_IMAGE_PULL_ATTEMPTS = 4
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _images_pulled() -> None:
+    """Have both images before any test starts a container.
+
+    `docker run` pulls a missing image itself but gives up on the first failed
+    registry request, so one dropped download from Docker Hub would fail
+    whichever test ran first. Pull each once, retrying with backoff.
+    """
+
+    from cayu.egress.docker_adapter import DEFAULT_SIDECAR_IMAGE
+
+    for image in (DEFAULT_SIDECAR_IMAGE, CONTAINER_IMAGE):
+        present = subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, timeout=30
+        )
+        if present.returncode == 0:
+            continue
+        for attempt in range(1, _IMAGE_PULL_ATTEMPTS + 1):
+            try:
+                pulled = subprocess.run(
+                    ["docker", "pull", "--quiet", image],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+            except subprocess.TimeoutExpired:
+                error = "image pull timed out"
+            else:
+                if pulled.returncode == 0:
+                    break
+                error = pulled.stderr[-2000:]
+            if attempt == _IMAGE_PULL_ATTEMPTS:
+                pytest.fail(f"docker pull {image} failed: {error}")
+            time.sleep(5 * attempt)
 
 
 class _FakeStripe:

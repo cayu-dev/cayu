@@ -2532,8 +2532,9 @@ RUN test -n "${CAYU_UV_VERSION}" \
     && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/%s %s-security main\n' \
         "${CAYU_DEBIAN_SNAPSHOT}" "${CAYU_DEBIAN_SUITE}" \
         >> /etc/apt/sources.list \
-    && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=60 install -y --no-install-recommends \
         "git=${CAYU_GIT_PACKAGE}" \
         "ripgrep=${CAYU_RIPGREP_PACKAGE}" \
     && python -m pip install --no-cache-dir "uv==${CAYU_UV_VERSION}" \
@@ -3216,7 +3217,11 @@ def resolve_pins() -> int:
             f"deb [check-valid-until=no] {archive}/debian/{snapshot} {suite}-updates main\\n"
             f"deb [check-valid-until=no] {archive}/debian-security/{snapshot} "
             f"{suite}-security main\\n'"
-            " > /etc/apt/sources.list && apt-get update -qq >/dev/null"
+            " > /etc/apt/sources.list"
+            # The snapshot archive answers with transient 5xx errors and stalls;
+            # apt retries each fetch with backoff instead of failing the build.
+            " && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60"
+            " update -qq >/dev/null"
             f" && apt-cache madison {' '.join(wanted)}",
         )
         for package in wanted:

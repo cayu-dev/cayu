@@ -60,6 +60,45 @@ def _docker_unavailable(reason: str) -> None:
     pytest.skip(reason)
 
 
+def _provisioned(docker_path: str, image: str) -> str:
+    """Have ``image`` locally, pulling it with retries when Docker lacks it.
+
+    `docker run` pulls a missing image itself but gives up on the first failed
+    registry request. Provision separately from the command under test: registry
+    outages may retry here; execution and its assertions must run exactly once.
+    """
+
+    inspected = subprocess.run(
+        [docker_path, "image", "inspect", image], capture_output=True, timeout=20
+    )
+    if inspected.returncode == 0:
+        return image
+    error = ""
+    for attempt in range(3):
+        try:
+            pulled = subprocess.run(
+                [docker_path, "pull", image], capture_output=True, text=True, timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            error = "image pull timed out"
+        else:
+            if pulled.returncode == 0:
+                return image
+            error = pulled.stderr
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+    pytest.fail(f"Docker test image {image} unavailable after three attempts: {error}")
+
+
+def _live_image(docker_path: str) -> str:
+    """The image live runner tests start, unless CAYU_DOCKER_LIVE_IMAGE names one."""
+
+    configured = os.environ.get("CAYU_DOCKER_LIVE_IMAGE")
+    if configured is not None:
+        return configured
+    return _provisioned(docker_path, "alpine:3.20")
+
+
 def _search_text_image(docker_path: str) -> str:
     configured = os.environ.get("CAYU_SEARCH_TEXT_DOCKER_IMAGE")
     if configured is not None:
@@ -90,7 +129,7 @@ def _search_text_image(docker_path: str) -> str:
 
 def test_real_docker_runner_executes_and_cleans_up_timed_out_command() -> None:
     docker_path = _docker_path_or_skip()
-    image = os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20")
+    image = _live_image(docker_path)
     name = f"cayu-docker-live-{uuid4().hex[:12]}"
 
     async def run() -> None:
@@ -188,16 +227,8 @@ def test_real_docker_runner_executes_and_cleans_up_timed_out_command() -> None:
 
 def test_100_real_docker_runners_share_one_immutable_input(tmp_path: Path) -> None:
     docker_path = _docker_path_or_skip()
-    image = os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20")
+    image = _live_image(docker_path)
     try:
-        if "CAYU_DOCKER_LIVE_IMAGE" not in os.environ:
-            subprocess.run(
-                [docker_path, "pull", image],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
         image_id = subprocess.run(
             [docker_path, "image", "inspect", "--format", "{{.Id}}", image],
             check=True,
@@ -386,7 +417,7 @@ def test_real_docker_failure_diagnostics_survive_durable_tool_evidence(tmp_path,
     runner = asyncio.run(
         DockerRunner.create(
             name,
-            image=os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20"),
+            image=_live_image(docker_path),
             docker_path=docker_path,
             close_action="remove",
         )
@@ -428,30 +459,7 @@ def test_real_docker_failure_diagnostics_survive_durable_tool_evidence(tmp_path,
 @pytest.fixture(scope="module")
 def python_transport_image():
     docker_path = _docker_path_or_skip()
-    image = "python:3.12-slim"
-    inspected = subprocess.run(
-        [docker_path, "image", "inspect", image], capture_output=True, timeout=20
-    )
-    if inspected.returncode == 0:
-        return docker_path, image
-
-    # Provision separately from the command under test. Registry outages may
-    # retry here; transport execution and its assertions must run exactly once.
-    error = ""
-    for attempt in range(3):
-        try:
-            pulled = subprocess.run(
-                [docker_path, "pull", image], capture_output=True, text=True, timeout=120
-            )
-        except subprocess.TimeoutExpired:
-            error = "image pull timed out"
-        else:
-            if pulled.returncode == 0:
-                return docker_path, image
-            error = pulled.stderr
-        if attempt < 2:
-            time.sleep(2 * (attempt + 1))
-    pytest.fail(f"Docker transport test image unavailable after three attempts: {error}")
+    return docker_path, _provisioned(docker_path, "python:3.12-slim")
 
 
 @pytest.mark.parametrize("mode", ["fallback", "no_setsid", "direct", "shell"])
@@ -569,7 +577,7 @@ def test_real_docker_native_child_completed_result_survives_cancellation(
     runner = asyncio.run(
         DockerRunner.create(
             f"cayu-publication-{uuid4().hex[:12]}",
-            image=os.environ.get("CAYU_DOCKER_LIVE_IMAGE", "alpine:3.20"),
+            image=_live_image(docker_path),
             docker_path=docker_path,
             mount_path=str(tmp_path),
             close_action="remove",
