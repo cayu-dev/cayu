@@ -87,6 +87,13 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._claim_fence import (
+    TaskClaimFence,
+    ensure_claim_fence,
+    fenced_claim_lease,
+    released_claim_lease,
+    validate_claim_generation,
+)
 from cayu.tasks._failure_scrub import (
     TaskFailureScrub,
     TaskFailureScrubResult,
@@ -685,6 +692,7 @@ class InMemoryTaskStore(TaskStore):
         *,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         contract: WorkContractRef,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -694,18 +702,20 @@ class InMemoryTaskStore(TaskStore):
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:  # pragma: no cover - excluded by the public type
             raise TypeError("contract must be a WorkContractRef.")
         async with self._lock:
             task = self._require_task(task_id)
             now = self._ownership_clock()
-            if expected_lease is None:
+            if expected_lease is None and claim_generation is None:
                 raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=now,
             )
             if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
@@ -721,6 +731,7 @@ class InMemoryTaskStore(TaskStore):
                     },
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "claim_generation": task.claim_generation + 1,
                     "updated_at": now,
                 }
             )
@@ -3204,6 +3215,7 @@ class InMemoryTaskStore(TaskStore):
         session_invocation: SessionInvocationBinding,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -3213,6 +3225,7 @@ class InMemoryTaskStore(TaskStore):
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             task = self._require_task(task_id)
@@ -3220,12 +3233,13 @@ class InMemoryTaskStore(TaskStore):
             now = self._ownership_clock()
             if not _can_attach_claimed_task(task, worker_id=worker_id, now=now):
                 _raise_task_claim_attach_error(task, worker_id, now=now)
-            if expected_lease is None:
+            if expected_lease is None and claim_generation is None:
                 raise TaskClaimLost("Task attachment requires its exact worker lease.")
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=now,
             )
             self._ensure_contract_session_accepts_attachment(
@@ -3262,10 +3276,12 @@ class InMemoryTaskStore(TaskStore):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -3275,17 +3291,23 @@ class InMemoryTaskStore(TaskStore):
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 presented_lease_expires_at=lease_expires_at,
-            ) as effective_lease,
+                presented_claim_generation=claim_generation,
+            ) as managed,
             self._lock,
         ):
+            fenced_lease, fenced_handoff_id = (
+                (managed.lease_expires_at, handoff_id)
+                if worker_id is None or managed.claim_generation is None
+                else self._fence_claim(task_id, worker_id, managed.claim_generation)
+            )
             return self._finish_task(
                 task_id,
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
-                handoff_id=handoff_id,
+                expected_lease_expires_at=fenced_lease,
+                handoff_id=fenced_handoff_id,
             )
 
     async def fail_task(
@@ -3296,10 +3318,12 @@ class InMemoryTaskStore(TaskStore):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -3309,17 +3333,23 @@ class InMemoryTaskStore(TaskStore):
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 presented_lease_expires_at=lease_expires_at,
-            ) as effective_lease,
+                presented_claim_generation=claim_generation,
+            ) as managed,
             self._lock,
         ):
+            fenced_lease, fenced_handoff_id = (
+                (managed.lease_expires_at, handoff_id)
+                if worker_id is None or managed.claim_generation is None
+                else self._fence_claim(task_id, worker_id, managed.claim_generation)
+            )
             return self._finish_task(
                 task_id,
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
-                handoff_id=handoff_id,
+                expected_lease_expires_at=fenced_lease,
+                handoff_id=fenced_handoff_id,
             )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -3359,7 +3389,12 @@ class InMemoryTaskStore(TaskStore):
                 request,
                 now=committed_at,
             )
-            _ensure_task_handoff_authority(task, request.handoff_id)
+            fenced_lease, fenced_handoff_id = (
+                (request.lease_expires_at, request.handoff_id)
+                if request.claim_generation is None
+                else (task.lease_expires_at, task.interrupted_handoff_id)
+            )
+            _ensure_task_handoff_authority(task, fenced_handoff_id)
             _validate_ordinary_task_terminalization_against_cancellation(task, request)
             status = TaskStatus(request.kind.value)
             terminal_task = self._finish_task(
@@ -3368,8 +3403,8 @@ class InMemoryTaskStore(TaskStore):
                 result=request.result,
                 error=request.error,
                 worker_id=request.worker_id,
-                expected_lease_expires_at=request.lease_expires_at,
-                handoff_id=request.handoff_id,
+                expected_lease_expires_at=fenced_lease,
+                handoff_id=fenced_handoff_id,
                 now=committed_at,
             )
             self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
@@ -3513,6 +3548,7 @@ class InMemoryTaskStore(TaskStore):
                     "worker_id": None,
                     "lease_expires_at": None,
                     "interrupted_handoff_id": request.handoff_id,
+                    "claim_generation": task.claim_generation + 1,
                     "updated_at": committed_at,
                 }
             )
@@ -3737,6 +3773,7 @@ class InMemoryTaskStore(TaskStore):
                         "worker_id": worker_id,
                         "lease_expires_at": now + timedelta(seconds=lease_seconds),
                         "interrupted_handoff_id": handoff_id,
+                        "claim_generation": task.claim_generation + 1,
                         "updated_at": now,
                     }
                 )
@@ -3842,12 +3879,13 @@ class InMemoryTaskStore(TaskStore):
                 )
             task = self._require_task(request.task_id)
             now = self._ownership_clock()
-            if request.lease_expires_at is None:
+            if request.lease_expires_at is None and request.claim_generation is None:
                 raise TaskClaimLost("Task retry settlement requires its exact worker lease.")
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 request.worker_id,
-                request.lease_expires_at,
+                lease_expires_at=request.lease_expires_at,
+                claim_generation=request.claim_generation,
                 now=now,
             )
             if task.retry_series is None:
@@ -3903,13 +3941,19 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
@@ -3917,10 +3961,11 @@ class InMemoryTaskStore(TaskStore):
         async with self._lock:
             task = self._require_task(task_id)
             lease_now = self._ownership_clock()
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=lease_now,
             )
             series_now = self._clock()
@@ -3941,17 +3986,24 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             task = self._require_task(task_id)
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=self._ownership_clock(),
             )
             return _claimed_task_retry_attempt_elapsed(task, series_now=self._clock())
@@ -4128,15 +4180,29 @@ class InMemoryTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
         error: dict[str, Any] | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
             current = self._require_task(task_id)
+            if claim_generation is not None:
+                ensure_claim_fence(
+                    current,
+                    TaskClaimFence(worker_id, claim_generation),
+                    now=self._ownership_clock(),
+                    require_live=False,
+                )
+                expected_lease = current.lease_expires_at
+            else:
+                if lease_expires_at is None:
+                    raise TaskClaimLost("Claimed-task cancellation requires its claim generation.")
+                expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
             if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
                 raise TaskClaimLost(
                     "Claimed-task cancellation no longer owns the expected worker lease."
@@ -4164,19 +4230,27 @@ class InMemoryTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             now = self._ownership_clock()
             current = self._require_task(task_id)
-            if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
-                raise TaskClaimLost(
-                    "Claimed-task execution no longer owns the expected worker lease."
-                )
-            _ensure_owned_active_task_lease(current, worker_id, now=now)
+            if claim_generation is not None:
+                ensure_claim_fence(current, TaskClaimFence(worker_id, claim_generation), now=now)
+            else:
+                if lease_expires_at is None:
+                    raise TaskClaimLost("Claimed-task execution requires its claim generation.")
+                expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+                if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Claimed-task execution no longer owns the expected worker lease."
+                    )
+                _ensure_owned_active_task_lease(current, worker_id, now=now)
             if (
                 current.status is not TaskStatus.CLAIMED
                 or current.session_id is not None
@@ -4382,6 +4456,7 @@ class InMemoryTaskStore(TaskStore):
                     "schedule": admitted_schedule(task, now=availability_now),
                     "worker_id": worker_id,
                     "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                    "claim_generation": task.claim_generation + 1,
                     "updated_at": now,
                 }
             )
@@ -4393,20 +4468,27 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
             now = self._ownership_clock()
             task = self._require_owned_leased_task(task_id, worker_id, now=now)
-            if task.lease_expires_at != expected_lease:
-                raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
-            _ensure_task_handoff_authority(task, handoff_id)
+            if claim_generation is not None:
+                ensure_claim_fence(task, TaskClaimFence(worker_id, claim_generation), now=now)
+            else:
+                if lease_expires_at is None:
+                    raise TaskClaimLost("Task heartbeat requires its claim generation.")
+                expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+                if task.lease_expires_at != expected_lease:
+                    raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
+                _ensure_task_handoff_authority(task, handoff_id)
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -4422,18 +4504,34 @@ class InMemoryTaskStore(TaskStore):
             return updated.model_copy(deep=True)
 
     async def restart_task(
-        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         from cayu.tasks.restart import _restarted_task
 
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             task = self._require_task(task_id)
             if task_id in self._latest_admission_id_by_task:
                 raise WorkAttemptExecutionClaimLost("Admitted work attempts cannot restart.")
-            updated = _restarted_task(task, worker_id, expected_lease, now=self._ownership_clock())
+            updated = _restarted_task(
+                task,
+                worker_id,
+                expected_lease,
+                claim_generation=claim_generation,
+                now=self._ownership_clock(),
+            )
             if task.session_id is not None:
                 self._retired_task_sessions.add(task.session_id)
             self._store_task(updated)
@@ -4460,16 +4558,23 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             now = self._ownership_clock()
             task = self._require_owned_leased_task(task_id, worker_id, now=now)
-            if task.lease_expires_at != expected_lease:
-                raise TaskClaimLost("Task release no longer owns the expected worker lease.")
+            released_claim_lease(
+                task,
+                worker_id,
+                lease_expires_at,
+                claim_generation,
+                now=now,
+                message="Task release no longer owns the expected worker lease.",
+            )
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -4490,6 +4595,7 @@ class InMemoryTaskStore(TaskStore):
                     "status": TaskStatus.PENDING,
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "claim_generation": task.claim_generation + 1,
                     "started_at": None,
                     "updated_at": now,
                 }
@@ -4502,18 +4608,23 @@ class InMemoryTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             now = self._ownership_clock()
             task = self._require_owned_leased_task(task_id, worker_id, now=now)
-            if task.lease_expires_at != expected_lease:
-                raise TaskClaimLost(
-                    "Attached-task release no longer owns the expected worker lease."
-                )
+            released_claim_lease(
+                task,
+                worker_id,
+                lease_expires_at,
+                claim_generation,
+                now=now,
+                message="Attached-task release no longer owns the expected worker lease.",
+            )
             admission_id = self._latest_admission_id_by_task.get(task_id)
             if admission_id is not None:
                 raise WorkAttemptExecutionClaimLost(
@@ -4535,6 +4646,7 @@ class InMemoryTaskStore(TaskStore):
                 update={
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "claim_generation": task.claim_generation + 1,
                     "updated_at": now,
                 }
             )
@@ -4574,13 +4686,17 @@ class InMemoryTaskStore(TaskStore):
                         task,
                         updated_at=now,
                     )
-                    self._store_task(requested)
+                    # The lost holder no longer owns the claim it may still drain.
+                    self._store_task(
+                        requested.model_copy(update={"claim_generation": task.claim_generation + 1})
+                    )
                     continue
                 updated = task.model_copy(
                     update={
                         "status": TaskStatus.PENDING,
                         "worker_id": None,
                         "lease_expires_at": None,
+                        "claim_generation": task.claim_generation + 1,
                         "updated_at": now,
                     }
                 )
@@ -4991,6 +5107,23 @@ class InMemoryTaskStore(TaskStore):
             session_id=parent.session_id,
             session_instance_id=parent.session_instance_id,
             invocation=parent.invocation,
+        )
+
+    def _fence_claim(
+        self,
+        task_id: str,
+        worker_id: str,
+        claim_generation: int,
+    ) -> tuple[datetime, str | None]:
+        """Check one claim generation and return the lease and handoff it holds."""
+
+        task = self._require_task(task_id)
+        return fenced_claim_lease(
+            task,
+            worker_id,
+            lease_expires_at=None,
+            claim_generation=claim_generation,
+            now=self._ownership_clock(),
         )
 
     def _require_owned_leased_task(

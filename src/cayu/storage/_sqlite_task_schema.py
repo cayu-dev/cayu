@@ -282,6 +282,23 @@ def _validate_interrupted_handoff_generation_column(
         )
 
 
+def _validate_task_claim_generation_column(connection: sqlite3.Connection) -> None:
+    column = next(
+        (
+            (str(row[2]).upper(), int(row[3]), row[4])
+            for row in connection.execute("PRAGMA table_info(cayu_tasks)")
+            if row[1] == "claim_generation"
+        ),
+        None,
+    )
+    if column != ("INTEGER", 1, "0"):
+        raise RuntimeError(
+            "SQLite task claim generation storage conflicts with Cayu's revision-142 "
+            "durability contract. Run `cayu storage migrate` or restore the database "
+            "from a known-good backup."
+        )
+
+
 def _validate_task_creation_operations(
     connection: sqlite3.Connection, *, revision_sql: str
 ) -> None:

@@ -177,7 +177,9 @@ def test_the_current_task_is_the_handler_task_this_code_runs_in() -> None:
     from datetime import UTC, datetime
 
     assert current_task_id() is None
-    authority = TaskLeaseAuthority(datetime.now(UTC), task_id="task_2", worker_id="w-1")
+    authority = TaskLeaseAuthority(
+        datetime.now(UTC), claim_generation=1, task_id="task_2", worker_id="w-1"
+    )
 
     async def handler() -> str | None:
         await asyncio.sleep(0)
@@ -205,7 +207,9 @@ def test_the_coding_factory_names_the_session_and_task_of_each_sandbox(tmp_path:
         source_workspace=LocalWorkspace(source, workspace_id="project"),
         egress="none",
     )
-    authority = TaskLeaseAuthority(datetime.now(UTC), task_id="task_2", worker_id="w-1")
+    authority = TaskLeaseAuthority(
+        datetime.now(UTC), claim_generation=1, task_id="task_2", worker_id="w-1"
+    )
 
     async def create(session_id: str):
         result = await factory.create(

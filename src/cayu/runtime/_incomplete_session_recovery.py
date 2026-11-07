@@ -2892,7 +2892,9 @@ class IncompleteSessionRecovery:
                 TaskTerminalizationRequest(
                     task_id=task.id,
                     worker_id=task.worker_id,
-                    lease_expires_at=task.lease_expires_at,
+                    # The expired claim this recovery read: a later claim advances
+                    # the generation and refuses the write.
+                    claim_generation=task.claim_generation,
                     handoff_id=task.interrupted_handoff_id,
                     kind=TaskTerminalKind.FAILED,
                     error=failure_payload,

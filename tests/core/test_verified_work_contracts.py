@@ -5127,6 +5127,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
             *,
             worker_id: str,
             lease_expires_at: datetime | None = None,
+            claim_generation: int | None = None,
             contract: WorkContractRef,
         ) -> Task:
             self.parking_started.set()
@@ -5135,6 +5136,7 @@ def test_stale_ordinary_worker_cannot_park_successor_claim() -> None:
                 task_id,
                 worker_id=worker_id,
                 lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 contract=contract,
             )
 
@@ -7439,6 +7441,7 @@ def test_unproven_worker_parking_is_rejected_before_claim_mutation() -> None:
             *,
             worker_id: str,
             lease_expires_at: datetime | None = None,
+            claim_generation: int | None = None,
             contract: WorkContractRef,
         ) -> Task:
             await asyncio.to_thread(lambda: None)
@@ -7446,6 +7449,7 @@ def test_unproven_worker_parking_is_rejected_before_claim_mutation() -> None:
                 task_id,
                 worker_id=worker_id,
                 lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 contract=contract,
             )
 
@@ -7857,6 +7861,7 @@ def test_runtime_admission_and_worker_parking_store_failures_are_detached(
             *,
             worker_id: str,
             lease_expires_at: datetime | None = None,
+            claim_generation: int | None = None,
             contract: WorkContractRef,
         ) -> Task:
             loaded = await super().load_task(task_id)

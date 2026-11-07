@@ -161,17 +161,45 @@ def _expired_dispatched_task_cancellation(
     )
 
 
+def _cancellation_drain_holds(task: Task, *, worker_id: str, claim_generation: int) -> bool:
+    """Whether a drain of claim ``claim_generation`` may settle the row's cancellation.
+
+    The row is either that claim or reclaim's fence of it: reclaiming an expired
+    dispatched claim keeps its worker and lease, requests cancellation and advances
+    the generation by exactly one. Every other change of holder releases the worker
+    first, so any other generation is a later claim, possibly under the same name.
+    """
+
+    if task.worker_id != worker_id:
+        return False
+    if task.claim_generation == claim_generation:
+        return True
+    return task.claim_generation == claim_generation + 1 and (
+        _task_cancellation_requested(task) or _task_retry_cancellation_requested(task)
+    )
+
+
 def _task_cancellation_terminalization_request(
     task: Task,
     *,
     worker_id: str,
+    claim_generation: int | None = None,
 ) -> TaskTerminalizationRequest | None:
-    """Build the exact worker terminalization for a requested cancellation."""
+    """Build the exact worker terminalization for a requested cancellation.
+
+    With ``claim_generation`` the request is fenced by that claim instead of
+    the row's lease expiry, which a concurrent renewal of the same claim moves.
+    """
 
     if not _task_cancellation_requested(task):
         return None
     if task.worker_id != worker_id or task.lease_expires_at is None:
         raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
+    if claim_generation is not None and task.claim_generation != claim_generation:
+        raise TaskClaimLost(
+            f"Task {task.id} claim generation {claim_generation} was superseded by "
+            f"{task.claim_generation}."
+        )
     payload = task.status_payload
     if type(payload) is not dict or set(payload) != {
         "terminalization_idempotency_key",
@@ -196,7 +224,8 @@ def _task_cancellation_terminalization_request(
     return TaskTerminalizationRequest(
         task_id=task.id,
         worker_id=worker_id,
-        lease_expires_at=task.lease_expires_at,
+        lease_expires_at=task.lease_expires_at if claim_generation is None else None,
+        claim_generation=claim_generation,
         handoff_id=task.interrupted_handoff_id,
         kind=TaskTerminalKind.CANCELLED,
         error=error,
@@ -211,6 +240,7 @@ def _validate_ordinary_task_terminalization_against_cancellation(
     cancellation = _task_cancellation_terminalization_request(
         task,
         worker_id=request.worker_id,
+        claim_generation=request.claim_generation,
     )
     if cancellation is None:
         if request.kind is TaskTerminalKind.CANCELLED:
@@ -218,6 +248,10 @@ def _validate_ordinary_task_terminalization_against_cancellation(
                 "Worker cancellation requires a durable cancellation request."
             )
         return
+    if request.claim_generation is not None:
+        # A generation-fenced request's lease is ignored, so it is no part of the
+        # cancellation intent either.
+        request = request.model_copy(update={"lease_expires_at": None})
     if cancellation != request:
         raise TaskTerminalizationConflict("Task cancellation request must win terminalization.")
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -12,6 +12,13 @@ from tests.core.task_invocation_fixtures import (
 )
 
 from cayu.sessions.invocation import TaskExecutionSource
+from cayu.tasks.contracts import (
+    CompletionResultResolverRef,
+    CompletionVerifierRef,
+    WorkContractDraft,
+    WorkCriterion,
+    work_contract_from_draft,
+)
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.handoff import interrupted_task_handoff_request
 from cayu.tasks.queries import TaskQuery
@@ -946,3 +953,222 @@ async def assert_task_store_time_conformance(
             handoff_id=handoff_id,
             lease_seconds=30,
         )
+
+
+async def assert_claim_generation_conformance(store: TaskStore) -> None:
+    """A claim is identified by its generation, which renewals keep and holders change."""
+
+    await store.create_task(TaskCreate(task_id="generation_job", type="generation"))
+    first = await store.claim_task("stable-worker", TaskQuery(type="generation"), lease_seconds=2)
+    assert first is not None and first.claim_generation == 1
+    renewed = await store.heartbeat(
+        first.id, "stable-worker", claim_generation=first.claim_generation, extend_seconds=300
+    )
+    assert renewed.claim_generation == first.claim_generation
+    assert renewed.lease_expires_at != first.lease_expires_at
+    # A write the holder sends with its generation is accepted after any renewal,
+    # including one whose acknowledgement it never saw.
+    renewed_again = await store.heartbeat(
+        first.id, "stable-worker", claim_generation=first.claim_generation, extend_seconds=300
+    )
+    assert renewed_again.claim_generation == first.claim_generation
+    released = await store.release_task(
+        first.id, "stable-worker", claim_generation=first.claim_generation
+    )
+    assert (released.status, released.claim_generation) == (TaskStatus.PENDING, 2)
+
+    # The same worker name claims again: the old generation is refused everywhere.
+    second = await store.claim_task("stable-worker", TaskQuery(type="generation"))
+    assert second is not None and second.claim_generation == 3
+    stale = first.claim_generation
+    for attempt in (
+        lambda: store.heartbeat(second.id, "stable-worker", claim_generation=stale),
+        lambda: store.release_task(second.id, "stable-worker", claim_generation=stale),
+        lambda: store.mark_claimed_task_execution_started(
+            second.id, "stable-worker", claim_generation=stale
+        ),
+        lambda: store.request_claimed_task_cancellation(
+            second.id, "stable-worker", error={"reason": "stale"}, claim_generation=stale
+        ),
+        lambda: store.complete_task(
+            second.id, {"winner": "stale"}, worker_id="stable-worker", claim_generation=stale
+        ),
+        lambda: store.fail_task(
+            second.id, {"winner": "stale"}, worker_id="stable-worker", claim_generation=stale
+        ),
+        lambda: store.terminalize_task(
+            TaskTerminalizationRequest(
+                task_id=second.id,
+                worker_id="stable-worker",
+                claim_generation=stale,
+                kind=TaskTerminalKind.FAILED,
+                error={"winner": "stale"},
+                idempotency_key="stale-generation",
+            )
+        ),
+    ):
+        with pytest.raises(TaskClaimLost, match="superseded"):
+            await attempt()
+    with pytest.raises(TaskClaimLost, match="superseded"):
+        await store.attach_task(
+            second.id,
+            session_id="generation_session",
+            session_invocation=await task_backed_session_invocation(
+                store, second.id, "generation_session"
+            ),
+            worker_id="stable-worker",
+            claim_generation=stale,
+        )
+    with pytest.raises(TaskClaimLost, match="does not own"):
+        await store.heartbeat(second.id, "other-worker", claim_generation=second.claim_generation)
+    unchanged = await store.load_task(second.id)
+    assert unchanged == second
+
+    # A terminalization keeps its identity across a renewal and replays exactly.
+    request = TaskTerminalizationRequest(
+        task_id=second.id,
+        worker_id="stable-worker",
+        claim_generation=second.claim_generation,
+        kind=TaskTerminalKind.COMPLETED,
+        result={"winner": "current"},
+        idempotency_key="current-generation",
+    )
+    await store.heartbeat(second.id, "stable-worker", claim_generation=second.claim_generation)
+    completed = await store.terminalize_task(request)
+    assert completed.status is TaskStatus.COMPLETED
+    assert completed.claim_generation == second.claim_generation
+    assert await store.terminalize_task(request) == completed
+
+    # Attaching keeps the generation; releasing the attached worker advances it.
+    await store.create_task(TaskCreate(task_id="generation_attached", type="generation-attached"))
+    attached_claim = await store.claim_task(
+        "attached-worker", TaskQuery(type="generation-attached")
+    )
+    assert attached_claim is not None
+    attached = await store.attach_task(
+        attached_claim.id,
+        session_id="generation_attached_session",
+        session_invocation=await task_backed_session_invocation(
+            store, attached_claim.id, "generation_attached_session"
+        ),
+        worker_id="attached-worker",
+        claim_generation=attached_claim.claim_generation,
+    )
+    assert attached.claim_generation == attached_claim.claim_generation
+    detached = await store.release_attached_task_worker(
+        attached.id, "attached-worker", claim_generation=attached.claim_generation
+    )
+    assert detached.worker_id is None
+    assert detached.claim_generation == attached.claim_generation + 1
+
+    # A restart requeues the task under a new generation.
+    await store.create_task(
+        TaskCreate(task_id="generation_restart", type="generation-restart", restartable=True)
+    )
+    restart_claim = await store.claim_task("restart-worker", TaskQuery(type="generation-restart"))
+    assert restart_claim is not None
+    restarted = await store.restart_task(
+        restart_claim.id, "restart-worker", claim_generation=restart_claim.claim_generation
+    )
+    assert restarted.status is TaskStatus.PENDING
+    assert restarted.claim_generation == restart_claim.claim_generation + 1
+
+
+async def assert_claim_generation_increments_conformance(
+    store: TaskStore,
+    *,
+    outlive_lease: Callable[[timedelta], Awaitable[None]],
+) -> None:
+    """Reclaim, handoff, continuation and contract parking each start a new generation.
+
+    ``outlive_lease`` moves the store's ownership time past a lease of that length.
+    """
+
+    # Reclaim fences the lost holder whether or not it started.
+    await store.create_task(TaskCreate(task_id="reclaim_unstarted", type="reclaim"))
+    await store.create_task(TaskCreate(task_id="reclaim_started", type="reclaim"))
+    unstarted = await store.claim_task("lost", TaskQuery(type="reclaim"), lease_seconds=1)
+    started = await store.claim_task("lost", TaskQuery(type="reclaim"), lease_seconds=1)
+    assert unstarted is not None and started is not None
+    await store.mark_claimed_task_execution_started(
+        started.id, "lost", claim_generation=started.claim_generation
+    )
+    await outlive_lease(timedelta(seconds=1))
+    await store.reclaim_expired()
+    requeued = await store.load_task(unstarted.id)
+    fenced = await store.load_task(started.id)
+    assert requeued is not None and fenced is not None
+    assert requeued.status is TaskStatus.PENDING
+    assert requeued.claim_generation == unstarted.claim_generation + 1
+    assert fenced.status is TaskStatus.CLAIMED
+    assert fenced.status_reason == "cancellation_requested"
+    assert fenced.claim_generation == started.claim_generation + 1
+    with pytest.raises(TaskClaimLost, match="superseded"):
+        await store.request_claimed_task_cancellation(
+            started.id, "lost", claim_generation=started.claim_generation
+        )
+
+    # An interrupted-task handoff and its continuation claim each advance it.
+    await store.create_task(TaskCreate(task_id="handed_off", type="handoff"))
+    source = await store.claim_task("source", TaskQuery(type="handoff"), lease_seconds=60)
+    assert source is not None
+    attached = await store.attach_task(
+        source.id,
+        session_id="handed_off_session",
+        session_invocation=await task_backed_session_invocation(
+            store, source.id, "handed_off_session"
+        ),
+        worker_id="source",
+        claim_generation=source.claim_generation,
+    )
+    receipt = await store.release_interrupted_task_worker(
+        interrupted_task_handoff_request(attached, session_run_epoch=1)
+    )
+    assert receipt.task.worker_id is None
+    assert receipt.task.claim_generation == source.claim_generation + 1
+    continuation = await store.claim_interrupted_task_continuation(
+        "source",
+        TaskQuery(type="handoff"),
+        handoff_id="generation-increments-continuation",
+        lease_seconds=60,
+    )
+    assert continuation.task is not None and continuation.task.id == source.id
+    assert continuation.task.claim_generation == source.claim_generation + 2
+    with pytest.raises(TaskClaimLost, match="superseded"):
+        await store.heartbeat(source.id, "source", claim_generation=source.claim_generation)
+
+    # Parking a contracted task releases its worker under a new generation.
+    contract = work_contract_from_draft(
+        WorkContractDraft(
+            contract_id="generation-increments",
+            version=1,
+            objective="Park the contracted task.",
+            criteria=(
+                WorkCriterion(criterion_id="parked", ordinal=1, description="It is parked."),
+            ),
+            verifier=CompletionVerifierRef(
+                verifier_id="generation-verifier",
+                version="v1",
+                configuration_fingerprint="0" * 64,
+            ),
+            result_resolver=CompletionResultResolverRef(
+                resolver_id="generation-result",
+                version="v1",
+                configuration_fingerprint="1" * 64,
+            ),
+        )
+    )
+    await store.publish_work_contract(contract)
+    await store.create_task(
+        TaskCreate(task_id="parked", type="contracted", work_contract=contract.reference())
+    )
+    contracted = await store.claim_task("ordinary", TaskQuery(type="contracted"))
+    assert contracted is not None
+    parked = await store.hold_claimed_work_contract_task(
+        contracted.id,
+        worker_id="ordinary",
+        claim_generation=contracted.claim_generation,
+        contract=contract.reference(),
+    )
+    assert parked.worker_id is None
+    assert parked.claim_generation == contracted.claim_generation + 1

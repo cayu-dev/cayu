@@ -111,9 +111,9 @@ def expire_worker_start_acknowledgement(store, monkeypatch):
     monotonic = worker.monotonic
     offset = 0
 
-    async def delayed_start(self, *args):
+    async def delayed_start(self, *args, **kwargs):
         nonlocal offset
-        task = await original(*args)
+        task = await original(*args, **kwargs)
         # Keep a comfortably live durable lease. Scheduling/database latency
         # must not expire it before this test reaches its acknowledgement seam.
         offset = 301
@@ -724,9 +724,11 @@ async def test_failed_execution_entry_keeps_exact_nondispatch_owner(
     entry_calls, settlements, entry_cancellations = [], [], []
     repaired = False
 
-    async def lost_entry(instance, *args):
+    async def lost_entry(instance, *args, **kwargs):
         task = (
-            await load(instance, args[0]) if failure == "precommit" else await mark(instance, *args)
+            await load(instance, args[0])
+            if failure == "precommit"
+            else await mark(instance, *args, **kwargs)
         )
         entry_calls.append(task.model_copy(deep=True))
         entered.set()
@@ -853,8 +855,8 @@ async def test_dispatcher_ack_owner_does_not_turn_success_into_callback_failure(
     if nondispatch:
         original = store.mark_claimed_task_execution_started
 
-        async def delayed_start(self, *args):
-            task = await original(*args)
+        async def delayed_start(self, *args, **kwargs):
+            task = await original(*args, **kwargs)
             await asyncio.sleep(0.72)
             return task
 

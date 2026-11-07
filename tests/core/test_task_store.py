@@ -19,6 +19,8 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_claim_generation_conformance,
+    assert_claim_generation_increments_conformance,
     assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
@@ -120,7 +122,7 @@ def _interrupted_handoff_request(
     return TaskInterruptedHandoffRequest(
         task_id=task.id,
         worker_id=task.worker_id if worker_id is None else worker_id,
-        lease_expires_at=task.lease_expires_at,
+        claim_generation=task.claim_generation,
         session_id=task.session_id,
         session_instance_id=task.session_instance_id,
         session_run_epoch=session_run_epoch,
@@ -290,6 +292,21 @@ def test_task_stores_worker_terminalization_generation_conformance(
             if store_factory is SQLiteTaskStore:
                 resources.own(store)
             await assert_worker_terminalization_generation_conformance(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_claim_generation_conformance(
+    store_factory: StoreFactory,
+    sqlite_resources,
+):
+    async def run_store_operations() -> None:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
+            await assert_claim_generation_conformance(store)
 
     asyncio.run(run_store_operations())
 
@@ -1449,7 +1466,7 @@ def test_interrupted_task_handoff_is_exact_and_replay_safe(
         )
         changed_fields = (
             {"worker_id": "worker_b"},
-            {"lease_expires_at": request.lease_expires_at + timedelta(seconds=1)},
+            {"claim_generation": request.claim_generation + 1},
             {"session_id": "session_other_handoff"},
             {"session_instance_id": "11111111-1111-4111-8111-111111111111"},
             {"session_run_epoch": 2},
@@ -1567,7 +1584,7 @@ def test_in_memory_interrupted_task_handoff_faults_reconcile_exactly(
             unchanged = await store.load_task(request.task_id)
             assert unchanged is not None
             assert unchanged.worker_id == request.worker_id
-            assert unchanged.lease_expires_at == request.lease_expires_at
+            assert unchanged.claim_generation == request.claim_generation
         else:
             assert receipt is not None
             assert receipt.task.worker_id is None
@@ -3169,3 +3186,25 @@ async def _close_store(store: TaskStore) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_reclaim_handoff_continuation_and_parking_advance_the_claim_generation(backend, tmp_path):
+    async def scenario() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        store = (
+            InMemoryTaskStore(ownership_clock=lambda: now[0])
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "tasks.sqlite", ownership_clock=lambda: now[0])
+        )
+
+        async def outlive_lease(lease: timedelta) -> None:
+            now[0] += lease * 2
+
+        try:
+            await assert_claim_generation_increments_conformance(store, outlive_lease=outlive_lease)
+        finally:
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(scenario())

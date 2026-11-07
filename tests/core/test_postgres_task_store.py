@@ -34,6 +34,8 @@ from tests.core.task_invocation_fixtures import (
     unattributed_session_invocation_binding,
 )
 from tests.core.task_store_conformance import (
+    assert_claim_generation_conformance,
+    assert_claim_generation_increments_conformance,
     assert_exact_claimed_task_cancellation_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
@@ -3504,6 +3506,30 @@ def test_postgres_task_store_worker_terminalization_generation_conformance(postg
     _run(postgres_dsn, ops)
 
 
+def test_postgres_task_store_claim_generation_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_claim_generation_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_claim_generation_increments_conformance(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+
+        async def outlive_lease(lease: timedelta) -> None:
+            # Postgres leases run on the database clock.
+            await asyncio.sleep(lease.total_seconds() * 1.5)
+
+        try:
+            await assert_claim_generation_increments_conformance(store, outlive_lease=outlive_lease)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_postgres_task_store_exact_claimed_cancellation_conformance(postgres_dsn):
     async def ops(store):
         await assert_exact_claimed_task_cancellation_conformance(store)
@@ -4975,8 +5001,9 @@ def test_postgres_interrupted_task_handoff_converges_and_replays(postgres_dsn):
             async with store._pool.connection() as conn, conn.cursor() as cur:
                 await cur.execute(
                     "UPDATE cayu_tasks SET worker_id = NULL, lease_expires_at = NULL, "
-                    "updated_at = %s WHERE id = %s",
+                    "claim_generation = %s, updated_at = %s WHERE id = %s",
                     (
+                        first_receipt.task.claim_generation,
                         first_receipt.task.updated_at,
                         continuation_owner.id,
                     ),
@@ -5527,7 +5554,7 @@ def test_postgres_interrupted_task_handoff_faults_reconcile_exactly(
             request = TaskInterruptedHandoffRequest(
                 task_id=attached.id,
                 worker_id="worker_a",
-                lease_expires_at=attached.lease_expires_at,
+                claim_generation=attached.claim_generation,
                 session_id="session_postgres_fault_handoff",
                 session_instance_id=attached.session_instance_id,
                 session_run_epoch=1,
@@ -5545,7 +5572,7 @@ def test_postgres_interrupted_task_handoff_faults_reconcile_exactly(
                 unchanged = await store.load_task(request.task_id)
                 assert unchanged is not None
                 assert unchanged.worker_id == request.worker_id
-                assert unchanged.lease_expires_at == request.lease_expires_at
+                assert unchanged.claim_generation == request.claim_generation
             else:
                 assert receipt is not None
                 assert receipt.task.worker_id is None

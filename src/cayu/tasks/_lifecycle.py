@@ -181,6 +181,13 @@ def _ensure_task_terminalization_lease_authority(
     """Fence reclaimable claims exactly while preserving attached-task handoffs."""
 
     _ensure_owned_active_task_lease(task, request.worker_id, now=now)
+    if request.claim_generation is not None:
+        if task.claim_generation != request.claim_generation:
+            raise TaskClaimLost(
+                f"Task {task.id} claim generation {request.claim_generation} was superseded "
+                f"by {task.claim_generation}."
+            )
+        return
     if request.lease_expires_at is not None:
         _ensure_exact_owned_active_task_lease(
             task,
@@ -233,16 +240,18 @@ def _ensure_recovered_attached_task_failure_authority(
         )
     if task.status is not TaskStatus.RUNNING:
         raise TaskClaimLost("Attached-task recovery requires a running task.")
-    if (
-        task.worker_id != request.worker_id
-        or task.lease_expires_at is None
-        or request.lease_expires_at is None
-        or task.lease_expires_at != request.lease_expires_at
-    ):
+    claim_matches = (
+        task.claim_generation == request.claim_generation
+        if request.claim_generation is not None
+        else request.lease_expires_at is not None
+        and task.lease_expires_at == request.lease_expires_at
+    )
+    if task.worker_id != request.worker_id or task.lease_expires_at is None or not claim_matches:
         raise TaskClaimLost(
             "Attached-task recovery no longer owns the expected worker lease generation."
         )
-    _ensure_task_handoff_authority(task, request.handoff_id)
+    if request.claim_generation is None:
+        _ensure_task_handoff_authority(task, request.handoff_id)
     if task.lease_expires_at > now:
         raise TaskClaimLost("Attached-task recovery owner lease is still active.")
     _validate_ordinary_task_terminalization_against_cancellation(task, request)

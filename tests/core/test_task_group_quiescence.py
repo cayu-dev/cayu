@@ -524,8 +524,8 @@ async def test_undispatched_verified_preparation_entry_is_settled(store, failure
     if failure in {"wrong_claim", "missing_claim"}:
         monkeypatch.setattr(type(store), "load_task", conflicting_readback)
 
-    async def lost_entry(instance, *args):
-        await mark(instance, *args)
+    async def lost_entry(instance, *args, **kwargs):
+        await mark(instance, *args, **kwargs)
         entered.set()
         await release.wait()
         raise OSError("Preparation entry acknowledgement lost.")
@@ -663,8 +663,8 @@ async def test_resumed_ordinary_callback_gets_fresh_execution_authority(store, m
     entries = []
     mark, heartbeat = type(store).mark_claimed_task_execution_started, type(store).heartbeat
 
-    async def record_entry(instance, *args):
-        marked = await mark(instance, *args)
+    async def record_entry(instance, *args, **kwargs):
+        marked = await mark(instance, *args, **kwargs)
         entries.append(marked)
         return marked
 
@@ -1333,7 +1333,7 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
     entries = []
     mark, heartbeat = type(store).mark_claimed_task_execution_started, type(store).heartbeat
 
-    async def record_entry(instance, *args):
+    async def record_entry(instance, *args, **kwargs):
         with monkeypatch.context() as clock_patch:
             if entries and repeat_start_clock:
                 if isinstance(instance, PostgresTaskStore):
@@ -1344,7 +1344,7 @@ async def test_resumed_preparation_cannot_inherit_prior_settlement(
                     clock_patch.setattr(instance, "_database_now", fixed_database_time)
                 else:
                     clock_patch.setattr(instance, "_ownership_clock", lambda: entries[0].started_at)
-            marked = await mark(instance, *args)
+            marked = await mark(instance, *args, **kwargs)
         entries.append(marked)
         return marked
 

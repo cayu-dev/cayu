@@ -285,9 +285,9 @@ mutation, so the handler must not reload or guess a replacement lease while
 `run_task_worker(...)` is supervising it. If the handler itself completes or
 fails the task, use `complete_managed_task(task_store, task, worker_id, result)`
 or `fail_managed_task(task_store, task, worker_id, error)` with the original
-claimed `task`; those boundaries present the latest acknowledged private lease
-to the store without allowing a same-ID successor claim to be mistaken for the
-original owner.
+claimed `task`; those boundaries present that claim's generation to the store,
+so a renewal never fences them and a same-ID successor claim, which carries a
+later generation, is never mistaken for the original owner.
 
 The explicit `SESSION_INTERRUPTED` outcome is the exception to terminal handler
 completion. The helper verifies that the task is attached and its durable

@@ -747,6 +747,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     141: """CREATE INDEX IF NOT EXISTS idx_cayu_events_session_steps
         ON cayu_events(session_id, event_type)
         WHERE event_type IN ('model.completed', 'tool.call.started');""",
+    142: "",  # Task claim generation column; added by _MIGRATION_ADD_COLUMNS.
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL
@@ -4432,6 +4433,13 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    142: (
+        (
+            "cayu_tasks",
+            "claim_generation",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (claim_generation >= 0)",
+        ),
+    ),
     135: (
         (
             "cayu_tasks",

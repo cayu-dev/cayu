@@ -13,6 +13,7 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
+from cayu.tasks._cancellation import _cancellation_drain_holds
 from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.records import Task, copy_task
 from cayu.tasks.store import TaskStore
@@ -79,9 +80,9 @@ class TaskExecutionSettlement:
         and reconciles proven nondispatch instead of issuing another start.
         """
         if not self._store.supports_task_group_quiescence:
-            assert claim.worker_id is not None and claim.lease_expires_at is not None
+            assert claim.worker_id is not None
             return await self._store.mark_claimed_task_execution_started(
-                claim.id, claim.worker_id, claim.lease_expires_at
+                claim.id, claim.worker_id, claim_generation=claim.claim_generation
             )
         if self._entry_claim is not None or self._authority is not None:
             raise RuntimeError("Execution entry is already owned.")
@@ -90,9 +91,9 @@ class TaskExecutionSettlement:
         self.result = nondispatch_result
 
         async def mark() -> Task:
-            assert claim.worker_id is not None and claim.lease_expires_at is not None
+            assert claim.worker_id is not None
             result = await self._store.mark_claimed_task_execution_started(
-                claim.id, claim.worker_id, claim.lease_expires_at
+                claim.id, claim.worker_id, claim_generation=claim.claim_generation
             )
             return self._require_entry(result, readback=False)
 
@@ -138,6 +139,13 @@ class TaskExecutionSettlement:
                     status_payload=claim.status_payload,
                     error=claim.error,
                 )
+                assert claim.worker_id is not None
+                if _cancellation_drain_holds(
+                    recorded, worker_id=claim.worker_id, claim_generation=claim.claim_generation
+                ):
+                    # Reclaim's cancellation fence of this same claim advances its
+                    # generation by one; a successor claim is never accepted.
+                    ignored["claim_generation"] = claim.claim_generation
             if (
                 (readback and claim.started_at is not None)
                 or (not readback and recorded.started_at is None)

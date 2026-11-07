@@ -3190,12 +3190,14 @@ def test_task_worker_reconciles_lost_retry_settlement_acknowledgement() -> None:
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 @pytest.mark.parametrize("acknowledged", [True, False])
-def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
+def test_retry_settlement_does_not_wait_for_inflight_heartbeat_acknowledgement(
     store_kind: str,
     acknowledged: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A renewal keeps the claim generation, so its late acknowledgement fences nothing."""
+
     from cayu.runtime._task_lease_authority import TaskLeaseAuthority
     from cayu.tasks.worker import (
         _renew_task_lease_before_deadline,
@@ -3207,9 +3209,7 @@ def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
         store = _store_for_kind(store_kind, tmp_path / "heartbeat-ack.sqlite", clock)
         committed = asyncio.Event()
         release_ack = asyncio.Event()
-        receipt_checked = asyncio.Event()
         heartbeat = store.heartbeat
-        load_receipt = store.load_task_retry_settlement
 
         async def delayed_heartbeat(*args, **kwargs):
             updated = await heartbeat(*args, **kwargs)
@@ -3219,20 +3219,19 @@ def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
                 raise TaskClaimLost("heartbeat acknowledgement lost")
             return updated
 
-        async def observed_receipt(*args, **kwargs):
-            receipt = await load_receipt(*args, **kwargs)
-            receipt_checked.set()
-            return receipt
-
         monkeypatch.setattr(store, "heartbeat", delayed_heartbeat)
-        monkeypatch.setattr(store, "load_task_retry_settlement", observed_receipt)
         await store.create_task(
             TaskCreate(type="job", retry_policy=TaskRetryPolicy(max_attempts=1))
         )
         claimed = await store.claim_task("owner", lease_seconds=30)
         assert claimed is not None
         assert claimed.lease_expires_at is not None
-        authority = TaskLeaseAuthority(claimed.lease_expires_at)
+        authority = TaskLeaseAuthority(
+            claimed.lease_expires_at,
+            task_id=claimed.id,
+            worker_id="owner",
+            claim_generation=claimed.claim_generation,
+        )
         clock.value += timedelta(seconds=1)
         renewal = asyncio.create_task(
             _renew_task_lease_before_deadline(
@@ -3241,11 +3240,9 @@ def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
                 "owner",
                 30,
                 lease_authority=authority,
-                handoff_id=None,
                 claim_deadline_monotonic=time.monotonic() + 30,
             )
         )
-        settlement = None
         try:
             await asyncio.wait_for(committed.wait(), timeout=3)
             request = TaskRetrySettlementRequest(
@@ -3259,39 +3256,34 @@ def test_retry_settlement_waits_for_inflight_heartbeat_acknowledgement(
                 estimated_cost=Decimal("0.10"),
                 result={"ok": True},
             )
-            settlement = asyncio.create_task(
-                _settle_task_retry_request_with_lease_authority(store, request, authority)
+            # The renewal committed and its acknowledgement is still pending.
+            result = await asyncio.wait_for(
+                _settle_task_retry_request_with_lease_authority(store, request, authority),
+                timeout=3,
             )
-            await asyncio.wait_for(receipt_checked.wait(), timeout=3)
+            assert result.task.status is TaskStatus.COMPLETED
+            assert result.task.retry_series is not None
+            assert result.task.retry_series.cumulative_tokens == 7
+            assert result.task.retry_series.cumulative_estimated_cost == Decimal("0.10")
             release_ack.set()
             if acknowledged:
                 await renewal
-                result = await asyncio.wait_for(settlement, timeout=3)
-                assert result.task.status is TaskStatus.COMPLETED
-                assert result.task.retry_series is not None
-                assert result.task.retry_series.cumulative_tokens == 7
-                assert result.task.retry_series.cumulative_estimated_cost == Decimal("0.10")
-                replay = await _settle_task_retry_request_with_lease_authority(
-                    store, request, authority
-                )
-                assert replay == result
-                receipt = await load_receipt(claimed.id, request.idempotency_key)
-                assert receipt is not None
-                assert result == receipt
             else:
                 with pytest.raises(TaskClaimLost, match="acknowledgement lost"):
                     await renewal
-                with pytest.raises(TaskClaimLost):
-                    await asyncio.wait_for(settlement, timeout=3)
-                assert authority.lease_expires_at == claimed.lease_expires_at
-                assert await load_receipt(claimed.id, request.idempotency_key) is None
+            replay = await _settle_task_retry_request_with_lease_authority(
+                store, request, authority
+            )
+            assert replay == result
+            assert (
+                await store.load_task_retry_settlement(claimed.id, request.idempotency_key)
+                == result
+            )
         finally:
             release_ack.set()
-            pending = [renewal] + ([settlement] if settlement is not None else [])
-            for task in pending:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            if not renewal.done():
+                renewal.cancel()
+            await asyncio.gather(renewal, return_exceptions=True)
             await _close(store)
 
     asyncio.run(run())
@@ -3401,8 +3393,7 @@ def test_retry_worker_fences_replacement_while_lost_lease_handler_drains(
             task_id,
             worker_id,
             *,
-            lease_expires_at,
-            handoff_id=None,
+            claim_generation=None,
             extend_seconds=300,
         ):
             self.heartbeat_calls += 1
@@ -3412,8 +3403,7 @@ def test_retry_worker_fences_replacement_while_lost_lease_handler_drains(
             return await super().heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
-                handoff_id=handoff_id,
+                claim_generation=claim_generation,
                 extend_seconds=extend_seconds,
             )
 
@@ -3581,8 +3571,7 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
             task_id,
             worker_id,
             *,
-            lease_expires_at,
-            handoff_id=None,
+            claim_generation=None,
             extend_seconds=300,
         ):
             self.heartbeat_calls += 1
@@ -3590,8 +3579,7 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
                 return await super().heartbeat(
                     task_id,
                     worker_id,
-                    lease_expires_at=lease_expires_at,
-                    handoff_id=handoff_id,
+                    claim_generation=claim_generation,
                     extend_seconds=extend_seconds,
                 )
             self.heartbeat_failed.set()
@@ -3682,8 +3670,7 @@ def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_se
             task_id,
             worker_id,
             *,
-            lease_expires_at,
-            handoff_id=None,
+            claim_generation=None,
             extend_seconds=300,
         ):
             if self.settlement_started.is_set():
@@ -3692,8 +3679,7 @@ def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_se
             return await super().heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
-                handoff_id=handoff_id,
+                claim_generation=claim_generation,
                 extend_seconds=extend_seconds,
             )
 

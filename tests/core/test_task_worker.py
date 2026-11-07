@@ -540,15 +540,13 @@ def test_task_worker_rejects_heartbeat_acknowledged_after_its_lease(
                 task_id,
                 worker_id,
                 *,
-                lease_expires_at,
-                handoff_id=None,
+                claim_generation=None,
                 extend_seconds=300,
             ):
                 renewed = await super().heartbeat(
                     task_id,
                     worker_id,
-                    lease_expires_at=lease_expires_at,
-                    handoff_id=handoff_id,
+                    claim_generation=claim_generation,
                     extend_seconds=extend_seconds,
                 )
                 if not self.heartbeat_committed.is_set():
@@ -605,8 +603,7 @@ def test_task_worker_stops_handler_when_heartbeat_stalls_past_lease() -> None:
                 task_id,
                 worker_id,
                 *,
-                lease_expires_at,
-                handoff_id=None,
+                claim_generation=None,
                 extend_seconds=300,
             ):
                 self.heartbeat_calls += 1
@@ -616,8 +613,7 @@ def test_task_worker_stops_handler_when_heartbeat_stalls_past_lease() -> None:
                 return await super().heartbeat(
                     task_id,
                     worker_id,
-                    lease_expires_at=lease_expires_at,
-                    handoff_id=handoff_id,
+                    claim_generation=claim_generation,
                     extend_seconds=extend_seconds,
                 )
 
@@ -711,8 +707,10 @@ def test_task_worker_cancellation_fences_opaque_handler_until_natural_settlement
                 self,
                 task_id,
                 worker_id,
-                lease_expires_at,
+                lease_expires_at=None,
                 error=None,
+                *,
+                claim_generation=None,
             ):
                 self.cancel_calls += 1
                 cancelled = await super().request_claimed_task_cancellation(
@@ -720,6 +718,7 @@ def test_task_worker_cancellation_fences_opaque_handler_until_natural_settlement
                     worker_id,
                     lease_expires_at,
                     error,
+                    claim_generation=claim_generation,
                 )
                 if self.cancel_calls == 1:
                     raise ConnectionError("cancellation acknowledgement lost")
@@ -809,8 +808,10 @@ def test_expired_dispatched_task_cannot_be_reclaimed_while_fence_publication_wai
                 self,
                 task_id,
                 worker_id,
-                lease_expires_at,
+                lease_expires_at=None,
                 error=None,
+                *,
+                claim_generation=None,
             ):
                 self.fence_started.set()
                 await self.release_fence.wait()
@@ -819,6 +820,7 @@ def test_expired_dispatched_task_cannot_be_reclaimed_while_fence_publication_wai
                     worker_id,
                     lease_expires_at,
                     error,
+                    claim_generation=claim_generation,
                 )
 
         store = DelayedCancellationStore()
@@ -981,13 +983,13 @@ def test_task_retry_worker_revalidates_cancellation_after_deadline_query() -> No
             task_id,
             worker_id,
             *,
-            lease_expires_at,
+            claim_generation=None,
         ):
             await self.cancel_task(task_id, {"code": "cancel_during_deadline_query"})
             return await super().task_retry_deadline_elapsed(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
             )
 
     async def scenario() -> None:
@@ -1031,7 +1033,14 @@ def test_task_retry_worker_revalidates_cancellation_after_deadline_query() -> No
     asyncio.run(scenario())
 
 
-def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
+def test_completed_handler_disposition_commits_while_its_heartbeat_stalls() -> None:
+    """Heartbeat last: the disposition commits under the claim the store still holds.
+
+    The store accepts the write only while the claim's generation holds a live
+    lease, so a stalled renewal no longer has to be turned into a cancellation
+    fence before the handler's outcome can be recorded.
+    """
+
     class BlockingHeartbeatStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
@@ -1046,8 +1055,7 @@ def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
             task_id,
             worker_id,
             *,
-            lease_expires_at,
-            handoff_id=None,
+            claim_generation=None,
             extend_seconds=300,
         ):
             self.heartbeat_calls += 1
@@ -1057,8 +1065,7 @@ def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
             return await super().heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
-                handoff_id=handoff_id,
+                claim_generation=claim_generation,
                 extend_seconds=extend_seconds,
             )
 
@@ -1091,13 +1098,15 @@ def test_completed_handler_still_fences_a_stalled_heartbeat() -> None:
         await asyncio.wait_for(store.periodic_heartbeat_started.wait(), timeout=10)
         allow_handler_completion.set()
 
-        with pytest.raises(TaskClaimLost, match="positively known lease deadline"):
-            await asyncio.wait_for(worker, timeout=2)
+        assert await asyncio.wait_for(worker, timeout=2) == 1
         assert effects == ["completed"]
         terminal = await store.load_task("completed-before-heartbeat")
         assert terminal is not None
-        assert terminal.status is TaskStatus.CANCELLED
-        assert terminal.worker_id is None
+        assert terminal.status is TaskStatus.FAILED
+        assert terminal.error is not None
+        assert terminal.error["message"] == (
+            "Task handler returned without completing or failing the task."
+        )
         assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
         assert await store.claim_task("replacement-worker") is None
 
@@ -1117,15 +1126,13 @@ def test_task_worker_rechecks_cancellation_marker_before_handler_dispatch() -> N
                 task_id,
                 worker_id,
                 *,
-                lease_expires_at,
-                handoff_id=None,
+                claim_generation=None,
                 extend_seconds=300,
             ):
                 renewed = await super().heartbeat(
                     task_id,
                     worker_id,
-                    lease_expires_at=lease_expires_at,
-                    handoff_id=handoff_id,
+                    claim_generation=claim_generation,
                     extend_seconds=extend_seconds,
                 )
                 if renewed.status_reason is None:
@@ -1234,13 +1241,11 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at,
-            handoff_id: str | None = None,
+            claim_generation=None,
             extend_seconds: int,
         ) -> None:
-            assert handoff_id is None
             assert elapsed < 1.0
-            del lease_expires_at
+            del claim_generation
             observed_heartbeats.append((task_id, worker_id, extend_seconds, elapsed))
             stop.set()
 
@@ -1258,7 +1263,9 @@ async def test_one_second_task_lease_heartbeats_after_one_third(
         "worker-a",
         1,
         stop,
-        lease_authority=task_worker_module._TaskLeaseAuthority(datetime.now(UTC)),
+        lease_authority=task_worker_module._TaskLeaseAuthority(
+            datetime.now(UTC), claim_generation=1
+        ),
     )
 
     assert observed_heartbeats == [("task-1", "worker-a", 1, pytest.approx(1 / 3))]
@@ -1287,11 +1294,10 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at: datetime,
-            handoff_id: str | None = None,
+            claim_generation: int | None = None,
             extend_seconds: int,
         ) -> Task:
-            del task_id, worker_id, lease_expires_at, handoff_id, extend_seconds
+            del task_id, worker_id, claim_generation, extend_seconds
             return renewed
 
         async def task_retry_deadline_elapsed(
@@ -1299,9 +1305,9 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at: datetime,
+            claim_generation: int | None = None,
         ) -> bool:
-            del task_id, worker_id, lease_expires_at
+            del task_id, worker_id, claim_generation
             raise inspection_failure
 
         async def load_task(self, task_id: str) -> Task:
@@ -1321,7 +1327,9 @@ async def test_retry_deadline_inspection_failure_reconciles_terminal_task(
         "worker-a",
         3,
         asyncio.Event(),
-        lease_authority=task_worker_module._TaskLeaseAuthority(renewed.lease_expires_at),
+        lease_authority=task_worker_module._TaskLeaseAuthority(
+            renewed.lease_expires_at, claim_generation=renewed.claim_generation
+        ),
         enforce_retry_deadline=True,
     )
 
@@ -1342,12 +1350,11 @@ async def test_task_heartbeat_rejects_acknowledgement_that_consumed_renewed_leas
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at,
-            handoff_id: str | None = None,
+            claim_generation: int | None = None,
             extend_seconds: int,
         ) -> None:
             nonlocal monotonic_time
-            del task_id, worker_id, lease_expires_at, handoff_id, extend_seconds
+            del task_id, worker_id, claim_generation, extend_seconds
             monotonic_time += 2
 
     async def advance_clock(seconds: float, wait_stop: asyncio.Event) -> bool:
@@ -1365,7 +1372,9 @@ async def test_task_heartbeat_rejects_acknowledgement_that_consumed_renewed_leas
             "worker-a",
             1,
             stop,
-            lease_authority=task_worker_module._TaskLeaseAuthority(datetime.now(UTC)),
+            lease_authority=task_worker_module._TaskLeaseAuthority(
+                datetime.now(UTC), claim_generation=1
+            ),
         )
 
 
@@ -1377,7 +1386,9 @@ async def test_task_cancellation_fence_rejects_reused_worker_lease_generation() 
     stale = await store.claim_task("shared-worker", lease_seconds=1)
     assert stale is not None
     assert stale.lease_expires_at is not None
-    stale_authority = task_worker_module._TaskLeaseAuthority(stale.lease_expires_at)
+    stale_authority = task_worker_module._TaskLeaseAuthority(
+        stale.lease_expires_at, claim_generation=stale.claim_generation
+    )
 
     ownership_now += timedelta(seconds=1)
     assert [task.id for task in await store.reclaim_expired()] == [stale.id]
@@ -1385,7 +1396,7 @@ async def test_task_cancellation_fence_rejects_reused_worker_lease_generation() 
     assert successor is not None
     assert successor.lease_expires_at != stale.lease_expires_at
 
-    with pytest.raises(TaskClaimLost, match="expected lease generation"):
+    with pytest.raises(TaskClaimLost, match="expected claim generation"):
         await task_worker_module._request_task_cancellation_fence(
             store,
             stale,
@@ -1536,15 +1547,13 @@ def test_worker_uses_current_hidden_lease_for_session_attachment(
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at: datetime,
-            handoff_id: str | None = None,
+            claim_generation=None,
             extend_seconds: int = 300,
         ) -> Task:
             updated = await super().heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
-                handoff_id=handoff_id,
+                claim_generation=claim_generation,
                 extend_seconds=extend_seconds,
             )
             assert updated.lease_expires_at is not None
@@ -1591,13 +1600,14 @@ def test_worker_uses_current_hidden_lease_for_session_attachment(
 
 @pytest.mark.parametrize("terminal_kind", ["complete", "fail"])
 @pytest.mark.parametrize("entrypoint", ["managed_helper", "store_method"])
-def test_managed_handler_terminalization_uses_latest_acknowledged_lease(
+def test_managed_handler_terminalization_is_fenced_by_the_claim_generation(
     terminal_kind: str,
     entrypoint: str,
 ) -> None:
     periodic_heartbeat = asyncio.Event()
     acknowledged_leases: list[datetime] = []
-    terminal_leases: list[datetime | None] = []
+    terminal_authority: list[tuple[datetime | None, int | None]] = []
+    claim_generations: list[int] = []
 
     class LeaseRecordingStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
@@ -1611,11 +1621,15 @@ def test_managed_handler_terminalization_uses_latest_acknowledged_lease(
             return updated
 
         async def complete_task(self, task_id, result, **kwargs):
-            terminal_leases.append(kwargs.get("lease_expires_at"))
+            terminal_authority.append(
+                (kwargs.get("lease_expires_at"), kwargs.get("claim_generation"))
+            )
             return await super().complete_task(task_id, result, **kwargs)
 
         async def fail_task(self, task_id, error, **kwargs):
-            terminal_leases.append(kwargs.get("lease_expires_at"))
+            terminal_authority.append(
+                (kwargs.get("lease_expires_at"), kwargs.get("claim_generation"))
+            )
             return await super().fail_task(task_id, error, **kwargs)
 
     async def scenario() -> Task | None:
@@ -1627,6 +1641,7 @@ def test_managed_handler_terminalization_uses_latest_acknowledged_lease(
 
         async def handler(_app: CayuApp, task: Task, worker_id: str) -> None:
             original_lease = task.lease_expires_at
+            claim_generations.append(task.claim_generation)
             await asyncio.wait_for(periodic_heartbeat.wait(), timeout=3)
             assert acknowledged_leases[-1] != original_lease
             if terminal_kind == "complete":
@@ -1671,11 +1686,17 @@ def test_managed_handler_terminalization_uses_latest_acknowledged_lease(
     assert task.status is (
         TaskStatus.COMPLETED if terminal_kind == "complete" else TaskStatus.FAILED
     )
-    assert len(terminal_leases) == 1
+    # Renewals keep the claim generation: the helper presents it, and a handler
+    # that presents its first (since renewed) lease is fenced by it too.
+    assert len(terminal_authority) == 1
+    presented_lease, presented_generation = terminal_authority[0]
     if entrypoint == "managed_helper":
-        assert terminal_leases[0] == acknowledged_leases[-1]
+        assert presented_lease is None
+        assert presented_generation == claim_generations[0] == task.claim_generation
     else:
-        assert terminal_leases[0] != acknowledged_leases[-1]
+        assert presented_lease is not None
+        assert presented_lease != acknowledged_leases[-1]
+        assert presented_generation is None
 
 
 @pytest.mark.parametrize("provider_fails", [False, True])
@@ -1855,6 +1876,7 @@ def test_owner_lost_cancellation_reconciliation_uses_store_owned_time() -> None:
             store,
             created.id,
             "store-time-worker",
+            claim_generation=claimed.claim_generation,
         )
         terminal = await store.load_task(created.id)
         assert terminal is not None
@@ -2193,6 +2215,7 @@ def test_run_task_worker_keeps_same_key_changed_intent_conflict_explicit() -> No
                     task_id=request.task_id,
                     worker_id=request.worker_id,
                     lease_expires_at=request.lease_expires_at,
+                    claim_generation=request.claim_generation,
                     kind=TaskTerminalKind.COMPLETED,
                     result={"winner": "other-intent"},
                     idempotency_key=request.idempotency_key,
@@ -3113,7 +3136,7 @@ def test_terminal_peer_winner_during_handoff_does_not_stop_worker() -> None:
                     TaskTerminalizationRequest(
                         task_id=request.task_id,
                         worker_id=request.worker_id,
-                        lease_expires_at=request.lease_expires_at,
+                        claim_generation=request.claim_generation,
                         kind=TaskTerminalKind.COMPLETED,
                         result={"winner": "peer"},
                         idempotency_key="terminal-peer-winner",

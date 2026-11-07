@@ -478,7 +478,7 @@ class WorkAttemptExecution:
             presented_lease_expires_at=stable.task_lease_expires_at,
         ) as effective_lease:
             prepare = prepare.model_copy(
-                update={"task_lease_expires_at": effective_lease},
+                update={"task_lease_expires_at": effective_lease.lease_expires_at},
                 deep=True,
             )
             outcome = await capture_task_store_operation(

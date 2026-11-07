@@ -433,6 +433,64 @@ def test_operator_cancellation_wins_the_terminal_settlement_race() -> None:
     asyncio.run(run())
 
 
+def test_cancellation_fallback_settles_after_a_renewal_moves_the_lease() -> None:
+    class RenewingAfterReadStore(InMemoryTaskStore):
+        settlement_refused = False
+        renewed_after_read = False
+
+        async def settle_task_retry_attempt(self, request):
+            try:
+                return await super().settle_task_retry_attempt(request)
+            except Exception:
+                self.settlement_refused = True
+                raise
+
+        async def load_task(self, task_id):
+            task = await super().load_task(task_id)
+            if (
+                self.settlement_refused
+                and not self.renewed_after_read
+                and task is not None
+                and task.status is TaskStatus.CLAIMED
+            ):
+                # A heartbeat commits between the fallback's read and its write.
+                self.renewed_after_read = True
+                await super().heartbeat(
+                    task.id,
+                    task.worker_id,
+                    claim_generation=task.claim_generation,
+                    extend_seconds=60,
+                )
+            return task
+
+    async def run() -> None:
+        store = RenewingAfterReadStore()
+        generator = _BlockingGenerator()
+        curator, _, _ = _curator(generator=generator)
+        queue = KnowledgeEnrichmentQueue(
+            store,
+            curator_config=curator.config,
+            access_scope=curator.access_scope,
+            config=_queue_config(),
+        )
+        submitted = await queue.submit(_request(queue))
+        processing = asyncio.create_task(
+            KnowledgeEnrichmentWorker(queue, curator).process_next(
+                worker_id="worker-1",
+                lease_seconds=30,
+            )
+        )
+        await generator.started.wait()
+        await store.cancel_task(submitted.current_task_id, {"code": "operator_requested"})
+        generator.release.set()
+        cancelled = await processing
+        assert store.renewed_after_read
+        assert cancelled is not None
+        assert cancelled.status is KnowledgeEnrichmentJobStatus.CANCELLED
+
+    asyncio.run(run())
+
+
 def test_retryable_worker_failure_creates_a_fenced_successor() -> None:
     class FlakyCurator(KnowledgeCurator):
         calls = 0
@@ -900,8 +958,7 @@ def test_heartbeat_authority_loss_cannot_publish_a_terminal_job_result() -> None
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at: datetime,
-            handoff_id: str | None = None,
+            claim_generation: int | None = None,
             extend_seconds: int = 300,
         ):
             raise TaskClaimLost("lease transferred")
@@ -1642,7 +1699,7 @@ def test_durable_knowledge_enrichment_example_uses_a_fresh_worker_process() -> N
     "backend", ["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)]
 )
 @pytest.mark.parametrize("retryable", [False, True])
-def test_renewed_lease_settlement_waits_for_heartbeat_acknowledgement(
+def test_settlement_does_not_wait_for_a_pending_heartbeat_acknowledgement(
     tmp_path, backend, retryable, request
 ) -> None:
     async def run() -> None:
@@ -1678,21 +1735,21 @@ def test_renewed_lease_settlement_waits_for_heartbeat_acknowledgement(
         await queue.submit(_request(queue, operation_id=f"renewed-{backend}-{retryable}-{uuid4()}"))
         original_heartbeat = store.heartbeat
         original_settle = store.settle_task_retry_attempt
-        renewed_lease = None
+        claim_generations = []
 
         async def heartbeat(*args, **kwargs):
-            nonlocal renewed_lease
             renewed = await original_heartbeat(*args, **kwargs)
-            assert renewed.lease_expires_at != kwargs["lease_expires_at"]
-            renewed_lease = renewed.lease_expires_at
+            # A renewal keeps the claim generation every write presents.
+            assert renewed.claim_generation == kwargs["claim_generation"]
+            claim_generations.append(renewed.claim_generation)
             renewal_committed.set()
             await release_heartbeat.wait()
             return renewed
 
         async def settle(request):
             settlement_started.set()
-            assert release_heartbeat.is_set()
-            assert request.lease_expires_at == renewed_lease
+            assert request.lease_expires_at is None
+            assert request.claim_generation == claim_generations[0]
             return await original_settle(request)
 
         store.heartbeat = heartbeat
@@ -1706,9 +1763,9 @@ def test_renewed_lease_settlement_waits_for_heartbeat_acknowledgement(
             await asyncio.wait_for(generator.started.wait(), 5)
             await asyncio.wait_for(renewal_committed.wait(), 5)
             generator.release.set()
-            for _ in range(10):
-                await asyncio.sleep(0)
-            assert not settlement_started.is_set()
+            # The renewal committed but its acknowledgement is still pending: the
+            # settlement presents the claim generation and does not wait for it.
+            await asyncio.wait_for(settlement_started.wait(), 5)
             release_heartbeat.set()
             job = await asyncio.wait_for(task, 5)
             assert job is not None
@@ -1820,9 +1877,13 @@ def test_settlement_keeps_lease_live_during_store_delays(
             if delay_kind == "lost_ack":
                 assert len(requests) == len(reconciled_receipts) == 1
             else:
+                # Renewals kept the lease live across the delay; every attempt
+                # presents the same claim generation, never a lease.
                 assert renewed_leases
-                assert requests[-1].lease_expires_at in renewed_leases
-                assert requests[-1].lease_expires_at != requests[0].lease_expires_at
+                assert {request.claim_generation for request in requests} == {
+                    requests[0].claim_generation
+                }
+                assert all(request.lease_expires_at is None for request in requests)
             tasks = await store.list_tasks()
             successors = [
                 task
@@ -1885,7 +1946,9 @@ def test_malformed_claim_keeps_lease_live_during_terminalization_backoff(tmp_pat
                 )
             rejected = await store.load_task(malformed.id)
             assert rejected is not None and rejected.status is TaskStatus.FAILED
-            assert requests[-1].lease_expires_at != requests[0].lease_expires_at
+            # Both attempts present the claim's generation, not its moving lease.
+            assert requests[-1].claim_generation == requests[0].claim_generation
+            assert requests[-1].lease_expires_at is None
         finally:
             if backend != "memory":
                 await store.close()

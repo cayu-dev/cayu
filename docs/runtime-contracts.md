@@ -6841,15 +6841,15 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_task(task_id)`
 - `list_tasks(TaskQuery(...))`
 - `start_task(task_id, session_id=..., session_invocation=...)`
-- `attach_task(task_id, session_id=..., session_invocation=..., worker_id=..., lease_expires_at=...)`
+- `attach_task(task_id, session_id=..., session_invocation=..., worker_id=..., claim_generation=...)`
 - `pause_task(task_id, reason=..., payload=...)`
 - `block_task(task_id, reason=..., payload=...)`
 - `mark_task_needs_attention(task_id, reason=..., payload=...)`
 - `resume_task(task_id)`
 - `claim_task(worker_id, TaskQuery(...), lease_seconds=...)`
-- `heartbeat(task_id, worker_id, lease_expires_at=..., handoff_id=..., extend_seconds=...)`
-- `release_task(task_id, worker_id, lease_expires_at=...)`
-- `release_attached_task_worker(task_id, worker_id, lease_expires_at=...)`
+- `heartbeat(task_id, worker_id, claim_generation=..., extend_seconds=...)`
+- `release_task(task_id, worker_id, claim_generation=...)`
+- `release_attached_task_worker(task_id, worker_id, claim_generation=...)`
 - `release_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `recover_interrupted_task_worker(TaskInterruptedHandoffRequest(...))`
 - `load_interrupted_task_handoff_receipt(task_id, handoff_id)`
@@ -6858,14 +6858,17 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `load_active_attached_task_worker(task_id, worker_id, session_id=..., session_instance_id=...)`
 - `load_direct_attached_task_resume(task_id, session_id=..., session_instance_id=...)`
 - `reclaim_expired(query=..., max_reclaims=...)`
-- `complete_task(task_id, result, worker_id=..., lease_expires_at=..., handoff_id=...)`
-- `fail_task(task_id, error, worker_id=..., lease_expires_at=..., handoff_id=...)`
+- `complete_task(task_id, result, worker_id=..., claim_generation=..., handoff_id=...)`
+- `fail_task(task_id, error, worker_id=..., claim_generation=..., handoff_id=...)`
 - `terminalize_task(TaskTerminalizationRequest(...))`
 - `load_task_terminalization_receipt(task_id, idempotency_key)`
-- `mark_claimed_task_execution_started(task_id, worker_id, lease_expires_at)`
-- `request_claimed_task_cancellation(task_id, worker_id, lease_expires_at, error=...)`
+- `mark_claimed_task_execution_started(task_id, worker_id, claim_generation=...)`
+- `request_claimed_task_cancellation(task_id, worker_id, error=..., claim_generation=...)`
 - `reconcile_task_cancellation(TaskCancellationReconciliationRequest(...))`
 - `cancel_task(task_id, error=...)`
+
+Each claimed mutation above also still accepts the claim's exact
+`lease_expires_at` in place of `claim_generation`; that path is deprecated.
 
 Bound claims are advertised by `supports_bound_interrupted_task_handoffs`.
 Their optional `TaskContinuationExpectation` (from `cayu.tasks.continuation_claims`)
@@ -7835,23 +7838,65 @@ There are two supported task execution modes:
 1. **Direct task/session link.** `CayuApp(task_store=...)` can link an agent run to an existing pending task through `RunRequest.task_id`. The runtime starts that task with the created session id, emits `task.started`, and marks the task completed or failed when the run reaches those terminal states. Use this when app code already decided exactly which task and session should run.
 2. **Worker-claimed queue task.** App-owned worker code can atomically claim one unattached pending task with `claim_task(worker_id, query)`. The claim marks the task `claimed`, records `worker_id`, and sets `lease_expires_at`; it does not attach a session or mark the task started. The worker must pass `task_id`, `task_worker_id`, and the exact returned `lease_expires_at` as `task_lease_expires_at` to `RunRequest`; Cayu then calls `attach_task(...)` with that complete claim-generation tuple to move the live owned claim to `running` with the created session id. The worker must carry the same exact lease generation into claimed-task terminalization, verified-work parking, cancellation fencing, `heartbeat(...)`, `release_task(...)`, and `release_attached_task_worker(...)`. This prevents a delayed request from an earlier claim from mutating a successor claim that deliberately reuses the same worker ID. The worker should heartbeat while it is doing pre-run work or while the agent run is active. It can release an unattached task before session attachment if it decides not to process it. Another worker can call `reclaim_expired(...)` to return abandoned unattached claims to `pending`.
 
-`run_task_worker(...)` coordinates its private heartbeat generation with session
-attachment, managed handler completion/failure, retry settlement, and retry-
-deadline decisions. Ordinary terminal mutations serialize with heartbeat renewal;
-retry settlement instead keeps renewing while a potentially slow durable mutation
-is in flight, reconciles its exact receipt after acknowledgement loss, and retries
-against a newer positively acknowledged lease only when no prior receipt exists.
-A handler still passes the lease snapshot it received at dispatch;
-when that exact runtime-owned handler has renewed meanwhile, Cayu atomically
-uses the latest positively acknowledged generation for attachment. Equal values
-outside that managed handler context do not receive this process-local authority.
-Handlers that directly settle ordinary tasks call `complete_managed_task(...)`
-or `fail_managed_task(...)`; these functions carry the handler's original task
-snapshot through the private authority boundary and present the latest
-acknowledged lease to custom stores. Built-in stores apply the same boundary to
-their direct completion and failure implementations. A same-worker successor
-claim never enters that private authority and rejects every delayed mutation
-from the prior lease generation.
+A claim is identified by its durable `Task.claim_generation` (storage revision
+142, a breaking revision: stop every worker and dispatcher, run `cayu storage
+migrate --acknowledge-breaking 142`, then start the new binaries; on Postgres the
+new column's `CHECK` constraint is validated by a full scan of `cayu_tasks` under
+an `ACCESS EXCLUSIVE` lock, so a large task table extends the migration), not by
+its worker name or its exact lease expiry.
+`claim_task`, `claim_interrupted_task_continuation`, `release_task`,
+`release_attached_task_worker`, `reclaim_expired` (both the requeue and the
+started-task cancellation fence), both interrupted-task handoffs, `restart_task`,
+`restart_abandoned_task` and contracted-task parking advance it by one; a
+heartbeat keeps it and only moves `lease_expires_at`; terminal transitions keep
+the value of the claim that ended. Claimed mutations accept
+`claim_generation=...` (`heartbeat`, `release_task`, `release_attached_task_worker`,
+`restart_task`, `attach_task`, `complete_task`, `fail_task`,
+`mark_claimed_task_execution_started`, `request_claimed_task_cancellation`,
+`task_retry_deadline_elapsed`, `enforce_task_retry_deadline`,
+`hold_claimed_work_contract_task`, and the `TaskTerminalizationRequest`,
+`TaskRetrySettlementRequest` and `TaskInterruptedHandoffRequest` models). A store
+accepts one only while the row still carries that generation and is claimed or
+running under the same worker with a live lease (a cancellation request needs no
+live lease, as before). The presented lease expiry is then ignored, so a renewal
+whose acknowledgement was lost never fences its own holder, and a write meant for
+an earlier claim is refused even when a successor reuses the worker name. A
+refusal says whether the generation was superseded or the lease expired. A
+terminalization request with a generation leaves the lease out of its digest
+(`cayu.task-terminalization.v4`), and an interrupted-task handoff id is derived
+from the generation (`cayu.task-interrupted-handoff-id.v3`), so a retry after a
+renewal keeps its identity; receipts written before the upgrade still replay
+through the earlier digests. Presenting only `lease_expires_at` is the deprecated
+exact-token path: it still works, and is removed in a later release. Inside
+`src/cayu` a ratchet test refuses new calls that present only a lease to a
+claimed mutation or request model, cancellation requests rebuilt from the row
+without the drain's generation, and task-claim `model_copy` updates that set a
+lease without a generation; a generation passed through a variable is taken on
+trust, and the remaining owner-lost and receipt-derivation sites are listed in
+it with their reasons.
+
+`run_task_worker(...)` binds every mutation of a handler's claim to the
+generation of the claim or continuation row it received. The heartbeat keeps
+renewing until a handler's outcome disposition has committed, for ordinary and
+retry-series tasks alike, and a disposition runs without holding the renewal
+lock. An ordinary task's cancellation drain also settles under the running
+heartbeat. Two settlements still stop renewing first: the restart of a
+restartable task on shutdown, and a drained retry-series cancellation. If the
+lease lapses before one commits, owner-lost reconciliation or reclaim's
+cancellation fence settles the claim instead, so a slow store can turn such a
+restart into a cancellation. An ordinary disposition that has not committed after one lease (at least
+five minutes) is abandoned: the claim stops renewing and is left to lease expiry
+and reclaim. A disposition that finds the row at another generation writes
+nothing, and one the store refuses is logged as `Task disposition lost its
+claim` with the task and its generation. Retry settlement is one store call under
+the generation. Inside the handler, lease-only `complete_task`/`fail_task` calls
+and runtime attachment resolve to the handler's generation through the private
+authority boundary. Handlers that directly settle ordinary tasks call
+`complete_managed_task(...)` or `fail_managed_task(...)`, which present the
+generation of the task snapshot the handler received. A same-worker successor
+claim never enters that private authority, and its generation refuses every
+delayed mutation of the prior claim. `TaskStoreDispatcher` binds a queued
+dispatch the same way.
 An attachment acknowledgement that consumes the conservative local lease
 deadline is rejected before model or tool dispatch. A direct custom worker may
 use a store without idempotent terminalization only outside the generic worker;

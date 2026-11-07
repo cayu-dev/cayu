@@ -273,7 +273,7 @@ async def handle_coding_task(app, claimed, worker_id):
 ```
 
 `run_task_worker` owns the heartbeat while this handler executes.
-`complete_managed_task` uses its latest acknowledged lease and returns a durable
+`complete_managed_task` presents the claim generation of that task and returns a durable
 `Task`; it does not create a caller-keyed `TaskTerminalizationReceipt`. Do not
 load a lease and construct a raw `TaskTerminalizationRequest` alongside that
 heartbeat merely to obtain such a receipt. Extending the lease duration does not

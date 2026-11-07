@@ -97,6 +97,13 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._claim_fence import (
+    TaskClaimFence,
+    ensure_claim_fence,
+    fenced_claim_lease,
+    released_claim_lease,
+    validate_claim_generation,
+)
 from cayu.tasks._failure_scrub import (
     TaskFailureScrub,
     TaskFailureScrubResult,
@@ -395,7 +402,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 139
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 142
 
 
 @model_store_surface("tasks")
@@ -1327,7 +1334,7 @@ class SQLiteTaskStore(TaskStore):
                 status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
                 updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
                 work_contract_json = ?, available_at = ?, schedule_json = ?, restart_count = ?,
-                restart_history_json = ?
+                restart_history_json = ?, claim_generation = ?
             WHERE id = ?
             """,
             (
@@ -1359,6 +1366,7 @@ class SQLiteTaskStore(TaskStore):
                 else sqlite_records.json_dumps(task.schedule.model_dump(mode="json")),
                 task.restart_count,
                 sqlite_records.restart_history_json(task),
+                task.claim_generation,
                 task.id,
             ),
         )
@@ -1463,6 +1471,7 @@ class SQLiteTaskStore(TaskStore):
         *,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         contract: WorkContractRef,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -1472,6 +1481,7 @@ class SQLiteTaskStore(TaskStore):
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:
             raise TypeError("contract must be a WorkContractRef.")
@@ -1479,12 +1489,13 @@ class SQLiteTaskStore(TaskStore):
             with self._verified_transaction_unlocked():
                 task = self._require_task_unlocked(task_id)
                 now = self._ownership_clock()
-                if expected_lease is None:
+                if expected_lease is None and claim_generation is None:
                     raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
-                _ensure_exact_owned_active_task_lease(
+                fenced_claim_lease(
                     task,
                     worker_id,
-                    expected_lease,
+                    lease_expires_at=expected_lease,
+                    claim_generation=claim_generation,
                     now=now,
                 )
                 if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
@@ -1502,6 +1513,7 @@ class SQLiteTaskStore(TaskStore):
                         },
                         "worker_id": None,
                         "lease_expires_at": None,
+                        "claim_generation": task.claim_generation + 1,
                         "updated_at": now,
                     }
                 )
@@ -4165,9 +4177,9 @@ class SQLiteTaskStore(TaskStore):
                     retry_series_json,
                     work_contract_json,
                     schedule_json, restartable, restart_count, concurrency_key,
-                    max_restarts, restart_history_json
+                    max_restarts, restart_history_json, claim_generation
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_records.task_to_row_values(task),
             )
@@ -4928,6 +4940,7 @@ class SQLiteTaskStore(TaskStore):
         session_invocation: SessionInvocationBinding,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -4937,6 +4950,7 @@ class SQLiteTaskStore(TaskStore):
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
             with self._verified_transaction_unlocked():
@@ -4955,12 +4969,13 @@ class SQLiteTaskStore(TaskStore):
                     now=now,
                 ):
                     self._raise_task_claim_attach_error(task_id, worker_id, now=now)
-                if expected_lease is None:
+                if expected_lease is None and claim_generation is None:
                     raise TaskClaimLost("Task attachment requires its exact worker lease.")
-                _ensure_exact_owned_active_task_lease(
+                fenced_claim_lease(
                     task,
                     worker_id,
-                    expected_lease,
+                    lease_expires_at=expected_lease,
+                    claim_generation=claim_generation,
                     now=now,
                 )
                 if task.work_contract is not None:
@@ -5000,10 +5015,12 @@ class SQLiteTaskStore(TaskStore):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -5013,7 +5030,8 @@ class SQLiteTaskStore(TaskStore):
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 presented_lease_expires_at=lease_expires_at,
-            ) as effective_lease,
+                presented_claim_generation=claim_generation,
+            ) as managed,
             self._lock,
         ):
             return self._finish_task_unlocked(
@@ -5022,8 +5040,9 @@ class SQLiteTaskStore(TaskStore):
                 result=result,
                 error=None,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
+                expected_lease_expires_at=managed.lease_expires_at,
                 handoff_id=handoff_id,
+                claim_generation=managed.claim_generation,
             )
 
     async def fail_task(
@@ -5034,10 +5053,12 @@ class SQLiteTaskStore(TaskStore):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -5047,7 +5068,8 @@ class SQLiteTaskStore(TaskStore):
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 presented_lease_expires_at=lease_expires_at,
-            ) as effective_lease,
+                presented_claim_generation=claim_generation,
+            ) as managed,
             self._lock,
         ):
             return self._finish_task_unlocked(
@@ -5056,8 +5078,9 @@ class SQLiteTaskStore(TaskStore):
                 result=None,
                 error=error,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
+                expected_lease_expires_at=managed.lease_expires_at,
                 handoff_id=handoff_id,
+                claim_generation=managed.claim_generation,
             )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -5106,7 +5129,12 @@ class SQLiteTaskStore(TaskStore):
                     )
                 now = self._ownership_clock()
                 _ensure_task_terminalization_lease_authority(task, request, now=now)
-                _ensure_task_handoff_authority(task, request.handoff_id)
+                fenced_handoff_id = (
+                    request.handoff_id
+                    if request.claim_generation is None
+                    else task.interrupted_handoff_id
+                )
+                _ensure_task_handoff_authority(task, fenced_handoff_id)
 
                 _validate_ordinary_task_terminalization_against_cancellation(task, request)
                 status = TaskStatus(request.kind.value)
@@ -5154,7 +5182,7 @@ class SQLiteTaskStore(TaskStore):
                         str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         request.worker_id,
-                        request.handoff_id,
+                        fenced_handoff_id,
                         sqlite_records.format_datetime(now),
                     ),
                 )
@@ -5353,7 +5381,7 @@ class SQLiteTaskStore(TaskStore):
                     "Admitted work attempts do not use interrupted-task handoff release.",
                 )
                 now = self._ownership_clock()
-                _require_interrupted_task_handoff_authority(
+                fenced_lease = _require_interrupted_task_handoff_authority(
                     task,
                     request,
                     now=now,
@@ -5364,6 +5392,7 @@ class SQLiteTaskStore(TaskStore):
                     f"""
                     UPDATE cayu_tasks
                     SET worker_id = NULL, lease_expires_at = NULL,
+                        claim_generation = claim_generation + 1,
                         interrupted_handoff_id = ?, updated_at = ?
                     WHERE id = ?
                       AND status = ?
@@ -5381,7 +5410,7 @@ class SQLiteTaskStore(TaskStore):
                         request.session_id,
                         request.session_instance_id,
                         request.worker_id,
-                        sqlite_records.format_datetime(request.lease_expires_at),
+                        sqlite_records.format_datetime(fenced_lease),
                         sqlite_records.format_datetime(now),
                     ),
                 )
@@ -5717,7 +5746,8 @@ class SQLiteTaskStore(TaskStore):
                     )
                     update_cursor = self._connection.execute(
                         "UPDATE cayu_tasks SET worker_id = ?, lease_expires_at = ?, "
-                        "interrupted_handoff_id = ?, updated_at = ? "
+                        "interrupted_handoff_id = ?, updated_at = ?, "
+                        "claim_generation = claim_generation + 1 "
                         "WHERE id = ? AND status = ? AND worker_id IS NULL "
                         "AND lease_expires_at IS NULL AND interrupted_handoff_id = ?",
                         (
@@ -5955,12 +5985,13 @@ class SQLiteTaskStore(TaskStore):
 
                 task = self._require_task_unlocked(request.task_id)
                 now = self._ownership_clock()
-                if request.lease_expires_at is None:
+                if request.lease_expires_at is None and request.claim_generation is None:
                     raise TaskClaimLost("Task retry settlement requires its exact worker lease.")
-                _ensure_exact_owned_active_task_lease(
+                fenced_claim_lease(
                     task,
                     request.worker_id,
-                    request.lease_expires_at,
+                    lease_expires_at=request.lease_expires_at,
+                    claim_generation=request.claim_generation,
                     now=now,
                 )
                 series_now = self._clock()
@@ -6029,8 +6060,8 @@ class SQLiteTaskStore(TaskStore):
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
                             work_contract_json, schedule_json, restartable, restart_count, concurrency_key,
-                            max_restarts, restart_history_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            max_restarts, restart_history_json, claim_generation
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_records.task_to_row_values(successor),
                     )
@@ -6247,13 +6278,19 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        presented_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
@@ -6263,10 +6300,11 @@ class SQLiteTaskStore(TaskStore):
                 self._connection.execute("BEGIN IMMEDIATE")
                 task = self._require_task_unlocked(task_id)
                 lease_now = self._ownership_clock()
-                _ensure_exact_owned_active_task_lease(
+                expected_lease, _ = fenced_claim_lease(
                     task,
                     worker_id,
-                    expected_lease,
+                    lease_expires_at=presented_lease,
+                    claim_generation=claim_generation,
                     now=lease_now,
                 )
                 if not _claimed_task_retry_attempt_elapsed(task, series_now=self._clock()):
@@ -6333,19 +6371,26 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 task = self._require_task_unlocked(task_id)
-                _ensure_exact_owned_active_task_lease(
+                fenced_claim_lease(
                     task,
                     worker_id,
-                    expected_lease,
+                    lease_expires_at=expected_lease,
+                    claim_generation=claim_generation,
                     now=self._ownership_clock(),
                 )
                 elapsed = _claimed_task_retry_attempt_elapsed(
@@ -6482,16 +6527,30 @@ class SQLiteTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
         error: dict[str, Any] | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         copied_error = None if error is None else copy_durable_json_object(error, "error")
         async with self._lock:
             with self._verified_transaction_unlocked():
                 current = self._require_task_unlocked(task_id)
+                if claim_generation is not None:
+                    ensure_claim_fence(
+                        current,
+                        TaskClaimFence(worker_id, claim_generation),
+                        now=self._ownership_clock(),
+                        require_live=False,
+                    )
+                    expected_lease = current.lease_expires_at
+                elif lease_expires_at is None:
+                    raise TaskClaimLost("Claimed-task cancellation requires its claim generation.")
+                else:
+                    expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
                 if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
                     raise TaskClaimLost(
                         "Claimed-task cancellation no longer owns the expected worker lease."
@@ -6525,20 +6584,30 @@ class SQLiteTaskStore(TaskStore):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             with self._verified_transaction_unlocked():
                 now = self._ownership_clock()
                 current = self._require_task_unlocked(task_id)
-                if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
-                    raise TaskClaimLost(
-                        "Claimed-task execution no longer owns the expected worker lease."
+                if claim_generation is not None:
+                    ensure_claim_fence(
+                        current, TaskClaimFence(worker_id, claim_generation), now=now
                     )
-                _ensure_owned_active_task_lease(current, worker_id, now=now)
+                else:
+                    if lease_expires_at is None:
+                        raise TaskClaimLost("Claimed-task execution requires its claim generation.")
+                    expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+                    if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                        raise TaskClaimLost(
+                            "Claimed-task execution no longer owns the expected worker lease."
+                        )
+                    _ensure_owned_active_task_lease(current, worker_id, now=now)
                 if (
                     current.status is not TaskStatus.CLAIMED
                     or current.session_id is not None
@@ -6857,6 +6926,7 @@ class SQLiteTaskStore(TaskStore):
                     SET status = ?,
                         worker_id = ?,
                         lease_expires_at = ?,
+                        claim_generation = claim_generation + 1,
                         updated_at = ?
                     WHERE id = ? AND status = ?
                     """,
@@ -6952,23 +7022,35 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
             with self._verified_transaction_unlocked():
                 now = self._ownership_clock()
-                lease_expires_at = now + timedelta(seconds=extend_seconds)
+                renewed_lease = now + timedelta(seconds=extend_seconds)
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
-                _ensure_task_handoff_authority(task, handoff_id)
+                if claim_generation is not None:
+                    expected_lease = ensure_claim_fence(
+                        task, TaskClaimFence(worker_id, claim_generation), now=now
+                    )
+                    handoff_id = task.interrupted_handoff_id
+                else:
+                    if lease_expires_at is None:
+                        raise TaskClaimLost("Task heartbeat requires its claim generation.")
+                    expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+                    if task.lease_expires_at != expected_lease:
+                        raise TaskClaimLost(
+                            "Task heartbeat no longer owns the expected worker lease."
+                        )
+                    _ensure_task_handoff_authority(task, handoff_id)
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -6993,7 +7075,7 @@ class SQLiteTaskStore(TaskStore):
                       )
                     """,
                     (
-                        sqlite_records.format_datetime(lease_expires_at),
+                        sqlite_records.format_datetime(renewed_lease),
                         sqlite_records.format_datetime(now),
                         task_id,
                         worker_id,
@@ -7015,13 +7097,23 @@ class SQLiteTaskStore(TaskStore):
                 return updated.model_copy(deep=True)
 
     async def restart_task(
-        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         from cayu.tasks.restart import _restarted_task
 
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             with self._verified_transaction_unlocked():
                 task = self._require_task_unlocked(task_id)
@@ -7029,7 +7121,11 @@ class SQLiteTaskStore(TaskStore):
                     task_id, "Admitted work attempts cannot restart."
                 )
                 updated = _restarted_task(
-                    task, worker_id, expected_lease, now=self._ownership_clock()
+                    task,
+                    worker_id,
+                    expected_lease,
+                    claim_generation=claim_generation,
+                    now=self._ownership_clock(),
                 )
                 if task.session_id is not None:
                     self._connection.execute(
@@ -7064,18 +7160,25 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             with self._verified_transaction_unlocked():
                 now = self._ownership_clock()
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost("Task release no longer owns the expected worker lease.")
+                expected_lease = released_claim_lease(
+                    task,
+                    worker_id,
+                    lease_expires_at,
+                    claim_generation,
+                    now=now,
+                    message="Task release no longer owns the expected worker lease.",
+                )
                 if (
                     self._connection.execute(
                         "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = ? LIMIT 1",
@@ -7092,6 +7195,7 @@ class SQLiteTaskStore(TaskStore):
                     SET status = ?,
                         worker_id = NULL,
                         lease_expires_at = NULL,
+                        claim_generation = claim_generation + 1,
                         started_at = NULL,
                         updated_at = ?
                     WHERE id = ? AND worker_id = ? AND status = ?
@@ -7131,20 +7235,25 @@ class SQLiteTaskStore(TaskStore):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
         async with self._lock:
             with self._verified_transaction_unlocked():
                 now = self._ownership_clock()
                 task = self._require_task_unlocked(task_id)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost(
-                        "Attached-task release no longer owns the expected worker lease."
-                    )
+                expected_lease = released_claim_lease(
+                    task,
+                    worker_id,
+                    lease_expires_at,
+                    claim_generation,
+                    now=now,
+                    message="Attached-task release no longer owns the expected worker lease.",
+                )
                 if task.interrupted_handoff_id is not None:
                     raise TaskInterruptedHandoffConflict(
                         "Recovery-owned attached tasks must publish an interrupted handoff."
@@ -7164,6 +7273,7 @@ class SQLiteTaskStore(TaskStore):
                     UPDATE cayu_tasks
                     SET worker_id = NULL,
                         lease_expires_at = NULL,
+                        claim_generation = claim_generation + 1,
                         updated_at = ?
                     WHERE id = ? AND worker_id = ? AND status = ?
                       AND session_id IS NOT NULL
@@ -7252,10 +7362,11 @@ class SQLiteTaskStore(TaskStore):
                 for task_id in task_ids:
                     task = self._require_task_unlocked(task_id)
                     if task.started_at is not None:
+                        # The lost holder no longer owns the claim it may still drain.
                         requested = _expired_dispatched_task_cancellation(
                             task,
                             updated_at=now,
-                        )
+                        ).model_copy(update={"claim_generation": task.claim_generation + 1})
                         self._update_task_snapshot_unlocked(requested)
                         self._record_task_transition_unlocked(task, requested)
                         continue
@@ -7264,6 +7375,7 @@ class SQLiteTaskStore(TaskStore):
                             "status": TaskStatus.PENDING,
                             "worker_id": None,
                             "lease_expires_at": None,
+                            "claim_generation": task.claim_generation + 1,
                             "updated_at": now,
                         }
                     )
@@ -7369,6 +7481,7 @@ class SQLiteTaskStore(TaskStore):
         worker_id: str | None = None,
         handoff_id: str | None = None,
         expected_lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         with self._verified_transaction_unlocked():
             prior = self._require_task_unlocked(task_id)
@@ -7380,6 +7493,7 @@ class SQLiteTaskStore(TaskStore):
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 expected_lease_expires_at=expected_lease_expires_at,
+                claim_generation=claim_generation,
             )
             self._record_task_transition_unlocked(prior, updated)
             return updated
@@ -7394,9 +7508,19 @@ class SQLiteTaskStore(TaskStore):
         worker_id: str | None = None,
         handoff_id: str | None = None,
         expected_lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         now = self._ownership_clock()
         task = self._require_task_unlocked(task_id)
+        if worker_id is not None and claim_generation is not None:
+            # The generation decides; the write is bound to this locked row's claim.
+            expected_lease_expires_at, handoff_id = fenced_claim_lease(
+                task,
+                worker_id,
+                lease_expires_at=None,
+                claim_generation=claim_generation,
+                now=now,
+            )
         if worker_id is not None:
             if expected_lease_expires_at is not None:
                 expected_lease_expires_at = normalize_utc_datetime(

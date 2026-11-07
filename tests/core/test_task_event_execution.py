@@ -726,6 +726,7 @@ def test_event_inspection_cannot_block_heartbeat_past_lease(monkeypatch):
             handoff_id=None,
             task_id=task.id,
             worker_id="owner",
+            claim_generation=task.claim_generation,
             deadline_monotonic=monotonic() + 0.8,
         )
         try:

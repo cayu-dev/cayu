@@ -441,6 +441,7 @@ class SessionTaskLifecycle:
                         session_invocation=session_invocation,
                         worker_id=worker_id,
                         lease_expires_at=lease_authority.lease_expires_at,
+                        claim_generation=lease_authority.claim_generation,
                     )
                     if (
                         lease_authority.deadline_monotonic is not None
@@ -530,7 +531,7 @@ class SessionTaskLifecycle:
             failed = await self._session_finalization.fail_task(
                 task_id=task.id,
                 task_worker_id=task_worker_id,
-                task_lease_expires_at=exact_lease,
+                task_lease_expires_at=exact_lease.lease_expires_at,
                 task_handoff_id=task_handoff_id,
                 session=session,
                 error=self._secret_redactor.redact_json(

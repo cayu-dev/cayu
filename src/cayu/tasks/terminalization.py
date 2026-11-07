@@ -20,7 +20,11 @@ from pydantic import (
 )
 
 from cayu._clock import normalize_utc_datetime
-from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+)
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.tasks.records import (
     Task,
@@ -51,6 +55,14 @@ class TaskTerminalizationRequest(BaseModel):
     # Exact lease generation returned by claim/heartbeat. A worker name is
     # reusable and therefore is not sufficient terminalization authority.
     lease_expires_at: datetime | None = None
+    # The claim's durable generation. When present it is the authority, and the
+    # lease expiry is neither checked nor part of the request's identity.
+    claim_generation: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value is None,
+    )
     # Exact interrupted-continuation generation. ``None`` is the authority for
     # ordinary task claims and direct attachments; recovered continuations must
     # present the non-null generation returned by their claim.
@@ -238,7 +250,7 @@ def prepare_task_terminalization(
             "Task terminalization requests must be TaskTerminalizationRequest instances."
         )
     copied = TaskTerminalizationRequest.model_validate(request.model_dump(mode="python"))
-    material = {
+    material: dict[str, Any] = {
         "schema": "cayu.task-terminalization.v3",
         "task_id": copied.task_id,
         "idempotency_key": copied.idempotency_key,
@@ -252,6 +264,12 @@ def prepare_task_terminalization(
     }
     if copied.handoff_id is not None:
         material["handoff_id"] = copied.handoff_id
+    if copied.claim_generation is not None:
+        # A retry after a renewal keeps its identity: the generation replaces the
+        # moving lease expiry.
+        del material["lease_expires_at"]
+        material["schema"] = "cayu.task-terminalization.v4"
+        material["claim_generation"] = copied.claim_generation
     request_sha256 = sha256(
         canonical_durable_json_bytes(material, "task_terminalization")
     ).hexdigest()

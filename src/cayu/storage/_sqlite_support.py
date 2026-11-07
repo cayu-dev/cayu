@@ -1230,6 +1230,8 @@ def reconcile_schema(
         sqlite_task_schema._validate_interrupted_handoff_generation_column(
             connection, bound_claims=current.revision >= 126
         )
+    if current.revision >= 142:
+        sqlite_task_schema._validate_task_claim_generation_column(connection)
     if current.revision >= 127:
         sqlite_task_schema._validate_task_creation_operations(
             connection, revision_sql=sqlite_schema_history._MIGRATION_STEPS[127]

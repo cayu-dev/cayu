@@ -778,6 +778,18 @@ def test_revision_twenty_three_rejects_pre_execution_identity_workers() -> None:
     )
 
 
+def test_task_claim_generation_fences_old_workers():
+    current = m.SchemaState(revision=142, compatible_from=142)
+    with pytest.raises(m.SchemaTooNew):
+        m.validate(current, app_latest=141, app_min_supported=139)
+    with pytest.raises(m.SchemaTooOld):
+        m.validate(m.SchemaState(revision=141, compatible_from=139))
+    assert (
+        m.validate_migration_input(m.SchemaState(revision=141, compatible_from=139))[0].revision
+        == 142
+    )
+
+
 def test_retry_budget_provenance_fences_old_readers():
     current = m.SchemaState(revision=139, compatible_from=139)
     with pytest.raises(m.SchemaTooNew):

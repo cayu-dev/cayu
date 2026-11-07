@@ -156,6 +156,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         task.concurrency_key,
         task.max_restarts,
         restart_history_json(task),
+        task.claim_generation,
     )
 
 
@@ -189,6 +190,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
         worker_id=row["worker_id"],
         lease_expires_at=parse_optional_datetime(row["lease_expires_at"]),
         interrupted_handoff_id=row["interrupted_handoff_id"],
+        claim_generation=row["claim_generation"],
         status_reason=row["status_reason"],
         status_payload=(None if status_payload_json is None else json.loads(status_payload_json)),
         input=json.loads(row["input_json"]),

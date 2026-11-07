@@ -90,7 +90,6 @@ from cayu.runtime._task_lease_authority import (
 )
 from cayu.runtime._task_lease_authority import (
     bind_task_lease_authority,
-    managed_task_lease_mutation,
 )
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
@@ -117,7 +116,10 @@ from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
-from cayu.tasks._cancellation import _task_cancellation_terminalization_request
+from cayu.tasks._cancellation import (
+    _cancellation_drain_holds,
+    _task_cancellation_terminalization_request,
+)
 from cayu.tasks._event_budget_warnings import EventBudgetCheck, with_event_budget_expiry
 from cayu.tasks._execution_settlement import TaskExecutionSettlement
 from cayu.tasks._group_maintenance import TaskGroupMaintenance
@@ -161,6 +163,7 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
     TaskParkedWait,
+    claim_interrupted_task_handoff_request,
     interrupted_task_handoff_request,
     new_interrupted_task_continuation_handoff_id,
     prepare_interrupted_task_handoff,
@@ -263,22 +266,16 @@ async def complete_managed_task(
     worker_id: str,
     result: dict[str, Any],
 ) -> Task:
-    """Complete a managed worker task against its latest acknowledged lease."""
+    """Complete a managed worker task under the claim generation its handler received."""
 
     task = copy_task(task)
-    async with managed_task_lease_mutation(
-        task_id=task.id,
+    return await task_store.complete_task(
+        task.id,
+        result,
         worker_id=worker_id,
         handoff_id=task.interrupted_handoff_id,
-        presented_lease_expires_at=task.lease_expires_at,
-    ) as effective_lease:
-        return await task_store.complete_task(
-            task.id,
-            result,
-            worker_id=worker_id,
-            lease_expires_at=effective_lease,
-            handoff_id=task.interrupted_handoff_id,
-        )
+        claim_generation=task.claim_generation,
+    )
 
 
 async def fail_managed_task(
@@ -287,22 +284,16 @@ async def fail_managed_task(
     worker_id: str,
     error: dict[str, Any],
 ) -> Task:
-    """Fail a managed worker task against its latest acknowledged lease."""
+    """Fail a managed worker task under the claim generation its handler received."""
 
     task = copy_task(task)
-    async with managed_task_lease_mutation(
-        task_id=task.id,
+    return await task_store.fail_task(
+        task.id,
+        error,
         worker_id=worker_id,
         handoff_id=task.interrupted_handoff_id,
-        presented_lease_expires_at=task.lease_expires_at,
-    ) as effective_lease:
-        return await task_store.fail_task(
-            task.id,
-            error,
-            worker_id=worker_id,
-            lease_expires_at=effective_lease,
-            handoff_id=task.interrupted_handoff_id,
-        )
+        claim_generation=task.claim_generation,
+    )
 
 
 async def reconcile_abandoned_task_cancellation(
@@ -909,6 +900,17 @@ async def run_task_worker(
                 changed = changed or bool(settled_fenced)
             return changed
 
+        def maintenance_wake_at() -> float | None:
+            deadlines = [
+                cadence.next_run_at
+                for enabled, cadence in (
+                    (reclaim, reclaim_cadence),
+                    (fenced_monitor is not None, fenced_cadence),
+                )
+                if enabled and cadence.next_run_at is not None
+            ]
+            return min(deadlines) if deadlines else None
+
         def rescan_released_handoffs() -> None:
             nonlocal handoffs_released
             if handoffs_released:
@@ -921,12 +923,9 @@ async def run_task_worker(
             # unsettled meanwhile. So it keeps its cadence while the slot is busy.
             loop = asyncio.get_running_loop()
             while True:
-                deadlines: list[float] = []
-                if reclaim and reclaim_cadence.next_run_at is not None:
-                    deadlines.append(reclaim_cadence.next_run_at)
-                if fenced_monitor is not None and fenced_cadence.next_run_at is not None:
-                    deadlines.append(fenced_cadence.next_run_at)
-                due_in = max(min(deadlines) - loop.time(), 0.0)
+                wake_at = maintenance_wake_at()
+                assert wake_at is not None  # maintained_while_busy runs only with a cadence
+                due_in = max(wake_at - loop.time(), 0.0)
                 if await wait_or_stop(due_in, idle) or slot_should_stop():
                     return
                 try:
@@ -1226,11 +1225,11 @@ async def run_task_worker(
                     if lease_expires_at is None:  # pragma: no cover - claim contract
                         raise TaskClaimLost("Contracted task claim has no worker lease.")
                     parking_outcome = await capture_task_store_operation(
-                        lambda task_id=task_id, contract=contract, lease_expires_at=lease_expires_at: (
+                        lambda task_id=task_id, contract=contract, generation=task.claim_generation: (
                             task_store.hold_claimed_work_contract_task(
                                 task_id,
                                 worker_id=worker_id,
-                                lease_expires_at=lease_expires_at,
+                                claim_generation=generation,
                                 contract=contract,
                             )
                         ),
@@ -1259,7 +1258,6 @@ async def run_task_worker(
                             handler,
                             worker_id,
                             lease_seconds,
-                            unstarted_claim=claimed,
                             execution_timeout_s=execution_timeout_s,
                             execution_grace_s=execution_grace_s,
                             event_budget_check=event_budget_check,
@@ -1302,6 +1300,12 @@ async def run_task_worker(
                     return DurableWorkerStep(stop=True)
                 if budget is not None and not budget.reserve():
                     poller.defer_step()
+                    if owns_maintenance and not budget.exhausted:
+                        # Another slot's handler still runs on the last reservation.
+                        # This slot owns the pool's maintenance, so it keeps
+                        # reclaiming and settling lost work until the pool drains.
+                        await app._run_worker_step(maintain_expired_claims)
+                        return DurableWorkerStep(idle=True, next_wake_at=maintenance_wake_at())
                     return DurableWorkerStep(stop=budget.exhausted, idle=not budget.exhausted)
                 completed = 0
                 if until_idle is not None:
@@ -1497,7 +1501,6 @@ async def _handle_with_heartbeat(
     lease_seconds: int,
     *,
     recover_interrupted_authority_loss: bool = False,
-    unstarted_claim: UnstartedClaim | None = None,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
     event_budget_check: EventBudgetCheck | None = None,
@@ -1514,7 +1517,6 @@ async def _handle_with_heartbeat(
             lease_seconds,
             settlement=settlement,
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
-            unstarted_claim=unstarted_claim,
             execution_timeout_s=execution_timeout_s,
             execution_grace_s=execution_grace_s,
             event_budget_check=event_budget_check,
@@ -1550,7 +1552,6 @@ async def _handle_with_heartbeat_owned(
     *,
     settlement: TaskExecutionSettlement,
     recover_interrupted_authority_loss: bool,
-    unstarted_claim: UnstartedClaim | None,
     execution_timeout_s: float | None,
     execution_grace_s: float | None,
     event_budget_check: EventBudgetCheck | None = None,
@@ -1603,7 +1604,6 @@ async def _handle_with_heartbeat_owned(
         worker_id,
         lease_seconds,
         settlement=settlement,
-        unstarted_claim=unstarted_claim,
     )
     owner_task = asyncio.current_task()
     if owner_task is None:  # pragma: no cover - coroutine execution invariant
@@ -1615,6 +1615,8 @@ async def _handle_with_heartbeat_owned(
         handoff_id=task.interrupted_handoff_id,
         task_id=task.id,
         worker_id=worker_id,
+        # Fixed for the callback's lifetime: the claim this worker itself received.
+        claim_generation=task.claim_generation,
         deadline_monotonic=claim_deadline_monotonic,
     )
     heartbeat_task = asyncio.create_task(
@@ -1625,7 +1627,6 @@ async def _handle_with_heartbeat_owned(
             lease_seconds,
             stop_heartbeat,
             lease_authority=lease_authority,
-            handoff_id=task.interrupted_handoff_id,
             claim_deadline_monotonic=claim_deadline_monotonic,
             enforce_retry_deadline=(
                 task.retry_series is not None and task.retry_series.elapsed_deadline is not None
@@ -1698,27 +1699,27 @@ async def _handle_with_heartbeat_owned(
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
             if retry_cancellation_requested and task.retry_series is None:
                 # The heartbeat may still be renewing (cancellation can win before dispatch,
-                # with no handler to stop it); a renewal between reading the claim and writing
-                # the cancellation would make the write's lease stale, so hold the lease.
-                async with lease_authority.lock:
-                    current = await task_store.load_task(task.id)
-                    if current is None:
-                        raise RuntimeError(
-                            "Task cancellation lost its store-authoritative task after handler "
-                            "quiescence."
-                        )
-                    request = _task_cancellation_terminalization_request(
-                        current,
-                        worker_id=worker_id,
+                # with no handler to stop it); the write presents the claim's generation,
+                # which renewals keep.
+                current = await task_store.load_task(task.id)
+                if current is None:
+                    raise RuntimeError(
+                        "Task cancellation lost its store-authoritative task after handler "
+                        "quiescence."
                     )
-                    if request is None:
-                        raise RuntimeError(
-                            "Task cancellation lost its durable request after handler quiescence."
-                        )
-                    await _terminalize_claimed_task_or_detect_peer_winner(
-                        task_store,
-                        request,
+                request = _task_cancellation_terminalization_request(
+                    current,
+                    worker_id=worker_id,
+                    claim_generation=lease_authority.claim_generation,
+                )
+                if request is None:
+                    raise RuntimeError(
+                        "Task cancellation lost its durable request after handler quiescence."
                     )
+                await _terminalize_claimed_task_or_detect_peer_winner(
+                    task_store,
+                    request,
+                )
                 ownership_settled = True
                 if retry_elapsed_cancellation is not None:
                     raise retry_elapsed_cancellation
@@ -1778,8 +1779,7 @@ async def _handle_with_heartbeat_owned(
             ownership_settled = await _settle_recovered_continuation_authority_loss(
                 app,
                 task_store,
-                task,
-                worker_id,
+                lease_authority,
             )
             return
 
@@ -1797,7 +1797,6 @@ async def _handle_with_heartbeat_owned(
                         task.id,
                         worker_id,
                         lease_authority,
-                        holds_lease_lock=task.retry_series is None,
                     )
                 ):
                     handler_error = None
@@ -1834,6 +1833,7 @@ async def _handle_with_heartbeat_owned(
                 ):
                     with_event_budget_expiry(failure_payload, task, event_state)
                 await _safe_fail_payload(
+                    app,
                     task_store,
                     task.id,
                     worker_id,
@@ -1862,7 +1862,7 @@ async def _handle_with_heartbeat_owned(
                         lease_authority=lease_authority,
                     )
             elif handler_outcome is TaskHandlerOutcome.SESSION_INTERRUPTED:
-                await _handoff_interrupted_session(app, task_store, task.id, worker_id)
+                await _handoff_interrupted_session(app, task_store, lease_authority)
             elif handler_outcome is None and time_limit is not None and time_limit.expired:
                 # Returning after the limit without settling is still a timeout.
                 await _fail_task_for_handler_time_limit(
@@ -1896,8 +1896,10 @@ async def _handle_with_heartbeat_owned(
                 )
 
         if task.retry_series is None:
-            async with lease_authority.lock:
-                await finalize_handler_outcome()
+            if not await _dispose_within_deadline(
+                app, task, lease_authority, lease_seconds, finalize_handler_outcome()
+            ):
+                return
         else:
             (
                 _receipt,
@@ -1956,7 +1958,6 @@ async def _renew_task_claim_before_dispatch(
     lease_seconds: int,
     *,
     settlement: TaskExecutionSettlement,
-    unstarted_claim: UnstartedClaim | None,
 ) -> tuple[Task, float, bool, bool]:
     """Prove that an acknowledged lease can still authorize handler dispatch."""
 
@@ -1964,12 +1965,9 @@ async def _renew_task_claim_before_dispatch(
     renewed = await task_store.heartbeat(
         task.id,
         worker_id,
-        lease_expires_at=_require_task_lease_expires_at(task),
-        handoff_id=task.interrupted_handoff_id,
+        claim_generation=task.claim_generation,
         extend_seconds=lease_seconds,
     )
-    if unstarted_claim is not None:
-        unstarted_claim.renewed(renewed)
     claim_deadline_monotonic = _conservative_task_lease_deadline(
         renewal_started,
         lease_seconds,
@@ -1983,7 +1981,7 @@ async def _renew_task_claim_before_dispatch(
         retry_deadline_elapsed = await task_store.task_retry_deadline_elapsed(
             renewed.id,
             worker_id,
-            lease_expires_at=_require_task_lease_expires_at(renewed),
+            claim_generation=task.claim_generation,
         )
         if monotonic() >= claim_deadline_monotonic:
             raise TaskClaimLost(
@@ -1998,12 +1996,9 @@ async def _renew_task_claim_before_dispatch(
             renewed = await task_store.heartbeat(
                 renewed.id,
                 worker_id,
-                lease_expires_at=_require_task_lease_expires_at(renewed),
-                handoff_id=renewed.interrupted_handoff_id,
+                claim_generation=task.claim_generation,
                 extend_seconds=lease_seconds,
             )
-            if unstarted_claim is not None:
-                unstarted_claim.renewed(renewed)
             claim_deadline_monotonic = _conservative_task_lease_deadline(
                 renewal_started,
                 lease_seconds,
@@ -2030,7 +2025,6 @@ async def _renew_task_claim_before_dispatch(
     ):
         if renewed.lease_expires_at is None:  # pragma: no cover - heartbeat contract
             raise TaskClaimLost("Task heartbeat returned no worker lease before dispatch.")
-        execution_lease_expires_at = renewed.lease_expires_at
         renewed = await settlement.enter(renewed)
         if monotonic() >= claim_deadline_monotonic:
             # No callback has been dispatched. Retain the exact start receipt
@@ -2040,8 +2034,8 @@ async def _renew_task_claim_before_dispatch(
             renewed = await task_store.request_claimed_task_cancellation(
                 renewed.id,
                 worker_id,
-                execution_lease_expires_at,
-                {"code": "task_execution_start_acknowledgement_consumed_lease"},
+                error={"code": "task_execution_start_acknowledgement_consumed_lease"},
+                claim_generation=task.claim_generation,
             )
             cancellation_requested = True
     return (
@@ -2250,67 +2244,12 @@ async def _await_task_handler(
             _TaskHeartbeatOutcome.ELAPSED,
             _TaskHeartbeatOutcome.CANCELLATION_REQUESTED,
         }:
-            if task.retry_series is not None and not heartbeat_task.done():
-                return await handler_task
-            stop_heartbeat.set()
-            try:
-                final_heartbeat_result = await heartbeat_task
-            except Exception as heartbeat_failure:
-                if task.retry_series is None:
-                    await _drain_ordinary_task_handler_under_cancellation_fence(
-                        task_store,
-                        task,
-                        worker_id,
-                        handler_task,
-                        heartbeat_task,
-                        stop_heartbeat,
-                        lease_authority=lease_authority,
-                        lease_seconds=lease_seconds,
-                        cancellation_error={"code": "task_worker_lease_authority_lost"},
-                        primary_failure=heartbeat_failure,
-                    )
-                else:
-                    await _drain_retry_task_handler_under_cancellation_fence(
-                        task_store,
-                        task,
-                        worker_id,
-                        handler_task,
-                        heartbeat_task,
-                        stop_heartbeat,
-                        lease_authority=lease_authority,
-                        lease_seconds=lease_seconds,
-                        cancellation_baseline=cancellation_baseline,
-                        primary_failure=heartbeat_failure,
-                    )
-                raise
-            if final_heartbeat_result is _TaskHeartbeatOutcome.ELAPSED:
-                quiescence = await _quiesce_task_retry_handler_before_terminalization(
-                    task_store,
-                    task.id,
-                    worker_id,
-                    lease_seconds,
-                    handler_task,
-                    cancellation_baseline,
-                    lease_authority,
-                )
-                raise _TaskRetryElapsed(
-                    quiescence.owner_cancellation,
-                    quiescence.report,
-                )
-            if final_heartbeat_result is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED:
-                quiescence = await _quiesce_task_retry_handler_before_terminalization(
-                    task_store,
-                    task.id,
-                    worker_id,
-                    lease_seconds,
-                    handler_task,
-                    cancellation_baseline,
-                    lease_authority,
-                )
-                raise _TaskRetryCancellationRequested(
-                    quiescence.owner_cancellation,
-                    quiescence.report,
-                )
+            # Heartbeat last: the claim keeps renewing until the disposition has
+            # committed, and the owner stops the heartbeat after it. An ordinary
+            # task's disposition already accounts for a requested cancellation,
+            # so its heartbeat no longer stops to report one.
+            if task.retry_series is None:
+                lease_authority.keep_renewing_on_cancellation = True
             return await handler_task
         if heartbeat_result is _TaskHeartbeatOutcome.ELAPSED:
             quiescence = await _quiesce_task_retry_handler_before_terminalization(
@@ -2509,6 +2448,7 @@ async def _fail_task_for_handler_time_limit(
             note = f"{note} {payload['message']}"
     del handler_error  # Not held across the store await.
     if not await _safe_fail_payload(
+        app,
         task_store,
         task.id,
         worker_id,
@@ -2626,7 +2566,6 @@ def _heartbeat_during_quiescence(
                 lease_seconds,
                 stop_heartbeat,
                 lease_authority=lease_authority,
-                handoff_id=task.interrupted_handoff_id,
                 claim_deadline_monotonic=lease_authority.deadline_monotonic,
             )
         )
@@ -2667,7 +2606,7 @@ async def _restart_task_handler_after_shutdown(
             if not _task_cancellation_requested(current):
                 try:
                     await task_store.restart_task(
-                        task.id, worker_id, lease_expires_at=lease_authority.lease_expires_at
+                        task.id, worker_id, claim_generation=lease_authority.claim_generation
                     )
                     return
                 except TaskTerminalizationConflict:
@@ -2676,11 +2615,14 @@ async def _restart_task_handler_after_shutdown(
                         current is None
                         or not _task_cancellation_requested(current)
                         or current.worker_id != worker_id
-                        or current.lease_expires_at != lease_authority.lease_expires_at
+                        or current.claim_generation != lease_authority.claim_generation
                     ):
                         raise
             await _settle_ordinary_task_cancellation_after_quiescence(
-                task_store, task.id, worker_id
+                task_store,
+                task.id,
+                worker_id,
+                claim_generation=lease_authority.claim_generation,
             )
 
     async def cleanup() -> None:
@@ -2766,6 +2708,7 @@ async def _raise_task_retry_owner_cancellation(
                     task,
                     worker_id,
                     lease_expires_at=lease_authority.lease_expires_at,
+                    claim_generation=lease_authority.claim_generation,
                     token_count=(0 if quiescence.report is None else quiescence.report.token_count),
                     estimated_cost=(
                         Decimal(0)
@@ -2852,6 +2795,7 @@ async def _raise_task_retry_owner_cancellation(
                 task,
                 worker_id,
                 lease_expires_at=lease_authority.lease_expires_at,
+                claim_generation=lease_authority.claim_generation,
                 token_count=0 if report is None else report.token_count,
                 estimated_cost=(Decimal(0) if report is None else report.estimated_cost),
             )
@@ -2875,7 +2819,7 @@ async def _raise_task_retry_owner_cancellation(
             await task_store.release_task(
                 task.id,
                 worker_id,
-                lease_expires_at=lease_authority.lease_expires_at,
+                claim_generation=lease_authority.claim_generation,
             )
         if handler_failure is not None:
             raise handler_failure
@@ -3190,22 +3134,25 @@ async def _drain_ordinary_task_handler_under_cancellation_fence(
         except BaseException as exc:
             failures.append(exc)
 
-        stop_heartbeat.set()
-        if not heartbeat_task.done():
-            try:
-                await heartbeat_task
-            except (GeneratorExit, KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as exc:
-                failures.append(exc)
-
+        # The settlement presents the claim's generation, so the heartbeat keeps the
+        # lease live until it has committed.
         if cancellation_requested:
             try:
                 await _settle_ordinary_task_cancellation_after_quiescence(
                     task_store,
                     task.id,
                     worker_id,
+                    claim_generation=lease_authority.claim_generation,
                 )
+            except (GeneratorExit, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
+                failures.append(exc)
+
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            try:
+                await heartbeat_task
             except (GeneratorExit, KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as exc:
@@ -3274,36 +3221,30 @@ async def _request_task_cancellation_fence(
 ) -> Task | None:
     """Retry until durable state prevents another worker from dispatching the task."""
 
+    claim_generation = lease_authority.claim_generation
+    if claim_generation is None:
+        raise TaskClaimLost("Task cancellation fence requires the claim's generation.")
     async with lease_authority.lock:
         while True:
-            expected_lease_expires_at = lease_authority.lease_expires_at
             current = await task_store.load_task(task.id)
             if current is None:
                 raise TaskClaimLost("Task cancellation fence target no longer exists.")
-            if (
-                current.status
-                in {
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                }
-                or _task_cancellation_requested(current)
-                or _task_retry_cancellation_requested(current)
-            ):
+            if current.status in _TERMINAL_TASK_STATUSES:
                 return current
-            if (
-                current.worker_id != worker_id
-                or current.lease_expires_at != expected_lease_expires_at
+            if not _cancellation_drain_holds(
+                current, worker_id=worker_id, claim_generation=claim_generation
             ):
                 raise TaskClaimLost(
-                    "Task cancellation fence no longer owns the expected lease generation."
+                    "Task cancellation fence no longer owns the expected claim generation."
                 )
+            if _task_cancellation_requested(current) or _task_retry_cancellation_requested(current):
+                return current
             try:
                 requested = await task_store.request_claimed_task_cancellation(
                     task.id,
                     worker_id,
-                    expected_lease_expires_at,
-                    cancellation_error,
+                    error=cancellation_error,
+                    claim_generation=claim_generation,
                 )
             except (GeneratorExit, KeyboardInterrupt, SystemExit):
                 raise
@@ -3327,24 +3268,18 @@ async def _request_task_cancellation_fence(
                     continue
                 if current is None:
                     raise request_failure
-                if (
-                    current.status
-                    in {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    }
-                    or _task_cancellation_requested(current)
-                    or _task_retry_cancellation_requested(current)
-                ):
+                if current.status in _TERMINAL_TASK_STATUSES:
                     return current
-                if (
-                    current.worker_id != worker_id
-                    or current.lease_expires_at != expected_lease_expires_at
+                if not _cancellation_drain_holds(
+                    current, worker_id=worker_id, claim_generation=claim_generation
                 ):
                     raise TaskClaimLost(
-                        "Task cancellation fence lost its exact worker lease."
+                        "Task cancellation fence lost its claim generation."
                     ) from request_failure
+                if _task_cancellation_requested(current) or _task_retry_cancellation_requested(
+                    current
+                ):
+                    return current
                 if isinstance(request_failure, TaskClaimLost):
                     raise
                 await asyncio.sleep(0.05)
@@ -3367,52 +3302,56 @@ async def _settle_ordinary_task_cancellation_after_quiescence(
     task_store: TaskStore,
     task_id: str,
     worker_id: str,
+    *,
+    claim_generation: int,
 ) -> None:
-    """Settle the exact cancellation after this runtime observed natural quiescence."""
+    """Settle the exact cancellation after this runtime observed natural quiescence.
+
+    Only claim ``claim_generation`` or reclaim's fence of it is settled. A later
+    claim, possibly under the same worker name, observes and owns its own
+    cancellation request.
+    """
 
     current = await task_store.load_task(task_id)
-    if current is None or current.status in {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    }:
-        return
-    if current.worker_id != worker_id:
-        # A peer claim may have won immediately before the cancellation marker.
-        # That peer now observes and owns the same durable cancellation request.
-        return
-    terminalization = _task_cancellation_terminalization_request(
-        current,
-        worker_id=worker_id,
-    )
-    if terminalization is None:
-        raise TaskTerminalizationConflict(
-            "Ordinary task drain lost its durable cancellation request."
-        )
-    with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
-        await _terminalize_claimed_task_or_detect_peer_winner(
-            task_store,
-            terminalization,
-        )
-    current = await task_store.load_task(task_id)
-    if current is None or current.status in {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    }:
-        return
     if (
         current is None
-        or current.worker_id != worker_id
+        or current.status in _TERMINAL_TASK_STATUSES
+        or not _cancellation_drain_holds(
+            current, worker_id=worker_id, claim_generation=claim_generation
+        )
+    ):
+        return
+    if current.claim_generation == claim_generation:
+        terminalization = _task_cancellation_terminalization_request(
+            current,
+            worker_id=worker_id,
+            claim_generation=claim_generation,
+        )
+        if terminalization is None:
+            raise TaskTerminalizationConflict(
+                "Ordinary task drain lost its durable cancellation request."
+            )
+        with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+            await _terminalize_claimed_task_or_detect_peer_winner(
+                task_store,
+                terminalization,
+            )
+        current = await task_store.load_task(task_id)
+    # The claim's lease lapsed (reclaim may have fenced it): settle it as owner-lost,
+    # with this runtime's observed quiescence as the evidence.
+    if (
+        current is None
+        or current.status in _TERMINAL_TASK_STATUSES
         or current.lease_expires_at is None
         or not _task_cancellation_requested(current)
+        or not _cancellation_drain_holds(
+            current, worker_id=worker_id, claim_generation=claim_generation
+        )
     ):
         return
 
-    terminalization = _task_cancellation_terminalization_request(
-        current,
-        worker_id=worker_id,
-    )
+    # Only the cancellation's idempotency key is read from it.
+    terminalization = _task_cancellation_terminalization_request(current, worker_id=worker_id)
     if terminalization is None:  # pragma: no cover - guarded above
         raise AssertionError("Task cancellation request disappeared during reconciliation.")
     evidence_identity = canonical_durable_json_bytes(
@@ -3632,8 +3571,7 @@ async def _quiesce_task_retry_handler_before_terminalization(
             renewed = await task_store.heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_authority.lease_expires_at,
-                handoff_id=lease_authority.handoff_id,
+                claim_generation=lease_authority.claim_generation,
                 extend_seconds=lease_seconds,
             )
             lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
@@ -3712,15 +3650,28 @@ async def _await_task_retry_cleanup_resisting_cancellation(
 async def _handoff_interrupted_session(
     app: CayuApp,
     task_store: TaskStore,
-    task_id: str,
-    worker_id: str,
+    lease_authority: _TaskLeaseAuthority,
 ) -> None:
+    """Hand off the session of the claim this callback holds, never a newer one.
+
+    The disposition is bound to the callback's own claim generation. A row that
+    shows another generation belongs to a later holder, possibly under the same
+    worker name, and is left alone.
+    """
+
+    task_id = lease_authority.task_id
+    worker_id = lease_authority.worker_id
+    claim_generation = lease_authority.claim_generation
+    assert task_id is not None and worker_id is not None and claim_generation is not None
     task = await task_store.load_task(task_id)
     if task is None or task.status in {
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
     }:
+        return
+    if task.claim_generation != claim_generation:
+        _log_superseded_disposition(app, task, lease_authority)
         return
     if task.status is not TaskStatus.RUNNING or task.session_id is None:
         await _safe_fail(
@@ -3732,7 +3683,7 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff without a "
                 "running attached task."
             ),
-            lease_expires_at=task.lease_expires_at,
+            lease_authority=lease_authority,
         )
         return
     if (
@@ -3756,7 +3707,7 @@ async def _handoff_interrupted_session(
             task_id,
             worker_id,
             RuntimeError(f"Attached session not found: {task.session_id}."),
-            lease_expires_at=task.lease_expires_at,
+            lease_authority=lease_authority,
         )
         return
     if session.status is not SessionStatus.INTERRUPTED:
@@ -3769,7 +3720,7 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff while session "
                 f"{task.session_id} was {session.status}."
             ),
-            lease_expires_at=task.lease_expires_at,
+            lease_authority=lease_authority,
         )
         return
     if session.instance_id != task.session_instance_id:
@@ -3782,11 +3733,16 @@ async def _handoff_interrupted_session(
                 "Task handler requested an interrupted-session handoff for a "
                 "different session incarnation."
             ),
-            lease_expires_at=task.lease_expires_at,
+            lease_authority=lease_authority,
         )
         return
-    request = interrupted_task_handoff_request(
-        task,
+    request = claim_interrupted_task_handoff_request(
+        task_id=task_id,
+        worker_id=worker_id,
+        claim_generation=claim_generation,
+        prior_handoff_id=lease_authority.handoff_id,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
         session_run_epoch=session.run_epoch,
         parked=await _session_parked_wait(app, session.id),
     )
@@ -3805,16 +3761,20 @@ async def _handoff_interrupted_session(
         # That durable peer winner has already settled this worker's ownership;
         # it must not abort the worker loop.  Non-terminal conflicts remain
         # authoritative and fail closed.
-        current = await task_store.load_task(task.id)
+        current = await task_store.load_task(task_id)
         if current is None or current.status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }:
             return
+        if current.claim_generation != claim_generation:
+            _log_superseded_disposition(app, current, lease_authority)
+            return
         cancellation = _task_cancellation_terminalization_request(
             current,
             worker_id=worker_id,
+            claim_generation=claim_generation,
         )
         if cancellation is not None:
             await _terminalize_claimed_task_or_detect_peer_winner(
@@ -3823,6 +3783,72 @@ async def _handoff_interrupted_session(
             )
             return
         raise
+
+
+#: The shortest disposition deadline: a disposition renews its claim while it
+#: runs, so this bounds how long a stuck store call can keep the claim alive.
+_MIN_TASK_DISPOSITION_DEADLINE_S = 300.0
+
+
+async def _dispose_within_deadline(
+    app: CayuApp,
+    task: Task,
+    lease_authority: _TaskLeaseAuthority,
+    lease_seconds: int,
+    disposition: Awaitable[None],
+) -> bool:
+    """Run an ordinary task's disposition while its heartbeat keeps renewing.
+
+    Returns False when the disposition outlived its deadline (one lease, at
+    least five minutes): the claim stops renewing and is left to lease expiry
+    and reclaim instead of being held by a stuck store call.
+    """
+
+    deadline_s = max(float(lease_seconds), _MIN_TASK_DISPOSITION_DEADLINE_S)
+    deadline = asyncio.timeout(deadline_s)
+    try:
+        async with deadline:
+            await disposition
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        logger.warning(
+            "Task disposition did not commit within %ss; the claim stops renewing and is "
+            "left to lease expiry: task_id=%s claim_generation=%s",
+            deadline_s,
+            app.redact_json(task.id),
+            lease_authority.claim_generation,
+        )
+        return False
+    return True
+
+
+def _log_lost_disposition(
+    app: CayuApp,
+    task_id: str,
+    claim_generation: int | None,
+    lost: TaskClaimLost,
+) -> None:
+    logger.warning(
+        "Task disposition lost its claim: task_id=%s claim_generation=%s reason=%s",
+        app.redact_json(task_id),
+        claim_generation,
+        app.redact_json(str(lost)),
+    )
+
+
+def _log_superseded_disposition(
+    app: CayuApp,
+    task: Task,
+    lease_authority: _TaskLeaseAuthority,
+) -> None:
+    logger.warning(
+        "Task disposition lost its claim: task_id=%s claim_generation=%s "
+        "current_claim_generation=%s",
+        app.redact_json(task.id),
+        lease_authority.claim_generation,
+        task.claim_generation,
+    )
 
 
 async def _session_parked_wait(app: CayuApp, session_id: str) -> TaskParkedWait | None:
@@ -4148,7 +4174,12 @@ def _task_still_matches_interrupted_handoff_request(
         and task.status is TaskStatus.RUNNING
         and task.id == request.task_id
         and task.worker_id == request.worker_id
-        and task.lease_expires_at == request.lease_expires_at
+        and task.lease_expires_at is not None
+        and (
+            task.claim_generation == request.claim_generation
+            if request.claim_generation is not None
+            else task.lease_expires_at == request.lease_expires_at
+        )
         and task.session_id == request.session_id
         and task.session_instance_id == request.session_instance_id
         and not _task_cancellation_requested(task)
@@ -4433,7 +4464,7 @@ async def _recover_expired_interrupted_task_handoffs(
                 or _task_retry_cancellation_requested(current)
                 or current.worker_id is None
                 or current.worker_id != request.worker_id
-                or current.lease_expires_at != request.lease_expires_at
+                or current.claim_generation != request.claim_generation
             ):
                 continue
             raise
@@ -4687,28 +4718,23 @@ async def _run_bounded_interrupted_task_handler(
                 app.redact_json(task.id),
                 app.redact_json(task.session_id),
             )
-            async with managed_task_lease_mutation(
-                task_id=task.id,
-                worker_id=worker_id,
+            await _safe_fail_payload(
+                app,
+                task_store,
+                task.id,
+                worker_id,
+                {
+                    "error": "InterruptedTaskContinuationStalled",
+                    "message": (
+                        f"The attached session was handed off {unproductive_handoffs} times "
+                        "without model, tool, or input progress, so its continuation was "
+                        "stopped instead of being released again."
+                    ),
+                    "unproductive_interrupted_handoffs": unproductive_handoffs,
+                },
+                claim_generation=task.claim_generation,
                 handoff_id=task.interrupted_handoff_id,
-                presented_lease_expires_at=task.lease_expires_at,
-            ) as effective_lease:
-                await _safe_fail_payload(
-                    task_store,
-                    task.id,
-                    worker_id,
-                    {
-                        "error": "InterruptedTaskContinuationStalled",
-                        "message": (
-                            f"The attached session was handed off {unproductive_handoffs} times "
-                            "without model, tool, or input progress, so its continuation was "
-                            "stopped instead of being released again."
-                        ),
-                        "unproductive_interrupted_handoffs": unproductive_handoffs,
-                    },
-                    lease_expires_at=effective_lease,
-                    handoff_id=task.interrupted_handoff_id,
-                )
+            )
             return None
     # Explicit owned human decisions do not throttle behind automated retry history.
     # Session identity, bound claims, heartbeat, stop and quiescent cleanup still apply.
@@ -4851,12 +4877,12 @@ async def _count_unproductive_interrupted_handoffs(
 async def _settle_recovered_continuation_authority_loss(
     app: CayuApp,
     task_store: TaskStore,
-    claimed: Task,
-    worker_id: str,
+    lease_authority: _TaskLeaseAuthority,
 ) -> bool:
     """Release a still-interrupted continuation or defer it to lease recovery."""
 
-    current = await task_store.load_task(claimed.id)
+    assert lease_authority.task_id is not None
+    current = await task_store.load_task(lease_authority.task_id)
     if current is None or current.status in {
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
@@ -4865,9 +4891,9 @@ async def _settle_recovered_continuation_authority_loss(
         return True
     if (
         current.status is not TaskStatus.RUNNING
-        or current.worker_id != worker_id
+        or current.worker_id != lease_authority.worker_id
         or current.lease_expires_at is None
-        or current.interrupted_handoff_id != claimed.interrupted_handoff_id
+        or current.claim_generation != lease_authority.claim_generation
         or current.session_id is None
         or current.session_instance_id is None
     ):
@@ -4881,12 +4907,7 @@ async def _settle_recovered_continuation_authority_loss(
         and session.instance_id == current.session_instance_id
         and session.status is SessionStatus.INTERRUPTED
     ):
-        await _handoff_interrupted_session(
-            app,
-            task_store,
-            current.id,
-            worker_id,
-        )
+        await _handoff_interrupted_session(app, task_store, lease_authority)
         return True
 
     # A different session epoch may still be settling the task. Stop renewing
@@ -4976,11 +4997,11 @@ async def _settle_pending_runtime_task_failure_owner(
 
     if (
         current.worker_id != worker_id
-        or current.lease_expires_at != lease_authority.lease_expires_at
+        or current.claim_generation != lease_authority.claim_generation
         or current.interrupted_handoff_id != lease_authority.handoff_id
     ):
         raise TaskClaimLost(
-            "Pending runtime task failure no longer owns the worker lease."
+            "Pending runtime task failure no longer owns the worker claim."
         ) from None
     if (
         decision.task_error_payload is None
@@ -5026,7 +5047,6 @@ async def _heartbeat_until(
     stop: asyncio.Event,
     *,
     lease_authority: _TaskLeaseAuthority,
-    handoff_id: str | None = None,
     claim_deadline_monotonic: float | None = None,
     enforce_retry_deadline: bool = False,
 ) -> _TaskHeartbeatOutcome:
@@ -5052,7 +5072,6 @@ async def _heartbeat_until(
             worker_id,
             lease_seconds,
             lease_authority=lease_authority,
-            handoff_id=handoff_id,
             claim_deadline_monotonic=current_deadline(),
         )
         return updated
@@ -5082,7 +5101,7 @@ async def _heartbeat_until(
         if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
             task_id,
             worker_id,
-            lease_expires_at=lease_authority.lease_expires_at,
+            claim_generation=lease_authority.claim_generation,
         ):
             return _TaskHeartbeatOutcome.ELAPSED
         return None
@@ -5142,10 +5161,14 @@ async def _renew_task_lease_before_deadline(
     lease_seconds: int,
     *,
     lease_authority: _TaskLeaseAuthority,
-    handoff_id: str | None,
     claim_deadline_monotonic: float,
 ) -> tuple[Task | None, float]:
-    """Serialize one renewal with mutations that consume the exact lease token."""
+    """Renew the claim by its generation; the lock serializes only local deadline bookkeeping.
+
+    The acknowledgement updates only the local lease deadline. A renewal whose
+    acknowledgement is late never invalidates a write of the same claim, which
+    presents the generation, not the expiry.
+    """
 
     async with lease_authority.lock:
         renewal_started = monotonic()
@@ -5153,8 +5176,7 @@ async def _renew_task_lease_before_deadline(
             task_store.heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_authority.lease_expires_at,
-                handoff_id=handoff_id,
+                claim_generation=lease_authority.claim_generation,
                 extend_seconds=lease_seconds,
             )
         )
@@ -5221,10 +5243,15 @@ async def _enforce_task_retry_deadline_with_retry(
     worker_id: str,
     *,
     lease_expires_at: datetime,
+    claim_generation: int,
     token_count: int = 0,
     estimated_cost: Decimal = Decimal(0),
 ) -> TaskRetrySettlementResult | None:
-    """Enforce or authenticate a deadline commit whose acknowledgement was lost."""
+    """Enforce or authenticate a deadline commit whose acknowledgement was lost.
+
+    The store fences by ``claim_generation``. The expected receipt is derived
+    from ``lease_expires_at``, the lease the caller holds still under its lock.
+    """
 
     expected_request, expected_request_sha256 = _task_retry_runtime_terminal_request(
         task.model_copy(update={"lease_expires_at": lease_expires_at}, deep=True),
@@ -5240,7 +5267,7 @@ async def _enforce_task_retry_deadline_with_retry(
             receipt = await task_store.enforce_task_retry_deadline(
                 task.id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 token_count=token_count,
                 estimated_cost=estimated_cost,
             )
@@ -5256,6 +5283,7 @@ async def _enforce_task_retry_deadline_with_retry(
                 cancellation = _task_retry_requested_cancellation_settlement(
                     current,
                     worker_id=worker_id,
+                    claim_generation=claim_generation,
                     token_count=token_count,
                     estimated_cost=estimated_cost,
                 )
@@ -5309,6 +5337,7 @@ async def _enforce_task_retry_deadline_resisting_cancellation(
                 task,
                 worker_id,
                 lease_expires_at=lease_authority.lease_expires_at,
+                claim_generation=lease_authority.claim_generation,
                 token_count=0 if report is None else report.token_count,
                 estimated_cost=Decimal(0) if report is None else report.estimated_cost,
             )
@@ -5402,6 +5431,7 @@ async def _settle_task_retry_cancellation_resisting_cancellation(
         request = _task_retry_requested_cancellation_settlement(
             task,
             worker_id=worker_id,
+            claim_generation=None if lease_authority is None else lease_authority.claim_generation,
             token_count=0 if report is None else report.token_count,
             estimated_cost=Decimal(0) if report is None else report.estimated_cost,
         )
@@ -5476,6 +5506,7 @@ async def _safe_fail(
     payload = _task_failure_payload(app, exc)
     del exc
     await _safe_fail_payload(
+        app,
         task_store,
         task_id,
         worker_id,
@@ -5563,18 +5594,22 @@ def _redact_and_bound_task_failure_text(app: CayuApp, value: str) -> str:
 
 
 async def _safe_fail_payload(
+    app: CayuApp,
     task_store: TaskStore,
     task_id: str,
     worker_id: str,
     payload: dict[str, Any],
     *,
     lease_expires_at: datetime | None = None,
+    claim_generation: int | None = None,
     lease_authority: _TaskLeaseAuthority | None = None,
     handoff_id: str | None = None,
     retryable: bool = False,
 ) -> bool:
     """Fail a live claimed task; return whether this call recorded the failure."""
 
+    if claim_generation is None and lease_authority is not None:
+        claim_generation = lease_authority.claim_generation
     task = await task_store.load_task(task_id)
     if task is None or task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
         return False
@@ -5583,6 +5618,7 @@ async def _safe_fail_payload(
             task_id=task_id,
             worker_id=worker_id,
             lease_expires_at=lease_expires_at,
+            claim_generation=claim_generation,
             causal_budget_id=task.retry_series.causal_budget_id,
             disposition=(
                 TaskRetryAttemptDisposition.RETRYABLE_FAILURE
@@ -5593,6 +5629,7 @@ async def _safe_fail_payload(
             idempotency_key=_worker_failure_terminalization_key(
                 task_id,
                 worker_id,
+                claim_generation,
             ),
         )
         try:
@@ -5605,7 +5642,8 @@ async def _safe_fail_payload(
                 if lease_authority is not None
                 else _settle_task_retry_request_honoring_cancellation(task_store, request)
             )
-        except TaskClaimLost:
+        except TaskClaimLost as lost:
+            _log_lost_disposition(app, task_id, claim_generation, lost)
             return False
         # A cancellation committed first settles the attempt as cancelled.
         return settled.task.status is TaskStatus.FAILED
@@ -5616,18 +5654,21 @@ async def _safe_fail_payload(
                 task_id=task_id,
                 worker_id=worker_id,
                 lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 kind=TaskTerminalKind.FAILED,
                 error=payload,
                 handoff_id=handoff_id,
                 idempotency_key=_worker_failure_terminalization_key(
                     task_id,
                     worker_id,
+                    claim_generation,
                 ),
             ),
         )
         if peer_terminalization_won:
             return False
-    except TaskClaimLost:
+    except TaskClaimLost as lost:
+        _log_lost_disposition(app, task_id, claim_generation, lost)
         return False
     except ValueError:
         if task_store.supports_idempotent_terminalization:
@@ -5663,7 +5704,7 @@ async def _settle_retry_attempt_report(
         TaskRetrySettlementRequest(
             task_id=task.id,
             worker_id=worker_id,
-            lease_expires_at=lease_authority.lease_expires_at,
+            claim_generation=lease_authority.claim_generation,
             causal_budget_id=series.causal_budget_id,
             **copied.model_dump(mode="python", warnings=False),
         ),
@@ -5676,41 +5717,19 @@ async def _settle_task_retry_request_with_lease_authority(
     request: TaskRetrySettlementRequest,
     lease_authority: _TaskLeaseAuthority,
 ) -> TaskRetrySettlementResult:
-    """Settle against the latest acknowledged lease without stopping heartbeats."""
+    """Settle under the claim's generation while heartbeats keep renewing it.
 
-    last_claim_loss: TaskClaimLost | None = None
-    for _attempt in range(3):
-        effective_lease = lease_authority.lease_expires_at
-        effective_request = request.model_copy(
-            update={"lease_expires_at": effective_lease},
+    Renewals keep the generation, so the settlement never races them: a
+    ``TaskClaimLost`` here means the lease really lapsed or was superseded.
+    """
+
+    return await _settle_task_retry_request_honoring_cancellation(
+        task_store,
+        request.model_copy(
+            update={"lease_expires_at": None, "claim_generation": lease_authority.claim_generation},
             deep=True,
-        )
-        try:
-            return await _settle_task_retry_request_honoring_cancellation(
-                task_store,
-                effective_request,
-            )
-        except TaskClaimLost as exc:
-            last_claim_loss = exc
-
-        receipt = await task_store.load_task_retry_settlement(
-            effective_request.task_id,
-            effective_request.idempotency_key,
-        )
-        if receipt is not None:
-            return await _settle_task_retry_request_honoring_cancellation(
-                task_store,
-                effective_request,
-            )
-        # A renewal may have committed while its acknowledgement is still pending.
-        # Wait for that renewal before deciding whether this generation was lost;
-        # keep the store settlement itself outside the lock so heartbeats can run.
-        async with lease_authority.lock:
-            if lease_authority.lease_expires_at == effective_lease:
-                raise last_claim_loss
-
-    assert last_claim_loss is not None
-    raise last_claim_loss
+        ),
+    )
 
 
 async def _settle_task_retry_request_honoring_cancellation(
@@ -5728,6 +5747,9 @@ async def _settle_task_retry_request_honoring_cancellation(
         cancellation = _task_retry_requested_cancellation_settlement(
             task,
             worker_id=request.worker_id,
+            # The generation the settlement presented: a heartbeat may move the
+            # lease between this read and the settlement.
+            claim_generation=request.claim_generation,
             token_count=request.token_count,
             estimated_cost=request.estimated_cost,
         )
@@ -5736,16 +5758,30 @@ async def _settle_task_retry_request_honoring_cancellation(
         return await settle_task_retry_attempt_with_retry(task_store, cancellation)
 
 
-def _worker_failure_terminalization_key(task_id: str, worker_id: str) -> str:
+def _worker_failure_terminalization_key(
+    task_id: str, worker_id: str, claim_generation: int | None
+) -> str:
+    if claim_generation is None:
+        identity = canonical_durable_json_bytes(
+            {
+                "schema": "cayu.task-worker-failure.v1",
+                "task_id": task_id,
+                "worker_id": worker_id,
+            },
+            "task_worker_failure",
+        )
+        return f"task-worker-failure:v1:{sha256(identity).hexdigest()}"
+    # Two incarnations of one worker name never share a failure key.
     identity = canonical_durable_json_bytes(
         {
-            "schema": "cayu.task-worker-failure.v1",
+            "schema": "cayu.task-worker-failure.v2",
             "task_id": task_id,
             "worker_id": worker_id,
+            "claim_generation": claim_generation,
         },
         "task_worker_failure",
     )
-    return f"task-worker-failure:v1:{sha256(identity).hexdigest()}"
+    return f"task-worker-failure:v2:{sha256(identity).hexdigest()}"
 
 
 async def _safe_fail_unfinished(
@@ -5780,8 +5816,6 @@ async def _settle_task_refused_by_shutdown(
     task_id: str,
     worker_id: str,
     lease_authority: _TaskLeaseAuthority,
-    *,
-    holds_lease_lock: bool,
 ) -> bool:
     """Leave a claim the closing app refused for the next worker, without failing it.
 
@@ -5801,14 +5835,11 @@ async def _settle_task_refused_by_shutdown(
         or current.session_id is not None
     ):
         return True
-    # A retry-policy task settles without the lease lock; take it so a renewal
-    # in flight cannot leave the release with a stale lease expiry.
-    async with contextlib.nullcontext() if holds_lease_lock else lease_authority.lock:
-        # A claim that moved on or changed meanwhile is left to lease expiry.
-        with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
-            await task_store.release_task(
-                task_id, worker_id, lease_expires_at=lease_authority.lease_expires_at
-            )
+    # A claim that moved on or changed meanwhile is left to lease expiry.
+    with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+        await task_store.release_task(
+            task_id, worker_id, claim_generation=lease_authority.claim_generation
+        )
     return True
 
 

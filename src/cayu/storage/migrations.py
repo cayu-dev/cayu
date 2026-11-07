@@ -590,6 +590,10 @@ REVISIONS: tuple[Revision, ...] = (
     # A partial index that counts each session's model steps and tool calls.
     # Older binaries never use it and keep working beside it.
     Revision(revision=141, kind=RevisionKind.ADDITIVE, compatible_from=139),
+    # Task claims are fenced by a durable generation that claim, release, reclaim,
+    # handoff and restart advance and heartbeats keep. An older worker would claim
+    # without advancing it, and older Task models reject receipts that carry it.
+    Revision(revision=142, kind=RevisionKind.BREAKING, compatible_from=142),
 )
 
 #: The revision an empty database is initialized to.

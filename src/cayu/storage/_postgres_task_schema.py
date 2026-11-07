@@ -444,6 +444,24 @@ async def _validate_interrupted_handoff_generation_column(
         )
 
 
+async def _validate_task_claim_generation_column(cur: Any) -> None:
+    await cur.execute(
+        """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_tasks'
+              AND column_name = 'claim_generation'
+            """
+    )
+    if await cur.fetchone() != ("bigint", "NO", "0"):
+        raise RuntimeError(
+            "Postgres task claim generation storage conflicts with Cayu's "
+            "revision-142 durability contract. Run `cayu storage migrate` or "
+            "restore the database from a known-good backup."
+        )
+
+
 async def _validate_task_creation_operations(cur: Any, *, expected_guard_sql: str) -> None:
     await cur.execute("""
         SELECT column_name, data_type, is_nullable, collation_name

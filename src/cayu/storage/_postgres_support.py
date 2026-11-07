@@ -213,6 +213,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.concurrency_key,
         task.max_restarts,
         restart_history_json(task),
+        task.claim_generation,
     )
 
 
@@ -226,7 +227,7 @@ TASK_COLUMNS = (
     "status_reason, status_payload, input, result, error, metadata, created_at, updated_at, "
     "started_at, completed_at, invocation, retry_series, work_contract, schedule, "
     "graph_id, prerequisite_task_ids, restartable, restart_count, concurrency_key, "
-    "max_restarts, restart_history"
+    "max_restarts, restart_history, claim_generation"
 )
 
 
@@ -237,6 +238,7 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         concurrency_key=row[31],
         max_restarts=row[32],
         restart_history=tuple(_loads(row[33])),
+        claim_generation=row[34],
         id=row[0],
         type=row[1],
         title=row[2],

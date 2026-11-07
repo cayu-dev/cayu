@@ -4934,7 +4934,8 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
             task_id: str,
             worker_id: str,
             *,
-            lease_expires_at,
+            lease_expires_at=None,
+            claim_generation: int | None = None,
             handoff_id: str | None = None,
             extend_seconds: int = 300,
         ) -> Task:
@@ -4942,6 +4943,7 @@ def test_task_worker_remains_live_and_renews_lease_while_isolated_child_blocks_g
                 task_id,
                 worker_id,
                 lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 handoff_id=handoff_id,
                 extend_seconds=extend_seconds,
             )

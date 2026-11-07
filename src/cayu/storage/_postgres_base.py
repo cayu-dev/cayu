@@ -1110,6 +1110,8 @@ class _PostgresStoreBase:
                             await postgres_task_schema._validate_interrupted_handoff_generation_column(
                                 cur, bound_claims=current_state.revision >= 126
                             )
+                        if self._min_required_revision >= 142:
+                            await postgres_task_schema._validate_task_claim_generation_column(cur)
                         if self._min_required_revision >= 77:
                             await postgres_knowledge_schema._validate_knowledge_maintenance_governance_schema(
                                 cur
@@ -1478,6 +1480,8 @@ class _PostgresStoreBase:
             await postgres_task_schema._validate_interrupted_handoff_generation_column(
                 cur, bound_claims=state.revision >= 126
             )
+        if self._min_required_revision >= 142:
+            await postgres_task_schema._validate_task_claim_generation_column(cur)
         if self._min_required_revision >= 74:
             await postgres_eval_schema._validate_eval_run_trial_checkpoint_schema(cur)
         if self._min_required_revision >= 75:
@@ -1653,6 +1657,8 @@ class _PostgresStoreBase:
         if revision.revision == 76:
             await self._backfill_interrupted_handoff_generations(cur)
             await postgres_task_schema._validate_interrupted_handoff_generation_column(cur)
+        if revision.revision == 142:
+            await postgres_task_schema._validate_task_claim_generation_column(cur)
         if revision.revision == 77:
             await postgres_knowledge_schema._validate_knowledge_maintenance_governance_schema(cur)
         if revision.revision == 78:

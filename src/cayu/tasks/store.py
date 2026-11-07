@@ -535,6 +535,7 @@ class TaskStore(ABC):
         *,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         contract: WorkContractRef,
     ) -> Task:
         """Claim-fence an unsupported contracted task into operator attention."""
@@ -1100,11 +1101,12 @@ class TaskStore(ABC):
         session_invocation: SessionInvocationBinding,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         """Attach a live worker-claimed task to a session and mark it running.
 
-        Raise ``TaskClaimLost`` unless the worker and exact lease generation
-        still own a live claim.
+        Raise ``TaskClaimLost`` unless the worker still holds a live claim with
+        that ``claim_generation`` (or, deprecated, that exact lease expiry).
         """
 
     @abstractmethod
@@ -1116,11 +1118,13 @@ class TaskStore(ABC):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         """Mark a pending or running task as completed.
 
-        If ``worker_id`` is given, ``lease_expires_at`` must identify the exact
-        active lease generation. The update also requires the exact continuation
+        If ``worker_id`` is given, ``claim_generation`` must identify the live
+        claim; a claim generation keeps its identity across lease renewals.
+        Presenting only the exact ``lease_expires_at`` is deprecated. The update also requires the exact continuation
         generation, so a stale worker cannot clobber a task after renewal or
         reclaim.
         """
@@ -1134,11 +1138,12 @@ class TaskStore(ABC):
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         """Mark a pending or running task as failed.
 
-        If ``worker_id`` is given, ``lease_expires_at`` must identify the exact
-        active lease generation. The update also requires the exact continuation
+        If ``worker_id`` is given, ``claim_generation`` must identify the live
+        claim. Presenting only the exact ``lease_expires_at`` is deprecated. The update also requires the exact continuation
         generation.
         """
 
@@ -1372,7 +1377,8 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
@@ -1390,7 +1396,8 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> bool:
         """Return store-authoritative elapsed evidence without releasing ownership."""
 
@@ -1412,10 +1419,12 @@ class TaskStore(ABC):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
         error: dict[str, Any] | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
-        """Request cancellation only for one exact live worker lease.
+        """Request cancellation only for the claim ``claim_generation`` names.
 
         A delayed stale owner must not place a cancellation marker on a claim
         acquired by a replacement worker.
@@ -1429,7 +1438,9 @@ class TaskStore(ABC):
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         """Fence an exact claim before its worker can dispatch opaque work.
 
@@ -1493,14 +1504,16 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
-        """Extend the exact worker-owned lease identified by its expiry.
+        """Extend the live claim ``claim_generation`` names; keep its generation.
 
-        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
-        the live claim.
+        Raise ``TaskClaimLost`` if the worker and generation no longer identify
+        the live claim. Identifying it by its exact lease expiry instead is
+        deprecated: every renewal changes the expiry.
         """
 
     async def restart_task(
@@ -1508,7 +1521,8 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         """Atomically requeue an opted-in task after its handler is quiescent.
 
@@ -1543,12 +1557,13 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
-        """Release the exact claimed task lease back to pending.
+        """Release the live claim ``claim_generation`` names back to pending.
 
-        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
-        the live claim.
+        Raise ``TaskClaimLost`` if the worker and generation (or, deprecated,
+        the exact lease expiry) no longer identify the live claim.
         """
 
     @abstractmethod
@@ -1557,12 +1572,13 @@ class TaskStore(ABC):
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
-        """Release an exact lease while preserving a running task's session link.
+        """Release a live claim while preserving a running task's session link.
 
-        Raise ``TaskClaimLost`` if the worker and lease expiry no longer identify
-        the live claim.
+        Raise ``TaskClaimLost`` if the worker and generation (or, deprecated,
+        the exact lease expiry) no longer identify the live claim.
         """
 
     @abstractmethod

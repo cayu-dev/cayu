@@ -99,6 +99,7 @@ from cayu.sessions.requests import (
 from cayu.sessions.transcript_input import session_input_messages_sha256
 from cayu.sessions.transcript_queries import fork_source_transcript_sha256
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.dispatch import (
     _STALLED_RECOVERED_ACTIONS,
@@ -177,6 +178,7 @@ def test_dispatch_owner_lost_reconciliation_uses_store_owned_time() -> None:
         await dispatcher._settle_dispatch_cancellation_after_quiescence(
             created.id,
             "store-time-dispatch-worker",
+            claim_generation=claimed.claim_generation,
         )
         terminal = await store.load_task(created.id)
         assert terminal is not None
@@ -4114,7 +4116,7 @@ def test_dispatch_cancellation_fence_rejects_reused_worker_lease_generation() ->
         stale = await tasks.claim_task("shared-worker", lease_seconds=1)
         assert stale is not None
         assert stale.lease_expires_at is not None
-        stale_authority = _DispatchLeaseAuthority(stale.lease_expires_at)
+        stale_authority = _DispatchLeaseAuthority(stale.lease_expires_at, stale.claim_generation)
 
         ownership_now[0] += timedelta(seconds=1)
         assert [task.id for task in await tasks.reclaim_expired()] == [stale.id]
@@ -4123,7 +4125,7 @@ def test_dispatch_cancellation_fence_rejects_reused_worker_lease_generation() ->
         assert successor.lease_expires_at != stale.lease_expires_at
 
         dispatcher = TaskStoreDispatcher(tasks)
-        with pytest.raises(TaskClaimLost, match="expected lease generation"):
+        with pytest.raises(TaskClaimLost, match="expected claim generation"):
             await dispatcher._request_dispatch_cancellation_fence(
                 stale,
                 "shared-worker",
@@ -4144,29 +4146,21 @@ def test_dispatch_late_renewal_cannot_authorize_successor_lease() -> None:
         stale = await tasks.claim_task("shared-worker", lease_seconds=1)
         assert stale is not None
         assert stale.lease_expires_at is not None
-        authority = _DispatchLeaseAuthority(stale.lease_expires_at)
-        release_acknowledgement = asyncio.Event()
-
-        async def renew() -> Task:
-            renewed = await tasks.heartbeat(
-                stale.id,
-                "shared-worker",
-                lease_expires_at=stale.lease_expires_at,
-                extend_seconds=2,
-            )
-            await release_acknowledgement.wait()
-            return renewed
-
-        authority.pending_renewal = asyncio.create_task(renew())
-        await asyncio.sleep(0)
+        authority = _DispatchLeaseAuthority(stale.lease_expires_at, stale.claim_generation)
+        # A renewal commits; its acknowledgement never reaches the authority.
+        await tasks.heartbeat(
+            stale.id,
+            "shared-worker",
+            claim_generation=stale.claim_generation,
+            extend_seconds=2,
+        )
         ownership_now[0] += timedelta(seconds=3)
         assert [task.id for task in await tasks.reclaim_expired()] == [stale.id]
         successor = await tasks.claim_task("shared-worker", lease_seconds=30)
         assert successor is not None
-        release_acknowledgement.set()
 
         dispatcher = TaskStoreDispatcher(tasks)
-        with pytest.raises(TaskClaimLost, match="expected lease generation"):
+        with pytest.raises(TaskClaimLost, match="expected claim generation"):
             await dispatcher._request_dispatch_cancellation_fence(
                 stale,
                 "shared-worker",
@@ -4174,19 +4168,17 @@ def test_dispatch_late_renewal_cannot_authorize_successor_lease() -> None:
                 lease_authority=authority,
             )
 
-        assert authority.pending_renewal is None
-        assert authority.lease_expires_at != successor.lease_expires_at
+        assert authority.claim_generation != successor.claim_generation
         assert await tasks.load_task(successor.id) == successor
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("request_race", [False, True])
-@pytest.mark.parametrize("publish_cancellation", [False, True])
-def test_dispatch_stalled_renewal_does_not_block_cancellation_fence(
+@pytest.mark.parametrize("superseded", [False, True])
+def test_dispatch_unacknowledged_renewal_does_not_block_cancellation_fence(
     request_race: bool,
-    publish_cancellation: bool,
-    monkeypatch: pytest.MonkeyPatch,
+    superseded: bool,
 ) -> None:
     async def scenario() -> None:
         ownership_now = [datetime(2026, 1, 1, tzinfo=UTC)]
@@ -4204,67 +4196,46 @@ def test_dispatch_stalled_renewal_does_not_block_cancellation_fence(
         await tasks.create_task(TaskCreate(task_id="stalled-renewal", type="dispatch"))
         stale = await tasks.claim_task("shared-worker", lease_seconds=1)
         assert stale is not None and stale.lease_expires_at is not None
-        authority = _DispatchLeaseAuthority(stale.lease_expires_at)
-        renewed = await tasks.heartbeat(
+        authority = _DispatchLeaseAuthority(stale.lease_expires_at, stale.claim_generation)
+        # The renewal commits but its acknowledgement is lost: the authority
+        # still holds the claim's first lease, and that no longer matters.
+        await tasks.heartbeat(
             stale.id,
             "shared-worker",
-            lease_expires_at=stale.lease_expires_at,
+            claim_generation=stale.claim_generation,
             extend_seconds=2,
         )
-        release_acknowledgement = asyncio.Event()
-        observation_started = asyncio.Event()
-
-        async def acknowledge() -> Task:
-            await release_acknowledgement.wait()
-            return renewed
-
-        reconcile = authority.reconcile_renewal
-
-        async def observe() -> bool:
-            observation_started.set()
-            return await reconcile()
-
-        monkeypatch.setattr(authority, "reconcile_renewal", observe)
-        pending = asyncio.create_task(acknowledge())
-        authority.pending_renewal = pending
-        if not publish_cancellation:
+        successor = None
+        if superseded:
             ownership_now[0] += timedelta(seconds=3)
             await tasks.reclaim_expired()
             successor = await tasks.claim_task("shared-worker", lease_seconds=30)
             assert successor is not None
         tasks.return_stale = request_race
         dispatcher = TaskStoreDispatcher(tasks)
-        fence = asyncio.create_task(
-            dispatcher._request_dispatch_cancellation_fence(
+        if superseded:
+            with pytest.raises(TaskClaimLost, match="claim generation"):
+                await dispatcher._request_dispatch_cancellation_fence(
+                    stale,
+                    "shared-worker",
+                    {"code": "stalled-renewal"},
+                    lease_authority=authority,
+                )
+            assert await tasks.load_task(stale.id) == successor
+        else:
+            requested = await dispatcher._request_dispatch_cancellation_fence(
                 stale,
                 "shared-worker",
                 {"code": "stalled-renewal"},
                 lease_authority=authority,
             )
-        )
-        try:
-            await asyncio.wait_for(observation_started.wait(), 3)
-            if publish_cancellation:
-                assert renewed.lease_expires_at is not None
-                requested = await tasks.request_claimed_task_cancellation(
-                    stale.id,
-                    "shared-worker",
-                    renewed.lease_expires_at,
-                    {"code": "independent-cancellation"},
-                )
-                assert await asyncio.wait_for(fence, 3) == requested
-            else:
-                with pytest.raises(TaskClaimLost, match="lease generation"):
-                    await asyncio.wait_for(fence, 3)
-                assert await tasks.load_task(stale.id) == successor
-            assert authority.pending_renewal is pending
-            assert not pending.done()
-            assert authority.lease_expires_at == stale.lease_expires_at
-            assert not authority.lock.locked()
-        finally:
-            fence.cancel()
-            release_acknowledgement.set()
-            await asyncio.gather(fence, pending, return_exceptions=True)
+            assert requested is not None
+            assert requested.claim_generation == stale.claim_generation
+            assert requested.status is TaskStatus.CLAIMED
+            assert _task_cancellation_requested(requested)
+            assert await tasks.load_task(stale.id) == requested
+        assert authority.lease_expires_at == stale.lease_expires_at
+        assert not authority.lock.locked()
 
     asyncio.run(scenario())
 
@@ -4354,7 +4325,7 @@ def test_live_dispatcher_stops_before_replacement_after_heartbeat_stalls() -> No
             task_id,
             worker_id,
             *,
-            lease_expires_at,
+            claim_generation=None,
             extend_seconds=300,
         ):
             if worker_id == "stale-dispatch-worker":
@@ -4363,7 +4334,7 @@ def test_live_dispatcher_stops_before_replacement_after_heartbeat_stalls() -> No
             return await super().heartbeat(
                 task_id,
                 worker_id,
-                lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 extend_seconds=extend_seconds,
             )
 
@@ -4463,8 +4434,10 @@ def test_cancelled_live_dispatcher_fences_opaque_work_before_replacement() -> No
             self,
             task_id,
             worker_id,
-            lease_expires_at,
+            lease_expires_at=None,
             error=None,
+            *,
+            claim_generation=None,
         ):
             self.fence_started.set()
             await self.release_fence.wait()
@@ -4473,6 +4446,7 @@ def test_cancelled_live_dispatcher_fences_opaque_work_before_replacement() -> No
                 worker_id,
                 lease_expires_at,
                 error,
+                claim_generation=claim_generation,
             )
 
         async def heartbeat(
@@ -4480,10 +4454,10 @@ def test_cancelled_live_dispatcher_fences_opaque_work_before_replacement() -> No
             task_id,
             worker_id,
             *,
-            lease_expires_at,
+            claim_generation=None,
             extend_seconds=300,
         ):
-            del task_id, worker_id, lease_expires_at, extend_seconds
+            del task_id, worker_id, claim_generation, extend_seconds
             self.heartbeat_started.set()
             await self.release_heartbeat.wait()
             raise lease_failure
@@ -4841,7 +4815,7 @@ def test_process_next_rejects_peer_terminalization_without_exact_dispatch_eviden
                 request.task_id,
                 {"winner": "peer"},
                 worker_id=request.worker_id,
-                lease_expires_at=request.lease_expires_at,
+                claim_generation=request.claim_generation,
             )
             return await super().terminalize_task(request)
 
@@ -5031,7 +5005,7 @@ def test_operator_cancellation_wins_terminal_race_and_restart_acknowledges_recei
             *,
             task_id: str,
             worker_id: str,
-            lease_expires_at: datetime,
+            claim_generation: int,
             kind: TaskTerminalKind,
             payload: dict[str, Any],
         ) -> bool:
@@ -5040,7 +5014,7 @@ def test_operator_cancellation_wins_terminal_race_and_restart_acknowledges_recei
             return await original_commit(
                 task_id=task_id,
                 worker_id=worker_id,
-                lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 kind=kind,
                 payload=payload,
             )
@@ -5673,7 +5647,9 @@ def test_queue_terminalization_uses_exact_session_event_status() -> None:
                 "error": "failure after the session terminal event",
             },
             envelope=envelope,
-            lease_authority=_DispatchLeaseAuthority(claimed.lease_expires_at),
+            lease_authority=_DispatchLeaseAuthority(
+                claimed.lease_expires_at, claimed.claim_generation
+            ),
         )
         terminal_task = await tasks.load_task(task_id)
         assert terminal_task is not None
@@ -7509,7 +7485,9 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
             DispatchStatus.COMPLETED,
             {"status": "completed"},
             envelope=envelope,
-            lease_authority=_DispatchLeaseAuthority(claimed.lease_expires_at),
+            lease_authority=_DispatchLeaseAuthority(
+                claimed.lease_expires_at, claimed.claim_generation
+            ),
         )
 
         assert handle.metadata.get("reclaimed") is True

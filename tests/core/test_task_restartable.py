@@ -389,13 +389,13 @@ def test_shutdown_settles_even_when_cleanup_fails_or_operator_wins(backend, faul
         class RacingStore(base):
             verified_work_mutations_are_cancellation_quiescent = True
 
-            async def restart_task(self, task_id, worker_id, *, lease_expires_at):
+            async def restart_task(self, task_id, worker_id, *, claim_generation=None):
                 if fault == "operator_race":
                     await self.request_claimed_task_cancellation(
-                        task_id, worker_id, lease_expires_at
+                        task_id, worker_id, claim_generation=claim_generation
                     )
                 return await super().restart_task(
-                    task_id, worker_id, lease_expires_at=lease_expires_at
+                    task_id, worker_id, claim_generation=claim_generation
                 )
 
         store = RacingStore() if backend == "memory" else RacingStore(tmp_path / "fault.db")

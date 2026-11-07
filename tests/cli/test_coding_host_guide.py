@@ -67,6 +67,7 @@ def test_coding_host_fragment_uses_managed_completion_and_durable_readback(
         leases = []
         verification_calls = []
         completion_calls = []
+        created_claim_generation = []
         failures = []
         expected = {"product_run_id": "retained-product", "result_digest": "a" * 64}
         original_heartbeat = store.heartbeat
@@ -81,7 +82,9 @@ def test_coding_host_fragment_uses_managed_completion_and_durable_readback(
             return updated
 
         async def complete(*args, **kwargs):
-            completion_calls.append(kwargs["lease_expires_at"])
+            completion_calls.append(
+                (kwargs.get("lease_expires_at"), kwargs.get("claim_generation"))
+            )
             result = await original_complete(*args, **kwargs)
             if lose_ack:
                 raise lost
@@ -89,6 +92,7 @@ def test_coding_host_fragment_uses_managed_completion_and_durable_readback(
 
         async def verify_product_for_claim(_app, claimed):
             verification_calls.append(claimed.id)
+            created_claim_generation.append(claimed.claim_generation)
             await asyncio.wait_for(renewed.wait(), timeout=5)
             assert leases[-1] != claimed.lease_expires_at
             # Domain acceptance is deliberately characterized here; this test
@@ -129,7 +133,9 @@ def test_coding_host_fragment_uses_managed_completion_and_durable_readback(
                     )
                     == 1
                 )
-            assert completion_calls == [leases[-1]]
+            # Renewed after the claim, the completion is fenced by the claim's
+            # generation and presents no lease.
+            assert completion_calls == [(None, created_claim_generation[0])]
             assert verification_calls == [created.id]
             assert failures == ([lost] if lose_ack else [])
             if isinstance(store, SQLiteTaskStore):

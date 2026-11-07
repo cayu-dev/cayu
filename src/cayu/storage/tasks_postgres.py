@@ -87,6 +87,13 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._claim_fence import (
+    TaskClaimFence,
+    ensure_claim_fence,
+    fenced_claim_lease,
+    released_claim_lease,
+    validate_claim_generation,
+)
 from cayu.tasks._failure_scrub import (
     TaskFailureScrub,
     TaskFailureScrubResult,
@@ -104,7 +111,6 @@ from cayu.tasks._lifecycle import (
     _ensure_can_hold_task,
     _ensure_can_resume_task,
     _ensure_can_transition,
-    _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
     _ensure_recovered_attached_task_failure_authority,
     _ensure_recovered_attached_task_session,
@@ -274,7 +280,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 139
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 142
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -286,7 +292,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.created_at, task.updated_at, task.started_at, task.completed_at, task.invocation, "
     "task.retry_series, task.work_contract, task.schedule, task.graph_id, task.prerequisite_task_ids, "
     "task.restartable, task.restart_count, task.concurrency_key, task.max_restarts, "
-    "task.restart_history"
+    "task.restart_history, task.claim_generation"
 )
 
 
@@ -1228,7 +1234,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s
+                    %s, %s, %s
                 )
                 """,
                 pg_support.task_insert_values(task),
@@ -2484,6 +2490,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         session_invocation: SessionInvocationBinding,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -2493,6 +2500,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         session_binding = _copy_required_session_binding(session_invocation)
         await self._ensure_ready()
 
@@ -2532,12 +2540,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     worker_id,
                     now=now,
                 )
-            if expected_lease is None:
+            if expected_lease is None and claim_generation is None:
                 raise TaskClaimLost("Task attachment requires its exact worker lease.")
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=now,
             )
             updated = task.model_copy(
@@ -2563,10 +2572,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         result = copy_durable_json_object(result, "result")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -2575,15 +2586,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             worker_id=worker_id,
             handoff_id=handoff_id,
             presented_lease_expires_at=lease_expires_at,
-        ) as effective_lease:
+            presented_claim_generation=claim_generation,
+        ) as managed:
             return await self._finish_task(
                 task_id,
                 TaskStatus.COMPLETED,
                 result=result,
                 error=None,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
+                expected_lease_expires_at=managed.lease_expires_at,
                 handoff_id=handoff_id,
+                claim_generation=managed.claim_generation,
             )
 
     async def fail_task(
@@ -2594,10 +2607,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         worker_id: str | None = None,
         lease_expires_at: datetime | None = None,
         handoff_id: str | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         error = copy_durable_json_object(error, "error")
-        if worker_id is not None and lease_expires_at is None:
+        claim_generation = validate_claim_generation(claim_generation)
+        if worker_id is not None and lease_expires_at is None and claim_generation is None:
             raise TaskClaimLost(
                 "Worker-owned task terminalization requires its exact lease generation."
             )
@@ -2606,15 +2621,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             worker_id=worker_id,
             handoff_id=handoff_id,
             presented_lease_expires_at=lease_expires_at,
-        ) as effective_lease:
+            presented_claim_generation=claim_generation,
+        ) as managed:
             return await self._finish_task(
                 task_id,
                 TaskStatus.FAILED,
                 result=None,
                 error=error,
                 worker_id=worker_id,
-                expected_lease_expires_at=effective_lease,
+                expected_lease_expires_at=managed.lease_expires_at,
                 handoff_id=handoff_id,
+                claim_generation=managed.claim_generation,
             )
 
     async def terminalize_task(self, request: TaskTerminalizationRequest) -> Task:
@@ -2671,7 +2688,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         )
                     now = await self._database_now(cur)
                     _ensure_task_terminalization_lease_authority(task, request, now=now)
-                    _ensure_task_handoff_authority(task, request.handoff_id)
+                    fenced_handoff_id = (
+                        request.handoff_id
+                        if request.claim_generation is None
+                        else task.interrupted_handoff_id
+                    )
+                    _ensure_task_handoff_authority(task, fenced_handoff_id)
                     _validate_ordinary_task_terminalization_against_cancellation(task, request)
                     status = TaskStatus(request.kind.value)
                     verified_work_support.require_contracted_completion_authority(
@@ -2711,7 +2733,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             str(TaskStatus.CLAIMED),
                             str(TaskStatus.RUNNING),
                             request.worker_id,
-                            request.handoff_id,
+                            fenced_handoff_id,
                             now,
                         ),
                     )
@@ -2849,9 +2871,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             session_id,
                             session_instance_id,
                             request.worker_id,
-                            request.lease_expires_at,
+                            # The locked row the authority check accepted: a
+                            # generation-fenced request presents no lease.
+                            task.lease_expires_at,
                             now,
-                            request.handoff_id,
+                            task.interrupted_handoff_id,
                         ),
                     )
                     terminal_row = await cur.fetchone()
@@ -2992,7 +3016,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             "Admitted work attempts do not use interrupted-task handoff release."
                         )
                     now = await self._database_now(cur)
-                    _require_interrupted_task_handoff_authority(
+                    fenced_lease = _require_interrupted_task_handoff_authority(
                         task,
                         request,
                         now=now,
@@ -3004,6 +3028,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         UPDATE cayu_tasks
                         SET worker_id = NULL,
                             lease_expires_at = NULL,
+                            claim_generation = claim_generation + 1,
                             interrupted_handoff_id = %s,
                             updated_at = %s
                         WHERE id = %s
@@ -3023,7 +3048,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             request.session_id,
                             request.session_instance_id,
                             request.worker_id,
-                            request.lease_expires_at,
+                            fenced_lease,
                             now,
                         ),
                     )
@@ -3434,6 +3459,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                                 lease_expires_at = clock_timestamp()
                                     + (%s * INTERVAL '1 second'),
                                 interrupted_handoff_id = %s,
+                                claim_generation = task.claim_generation + 1,
                                 updated_at = transaction_timestamp()
                             WHERE task.id = %s
                               AND task.status = %s
@@ -3712,14 +3738,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         )
                     now = await self._database_now(cur)
                     series_now = self._clock() if self._clock_is_injected else now
-                    if request.lease_expires_at is None:
+                    if request.lease_expires_at is None and request.claim_generation is None:
                         raise TaskClaimLost(
                             "Task retry settlement requires its exact worker lease."
                         )
-                    _ensure_exact_owned_active_task_lease(
+                    fenced_claim_lease(
                         task,
                         request.worker_id,
-                        request.lease_expires_at,
+                        lease_expires_at=request.lease_expires_at,
+                        claim_generation=request.claim_generation,
                         now=now,
                     )
                     settled, successor = _settled_task_retry_attempt(
@@ -3777,7 +3804,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s
+                                %s, %s, %s
                             )
                             """,
                             pg_support.task_insert_values(successor),
@@ -4043,13 +4070,19 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         token_count: int = 0,
         estimated_cost: Decimal = Decimal(0),
     ) -> TaskRetrySettlementResult | None:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        presented_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         token_count, estimated_cost = _validated_task_retry_terminal_accounting(
             token_count=token_count,
             estimated_cost=estimated_cost,
@@ -4076,10 +4109,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     lease_now = timestamp_row[0]
                     series_now = self._clock() if self._clock_is_injected else lease_now
                     task = pg_support.task_from_row(row)
-                    _ensure_exact_owned_active_task_lease(
+                    expected_lease, _ = fenced_claim_lease(
                         task,
                         worker_id,
-                        expected_lease,
+                        lease_expires_at=presented_lease,
+                        claim_generation=claim_generation,
                         now=lease_now,
                     )
                     if not _claimed_task_retry_attempt_elapsed(task, series_now=series_now):
@@ -4152,11 +4186,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> bool:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
@@ -4176,10 +4216,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     lease_now = timestamp_row[0]
                     series_now = self._clock() if self._clock_is_injected else lease_now
                     task = pg_support.task_from_row(row)
-                    _ensure_exact_owned_active_task_lease(
+                    fenced_claim_lease(
                         task,
                         worker_id,
-                        expected_lease,
+                        lease_expires_at=expected_lease,
+                        claim_generation=claim_generation,
                         now=lease_now,
                     )
                     elapsed = _claimed_task_retry_attempt_elapsed(
@@ -4318,12 +4359,21 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
         error: dict[str, Any] | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
+        if lease_expires_at is None and claim_generation is None:
+            raise TaskClaimLost("Claimed-task cancellation requires its claim generation.")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         copied_error = None if error is None else copy_durable_json_object(error, "error")
         return await self._finish_task(
             task_id,
@@ -4332,6 +4382,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             error=copied_error,
             worker_id=worker_id,
             expected_lease_expires_at=expected_lease,
+            claim_generation=claim_generation,
             request_claimed_cancellation=True,
         )
 
@@ -4339,11 +4390,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         self,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        *,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
+        if lease_expires_at is None and claim_generation is None:
+            raise TaskClaimLost("Claimed-task execution requires its claim generation.")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         await self._ensure_ready()
 
         async def operation(conn: Any, cur: Any) -> Task:
@@ -4351,11 +4411,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             await self._lock_verified_work_task(cur, task_id)
             current = await self._load_task_locked(cur, task_id)
             now = await self._database_now(cur)
-            if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
-                raise TaskClaimLost(
-                    "Claimed-task execution no longer owns the expected worker lease."
-                )
-            _ensure_owned_active_task_lease(current, worker_id, now=now)
+            if claim_generation is not None:
+                ensure_claim_fence(current, TaskClaimFence(worker_id, claim_generation), now=now)
+            else:
+                if current.worker_id != worker_id or current.lease_expires_at != expected_lease:
+                    raise TaskClaimLost(
+                        "Claimed-task execution no longer owns the expected worker lease."
+                    )
+                _ensure_owned_active_task_lease(current, worker_id, now=now)
             if (
                 current.status is not TaskStatus.CLAIMED
                 or current.session_id is not None
@@ -4862,6 +4925,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         SET status = %s,
                             worker_id = %s,
                             lease_expires_at = {lease_expires_sql},
+                            claim_generation = task.claim_generation + 1,
                             updated_at = {updated_at_sql}
                         FROM candidate
                         WHERE task.id = candidate.id
@@ -5046,13 +5110,21 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         handoff_id: str | None = None,
         extend_seconds: int = 300,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        claim_generation = validate_claim_generation(claim_generation)
+        if lease_expires_at is None and claim_generation is None:
+            raise TaskClaimLost("Task heartbeat requires its claim generation.")
+        presented_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
 
         await self._ensure_ready()
@@ -5066,9 +5138,18 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     raise TaskClaimLost("Task concurrency key is no longer available to renew.")
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost("Task heartbeat no longer owns the expected worker lease.")
-                _ensure_task_handoff_authority(task, handoff_id)
+                if claim_generation is not None:
+                    expected_lease = ensure_claim_fence(
+                        task, TaskClaimFence(worker_id, claim_generation), now=now
+                    )
+                    handoff_id = task.interrupted_handoff_id
+                else:
+                    expected_lease = presented_lease
+                    if task.lease_expires_at != expected_lease:
+                        raise TaskClaimLost(
+                            "Task heartbeat no longer owns the expected worker lease."
+                        )
+                    _ensure_task_handoff_authority(task, handoff_id)
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -5115,13 +5196,23 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             return updated.model_copy(deep=True)
 
     async def restart_task(
-        self, task_id: str, worker_id: str, *, lease_expires_at: datetime
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         from cayu.tasks.restart import _restarted_task
 
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        expected_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn:
             async with conn.cursor() as cur:
@@ -5133,7 +5224,11 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 if await cur.fetchone() is not None:
                     raise WorkAttemptExecutionClaimLost("Admitted work attempts cannot restart.")
                 updated = _restarted_task(
-                    task, worker_id, expected_lease, now=await self._database_now(cur)
+                    task,
+                    worker_id,
+                    expected_lease,
+                    claim_generation=claim_generation,
+                    now=await self._database_now(cur),
                 )
                 if task.session_id is not None:
                     await cur.execute(
@@ -5176,11 +5271,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        presented_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
 
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn:
@@ -5188,8 +5289,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost("Task release no longer owns the expected worker lease.")
+                expected_lease = released_claim_lease(
+                    task,
+                    worker_id,
+                    presented_lease,
+                    claim_generation,
+                    now=now,
+                    message="Task release no longer owns the expected worker lease.",
+                )
                 await cur.execute(
                     "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
                     (task_id,),
@@ -5204,6 +5311,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     SET status = %s,
                         worker_id = NULL,
                         lease_expires_at = NULL,
+                        claim_generation = claim_generation + 1,
                         started_at = NULL,
                         updated_at = %s
                     WHERE id = %s AND worker_id = %s AND status = %s
@@ -5244,11 +5352,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         task_id: str,
         worker_id: str,
         *,
-        lease_expires_at: datetime,
+        lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
     ) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        expected_lease = normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        presented_lease = (
+            None
+            if lease_expires_at is None
+            else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
+        )
+        claim_generation = validate_claim_generation(claim_generation)
 
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn:
@@ -5256,10 +5370,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
-                if task.lease_expires_at != expected_lease:
-                    raise TaskClaimLost(
-                        "Attached-task release no longer owns the expected worker lease."
-                    )
+                expected_lease = released_claim_lease(
+                    task,
+                    worker_id,
+                    presented_lease,
+                    claim_generation,
+                    now=now,
+                    message="Attached-task release no longer owns the expected worker lease.",
+                )
                 if task.interrupted_handoff_id is not None:
                     raise TaskInterruptedHandoffConflict(
                         "Recovery-owned attached tasks must publish an interrupted handoff."
@@ -5277,6 +5395,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     UPDATE cayu_tasks
                     SET worker_id = NULL,
                         lease_expires_at = NULL,
+                        claim_generation = claim_generation + 1,
                         updated_at = %s
                     WHERE id = %s AND worker_id = %s AND status = %s
                       AND session_id IS NOT NULL
@@ -5432,16 +5551,18 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     for task in expired:
                         assert now is not None
                         if task.started_at is not None:
+                            # The lost holder no longer owns the claim it may still drain.
                             updated = _expired_dispatched_task_cancellation(
                                 task,
                                 updated_at=now,
-                            )
+                            ).model_copy(update={"claim_generation": task.claim_generation + 1})
                         else:
                             updated = task.model_copy(
                                 update={
                                     "status": TaskStatus.PENDING,
                                     "worker_id": None,
                                     "lease_expires_at": None,
+                                    "claim_generation": task.claim_generation + 1,
                                     "updated_at": now,
                                 }
                             )
@@ -5543,6 +5664,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         worker_id: str | None = None,
         handoff_id: str | None = None,
         expected_lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         request_claimed_cancellation: bool = False,
     ) -> Task:
         await self._ensure_ready()
@@ -5562,6 +5684,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 worker_id=worker_id,
                 handoff_id=handoff_id,
                 expected_lease_expires_at=expected_lease_expires_at,
+                claim_generation=claim_generation,
                 request_claimed_cancellation=request_claimed_cancellation,
             )
             await self._record_task_transition(cur, prior, updated)
@@ -5580,6 +5703,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         worker_id: str | None = None,
         handoff_id: str | None = None,
         expected_lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         request_claimed_cancellation: bool = False,
     ) -> Task:
         if expected_lease_expires_at is not None:
@@ -5600,6 +5724,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             )
         task = await self._load_task_locked(cur, task_id)
         now = await self._database_now(cur)
+        if worker_id is not None and claim_generation is not None:
+            # The generation decides; the write is bound to this locked row's claim.
+            ensure_claim_fence(
+                task,
+                TaskClaimFence(worker_id, claim_generation),
+                now=now,
+                require_live=not request_claimed_cancellation,
+            )
+            expected_lease_expires_at = task.lease_expires_at
+            handoff_id = task.interrupted_handoff_id
         if (
             worker_id is not None
             and expected_lease_expires_at is not None

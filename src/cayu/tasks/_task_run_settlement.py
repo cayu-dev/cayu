@@ -10,8 +10,7 @@ obligations on every path.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from cayu._exception_groups import iter_exception_tree
@@ -25,27 +24,21 @@ if TYPE_CHECKING:
     from cayu.tasks.store import TaskStore
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class UnstartedClaim:
     """One claim this worker holds, by identity: never the task's content.
 
-    ``leases`` holds every lease expiry this worker was acknowledged for this
-    claim, the claim's own and each renewal, so a renewed claim is still this
-    worker's while a newer claim under the same worker id is not.
+    ``claim_generation`` is the generation the claim call acknowledged. Renewals
+    keep it, so a renewed claim is still this worker's, while a newer claim
+    under the same worker id carries a later one.
     """
 
     task_id: str
-    leases: set[datetime] = field(default_factory=set)
+    claim_generation: int
 
     @classmethod
     def of(cls, task: Task) -> UnstartedClaim:
-        claim = cls(task.id)
-        claim.renewed(task)
-        return claim
-
-    def renewed(self, task: Task) -> None:
-        if task.id == self.task_id and task.lease_expires_at is not None:
-            self.leases.add(task.lease_expires_at)
+        return cls(task.id, task.claim_generation)
 
 
 async def acknowledge_stopped_handler(
@@ -113,12 +106,13 @@ async def release_unstarted_claims(
     acknowledgement, would strand it with the exited worker until its lease
     expires. Durable state decides: only a claim this worker still holds, not
     started, is released, shielded from the caller's cancellation. ``claims``
-    names the claims this worker's claim calls returned, and only that claim (a
-    lease this worker was acknowledged for it) is released: a newer claim under
-    the same worker id belongs to its own owner. Unacknowledged claims are left
-    to lease expiry because their authority cannot be recovered by worker id. A process-level stop is left
-    to lease expiry, and a claim whose execution entry is still pending stays
-    with that entry's settlement owner.
+    names the claims this worker's claim calls returned, each released only
+    under the claim generation it was acknowledged for: renewals keep the
+    generation, and a newer claim under the same worker id carries its own.
+    Unacknowledged claims are left to lease expiry because their authority
+    cannot be recovered by worker id. A process-level stop is left to lease
+    expiry, and a claim whose execution entry is still pending stays with that
+    entry's settlement owner.
     """
 
     from cayu.runtime._recovery_ownership import _run_recovery_cleanup_steps
@@ -138,12 +132,13 @@ async def release_unstarted_claims(
                 or current.status is not TaskStatus.CLAIMED
                 or current.started_at is not None
                 or current.worker_id != worker_id
-                or current.lease_expires_at not in candidate.leases
+                or current.claim_generation != candidate.claim_generation
             ):
                 continue
             try:
+                # Fenced by the generation this worker's claim call returned.
                 await task_store.release_task(
-                    current.id, worker_id, lease_expires_at=current.lease_expires_at
+                    current.id, worker_id, claim_generation=candidate.claim_generation
                 )
             except TaskClaimLost:
                 continue

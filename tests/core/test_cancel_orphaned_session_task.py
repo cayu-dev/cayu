@@ -722,7 +722,10 @@ def test_a_continuation_cancelled_while_draining_settles_after_its_lease_expired
             # The continuation drained, but its own lease expired before it settled.
             await _expire(backend, clock)
             await task_worker._settle_ordinary_task_cancellation_after_quiescence(
-                tasks, task_id, "continuing-worker"
+                tasks,
+                task_id,
+                "continuing-worker",
+                claim_generation=claimed.task.claim_generation,
             )
             assert (await tasks.load_task(task_id)).status is TaskStatus.CANCELLED
         finally:

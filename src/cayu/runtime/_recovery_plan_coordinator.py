@@ -1486,7 +1486,7 @@ class RecoveryPlanCoordinator:
         request = TaskTerminalizationRequest(
             task_id=task.id,
             worker_id=task.worker_id,
-            lease_expires_at=task.lease_expires_at,
+            claim_generation=task.claim_generation,
             handoff_id=task.interrupted_handoff_id,
             kind=TaskTerminalKind.FAILED,
             error={
@@ -1560,7 +1560,6 @@ class RecoveryPlanCoordinator:
         if self._task_store is None or task.worker_id is None or task.lease_expires_at is None:
             lost.set()
             return
-        lease_expires_at = task.lease_expires_at
         local_deadline = monotonic() + _RECOVERY_PLAN_TASK_LEASE_SECONDS
         while not stop.is_set():
             remaining = local_deadline - monotonic()
@@ -1579,8 +1578,7 @@ class RecoveryPlanCoordinator:
                 renewed = await self._task_store.heartbeat(
                     task.id,
                     task.worker_id,
-                    lease_expires_at=lease_expires_at,
-                    handoff_id=task.interrupted_handoff_id,
+                    claim_generation=task.claim_generation,
                     extend_seconds=_RECOVERY_PLAN_TASK_LEASE_SECONDS,
                 )
             except TaskClaimLost:
@@ -1598,7 +1596,6 @@ class RecoveryPlanCoordinator:
             if renewed.lease_expires_at is None:
                 lost.set()
                 return
-            lease_expires_at = renewed.lease_expires_at
             local_deadline = monotonic() + _RECOVERY_PLAN_TASK_LEASE_SECONDS
 
     @staticmethod

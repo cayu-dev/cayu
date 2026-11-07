@@ -205,6 +205,13 @@ class TaskRetrySettlementRequest(_TaskRetryAttemptOutcome):
     task_id: str
     worker_id: str
     lease_expires_at: datetime | None = None
+    # The claim's durable generation; when present it is the settlement's authority.
+    claim_generation: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value is None,
+    )
     causal_budget_id: str
 
     @field_validator("task_id", "worker_id", "causal_budget_id")
@@ -478,7 +485,7 @@ def _legacy_task_retry_settlement_request_sha256(
                 **copied.model_dump(
                     mode="json",
                     warnings=False,
-                    exclude={"lease_expires_at"},
+                    exclude={"lease_expires_at", "claim_generation"},
                 ),
             },
             "task_retry_settlement",
@@ -696,10 +703,16 @@ def _task_retry_requested_cancellation_settlement(
     task: Task,
     *,
     worker_id: str,
+    claim_generation: int | None = None,
     token_count: int = 0,
     estimated_cost: Decimal = Decimal(0),
 ) -> TaskRetrySettlementRequest | None:
-    """Reconstruct the exact cancellation intent owned by a draining attempt."""
+    """Reconstruct the exact cancellation intent owned by a draining attempt.
+
+    With ``claim_generation`` the request is fenced by that claim and carries no
+    lease, so a renewal between reading the row and settling never makes it
+    stale. Without it, it carries the row's current lease.
+    """
 
     if not _task_retry_cancellation_requested(task):
         return None
@@ -736,7 +749,8 @@ def _task_retry_requested_cancellation_settlement(
     return TaskRetrySettlementRequest(
         task_id=task.id,
         worker_id=worker_id,
-        lease_expires_at=task.lease_expires_at,
+        lease_expires_at=None if claim_generation is not None else task.lease_expires_at,
+        claim_generation=claim_generation,
         idempotency_key=expected_key,
         causal_budget_id=series.causal_budget_id,
         disposition=TaskRetryAttemptDisposition.CANCELLED,
@@ -1183,10 +1197,18 @@ def _settled_task_retry_attempt(
     requested_cancellation = _task_retry_requested_cancellation_settlement(
         task,
         worker_id=request.worker_id,
+        claim_generation=request.claim_generation,
         token_count=request.token_count,
         estimated_cost=request.estimated_cost,
     )
-    if requested_cancellation is not None and request != requested_cancellation:
+    # A generation-fenced request's lease is ignored, so it is no part of the
+    # cancellation intent either.
+    presented_intent = (
+        request
+        if request.claim_generation is None
+        else request.model_copy(update={"lease_expires_at": None})
+    )
+    if requested_cancellation is not None and presented_intent != requested_cancellation:
         raise TaskTerminalizationConflict("Task retry attempt has a pending cancellation request.")
     token_authority_exceeded = (
         series.tokens_remaining is not None and request.token_count > series.tokens_remaining

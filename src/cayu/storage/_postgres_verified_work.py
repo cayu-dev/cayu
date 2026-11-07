@@ -1109,7 +1109,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 status_reason = %s, status_payload = %s, result = %s, error = %s,
                 updated_at = %s, started_at = %s, completed_at = %s, retry_series = %s,
                 work_contract = %s, available_at = %s, schedule = %s, restart_count = %s,
-                restart_history = %s
+                restart_history = %s, claim_generation = %s
             WHERE id = %s
             """,
             (
@@ -1137,6 +1137,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 else json.dumps(task.schedule.model_dump(mode="json")),
                 task.restart_count,
                 pg_support.restart_history_json(task),
+                task.claim_generation,
                 task.id,
             ),
         )
@@ -1273,8 +1274,11 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
         *,
         worker_id: str,
         lease_expires_at: datetime | None = None,
+        claim_generation: int | None = None,
         contract: WorkContractRef,
     ) -> Task:
+        from cayu.tasks._claim_fence import fenced_claim_lease, validate_claim_generation
+
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         expected_lease = (
@@ -1282,6 +1286,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
             if lease_expires_at is None
             else normalize_utc_datetime(lease_expires_at, "lease_expires_at")
         )
+        claim_generation = validate_claim_generation(claim_generation)
         copied_contract = copy_work_contract_ref(contract)
         if copied_contract is None:
             raise TypeError("contract must be a WorkContractRef.")
@@ -1297,12 +1302,13 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
             # The shared contract row can be locked by another verifier
             # transaction.  Revalidate worker ownership after that wait.
             now = await self._database_now(cur)
-            if expected_lease is None:
+            if expected_lease is None and claim_generation is None:
                 raise TaskClaimLost("Contracted task parking requires its exact worker lease.")
-            _ensure_exact_owned_active_task_lease(
+            fenced_claim_lease(
                 task,
                 worker_id,
-                expected_lease,
+                lease_expires_at=expected_lease,
+                claim_generation=claim_generation,
                 now=now,
             )
             updated = task.model_copy(
@@ -1315,6 +1321,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                     },
                     "worker_id": None,
                     "lease_expires_at": None,
+                    "claim_generation": task.claim_generation + 1,
                     "updated_at": now,
                 }
             )

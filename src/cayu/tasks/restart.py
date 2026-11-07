@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_clean_nonblank
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
-from cayu.tasks._lifecycle import _ensure_exact_owned_active_task_lease
 from cayu.tasks.cancellation import _task_cancellation_requested, _task_retry_cancellation_requested
 from cayu.tasks.records import (
     TASK_MAX_RESTARTS_LIMIT,
@@ -144,6 +143,7 @@ def _requeued_task(task: Task, *, now: datetime, restart: dict[str, object]) -> 
             "session_instance_id": None,
             "worker_id": None,
             "lease_expires_at": None,
+            "claim_generation": task.claim_generation + 1,
             "started_at": None,
             "completed_at": None,
             "result": None,
@@ -163,9 +163,22 @@ def _requeued_task(task: Task, *, now: datetime, restart: dict[str, object]) -> 
 
 
 def _restarted_task(
-    task: Task, worker_id: str, lease_expires_at: datetime, *, now: datetime
+    task: Task,
+    worker_id: str,
+    lease_expires_at: datetime | None,
+    *,
+    claim_generation: int | None = None,
+    now: datetime,
 ) -> Task:
-    _ensure_exact_owned_active_task_lease(task, worker_id, lease_expires_at, now=now)
+    from cayu.tasks._claim_fence import fenced_claim_lease
+
+    fenced_claim_lease(
+        task,
+        worker_id,
+        lease_expires_at=lease_expires_at,
+        claim_generation=claim_generation,
+        now=now,
+    )
     if not task.restartable or task.interrupted_handoff_id is not None:
         raise ValueError("Only ordinary restartable root queue jobs can be requeued.")
     if _task_cancellation_requested(task) or _task_retry_cancellation_requested(task):
@@ -256,15 +269,16 @@ async def requeue_restartable_task(task_store: TaskStore, task: Task, worker_id:
     """Requeue a handler the caller has already stopped and fully joined.
 
     This does not cancel or join work for the caller. Keep renewing ownership
-    during shutdown; the exact current lease must still be live. A handler must
+    during shutdown; the claim ``task`` was received under must still hold a
+    live lease, and is identified by its claim generation. A handler must
     leave no detached work capable of producing further effects. Operator
     cancellation, lost leases and non-restartable tasks are refused. Use a fresh
     session ID on the next attempt; ``restart_count`` distinguishes attempts.
     The generic worker performs this shutdown sequence automatically.
     """
     if task.lease_expires_at is None:
-        raise ValueError("Restarting a task requires its exact worker lease.")
-    return await task_store.restart_task(task.id, worker_id, lease_expires_at=task.lease_expires_at)
+        raise ValueError("Restarting a task requires the claim it was received under.")
+    return await task_store.restart_task(task.id, worker_id, claim_generation=task.claim_generation)
 
 
 async def restart_abandoned_task(

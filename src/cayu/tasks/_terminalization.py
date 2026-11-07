@@ -351,6 +351,7 @@ async def _terminalize_claimed_task(
                 request.result,
                 worker_id=request.worker_id,
                 lease_expires_at=lease_expires_at,
+                claim_generation=request.claim_generation,
                 handoff_id=request.handoff_id,
             )
         if request.error is None:  # pragma: no cover - request model invariant
@@ -360,10 +361,15 @@ async def _terminalize_claimed_task(
             request.error,
             worker_id=request.worker_id,
             lease_expires_at=lease_expires_at,
+            claim_generation=request.claim_generation,
             handoff_id=request.handoff_id,
         )
 
-    if request.worker_id is None or request.lease_expires_at is not None:
+    if (
+        request.worker_id is None
+        or request.lease_expires_at is not None
+        or request.claim_generation is not None
+    ):
         return await apply(request.lease_expires_at)
 
     current = await task_store.load_task(request.task_id)
@@ -405,6 +411,7 @@ async def _terminalize_claimed_task_or_detect_peer_winner(
             cancellation = _task_cancellation_terminalization_request(
                 task,
                 worker_id=request.worker_id,
+                claim_generation=request.claim_generation,
             )
             if cancellation is not None:
                 await _terminalize_claimed_task(task_store, cancellation)

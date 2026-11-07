@@ -414,6 +414,14 @@ class Task(BaseModel):
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
     interrupted_handoff_id: str | None = None
+    #: The claim this row belongs to. Claim, release, reclaim, handoff and restart
+    #: advance it; heartbeats keep it. Claimed mutations present it as authority.
+    claim_generation: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value == 0,
+    )
     status_reason: str | None = None
     status_payload: dict[str, Any] | None = None
     input: dict[str, Any] = Field(default_factory=dict)
@@ -649,6 +657,7 @@ def copy_task(task: Task) -> Task:
         worker_id=task.worker_id,
         lease_expires_at=task.lease_expires_at,
         interrupted_handoff_id=task.interrupted_handoff_id,
+        claim_generation=task.claim_generation,
         status_reason=task.status_reason,
         status_payload=(
             None

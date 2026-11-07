@@ -220,11 +220,12 @@ async def _drained_after_its_lease(app: CayuApp, clock: Any, backend: str) -> _S
 
     tasks = app.task_store
     await tasks.create_task(TaskCreate(task_id="drain", type="scan"))
-    assert await tasks.claim_task(_DEAD_WORKER, lease_seconds=5) is not None
+    claimed = await tasks.claim_task(_DEAD_WORKER, lease_seconds=5)
+    assert claimed is not None
     requested = await tasks.cancel_task("drain", {"code": "operator", "message": "not needed"})
     await _expire(backend, clock)
     await task_worker._settle_ordinary_task_cancellation_after_quiescence(
-        tasks, "drain", _DEAD_WORKER
+        tasks, "drain", _DEAD_WORKER, claim_generation=claimed.claim_generation
     )
     settled = await tasks.load_task("drain")
     evidence_id = settled.status_payload["cancellation_reconciliation"]["evidence"]["evidence_id"]

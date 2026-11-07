@@ -687,13 +687,13 @@ async def _run_external_agent(
                         worker_id=request.task_worker_id,
                         handoff_id=settling_task.interrupted_handoff_id,
                         presented_lease_expires_at=request.task_lease_expires_at,
-                    ) as lease:
-                        assert lease is not None
+                    ) as managed:
                         await app.task_store.request_claimed_task_cancellation(
                             settling_task.id,
                             request.task_worker_id,
-                            lease,
+                            managed.lease_expires_at,
                             {"error": "ExternalAgentInterrupted"},
+                            claim_generation=managed.claim_generation,
                         )
                 elif not cancelled:
                     await _settle_task(app, settling_task, request, error=error)

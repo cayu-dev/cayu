@@ -31,7 +31,12 @@ def _attempt(n: int) -> dict[str, str]:
 
 def _in_task(task_id: str):
     return bind_task_lease_authority(
-        TaskLeaseAuthority(datetime.now(UTC) + timedelta(minutes=5), task_id=task_id, worker_id="w")
+        TaskLeaseAuthority(
+            datetime.now(UTC) + timedelta(minutes=5),
+            claim_generation=1,
+            task_id=task_id,
+            worker_id="w",
+        )
     )
 
 

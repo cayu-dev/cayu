@@ -43,8 +43,8 @@ def test_task_key_forward_upgrade(backend, tmp_path, request, monkeypatch):
                         "started_at,completed_at,invocation_json,retry_series_json,work_contract_json,"
                         "schedule_json,restartable,restart_count"
                     )
-                    # Revision 122 predates the concurrency key and the revision-135 columns.
-                    values = sq.task_to_row_values(original)[:-3]
+                    # Revision 122 predates the concurrency key and the revision-135 and -142 columns.
+                    values = sq.task_to_row_values(original)[:-4]
                     connection.execute(
                         f"INSERT INTO cayu_tasks ({columns}) VALUES ({','.join('?' for _ in values)})",
                         values,
@@ -59,8 +59,8 @@ def test_task_key_forward_upgrade(backend, tmp_path, request, monkeypatch):
                 finally:
                     await historical.close()
                 async with await psycopg.AsyncConnection.connect(dsn) as connection:
-                    columns = pg.TASK_COLUMNS.rsplit(", ", 3)[0]
-                    values = pg.task_insert_values(original)[:-3]
+                    columns = pg.TASK_COLUMNS.rsplit(", ", 4)[0]
+                    values = pg.task_insert_values(original)[:-4]
                     await connection.execute(
                         f"INSERT INTO cayu_tasks ({columns}) VALUES ({','.join('%s' for _ in values)})",
                         values,

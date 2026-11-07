@@ -79,7 +79,15 @@ class TaskInterruptedHandoffRequest(BaseModel):
 
     task_id: str
     worker_id: str
-    lease_expires_at: datetime
+    # The legacy exact-lease authority; left out when the claim generation is given.
+    lease_expires_at: datetime | None = Field(default=None, exclude_if=lambda value: value is None)
+    # The released claim's durable generation, the handoff's authority when present.
+    claim_generation: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+        exclude_if=lambda value: value is None,
+    )
     session_id: str
     session_instance_id: str
     session_run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
@@ -98,8 +106,14 @@ class TaskInterruptedHandoffRequest(BaseModel):
 
     @field_validator("lease_expires_at")
     @classmethod
-    def normalize_lease_expires_at(cls, value: datetime) -> datetime:
-        return normalize_utc_datetime(value, "lease_expires_at")
+    def normalize_lease_expires_at(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else normalize_utc_datetime(value, "lease_expires_at")
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> TaskInterruptedHandoffRequest:
+        if self.lease_expires_at is None and self.claim_generation is None:
+            raise ValueError("An interrupted-task handoff requires its claim generation.")
+        return self
 
 
 def _interrupted_task_handoff_request_sha256(
@@ -261,6 +275,7 @@ def prepare_interrupted_task_handoff(
         task_id=request.task_id,
         worker_id=request.worker_id,
         lease_expires_at=request.lease_expires_at,
+        claim_generation=request.claim_generation,
         session_id=request.session_id,
         session_instance_id=request.session_instance_id,
         session_run_epoch=request.session_run_epoch,
@@ -277,7 +292,7 @@ def interrupted_task_handoff_request(
     session_run_epoch: int,
     parked: TaskParkedWait | None = None,
 ) -> TaskInterruptedHandoffRequest:
-    """Bind one running task snapshot to an exact interrupted-session handoff."""
+    """Bind one running task snapshot's claim to an exact interrupted-session handoff."""
 
     if type(task) is not Task:
         raise TypeError("Interrupted-task handoff requests require a Task instance.")
@@ -290,25 +305,53 @@ def interrupted_task_handoff_request(
         raise TaskInterruptedHandoffConflict(
             "Task does not retain complete interrupted-handoff authority."
         )
+    return claim_interrupted_task_handoff_request(
+        task_id=task.id,
+        worker_id=task.worker_id,
+        claim_generation=task.claim_generation,
+        prior_handoff_id=task.interrupted_handoff_id,
+        session_id=task.session_id,
+        session_instance_id=task.session_instance_id,
+        session_run_epoch=session_run_epoch,
+        parked=parked,
+    )
+
+
+def claim_interrupted_task_handoff_request(
+    *,
+    task_id: str,
+    worker_id: str,
+    claim_generation: int,
+    prior_handoff_id: str | None,
+    session_id: str,
+    session_instance_id: str,
+    session_run_epoch: int,
+    parked: TaskParkedWait | None = None,
+) -> TaskInterruptedHandoffRequest:
+    """Bind one claim generation to an exact interrupted-session handoff.
+
+    The handoff id is derived from the claim's generation, not from its moving
+    lease expiry, so a handoff retried after a renewal keeps its identity.
+    """
+
     material = {
-        "schema": "cayu.task-interrupted-handoff-id.v2",
-        "task_id": task.id,
-        "worker_id": task.worker_id,
-        "lease_expires_at": task.lease_expires_at.isoformat(),
-        "session_id": task.session_id,
-        "session_instance_id": task.session_instance_id,
+        "schema": "cayu.task-interrupted-handoff-id.v3",
+        "task_id": task_id,
+        "claim_generation": claim_generation,
+        "session_id": session_id,
+        "session_instance_id": session_instance_id,
         "session_run_epoch": session_run_epoch,
-        "prior_handoff_lineage_id": task.interrupted_handoff_id,
+        "prior_handoff_lineage_id": prior_handoff_id,
     }
     handoff_id = sha256(
         canonical_durable_json_bytes(material, "task_interrupted_handoff_id")
     ).hexdigest()
     return TaskInterruptedHandoffRequest(
-        task_id=task.id,
-        worker_id=task.worker_id,
-        lease_expires_at=task.lease_expires_at,
-        session_id=task.session_id,
-        session_instance_id=task.session_instance_id,
+        task_id=task_id,
+        worker_id=worker_id,
+        claim_generation=claim_generation,
+        session_id=session_id,
+        session_instance_id=session_instance_id,
         session_run_epoch=session_run_epoch,
         handoff_id=handoff_id,
         parked=parked,
@@ -447,14 +490,26 @@ def _require_interrupted_task_handoff_authority(
     *,
     now: datetime,
     recover_expired: bool,
-) -> None:
+) -> datetime:
+    """Authenticate one handoff and return the lease expiry its write fences on.
+
+    With a claim generation, the row read under the store's lock must still
+    carry that generation, and its own lease is the one the write matches.
+    """
+
+    claim_matches = (
+        task.claim_generation == request.claim_generation
+        if request.claim_generation is not None
+        else task.lease_expires_at == request.lease_expires_at
+    )
     if (
         task.id != request.task_id
         or task.status is not TaskStatus.RUNNING
         or task.session_id != request.session_id
         or task.session_instance_id != request.session_instance_id
         or task.worker_id != request.worker_id
-        or task.lease_expires_at != request.lease_expires_at
+        or task.lease_expires_at is None
+        or not claim_matches
     ):
         raise TaskInterruptedHandoffConflict(
             "Interrupted-task handoff authority no longer matches the task."
@@ -463,9 +518,10 @@ def _require_interrupted_task_handoff_authority(
         raise TaskInterruptedHandoffConflict(
             "Task cancellation is still draining under its current owner."
         )
-    expired = request.lease_expires_at <= now
+    expired = task.lease_expires_at <= now
     if recover_expired is not expired:
         boundary = "expired" if recover_expired else "live"
         raise TaskInterruptedHandoffConflict(
             f"Interrupted-task handoff requires an exact {boundary} worker lease."
         )
+    return task.lease_expires_at

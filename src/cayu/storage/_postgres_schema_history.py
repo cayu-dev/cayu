@@ -824,6 +824,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     # The step-count index on cayu_events is built CONCURRENTLY; see
     # _CONCURRENT_INDEX_MIGRATIONS.
     141: (),
+    142: (
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS claim_generation BIGINT "
+        "NOT NULL DEFAULT 0 CHECK (claim_generation >= 0)",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

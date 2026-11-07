@@ -109,7 +109,10 @@ from cayu.sessions.invocation import (
 from cayu.sessions.records import SessionStatusConflict
 from cayu.sessions.recovery import IncompleteSessionRecoveryAction, IncompleteSessionRecoveryRequest
 from cayu.sessions.requests import ResumeRequest
-from cayu.tasks._cancellation import _task_cancellation_terminalization_request
+from cayu.tasks._cancellation import (
+    _cancellation_drain_holds,
+    _task_cancellation_terminalization_request,
+)
 from cayu.tasks._execution_settlement import (
     TaskExecutionSettlement,
     has_task_execution_settlement_pending,
@@ -169,27 +172,16 @@ class _DispatchOperationDrainOutcome:
 
 
 class _DispatchLeaseAuthority:
-    """Serialize renewal and release of one exact queue-task lease."""
+    """One queue-task claim: its fixed generation and its local lease bookkeeping.
 
-    def __init__(self, lease_expires_at: datetime) -> None:
+    Every mutation presents ``claim_generation``, which renewals keep, so a
+    renewal whose acknowledgement is late never fences this claim's own writes.
+    """
+
+    def __init__(self, lease_expires_at: datetime, claim_generation: int) -> None:
         self.lease_expires_at = lease_expires_at
+        self.claim_generation = claim_generation
         self.lock = asyncio.Lock()
-        self.pending_renewal: asyncio.Task[Task] | None = None
-
-    async def reconcile_renewal(self) -> bool:
-        """Observe a late renewal for bounded cleanup, with the authority lock held."""
-
-        if self.pending_renewal is None:
-            return False
-        completed, _pending = await asyncio.wait({self.pending_renewal}, timeout=1.0)
-        if self.pending_renewal not in completed:
-            return False
-        renewed = self.pending_renewal.result()
-        if renewed.lease_expires_at is None:  # pragma: no cover - store contract
-            raise TaskClaimLost("Dispatch heartbeat returned no worker lease.")
-        self.lease_expires_at = renewed.lease_expires_at
-        self.pending_renewal = None
-        return True
 
 
 def _conservative_dispatch_lease_deadline(started: float, lease_seconds: int) -> float:
@@ -1256,7 +1248,9 @@ class TaskStoreDispatcher(Dispatcher):
                     continue
                 if candidate.lease_expires_at is None:  # pragma: no cover - claim contract
                     raise TaskClaimLost("Queued dispatch claim has no worker lease.")
-                lease_authority = _DispatchLeaseAuthority(candidate.lease_expires_at)
+                lease_authority = _DispatchLeaseAuthority(
+                    candidate.lease_expires_at, candidate.claim_generation
+                )
                 claim_deadline_monotonic = _conservative_dispatch_lease_deadline(
                     claim_started_monotonic,
                     self._lease_seconds,
@@ -1453,6 +1447,7 @@ class TaskStoreDispatcher(Dispatcher):
                 await self._settle_dispatch_cancellation_after_quiescence(
                     task.id,
                     worker_id,
+                    claim_generation=lease_authority.claim_generation,
                 )
             return self._handle(
                 request,
@@ -1792,14 +1787,13 @@ class TaskStoreDispatcher(Dispatcher):
                 "status": DispatchStatus.FAILED.value,
             }
         try:
-            async with lease_authority.lock:
-                peer_terminalization_won = await self._commit_task_terminal(
-                    task_id=task.id,
-                    worker_id=worker_id,
-                    lease_expires_at=lease_authority.lease_expires_at,
-                    kind=TaskTerminalKind.FAILED,
-                    payload=failure_payload,
-                )
+            peer_terminalization_won = await self._commit_task_terminal(
+                task_id=task.id,
+                worker_id=worker_id,
+                claim_generation=lease_authority.claim_generation,
+                kind=TaskTerminalKind.FAILED,
+                payload=failure_payload,
+            )
         except TaskClaimLost:
             logger.warning(
                 "dispatch task %s lost its lease while rejecting invalid authority",
@@ -1895,14 +1889,13 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str,
         lease_authority: _DispatchLeaseAuthority,
     ) -> Task:
-        """Release only the exact lease generation acknowledged by this worker."""
+        """Release only the claim generation this worker received."""
 
-        async with lease_authority.lock:
-            return await self._tasks.release_task(
-                task_id,
-                worker_id,
-                lease_expires_at=lease_authority.lease_expires_at,
-            )
+        return await self._tasks.release_task(
+            task_id,
+            worker_id,
+            claim_generation=lease_authority.claim_generation,
+        )
 
     async def _terminalize(
         self,
@@ -1983,14 +1976,13 @@ class TaskStoreDispatcher(Dispatcher):
                 else TaskTerminalKind.COMPLETED
             )
             self._arm_terminal_receipt_reconciliation()
-            async with lease_authority.lock:
-                peer_terminalization_won = await self._commit_task_terminal(
-                    task_id=task.id,
-                    worker_id=worker_id,
-                    lease_expires_at=lease_authority.lease_expires_at,
-                    kind=kind,
-                    payload=payload,
-                )
+            peer_terminalization_won = await self._commit_task_terminal(
+                task_id=task.id,
+                worker_id=worker_id,
+                claim_generation=lease_authority.claim_generation,
+                kind=kind,
+                payload=payload,
+            )
             terminal_task = await self._tasks.load_task(task.id)
             if terminal_task is None:
                 raise RuntimeError(
@@ -2041,7 +2033,7 @@ class TaskStoreDispatcher(Dispatcher):
         *,
         task_id: str,
         worker_id: str,
-        lease_expires_at: datetime | None,
+        claim_generation: int,
         kind: TaskTerminalKind,
         payload: dict[str, Any],
     ) -> bool:
@@ -2050,7 +2042,7 @@ class TaskStoreDispatcher(Dispatcher):
             TaskTerminalizationRequest(
                 task_id=task_id,
                 worker_id=worker_id,
-                lease_expires_at=lease_expires_at,
+                claim_generation=claim_generation,
                 kind=kind,
                 result=payload if kind is TaskTerminalKind.COMPLETED else None,
                 error=payload if kind is TaskTerminalKind.FAILED else None,
@@ -2058,6 +2050,7 @@ class TaskStoreDispatcher(Dispatcher):
                     task_id=task_id,
                     worker_id=worker_id,
                     kind=kind,
+                    claim_generation=claim_generation,
                 ),
             ),
         )
@@ -2129,7 +2122,7 @@ class TaskStoreDispatcher(Dispatcher):
                     self._tasks.heartbeat(
                         task_id,
                         worker_id,
-                        lease_expires_at=lease_authority.lease_expires_at,
+                        claim_generation=lease_authority.claim_generation,
                         extend_seconds=self._lease_seconds,
                     )
                 )
@@ -2139,11 +2132,9 @@ class TaskStoreDispatcher(Dispatcher):
                         timeout=max(0.0, claim_deadline_monotonic - loop.time()),
                     )
                 except asyncio.CancelledError:
-                    lease_authority.pending_renewal = renewal_task
                     renewal_task.add_done_callback(_consume_dispatch_heartbeat_outcome)
                     raise
                 if renewal_task not in completed:
-                    lease_authority.pending_renewal = renewal_task
                     renewal_task.add_done_callback(_consume_dispatch_heartbeat_outcome)
                     raise TaskClaimLost(
                         "Dispatch task heartbeat acknowledgement did not arrive before "
@@ -2223,9 +2214,7 @@ class TaskStoreDispatcher(Dispatcher):
         """Persist a reclaim-blocking marker before draining an opaque dispatch."""
 
         async with lease_authority.lock:
-            renewal_observed = False
             while True:
-                expected_lease_expires_at = lease_authority.lease_expires_at
                 current = await self._tasks.load_task(task.id)
                 if current is None:
                     raise TaskClaimLost("Dispatch cancellation fence target no longer exists.")
@@ -2233,34 +2222,24 @@ class TaskStoreDispatcher(Dispatcher):
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,
                     TaskStatus.CANCELLED,
-                } or _task_cancellation_requested(current):
+                }:
                     return current
-                if (
-                    current.worker_id != worker_id
-                    or current.lease_expires_at != expected_lease_expires_at
+                if not _cancellation_drain_holds(
+                    current,
+                    worker_id=worker_id,
+                    claim_generation=lease_authority.claim_generation,
                 ):
-                    # A timed-out heartbeat may have committed this worker's
-                    # renewal. Only its exact acknowledgement can authorize
-                    # cleanup; a readback with the same worker ID cannot.
-                    if (
-                        current.worker_id == worker_id
-                        and not renewal_observed
-                        and lease_authority.pending_renewal is not None
-                    ):
-                        renewal_observed = True
-                        await lease_authority.reconcile_renewal()
-                        # Reload durable cancellation/terminal state even when
-                        # the acknowledgement remains stalled after observation.
-                        continue
                     raise TaskClaimLost(
-                        "Dispatch cancellation fence no longer owns the expected lease generation."
+                        "Dispatch cancellation fence no longer owns the expected claim generation."
                     )
+                if _task_cancellation_requested(current):
+                    return current
                 try:
                     requested = await self._tasks.request_claimed_task_cancellation(
                         task.id,
                         worker_id,
-                        expected_lease_expires_at,
-                        error,
+                        error=error,
+                        claim_generation=lease_authority.claim_generation,
                     )
                 except (GeneratorExit, KeyboardInterrupt, SystemExit):
                     raise
@@ -2282,23 +2261,18 @@ class TaskStoreDispatcher(Dispatcher):
                         TaskStatus.COMPLETED,
                         TaskStatus.FAILED,
                         TaskStatus.CANCELLED,
-                    } or _task_cancellation_requested(current):
+                    }:
                         return current
-                    if (
-                        current.worker_id != worker_id
-                        or current.lease_expires_at != expected_lease_expires_at
+                    if not _cancellation_drain_holds(
+                        current,
+                        worker_id=worker_id,
+                        claim_generation=lease_authority.claim_generation,
                     ):
-                        if (
-                            current.worker_id == worker_id
-                            and not renewal_observed
-                            and lease_authority.pending_renewal is not None
-                        ):
-                            renewal_observed = True
-                            await lease_authority.reconcile_renewal()
-                            continue
                         raise TaskClaimLost(
-                            "Dispatch cancellation fence lost its exact worker lease."
+                            "Dispatch cancellation fence lost its claim generation."
                         ) from request_failure
+                    if _task_cancellation_requested(current):
+                        return current
                     if isinstance(request_failure, TaskClaimLost):
                         raise
                     await asyncio.sleep(0.05)
@@ -2355,6 +2329,7 @@ class TaskStoreDispatcher(Dispatcher):
                 await self._settle_dispatch_cancellation_after_quiescence(
                     task.id,
                     worker_id,
+                    claim_generation=lease_authority.claim_generation,
                 )
             except BaseException as exc:
                 settlement_failure = (
@@ -2376,8 +2351,13 @@ class TaskStoreDispatcher(Dispatcher):
         self,
         task_id: str,
         worker_id: str,
+        *,
+        claim_generation: int,
     ) -> None:
-        """Commit exact quiescence after a lease-loss dispatch has naturally ended."""
+        """Commit exact quiescence after a lease-loss dispatch has naturally ended.
+
+        Only claim ``claim_generation`` or reclaim's fence of it is settled.
+        """
 
         current = await self._tasks.load_task(task_id)
         if current is None or current.status in {
@@ -2386,26 +2366,38 @@ class TaskStoreDispatcher(Dispatcher):
             TaskStatus.CANCELLED,
         }:
             return
-        terminalization = _task_cancellation_terminalization_request(
-            current,
-            worker_id=worker_id,
-        )
-        if terminalization is not None:
-            with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
-                await _terminalize_claimed_task_or_detect_peer_winner(
-                    self._tasks,
-                    terminalization,
-                )
-        current = await self._tasks.load_task(task_id)
-        if current is None or current.status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        }:
-            return
+        if not _cancellation_drain_holds(
+            current, worker_id=worker_id, claim_generation=claim_generation
+        ):
+            raise TaskClaimLost(
+                f"Dispatch quiescence of claim generation {claim_generation} found a later "
+                f"claim of task {task_id}."
+            )
+        if current.claim_generation == claim_generation:
+            terminalization = _task_cancellation_terminalization_request(
+                current,
+                worker_id=worker_id,
+                claim_generation=claim_generation,
+            )
+            if terminalization is not None:
+                with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+                    await _terminalize_claimed_task_or_detect_peer_winner(
+                        self._tasks,
+                        terminalization,
+                    )
+            current = await self._tasks.load_task(task_id)
+            if current is None or current.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                return
+        # The claim's lease lapsed (reclaim may have fenced it): settle it as owner-lost.
         payload = current.status_payload
         if (
-            current.worker_id != worker_id
+            not _cancellation_drain_holds(
+                current, worker_id=worker_id, claim_generation=claim_generation
+            )
             or current.lease_expires_at is None
             or not _task_cancellation_requested(current)
             or type(payload) is not dict
@@ -2415,6 +2407,8 @@ class TaskStoreDispatcher(Dispatcher):
                 "Dispatch quiescence lost its durable cancellation authority."
             )
         event = TaskCancellationReconciliationEvent.model_validate(payload["event"])
+        # Only the cancellation's idempotency key is read from it.
+        terminalization = _task_cancellation_terminalization_request(current, worker_id=worker_id)
         cancellation_key = (
             terminalization.idempotency_key
             if terminalization is not None
@@ -4038,17 +4032,20 @@ def _dispatch_terminalization_key(
     task_id: str,
     worker_id: str,
     kind: TaskTerminalKind,
+    claim_generation: int,
 ) -> str:
+    # Two claims of one worker name never share a terminalization key.
     identity = canonical_durable_json_bytes(
         {
-            "schema": "cayu.dispatch-task-terminalization.v1",
+            "schema": "cayu.dispatch-task-terminalization.v2",
             "task_id": task_id,
             "worker_id": worker_id,
             "kind": kind.value,
+            "claim_generation": claim_generation,
         },
         "dispatch_task_terminalization",
     )
-    return f"dispatch-task-terminal:v1:{sha256(identity).hexdigest()}"
+    return f"dispatch-task-terminal:v2:{sha256(identity).hexdigest()}"
 
 
 def _dispatch_status_after_event(
