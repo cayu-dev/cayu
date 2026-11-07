@@ -92,7 +92,11 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
     every port forward before the new owner can start anything, then cancels
     every command of earlier owners. The
     response is sent only after that cancellation, so a completed takeover
-    leaves no earlier owner's command able to run.
+    leaves no earlier owner's command able to run. That holds for a retried
+    claim too: a host whose takeover request failed in flight re-presents the
+    same claim, which the fence treats as already current, so every accepted
+    claim waits for earlier owners' commands to stop, not only the one that
+    swapped the owner.
 
     With ``carry_commands`` (command IDs, which needs ``owner_epoch``) the
     listed commands of earlier owners are moved to the new owner instead of
@@ -120,7 +124,11 @@ async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
     carried = None
     if carry is not None:
         carried = await asyncio.to_thread(_carry_granted, generation, carry)
-    if superseded:
+    # Runs for every accepted claim, so a retried takeover also waits for the
+    # first call's cancellations. Stopped commands are skipped, and the current
+    # owner's own commands are never earlier than its generation. The first
+    # owner has no earlier generation to stop.
+    if generation > 1:
         await asyncio.to_thread(
             SUPERVISOR.cancel_all,
             reason=OWNER_SUPERSEDED_REASON,

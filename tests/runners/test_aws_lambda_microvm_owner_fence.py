@@ -722,6 +722,47 @@ def test_owner_check_and_command_registration_are_atomic_with_takeover(
     asyncio.run(scenario())
 
 
+def test_retried_takeover_returns_only_after_earlier_owners_commands_stop(
+    sidecar, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner B's takeover request fails in flight while the sidecar is still
+    # stopping A's command, and B's runner retries the same claim. The retry
+    # must not answer before A's command has stopped.
+    async def scenario() -> None:
+        await sidecar.claim_owner({"claim_id": _CLAIM_A})
+        older = _payload(tmp_path, _CLAIM_A, sys.executable, "-c", "import time; time.sleep(30)")
+        await sidecar.start_command(dict(older))
+        _wait_for_state(sidecar, older["command_id"], "running")
+
+        # Hold the first takeover's cancellation of A's command, as a slow stop would.
+        held, release = threading.Event(), threading.Event()
+        original = sidecar.SUPERVISOR._cancel
+
+        def slow_first_cancel(command_id: str, **kwargs: Any) -> dict[str, Any]:
+            if not held.is_set():
+                held.set()
+                assert release.wait(30)
+            return original(command_id, **kwargs)
+
+        monkeypatch.setattr(sidecar.SUPERVISOR, "_cancel", slow_first_cancel)
+        takeover = asyncio.create_task(sidecar.claim_owner({"claim_id": _CLAIM_B}))
+        try:
+            assert await asyncio.to_thread(held.wait, 30)
+
+            retried = await sidecar.claim_owner({"claim_id": _CLAIM_B})
+
+            assert retried["generation"] == 2
+            stopped = sidecar.SUPERVISOR.get(older["command_id"])
+            assert stopped["state"] == "cancelled"
+            assert stopped["cancel_reason"] == sidecar.OWNER_SUPERSEDED_REASON
+        finally:
+            release.set()
+            await asyncio.gather(takeover, return_exceptions=True)
+        assert await takeover == {"generation": 2, "superseded_previous": True}
+
+    asyncio.run(scenario())
+
+
 def test_takeover_cancels_only_earlier_owners_commands(sidecar, tmp_path: Path) -> None:
     asyncio.run(sidecar.claim_owner({"claim_id": _CLAIM_A}))
     older = _payload(tmp_path, _CLAIM_A, sys.executable, "-c", "import time; time.sleep(30)")

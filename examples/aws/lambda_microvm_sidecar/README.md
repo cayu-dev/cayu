@@ -120,7 +120,9 @@ random 32 to 128 character `claim_id` that it keeps in memory; the sidecar store
 SHA-256 digest. Every command start carries `owner_claim`, and a start from any other claim, or
 before any claim, is rejected with HTTP 412. A claim that supersedes another cancels every
 command of earlier owners, reporting them with `"cancel_reason": "owner_superseded"`, and resets
-the agent proxy relay so the new owner's proxy can be installed. Re-presenting the current claim is idempotent. `POST /v1/owner/check` reports whether
+the agent proxy relay so the new owner's proxy can be installed. Re-presenting the current claim is idempotent:
+it stops nothing new, and it answers only once earlier owners' commands have stopped, so a host
+that retries a takeover whose answer it lost never sees it complete early. `POST /v1/owner/check` reports whether
 a claim is still current. The fence lives in sidecar memory, so it survives suspend and resume;
 a restarted sidecar forgets it and every earlier host becomes stale until a new claim.
 
