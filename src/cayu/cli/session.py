@@ -22,10 +22,12 @@ from cayu._validation import compact_json_utf8_size
 from cayu.budgets.pricing import PriceBook, default_price_book, load_price_book
 from cayu.cli._output import add_output_options, output_destination, print_table, terminal_safe
 from cayu.cli._session_reader import (
+    OWNER_LOST_STATUSES,
     SessionReader,
     StoreSessionReader,
     TranscriptEntry,
     aggregate_usage_cli_payload,
+    owner_lost_sessions,
 )
 from cayu.cli._workflow_run import SessionUsage as WorkflowSessionUsage
 from cayu.cli._workflow_run import read_workflow_run, run_status, session_ended_at, step_times
@@ -154,6 +156,15 @@ def add_session_parser(subparsers: Any) -> None:
             "Cayu's bundled one. A Cloud Agent prices with its own."
         ),
     )
+    list_parser.add_argument(
+        "--owner-lost",
+        action="store_true",
+        help=(
+            "Only running or interrupting sessions whose execution owner is gone (its "
+            "lease expired or its process died), each with its execution presence. Reads "
+            "every such session's state, newest activity first, until --limit are found."
+        ),
+    )
     add_output_options(list_parser, formats=FORMAT_CHOICES)
 
     rollup_parser = commands.add_parser(
@@ -231,8 +242,9 @@ def add_session_parser(subparsers: Any) -> None:
         "show",
         help="Show a compact session overview.",
         description=(
-            "Show a compact session overview. Use usage, tools, events, or transcript "
-            "for bounded detail."
+            "Show a compact session overview, including its execution presence: who holds "
+            "the running session, until when its lease runs, and whether that owner is "
+            "gone (owner_lost). Use usage, tools, events, or transcript for bounded detail."
         ),
     )
     show_parser.add_argument("session_id")
@@ -566,6 +578,8 @@ def _run_session(args: argparse.Namespace) -> int:
             return asyncio.run(_run_session_command(args, lambda: _open_cloud_reader(args)))
         if getattr(args, "context", None) is not None:
             raise ValueError("--context selects the Cayu Cloud for --application NAME.")
+        if getattr(args, "server_url", None) is not None:
+            return asyncio.run(_run_session_command(args, lambda: _open_server_reader(args)))
         target = resolve_session_store_target(
             sqlite=args.sqlite,
             postgres=args.postgres,
@@ -868,6 +882,18 @@ def _open_cloud_reader(args: argparse.Namespace) -> SessionReader:
     )
 
 
+def _open_server_reader(args: argparse.Namespace) -> SessionReader:
+    from cayu.cli._agent_session_reader import AgentSessionReader
+    from cayu.cli._cloud_agent_api import CayuApi
+    from cayu.cli.diagnostics import read_authorization, request_cost_endpoint
+
+    # Refuses credentials, a query or plain HTTP outside loopback in the URL.
+    request_cost_endpoint(args.server_url)
+    return AgentSessionReader(
+        CayuApi(args.server_url, authorization=read_authorization(args.authorization_env))
+    )
+
+
 async def _run_session_command(
     args: argparse.Namespace,
     open_reader: Callable[[], SessionReader],
@@ -942,21 +968,24 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
     local = isinstance(reader, StoreSessionReader)
     if args.price_book is not None and not (args.overview and local):
         raise ValueError("--price-book prices --overview costs of a local store.")
+    query = SessionQuery(
+        status=None if args.status is None else SessionStatus(args.status),
+        agent_name=args.agent,
+        environment_name=args.environment,
+        task_id=args.task,
+        labels=labels,
+        created_since=args.since,
+        created_before=args.until,
+        limit=args.limit,
+        offset=args.offset,
+        cursor=args.cursor,
+        include_total_count=True,
+        order_by=SessionOrder.LAST_ACTIVITY_AT_DESC,
+    )
+    if args.owner_lost:
+        return await _list_owner_lost_sessions(args, reader, query)
     result = await reader.list_sessions(
-        SessionQuery(
-            status=None if args.status is None else SessionStatus(args.status),
-            agent_name=args.agent,
-            environment_name=args.environment,
-            task_id=args.task,
-            labels=labels,
-            created_since=args.since,
-            created_before=args.until,
-            limit=args.limit,
-            offset=args.offset,
-            cursor=args.cursor,
-            include_total_count=True,
-            order_by=SessionOrder.LAST_ACTIVITY_AT_DESC,
-        ),
+        query,
         overview=args.overview,
         pricing=_price_book(args) if args.overview and local else None,
     )
@@ -994,6 +1023,63 @@ async def _list_sessions(args: argparse.Namespace, reader: SessionReader) -> int
         ),
     )
     return 0
+
+
+async def _list_owner_lost_sessions(
+    args: argparse.Namespace, reader: SessionReader, query: SessionQuery
+) -> int:
+    if args.overview or args.offset or args.cursor is not None:
+        raise ValueError("--owner-lost can't be combined with --overview, --offset or --cursor.")
+    page = await owner_lost_sessions(
+        reader,
+        query,
+        statuses=OWNER_LOST_STATUSES if query.status is None else (query.status,),
+    )
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "sessions": page.rows,
+        "next_cursor": None,
+        "has_more": page.has_more,
+        "total_count": None,
+        "scanned": page.scanned,
+    }
+    _render_collection(
+        args.output_format,
+        payload,
+        page.rows if args.output_format == "jsonl" else [_owner_lost_cells(r) for r in page.rows],
+        headers=_OWNER_LOST_HEADERS,
+    )
+    return 0
+
+
+_OWNER_LOST_HEADERS = (
+    "id",
+    "status",
+    "agent",
+    "owner_kind",
+    "owner_id",
+    "heartbeat_at",
+    "lease_expires_at",
+    "last_progress_kind",
+    "last_activity_at",
+)
+
+
+def _owner_lost_cells(row: dict[str, Any]) -> dict[str, Any]:
+    execution = row["execution"]
+    return {
+        **{key: row.get(key) for key in ("id", "status", "agent", "last_activity_at")},
+        **{
+            key: execution.get(key)
+            for key in (
+                "owner_kind",
+                "owner_id",
+                "heartbeat_at",
+                "lease_expires_at",
+                "last_progress_kind",
+            )
+        },
+    }
 
 
 _OVERVIEW_HEADERS = (
@@ -2382,6 +2468,22 @@ def _add_target_options(parser: argparse.ArgumentParser, *, cloud: bool = True) 
     target.add_argument("--postgres", metavar="DSN", help="Read this PostgreSQL store.")
     if not cloud:
         return
+    target.add_argument(
+        "--server-url",
+        metavar="URL",
+        help=(
+            "Read the sessions of the running Cayu server at this mount URL through its Cayu API."
+        ),
+    )
+    parser.add_argument(
+        "--authorization-env",
+        default="CAYU_API_AUTHORIZATION",
+        metavar="NAME",
+        help=(
+            "With --server-url: the environment variable holding the complete "
+            "Authorization header value (default: CAYU_API_AUTHORIZATION). Never printed."
+        ),
+    )
     target.add_argument(
         "--application",
         metavar="NAME",

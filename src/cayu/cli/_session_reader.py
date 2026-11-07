@@ -33,7 +33,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import INTERACTION_TERMINAL_EVENT_TYPES, InteractionSummaryEvidence
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.queries import SessionQuery
-from cayu.sessions.records import EventRecord, Session
+from cayu.sessions.records import EventRecord, Session, SessionStatus
 from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import TranscriptQuery
 
@@ -73,6 +73,23 @@ class InteractionPage:
     next_sequence: int | None
 
 
+@dataclass(frozen=True)
+class OwnerLostPage:
+    """Sessions whose execution owner is gone, each row carrying its ``execution``."""
+
+    rows: list[dict[str, Any]]
+    #: How many running or interrupting sessions were checked.
+    scanned: int
+    #: True when ``limit`` was reached before every candidate was checked.
+    has_more: bool
+
+
+#: The statuses a session with a lost owner can have: a pending one hasn't started, and
+#: the others have settled (`cayu.sessions.execution.execution_state`).
+OWNER_LOST_STATUSES = (SessionStatus.RUNNING, SessionStatus.INTERRUPTING)
+_OWNER_LOST_SCAN_PAGE = 500
+
+
 class SessionReader(Protocol):
     """The reads `cayu session` inspection commands make, from any source."""
 
@@ -96,6 +113,15 @@ class SessionReader(Protocol):
         ...
 
     async def overview(self, session_id: str) -> dict[str, Any]: ...
+
+    async def execution(self, session_id: str) -> dict[str, Any] | None:
+        """The session's execution presence, a `SessionExecutionState` as JSON.
+
+        Who holds the running session, until when its lease runs and whether that owner
+        is gone (``state == "owner_lost"``). ``None`` when the source can't report it, as
+        an Agent whose Cayu predates it. Raises like `require_session`.
+        """
+        ...
 
     async def latest_interactions(
         self, session_id: str, *, before_sequence: int | None, limit: int
@@ -128,6 +154,68 @@ class SessionReader(Protocol):
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptView: ...
 
     async def close(self) -> None: ...
+
+
+async def owner_lost_sessions(
+    reader: SessionReader,
+    query: SessionQuery,
+    *,
+    statuses: tuple[SessionStatus, ...] = OWNER_LOST_STATUSES,
+) -> OwnerLostPage:
+    """Find the sessions whose execution owner is gone, up to ``query.limit`` of them.
+
+    Pages through the sessions ``query`` matches, newest activity first, and reads the
+    execution presence of each one in ``statuses``: one store read, or one
+    `GET /api/sessions/{id}/state` request to an Agent, per session checked. With one
+    status the list is filtered by it; with several, every session is listed in one
+    stream and the others are skipped, so the newest are checked first whatever their
+    status. ``query``'s status, offset and cursor are replaced.
+    """
+
+    for status in statuses:
+        if status not in OWNER_LOST_STATUSES:
+            raise ValueError(
+                f"A {status.value} session can't have lost its owner; only running and "
+                "interrupting sessions can."
+            )
+    candidates = {status.value for status in statuses}
+    rows: list[dict[str, Any]] = []
+    scanned = 0
+    cursor: str | None = None
+    while True:
+        page = await reader.list_sessions(
+            query.model_copy(
+                update={
+                    "status": statuses[0] if len(statuses) == 1 else None,
+                    "offset": 0,
+                    "cursor": cursor,
+                    "limit": _OWNER_LOST_SCAN_PAGE,
+                    "include_total_count": False,
+                }
+            )
+        )
+        for row in page.rows:
+            if row.get("status") not in candidates:
+                continue
+            if len(rows) >= query.limit:
+                return OwnerLostPage(rows=rows, scanned=scanned, has_more=True)
+            scanned += 1
+            try:
+                execution = await reader.execution(str(row["id"]))
+            except ValueError:
+                # The session was deleted after the list was read.
+                continue
+            if execution is None:
+                raise ValueError(
+                    "This source doesn't report sessions' execution presence, so their "
+                    "owners can't be checked; an Agent needs a newer cayu release."
+                )
+            if execution.get("state") == "owner_lost":
+                rows.append({**row, "execution": execution})
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+    return OwnerLostPage(rows=rows, scanned=scanned, has_more=False)
 
 
 def session_list_row(session: Session) -> dict[str, Any]:
@@ -339,7 +427,16 @@ class StoreSessionReader:
             "terminal_failure": {"state": summary.terminal_failure_state},
             "budget": summary.budget.model_dump(mode="json"),
             "timing": (await session_timing(self.store, session_id)).model_dump(mode="json"),
+            "execution": await self.execution(session_id),
         }
+
+    async def execution(self, session_id: str) -> dict[str, Any] | None:
+        # A store answers without the process's own view: `local_owner` is always false.
+        try:
+            state = await self.store.inspect_session_execution(session_id)
+        except KeyError:
+            raise ValueError(f"Session not found: {session_id}") from None
+        return state.model_dump(mode="json")
 
     async def latest_interactions(
         self, session_id: str, *, before_sequence: int | None, limit: int

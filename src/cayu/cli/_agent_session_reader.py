@@ -35,6 +35,7 @@ from cayu.sessions._call_inspection import InspectionWindow
 from cayu.sessions._event_loop_lag import read_event_loop_lag
 from cayu.sessions._rollup import RollupPage, SessionRollupQuery, SessionTiming
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.records import EventRecord
 from cayu.sessions.transcript_queries import TranscriptQuery
@@ -229,7 +230,11 @@ class AgentSessionReader:
             },
             "budget": None,
             "timing": self.timing(session_id),
+            "execution": _execution(state),
         }
+
+    async def execution(self, session_id: str) -> dict[str, Any] | None:
+        return _execution(self._session_get(session_id, "state"))
 
     async def event_loop_lag(self, session_id: str) -> dict[str, Any] | None:
         """The worker's event-loop lag recorded on the session; ``None`` from an Agent whose
@@ -516,6 +521,25 @@ class AgentSessionReader:
             return self.api.get(path, query=_query(params), resource=_resource(path))
         except CayuApiNotFound:
             raise _unsupported(path) from None
+
+
+def _execution(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The `execution` of a `GET /api/sessions/{id}/state` body; ``None`` from an Agent
+    whose Cayu predates it."""
+
+    if "execution" not in state:
+        return None
+    # A later Cayu may add fields; read the ones this CLI knows.
+    known = {
+        key: value
+        for key, value in _mapping(state["execution"]).items()
+        if key in SessionExecutionState.model_fields
+    }
+    try:
+        execution = SessionExecutionState.model_validate_json(json.dumps(known))
+    except ValueError as exc:
+        raise CayuApiError("not_cayu", "The Agent's session execution state is invalid.") from exc
+    return execution.model_dump(mode="json")
 
 
 def _instant(value: datetime | None) -> str | None:

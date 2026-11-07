@@ -476,8 +476,12 @@ cayu session list --overview
 cayu session list --overview --table --application bug-hunter
 
 # Content-free operational summary, including runtime name/version, usage,
-# pending-action counts, session timing, and the worker's event-loop lag.
+# pending-action counts, session timing, the worker's event-loop lag, and who holds
+# the running session.
 cayu session show SESSION_ID
+
+# Running or interrupting sessions whose owner is gone, with that owner and its lease.
+cayu session list --owner-lost --table --application bug-hunter
 
 # A workflow run as a whole: steps, child sessions, usage and custom events.
 cayu session workflow SESSION_ID --table
@@ -552,6 +556,38 @@ stores, so text is redacted with the CLI's secret patterns, as in the other sess
 commands, and `uses.artifacts` is `null`. Costs are priced with Cayu's bundled price
 book, or `--price-book PATH`. Overviews need the `server` extra installed locally
 (`pip install "cayu[server]"`).
+
+### Who holds a running session
+
+`cayu session show` includes an `execution` object, the session's execution presence
+(`SessionExecutionState`, the `execution` of `GET /api/sessions/{id}/state`, or
+`SessionStore.inspect_session_execution` on a store). Its `state` is `executing` while
+an owner holds a live lease, `owner_lost` when the session is still running or
+interrupting but the owner of its current run is gone (its lease expired or its
+process died), `waiting` while it waits for a person or a child session, `idle` before
+it starts, `terminal` once settled, and `unknown` where the store can't say. While an
+owner holds it, or held it when it was lost, the object also names it: `owner_kind`
+(`task_worker`, `server_stream`, `in_process_runner`, `recovery` or
+`foreground_child_delivery`), `owner_id` (an opaque id of the owning process, the same
+for every session that process runs), the application's `owner_label`, `run_epoch`,
+`claimed_at`, `heartbeat_at`, `lease_expires_at`, and the kind and time of its last
+progress. No hostname, process id, prompt or tool argument is included. `local_owner`
+is true only when the server that answered runs the session itself; a store read
+directly always reports `false`. Reading never renews the lease.
+
+`cayu session list --owner-lost` lists the running and interrupting sessions whose
+`execution.state` is `owner_lost`, newest activity first, each row with its
+`execution`. It pages through the matching sessions in newest-activity order and reads
+each running or interrupting one's state in turn (one request per session for an Agent)
+until `--limit` are found, reports how many it checked as `scanned`, and sets
+`has_more` when it stopped at the limit. `--status running` or `--status interrupting`
+narrows the candidates, and `--agent`, `--environment`, `--task`, `--label`, `--since`
+and `--until` filter them as in a plain list; it doesn't take `--overview`, `--offset`
+or `--cursor`. `--table` prints each session's owner kind and id, last heartbeat,
+lease expiry and last progress. [Closing a session nobody will
+continue](#closing-a-session-nobody-will-continue) ends such a session. An Agent whose
+Cayu predates execution presence reports `execution` as `null`, and `--owner-lost`
+says it needs a newer release.
 
 ### Where a session's time went
 
@@ -983,7 +1019,19 @@ withholds left out:
   as `[quarantined]`, as the Agent's events endpoint shows them. An Agent whose Cayu predates these
   endpoints answers that it doesn't serve them yet.
 
-`snapshots` and `resolve-provider-operation` read a local store or a server URL only.
+The same commands take `--server-url URL` to read a running Cayu server, such as
+`cayu serve` or an application that mounts Cayu, through the same API. `URL` is where
+the server mounts Cayu, without `/api`; outside loopback it must use HTTPS, and it may
+not carry credentials. The complete `Authorization` header value is read from
+`CAYU_API_AUTHORIZATION`, or the variable `--authorization-env NAME` names, and is
+never printed.
+
+```console
+CAYU_API_AUTHORIZATION="Bearer $TOKEN" cayu session list --owner-lost \
+  --server-url https://cayu.example.com --table
+```
+
+`snapshots` reads a local store only, and `resolve-provider-operation` a server URL only.
 
 `fallback_retry` starts a new model attempt from the last durable Cayu
 boundary; it is not continuation of the unavailable provider operation. When
