@@ -28,6 +28,9 @@ from cayu.sessions.checkpoints import (
 
 _DECISION_RECORD_TYPE = "cayu.invocation-terminal-decision"
 _DECISION_SCHEMA_VERSION = 1
+# A COMPLETED decision is the only version-2 record, so every failed or
+# interrupted record keeps its version-1 bytes, identity and digest.
+_COMPLETED_DECISION_SCHEMA_VERSION = 2
 
 
 class InvocationTerminalOutcome(StrEnum):
@@ -35,6 +38,7 @@ class InvocationTerminalOutcome(StrEnum):
 
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
 
 
 class InvocationTerminalDecision(BaseModel):
@@ -48,7 +52,7 @@ class InvocationTerminalDecision(BaseModel):
     )
 
     record_type: Literal["cayu.invocation-terminal-decision"] = _DECISION_RECORD_TYPE
-    schema_version: Literal[1] = _DECISION_SCHEMA_VERSION
+    schema_version: Literal[1, 2] = _DECISION_SCHEMA_VERSION
     decision_id: str
     outcome: InvocationTerminalOutcome
     session_id: str
@@ -72,6 +76,10 @@ class InvocationTerminalDecision(BaseModel):
         default=None,
         max_length=128,
         pattern=r"^model-recovery:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
+    task_result_payload: dict[str, Any] | None = Field(
+        default=None,
         exclude_if=lambda value: value is None,
     )
     record_digest: str
@@ -116,7 +124,9 @@ class InvocationTerminalDecision(BaseModel):
     def normalize_observed_at(cls, value: datetime) -> datetime:
         return normalize_utc_datetime(value, "observed_at")
 
-    @field_validator("terminal_payload", "task_error_payload", "turn_completed_payload")
+    @field_validator(
+        "terminal_payload", "task_error_payload", "turn_completed_payload", "task_result_payload"
+    )
     @classmethod
     def copy_payloads(cls, value: dict[str, Any] | None, info: Any) -> dict[str, Any] | None:
         if value is None:
@@ -125,6 +135,14 @@ class InvocationTerminalDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_outcome_fields(self) -> InvocationTerminalDecision:
+        if (self.outcome is InvocationTerminalOutcome.COMPLETED) != (
+            self.schema_version == _COMPLETED_DECISION_SCHEMA_VERSION
+        ):
+            raise ValueError("Only completed decisions use schema version 2.")
+        if self.outcome is InvocationTerminalOutcome.COMPLETED:
+            return self._validate_completed_fields()
+        if self.task_result_payload is not None:
+            raise ValueError("Only completed decisions carry a task result.")
         failure_fields = (
             self.task_id,
             self.runtime_task_failure_id,
@@ -202,6 +220,43 @@ class InvocationTerminalDecision(BaseModel):
             raise ValueError(
                 "Invocation terminal decision event identities conflict with its authority."
             )
+        return self._validate_identity()
+
+    def _validate_completed_fields(self) -> InvocationTerminalDecision:
+        if (
+            self.interaction_event_id is None
+            or self.predecessor_interaction_event_id is not None
+            or self.interruption_request_id is not None
+            or self.model_recovery_id is not None
+            or self.runtime_task_failure_id is not None
+            or self.task_terminalization_request_sha256 is not None
+            or self.task_error_payload is not None
+            or self.turn_completed_payload is None
+            or (self.task_id is None) != (self.task_result_payload is None)
+        ):
+            raise ValueError("Completed decisions require only completion authority.")
+        expected_terminal_event_id = invocation_terminal_event_id(
+            outcome=self.outcome,
+            session_id=self.session_id,
+            session_instance_id=self.session_instance_id,
+            run_epoch=self.run_epoch,
+            interaction_id=self.interaction_id,
+            source_id=self.interaction_event_id,
+            event_kind="session",
+        )
+        queued_operation_id = self.terminal_payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+        if (
+            self.terminal_event_id != expected_terminal_event_id
+            and type(queued_operation_id) is str
+        ):
+            expected_terminal_event_id = queued_dispatch_terminal_event_id(queued_operation_id)
+        if self.terminal_event_id != expected_terminal_event_id:
+            raise ValueError(
+                "Invocation terminal decision event identities conflict with its authority."
+            )
+        return self._validate_identity()
+
+    def _validate_identity(self) -> InvocationTerminalDecision:
         expected_id = _decision_id(
             self.model_dump(mode="json", exclude={"decision_id", "record_digest"})
         )
@@ -220,7 +275,19 @@ def _decision_digest(payload: Mapping[str, Any]) -> str:
 
 
 def _decision_id(payload: Mapping[str, Any]) -> str:
-    return f"invocation-terminal-decision:v1:{_decision_digest(payload)}"
+    version = payload.get("schema_version", _DECISION_SCHEMA_VERSION)
+    return f"invocation-terminal-decision:v{version}:{_decision_digest(payload)}"
+
+
+def completed_decision_event_id(
+    decision: InvocationTerminalDecision,
+    event_kind: Literal["task_completed", "turn_completed"],
+) -> str:
+    """Return the exact ID of one event a completed decision still owes."""
+
+    if decision.outcome is not InvocationTerminalOutcome.COMPLETED:
+        raise ValueError("Only completed decisions own completion event IDs.")
+    return f"{decision.decision_id}:{event_kind}"
 
 
 def invocation_terminal_event_id(
@@ -339,10 +406,7 @@ def build_invocation_terminal_decision(
         "interaction_event_id": interaction_event_id,
         "predecessor_interaction_event_id": predecessor_interaction_event_id,
         "terminal_event_id": terminal_event_id,
-        "observed_at": normalize_utc_datetime(observed_at, "observed_at")
-        .astimezone(UTC)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "observed_at": _durable_timestamp(observed_at),
         "terminal_payload": copy_durable_json_object(terminal_payload, "terminal_payload"),
         "interruption_request_id": interruption_request_id,
         "task_id": task_id,
@@ -361,6 +425,68 @@ def build_invocation_terminal_decision(
     }
     if model_recovery_id is not None:
         payload["model_recovery_id"] = model_recovery_id
+    return _sealed_decision(payload)
+
+
+def build_completed_invocation_terminal_decision(
+    *,
+    session_id: str,
+    session_instance_id: str,
+    run_epoch: int,
+    profile_interaction_id: str,
+    interaction_id: str,
+    execution_profile_fingerprint: str,
+    interaction_event_id: str,
+    terminal_event_id: str,
+    observed_at: datetime,
+    terminal_payload: dict[str, Any],
+    turn_completed_payload: dict[str, Any],
+    task_id: str | None = None,
+    task_result_payload: dict[str, Any] | None = None,
+) -> InvocationTerminalDecision:
+    """Build the version-2 record of what a committed completion still owes."""
+
+    payload: dict[str, Any] = {
+        "record_type": _DECISION_RECORD_TYPE,
+        "schema_version": _COMPLETED_DECISION_SCHEMA_VERSION,
+        "outcome": InvocationTerminalOutcome.COMPLETED.value,
+        "session_id": session_id,
+        "session_instance_id": session_instance_id,
+        "run_epoch": run_epoch,
+        "profile_interaction_id": profile_interaction_id,
+        "interaction_id": interaction_id,
+        "execution_profile_fingerprint": execution_profile_fingerprint,
+        "interaction_event_id": interaction_event_id,
+        "predecessor_interaction_event_id": None,
+        "terminal_event_id": terminal_event_id,
+        "observed_at": _durable_timestamp(observed_at),
+        "terminal_payload": copy_durable_json_object(terminal_payload, "terminal_payload"),
+        "interruption_request_id": None,
+        "task_id": task_id,
+        "runtime_task_failure_id": None,
+        "task_terminalization_request_sha256": None,
+        "task_error_payload": None,
+        "turn_completed_payload": copy_durable_json_object(
+            turn_completed_payload, "turn_completed_payload"
+        ),
+    }
+    if task_result_payload is not None:
+        payload["task_result_payload"] = copy_durable_json_object(
+            task_result_payload, "task_result_payload"
+        )
+    return _sealed_decision(payload)
+
+
+def _durable_timestamp(value: datetime) -> str:
+    return (
+        normalize_utc_datetime(value, "observed_at")
+        .astimezone(UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _sealed_decision(payload: dict[str, Any]) -> InvocationTerminalDecision:
     identity_payload = {
         key: value for key, value in payload.items() if key not in {"decision_id", "record_digest"}
     }

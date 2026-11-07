@@ -109,7 +109,7 @@ def test_session_listing_composes_with_independent_state_and_access_bounds() -> 
         page = await queries.list_sessions(
             read,
             SessionQuery(limit=1, include_total_count=True),
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
             access_bounds=bounds,
         )
         assert page.total_count == 2
@@ -117,7 +117,7 @@ def test_session_listing_composes_with_independent_state_and_access_bounds() -> 
         second = await queries.list_sessions(
             read,
             SessionQuery(limit=1, cursor=page.next_cursor),
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
             access_bounds=bounds,
         )
         assert {page.sessions[0].id, second.sessions[0].id} == {"child-a", "child-b"}
@@ -126,7 +126,7 @@ def test_session_listing_composes_with_independent_state_and_access_bounds() -> 
         pending = await queries.list_sessions(
             read,
             None,
-            pending_interruption_cascade_only=True,
+            checkpoint_marker="pending_interruption_cascade",
         )
         assert [session.id for session in pending.sessions] == ["child-a"]
         aggregate = await queries.aggregate_operational_snapshot(read)

@@ -577,7 +577,7 @@ def test_revision_134_fences_binaries_that_cannot_read_references():
     revision = migrations.revision(134)
     assert revision.kind is migrations.RevisionKind.BREAKING
     assert revision.compatible_from == 134
-    assert sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION == 134
+    assert sqlite._SQLITE_SESSION_MIN_REQUIRED_REVISION >= 134
     assert postgres._POSTGRES_SESSION_MIN_REQUIRED_REVISION >= 134
 
 

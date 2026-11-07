@@ -1503,6 +1503,7 @@ class CayuApp(
             event_writer=self._event_writer,
             secret_redactor=self._secret_redactor,
             logger=logger,
+            task_store=self._task_store,
         )
 
         self._pending_tool_round_recovery = PendingToolRoundRecovery(

@@ -96,6 +96,7 @@ from cayu.sessions import _model_stage_publication as model_stage_publication
 from cayu.sessions import _model_stage_rules as model_stage_rules
 from cayu.sessions import _operation_records as operation_record_rules
 from cayu.sessions import _page_reads as page_reads
+from cayu.sessions import _paired_writes as paired_writes
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _runtime_publication_rules as publication_rules
 from cayu.sessions import _terminal_evidence as terminal_event_evidence
@@ -430,7 +431,7 @@ class InMemorySessionStore(
         return await memory_session_queries.list_sessions(
             self._read_session_query_state,
             query,
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
             access_bounds=bounds,
         )
 
@@ -2995,6 +2996,9 @@ class InMemorySessionStore(
                 )
             if to_status is SessionStatus.RUNNING:
                 self._require_external_wait_admission_unlocked(session)
+            paired_writes.require_owed_completion_kept(
+                session.status, to_status, self._checkpoints.get(session_id)
+            )
 
             now = self._ownership_clock()
             if to_status is SessionStatus.RUNNING:
@@ -3168,6 +3172,9 @@ class InMemorySessionStore(
                 )
             if to_status is SessionStatus.RUNNING:
                 self._require_external_wait_admission_unlocked(session)
+            paired_writes.require_owed_completion_kept(
+                session.status, to_status, self._checkpoints.get(session_id)
+            )
             if expected_latest_interaction_event_id is not None:
                 latest_interactions = self._latest_interaction_event_records_by_sequence.get(
                     session_id,
@@ -3689,6 +3696,14 @@ class InMemorySessionStore(
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {target_status}"
                 )
+            paired_writes.require_completed_decision_authority(
+                to_status=target_status,
+                checkpoint_mutation=checkpoint_mutation_request,
+                event=copied_event,
+                session=session,
+                checkpoint=current_checkpoint,
+                active_profile=expected_active_invocation_profile,
+            )
             queued = conditional and any(
                 (session_id, delivery_mode) in self._pending_session_messages
                 for delivery_mode in SessionMessageDeliveryMode
@@ -4264,6 +4279,13 @@ class InMemorySessionStore(
                     run_epochs=frozenset({copied.expected_run_epoch}),
                     active_profile=copied.expected_active_profile,
                 )
+                if (owed := paired_writes.unsettled_completed_decision(checkpoint)) is not None:
+                    published = self._event_records_by_id.get(
+                        (copied.session_id, owed.terminal_event_id)
+                    )
+                    checkpoint = paired_writes.checkpoint_settling_completed_decision(
+                        checkpoint, terminal_event=None if published is None else published.event
+                    )
                 session = session.model_copy(update={"run_epoch": copied.expected_run_epoch + 1})
                 updated_checkpoint = checkpoint_with_invocation_lifecycle_receipt(
                     checkpoint,
@@ -6862,7 +6884,7 @@ class InMemorySessionStore(
         if access_bounds is not None:
             return await self._access_list_sessions(access_bounds, copy_session_query(query))
         return await memory_session_queries.list_sessions(
-            self._read_session_query_state, query, pending_interruption_cascade_only=False
+            self._read_session_query_state, query, checkpoint_marker=None
         )
 
     async def query_session_topology(
@@ -6917,7 +6939,15 @@ class InMemorySessionStore(
         query: SessionQuery | None = None,
     ) -> SessionListResult:
         return await memory_session_queries.list_sessions(
-            self._read_session_query_state, query, pending_interruption_cascade_only=True
+            self._read_session_query_state, query, checkpoint_marker="pending_interruption_cascade"
+        )
+
+    async def list_sessions_with_unsettled_invocation_terminal_decision(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await memory_session_queries.list_sessions(
+            self._read_session_query_state, query, checkpoint_marker="invocation_terminal_decision"
         )
 
     async def list_queued_dispatch_terminal_receipts(

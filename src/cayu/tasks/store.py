@@ -1184,6 +1184,24 @@ class TaskStore(ABC):
             "This TaskStore does not support attached-task recovery terminalization."
         )
 
+    async def recover_attached_task_completion(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        """Complete one exact expired task owner whose attached session committed completion.
+
+        The same atomic authority as :meth:`recover_attached_task_failure`
+        applies; stores declaring ``supports_attached_task_recovery_terminalization``
+        implement both.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support attached-task recovery terminalization."
+        )
+
     async def release_interrupted_task_worker(
         self,
         request: TaskInterruptedHandoffRequest,

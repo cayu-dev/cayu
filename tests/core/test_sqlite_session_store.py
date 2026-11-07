@@ -1045,6 +1045,8 @@ def test_sqlite_public_authority_rotation_fences_stale_workers(tmp_path) -> None
         with pytest.raises(RuntimeError, match="configuration is stale"):
             await stale_store.list_sessions_with_pending_interruption_cascade()
         with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.list_sessions_with_unsettled_invocation_terminal_decision()
+        with pytest.raises(RuntimeError, match="configuration is stale"):
             await stale_store.query_transcript(
                 TranscriptQuery(session_id="before-rotation", limit=10)
             )
@@ -3606,6 +3608,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (140, 139),
         (141, 139),
         (142, 142),
+        (143, 143),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

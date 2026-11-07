@@ -671,15 +671,20 @@ async def query_pending_actions(
         )
 
 
+_CHECKPOINT_MARKERS = frozenset({"pending_interruption_cascade", "invocation_terminal_decision"})
+
+
 async def list_sessions(
     read: LockedSessionQuery,
     query: SessionQuery | None,
     *,
-    pending_interruption_cascade_only: bool,
+    checkpoint_marker: str | None,
     access_bounds: SessionReadBounds | None = None,
 ) -> SessionListResult:
     from cayu.sessions._access_rules import session_read_admitted
 
+    if checkpoint_marker is not None and checkpoint_marker not in _CHECKPOINT_MARKERS:
+        raise ValueError(f"Unsupported session checkpoint marker: {checkpoint_marker!r}.")
     query = copy_session_query(query)
     async with read() as state:
         inactive_before = (
@@ -704,9 +709,9 @@ async def list_sessions(
             (
                 state.sessions[session_id]
                 for session_id, checkpoint in state.checkpoints.items()
-                if "pending_interruption_cascade" in checkpoint and session_id in state.sessions
+                if checkpoint_marker in checkpoint and session_id in state.sessions
             )
-            if pending_interruption_cascade_only
+            if checkpoint_marker is not None
             else state.sessions.values()
         )
         matching = (

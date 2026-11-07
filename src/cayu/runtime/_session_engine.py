@@ -3476,6 +3476,7 @@ class SessionEngine:
         execution_profile: ExecutionProfileIdentity | None,
         task_id: str | None,
         tool_completion_result: ToolCompletionResult | None = None,
+        completion: SessionOutcomeContext | None = None,
     ) -> tuple[Session, Event | None, bool, dict[str, Any] | None]:
         completion_marker: dict[str, Any] | None = None
         checkpoint_mutation: dict[str, Any] | None = None
@@ -3521,6 +3522,7 @@ class SessionEngine:
                 from_statuses={SessionStatus.RUNNING},
                 checkpoint_mutation=checkpoint_mutation,
                 tool_completion_result=tool_completion_result,
+                completed_decision_context=completion if checkpoint_mutation is None else None,
             )
             return transitioned, event, completed, completion_marker if completed else None
         except (SessionRunFenced, SessionStatusConflict):
@@ -6635,6 +6637,14 @@ class SessionEngine:
 
         owed_completion: AsyncGenerator[Event, None] | None = None
 
+        if run_ledger is not None:
+            # A restart never repeats environment finalization; recovery finishes it instead.
+            run_ledger.completion = lambda completed: (
+                None
+                if outcome_state.completion_finalization_started
+                else complete_session(completed, None)
+            )
+
         def owe_completion(session_completed: bool) -> None:
             # A committed completion owes task and terminal publication. The
             # body publishes it below; settlement finishes it after any exit.
@@ -7522,6 +7532,7 @@ class SessionEngine:
                     execution_profile=execution_profile,
                     task_id=task_id,
                     tool_completion_result=tool_completion_result,
+                    completion=outcome_context(),
                 )
                 owe_completion(session_completed)
                 if interaction_completed_event is not None:
@@ -8386,6 +8397,7 @@ class SessionEngine:
                             execution_profile=execution_profile,
                             task_id=task_id,
                             tool_completion_result=None,
+                            completion=outcome_context(),
                         )
                         owe_completion(session_completed)
                         if interaction_completed_event is not None:
@@ -8528,6 +8540,7 @@ class SessionEngine:
                                     execution_profile=execution_profile,
                                     task_id=task_id,
                                     tool_completion_result=None,
+                                    completion=outcome_context(),
                                 )
                                 owe_completion(session_completed)
                                 if interaction_completed_event is not None:
@@ -8757,6 +8770,7 @@ class SessionEngine:
                         execution_profile=execution_profile,
                         task_id=task_id,
                         tool_completion_result=None,
+                        completion=outcome_context(),
                     )
                     owe_completion(session_completed)
                     if interaction_completed_event is not None:
@@ -8870,6 +8884,7 @@ class SessionEngine:
                         execution_profile=execution_profile,
                         task_id=task_id,
                         tool_completion_result=tool_completion_result,
+                        completion=outcome_context(),
                     )
                     owe_completion(session_completed)
                     if interaction_completed_event is not None:

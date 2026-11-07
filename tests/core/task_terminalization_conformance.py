@@ -261,6 +261,55 @@ async def assert_attached_task_recovery_terminalization_conformance(
             session_instance_id=attached.session_instance_id,
         )
 
+    # A session that committed its completion completes its task the same way.
+    await store.create_task(TaskCreate(task_id="attached-completion-recovery", type="review"))
+    claimed = await store.claim_task("attached-recovery-worker", lease_seconds=1)
+    assert claimed is not None and claimed.id == "attached-completion-recovery"
+    attached = await store.attach_task(
+        claimed.id,
+        session_id="attached-completion-session",
+        session_invocation=await task_backed_session_invocation(
+            store,
+            claimed.id,
+            "attached-completion-session",
+        ),
+        worker_id=claimed.worker_id,
+        claim_generation=claimed.claim_generation,
+    )
+    assert attached.session_instance_id is not None
+    completion = TaskTerminalizationRequest(
+        task_id=attached.id,
+        worker_id=claimed.worker_id,
+        claim_generation=claimed.claim_generation,
+        handoff_id=attached.interrupted_handoff_id,
+        kind=TaskTerminalKind.COMPLETED,
+        result={"session_id": "attached-completion-session"},
+        idempotency_key="attached-completion-recovery",
+    )
+    with pytest.raises(ValueError, match="expected a failed request"):
+        await store.recover_attached_task_failure(
+            completion,
+            session_id=attached.session_id,
+            session_instance_id=attached.session_instance_id,
+        )
+    await asyncio.sleep(1.05)
+    completed = await store.recover_attached_task_completion(
+        completion,
+        session_id=attached.session_id,
+        session_instance_id=attached.session_instance_id,
+    )
+    assert completed.status is TaskStatus.COMPLETED
+    assert completed.result == {"session_id": "attached-completion-session"}
+    assert completed.worker_id is None and completed.lease_expires_at is None
+    assert (
+        await store.recover_attached_task_completion(
+            completion,
+            session_id=attached.session_id,
+            session_instance_id=attached.session_instance_id,
+        )
+        == completed
+    )
+
 
 async def assert_owner_lost_ordinary_cancellation_reconciliation_conformance(
     store: TaskStore,

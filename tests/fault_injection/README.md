@@ -71,7 +71,10 @@ reruns the scenario in a fresh event loop for each point and fault:
   acknowledgement was lost to cancellation. That claim awaits lease expiry;
   the second worker must settle every task in recovery.
 - `task-outcome-disagrees-with-session`: a task completes exactly when its
-  linked session completes.
+  linked session completes. One pairing is deliberate and accepted: a completed
+  session whose task is cancelled. A task reaches cancelled only through a
+  durable cancellation request, and that request wins task terminalization even
+  after the session committed its completion; the session stays completed.
 - `task-group-execution-obligation-unsettled`: every execution a quiescent task
   group recorded is settled once its member is terminal.
 - `shutdown-or-recovery-hangs`: the phase, shutdown and recovery all finish,
@@ -150,16 +153,12 @@ points unless the fault says otherwise.
 
 | Finding | Faults, scenarios | Points | Invariant broken | Where |
 |---|---|---|---|---|
-| `task-completion-cancel` | grouped-cancel: task, task-group | 14 | task stays running under a completed session | between `_complete_session_if_no_queued_messages` and `terminalize_task` |
 | `task-session-grouped-recovery` | grouped-cancel: task, task-group | 68 | session running, owner lost, even after recovery | a task-backed run's model steps and tool round; recovery then fails with `TaskClaimLost` because the task was already settled |
 | `approval-grouped-continuation` | grouped-cancel: approval | 1 | session running without owner | right after the approval continuation commits `transition_status_and_checkpoint` |
 | `grouped-model-stage` | grouped-cancel: run, tool-round, resume, approval | 12 | cannot continue after recovery ("no authoritative open interaction") | right after `complete_model_completion_stage` commits in `_assistant_model_publication` |
-| `trailing-fence-cancel` | cancel, grouped-cancel: approval | 9 | completed session fenced forever (`SessionRunFenced`) | the approval continuation's trailing fence release in `cleanup_recovery_handoff` |
-| `trailing-fence-crash` | crash: run, tool-round, resume, approval | 30 | completed session fenced forever; abandoned-session recovery skips completed sessions | between the interaction's completion and `release_session_invocation` |
 | `task-claim-cancel` | cancel, grouped-cancel: task, task-group | 8 | task claimed by the exited worker until the next worker recovers it | while `mark_claimed_task_execution_started` is in flight; the claim waits for its pending execution-entry settlement |
-| `task-crash-terminalize` | crash: task, task-group | 6 | task running forever under a completed session | between session completion and `terminalize_task` |
 | `group-crash-conflict` | crash: task-group | 50 | task running forever: the next worker's continuation raises `TaskGroupConflict: Prior group execution is still unsettled` | a crash anywhere in the member's run |
-| `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled | a crash after the member completed, before `_settle_task_group_execution` |
+| `group-crash-after-complete` | crash: task-group | 14 | group execution obligation never settled; recovery completes the member but not its group acknowledgement | a crash after the member completed, before `_settle_task_group_execution` |
 
 Each finding names its tracking issue in `known_failures.py`; findings with no
 issue of their own share one tracking issue there.

@@ -5519,6 +5519,21 @@ class SessionStore(ABC):
         their checkpoints individually is not an acceptable implementation.
         """
 
+    async def list_sessions_with_unsettled_invocation_terminal_decision(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        """List only sessions whose checkpoint holds an unsettled invocation terminal decision.
+
+        Implementations should filter at the storage layer. This is the
+        restart-discovery path, so scanning all historical sessions and loading
+        their checkpoints individually is not an acceptable implementation.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support unsettled terminal-decision discovery."
+        )
+
     async def list_queued_dispatch_terminal_receipts(
         self,
         query: QueuedDispatchTerminalReceiptQuery | None = None,

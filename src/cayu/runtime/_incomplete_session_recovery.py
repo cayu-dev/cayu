@@ -596,6 +596,7 @@ class IncompleteSessionRecovery:
         self._effective_retry_policy = effective_retry_policy
         self._engine = engine
         self._session_tasks = session_tasks
+        self._committed_completion_listing_unsupported = False
         self._environment_lifecycle = environment_lifecycle
         self._event_writer = event_writer
         self._execution_profile_continuation = execution_profile_continuation
@@ -1243,6 +1244,64 @@ class IncompleteSessionRecovery:
         except _RecoveryPreflightMutationRequired:
             return None
 
+    async def recover_committed_completions(
+        self,
+        *,
+        inactive_for_seconds: int,
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Finish completed sessions whose completed decision is still unsettled.
+
+        The sweep over running and interrupting sessions never sees them: their
+        COMPLETED transition committed, but the process stopped before their
+        task, terminal events or fence release caught up.
+        """
+
+        request = IncompleteSessionsRecoveryRequest(
+            statuses={SessionStatus.COMPLETED},
+            inactive_for_seconds=inactive_for_seconds,
+            reason="committed_completion_recovered",
+        )
+        results: list[IncompleteSessionRecoveryResult] = []
+        cursor: str | None = None
+        while True:
+            try:
+                list_owed = (
+                    self._session_store.list_sessions_with_unsettled_invocation_terminal_decision
+                )
+                page = await list_owed(
+                    SessionQuery(
+                        status=SessionStatus.COMPLETED,
+                        inactive_for_seconds=inactive_for_seconds,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                        limit=1000,
+                        cursor=cursor,
+                    )
+                )
+            except NotImplementedError:
+                if not self._committed_completion_listing_unsupported:
+                    self._committed_completion_listing_unsupported = True
+                    logger.warning(
+                        "This SessionStore cannot list unsettled terminal decisions, so the "
+                        "sweep does not finish completed turns whose process stopped early; "
+                        "implement list_sessions_with_unsettled_invocation_terminal_decision."
+                    )
+                return results
+            for session in page.sessions:
+                results.append(
+                    await self._recover_incomplete_session_fault_isolated(
+                        session=session,
+                        request=request,
+                        before_recovery=None,
+                        before_mutation=None,
+                        after_recovery=None,
+                        reconcile_result=None,
+                        recover_abandoned_model=None,
+                    )
+                )
+            if page.next_cursor is None or page.next_cursor == cursor:
+                return results
+            cursor = page.next_cursor
+
     async def _recover_incomplete_session_fault_isolated(
         self,
         *,
@@ -1523,6 +1582,14 @@ class IncompleteSessionRecovery:
         )
         if recovered_runtime_failure is not None:
             return recovered_runtime_failure
+        recovered_completion = await self._session_tasks.recover_committed_completion(
+            session,
+            checkpoint,
+            previous_status,
+            admit_before_mutation,
+        )
+        if recovered_completion is not None:
+            return recovered_completion
         from cayu.runtime._producer_completion_replay import producer_completion_requires_execution
 
         if session.status is SessionStatus.RUNNING and producer_completion_requires_execution(

@@ -312,6 +312,20 @@ checkpoint writers cannot create, replace, or delete this decision. Only the
 typed invocation terminal-decision and interaction-transition boundaries may
 install or settle it.
 
+A completed run records what it still owes as a version-2 terminal decision,
+installed with its version-5 completion receipt.
+`SessionStore.list_sessions_with_unsettled_invocation_terminal_decision(query)`
+lists, like `list_sessions_with_pending_interruption_cascade`, only the
+sessions whose checkpoint still holds `invocation_terminal_decision`, so
+recovery finds them without scanning historical checkpoints; the SQLite and
+PostgreSQL stores read it from a partial checkpoint index, and a custom store
+that does not implement it raises `NotImplementedError`. Storage revision 143
+adds that index and is breaking, because older binaries reject both records:
+stop every process that opens the database, run `cayu storage migrate
+--acknowledge-breaking 143` before the new binary serves traffic, then start
+the new binaries. Older binaries must not open a migrated database; they
+refuse it as too new. On PostgreSQL the index is built `CONCURRENTLY`.
+
 Custom `SessionStore` implementations must accept the optional
 `checkpoint_root_guard` on bounded pending-action, interruption-marker,
 session-operation, and inspection reads. They project only the requested

@@ -262,6 +262,12 @@ from cayu.sessions._operation_records import (
     _active_unexpired_session_operation_id,
     _reject_reserved_runtime_publication_key,
 )
+from cayu.sessions._paired_writes import (
+    checkpoint_settling_completed_decision,
+    require_completed_decision_authority,
+    require_owed_completion_kept,
+    unsettled_completed_decision,
+)
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
@@ -439,7 +445,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 140
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 143
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -604,7 +610,7 @@ class PostgresSessionStore(
         return await session_queries.list_sessions(
             self._ready_connection,
             query,
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
             access_bounds=bounds,
         )
 
@@ -2870,6 +2876,12 @@ class PostgresSessionStore(
                     raise KeyError(f"Session not found: {session_id}")
                 for owner in await self._closure_lineage_owners(cur, (session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
+                if admission_source.status is SessionStatus.COMPLETED:
+                    require_owed_completion_kept(
+                        admission_source.status,
+                        to_status,
+                        await self._load_checkpoint(cur, session_id),
+                    )
                 updated_at = await self._session_store_now(cur)
                 params: list[object] = [
                     str(to_status),
@@ -3002,6 +3014,10 @@ class PostgresSessionStore(
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
+                        )
+                    if loaded.status is SessionStatus.COMPLETED:
+                        require_owed_completion_kept(
+                            loaded.status, to_status, await self._load_checkpoint(cur, session_id)
                         )
                     if to_status is SessionStatus.RUNNING:
                         await self._require_external_wait_admission(cur, loaded)
@@ -3917,6 +3933,14 @@ class PostgresSessionStore(
                             "Session status transition not allowed: "
                             f"{loaded.status} -> {target_status}"
                         )
+                    require_completed_decision_authority(
+                        to_status=target_status,
+                        checkpoint_mutation=checkpoint_mutation_request,
+                        event=copied_event,
+                        session=loaded,
+                        checkpoint=checkpoint,
+                        active_profile=expected_active_invocation_profile,
+                    )
                     queued = False
                     if conditional:
                         await cur.execute(
@@ -4719,6 +4743,21 @@ class PostgresSessionStore(
                             run_epochs=frozenset({copied.expected_run_epoch}),
                             active_profile=copied.expected_active_profile,
                         )
+                        if (owed := unsettled_completed_decision(checkpoint)) is not None:
+                            await cur.execute(
+                                "SELECT event.event FROM cayu_events AS event "
+                                "WHERE event.session_id = %s AND event.event_id = %s",
+                                (copied.session_id, owed.terminal_event_id),
+                            )
+                            published = await cur.fetchone()
+                            checkpoint = checkpoint_settling_completed_decision(
+                                checkpoint,
+                                terminal_event=(
+                                    None
+                                    if published is None
+                                    else Event.model_validate(published[0])
+                                ),
+                            )
                         await cur.execute(
                             "UPDATE cayu_sessions SET run_epoch = run_epoch + 1 "
                             "WHERE id = %s AND run_epoch = %s",
@@ -6444,7 +6483,7 @@ class PostgresSessionStore(
         if access_bounds is not None:
             return await self._access_list_sessions(access_bounds, copy_session_query(query))
         return await session_queries.list_sessions(
-            self._ready_connection, query, pending_interruption_cascade_only=False
+            self._ready_connection, query, checkpoint_marker=None
         )
 
     async def query_session_topology(
@@ -6531,7 +6570,15 @@ class PostgresSessionStore(
         query: SessionQuery | None = None,
     ) -> SessionListResult:
         return await session_queries.list_sessions(
-            self._ready_connection, query, pending_interruption_cascade_only=True
+            self._ready_connection, query, checkpoint_marker="pending_interruption_cascade"
+        )
+
+    async def list_sessions_with_unsettled_invocation_terminal_decision(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await session_queries.list_sessions(
+            self._ready_connection, query, checkpoint_marker="invocation_terminal_decision"
         )
 
     async def list_queued_dispatch_terminal_receipts(

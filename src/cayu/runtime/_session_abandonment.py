@@ -1181,6 +1181,11 @@ class SessionAbandonment:
                         await self.abandon_retained(inactive_for_seconds=inactive_for_seconds)
                     )
                 results.extend(
+                    await self._incomplete_recovery.recover_committed_completions(
+                        inactive_for_seconds=inactive_for_seconds
+                    )
+                )
+                results.extend(
                     await self.resume_stopped_closes(inactive_for_seconds=inactive_for_seconds)
                 )
                 return results

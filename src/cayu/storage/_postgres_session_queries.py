@@ -1596,27 +1596,34 @@ async def _query_events_by_session_id_batches(
     return records[: query.limit]
 
 
+_CHECKPOINT_MARKER_SESSION_SOURCES = {
+    marker: f"""
+        (
+            SELECT session_id
+            FROM cayu_checkpoints
+            WHERE state ? '{marker}'
+        ) AS checkpoint_markers
+        INNER JOIN cayu_sessions
+            ON cayu_sessions.id = checkpoint_markers.session_id
+        """
+    for marker in ("pending_interruption_cascade", "invocation_terminal_decision")
+}
+
+
 async def list_sessions(
     connect: PostgresConnection,
     query: SessionQuery | None,
     *,
-    pending_interruption_cascade_only: bool,
+    checkpoint_marker: str | None,
     access_bounds: SessionReadBounds | None = None,
 ) -> SessionListResult:
+    if checkpoint_marker is None:
+        session_source_sql = "cayu_sessions"
+    elif checkpoint_marker in _CHECKPOINT_MARKER_SESSION_SOURCES:
+        session_source_sql = _CHECKPOINT_MARKER_SESSION_SOURCES[checkpoint_marker]
+    else:
+        raise ValueError(f"Unsupported session checkpoint marker: {checkpoint_marker!r}.")
     query = copy_session_query(query)
-    session_source_sql = (
-        """
-        (
-            SELECT session_id
-            FROM cayu_checkpoints
-            WHERE state ? 'pending_interruption_cascade'
-        ) AS pending_interruption_cascades
-        INNER JOIN cayu_sessions
-            ON cayu_sessions.id = pending_interruption_cascades.session_id
-        """
-        if pending_interruption_cascade_only
-        else "cayu_sessions"
-    )
     async with connect() as conn, conn.cursor() as cur:
         if access_bounds is not None:
             await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")

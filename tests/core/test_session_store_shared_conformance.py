@@ -330,6 +330,7 @@ from tests.core.session_store_conformance.messages import (
 from tests.core.session_store_conformance.lifecycle import (
     test_session_store_conformance_atomically_transforms_checkpoint,
     test_session_store_conformance_lists_pending_interruption_cascades,
+    test_session_store_conformance_lists_unsettled_invocation_terminal_decisions,
     test_session_store_conformance_rejects_future_checkpoint_before_marker_projection,
 )
 
@@ -431,6 +432,13 @@ from tests.core.session_store_conformance.recall import (
 
 from tests.core.session_store_conformance.lifecycle import (
     test_session_store_conformance_admission_detaches_started_and_continued_inputs,
+)
+
+from tests.core.session_store_conformance.completed_decision import (
+    test_session_store_conformance_completed_decision_store_rules,
+    test_session_store_conformance_failure_after_completion_is_finished_by_recovery,
+    test_session_store_conformance_lasting_failure_after_completion_is_recovered,
+    test_session_store_conformance_queued_completion_installs_no_decision,
 )
 
 pytestmark = pytest.mark.postgres

@@ -116,7 +116,7 @@ from cayu.sessions._invocation_terminal_decision import (
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
-from cayu.sessions.records import SessionStatus
+from cayu.sessions.records import Session, SessionStatus
 from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import (
     _cancellation_drain_holds,
@@ -4398,6 +4398,17 @@ async def _emit_interrupted_task_handoff_event(
     return emitted
 
 
+async def _completion_owes_task(app: CayuApp, session: Session, task_id: str) -> bool:
+    """Whether a completed session's unsettled decision still owes this task."""
+
+    if session.status is not SessionStatus.COMPLETED:
+        return False
+    from cayu.sessions._paired_writes import unsettled_completed_decision
+
+    owed = unsettled_completed_decision(await app.session_store.load_checkpoint(session.id))
+    return owed is not None and owed.task_id == task_id
+
+
 async def _recover_expired_interrupted_task_handoffs(
     app: CayuApp,
     task_store: TaskStore,
@@ -4452,7 +4463,7 @@ async def _recover_expired_interrupted_task_handoffs(
             SessionStatus.PENDING,
             SessionStatus.RUNNING,
             SessionStatus.INTERRUPTING,
-        }:
+        } or await _completion_owes_task(app, session, task.id):
             from cayu.external_wait_tasks import recover_before_handoff
 
             try:
@@ -4493,7 +4504,11 @@ async def _recover_expired_interrupted_task_handoffs(
             session = await app.session_store.load(task.session_id)
             if session is None or session.instance_id != task.session_instance_id:
                 continue
-        if session.status is not SessionStatus.INTERRUPTED:
+        if session.status is not SessionStatus.INTERRUPTED and not (
+            # A completed session fences the lost worker's run as an interrupted
+            # one does; its pending cancellation still decides the task.
+            session.status is SessionStatus.COMPLETED and _task_cancellation_requested(task)
+        ):
             continue
         from cayu.external_wait_tasks import stop_wait_left_arming
 
@@ -4519,12 +4534,14 @@ async def _recover_expired_interrupted_task_handoffs(
                     task_store,
                     task,
                     actor=_declaring_worker_actor(worker_id),
-                    evidence_id=f"session-interrupted:{session.instance_id}:{session.run_epoch}",
+                    evidence_id=(
+                        f"session-{session.status.value}:{session.instance_id}:{session.run_epoch}"
+                    ),
                 ):
                     recovered += 1
                     logger.warning(
                         "Settled task %s as cancelled: its cancellation was pending when its "
-                        "worker stopped renewing its lease, and its session is interrupted.",
+                        "worker stopped renewing its lease, and its session has ended.",
                         app.redact_json(task.id),
                     )
             except Exception as exc:
@@ -4584,8 +4601,8 @@ async def _settle_expired_owner_cancellation(
 ) -> bool:
     """Cancel an attached task whose worker's lease expired with its cancellation pending.
 
-    Its session is interrupted, which fences the lost worker's run, so nothing of it
-    can continue; ``evidence_id`` names that session incarnation and run epoch. The
+    Its session is interrupted or completed, which fences the lost worker's run, so
+    nothing of it can continue; ``evidence_id`` names that session incarnation and run epoch. The
     store settles only the exact expired claim ``task`` shows; a claim that changed,
     a lease that is live again, or a settlement another worker made first is left
     alone. Returns whether this call settled the task.

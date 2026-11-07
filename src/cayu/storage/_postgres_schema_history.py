@@ -262,6 +262,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE state ? 'pending_interruption_cascade'
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_invocation_terminal_decision
+        ON cayu_checkpoints(session_id)
+        WHERE state ? 'invocation_terminal_decision'
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_control_action
         ON cayu_checkpoints(session_id)
         WHERE pending_action_flags <> 0
@@ -828,6 +833,9 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS claim_generation BIGINT "
         "NOT NULL DEFAULT 0 CHECK (claim_generation >= 0)",
     ),
+    # The terminal-decision index on cayu_checkpoints is built CONCURRENTLY; see
+    # _CONCURRENT_INDEX_MIGRATIONS.
+    143: (),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
@@ -4713,6 +4721,26 @@ class _ConcurrentIndexMigration:
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    # Recovery lists the sessions whose checkpoint holds an unsettled invocation
+    # terminal decision from this index instead of scanning every checkpoint.
+    143: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_checkpoints_invocation_terminal_decision",
+            table_name="cayu_checkpoints",
+            key_definitions=("session_id",),
+            predicate_definition="state ? 'invocation_terminal_decision'",
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_checkpoints_invocation_terminal_decision "
+                "ON cayu_checkpoints(session_id) "
+                "WHERE state ? 'invocation_terminal_decision'"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS "
+                "idx_cayu_checkpoints_invocation_terminal_decision"
+            ),
+        ),
+    ),
     # Activity and overview pages count each session's model steps and tool
     # calls from this index instead of reading the events. Built without
     # blocking the event writes of revision-139 binaries still running.

@@ -112,7 +112,7 @@ def test_native_session_queries_compose_with_direct_connections(backend, tmp_pat
                 actual_sessions = await queries.list_sessions(
                     run_read,
                     session_query,
-                    pending_interruption_cascade_only=False,
+                    checkpoint_marker=None,
                     ownership_clock=lambda: datetime.now(UTC),
                 )
                 actual_usage = await queries.read_usage_accounting(
@@ -129,7 +129,7 @@ def test_native_session_queries_compose_with_direct_connections(backend, tmp_pat
 
                 actual_events = await queries.query_events(connect, event_query)
                 actual_sessions = await queries.list_sessions(
-                    connect, session_query, pending_interruption_cascade_only=False
+                    connect, session_query, checkpoint_marker=None
                 )
                 actual_usage = await queries.read_usage_accounting(
                     connect, event_query, usage_cache=SessionUsageCache()

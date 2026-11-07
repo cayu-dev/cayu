@@ -57,6 +57,12 @@ from cayu.providers.base import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._completed_decision_settlement import (
+    completed_task_event,
+    completed_terminal_event,
+    completed_turn_event,
+    completion_terminal_payload,
+)
 from cayu.runtime._continuation_task_failure import (
     RuntimeTaskFailureIdentity,
     RuntimeTaskFailureTerminalizationPending,
@@ -162,6 +168,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._paired_writes import unsettled_completed_decision
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -180,7 +187,9 @@ from cayu.sessions.records import (
     SessionStatusConflict,
 )
 from cayu.sessions.store import SessionStore
+from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.store import TaskStore
+from cayu.tasks.terminalization import TaskTerminalizationConflict
 from cayu.vaults.redaction import SecretRedactor
 
 
@@ -192,6 +201,10 @@ class SessionOutcomeState:
     task_started: bool = False
     task_start_attempted: bool = False
     task_finished: bool = False
+    completed_decision: InvocationTerminalDecision | None = None
+    """The decision this invocation's completion transition carried."""
+    completion_publication_started: bool = False
+    completion_finalization_started: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,12 +280,7 @@ class SessionOutcomePublication:
         task_handoff_id = context.task_handoff_id
 
         def completion_payload() -> dict[str, Any]:
-            if tool_completion_result is None:
-                return {}
-            return {
-                "reason": tool_completion_result.reason,
-                "tool_completion": tool_completion_result.model_dump(mode="json"),
-            }
+            return completion_terminal_payload(tool_completion_result)
 
         state.session = completed_session
         prefinalized_completion: EnvironmentBindingFinalizeResult | None = None
@@ -439,27 +447,60 @@ class SessionOutcomePublication:
                 session=state.session,
                 expected_marker=completion_marker,
             )
+        # The completion transition fixed the identity of every event it still owes.
+        owed = state.completed_decision
+        # A restarted publication replays whatever the first one made durable.
+        replay = state.completion_publication_started
+        state.completion_publication_started = True
+        if owed is not None and (
+            owed.session_instance_id != state.session.instance_id
+            or owed.run_epoch != state.session.run_epoch
+        ):
+            raise SessionRunFenced("The completion's decision belongs to another invocation.")
+        task: Task | None = None
         if task_id is not None and invocation_context.work_attempt is None:
             await self._session_control.raise_if_interrupted(state.session.id)
-            task = await self._session_tasks.complete_task(
-                task_id=task_id,
-                task_worker_id=task_worker_id,
-                task_handoff_id=task_handoff_id,
+            completed_task = (
+                None
+                if owed is None or self.task_store is None
+                else await self.task_store.load_task(task_id)
+            )
+            if completed_task is not None and completed_task.status is TaskStatus.COMPLETED:
+                # A restarted publication finishes the decision it was cut short in.
+                task = completed_task
+            else:
+                try:
+                    task = await self._session_tasks.complete_task(
+                        task_id=task_id,
+                        task_worker_id=task_worker_id,
+                        task_handoff_id=task_handoff_id,
+                        session=state.session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                except TaskTerminalizationConflict:
+                    if owed is None:
+                        raise
+                    # A cancellation requested after the session committed its
+                    # completion still decides the task; the session side of
+                    # the decision is finished regardless, so its fence is released.
+        if task is not None:
+            state.task_finished = True
+            if active_run is not None:
+                active_run.task_finished = True
+            task_completed = _task_event(
+                event_type=EventType.TASK_COMPLETED,
+                task=task,
                 session=state.session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
             )
-            state.task_finished = True
-            if active_run is not None:
-                active_run.task_finished = True
-            yield await self._event_writer.emit(
-                _task_event(
-                    event_type=EventType.TASK_COMPLETED,
-                    task=task,
-                    session=state.session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                )
+            if owed is not None:
+                task_completed = completed_task_event(owed, task_completed)
+            yield await (
+                self._event_writer.emit_exact_replay(task_completed)
+                if replay
+                else self._event_writer.emit(task_completed)
             )
         for event in await self._session_finalization.emit_turn_completed_once(
             session=state.session,
@@ -470,20 +511,27 @@ class SessionOutcomePublication:
             usage_tracker=turn_usage_tracker,
             active_run=active_run,
             invocation_context=invocation_context,
+            prepared_turn_completed=(
+                None if owed is None else completed_turn_event(owed, state.session)
+            ),
+            exact_replay=replay,
         ):
             yield event
+        if prefinalized_completion is not None:
+            terminal_event = prefinalized_completion.event
+        elif owed is not None:
+            terminal_event = completed_terminal_event(owed, state.session)
+        else:
+            terminal_event = Event(
+                type=EventType.SESSION_COMPLETED,
+                payload=completion_payload(),
+                session_id=state.session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+            )
+        state.completion_finalization_started = True
         terminal_stream = self._terminal_event_publication.emit(
-            event=(
-                prefinalized_completion.event
-                if prefinalized_completion is not None
-                else Event(
-                    type=EventType.SESSION_COMPLETED,
-                    payload=completion_payload(),
-                    session_id=state.session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                )
-            ),
+            event=terminal_event,
             phase=RuntimeHookPhase.AFTER_SESSION_COMPLETED,
             session=state.session,
             registered_agent=registered_agent,
@@ -952,6 +1000,12 @@ class SessionOutcomePublication:
         task_worker_id = context.task_worker_id
         task_handoff_id = context.task_handoff_id
 
+        owed = state.completed_decision and unsettled_completed_decision(
+            await self.session_store.load_checkpoint(state.session.id)
+        )
+        if owed is not None and owed == state.completed_decision:
+            # The completion committed: its decision finishes it, never a failure.
+            raise exc
         if (
             isinstance(exc, ExecutionDeadlineExceeded)
             and invocation_context.work_attempt is not None

@@ -662,11 +662,13 @@ _INVOCATION_TERMINAL_DECISION_FIELDS = frozenset(
         "task_terminalization_request_sha256",
         "task_error_payload",
         "turn_completed_payload",
+        "model_recovery_id",
+        "task_result_payload",
         "record_digest",
     }
 )
 _INVOCATION_TERMINAL_DECISION_UNTRUSTED_FIELDS = frozenset(
-    {"terminal_payload", "task_error_payload", "turn_completed_payload"}
+    {"terminal_payload", "task_error_payload", "turn_completed_payload", "task_result_payload"}
 )
 
 

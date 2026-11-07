@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -91,11 +92,15 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
 )
 from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalDecision,
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
+    invocation_terminal_decision_matches_recovery_profile,
 )
+from cayu.sessions._paired_writes import unsettled_completed_decision
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.invocation import SessionInvocationBinding
 from cayu.sessions.records import (
@@ -147,6 +152,9 @@ def _provider_operation_task_terminalization_request(
             kind=TaskTerminalKind.FAILED,
         ),
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class SessionTaskLifecycle:
@@ -356,6 +364,137 @@ class SessionTaskLifecycle:
             actions=(IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,),
             events=events,
             message="Recovered the committed runtime task failure without redispatching work.",
+        )
+
+    async def recover_committed_completion(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+        previous_status: SessionStatus,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> IncompleteSessionRecoveryResult | None:
+        """Complete the task a durable completed decision still owes.
+
+        Only the task store is written here. Recovery then publishes the owed
+        TASK_COMPLETED, TURN_COMPLETED and SESSION_COMPLETED under its claim, so
+        this step never makes the session look active to that claim.
+        """
+
+        decision = unsettled_completed_decision(checkpoint)
+        if decision is None or session.status is not SessionStatus.COMPLETED:
+            return None
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_profile is None or not invocation_terminal_decision_matches_recovery_profile(
+            decision,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            current_run_epoch=session.run_epoch,
+            interaction_id=active_profile.interaction_id,
+            execution_profile_fingerprint=active_profile.profile.fingerprint,
+        ):
+            raise SessionRunFenced("Committed completion has conflicting recovery authority.")
+        if decision.task_id is None:
+            return None
+        if self.task_store is None:
+            # The task's completion stays owed until an application with its
+            # TaskStore recovers this session.
+            raise RuntimeError("Committed completion recovery requires a TaskStore.")
+        owner_live, _ = await self._recover_completed_decision_task(
+            session, decision, before_mutation
+        )
+        if owner_live:
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=(),
+                message="The task owner of the committed completion is still live.",
+            )
+        return None
+
+    async def _recover_completed_decision_task(
+        self,
+        session: Session,
+        decision: InvocationTerminalDecision,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> tuple[bool, Task | None]:
+        """Complete the decision's task: whether its owner is still live, and the task.
+
+        No task is returned when the task cannot be completed here: it was decided
+        elsewhere (cancelled, failed, moved to another session) or this store or
+        task cannot be recovered this way. The session side of the completion is
+        still finished, so the session is never left fenced by its task.
+        """
+
+        assert decision.task_id is not None and decision.task_result_payload is not None
+        task = (
+            None if self.task_store is None else await self.task_store.load_task(decision.task_id)
+        )
+        if (
+            self.task_store is None
+            or task is None
+            or task.session_id != session.id
+            or task.session_instance_id != session.instance_id
+        ):
+            return False, self._completion_task_skipped(decision, "is not attached to the session")
+        if task.status is TaskStatus.RUNNING:
+            await before_mutation()
+            if task.worker_id is None:
+                task = await self.task_store.complete_task(
+                    task.id, decision.task_result_payload, worker_id=None
+                )
+            elif not self.task_store.supports_attached_task_recovery_terminalization:
+                return False, self._completion_task_skipped(
+                    decision, "is in a store without attached-task recovery"
+                )
+            else:
+                running = task
+                try:
+                    task = await self.task_store.recover_attached_task_completion(
+                        TaskTerminalizationRequest(
+                            task_id=task.id,
+                            worker_id=task.worker_id,
+                            claim_generation=task.claim_generation,
+                            handoff_id=task.interrupted_handoff_id,
+                            kind=TaskTerminalKind.COMPLETED,
+                            result=decision.task_result_payload,
+                            idempotency_key=runtime_task_terminalization_idempotency_key(
+                                task_id=task.id,
+                                session_id=session.id,
+                                kind=TaskTerminalKind.COMPLETED,
+                            ),
+                        ),
+                        session_id=session.id,
+                        session_instance_id=session.instance_id,
+                    )
+                except TaskClaimLost:
+                    current = await self.task_store.load_task(running.id)
+                    if (
+                        current is not None
+                        and current.status is TaskStatus.RUNNING
+                        and current.claim_generation == running.claim_generation
+                    ):
+                        return True, None
+                    if current is None:
+                        return False, self._completion_task_skipped(decision, "disappeared")
+                    task = current
+                except ValueError:
+                    # A pending cancellation wins, and a retry series settles
+                    # through its own attempt; neither is completed here.
+                    return False, self._completion_task_skipped(
+                        decision, "is cancelled or settles through its retry series"
+                    )
+        if task.status is TaskStatus.COMPLETED:
+            return False, task
+        return False, self._completion_task_skipped(decision, f"ended {task.status.value}")
+
+    @staticmethod
+    def _completion_task_skipped(decision: InvocationTerminalDecision, reason: str) -> None:
+        logger.warning(
+            "A recovered completion leaves its task to its own owner: task %s %s.",
+            decision.task_id,
+            reason,
         )
 
     async def require_continuation_task_authority(
@@ -646,6 +785,12 @@ class SessionTaskLifecycle:
             raise KeyError(f"Task not found: {task_id}") from None
         checkpoint = await self.session_store.load_checkpoint(session.id)
         terminal_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        if (
+            terminal_decision is not None
+            and terminal_decision.outcome is InvocationTerminalOutcome.COMPLETED
+        ):
+            # A committed completion owes no failure; its own finisher completes the task.
+            return False, ()
         if terminal_decision is not None:
             decision_active_profile = active_invocation_execution_profile_from_checkpoint(
                 checkpoint

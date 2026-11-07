@@ -112,7 +112,7 @@ from cayu.tasks._lifecycle import (
     _ensure_can_resume_task,
     _ensure_can_transition,
     _ensure_owned_active_task_lease,
-    _ensure_recovered_attached_task_failure_authority,
+    _ensure_recovered_attached_task_authority,
     _ensure_recovered_attached_task_session,
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
@@ -255,6 +255,7 @@ from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
+    TaskTerminalKind,
     _replay_task_terminalization_receipt,
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
@@ -280,7 +281,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 142
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 143
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -2776,7 +2777,39 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         session_id: str,
         session_instance_id: str,
     ) -> Task:
+        return await self._recover_attached_task(
+            request,
+            TaskTerminalKind.FAILED,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+
+    async def recover_attached_task_completion(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        return await self._recover_attached_task(
+            request,
+            TaskTerminalKind.COMPLETED,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+
+    async def _recover_attached_task(
+        self,
+        request: TaskTerminalizationRequest,
+        kind: TaskTerminalKind,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
         request, request_sha256 = prepare_task_terminalization(request)
+        if request.kind is not kind:
+            raise ValueError(f"Attached-task recovery expected a {kind.value} request.")
+        terminal_status = TaskStatus(kind.value)
         session_id = require_clean_nonblank(session_id, "session_id")
         session_instance_id = require_clean_nonblank(
             session_instance_id,
@@ -2825,7 +2858,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             "terminalization."
                         )
                     now = await self._database_now(cur)
-                    _ensure_recovered_attached_task_failure_authority(
+                    _ensure_recovered_attached_task_authority(
                         task,
                         request,
                         session_id=session_id,
@@ -2834,7 +2867,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     )
                     verified_work_support.require_contracted_completion_authority(
                         task,
-                        TaskStatus.FAILED,
+                        terminal_status,
                     )
                     await cur.execute(
                         f"""
@@ -2842,7 +2875,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         SET status = %s,
                             status_reason = NULL,
                             status_payload = NULL,
-                            result = NULL,
+                            result = %s,
                             error = %s,
                             worker_id = NULL,
                             lease_expires_at = NULL,
@@ -2861,8 +2894,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         RETURNING {pg_support.TASK_COLUMNS}
                         """,
                         (
-                            str(TaskStatus.FAILED),
-                            pg_support._dumps(request.error),
+                            str(terminal_status),
+                            None if request.result is None else pg_support._dumps(request.result),
+                            None if request.error is None else pg_support._dumps(request.error),
                             now,
                             now,
                             now,

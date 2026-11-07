@@ -114,7 +114,7 @@ from cayu.tasks._lifecycle import (
     _ensure_can_transition,
     _ensure_exact_owned_active_task_lease,
     _ensure_owned_active_task_lease,
-    _ensure_recovered_attached_task_failure_authority,
+    _ensure_recovered_attached_task_authority,
     _ensure_recovered_attached_task_session,
     _ensure_retry_series_queue_attempt,
     _ensure_task_handoff_authority,
@@ -354,6 +354,7 @@ from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
     TaskTerminalizationRequest,
+    TaskTerminalKind,
     _replay_task_terminalization_receipt,
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
@@ -3448,7 +3449,39 @@ class InMemoryTaskStore(TaskStore):
         session_id: str,
         session_instance_id: str,
     ) -> Task:
+        return await self._recover_attached_task(
+            request,
+            TaskTerminalKind.FAILED,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+
+    async def recover_attached_task_completion(
+        self,
+        request: TaskTerminalizationRequest,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
+        return await self._recover_attached_task(
+            request,
+            TaskTerminalKind.COMPLETED,
+            session_id=session_id,
+            session_instance_id=session_instance_id,
+        )
+
+    async def _recover_attached_task(
+        self,
+        request: TaskTerminalizationRequest,
+        kind: TaskTerminalKind,
+        *,
+        session_id: str,
+        session_instance_id: str,
+    ) -> Task:
         request, request_sha256 = prepare_task_terminalization(request)
+        if request.kind is not kind:
+            raise ValueError(f"Attached-task recovery expected a {kind.value} request.")
+        terminal_status = TaskStatus(kind.value)
         session_id = require_clean_nonblank(session_id, "session_id")
         session_instance_id = require_clean_nonblank(
             session_instance_id,
@@ -3477,7 +3510,7 @@ class InMemoryTaskStore(TaskStore):
                     "Admitted work attempts cannot use attached-task recovery terminalization."
                 )
             committed_at = self._ownership_clock()
-            _ensure_recovered_attached_task_failure_authority(
+            _ensure_recovered_attached_task_authority(
                 task,
                 request,
                 session_id=session_id,
@@ -3486,8 +3519,8 @@ class InMemoryTaskStore(TaskStore):
             )
             terminal_task = self._finish_task(
                 request.task_id,
-                TaskStatus.FAILED,
-                result=None,
+                terminal_status,
+                result=request.result,
                 error=request.error,
                 worker_id=None,
                 now=committed_at,

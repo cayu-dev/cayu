@@ -1471,32 +1471,39 @@ async def _query_events_by_session_id_batches(
     return records[: query.limit]
 
 
+_CHECKPOINT_MARKER_SESSION_SOURCES = {
+    marker: f"""
+        (
+            SELECT session_id
+            FROM cayu_checkpoints
+                INDEXED BY idx_cayu_checkpoints_{marker}
+            WHERE json_type(
+                state_json,
+                '$.{marker}'
+            ) IS NOT NULL
+        ) AS checkpoint_markers
+        CROSS JOIN cayu_sessions
+            ON cayu_sessions.id = checkpoint_markers.session_id
+        """
+    for marker in ("pending_interruption_cascade", "invocation_terminal_decision")
+}
+
+
 async def list_sessions(
     run_read: SQLiteOperationRunner,
     query: SessionQuery | None,
     *,
-    pending_interruption_cascade_only: bool,
+    checkpoint_marker: str | None,
     access_bounds: SessionReadBounds | None = None,
     ownership_clock: Callable[[], datetime],
 ) -> SessionListResult:
+    if checkpoint_marker is None:
+        session_source_sql = "cayu_sessions"
+    elif checkpoint_marker in _CHECKPOINT_MARKER_SESSION_SOURCES:
+        session_source_sql = _CHECKPOINT_MARKER_SESSION_SOURCES[checkpoint_marker]
+    else:
+        raise ValueError(f"Unsupported session checkpoint marker: {checkpoint_marker!r}.")
     query = copy_session_query(query)
-    session_source_sql = (
-        """
-        (
-            SELECT session_id
-            FROM cayu_checkpoints
-                INDEXED BY idx_cayu_checkpoints_pending_interruption_cascade
-            WHERE json_type(
-                state_json,
-                '$.pending_interruption_cascade'
-            ) IS NOT NULL
-        ) AS pending_interruption_cascades
-        CROSS JOIN cayu_sessions
-            ON cayu_sessions.id = pending_interruption_cascades.session_id
-        """
-        if pending_interruption_cascade_only
-        else "cayu_sessions"
-    )
 
     def run_query(connection: sqlite3.Connection) -> SessionListResult:
         inactive_before = (

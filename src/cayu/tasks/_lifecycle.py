@@ -216,7 +216,7 @@ def _ensure_recovered_attached_task_session(
         )
 
 
-def _ensure_recovered_attached_task_failure_authority(
+def _ensure_recovered_attached_task_authority(
     task: Task,
     request: TaskTerminalizationRequest,
     *,
@@ -224,7 +224,7 @@ def _ensure_recovered_attached_task_failure_authority(
     session_instance_id: str,
     now: datetime,
 ) -> None:
-    """Fence recovery failure to one exact expired attached-task generation."""
+    """Fence recovery terminalization to one exact expired attached-task generation."""
 
     now = normalize_utc_datetime(now, "now")
     _ensure_recovered_attached_task_session(
@@ -232,8 +232,8 @@ def _ensure_recovered_attached_task_failure_authority(
         session_id=session_id,
         session_instance_id=session_instance_id,
     )
-    if request.kind is not TaskTerminalKind.FAILED:
-        raise ValueError("Attached-task recovery can only publish task failure.")
+    if request.kind not in {TaskTerminalKind.COMPLETED, TaskTerminalKind.FAILED}:
+        raise ValueError("Attached-task recovery can only complete or fail a task.")
     if task.retry_series is not None:
         raise ValueError(
             "Retry-series tasks require settle_task_retry_attempt for completion or failure."

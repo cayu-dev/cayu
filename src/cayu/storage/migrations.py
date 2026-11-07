@@ -594,6 +594,11 @@ REVISIONS: tuple[Revision, ...] = (
     # handoff and restart advance and heartbeats keep. An older worker would claim
     # without advancing it, and older Task models reject receipts that carry it.
     Revision(revision=142, kind=RevisionKind.BREAKING, compatible_from=142),
+    # A completed run records what it still owes as a version-2 terminal decision
+    # in its checkpoint, installed with its version-5 completion receipt, and
+    # recovery lists those decisions from a partial index. Older binaries reject
+    # both records, so they must not open it.
+    Revision(revision=143, kind=RevisionKind.BREAKING, compatible_from=143),
 )
 
 #: The revision an empty database is initialized to.

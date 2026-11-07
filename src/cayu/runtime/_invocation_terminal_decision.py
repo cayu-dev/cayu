@@ -7,6 +7,9 @@ from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome as InvocationTerminalOutcome,
 )
 from cayu.sessions._invocation_terminal_decision import (
+    build_completed_invocation_terminal_decision as build_completed_invocation_terminal_decision,
+)
+from cayu.sessions._invocation_terminal_decision import (
     build_invocation_terminal_decision as build_invocation_terminal_decision,
 )
 from cayu.sessions._invocation_terminal_decision import (
@@ -14,6 +17,9 @@ from cayu.sessions._invocation_terminal_decision import (
 )
 from cayu.sessions._invocation_terminal_decision import (
     checkpoint_with_invocation_terminal_decision as checkpoint_with_invocation_terminal_decision,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    completed_decision_event_id as completed_decision_event_id,
 )
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint as invocation_terminal_decision_from_checkpoint,

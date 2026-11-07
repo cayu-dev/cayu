@@ -142,7 +142,9 @@ async def task_violations(
 
     Every check runs after the phase's worker has returned or died, so a claimed
     or running task still names an owner that no longer exists. A task whose
-    linked session completed must have completed with it, and the reverse.
+    linked session completed must have completed with it, and the reverse, except
+    that a durable cancellation request still decides a task whose session
+    completed.
     An unacknowledged, unstarted claim may await its live lease expiry; recovery
     checks pass no exception and require that a second worker settles it.
     """
@@ -170,6 +172,11 @@ async def task_violations(
             continue
         session_completed = session.status is SessionStatus.COMPLETED
         task_completed = task.status is TaskStatus.COMPLETED
+        if session_completed and task.status is TaskStatus.CANCELLED:
+            # A task reaches CANCELLED only through a durable cancellation request,
+            # which wins task terminalization over its session's committed
+            # completion: the session stays completed and the task cancelled.
+            continue
         if session_completed != task_completed and (
             task.status in TERMINAL_TASK_STATUSES or session.status in TERMINAL_SESSION_STATUSES
         ):

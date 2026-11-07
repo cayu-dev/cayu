@@ -33,8 +33,10 @@ from cayu.sessions._invocation_scope import (
 )
 from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._paired_writes import unsettled_completed_decision
 from cayu.sessions.records import SessionStatus
 
 if TYPE_CHECKING:
@@ -66,6 +68,7 @@ class _Owed(Enum):
     NOTHING = "nothing"
     RECOVERY = "recovery"
     DECISION = "decision"
+    COMPLETION = "completion"
     RELEASE = "release"
 
 
@@ -98,6 +101,8 @@ class RunLedger:
     """Publish state the body would publish on failure (deferred input)."""
     provider_free_exit: bool = False
     """The exit was rebuilt without provider state; settlement must not chain onto it."""
+    completion: Callable[[Session], AsyncGenerator[Any, None] | None] | None = None
+    """Publish a committed completion from its durable decision, for any exit."""
     cancellation_baseline: int = field(default_factory=current_cancellation_requests)
     local_release: list[Callable[[], None]] = field(default_factory=list)
 
@@ -266,21 +271,19 @@ class RunSettlement:
 
         if run_exit.kind in _UNSETTLED_EXITS or ledger.stage >= OutcomeStage.FENCE_RELEASED:
             return
-        if (
-            ledger.stage < OutcomeStage.DECIDED
-            and run_exit.error is not None
-            and self._recovery_owns_failure(run_exit.error, ledger)
-        ):
-            # The body deliberately left this invocation open for its recovery
-            # owner (uncertain terminal evidence, an unsettled durable child
-            # submission, a rejected interaction publication).
-            return
-        if ledger.failure_owned_by_body and ledger.stage < OutcomeStage.DECIDED:
-            # The body's own failure handler took this invocation's outcome; if
-            # it could not finish, also because a cancellation interrupted it,
-            # its durable state is left for recovery exactly as before.
-            return
+        # A committed completion is finished from its decision whoever handled the error.
         owed = await self._owed_settlement(ledger)
+        if owed is not _Owed.COMPLETION and ledger.stage < OutcomeStage.DECIDED:
+            if run_exit.error is not None and self._recovery_owns_failure(run_exit.error, ledger):
+                # The body deliberately left this invocation open for its recovery
+                # owner (uncertain terminal evidence, an unsettled durable child
+                # submission, a rejected interaction publication).
+                return
+            if ledger.failure_owned_by_body:
+                # The body's own failure handler took this invocation's outcome; if
+                # it could not finish, also because a cancellation interrupted it,
+                # its durable state is left for recovery exactly as before.
+                return
         if owed is _Owed.NOTHING:
             ledger.advance(OutcomeStage.FENCE_RELEASED)
             return
@@ -289,8 +292,19 @@ class RunSettlement:
         try:
             if owed is _Owed.DECISION:
                 await self._decide_abandoned(ledger)
-            if ledger.remainder is not None and await ledger.remainder() is not False:
+            # A completion that committed before the body recorded it publishes
+            # what its decision owes before the release.
+            if owed is _Owed.COMPLETION and await self._publish_owed_completion(ledger):
                 ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+            if ledger.remainder is not None:
+                published = await ledger.remainder()
+                if published is False and run_exit.kind is RunExitKind.CANCELLED:
+                    # A cancellation inside the publication ended it. Its decision
+                    # still holds every event it owes, so a fresh publication
+                    # finishes it; each step replays what is already durable.
+                    published = await self._publish_owed_completion(ledger)
+                if published is not False:
+                    ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
         finally:
             # Abort the environment and release the fence even if the decision
             # or its remainder failed: the release itself keeps the fence when
@@ -335,6 +349,21 @@ class RunSettlement:
             return _Owed.NOTHING
         if ledger.stage >= OutcomeStage.DECIDED:
             return _Owed.RELEASE
+        completed = unsettled_completed_decision(checkpoint)
+        if (
+            ledger.completion is not None
+            and session.status is SessionStatus.COMPLETED
+            and completed is not None
+            and invocation_terminal_decision_matches_active_profile(
+                completed,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+                interaction_id=active.interaction_id,
+                execution_profile_fingerprint=active.profile.fingerprint,
+            )
+        ):
+            return _Owed.COMPLETION
         settled = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
         if (
             session.status not in _LIVE_STATUSES
@@ -348,6 +377,23 @@ class RunSettlement:
             # and never retry its release on its behalf.
             return _Owed.RECOVERY
         return _Owed.DECISION
+
+    async def _publish_owed_completion(self, ledger: RunLedger) -> bool:
+        """Publish a completion from its decision while the session is still completed."""
+
+        session = await self._session_store.load(ledger.session_id)
+        if (
+            ledger.completion is None
+            or session is None
+            or session.status is not SessionStatus.COMPLETED
+            or unsettled_completed_decision(
+                await self._session_store.load_checkpoint(ledger.session_id)
+            )
+            is None
+        ):
+            return False
+        publication = ledger.completion(session)
+        return publication is not None and await drain_event_stream(publication)
 
     async def _decide_abandoned(self, ledger: RunLedger) -> None:
         context = ledger.invocation_context

@@ -31,11 +31,6 @@ class Finding:
 
 # Issues are cayu-tech/cayu. Findings with no issue of their own are tracked in #3390.
 FINDINGS: dict[str, Finding] = {
-    "task-completion-cancel": Finding(
-        "#3334 (same window, grouped cancellation)",
-        "Grouped cancellation between interaction completion and task completion "
-        "leaves the task RUNNING under a completed session",
-    ),
     "approval-grouped-continuation": Finding(
         "#3390 (approval analogue of #3330)",
         "Grouped cancellation right after an approval continuation commits its status "
@@ -46,25 +41,10 @@ FINDINGS: dict[str, Finding] = {
         "Grouped cancellation right after a model completion stage commits leaves a "
         "session that cannot continue after recovery",
     ),
-    "trailing-fence-cancel": Finding(
-        "#3390 (same end state as #3306)",
-        "Cancellation during the trailing run-fence release of a completed turn leaves "
-        "the session fenced forever",
-    ),
-    "trailing-fence-crash": Finding(
-        "#3390 (same end state as #3306)",
-        "A crash between completing the interaction and releasing the invocation leaves "
-        "the completed session fenced forever",
-    ),
     "task-claim-cancel": Finding(
         "#3390",
         "Cancelling the worker while the execution-start mark is in flight leaves the "
         "claim with its pending entry settlement until the next worker recovers it",
-    ),
-    "task-crash-terminalize": Finding(
-        "#3390 (crash analogue of #3334)",
-        "A crash after the session completed, before the task is terminalized, leaves "
-        "the task RUNNING forever",
     ),
     "group-crash-conflict": Finding(
         "#3390 (related #3245)",
@@ -125,44 +105,6 @@ def _known(
 
 KNOWN_FAILURES: tuple[KnownFailure, ...] = (
     _known(
-        "task-completion-cancel",
-        "task",
-        FaultKind.GROUPED_CANCEL,
-        (
-            (Invariant.TASK_SESSION_DISAGREE, Stage.LIVE),
-            (Invariant.TASK_SESSION_DISAGREE, Stage.AFTER_SHUTDOWN),
-            (Invariant.TASK_SESSION_DISAGREE, Stage.RECOVERED),
-        ),
-        (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.claim_persisted_event_side_effect:exit#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.mark_persisted_event_side_effect_delivered:exit#16",
-            "store.query_events:enter#11",
-            "store.load_state:enter#19",
-            "store.terminalize_task:enter#0",
-        ),
-    ),
-    _known(
-        "task-completion-cancel",
-        "task-group",
-        FaultKind.GROUPED_CANCEL,
-        (
-            (Invariant.TASK_SESSION_DISAGREE, Stage.LIVE),
-            (Invariant.TASK_SESSION_DISAGREE, Stage.AFTER_SHUTDOWN),
-            (Invariant.TASK_SESSION_DISAGREE, Stage.RECOVERED),
-        ),
-        (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.claim_persisted_event_side_effect:exit#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.mark_persisted_event_side_effect_delivered:exit#16",
-            "store.query_events:enter#11",
-            "store.load_state:enter#19",
-            "store.terminalize_task:enter#0",
-        ),
-    ),
-    _known(
         "approval-grouped-continuation",
         "approval",
         FaultKind.GROUPED_CANCEL,
@@ -217,93 +159,6 @@ KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     _known(
-        "trailing-fence-cancel",
-        "approval",
-        FaultKind.CANCEL,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.load:enter#9",
-            "store.load_checkpoint:enter#17",
-        ),
-    ),
-    _known(
-        "trailing-fence-cancel",
-        "approval",
-        FaultKind.GROUPED_CANCEL,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.load:enter#9",
-            "store.load_checkpoint:enter#17",
-            "store.load:enter#10",
-            "store.load_checkpoint:enter#18",
-            "store.load_invocation_settlement_transition:enter#0",
-            "store.load_interaction_transition_receipt:enter#0",
-            "store.release_session_invocation:enter#0",
-        ),
-    ),
-    _known(
-        "trailing-fence-crash",
-        "approval",
-        FaultKind.CRASH,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.claim_persisted_event_side_effect:enter#4",
-            "store.mark_persisted_event_side_effect_delivered:enter#11",
-            "store.append_event_and_claim_side_effect:enter#8",
-            "store.mark_persisted_event_side_effect_delivered:enter#12",
-            "store.append_event_and_claim_side_effect:enter#9",
-            "store.mark_persisted_event_side_effect_delivered:enter#13",
-            "store.transform_checkpoint:enter#2",
-            "store.release_session_invocation:enter#0",
-        ),
-    ),
-    _known(
-        "trailing-fence-crash",
-        "resume",
-        FaultKind.CRASH,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.claim_persisted_event_side_effect:enter#6",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.append_event_and_claim_side_effect:enter#12",
-            "store.mark_persisted_event_side_effect_delivered:enter#17",
-            "store.append_event_and_claim_side_effect:enter#13",
-            "store.mark_persisted_event_side_effect_delivered:enter#18",
-            "store.transform_checkpoint:enter#5",
-            "store.release_session_invocation:enter#0",
-        ),
-    ),
-    _known(
-        "trailing-fence-crash",
-        "run",
-        FaultKind.CRASH,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.claim_persisted_event_side_effect:enter#2",
-            "store.mark_persisted_event_side_effect_delivered:enter#7",
-            "store.append_event_and_claim_side_effect:enter#5",
-            "store.mark_persisted_event_side_effect_delivered:enter#8",
-            "store.append_event_and_claim_side_effect:enter#6",
-            "store.mark_persisted_event_side_effect_delivered:enter#9",
-            "store.release_session_invocation:enter#0",
-        ),
-    ),
-    _known(
-        "trailing-fence-crash",
-        "tool-round",
-        FaultKind.CRASH,
-        ((Invariant.NOT_RESUMABLE, Stage.LIVENESS),),
-        (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#15",
-            "store.append_event_and_claim_side_effect:enter#12",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.append_event_and_claim_side_effect:enter#13",
-            "store.mark_persisted_event_side_effect_delivered:enter#17",
-            "store.release_session_invocation:enter#0",
-        ),
-    ),
-    _known(
         "task-claim-cancel",
         "task",
         FaultKind.CANCEL,
@@ -341,36 +196,6 @@ KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         (
             "store.mark_claimed_task_execution_started:enter#0",
             "store.mark_claimed_task_execution_started:exit#0",
-        ),
-    ),
-    _known(
-        "task-crash-terminalize",
-        "task",
-        FaultKind.CRASH,
-        (
-            (Invariant.TASK_SESSION_DISAGREE, Stage.RECOVERED),
-            (Invariant.TASK_UNSETTLED, Stage.TASK_RECOVERY),
-            (Invariant.TASK_UNSETTLED, Stage.RECOVERED),
-        ),
-        (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.terminalize_task:enter#0",
-        ),
-    ),
-    _known(
-        "task-crash-terminalize",
-        "task-group",
-        FaultKind.CRASH,
-        (
-            (Invariant.TASK_SESSION_DISAGREE, Stage.RECOVERED),
-            (Invariant.TASK_UNSETTLED, Stage.TASK_RECOVERY),
-            (Invariant.TASK_UNSETTLED, Stage.RECOVERED),
-        ),
-        (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.terminalize_task:enter#0",
         ),
     ),
     _known(
@@ -440,6 +265,9 @@ KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         FaultKind.CRASH,
         ((Invariant.TASK_GROUP_OBLIGATION, Stage.RECOVERED),),
         (
+            "store.claim_persisted_event_side_effect:enter#3",
+            "store.mark_persisted_event_side_effect_delivered:enter#16",
+            "store.terminalize_task:enter#0",
             "store.append_event_and_claim_side_effect:enter#13",
             "store.mark_persisted_event_side_effect_delivered:enter#17",
             "store.append_event_and_claim_side_effect:enter#14",

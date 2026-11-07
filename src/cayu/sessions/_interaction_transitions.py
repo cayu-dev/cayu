@@ -19,6 +19,7 @@ from cayu.execution_profiles import (
 )
 from cayu.messages import Message, detach_message
 from cayu.sessions import _completion_finalization as completion_finalization
+from cayu.sessions import _paired_writes as paired_writes
 from cayu.sessions import records as session_record_rules
 from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
 from cayu.sessions._execution_profile_rules import SessionModelTransition
@@ -226,13 +227,16 @@ class InteractionTransitionSpec(BaseModel):
         if self.checkpoint_mutation is not None and (
             self.event.type != EventType.INTERACTION_COMPLETED
             or not self.only_if_no_queued_messages
-            or self.to_status is not SessionStatus.RUNNING
         ):
             raise ValueError(
-                "checkpoint_mutation is valid only for a queue-conditional running "
-                "interaction completion."
+                "checkpoint_mutation is valid only for a queue-conditional interaction completion."
             )
-        if self.checkpoint_mutation is not None:
+        if self.checkpoint_mutation is not None and self.to_status is SessionStatus.COMPLETED:
+            # The completed decision is installed only if the session completes.
+            paired_writes.completed_decision_from_install_mutation(
+                self.checkpoint_mutation, event=self.event
+            )
+        elif self.checkpoint_mutation is not None:
             completion_finalization._validate_completion_finalization_mutation_shape(
                 self.checkpoint_mutation
             )

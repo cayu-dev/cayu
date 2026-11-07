@@ -47,7 +47,9 @@ class SessionAbandonmentEntrances:
         one of its tasks is terminal, which requires a ``task_store``. The
         sweep then also revisits interrupted sessions whose tasks finished
         later, and abandoned sessions whose cleanup did not finish. Every sweep
-        finishes a ``close_session`` that stopped before closing the children.
+        finishes a ``close_session`` that stopped before closing the children,
+        and every completed turn whose process stopped before it completed its
+        task, published its terminal events or released its session.
         """
 
         return tuple(

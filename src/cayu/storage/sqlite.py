@@ -238,6 +238,12 @@ from cayu.sessions._operation_records import (
     _active_unexpired_session_operation_id,
     _reject_reserved_runtime_publication_key,
 )
+from cayu.sessions._paired_writes import (
+    checkpoint_settling_completed_decision,
+    require_completed_decision_authority,
+    require_owed_completion_kept,
+    unsettled_completed_decision,
+)
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
@@ -431,7 +437,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 134
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 143
 _T = TypeVar("_T")
 
 
@@ -1069,7 +1075,7 @@ class SQLiteSessionStore(
             self._run_read,
             ownership_clock=self._ownership_clock,
             query=query,
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
             access_bounds=bounds,
         )
 
@@ -3354,6 +3360,12 @@ class SQLiteSessionStore(
                 admission_source = (
                     self._load_unlocked(session_id) if to_status is SessionStatus.RUNNING else None
                 )
+                if to_status is not SessionStatus.COMPLETED:
+                    current = self._load_unlocked(session_id)
+                    if current is not None and current.status is SessionStatus.COMPLETED:
+                        require_owed_completion_kept(
+                            current.status, to_status, self._load_checkpoint_unlocked(session_id)
+                        )
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 params: list[object] = [
                     str(to_status),
@@ -3492,6 +3504,10 @@ class SQLiteSessionStore(
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
+                    )
+                if loaded.status is SessionStatus.COMPLETED:
+                    require_owed_completion_kept(
+                        loaded.status, to_status, self._load_checkpoint_unlocked(session_id)
                     )
                 if to_status is SessionStatus.RUNNING:
                     self._require_external_wait_admission_unlocked(loaded)
@@ -4680,6 +4696,14 @@ class SQLiteSessionStore(
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {target_status}"
                     )
+                require_completed_decision_authority(
+                    to_status=target_status,
+                    checkpoint_mutation=checkpoint_mutation_request,
+                    event=copied_event,
+                    session=loaded,
+                    checkpoint=current_checkpoint,
+                    active_profile=expected_active_invocation_profile,
+                )
                 queued = False
                 if conditional:
                     queued = (
@@ -5294,6 +5318,17 @@ class SQLiteSessionStore(
                     run_epochs=frozenset({copied.expected_run_epoch}),
                     active_profile=copied.expected_active_profile,
                 )
+                if (owed := unsettled_completed_decision(checkpoint)) is not None:
+                    published = connection.execute(
+                        "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
+                        (copied.session_id, owed.terminal_event_id),
+                    ).fetchone()
+                    checkpoint = checkpoint_settling_completed_decision(
+                        checkpoint,
+                        terminal_event=(
+                            None if published is None else sqlite_records.event_from_row(published)
+                        ),
+                    )
                 connection.execute(
                     "UPDATE cayu_sessions SET run_epoch = run_epoch + 1 "
                     "WHERE id = ? AND run_epoch = ?",
@@ -7071,7 +7106,7 @@ class SQLiteSessionStore(
             self._run_read,
             ownership_clock=self._ownership_clock,
             query=query,
-            pending_interruption_cascade_only=False,
+            checkpoint_marker=None,
         )
 
     async def query_session_topology(
@@ -7154,7 +7189,18 @@ class SQLiteSessionStore(
             self._run_read,
             ownership_clock=self._ownership_clock,
             query=query,
-            pending_interruption_cascade_only=True,
+            checkpoint_marker="pending_interruption_cascade",
+        )
+
+    async def list_sessions_with_unsettled_invocation_terminal_decision(
+        self,
+        query: SessionQuery | None = None,
+    ) -> SessionListResult:
+        return await session_queries.list_sessions(
+            self._run_read,
+            ownership_clock=self._ownership_clock,
+            query=query,
+            checkpoint_marker="invocation_terminal_decision",
         )
 
     async def list_queued_dispatch_terminal_receipts(

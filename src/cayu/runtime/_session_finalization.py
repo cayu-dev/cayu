@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any, NoReturn, TypeVar
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 from uuid import uuid4
 
 from pydantic import (
@@ -122,6 +122,10 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._completed_decision_settlement import (
+    completed_decision_install,
+    task_lifecycle_event,
+)
 from cayu.runtime._continuation_task_failure import (
     load_direct_task_failure_replay,
     provider_operation_task_failure_payload,
@@ -337,6 +341,9 @@ from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
 )
+
+if TYPE_CHECKING:
+    from cayu.runtime._session_outcome_publication import SessionOutcomeContext
 
 _INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS = 3
 
@@ -1135,27 +1142,12 @@ def _task_event(
     registered_agent: runtime_records.RegisteredAgentState,
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Event:
-    event = Event(
-        type=event_type,
+    return task_lifecycle_event(
+        event_type=event_type,
+        task=task,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=_environment_name(registered_environment),
-        payload={
-            "task_id": task.id,
-            "task_type": task.type,
-            "task_status": task.status.value,
-            "task_session_id": task.session_id,
-            "assigned_agent_name": task.assigned_agent_name,
-            "parent_task_id": task.parent_task_id,
-        },
-    )
-    return event_with_runtime_payload_authority(
-        event,
-        *(
-            field_name
-            for field_name in ("task_id", "task_session_id", "parent_task_id")
-            if event.payload.get(field_name) is not None
-        ),
     )
 
 
@@ -1380,11 +1372,11 @@ class SessionFinalization:
                 return None
             return None
         if latest.type in INTERACTION_TERMINAL_EVENT_TYPES:
-            expected_type = (
-                EventType.INTERACTION_INTERRUPTED
-                if decision.outcome is InvocationTerminalOutcome.INTERRUPTED
-                else EventType.INTERACTION_FAILED
-            )
+            expected_type = {
+                InvocationTerminalOutcome.INTERRUPTED: EventType.INTERACTION_INTERRUPTED,
+                InvocationTerminalOutcome.FAILED: EventType.INTERACTION_FAILED,
+                InvocationTerminalOutcome.COMPLETED: EventType.INTERACTION_COMPLETED,
+            }[decision.outcome]
             if (
                 latest.type is not expected_type
                 or latest.id != decision.interaction_event_id
@@ -2097,6 +2089,7 @@ class SessionFinalization:
         terminal_event: Event | None = None,
         terminal_decision: InvocationTerminalDecision | None = None,
         tool_completion_result: ToolCompletionResult | None = None,
+        completed_decision_context: SessionOutcomeContext | None = None,
     ) -> tuple[Session, Event | None, bool]:
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext or not isinstance(
@@ -2330,10 +2323,12 @@ class SessionFinalization:
         completion_pending_finalization = (
             to_status is SessionStatus.RUNNING and checkpoint_mutation is not None
         )
+        completion_checkpoint: dict[str, Any] | None = None
         if to_status is SessionStatus.COMPLETED or completion_pending_finalization:
+            completion_checkpoint = await self.session_store.load_checkpoint(session.id)
             producer_publication = (
                 model_completion_publication.model_step_publication_from_checkpoint(
-                    await self.session_store.load_checkpoint(session.id)
+                    completion_checkpoint
                 )
             )
             if producer_publication is not None:
@@ -2435,6 +2430,20 @@ class SessionFinalization:
                 )
             return transitioned, None, True
 
+        if (
+            completed_decision_context is not None
+            and to_status is SessionStatus.COMPLETED
+            # A recovered continuation keeps its claim's own completion path.
+            and expected_recovery_claim_id is None
+        ):
+            # What this completion still owes is installed with it, if it completes.
+            checkpoint_mutation = await completed_decision_install(
+                checkpoint=completion_checkpoint,
+                session_finalization=self,
+                context=completed_decision_context,
+                interaction_completed=event,
+                tool_completion_result=tool_completion_result,
+            )
         replay_event = copy_event(event)
         from cayu.runtime._session_steering import SessionSteeringBoundaryReached
 
@@ -3246,6 +3255,7 @@ class SessionFinalization:
         invocation_context: InvocationContext | None = None,
         prepared_turn_completed: Event | None = None,
         settle_interaction: bool = True,
+        exact_replay: bool = False,
     ) -> tuple[Event, ...]:
         registered_environment = None
         execution_profile = None
@@ -3292,7 +3302,11 @@ class SessionFinalization:
             or turn_completed.payload.get("status") != status.value
         ):
             raise RuntimeError("Prepared turn completion conflicts with its invocation.")
-        turn_completed_event = await self._event_writer.emit(turn_completed)
+        turn_completed_event = await (
+            self._event_writer.emit_exact_replay(turn_completed)
+            if exact_replay
+            else self._event_writer.emit(turn_completed)
+        )
         if interaction_event is None:
             return (turn_completed_event,)
         return (interaction_event, turn_completed_event)
@@ -3310,6 +3324,7 @@ class SessionFinalization:
         invocation_context: InvocationContext | None = None,
         prepared_turn_completed: Event | None = None,
         settle_interaction: bool = True,
+        exact_replay: bool = False,
     ) -> tuple[Event, ...]:
         if active_run is None:
             return await self._emit_turn_completed(
@@ -3322,6 +3337,7 @@ class SessionFinalization:
                 invocation_context=invocation_context,
                 prepared_turn_completed=prepared_turn_completed,
                 settle_interaction=settle_interaction,
+                exact_replay=exact_replay,
             )
         async with active_run.turn_completed_lock:
             if active_run.turn_completed_event is not None:
@@ -3336,6 +3352,7 @@ class SessionFinalization:
                 invocation_context=invocation_context,
                 prepared_turn_completed=prepared_turn_completed,
                 settle_interaction=settle_interaction,
+                exact_replay=exact_replay,
             )
             active_run.turn_completed_event = events[-1]
             return events

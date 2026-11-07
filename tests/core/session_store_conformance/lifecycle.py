@@ -761,6 +761,60 @@ def test_session_store_conformance_lists_pending_interruption_cascades(session_s
     asyncio.run(run())
 
 
+def test_session_store_conformance_lists_unsettled_invocation_terminal_decisions(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            for session_id in (
+                "sess_terminal_decision_unsettled",
+                "sess_terminal_decision_cascade",
+                "sess_terminal_decision_none",
+            ):
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", session_id)],
+                    ),
+                    identity=_identity(),
+                )
+            # Only the typed terminal-decision boundary installs this root; the
+            # listing reads the stored marker, not its record.
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
+                await store.checkpoint(
+                    "sess_terminal_decision_unsettled",
+                    {"invocation_terminal_decision": {"attempt_id": "decision"}},
+                )
+            await store.checkpoint(
+                "sess_terminal_decision_cascade",
+                {
+                    "pending_interruption_cascade": {
+                        "attempt_id": "cascade",
+                        "interrupt_payload": {"interruption_type": "operator_requested"},
+                    }
+                },
+            )
+            await store.checkpoint(
+                "sess_terminal_decision_none",
+                {"unrelated_checkpoint": True},
+            )
+
+            listed = await store.list_sessions_with_unsettled_invocation_terminal_decision(
+                SessionQuery(include_total_count=True)
+            )
+
+            assert [session.id for session in listed.sessions] == [
+                "sess_terminal_decision_unsettled"
+            ]
+            assert listed.total_count == 1
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_rejects_future_checkpoint_before_marker_projection(
     session_store_case,
 ) -> None:

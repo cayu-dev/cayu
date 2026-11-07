@@ -455,6 +455,12 @@ class RuntimeEventWriter:
             self._observe_persisted_event(event, persisted_observer)
         return await self.fan_out_persisted(events)
 
+    async def emit_exact_replay(self, event: Event) -> Event:
+        """Emit one event with a stable ID, accepting its exact earlier persistence."""
+
+        persisted = await self.persist_exact_replay(event)
+        return (await self.fan_out_persisted([persisted]))[0]
+
     async def fan_out_persisted(self, events: list[Event]) -> list[Event]:
         """Apply budget/sink side effects after a store-owned atomic publication."""
 

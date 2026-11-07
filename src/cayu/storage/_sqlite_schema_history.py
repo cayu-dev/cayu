@@ -232,6 +232,10 @@ _BASELINE_DDL = """
         ON cayu_checkpoints(session_id)
         WHERE json_type(state_json, '$.pending_interruption_cascade') IS NOT NULL;
 
+    CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_invocation_terminal_decision
+        ON cayu_checkpoints(session_id)
+        WHERE json_type(state_json, '$.invocation_terminal_decision') IS NOT NULL;
+
     CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_pending_control_action
         ON cayu_checkpoints(session_id)
         WHERE pending_action_flags <> 0;
@@ -748,6 +752,11 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
         ON cayu_events(session_id, event_type)
         WHERE event_type IN ('model.completed', 'tool.call.started');""",
     142: "",  # Task claim generation column; added by _MIGRATION_ADD_COLUMNS.
+    # Recovery lists the sessions whose checkpoint holds an unsettled
+    # invocation terminal decision from this index.
+    143: """CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_invocation_terminal_decision
+        ON cayu_checkpoints(session_id)
+        WHERE json_type(state_json, '$.invocation_terminal_decision') IS NOT NULL;""",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

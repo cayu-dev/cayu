@@ -243,6 +243,7 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_run_fence,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
+from cayu.sessions._paired_writes import unsettled_completed_decision
 from cayu.sessions._terminal_evidence import (
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
@@ -2794,7 +2795,8 @@ class EnvironmentLifecycle:
         try:
             await self._session_store.apply_invocation_lifecycle_command(command)
         except SessionRunFenced:
-            if stale_invocation:
+            # An owed completion keeps the fence until its finisher publishes it.
+            if stale_invocation or unsettled_completed_decision(checkpoint) is not None:
                 return
             raise
 

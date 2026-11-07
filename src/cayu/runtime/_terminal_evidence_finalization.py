@@ -44,6 +44,10 @@ from cayu.events import (
 from cayu.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.runtime._completed_decision_settlement import (
+    completed_terminal_event,
+    owed_completion_events,
+)
 from cayu.runtime._durable_tool_round import (
     _interrupted_tool_round_results as _interrupted_tool_round_results,
 )
@@ -87,6 +91,8 @@ from cayu.runtime._tool_completion import (
 )
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+from cayu.sessions._invocation_terminal_decision import InvocationTerminalDecision
+from cayu.sessions._paired_writes import unsettled_completed_decision
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _checkpoint_after_session_run_operation_cleanup,
@@ -109,6 +115,7 @@ from cayu.sessions.recovery import (
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.store import SessionStore
+from cayu.tasks.store import TaskStore
 from cayu.vaults.redaction import SecretRedactor
 
 _INTERRUPTION_REPAIR_JOIN_MAX_ATTEMPTS = 100
@@ -201,8 +208,10 @@ class TerminalEvidenceFinalization:
         event_writer: RuntimeEventWriter,
         secret_redactor: SecretRedactor,
         logger: logging.Logger,
+        task_store: TaskStore | None = None,
     ) -> None:
         self._session_store = session_store
+        self._task_store = task_store
         self._session_control = session_control
         self._recovery = recovery
         self._terminal_evidence = terminal_evidence
@@ -795,21 +804,34 @@ class TerminalEvidenceFinalization:
             checkpoint=checkpoint,
         )
         terminal_event = inspection.event
+        owed = (
+            unsettled_completed_decision(checkpoint)
+            if session.status is SessionStatus.COMPLETED
+            else None
+        )
         if terminal_event is None and inspection.terminal_event_required:
-            repair_event = self._repair_event(
-                session=session,
-                terminal_run_epoch=terminal_run_epoch,
-                terminal_timestamp=terminal_timestamp,
-                pending_interrupt_payload=inspection.pending_interrupt_payload,
-                pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
-                run_operation=inspection.run_operation,
-                interruption_reason=interruption_reason,
-                abandoned=abandoned_session_from_checkpoint(checkpoint),
-            )
-            if session.status is SessionStatus.COMPLETED:
-                repair_event.payload.update(
-                    await recorded_terminal_tool_completion_payload(self._session_store, session)
+            if owed is not None:
+                # A committed completion fixed its own events; its fence release
+                # waits for this SESSION_COMPLETED.
+                await self._publish_owed_completion_events(owed, session)
+                repair_event = completed_terminal_event(owed, session)
+            else:
+                repair_event = self._repair_event(
+                    session=session,
+                    terminal_run_epoch=terminal_run_epoch,
+                    terminal_timestamp=terminal_timestamp,
+                    pending_interrupt_payload=inspection.pending_interrupt_payload,
+                    pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
+                    run_operation=inspection.run_operation,
+                    interruption_reason=interruption_reason,
+                    abandoned=abandoned_session_from_checkpoint(checkpoint),
                 )
+                if session.status is SessionStatus.COMPLETED:
+                    repair_event.payload.update(
+                        await recorded_terminal_tool_completion_payload(
+                            self._session_store, session
+                        )
+                    )
             terminal_event = await self._persist_repair_event(repair_event)
         if inspection.pending_interrupt_payload is not None:
             await self.clear_pending_interrupt(
@@ -852,6 +874,22 @@ class TerminalEvidenceFinalization:
                 else "Repaired durable terminal event evidence."
             ),
         )
+
+    async def _publish_owed_completion_events(
+        self, decision: InvocationTerminalDecision, session: Session
+    ) -> None:
+        task = None
+        if decision.task_id is not None:
+            if self._task_store is None:
+                raise RuntimeError("Committed completion recovery requires a TaskStore.")
+            loaded = await self._task_store.load_task(decision.task_id)
+            if loaded is not None and loaded.session_instance_id == session.instance_id:
+                task = loaded
+        persisted = [
+            await self._event_writer.persist_exact_replay(event)
+            for event in owed_completion_events(decision, session, task)
+        ]
+        await self._event_writer.fan_out_persisted(persisted)
 
     def _repair_event(
         self,

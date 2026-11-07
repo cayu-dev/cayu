@@ -34,6 +34,7 @@ from cayu.observability.hooks import RuntimeHook, RuntimeHookContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import _session_finalization as session_finalization_module
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.sessions import _checkpoint_preservation as checkpoint_preservation
 from cayu.sessions import _invocation_scope as invocation_scope
 from cayu.sessions._interaction_transitions import (
     InteractionTransitionReceiptResult,
@@ -41,6 +42,7 @@ from cayu.sessions._interaction_transitions import (
     InteractionTransitionSpec,
 )
 from cayu.sessions.authority import SessionRunFenced
+from cayu.sessions.checkpoints import INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
@@ -1104,6 +1106,7 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id=None,
+        checkpoint_mutation=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_model_completion_stage_settlements.append(model_completion_stage_settlement)
@@ -1118,6 +1121,7 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
+            checkpoint_mutation=checkpoint_mutation,
         )
         if self.remaining_lost_acknowledgements > 0:
             self.remaining_lost_acknowledgements -= 1
@@ -1320,6 +1324,7 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
         expected_active_invocation_profile=None,
         expected_invocation_authority_state="active",
         expected_recovery_claim_id: str | None = None,
+        checkpoint_mutation: dict | None = None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
         self.attempted_from_statuses.append(set(from_statuses))
@@ -1335,6 +1340,7 @@ class CommitMutateThenLoseInteractionTransitionStore(InMemorySessionStore):
             expected_active_invocation_profile=expected_active_invocation_profile,
             expected_invocation_authority_state=expected_invocation_authority_state,
             expected_recovery_claim_id=expected_recovery_claim_id,
+            checkpoint_mutation=checkpoint_mutation,
         )
         if not self._lost_acknowledgement:
             self._lost_acknowledgement = True
@@ -2037,21 +2043,23 @@ def test_runtime_fails_closed_after_bounded_post_commit_acknowledgement_loss() -
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
         session_id = "sess_exhausted_post_commit_transition_replay"
 
-        emitted = [
-            event
+        emitted = []
+        # The completion committed with its decision, so the lost acknowledgements
+        # are reported while settlement still finishes the completion.
+        with pytest.raises(ExceptionGroup, match="failed across replay attempts"):
             async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
                     session_id=session_id,
                     messages=[Message.text("user", "run")],
                 )
-            )
-        ]
+            ):
+                emitted.append(event)
 
         session = await store.load(session_id)
         durable = await store.load_events(session_id)
         assert session is not None
-        assert session.status is SessionStatus.FAILED
+        assert session.status is SessionStatus.COMPLETED
         assert store.remaining_lost_acknowledgements == 0
         assert len(store.attempted_events) == 3
         assert all(event == store.attempted_events[0] for event in store.attempted_events)
@@ -2063,7 +2071,8 @@ def test_runtime_fails_closed_after_bounded_post_commit_acknowledgement_loss() -
         assert sum(event.type == EventType.INTERACTION_COMPLETED for event in durable) == 1
         assert all(event.interaction_id is None for event in durable[terminal_index + 1 :])
         assert sum(event.type == EventType.INTERACTION_COMPLETED for event in emitted) == 0
-        assert emitted[-1].type == EventType.SESSION_FAILED
+        assert [event.type for event in durable].count(EventType.SESSION_COMPLETED) == 1
+        assert EventType.SESSION_FAILED not in [event.type for event in durable]
         assert len(provider.requests) == 1
 
     asyncio.run(run())
@@ -3013,7 +3022,8 @@ def test_runtime_cancellation_fences_thread_dispatched_transition_until_settled(
         assert session is not None
         assert session.status is SessionStatus.COMPLETED
         assert task is not None
-        assert task.status is TaskStatus.RUNNING
+        # Settlement finishes the committed completion, task included.
+        assert task.status is TaskStatus.COMPLETED
         assert sum(event.type == EventType.INTERACTION_COMPLETED for event in durable) == 1
         assert sum(event.type == EventType.INTERACTION_FAILED for event in durable) == 0
         assert sum(event.type == EventType.INTERACTION_INTERRUPTED for event in durable) == 0
@@ -3349,6 +3359,17 @@ def test_sqlite_cancellation_fences_diagnostic_after_transition_settles(
             completed = await store.load(session_id)
             assert completed is not None
             assert completed.status is SessionStatus.COMPLETED
+            # Stand in for a successor: its admission settles this completion's
+            # decision before it may take the session off COMPLETED.
+            with checkpoint_preservation._invocation_lifecycle_authority_mutation_scope():
+                await store.transform_checkpoint(
+                    session_id,
+                    lambda _session, checkpoint: {
+                        key: value
+                        for key, value in (checkpoint or {}).items()
+                        if key != INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY
+                    },
+                )
             resumed = await store.transition_status(
                 session_id,
                 from_statuses={SessionStatus.COMPLETED},
