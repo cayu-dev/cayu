@@ -64,6 +64,7 @@ from cayu.cli._cloud_data_transfers import (
     add_data_transfer_parsers,
     data_transfer_command,
 )
+from cayu.cli._cloud_database_health import add_service_database_arguments, service_database
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
@@ -1323,6 +1324,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "cayu-cloud.toml declares in [operator_check] with the Agent's operator login, and "
             "this prints the Agent's answer. A failed check exits 2."
         ),
+        "database": (
+            "Show where the Agent's database time goes: Cayu Cloud's round trips to the "
+            "instance, the Agent role's connections, PgBouncer's query times and waits for it, "
+            "and the shared instance's CPU and CPU credits. It changes nothing."
+        ),
         "credentials": (
             "Show the Agent's own Developer dashboard (/cayu/) username and password. The "
             "output is a credential: keep it out of logs and shared terminals."
@@ -1358,6 +1364,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         operation.add_argument("--application", required=True)
         if action == "logs":
             add_service_logs_arguments(operation)
+        if action == "database":
+            add_service_database_arguments(operation)
         if action == "check":
             add_service_check_arguments(operation)
         if action in _SWITCH_REFUSED_SERVICE_ACTIONS:
@@ -4467,6 +4475,8 @@ def _service(
         )
     elif action == "credentials":
         result = _operator_credentials(client, application_id=application_id)
+    elif action == "database":
+        return service_database(arguments, client=client, application_id=application_id)
     else:
         result = change("DELETE", path)
         result_status = None if not result else _service_status(result)

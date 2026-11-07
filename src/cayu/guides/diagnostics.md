@@ -620,7 +620,10 @@ Check the cost of an open page before calling UI work done:
    `--server-url`: the CLI reads the Agent with your `cayu cloud login`, as
    `cayu session --application` does, which needs a developer or admin role
    for the Agent. Its per-route p50 and p95 are the time spent in the Agent,
-   so a round trip much slower than them was slowed down outside it.
+   so a round trip much slower than them was slowed down outside it. When the
+   time goes to the Agent's database, `cayu cloud service database
+   --application NAME` shows its round trips, PgBouncer's query times and
+   waits, and the shared instance's CPU and CPU credits.
 4. Fix the top route and repeat until the command exits 0. Typical fixes: poll
    less often or stop polling a hidden tab, return 304 Not Modified when nothing
    changed, push changes over a stream, and make GET handlers read only recent

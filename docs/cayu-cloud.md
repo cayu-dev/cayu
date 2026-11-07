@@ -1469,6 +1469,55 @@ redacted text. A filter Cloud can't read is refused with its reason (`log_query_
 Cloud from before line times prints the newest lines without times or processes, and refuses
 any option rather than ignore it (`service_logs_filters_unsupported`).
 
+## Checking an Agent's database
+
+`cayu cloud service database --application AGENT` shows where the Agent's database time goes,
+for anyone who may see the Agent. It reads Cayu Cloud's database health for the Agent and
+changes nothing:
+
+```text
+$ cayu cloud service database --application my-agent --window 1h
+Agent database: my-agent
+  Observed: 2026-11-06 18:30Z
+  Window: 2026-11-06 17:30Z to 2026-11-06 18:30Z
+
+Round trips from Cloud to the instance (direct):
+  Connect: 21.4 ms
+  SELECT 1 x 10: median 0.62 ms, min 0.51 ms, max 1.9 ms
+
+Connections of the Agent's role now:
+  TOTAL  ACTIVE  IDLE  IDLE IN TX  OTHER  WAITING ON LOCKS
+  7      1       6     0           0      0
+
+PgBouncer for this Agent (120 samples from 2 tasks):
+  Queries: 51120 (14.2/s), average 1.1 ms
+  Transactions: average 3.4 ms
+  Wait for a server connection: average 0.02 ms, longest 0.0 ms
+  Most in a minute: 0 clients waiting, 4 server connections
+
+Shared db.t4g.small (every Agent of the install):
+  CPU: average 18.5%, max 61.0%
+  CPU credits: now 140.2, lowest 132.0
+  Connections: at most 88
+```
+
+- The round trips are measured by Cloud as it answers, from its API in the Agent's network
+  straight to the instance: connecting, then ten `SELECT 1`. Agents reach the database through
+  PgBouncer where the install runs it, so a round trip the Agent sees as much slower than this
+  is spent in PgBouncer, its load balancer, or the Agent's own CPU.
+- The connections are the Agent role's connections to its database now. Through PgBouncer they
+  are its server connections; the Agent's direct `LISTEN` connections count too.
+- PgBouncer's figures cover the window: how many queries ran and the average query and
+  transaction time it measured for the Agent's database, how long clients waited for a server connection (on average and the
+  longest), and the most waiting clients and server connections in any minute.
+- The instance's figures cover the window too. Every Agent of the install shares the instance;
+  CPU credits apply only to burstable classes (`db.t*`), whose CPU slows down when they run out.
+
+`--window` takes `15m` (the default) up to `6h`. A part Cloud can't read is shown as unavailable
+with the reason, for example `no PgBouncer lines for this Agent in the window` for an idle Agent.
+`--json` prints the JSON envelope the other `cayu cloud` commands print. Its result keeps only
+the fields above, each checked (numbers stay numbers), so it never carries a host or credential.
+
 ## Reading an Agent's /data files
 
 `cayu cloud data ls|cat|get|stat --application AGENT PATH` reads the files the Agent keeps in

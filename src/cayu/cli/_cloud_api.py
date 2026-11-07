@@ -133,6 +133,9 @@ _REPORTED_API_REFUSALS = frozenset(
         (502, "agent_unreachable"),
         (503, "operator_credentials_unavailable"),
         (504, "operator_check_timeout"),
+        # `cayu cloud service database`: why Cloud has no database health for the Agent.
+        (404, "agent_database_not_found"),
+        (503, "agent_database_health_unavailable"),
         # `cayu cloud applications export|import`: why Cloud refused an export or import.
         (403, "admin_required"),
         (404, "application_not_found"),
