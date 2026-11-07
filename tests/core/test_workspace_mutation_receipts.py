@@ -91,6 +91,7 @@ from cayu.vaults.redaction import SecretRedactor
 from cayu.vaults.static import StaticVault
 from cayu.workspaces.local import LocalWorkspace
 from cayu.workspaces.observation_recovery import (
+    UNSUPPORTED_CAPTURE_PHASE,
     WorkspaceObservationLifecycle,
     _admit_workspace_observation_intent,
     _project_workspace_observation_authority,
@@ -112,6 +113,7 @@ from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationStatus,
     WorkspaceWriterIsolationEvidence,
     WorkspaceWriterIsolationStatus,
+    unsupported_workspace_revision,
 )
 
 
@@ -1233,6 +1235,18 @@ class _WorkspaceObservationProcessLossStore(InMemorySessionStore):
         return result
 
     async def _fail_after_terminal_stage(self, session_id):
+        if not self.failed and self.phase == "capture-recorded":
+            checkpoint = await self.load_checkpoint(session_id)
+            pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=SecretRedactor(),
+            )
+            if workspace_observations_from_checkpoint(checkpoint) and any(
+                item.event.payload.get("workspace_mutation_capture_status") == "recorded"
+                for item in (() if pending_round is None else pending_round.staged_terminals)
+            ):
+                self.failed = True
+                raise _WorkspaceObservationProcessLoss(self.phase)
         if not self.failed and self.phase == "terminal-stage":
             checkpoint = await self.load_checkpoint(session_id)
             observations = None if checkpoint is None else checkpoint.get("workspace_observations")
@@ -7901,6 +7915,526 @@ def test_fresh_process_recovers_workspace_observation_crash_boundaries_without_r
         assert terminal.payload["workspace_mutation_capture_status"] == "failed"
     assert checkpoint is not None
     assert "workspace_observations" not in checkpoint
+
+
+def _unsupported_capture_crash_outcome(tmp_path, crash_phase: str) -> dict[str, Any]:
+    """Crash after one capture step of an unsupported binding, recover, and summarize."""
+
+    def environment() -> Environment:
+        return Environment(
+            _portable_environment_spec("local"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+            runner=LocalRunner(tmp_path),
+            binding=NativeBinding(),
+        )
+
+    def application(store: Any, provider: Any) -> CayuApp:
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(environment(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"), tools=[ExecCommandTool()]
+        )
+        return app
+
+    async def run() -> dict[str, Any]:
+        store = _WorkspaceObservationProcessLossStore(phase=crash_phase)
+        first_provider = _ScriptedProvider()
+        session_id = f"session-unsupported-capture-loss-{crash_phase}"
+        crashed = False
+        try:
+            _ = [
+                event
+                async for event in application(store, first_provider).run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "create a file")],
+                    )
+                )
+            ]
+        except _WorkspaceObservationProcessLoss:
+            crashed = True
+        checkpoint = await store.load_checkpoint(session_id)
+        observations = workspace_observations_from_checkpoint(checkpoint)
+        crash_lifecycle_phase = (
+            None if not observations else next(iter(observations.values())).phase.value
+        )
+        actions: list[str] = []
+        recovery_requests = 0
+        if crashed:
+            store.failed = True
+            await interrupt_and_release_test_invocation(store, session_id)
+            recovery_provider = _ScriptedProvider()
+            recovery = await application(store, recovery_provider).recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+            actions = sorted(action.value for action in recovery.actions)
+            recovery_requests = recovery_provider.requests
+        durable = [
+            record.event for record in await store.query_events(EventQuery(session_id=session_id))
+        ]
+        final_checkpoint = await store.load_checkpoint(session_id)
+        terminals = [event for event in durable if event.type is EventType.TOOL_CALL_COMPLETED]
+        return {
+            "crashed": crashed,
+            "crash_lifecycle_phase": crash_lifecycle_phase,
+            "first_requests": first_provider.requests,
+            "recovery_requests": recovery_requests,
+            "tool_ran": (tmp_path / "shell.txt").exists(),
+            "actions": actions,
+            "revisions": sorted(
+                event.payload["phase"]
+                for event in durable
+                if event.type is EventType.WORKSPACE_REVISION_OBSERVED
+            ),
+            "receipts": [
+                event.payload["status"]
+                for event in durable
+                if event.type is EventType.WORKSPACE_MUTATION_RECORDED
+            ],
+            "finalized": [
+                (event.payload["status"], event.payload["detail_code"])
+                for event in durable
+                if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+            ],
+            "terminals": [
+                (
+                    event.payload.get("workspace_mutation_capture_status"),
+                    event.payload.get("workspace_mutation_capture_detail_code"),
+                )
+                for event in terminals
+            ],
+            "observations_left": bool(workspace_observations_from_checkpoint(final_checkpoint)),
+            "pending_round_left": (
+                final_checkpoint is not None and "pending_tool_round" in final_checkpoint
+            ),
+        }
+
+    return asyncio.run(run())
+
+
+# What recovery reached after a crash at each step of an unsupported binding's
+# capture when it took four transitions (recorded on main at 8e245a3dd with
+# _unsupported_capture_crash_outcome): the collapsed capture must reach one of
+# these states from each of its own steps.
+_LOST_BEFORE_OUTCOME = {
+    "crashed": True,
+    "first_requests": 1,
+    "recovery_requests": 0,
+    "tool_ran": False,
+    "actions": [
+        "pending_tool_effect",
+        "repaired_terminal_evidence",
+        "repaired_workspace_observation",
+    ],
+    "revisions": [],
+    "receipts": [],
+    "finalized": [("ambiguous", "worker_lost_before_tool_outcome_was_durable")],
+    "terminals": [],
+    "observations_left": False,
+    "pending_round_left": True,
+}
+_LOST_DURING_CAPTURE_OUTCOME = {
+    "crashed": True,
+    "first_requests": 1,
+    "recovery_requests": 0,
+    "tool_ran": True,
+    "actions": [
+        "repaired_terminal_evidence",
+        "repaired_tool_round",
+        "repaired_workspace_observation",
+    ],
+    "revisions": [],
+    "receipts": [],
+    "finalized": [("incomplete", "worker_lost_before_workspace_observation_completed")],
+    "terminals": [("failed", "worker_lost_before_workspace_observation_completed")],
+    "observations_left": False,
+    "pending_round_left": False,
+}
+_SEPARATE_TRANSITION_CRASH_OUTCOMES = {
+    "intent": {**_LOST_BEFORE_OUTCOME, "crash_lifecycle_phase": "intent"},
+    "before-capture": {**_LOST_BEFORE_OUTCOME, "crash_lifecycle_phase": "before_captured"},
+    "terminal-stage": {**_LOST_DURING_CAPTURE_OUTCOME, "crash_lifecycle_phase": "before_captured"},
+    "tool-outcome": {
+        **_LOST_DURING_CAPTURE_OUTCOME,
+        "crash_lifecycle_phase": "tool_outcome_staged",
+    },
+    "before-evidence": {
+        **_LOST_DURING_CAPTURE_OUTCOME,
+        "crash_lifecycle_phase": "tool_outcome_staged",
+        "revisions": ["before"],
+    },
+    "after-capture": {
+        **_LOST_DURING_CAPTURE_OUTCOME,
+        "crash_lifecycle_phase": "after_captured",
+        "revisions": ["after", "before"],
+    },
+    "delta-publication": {
+        **_LOST_DURING_CAPTURE_OUTCOME,
+        "crash_lifecycle_phase": "delta_published",
+        "revisions": ["after", "before"],
+        "receipts": ["unsupported"],
+        "finalized": [("incomplete", "workspace_revision_evidence_incomplete")],
+        "terminals": [("recorded", None)],
+    },
+    "terminal": {
+        **_LOST_DURING_CAPTURE_OUTCOME,
+        "crash_lifecycle_phase": None,
+        "actions": ["repaired_terminal_evidence", "repaired_tool_round"],
+        "revisions": ["after", "before"],
+        "receipts": ["unsupported"],
+        "finalized": [("incomplete", "workspace_revision_evidence_incomplete")],
+        "terminals": [("recorded", None)],
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("crash_phase", "separate_transition_phase"),
+    [
+        ("intent", "intent"),
+        ("before-capture", "before-capture"),
+        ("terminal-stage", "terminal-stage"),
+        ("tool-outcome", "tool-outcome"),
+        # The capture status is recorded on the staged outcome before the one
+        # write; recovery overwrites it, as for a loss right after staging.
+        ("capture-recorded", "tool-outcome"),
+        ("unsupported-capture", "terminal"),
+    ],
+)
+def test_unsupported_capture_recovers_from_each_crash_as_its_separate_transitions_did(
+    tmp_path, crash_phase: str, separate_transition_phase: str
+) -> None:
+    outcome = _unsupported_capture_crash_outcome(tmp_path, crash_phase)
+
+    assert outcome == _SEPARATE_TRANSITION_CRASH_OUTCOMES[separate_transition_phase]
+
+
+@pytest.mark.parametrize(
+    "separate_phase", ["before-evidence", "after-capture", "delta-publication", "terminal"]
+)
+def test_unsupported_capture_publishes_none_of_its_separate_transitions(
+    tmp_path, separate_phase: str
+) -> None:
+    outcome = _unsupported_capture_crash_outcome(tmp_path, separate_phase)
+
+    # No crash: the run completes with the same evidence the separate
+    # transitions published.
+    assert outcome == {
+        **_SEPARATE_TRANSITION_CRASH_OUTCOMES["terminal"],
+        "crashed": False,
+        "first_requests": 2,
+        "actions": [],
+    }
+
+
+class _UnsupportedCaptureAcknowledgementStore(InMemorySessionStore):
+    """Commit the unsupported capture, then lose or delay its acknowledgement."""
+
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self, *, lose_acknowledgement: bool) -> None:
+        super().__init__()
+        self.lose_acknowledgement = lose_acknowledgement
+        self.block = not lose_acknowledgement
+        self.phases: list[str] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        if request.kind == "workspace-observation":
+            self.phases.append(request.intent["phase"])
+        unsupported = (
+            request.kind == "workspace-observation"
+            and request.intent["phase"] == UNSUPPORTED_CAPTURE_PHASE
+        )
+        if unsupported and self.block:
+            self.started.set()
+            await self.release.wait()
+        result = await super().publish_runtime_publication(session_id, request=request, **kwargs)
+        if unsupported and self.lose_acknowledgement:
+            self.lose_acknowledgement = False
+            raise RuntimeError("unsupported capture acknowledgement lost")
+        return result
+
+
+def _unsupported_capture_application(store: Any, tmp_path) -> CayuApp:
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(_ScriptedProvider(), default=True)
+    app.register_environment(
+        Environment(
+            _portable_environment_spec("local"),
+            workspace=LocalWorkspace(tmp_path, workspace_id="workspace"),
+            runner=LocalRunner(tmp_path),
+            binding=NativeBinding(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="scripted-model"), tools=[ExecCommandTool()]
+    )
+    return app
+
+
+def _workspace_event_summary(events: list[Event]) -> list[tuple[str, str | None]]:
+    return [
+        (event.type.value, event.payload.get("phase") or event.payload.get("status"))
+        for event in events
+        if event.type
+        in {
+            EventType.WORKSPACE_REVISION_OBSERVED,
+            EventType.WORKSPACE_MUTATION_RECORDED,
+            EventType.WORKSPACE_OBSERVATION_FINALIZED,
+        }
+    ]
+
+
+_UNSUPPORTED_CAPTURE_EVENTS = [
+    ("workspace.revision.observed", "before"),
+    ("workspace.revision.observed", "after"),
+    ("workspace.mutation.recorded", "unsupported"),
+    ("workspace.observation.finalized", "incomplete"),
+]
+
+
+def test_unsupported_capture_reconciles_a_lost_acknowledgement_from_its_receipt(
+    tmp_path,
+) -> None:
+    async def run():
+        store = _UnsupportedCaptureAcknowledgementStore(lose_acknowledgement=True)
+        session_id = "session-unsupported-capture-ack-loss"
+
+        public = await collect_events(
+            _unsupported_capture_application(store, tmp_path),
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return store, public, [record.event for record in durable]
+
+    store, public_events, durable_events = asyncio.run(run())
+
+    # The lost acknowledgement is replayed from the receipt, not republished.
+    assert store.phases == [
+        "intent",
+        "before-capture",
+        "tool-outcome",
+        UNSUPPORTED_CAPTURE_PHASE,
+        UNSUPPORTED_CAPTURE_PHASE,
+    ]
+    assert _workspace_event_summary(durable_events) == _UNSUPPORTED_CAPTURE_EVENTS
+    assert _workspace_event_summary(public_events) == _UNSUPPORTED_CAPTURE_EVENTS
+    terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED
+    )
+    assert terminal.payload["workspace_mutation_capture_status"] == "recorded"
+    assert any(event.type is EventType.SESSION_COMPLETED for event in durable_events)
+
+
+class _BaselineLaterBinding(DeterministicWorkspaceBinding):
+    """Report unsupported until the tool runs, then the real tree (a deferred binding)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.observations = 0
+
+    async def observe_revision(self, bound):
+        self.observations += 1
+        if self.observations == 1:
+            workspace = bound.workspace or bound.source_workspace
+            return unsupported_workspace_revision(
+                workspace_id=workspace.id, observer=type(self).__name__
+            )
+        return await super().observe_revision(bound)
+
+
+def test_unsupported_before_with_an_artifact_backed_after_keeps_separate_transitions(
+    tmp_path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    for index in range(40):
+        (workspace_root / f"file-{index:02d}.txt").write_text(str(index), encoding="utf-8")
+
+    async def run():
+        store = _UnsupportedCaptureAcknowledgementStore(lose_acknowledgement=False)
+        store.block = False
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(_ScriptedProvider(), default=True)
+        app.register_environment(
+            Environment(
+                _portable_environment_spec("local"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="workspace"),
+                runner=LocalRunner(workspace_root),
+                artifact_store=LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts"),
+                binding=_BaselineLaterBinding(),
+            ),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"), tools=[ExecCommandTool()]
+        )
+        session_id = "session-baseline-later-capture"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return store, [record.event for record in durable]
+
+    store, durable_events = asyncio.run(run())
+
+    assert UNSUPPORTED_CAPTURE_PHASE not in store.phases
+    assert [
+        (event.payload["phase"], event.payload["status"])
+        for event in durable_events
+        if event.type is EventType.WORKSPACE_REVISION_OBSERVED
+    ] == [("before", "unsupported"), ("after", "supported")]
+    after = next(
+        event
+        for event in durable_events
+        if event.type is EventType.WORKSPACE_REVISION_OBSERVED and event.payload["phase"] == "after"
+    )
+    assert after.payload["manifest_artifact_id"] is not None
+    finalized = next(
+        event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+    )
+    assert (finalized.payload["status"], finalized.payload["detail_code"]) == (
+        "incomplete",
+        "workspace_revision_evidence_incomplete",
+    )
+    terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED
+    )
+    assert terminal.payload["workspace_mutation_capture_status"] == "recorded"
+
+
+def test_store_rejects_an_unsupported_capture_that_carries_other_evidence(tmp_path) -> None:
+    from cayu.sessions._workspace_observation_publication import (
+        _validate_workspace_observation_publication,
+    )
+
+    async def run():
+        store = _UnsupportedCaptureAcknowledgementStore(lose_acknowledgement=False)
+        store.block = False
+        captured = []
+        original = store.publish_runtime_publication
+
+        async def publish(session_id, *, request, **kwargs):
+            if (
+                request.kind == "workspace-observation"
+                and request.intent["phase"] == UNSUPPORTED_CAPTURE_PHASE
+            ):
+                captured.append((session_id, request))
+            return await original(session_id, request=request, **kwargs)
+
+        store.publish_runtime_publication = publish
+        await collect_events(
+            _unsupported_capture_application(store, tmp_path),
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-unsupported-capture-validation",
+                messages=[Message.text("user", "create a file")],
+            ),
+        )
+        return captured
+
+    ((session_id, request),) = asyncio.run(run())
+    _validate_workspace_observation_publication(request, session_id=session_id)
+    before, after, receipt, finalized = request.events
+
+    def variant(**update: Any) -> RuntimePublicationRequest:
+        return request.model_copy(update=update)
+
+    with pytest.raises(ValueError, match="event conflicts with its phase"):
+        _validate_workspace_observation_publication(
+            variant(events=(before, after, receipt)), session_id=session_id
+        )
+    with pytest.raises(ValueError, match="conflicts with its capture phase"):
+        _validate_workspace_observation_publication(
+            variant(events=(after, before, receipt, finalized)), session_id=session_id
+        )
+    supported = receipt.model_copy(update={"payload": {**receipt.payload, "status": "changed"}})
+    with pytest.raises(ValueError, match="published supported evidence"):
+        _validate_workspace_observation_publication(
+            variant(events=(before, after, supported, finalized)), session_id=session_id
+        )
+    with pytest.raises(ValueError, match="omitted its evidence"):
+        _validate_workspace_observation_publication(
+            variant(intent={**request.intent, "after_observation_id": None}),
+            session_id=session_id,
+        )
+
+
+def test_interruption_during_unsupported_capture_finishes_its_one_write(tmp_path) -> None:
+    async def run():
+        async def collect(stream):
+            return [event async for event in stream]
+
+        store = _UnsupportedCaptureAcknowledgementStore(lose_acknowledgement=False)
+        app = _unsupported_capture_application(store, tmp_path)
+        session_id = "session-unsupported-capture-interrupted"
+        consumer = asyncio.create_task(
+            collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "create a file")],
+                    )
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(store.started.wait(), timeout=30)
+            interruption = asyncio.create_task(
+                collect(
+                    app.interrupt_session(
+                        InterruptSessionRequest(
+                            session_id=session_id, reason="operator interrupted capture"
+                        )
+                    )
+                )
+            )
+            for _ in range(100):
+                if consumer.cancelling():
+                    break
+                await asyncio.sleep(0)
+            cancelling = consumer.cancelling()
+        finally:
+            # The shielded write must always finish, or the run cannot stop.
+            store.release.set()
+        assert cancelling == 1
+        public, interrupted = await asyncio.gather(consumer, interruption)
+        durable = await store.query_events(EventQuery(session_id=session_id))
+        return (
+            store,
+            public,
+            interrupted,
+            [record.event for record in durable],
+            (await store.load_checkpoint(session_id)),
+        )
+
+    store, public_events, interruption_events, durable_events, checkpoint = asyncio.run(run())
+
+    # The shielded write completes; the interruption takes effect after it.
+    assert store.phases.count(UNSUPPORTED_CAPTURE_PHASE) == 1
+    assert _workspace_event_summary(durable_events) == _UNSUPPORTED_CAPTURE_EVENTS
+    terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED
+    )
+    assert terminal.payload["workspace_mutation_capture_status"] == "recorded"
+    assert any(event.type is EventType.TOOL_CALL_COMPLETED for event in public_events)
+    assert [event.type for event in interruption_events] == [EventType.SESSION_INTERRUPTED]
+    assert not workspace_observations_from_checkpoint(checkpoint)
 
 
 @pytest.mark.parametrize(

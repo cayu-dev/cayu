@@ -194,6 +194,7 @@ from cayu.workspaces.mutation_attribution import (
     begin_workspace_mutation_window,
 )
 from cayu.workspaces.observation_recovery import (
+    UNSUPPORTED_CAPTURE_PHASE,
     WorkspaceObservationEvidenceState,
     WorkspaceObservationLifecycle,
     WorkspaceObservationPhase,
@@ -1658,15 +1659,19 @@ class ToolInvocation:
                             ),
                         }
                     )
-                    (receipt_event,) = await publish_workspace_observation_transition(
-                        session_store=self._session_store,
-                        event_writer=self._event_writer,
-                        session=session,
-                        previous=capture.lifecycle,
-                        current=delta_published,
-                        phase="delta-publication",
-                        events=(capture.receipt_event,),
-                    )
+                    if capture.unsupported:
+                        # Published below, with the finalization.
+                        receipt_event = capture.receipt_event
+                    else:
+                        (receipt_event,) = await publish_workspace_observation_transition(
+                            session_store=self._session_store,
+                            event_writer=self._event_writer,
+                            session=session,
+                            previous=capture.lifecycle,
+                            current=delta_published,
+                            phase="delta-publication",
+                            events=(capture.receipt_event,),
+                        )
                     final_payload = dict(staged_event.payload)
                     final_payload.update(workspace_capture_payload)
                     finalized_stage = (
@@ -1695,20 +1700,37 @@ class ToolInvocation:
                         ),
                         redactor=snapshot.redactor,
                     )
-                    (finalized_event,) = await publish_workspace_observation_transition(
-                        session_store=self._session_store,
-                        event_writer=self._event_writer,
-                        session=session,
-                        previous=delta_published,
-                        current=None,
-                        phase="terminal",
-                        terminal_status=capture.terminal_status,
-                        terminal_detail_code=capture.terminal_detail_code,
-                        terminal_artifacts=terminal_lifecycle.artifacts,
-                        events=(finalized_event,),
-                    )
+                    if capture.unsupported:
+                        # One write from the staged outcome to finalized; see
+                        # UNSUPPORTED_CAPTURE_PHASE.
+                        workspace_events = await publish_workspace_observation_transition(
+                            session_store=self._session_store,
+                            event_writer=self._event_writer,
+                            session=session,
+                            previous=capture.lifecycle,
+                            current=None,
+                            phase=UNSUPPORTED_CAPTURE_PHASE,
+                            terminal_status=capture.terminal_status,
+                            terminal_detail_code=capture.terminal_detail_code,
+                            terminal_artifacts=terminal_lifecycle.artifacts,
+                            events=(*capture.events, receipt_event, finalized_event),
+                            evidence=delta_published,
+                        )
+                    else:
+                        (finalized_event,) = await publish_workspace_observation_transition(
+                            session_store=self._session_store,
+                            event_writer=self._event_writer,
+                            session=session,
+                            previous=delta_published,
+                            current=None,
+                            phase="terminal",
+                            terminal_status=capture.terminal_status,
+                            terminal_detail_code=capture.terminal_detail_code,
+                            terminal_artifacts=terminal_lifecycle.artifacts,
+                            events=(finalized_event,),
+                        )
+                        workspace_events = (*capture.events, receipt_event, finalized_event)
                     workspace_lifecycle = delta_published
-                    workspace_events = (*capture.events, receipt_event, finalized_event)
                     if uncertainty_error is not None:
                         raise uncertainty_error
                     return finalized_stage

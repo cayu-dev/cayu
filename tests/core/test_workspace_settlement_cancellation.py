@@ -27,6 +27,7 @@ from cayu.storage.sqlite import SQLiteSessionStore
 from cayu.workflows.base import WorkflowSpec
 from cayu.workflows.models import StepError
 from cayu.workflows.workflow import StepRunOptions, WorkflowBase, step
+from cayu.workspaces.observation_recovery import UNSUPPORTED_CAPTURE_PHASE
 
 
 class SettlementWorkflow(WorkflowBase):
@@ -91,7 +92,8 @@ def test_cancel_before_workspace_terminal(
             if (
                 cancel
                 and cancel_phase == "workspace_terminal"
-                and kwargs.get("phase") == "terminal"
+                # An unsupported binding's capture closes in one transition.
+                and kwargs.get("phase") in {"terminal", UNSUPPORTED_CAPTURE_PHASE}
                 and not paused
             ):
                 paused = True

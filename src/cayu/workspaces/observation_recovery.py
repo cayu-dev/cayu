@@ -384,6 +384,13 @@ class WorkspaceObservationTerminalStatus(StrEnum):
     FAILED = "failed"
 
 
+#: Publishes a capture whose before, after and delta evidence are all
+#: ``unsupported`` in one transition, from a staged tool outcome straight to
+#: finalized: both revision observations, the mutation receipt and the
+#: finalization event in one durable write instead of four. A worker lost before
+#: it left the lifecycle staged, which recovery closes as it always has.
+UNSUPPORTED_CAPTURE_PHASE = "unsupported-capture"
+
 WORKSPACE_OBSERVATION_TERMINAL_CONTROLS = frozenset(
     {
         (WorkspaceObservationTerminalStatus.COMPLETE.value, None),
@@ -1014,6 +1021,15 @@ def validate_workspace_observation_transition(
         if current.phase is not WorkspaceObservationPhase.INTENT:
             raise ValueError("Workspace observation intent has an invalid target phase.")
         return
+    if current is None and phase == UNSUPPORTED_CAPTURE_PHASE:
+        if (
+            previous.phase is not WorkspaceObservationPhase.TOOL_OUTCOME_STAGED
+            or previous.artifacts
+            or terminal_artifacts
+            or terminal_status is not WorkspaceObservationTerminalStatus.INCOMPLETE
+        ):
+            raise ValueError("An unsupported capture must close a staged outcome as incomplete.")
+        return
     if current is None:
         if phase != "terminal":
             raise ValueError("Only a terminal transition may remove workspace observation state.")
@@ -1478,8 +1494,14 @@ async def publish_workspace_observation_transition(
     terminal_artifacts: tuple[WorkspaceObservationArtifact, ...] | None = None,
     events: tuple[Event, ...] = (),
     intent_admission: _WorkspaceObservationIntentAdmission | None = None,
+    evidence: WorkspaceObservationLifecycle | None = None,
 ) -> tuple[Event, ...]:
-    """CAS one lifecycle transition and idempotently fan out its events."""
+    """CAS one lifecycle transition and idempotently fan out its events.
+
+    For ``UNSUPPORTED_CAPTURE_PHASE``, ``evidence`` is the lifecycle the capture
+    would have reached through its separate transitions (its delta published),
+    and the intent binds that lifecycle's evidence identities.
+    """
 
     if previous is None and current is None:
         raise ValueError("A workspace observation transition requires previous or current state.")
@@ -1501,6 +1523,19 @@ async def publish_workspace_observation_transition(
             raise ValueError("Workspace observation authority cannot change across a transition.")
         if previous.window_id != current.window_id:
             raise ValueError("Workspace observation transition changed its window id.")
+    if (evidence is None) != (phase != UNSUPPORTED_CAPTURE_PHASE):
+        raise ValueError("Only an unsupported capture binds its evidence lifecycle.")
+    if evidence is not None and (
+        type(evidence) is not WorkspaceObservationLifecycle
+        or previous is None
+        or evidence.phase is not WorkspaceObservationPhase.DELTA_PUBLISHED
+        or evidence.authority_tuple() != previous.authority_tuple()
+        or evidence.window_id != previous.window_id
+        or evidence.tool_outcome_event_id != previous.tool_outcome_event_id
+        or evidence.tool_outcome_event_digest != previous.tool_outcome_event_digest
+        or evidence.artifacts
+    ):
+        raise ValueError("Unsupported capture evidence conflicts with its staged outcome.")
     if terminal_status is None and current is None:
         raise ValueError("Removing active workspace observation state requires terminal status.")
     if terminal_status is not None and current is not None:
@@ -1540,6 +1575,7 @@ async def publish_workspace_observation_transition(
     )
 
     prepared_events = tuple(event_writer.prepare(event) for event in events)
+    bound = owner if evidence is None else evidence
     intent: dict[str, Any] = {
         "schema_version": WORKSPACE_OBSERVATION_SCHEMA_VERSION,
         "window_id": owner.window_id,
@@ -1558,12 +1594,12 @@ async def publish_workspace_observation_transition(
         "model_attempt_id": owner.model_attempt_id,
         "tool_round_id": owner.tool_round_id,
         "model_step": owner.model_step,
-        "before_observation_id": owner.before_observation_id,
+        "before_observation_id": bound.before_observation_id,
         "tool_outcome_event_id": owner.tool_outcome_event_id,
         "tool_outcome_event_digest": owner.tool_outcome_event_digest,
-        "after_observation_id": owner.after_observation_id,
-        "mutation_event_id": owner.mutation_event_id,
-        "mutation_event_digest": owner.mutation_event_digest,
+        "after_observation_id": bound.after_observation_id,
+        "mutation_event_id": bound.mutation_event_id,
+        "mutation_event_digest": bound.mutation_event_digest,
         "artifacts": [artifact.model_dump(mode="json") for artifact in publication_artifacts],
         "terminal_status": None if terminal_status is None else terminal_status.value,
         "terminal_detail_code": terminal_detail_code,

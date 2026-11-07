@@ -24,6 +24,7 @@ def _validate_workspace_observation_publication(
     if request.kind != "workspace-observation":
         return
     from cayu.workspaces.observation_recovery import (
+        UNSUPPORTED_CAPTURE_PHASE,
         WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
         WorkspaceObservationArtifact,
         WorkspaceObservationArtifactState,
@@ -148,6 +149,7 @@ def _validate_workspace_observation_publication(
         "delta-publication",
         "terminal",
         "recovered-tool-outcome",
+        UNSUPPORTED_CAPTURE_PHASE,
     }
     artifact_phases = {
         f"artifact-{evidence_kind}-{artifact_state}"
@@ -166,11 +168,14 @@ def _validate_workspace_observation_publication(
         {(None, None)} | WORKSPACE_OBSERVATION_TERMINAL_CONTROLS
     ):
         raise ValueError("Workspace-observation terminal classification is invalid.")
-    if (phase == "terminal") != (terminal_status is not None):
+    # An unsupported capture also closes its lifecycle, with the finalization
+    # event its separate terminal transition would have carried.
+    terminal_phase = phase in {"terminal", UNSUPPORTED_CAPTURE_PHASE}
+    if terminal_phase != (terminal_status is not None):
         raise ValueError(
             "Workspace-observation terminal status conflicts with its publication phase."
         )
-    if phase != "terminal" and terminal_detail is not None:
+    if not terminal_phase and terminal_detail is not None:
         raise ValueError(
             "Workspace-observation terminal detail conflicts with its publication phase."
         )
@@ -260,11 +265,11 @@ def _validate_workspace_observation_publication(
                 if terminal_status is None
                 else WorkspaceObservationTerminalStatus(terminal_status)
             ),
-            terminal_artifacts=(intent_artifacts if phase == "terminal" else None),
+            terminal_artifacts=(intent_artifacts if terminal_phase else None),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("Workspace-observation lifecycle transition is invalid.") from exc
-    if phase == "terminal":
+    if terminal_phase:
         if current_record is not None or previous_record is None:
             raise ValueError(
                 "Workspace-observation terminal publication retained its active lifecycle."
@@ -292,6 +297,14 @@ def _validate_workspace_observation_publication(
             raise ValueError(
                 "Workspace-observation terminal lifecycle conflicts with its authority."
             )
+        # An unsupported capture's evidence identities exist only in its own
+        # events: its staged lifecycle has none yet.
+        evidence_fields = (
+            "before_observation_id",
+            "after_observation_id",
+            "mutation_event_id",
+            "mutation_event_digest",
+        )
         for field_name in (
             "before_observation_id",
             "tool_outcome_event_id",
@@ -300,11 +313,20 @@ def _validate_workspace_observation_publication(
             "mutation_event_id",
             "mutation_event_digest",
         ):
-            if getattr(previous_record, field_name) != intent[field_name]:
+            expected = (
+                None
+                if phase == UNSUPPORTED_CAPTURE_PHASE and field_name in evidence_fields
+                else intent[field_name]
+            )
+            if getattr(previous_record, field_name) != expected:
                 raise ValueError(
                     "Workspace-observation terminal lifecycle conflicts with its "
                     "content-bound intent."
                 )
+        if phase == UNSUPPORTED_CAPTURE_PHASE and any(
+            intent[field_name] is None for field_name in evidence_fields
+        ):
+            raise ValueError("Workspace-observation unsupported capture omitted its evidence.")
     else:
         if workspace_operation.action != "set" or current_record is None:
             raise ValueError("Workspace-observation publication omitted its active lifecycle.")
@@ -375,23 +397,43 @@ def _validate_workspace_observation_publication(
         EventType.WORKSPACE_MUTATION_RECORDED,
         EventType.WORKSPACE_OBSERVATION_FINALIZED,
     }
-    expected_event_type = {
+    event_types = {
         "before-evidence": EventType.WORKSPACE_REVISION_OBSERVED,
         "after-capture": EventType.WORKSPACE_REVISION_OBSERVED,
         "delta-publication": EventType.WORKSPACE_MUTATION_RECORDED,
         "terminal": EventType.WORKSPACE_OBSERVATION_FINALIZED,
-    }.get(phase)
-    if expected_event_type is None and request.events:
+    }
+    # Each event is checked as the phase that publishes it on its own.
+    event_phases = (
+        ("before-evidence", "after-capture", "delta-publication", "terminal")
+        if phase == UNSUPPORTED_CAPTURE_PHASE
+        else (phase,)
+        if phase in event_types
+        else ()
+    )
+    if not event_phases and request.events:
         raise ValueError("Workspace-observation publication phase cannot append lifecycle events.")
-    if expected_event_type is not None and (
-        len(request.events) != 1 or request.events[0].type is not expected_event_type
+    if event_phases and (
+        len(request.events) != len(event_phases)
+        or any(
+            event.type is not event_types[event_phase]
+            for event, event_phase in zip(request.events, event_phases, strict=True)
+        )
     ):
         raise ValueError("Workspace-observation publication event conflicts with its phase.")
-    expected_observation_phase = {
-        "before-evidence": "before",
-        "after-capture": "after",
-    }.get(phase)
-    for event in request.events:
+    for event, event_phase in zip(request.events, event_phases, strict=True):
+        expected_observation_phase = {
+            "before-evidence": "before",
+            "after-capture": "after",
+        }.get(event_phase)
+        if (
+            phase == UNSUPPORTED_CAPTURE_PHASE
+            and event_phase != "terminal"
+            and event.payload.get("status") != "unsupported"
+        ):
+            raise ValueError(
+                "Workspace-observation unsupported capture published supported evidence."
+            )
         if event.session_id != session_id or event.type not in allowed_events:
             raise ValueError("Workspace-observation publication contains an invalid event.")
         if (
@@ -437,12 +479,12 @@ def _validate_workspace_observation_publication(
             "before-evidence": intent["before_observation_id"],
             "after-capture": intent["after_observation_id"],
             "delta-publication": intent["mutation_event_id"],
-        }.get(phase)
+        }.get(event_phase)
         if expected_event_id is not None and event.id != expected_event_id:
             raise ValueError(
                 "Workspace-observation event conflicts with its lifecycle event identity."
             )
-        if phase == "delta-publication" and (
+        if event_phase == "delta-publication" and (
             workspace_observation_event_digest(event) != intent["mutation_event_digest"]
         ):
             raise ValueError(
@@ -452,7 +494,7 @@ def _validate_workspace_observation_publication(
             "before-evidence": "revision-before",
             "after-capture": "revision-after",
             "delta-publication": "revision-delta",
-        }.get(phase)
+        }.get(event_phase)
         if evidence_kind is not None:
             referenced_artifacts = tuple(
                 artifact
@@ -485,7 +527,7 @@ def _validate_workspace_observation_publication(
                 "tool_outcome_event_id",
                 "tool_outcome_event_digest",
             )
-            if phase == "delta-publication"
+            if event_phase == "delta-publication"
             else (
                 "before_observation_id",
                 "after_observation_id",
@@ -494,20 +536,20 @@ def _validate_workspace_observation_publication(
                 "mutation_event_id",
                 "mutation_event_digest",
             )
-            if phase == "terminal"
+            if event_phase == "terminal"
             else ()
         )
         for field_name in linked_fields:
             if event.payload.get(field_name) != intent[field_name]:
                 raise ValueError(f"Workspace-observation event conflicts with intent.{field_name}.")
-        if phase == "terminal" and (
+        if event_phase == "terminal" and (
             event.payload.get("status") != terminal_status
             or event.payload.get("detail_code") != terminal_detail
         ):
             raise ValueError(
                 "Workspace-observation terminal event conflicts with its final status."
             )
-        if phase == "terminal":
+        if event_phase == "terminal":
             expected_artifact_fields: dict[str, Any] = {}
             for artifact in intent_artifacts:
                 prefix = artifact.evidence_kind.replace("-", "_")

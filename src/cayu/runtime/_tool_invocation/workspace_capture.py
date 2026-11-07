@@ -157,6 +157,9 @@ class _WorkspaceCaptureResult:
     receipt_event: Event
     terminal_status: WorkspaceObservationTerminalStatus
     terminal_detail_code: str | None
+    # Nothing of the capture is published yet: its revision events, receipt
+    # and finalization go out in one unsupported-capture transition.
+    unsupported: bool = False
 
 
 _WORKSPACE_RECEIPT_INLINE_PATH_LIMIT = 32
@@ -576,16 +579,30 @@ async def _record_workspace_mutation_after(
             "before_observation_id": before_event.id,
         }
     )
-    (before_event,) = await publish_workspace_observation_transition(
-        session_store=session_store,
-        event_writer=event_writer,
-        session=session,
-        previous=active_lifecycle,
-        current=before_published,
-        phase="before-evidence",
-        events=(before_event,),
+    staged_lifecycle = active_lifecycle
+
+    async def publish_before_evidence() -> None:
+        nonlocal active_lifecycle, before_event
+        (before_event,) = await publish_workspace_observation_transition(
+            session_store=session_store,
+            event_writer=event_writer,
+            session=session,
+            previous=active_lifecycle,
+            current=before_published,
+            phase="before-evidence",
+            events=(before_event,),
+        )
+        active_lifecycle = before_published
+
+    # A binding that can only report unsupported has no evidence to lose in a
+    # crash, so the before evidence waits for the after observation: when that
+    # is unsupported too, the whole capture is published in one transition.
+    unsupported_before = (
+        _unsupported_evidence(before_observation, before_projection)
+        and not active_lifecycle.artifacts
     )
-    active_lifecycle = before_published
+    if not unsupported_before:
+        await publish_before_evidence()
     try:
         after_observation = await _observe_workspace_revision(
             registered_environment,
@@ -602,6 +619,14 @@ async def _record_workspace_mutation_after(
     ):
         attribution_window.close(discard_history=not evidence_available)
         raise RuntimeError("Workspace capture after evidence conflicts with its authority.")
+    if unsupported_before and (
+        after_observation.status is not WorkspaceRevisionObservationStatus.UNSUPPORTED
+        or after_observation.paths
+    ):
+        # The after evidence may need a manifest artifact, which can only follow
+        # durable before evidence: publish it now, as the separate flow did.
+        await publish_before_evidence()
+        unsupported_before = False
     try:
         try:
             delta = compare_workspace_revisions(before_observation, after_observation)
@@ -704,10 +729,19 @@ async def _record_workspace_mutation_after(
             else WorkspaceObservationEvidenceState.PUBLISHED
         )
     )
+    unsupported = (
+        unsupported_before
+        and _unsupported_evidence(after_observation, after_projection)
+        and delta.status is WorkspaceRevisionDeltaStatus.UNSUPPORTED
+        and not delta.paths
+        and not active_lifecycle.artifacts
+    )
+    if unsupported_before and not unsupported:
+        await publish_before_evidence()
     after_captured = WorkspaceObservationLifecycle.model_validate(
         {
             **lifecycle_with_referenced_artifact(
-                active_lifecycle,
+                before_published if unsupported else active_lifecycle,
                 after_projection,
             ).model_dump(mode="json"),
             "phase": WorkspaceObservationPhase.AFTER_CAPTURED.value,
@@ -715,15 +749,18 @@ async def _record_workspace_mutation_after(
             "after_observation_id": after_event.id,
         }
     )
-    (after_event,) = await publish_workspace_observation_transition(
-        session_store=session_store,
-        event_writer=event_writer,
-        session=session,
-        previous=active_lifecycle,
-        current=after_captured,
-        phase="after-capture",
-        events=(after_event,),
-    )
+    if not unsupported:
+        (after_event,) = await publish_workspace_observation_transition(
+            session_store=session_store,
+            event_writer=event_writer,
+            session=session,
+            previous=active_lifecycle,
+            current=after_captured,
+            phase="after-capture",
+            events=(after_event,),
+        )
+    # An unsupported capture is published with its receipt and finalization by
+    # the caller.
     active_lifecycle = after_captured
     delta_projection = await _workspace_evidence_projection(
         paths=[path.model_dump(mode="json") for path in delta.paths],
@@ -789,8 +826,15 @@ async def _record_workspace_mutation_after(
     if projection_changed_evidence:
         terminal_status = WorkspaceObservationTerminalStatus.INCOMPLETE
         terminal_detail_code = "workspace_revision_evidence_incomplete"
+    if unsupported and (
+        delta_projection.manifest_artifact_id is not None
+        or projection_changed_evidence
+        or active_lifecycle.artifacts
+    ):  # pragma: no cover - unsupported evidence has no paths to project
+        raise RuntimeError("Unsupported workspace evidence changed during projection.")
     return _WorkspaceCaptureResult(
-        lifecycle=active_lifecycle,
+        # An unsupported capture's durable lifecycle is still the staged one.
+        lifecycle=staged_lifecycle if unsupported else active_lifecycle,
         delta_lifecycle=lifecycle_with_referenced_artifact(
             active_lifecycle,
             delta_projection,
@@ -799,6 +843,20 @@ async def _record_workspace_mutation_after(
         receipt_event=receipt_event,
         terminal_status=terminal_status,
         terminal_detail_code=terminal_detail_code,
+        unsupported=unsupported,
+    )
+
+
+def _unsupported_evidence(
+    observation: WorkspaceRevisionObservation,
+    projection: _WorkspaceEvidenceProjection,
+) -> bool:
+    return (
+        observation.status is WorkspaceRevisionObservationStatus.UNSUPPORTED
+        and not observation.paths
+        and projection.evidence_available
+        and projection.status == observation.status.value
+        and projection.manifest_artifact_id is None
     )
 
 
