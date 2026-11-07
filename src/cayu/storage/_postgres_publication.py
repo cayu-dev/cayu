@@ -17,6 +17,7 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _checkpoint_unchanged,
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
@@ -236,7 +237,7 @@ async def publish_runtime(
     connect: PostgresConnection,
     ensure_ready: Callable[[], Awaitable[None]],
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
-    checkpoint_row_values: Callable[[str, dict[str, Any], datetime], tuple[object, ...]],
+    checkpoint_row_values: Callable[..., tuple[object, ...]],
     unique_violation: type[Exception],
 ) -> RuntimePublicationResult:
     from cayu.sessions.pending_actions import (
@@ -605,12 +606,15 @@ async def publish_runtime(
                     )
                     stored_target_checkpoint = checkpoint
                 else:
-                    checkpoint = checkpoint_codec.apply_mutation(
+                    # The codec reuses this transaction's one decoded checkpoint
+                    # and returns a fresh validated target the row writer need
+                    # not copy.
+                    stored_target_checkpoint = checkpoint_codec.stored_target(
                         loaded,
                         stored_checkpoint,
+                        current_checkpoint,
                         request.mutation,
                     )
-                    stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
                 # A tool result is stored once, in its tool event. Its row
                 # records the size of the full message it stands for.
@@ -671,6 +675,7 @@ async def publish_runtime(
                         session_id,
                         stored_target_checkpoint,
                         published_at,
+                        owned=checkpoint_codec is not None,
                     )
                 )
                 receipt = _build_runtime_publication_receipt(
@@ -907,7 +912,7 @@ async def publish_checkpoint_events(
     first_existing_event_id: Callable[[Any, str, list[str]], Awaitable[str | None]],
     publish_budget_identities: Callable[[Any, list[Event]], Awaitable[None]],
     record_terminal_receipts: TerminalReceiptRecorder,
-    upsert_checkpoint: Callable[[Any, str, dict[str, Any], datetime], Awaitable[None]],
+    upsert_checkpoint: Callable[..., Awaitable[None]],
     validate_compaction: Callable[[Any, str, int], Awaitable[None]],
 ) -> Session:
     from cayu.sessions.pending_actions import pending_action_event_storage_values
@@ -1030,13 +1035,9 @@ async def publish_checkpoint_events(
                         raise TypeError(
                             "Session operation transform must return a SessionOperationPublication."
                         )
-                    transformed = copy_durable_json_object(
-                        publication.checkpoint,
-                        "checkpoint",
-                    )
                     transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
                         current_checkpoint,
-                        transformed,
+                        publication.checkpoint,
                         session_id=session_id,
                     )
                     operation_records = copy_durable_json_object(
@@ -1125,7 +1126,12 @@ async def publish_checkpoint_events(
                 order_row = await cur.fetchone()
                 if order_row is None:
                     raise KeyError(f"Session not found: {session_id}")
-                await upsert_checkpoint(cur, session_id, transformed, updated_at)
+                # An unchanged checkpoint keeps its row: its derived columns are
+                # already those of the same state, and the session row locked
+                # above, not this row, fences the publication.
+                if not _checkpoint_unchanged(current_checkpoint, transformed):
+                    # Preservation returned a fresh validated copy.
+                    await upsert_checkpoint(cur, session_id, transformed, updated_at, owned=True)
                 if operation_records:
                     await cur.executemany(
                         """

@@ -166,6 +166,7 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _checkpoint_unchanged,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
@@ -7716,7 +7717,11 @@ class PostgresSessionStore(
                             )
                         )
                         await _touch_session_activity(cur, session_id, updated_at)
-                        await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
+                        if not _checkpoint_unchanged(current, transformed):
+                            # Preservation returned a fresh validated copy.
+                            await self._upsert_checkpoint(
+                                cur, session_id, transformed, updated_at, owned=True
+                            )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -7760,7 +7765,11 @@ class PostgresSessionStore(
                             )
                         )
                         await _touch_session_activity(cur, session_id, now)
-                        await self._upsert_checkpoint(cur, session_id, transformed, now)
+                        if not _checkpoint_unchanged(current, transformed):
+                            # Preservation returned a fresh validated copy.
+                            await self._upsert_checkpoint(
+                                cur, session_id, transformed, now, owned=True
+                            )
                 await conn.commit()
             except BaseException:
                 await conn.rollback()
@@ -7946,6 +7955,8 @@ class PostgresSessionStore(
         session_id: str,
         checkpoint: dict[str, Any],
         updated_at: datetime,
+        *,
+        owned: bool = False,
     ) -> None:
         await cur.execute(
             """
@@ -7965,7 +7976,7 @@ class PostgresSessionStore(
                 pending_action_flags = EXCLUDED.pending_action_flags,
                 pending_action_metrics_ready = EXCLUDED.pending_action_metrics_ready
             """,
-            _checkpoint_row_values(session_id, checkpoint, updated_at),
+            _checkpoint_row_values(session_id, checkpoint, updated_at, owned=owned),
         )
 
     async def _first_existing_event_id(
@@ -7990,10 +8001,20 @@ def _checkpoint_row_values(
     session_id: str,
     checkpoint: dict[str, Any],
     updated_at: datetime,
+    *,
+    owned: bool = False,
 ) -> tuple[object, ...]:
+    """Serialize one checkpoint row.
+
+    ``owned`` is only for a checkpoint the calling statement just produced with
+    ``copy_durable_json_object`` and has not shared, so copying it again would
+    repeat the same validation on the same private object.
+    """
+
     from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
 
-    checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+    if not owned:
+        checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,

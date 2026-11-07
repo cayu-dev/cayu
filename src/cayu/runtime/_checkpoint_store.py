@@ -878,6 +878,7 @@ class _RuntimeCheckpointSessionStore:
             decode=checkpoint_publication._decode_publication_checkpoint,
             encode=checkpoint_publication._encode_publication_checkpoint,
             apply_mutation=checkpoint_publication._apply_publication_checkpoint_mutation,
+            encode_mutation=checkpoint_publication._encode_publication_checkpoint_mutation,
         ):
             return await self._store.publish_runtime_publication(
                 session_id,
@@ -924,6 +925,7 @@ class _RuntimeCheckpointSessionStore:
             decode=checkpoint_publication._decode_publication_checkpoint,
             encode=checkpoint_publication._encode_publication_checkpoint,
             apply_mutation=checkpoint_publication._apply_publication_checkpoint_mutation,
+            encode_mutation=checkpoint_publication._encode_publication_checkpoint_mutation,
         ):
             return await self._store.promote_model_completion_stage(
                 session_id,

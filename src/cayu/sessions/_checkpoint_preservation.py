@@ -427,6 +427,25 @@ def _copy_checkpoint_for_transform(
     return thaw_json_value(copied) if decoded else copied
 
 
+def _checkpoint_unchanged(
+    current: dict[str, Any] | None,
+    replacement: dict[str, Any],
+) -> bool:
+    """Whether a validated replacement is exactly the validated stored checkpoint.
+
+    Both sides must already have passed durable copying. Python equality alone
+    conflates booleans and numbers, so a match is confirmed type-exactly.
+    """
+
+    from cayu.sessions.authority import _validated_runtime_publication_json_equal
+
+    return (
+        current is not None
+        and current == replacement
+        and _validated_runtime_publication_json_equal(current, replacement)
+    )
+
+
 def _checkpoint_transform_result_preserving_completion_result_event_publications(
     current: dict[str, Any] | None,
     transformed: dict[str, Any],

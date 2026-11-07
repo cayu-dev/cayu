@@ -16,6 +16,7 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _checkpoint_unchanged,
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
 )
@@ -560,12 +561,14 @@ async def publish_runtime(
                 )
                 stored_target_checkpoint = checkpoint
             else:
-                checkpoint = checkpoint_codec.apply_mutation(
+                # The codec reuses this transaction's one decoded checkpoint and
+                # returns a fresh validated target the row writer need not copy.
+                stored_target_checkpoint = checkpoint_codec.stored_target(
                     loaded,
                     stored_checkpoint,
+                    current_checkpoint,
                     request.mutation,
                 )
-                stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
             transcript_rows = [
                 sqlite_records.transcript_row(
@@ -621,6 +624,7 @@ async def publish_runtime(
                     session_id,
                     stored_target_checkpoint,
                     published_at,
+                    owned=checkpoint_codec is not None,
                 )
             )
             receipt = _build_runtime_publication_receipt(
@@ -910,14 +914,10 @@ async def publish_checkpoint_events(
                     raise TypeError(
                         "Session operation transform must return a SessionOperationPublication."
                     )
-                transformed = copy_durable_json_object(
-                    publication.checkpoint,
-                    "checkpoint",
-                )
                 transformed = (
                     _checkpoint_transform_result_preserving_completion_result_event_publications(
                         current_checkpoint,
-                        transformed,
+                        publication.checkpoint,
                         session_id=session_id,
                     )
                 )
@@ -1014,26 +1014,33 @@ async def publish_checkpoint_events(
                     )
                 )
             publish_budget_identities(connection, copied_events)
-            connection.execute(
-                """
-                    INSERT INTO cayu_checkpoints (
-                        session_id, state_json, updated_at,
-                        pending_action_source_bytes,
-                        pending_action_tool_call_count,
-                        pending_action_flags,
-                        pending_action_metrics_ready
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                        state_json = excluded.state_json,
-                        updated_at = excluded.updated_at,
-                        pending_action_source_bytes = excluded.pending_action_source_bytes,
-                        pending_action_tool_call_count = excluded.pending_action_tool_call_count,
-                        pending_action_flags = excluded.pending_action_flags,
-                        pending_action_metrics_ready = excluded.pending_action_metrics_ready
-                    """,
-                sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
-            )
+            # An unchanged checkpoint keeps its row: its derived columns are
+            # already those of the same state, and the locked session row, not
+            # this row, fences the publication.
+            if not _checkpoint_unchanged(current_checkpoint, transformed):
+                connection.execute(
+                    """
+                        INSERT INTO cayu_checkpoints (
+                            session_id, state_json, updated_at,
+                            pending_action_source_bytes,
+                            pending_action_tool_call_count,
+                            pending_action_flags,
+                            pending_action_metrics_ready
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at,
+                            pending_action_source_bytes = excluded.pending_action_source_bytes,
+                            pending_action_tool_call_count = excluded.pending_action_tool_call_count,
+                            pending_action_flags = excluded.pending_action_flags,
+                            pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                        """,
+                    # Preservation returned a fresh validated copy.
+                    sqlite_records.checkpoint_row_values(
+                        session_id, transformed, updated_at, owned=True
+                    ),
+                )
             if operation_records:
                 connection.executemany(
                     """

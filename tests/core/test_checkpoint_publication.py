@@ -12,6 +12,7 @@ import pytest
 from tests._session_provenance import session_fixture
 
 import cayu
+from cayu._validation import DurableValueError
 from cayu.messages import Message
 from cayu.sessions import _checkpoint_publication as publication
 from cayu.sessions._checkpoint_mutations import RuntimePublicationCheckpointOperation as Operation
@@ -249,3 +250,102 @@ def test_mutation_output_is_validated_before_return(session):
     with pytest.raises(CheckpointCompatibilityError):
         publication._apply_publication_checkpoint_mutation(session, checkpoint, mutation)
     assert checkpoint == {VERSION: CURRENT, "ordinary": [1]}
+
+
+def _outcome(call):
+    try:
+        return "ok", call()
+    except Exception as error:
+        return "error", type(error)
+
+
+def _one_decode_target(session, checkpoint, mutation):
+    decoded = publication._decode_publication_checkpoint(session, deepcopy(checkpoint))
+    return publication._encode_publication_checkpoint_mutation(
+        session, checkpoint, decoded, mutation
+    )
+
+
+@pytest.mark.parametrize("root", ["absent", "versionless", "current"])
+@pytest.mark.parametrize("writer_version", range(1, CURRENT + 1))
+@pytest.mark.parametrize("fenced", [False, True])
+def test_one_decode_target_matches_decode_apply_encode(session, root, writer_version, fenced):
+    checkpoint = {
+        "absent": None,
+        "versionless": {"ordinary": ["before"]},
+        "current": {VERSION: CURRENT, "ordinary": ["before"]},
+    }[root]
+    mutation = Mutation(
+        operations=(
+            _set(VERSION, writer_version, digest(writer_version) if fenced else None),
+            _set("ordinary", ["after"], digest(["before"]) if fenced else None),
+        )
+    )
+    before = deepcopy(checkpoint)
+    expected = _outcome(
+        lambda: publication._encode_publication_checkpoint(
+            session,
+            publication._apply_publication_checkpoint_mutation(session, checkpoint, mutation),
+        )
+    )
+    assert _outcome(lambda: _one_decode_target(session, checkpoint, mutation)) == expected
+    assert checkpoint == before
+
+
+def test_one_decode_target_is_detached_and_validated_once(session, monkeypatch):
+    import cayu.sessions.checkpoints as checkpoints
+
+    value = {"nested": ["after"]}
+    mutation = Mutation(operations=(_set(VERSION, CURRENT, digest(CURRENT)), _set("new", value)))
+    decoded = publication._decode_publication_checkpoint(session, {VERSION: CURRENT, "kept": [1]})
+    decodes = []
+    decode = checkpoints.CheckpointMigrator.decode
+
+    def counted(self, checkpoint, *, session_id):
+        decodes.append(checkpoint)
+        return decode(self, checkpoint, session_id=session_id)
+
+    monkeypatch.setattr(checkpoints.CheckpointMigrator, "decode", counted)
+    result = publication._encode_publication_checkpoint_mutation(
+        session, {VERSION: CURRENT, "kept": [1]}, decoded, mutation
+    )
+    assert result == {VERSION: CURRENT, "kept": [1], "new": {"nested": ["after"]}}
+    assert len(decodes) == 1
+    result["new"]["nested"].append("changed")
+    result["kept"].append("changed")
+    assert value == {"nested": ["after"]}
+    assert decoded["kept"] == [1]
+
+
+def test_one_decode_target_rejects_an_invalid_or_oversized_document(session):
+    stored = {VERSION: CURRENT, "ordinary": [1]}
+    invalid = Mutation(operations=(_set(VERSION, True, digest(CURRENT)),))
+    with pytest.raises(CheckpointCompatibilityError):
+        _one_decode_target(session, stored, invalid)
+    # Each part is under the document's node ceiling; together they are over it.
+    half = [0] * 130_000
+    oversized = Mutation(operations=(_set(VERSION, CURRENT, digest(CURRENT)), _set("b", half)))
+    with pytest.raises(DurableValueError):
+        _one_decode_target(session, {VERSION: CURRENT, "a": half}, oversized)
+    conflict = Mutation(operations=(_set("ordinary", [2], digest([0])),))
+    with pytest.raises(SessionRuntimePublicationConflict):
+        _one_decode_target(session, stored, conflict)
+
+
+def test_codec_without_one_decode_target_still_validates_its_result(session):
+    codec = publication._RuntimePublicationCheckpointCodec(
+        decode=lambda _session, checkpoint: checkpoint,
+        encode=lambda _session, checkpoint: {**checkpoint, "invalid": object()},
+        apply_mutation=lambda _session, checkpoint, _mutation: checkpoint,
+    )
+    with pytest.raises(DurableValueError):
+        codec.stored_target(session, {VERSION: CURRENT}, {VERSION: CURRENT}, Mutation())
+    retained = {VERSION: CURRENT, "kept": [1]}
+    codec = publication._RuntimePublicationCheckpointCodec(
+        decode=lambda _session, checkpoint: checkpoint,
+        encode=lambda _session, checkpoint: checkpoint,
+        apply_mutation=lambda _session, checkpoint, _mutation: checkpoint,
+    )
+    result = codec.stored_target(session, retained, retained, Mutation())
+    result["kept"].append("changed")
+    assert retained == {VERSION: CURRENT, "kept": [1]}

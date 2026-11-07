@@ -150,11 +150,25 @@ def _apply_runtime_publication_checkpoint_mutation(
     mutation: RuntimePublicationMutation,
     checkpoint: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    from cayu.collaboration._session_export_store import ROOT_KEY
-
     if checkpoint is None and not mutation.operations:
         return None
     updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    _apply_runtime_publication_checkpoint_operations(mutation, updated)
+    return updated
+
+
+def _apply_runtime_publication_checkpoint_operations(
+    mutation: RuntimePublicationMutation,
+    updated: dict[str, Any],
+) -> None:
+    """Apply fenced operations in place to a checkpoint the caller privately owns.
+
+    On a conflict the object is left partly changed, so the caller must discard
+    it. Each value is copied in; the whole result still needs one document check.
+    """
+
+    from cayu.collaboration._session_export_store import ROOT_KEY
+
     for operation in mutation.operations:
         if operation.key == ROOT_KEY:
             raise ValueError("Session export authority requires its publication owner.")
@@ -180,7 +194,6 @@ def _apply_runtime_publication_checkpoint_mutation(
             )
         else:
             del updated[operation.key]
-    return updated
 
 
 def apply_runtime_publication_checkpoint_mutation(

@@ -141,6 +141,7 @@ from cayu.sessions._checkpoint_mutations import (
 )
 from cayu.sessions._checkpoint_preservation import (
     _checkpoint_transform_result_preserving_completion_result_event_publications,
+    _checkpoint_unchanged,
     _completion_result_event_publication_delete_block_reason,
     _copy_checkpoint_for_transform,
     _replace_checkpoint_preserving_completion_result_event_publications,
@@ -8500,29 +8501,31 @@ class SQLiteSessionStore(
                         )
                     )
                     _touch_session_activity(connection, session_id, updated_at)
-                    connection.execute(
-                        """
-                        INSERT INTO cayu_checkpoints (
-                            session_id, state_json, updated_at,
-                            pending_action_source_bytes,
-                            pending_action_tool_call_count,
-                            pending_action_flags,
-                            pending_action_metrics_ready
+                    if not _checkpoint_unchanged(current, transformed):
+                        connection.execute(
+                            """
+                            INSERT INTO cayu_checkpoints (
+                                session_id, state_json, updated_at,
+                                pending_action_source_bytes,
+                                pending_action_tool_call_count,
+                                pending_action_flags,
+                                pending_action_metrics_ready
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(session_id) DO UPDATE SET
+                                state_json = excluded.state_json,
+                                updated_at = excluded.updated_at,
+                                pending_action_source_bytes = excluded.pending_action_source_bytes,
+                                pending_action_tool_call_count =
+                                    excluded.pending_action_tool_call_count,
+                                pending_action_flags = excluded.pending_action_flags,
+                                pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                            """,
+                            # The preservation step returns a fresh validated copy.
+                            sqlite_records.checkpoint_row_values(
+                                session_id, transformed, updated_at, owned=True
+                            ),
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(session_id) DO UPDATE SET
-                            state_json = excluded.state_json,
-                            updated_at = excluded.updated_at,
-                            pending_action_source_bytes = excluded.pending_action_source_bytes,
-                            pending_action_tool_call_count = excluded.pending_action_tool_call_count,
-                            pending_action_flags = excluded.pending_action_flags,
-                            pending_action_metrics_ready = excluded.pending_action_metrics_ready
-                        """,
-                        # The preservation step returns a fresh validated copy.
-                        sqlite_records.checkpoint_row_values(
-                            session_id, transformed, updated_at, owned=True
-                        ),
-                    )
                 connection.commit()
             except BaseException as primary:
                 transaction_failure = sqlite_connection._settle_failed_transaction(
@@ -8569,29 +8572,31 @@ class SQLiteSessionStore(
                         )
                     )
                     _touch_session_activity(connection, session_id, now)
-                    connection.execute(
-                        """
-                        INSERT INTO cayu_checkpoints (
-                            session_id, state_json, updated_at,
-                            pending_action_source_bytes,
-                            pending_action_tool_call_count,
-                            pending_action_flags,
-                            pending_action_metrics_ready
+                    if not _checkpoint_unchanged(current, transformed):
+                        connection.execute(
+                            """
+                            INSERT INTO cayu_checkpoints (
+                                session_id, state_json, updated_at,
+                                pending_action_source_bytes,
+                                pending_action_tool_call_count,
+                                pending_action_flags,
+                                pending_action_metrics_ready
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(session_id) DO UPDATE SET
+                                state_json = excluded.state_json,
+                                updated_at = excluded.updated_at,
+                                pending_action_source_bytes = excluded.pending_action_source_bytes,
+                                pending_action_tool_call_count =
+                                    excluded.pending_action_tool_call_count,
+                                pending_action_flags = excluded.pending_action_flags,
+                                pending_action_metrics_ready = excluded.pending_action_metrics_ready
+                            """,
+                            # The preservation step returns a fresh validated copy.
+                            sqlite_records.checkpoint_row_values(
+                                session_id, transformed, now, owned=True
+                            ),
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(session_id) DO UPDATE SET
-                            state_json = excluded.state_json,
-                            updated_at = excluded.updated_at,
-                            pending_action_source_bytes = excluded.pending_action_source_bytes,
-                            pending_action_tool_call_count = excluded.pending_action_tool_call_count,
-                            pending_action_flags = excluded.pending_action_flags,
-                            pending_action_metrics_ready = excluded.pending_action_metrics_ready
-                        """,
-                        # The preservation step returns a fresh validated copy.
-                        sqlite_records.checkpoint_row_values(
-                            session_id, transformed, now, owned=True
-                        ),
-                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()

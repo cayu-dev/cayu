@@ -6527,12 +6527,12 @@ class InMemorySessionStore(
             )
             stored_target_checkpoint = checkpoint
         else:
-            checkpoint = checkpoint_codec.apply_mutation(
+            stored_target_checkpoint = checkpoint_codec.stored_target(
                 session,
                 deepcopy(stored_checkpoint),
+                current_checkpoint,
                 request.mutation,
             )
-            stored_target_checkpoint = checkpoint_codec.encode(session, checkpoint)
         if prepared.storage_key in operation_records:
             raise SessionRuntimePublicationConflict(
                 "Runtime publication receipt appeared while the session lock was held."
