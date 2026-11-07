@@ -472,6 +472,88 @@ def test_the_cli_dismisses_recovery_items_and_approvals(monkeypatch, capsys) -> 
     assert options["payload"] == {"decision": "dismiss", "reason": "Old run"}
 
 
+_STUCK_RECOVERY = {
+    "id": "inbox_r",
+    "kind": "recovery",
+    "status": "pending",
+    "session_id": "s2",
+    "agent_name": "verifier",
+    "item": {
+        **_PENDING,
+        "id": "inbox_r",
+        "kind": "recovery",
+        "session_id": "s2",
+        "tool_name": "exec_command",
+        "title": "Manual recovery required",
+        "detail": "Tool started but no terminal result was recorded before the session failed.",
+        "decisions": [],
+    },
+    "settlement": None,
+}
+
+
+def _cloud_answering(monkeypatch, settle) -> None:
+    """The CLI on a Cloud whose settle route answers ``settle`` (status, JSON body)."""
+
+    import httpx
+
+    import cayu.cli._cloud_api as cloud_api
+    import cayu.cli.cloud as cloud_cli
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=_STUCK_RECOVERY)
+        return httpx.Response(settle[0], json=settle[1])
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        cloud_api.httpx,
+        "Client",
+        lambda **options: real_client(transport=httpx.MockTransport(answer), **options),
+    )
+    client = cloud_api.CloudApiClient(api_url="https://cloud.example", api_key="k")
+    monkeypatch.setattr(cloud_cli, "cloud_client", lambda **_kwargs: client)
+    monkeypatch.setattr(cloud_cli, "resolve_application_id", lambda _client, name: name)
+
+
+def test_a_dismiss_the_agent_refuses_fails_with_its_reason(monkeypatch, capsys) -> None:
+    # What Cloud answers when the Agent can't abandon the item's session.
+    reason = (
+        "This recovery item's session can't be abandoned now: The session's environment "
+        "'slot-3' isn't registered in this application, and only an interrupted session can "
+        "be abandoned without it; this one is failed."
+    )
+    detail = {"code": "not_settleable", "message": reason, "item": _STUCK_RECOVERY}
+    _cloud_answering(monkeypatch, (409, {"detail": detail}))
+    dismiss = ["inbox", "dismiss", "inbox_r", "--application", "bugs", "--reason", "Old run"]
+
+    assert main(dismiss) == 1
+    assert "only an interrupted session can be abandoned without it" in capsys.readouterr().err
+    assert main([*dismiss, "--json"]) == 1
+    refused = _json(capsys)
+    assert refused["error"]["code"] == "not_settleable"
+    assert "isn't registered in this application" in refused["error"]["message"]
+    assert refused["item"]["status"] == "pending"
+
+
+def test_a_dismiss_answered_without_settling_the_item_is_not_reported_done(
+    monkeypatch, capsys
+) -> None:
+    _cloud_answering(
+        monkeypatch, (200, {"settled": True, "replayed": False, "item": _STUCK_RECOVERY})
+    )
+    dismiss = ["inbox", "dismiss", "inbox_r", "--application", "bugs", "--reason", "Old run"]
+
+    assert main(dismiss) == 1
+    captured = capsys.readouterr()
+    assert "Dismissed" not in captured.out
+    assert "without settling this item; it is pending" in captured.err
+    assert main([*dismiss, "--json"]) == 1
+    refused = _json(capsys)
+    assert refused["error"]["code"] == "not_settled"
+    assert refused["item"]["status"] == "pending"
+
+
 def test_an_older_cloud_settles_without_a_reference_when_it_cant_say_about_a_policy(
     monkeypatch, capsys
 ) -> None:

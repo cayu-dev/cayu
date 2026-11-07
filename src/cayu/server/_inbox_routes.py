@@ -18,6 +18,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Path, Query, Response
@@ -51,6 +52,7 @@ from cayu.runtime._approval_support import approval_resolution_request_digest
 from cayu.runtime._inbox_continuation import controlled_inbox_continuation
 from cayu.runtime._session_abandonment import (
     SESSION_CLOSED_REASON,
+    abandoned_after_failure,
     abandoned_session_failure_payload,
     abandoned_session_from_checkpoint,
     stranded_approval_denial,
@@ -766,9 +768,37 @@ def register_inbox_routes(
                         else None,
                     )
             if len(records) < _CLAIM_SCAN_PAGE:
-                return None
+                break
             after = records[-1].sequence
-        return None
+        else:
+            return None
+        return await failed_round_dismissal(item) if item.kind == "recovery" else None
+
+    async def failed_round_dismissal(item: _SessionItem) -> InboxSettlement | None:
+        """The dismissal of a call whose session had already failed when it was abandoned.
+
+        Such a session keeps its own failure as its terminal evidence, so no
+        ``session.failed`` names the call: its abandonment record does, with the person
+        and reason as its metadata.
+        """
+
+        record = abandoned_session_from_checkpoint(
+            await session_store.load_checkpoint(item.session.id)
+        )
+        if (
+            record is None
+            or not abandoned_after_failure(record)
+            or not _abandons_call(abandoned_session_failure_payload(record), item.reference)
+        ):
+            return None
+        metadata = record["metadata"]
+        reason = metadata.get("reason")
+        return InboxSettlement(
+            decision="dismiss",
+            decided_by=_decider(cayu_app.redact_json(metadata.get("resolved_by"))),
+            decided_at=datetime.fromisoformat(record["after_failure"]["abandoned_at"]),
+            reason=cayu_app.redact_json(reason) if type(reason) is str else None,
+        )
 
     async def session_item_state(item: _SessionItem) -> InboxItemState:
         if item.pending is not None:
@@ -1718,6 +1748,16 @@ def register_inbox_routes(
         response.headers.update(_NO_STORE)
         state, source = await visible_item(item_id, auth_context)
         if isinstance(source, _SessionItem):
-            return await settle_session_item(source, body, auth_context)
-        workflow, locator = source
-        return await settle_knowledge_item(workflow, locator, state, body, auth_context)
+            answer = await settle_session_item(source, body, auth_context)
+        else:
+            workflow, locator = source
+            answer = await settle_knowledge_item(workflow, locator, state, body, auth_context)
+        if answer.item.status != "settled" or answer.item.settlement is None:
+            # A settle answers success only with the item settled: one still pending
+            # was not decided, so it is refused with its state rather than reported done.
+            raise _conflict(
+                "not_settleable",
+                f"This {answer.item.kind} wasn't settled; it is {answer.item.status}.",
+                answer.item,
+            )
+        return answer

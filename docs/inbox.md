@@ -347,6 +347,22 @@ its unknown tool outcomes, with no approval or question, no unfinished child
 session other than a fork, and no other recovery holding it; anything else is
 refused with 409 `not_settleable`.
 
+A session can also fail after a tool call started and before anything recorded how
+it ended, for example when its sandbox refuses the run part way. It is already
+`failed` with its own `session.failed`, but it keeps the call's round, so the call is
+still a recovery item (its detail says the call started "before the session
+failed"). Dismissing it needs neither the call's arguments nor the session's
+environment: the round leaves resumable work and is kept, with the unknown calls and
+the person and reason, in the session's abandonment record, and the session stays
+`failed`. No second `session.failed` is published, so the settlement's
+`decided_at` is when the round was abandoned. A failed session whose round waits on
+an approval, a question or a wake, or whose owner is live or held by another
+recovery, is refused with 409 `not_settleable`.
+
+A settle answers 200 only with the item settled. When the decision didn't settle it,
+the route answers 409 with the item's state, and `cayu inbox` exits non-zero with the
+reason; it never reports a decision done while the item is still pending.
+
 ### Dismissing an approval or a question
 
 An approval or a question whose session can never resume, for example one stranded

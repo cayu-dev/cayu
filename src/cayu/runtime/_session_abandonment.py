@@ -10,7 +10,10 @@ from uuid import UUID, uuid5
 
 from cayu._validation import copy_durable_metadata
 from cayu.approvals.actors import ResolutionActor, resolution_actor_payload
-from cayu.approvals.user_input import pending_user_input_from_checkpoint
+from cayu.approvals.user_input import (
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    pending_user_input_from_checkpoint,
+)
 from cayu.approvals.wakes import PENDING_WAKE_CHECKPOINT_KEY
 from cayu.events import (
     Event,
@@ -29,7 +32,11 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
-from cayu.sessions._pending_approval_reader import pending_approval_from_checkpoint
+from cayu.sessions._pending_approval_reader import (
+    PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+    pending_approval_from_checkpoint,
+)
+from cayu.sessions._pending_tool_round import PENDING_TOOL_ROUND_CHECKPOINT_KEY
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
@@ -119,6 +126,7 @@ def abandoned_session_record(
     denied_approval: dict[str, Any] | None = None,
     closed: dict[str, Any] | None = None,
     model_call: dict[str, Any] | None = None,
+    after_failure: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     record = {
         "schema_version": 1,
@@ -139,7 +147,18 @@ def abandoned_session_record(
         # The assistant model call the lost run was making, abandoned with it: its
         # stage, and whether it reached the provider (its outcome is then unknown).
         record["model_call"] = model_call
+    if after_failure is not None:
+        # The session had already failed, with its own terminal evidence, when it was
+        # abandoned: the abandonment retired the round its failure left retained, and
+        # publishes no second ``session.failed``. Names when it was abandoned.
+        record["after_failure"] = after_failure
     return record
+
+
+def abandoned_after_failure(record: dict[str, Any] | None) -> bool:
+    """Whether an abandonment retired the round of a session that had already failed."""
+
+    return record is not None and "after_failure" in record
 
 
 def _unknown_model_calls(record: dict[str, Any]) -> list[dict[str, str]]:
@@ -168,6 +187,7 @@ def abandoned_session_from_checkpoint(
         or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
         or ("closed" in record and not _valid_closed(record["closed"]))
         or ("model_call" in record and not _valid_model_call(record["model_call"]))
+        or ("after_failure" in record and not _valid_after_failure(record["after_failure"]))
     ):
         raise RuntimeError("Session retains malformed abandonment evidence.")
     return record
@@ -207,6 +227,14 @@ def _unresumed_close(
         status=SessionStatus.FAILED,
         actions=(action,),
         message=message,
+    )
+
+
+def _valid_after_failure(after_failure: Any) -> bool:
+    return (
+        type(after_failure) is dict
+        and set(after_failure) == {"abandoned_at"}
+        and type(after_failure["abandoned_at"]) is str
     )
 
 
@@ -291,6 +319,30 @@ def _model_call_payload(record: dict[str, Any]) -> dict[str, Any]:
     # Absent otherwise, so abandonments recorded before it kept their payload.
     unknown = _unknown_model_calls(record)
     return {"model_call_outcome_unknown": unknown} if unknown else {}
+
+
+# What holds a round for a person or a timer rather than leaving it to recovery.
+_GATE_CHECKPOINT_KEYS = (
+    PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+    PENDING_USER_INPUT_CHECKPOINT_KEY,
+    PENDING_WAKE_CHECKPOINT_KEY,
+)
+
+
+def _retains_failed_round(session: Session, checkpoint: dict[str, Any] | None) -> bool:
+    """Whether a failed session still holds a plain round, gated by nothing a person answers.
+
+    Its failure left the round in its checkpoint, so its unknown calls are still recovery
+    items. A round held by an approval, a question or a wake goes through recovery, which
+    interrupts such a session again before it can be abandoned.
+    """
+
+    return (
+        session.status is SessionStatus.FAILED
+        and checkpoint is not None
+        and PENDING_TOOL_ROUND_CHECKPOINT_KEY in checkpoint
+        and not any(key in checkpoint for key in _GATE_CHECKPOINT_KEYS)
+    )
 
 
 def _abandonable_tool_round(
@@ -438,6 +490,30 @@ class SessionAbandonment:
             is not None
         )
         passes = [] if prior is None else [prior]
+        if not abandoned and _retains_failed_round(
+            session, await self._session_store.load_checkpoint(session_id)
+        ):
+            # A session that failed with a round of unknown outcomes still retained: its
+            # terminal evidence is durable, so recovery has nothing to interrupt or end,
+            # and abandoning it only retires the round.
+            if any(
+                # A fork is an independent run; nothing waits on it. Any other child
+                # that hasn't ended may still continue this session's round.
+                child.invocation.source is not SessionExecutionSource.FORK
+                for child in await self._open_children(session.id)
+            ):
+                raise SessionStatusConflict(
+                    "The failed session has child sessions that haven't ended; end them first."
+                )
+            await self._incomplete_recovery.abandon_failed_round(
+                session,
+                reason=reason,
+                metadata=metadata,
+                inactive_for_seconds=inactive_for_seconds,
+            )
+            return await self._finish_failed_round(
+                session, reason=reason, metadata=metadata, passes=passes
+            )
         if not abandoned:
             try:
                 passes.append(
@@ -493,6 +569,62 @@ class SessionAbandonment:
         except KeyError:
             return True
         return False
+
+    async def _finish_failed_round(
+        self,
+        session: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        passes: list[IncompleteSessionRecoveryResult],
+    ) -> IncompleteSessionRecoveryResult:
+        """Finish abandoning a failed session's retained round.
+
+        Its terminal evidence is its own failure, so the ordinary pass that follows
+        only finalizes an environment binding the failure left owned, where the
+        environment is registered; then the interaction the failed run left open
+        settles, as for a session abandoned without its environment.
+        """
+
+        environment = session.environment_name
+        passes.append(
+            IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=SessionStatus.FAILED,
+                status=SessionStatus.FAILED,
+                actions=(IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT,),
+                message=(
+                    "Abandoned the failed session's retained round; its unknown tool "
+                    "outcomes were not dispatched again."
+                ),
+            )
+        )
+        try:
+            passes.append(
+                await self._session_recovery.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session.id,
+                        inactive_for_seconds=0,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+                )
+            )
+        except KeyError:
+            # Releasing the binding needs the environment, which happens where it is
+            # registered; the abandonment itself is durable.
+            if not await self._environment_unregistered(session.id):
+                raise
+            passes.append(
+                _unresumed_close(
+                    session.id,
+                    IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,
+                    f"The session's environment {environment!r} isn't registered in this "
+                    "application, so its binding is left to be released where it is.",
+                )
+            )
+        await self._session_recovery.settle_released_open_interaction(session.id)
+        return _merged_recovery_results(passes)
 
     async def _abandon_without_environment(
         self,
@@ -1162,16 +1294,18 @@ class SessionAbandonment:
         )
         if record is None:
             return None
-        [failure] = await self._session_store.query_events(
-            EventQuery(
-                session_id=session.id,
-                event_type=EventType.SESSION_FAILED,
-                order_by=EventOrder.SEQUENCE_DESC,
-                limit=1,
-            )
-        ) or [None]
-        if failure is None or failure.event.payload.get("error_type") != "SessionAbandoned":
-            return record
+        # One abandoned after it failed keeps that failure as its terminal evidence.
+        if not abandoned_after_failure(record):
+            [failure] = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_type=EventType.SESSION_FAILED,
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=1,
+                )
+            ) or [None]
+            if failure is None or failure.event.payload.get("error_type") != "SessionAbandoned":
+                return record
         [latest] = await self._session_store.query_events(
             EventQuery(
                 session_id=session.id,
@@ -1496,7 +1630,8 @@ class SessionAbandonment:
     async def _retained(self, session: Session) -> bool:
         checkpoint = await self._session_store.load_checkpoint(session.id)
         if session.status is SessionStatus.FAILED:
-            if abandoned_session_from_checkpoint(checkpoint) is None:
+            record = abandoned_session_from_checkpoint(checkpoint)
+            if record is None:
                 return False
             assert checkpoint is not None
             if PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint:
@@ -1518,6 +1653,9 @@ class SessionAbandonment:
                     is not None
                 ):
                     return True
+            if abandoned_after_failure(record):
+                # Its terminal evidence is the failure it had before it was abandoned.
+                return False
             failures = await self._session_store.query_events(
                 EventQuery(
                     session_id=session.id,

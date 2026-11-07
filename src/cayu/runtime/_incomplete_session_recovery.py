@@ -259,9 +259,11 @@ from cayu.sessions.invocation import (
     SessionInvocationBinding,
     inherited_session_invocation,
 )
+from cayu.sessions.pending_actions import round_evidence_record, unresolved_round_call_ids
 from cayu.sessions.queries import MAX_SESSION_LIST_CURSOR_BYTES, SessionOrder, SessionQuery
 from cayu.sessions.records import (
     CheckpointTransform,
+    EventRecord,
     Session,
     SessionStatus,
     SessionStatusConflict,
@@ -294,6 +296,15 @@ from cayu.workspaces.observation_recovery import (
 )
 
 _ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool_round"
+# A failed session's retained round: the events that say a call started or how it ended.
+_FAILED_ROUND_LEDGER_EVENT_TYPES = (
+    EventType.TOOL_CALL_STARTED,
+    EventType.TOOL_CALL_COMPLETED,
+    EventType.TOOL_CALL_FAILED,
+    EventType.TOOL_CALL_BLOCKED,
+    EventType.TOOL_CALL_APPROVAL_DENIED,
+)
+_FAILED_ROUND_LEDGER_PAGE = 100
 
 _COMPLETION_FINALIZATION_TASK_EVENT_NAMESPACE = UUID("ae86f400-31e6-4cd2-95f3-7d6f115c21a1")
 
@@ -5255,6 +5266,193 @@ class IncompleteSessionRecovery:
                 f"{unavailable}, and its paused round holds no unknown tool outcome to abandon."
             )
         return abandoned
+
+    async def abandon_failed_round(
+        self,
+        expected: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        inactive_for_seconds: int,
+    ) -> Session:
+        """Abandon the round of unknown tool outcomes a failed session still retains.
+
+        A session can fail after one of its tool calls started and before that call
+        recorded how it ended, as when its run is refused or its process dies part
+        way. Its terminal ``session.failed`` is already durable, but its checkpoint
+        keeps the round, so the call stays a recovery item and the round could still
+        be recovered and continued. Abandoning it continues nothing and needs neither
+        the environment nor the call's arguments: in one fenced transition that keeps
+        the session ``failed`` at the same run epoch, the round leaves resumable work
+        and the abandonment record retains it, with each call whose outcome is unknown
+        (``after_failure`` names when). Each such call keeps its ``outcome_unknown``
+        record and is never dispatched again. No second ``session.failed`` is
+        published: the session's own failure stays its terminal evidence.
+
+        ``expected`` is the session as it was read before. A session that changed
+        since, isn't ``failed``, was already abandoned, waits on an approval, a
+        question or a wake, holds no round with an unknown outcome, has a live owner
+        or another recovery's live claim, or had activity within
+        ``inactive_for_seconds`` of store time raises ``SessionStatusConflict``.
+        """
+
+        session = await self._session_store.load(expected.id)
+        if session is None:
+            raise KeyError(f"Session not found: {expected.id}")
+        if (session.instance_id, session.run_epoch) != (expected.instance_id, expected.run_epoch):
+            raise SessionStatusConflict("Session changed before it was abandoned.")
+        if session.status is not SessionStatus.FAILED:
+            raise SessionStatusConflict(
+                f"Only a failed session's retained round can be abandoned this way; this one "
+                f"is {session.status.value}."
+            )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict("Session was already abandoned.")
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if (
+            pending_round is None
+            or PENDING_WAKE_CHECKPOINT_KEY in (checkpoint or {})
+            or PENDING_USER_INPUT_CHECKPOINT_KEY in (checkpoint or {})
+            or pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY in (checkpoint or {})
+        ):
+            raise SessionStatusConflict(
+                "Only a failed session that retains a round of unknown tool outcomes can be "
+                "abandoned this way; this one waits on something else."
+            )
+        if await self.execution_owner(session) == "live":
+            raise SessionStatusConflict("The session's owner is live; it was left alone.")
+        unknown_tool_calls = await self._failed_round_unknown_calls(session, pending_round)
+        if not unknown_tool_calls:
+            raise SessionStatusConflict(
+                "The failed session's retained round holds no unknown tool outcome to abandon."
+            )
+
+        checked_activity: datetime | None = None
+
+        def unclaimed(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            if (current_session.instance_id, current_session.run_epoch) != (
+                session.instance_id,
+                session.run_epoch,
+            ):
+                raise RuntimeError("Session changed before it was abandoned.")
+            if _active_unexpired_incomplete_recovery_claim_id(current, now=store_now):
+                raise RuntimeError("Another recovery owns the session; it was left alone.")
+
+        def check(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> None:
+            nonlocal checked_activity
+            unclaimed(current_session, current, store_now)
+            checked_activity = current_session.last_activity_at
+            return None  # Writes nothing.
+
+        # Refuse another recovery's live claim or recent activity at store time before
+        # the abandonment claims the session's task set: a refusal after that claim
+        # retires it, and the unchanged session couldn't claim it again.
+        try:
+            await self._session_store.reserve_stalled_run_recovery(
+                session.id,
+                statuses={SessionStatus.FAILED},
+                inactive_for_seconds=inactive_for_seconds,
+                checkpoint_transform=check,
+            )
+        except RuntimeError as exc:
+            raise SessionStatusConflict(str(exc)) from exc
+        if checked_activity is None:
+            raise SessionStatusConflict(
+                f"Session had activity within the last {inactive_for_seconds} seconds, or "
+                "changed before it was abandoned."
+            )
+
+        def abandon(
+            current_session: Session, current: dict[str, Any] | None, store_now: datetime
+        ) -> dict[str, Any]:
+            # Checked again in the same store transaction as the transition.
+            unclaimed(current_session, current, store_now)
+            if inactive_for_seconds and current_session.last_activity_at != checked_activity:
+                raise RuntimeError(
+                    f"Session had activity within the last {inactive_for_seconds} seconds."
+                )
+            copied, durable_round = self._checkpoint_without_pending_tool_round(
+                current_session, current, pending_round
+            )
+            if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
+                raise RuntimeError("Session already retains abandonment evidence.")
+            copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
+                reason=reason,
+                metadata=metadata,
+                tool_round=durable_round,
+                unknown_tool_calls=unknown_tool_calls,
+                after_failure={"abandoned_at": store_now.isoformat()},
+            )
+            return copied
+
+        try:
+            return await self._commit_abandonment(
+                session,
+                task_id=pending_round.task_id,
+                from_statuses={SessionStatus.FAILED},
+                store_time_checkpoint_transform=abandon,
+            )
+        except RuntimeError as exc:
+            # The session was recovered, changed, or another recovery claimed it.
+            raise SessionStatusConflict(str(exc)) from exc
+
+    async def _failed_round_unknown_calls(
+        self, session: Session, pending_round: pending_rounds.PendingToolRound
+    ) -> list[dict[str, str]]:
+        """The retained round's calls whose outcome is unknown.
+
+        Those whose effect record is unknown, and every call of the round the
+        pending-action read would hold for manual recovery: one that started and
+        published no valid terminal result, or whose evidence is malformed or
+        contradictory. A call without an effect record (one that declares no external
+        effect) is unknown too once it started and nothing recorded how it ended.
+        """
+
+        calls = [(call.tool_call_id, call.tool_name) for call in pending_round.tool_calls]
+        unknown = await self._unknown_tool_calls(session, pending_round.tool_round_id, calls)
+        named = {call["tool_call_id"] for call in unknown}
+        records: list[EventRecord] = []
+        after: int | None = None
+        while True:
+            page = await self._session_store.query_events(
+                EventQuery(
+                    session_id=session.id,
+                    event_types=_FAILED_ROUND_LEDGER_EVENT_TYPES,
+                    after_sequence=after,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                    limit=_FAILED_ROUND_LEDGER_PAGE,
+                )
+            )
+            # Only the round's events, compacted, outlive their page.
+            records.extend(
+                kept
+                for record in page
+                if (kept := round_evidence_record(record, pending_round)) is not None
+            )
+            if len(page) < _FAILED_ROUND_LEDGER_PAGE:
+                break
+            after = page[-1].sequence
+        unresolved = unresolved_round_call_ids(records, pending_round)
+        unknown.extend(
+            {
+                "tool_round_id": pending_round.tool_round_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+            }
+            for tool_call_id, tool_name in calls
+            if tool_call_id in unresolved and tool_call_id not in named
+        )
+        return unknown
 
     async def execution_owner(self, session: Session) -> Literal["live", "lost", "unattested"]:
         """What the store attests about the owner of the session's current run.

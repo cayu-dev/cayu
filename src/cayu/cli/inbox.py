@@ -683,6 +683,17 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             body["review_reference"] = reference
     answer = await inbox.settle(args.item_id, body)
     settled: dict[str, Any] = answer["item"] if isinstance(answer.get("item"), dict) else {}
+    recorded = settled.get("settlement")
+    if settled.get("status") != "settled" or not isinstance(recorded, dict):
+        # Success means the item is settled. An answer that leaves it pending (or says
+        # nothing about it) decided nothing, so it isn't reported as done.
+        raise InboxClientError(
+            "not_settled",
+            f"The {'Agent' if inbox.where == 'cloud' else 'application'} answered without "
+            f"settling this item; it is {settled.get('status') or 'unknown'}. Nothing was "
+            f"recorded as {decision}. Read it with `cayu inbox show` and try again.",
+            item=settled or None,
+        )
     if inbox.where == "local" and decision != "dismiss" and args.output_format != "json":
         print(
             f"Recorded. Session {_plain(item.get('session_id'))} continues in this process...",

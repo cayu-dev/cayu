@@ -1914,7 +1914,16 @@ only a plain round of unknown outcomes is abandoned; a session that isn't
 interrupted, waits on an approval, a question or a wake, has child sessions other
 than forks that haven't ended, changed since recovery read it, holds another
 recovery's live claim, or had activity within `inactive_for_seconds` of store time
-raises `SessionStatusConflict`. The
+raises `SessionStatusConflict`. A session that already failed but still retains a
+plain round of unknown outcomes (its run failed after a call started and before the
+call recorded how it ended) is abandoned without recovery, the environment or the
+calls' arguments: one fenced transition keeps it `failed` at the same run epoch,
+removes the round from resumable work, and writes the abandonment record with the
+round, the unknown calls and `after_failure.abandoned_at`. Its own `session.failed`
+stays its terminal evidence, so no second one is published; recovery then finalizes
+an environment binding the failure left owned, where the environment is registered,
+and the run's open interaction settles. A failed session whose round waits on an
+approval, a question or a wake goes through recovery as before. The
 task attached to the round counts as one of the session's tasks even after a
 restart detached it. Its abandonment record is immutable
 runtime authority and survives ordinary checkpoint replacement. With a task store,

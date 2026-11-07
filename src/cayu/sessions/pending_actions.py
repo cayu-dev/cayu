@@ -1173,6 +1173,39 @@ def _pending_tool_round_evidence(
     )
 
 
+def round_evidence_record(
+    record: EventRecord, pending_round: pending_rounds.PendingToolRound
+) -> EventRecord | None:
+    """One stored event as round evidence: its compact projection, if it is the round's.
+
+    A caller scanning a session's history keeps only these, so a tool result's
+    payload is never held beyond its page.
+    """
+
+    projected = project_pending_action_event_record(record)
+    return (
+        projected
+        if pending_action_event_matches_tool_round(projected.event, pending_round)
+        else None
+    )
+
+
+def unresolved_round_call_ids(
+    records: list[EventRecord], pending_round: pending_rounds.PendingToolRound
+) -> set[str]:
+    """The round's calls a manual recovery would still hold.
+
+    ``records`` are the round's tool-call lifecycle events from ``round_evidence_record``,
+    in sequence order. A call that started without a valid terminal result, or whose
+    evidence is malformed or contradictory (such as two terminal results), is
+    unresolved, as the pending-action read classifies it.
+    """
+
+    evidence = _pending_tool_round_evidence(list(reversed(records)), pending_round)
+    unresolved = evidence.started_without_terminal_ids | evidence.conflicting_ids
+    return (evidence.started_ids | unresolved) if evidence.scope_conflicting else unresolved
+
+
 def _manual_recovery_source_linkage(
     session: PendingActionSession,
     source: EventRecord,
