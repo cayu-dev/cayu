@@ -300,6 +300,10 @@ from cayu.runtime._session_control import (
     SessionControl,
     SessionInterruptedByRequest,
 )
+from cayu.runtime._transcript_view import (
+    projection_position_map,
+    remap_model_positions_in_checkpoint,
+)
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     assistant_text_content,
@@ -3054,16 +3058,8 @@ class ModelStepRun:
             # history therefore precedes this switch. Keep semantic turns/files;
             # never forward another provider's response IDs or signed thinking.
             portable = project_portable_transcript(messages)
-            self._recall_anchor_index_map = dict(
-                zip(
-                    (i for i, message in enumerate(messages) if message.role is MessageRole.USER),
-                    (
-                        i
-                        for i, message in enumerate(portable.messages)
-                        if message.role is MessageRole.USER
-                    ),
-                    strict=True,
-                )
+            self._recall_anchor_index_map = projection_position_map(
+                portable, source_length=len(messages)
             )
             messages = list(portable.messages)
             portable_history_cursor = source_transcript_cursor
@@ -5920,8 +5916,6 @@ async def _build_context(
         checkpoint = project_runtime_managed_context_checkpoint(
             await session_store.load_checkpoint(session.id)
         )
-        from cayu.memory.context import _remap_recall_checkpoint_anchors
-
         # Until fallback preparation commits, the durable checkpoint still
         # addresses the predecessor's history. Build against the candidate's
         # projection, but publish context progress in the old coordinates.
@@ -5931,8 +5925,8 @@ async def _build_context(
             else {new: old for old, new in recall_anchor_index_map.items()}
         )
         if checkpoint is not None and recall_anchor_index_map is not None:
-            checkpoint = _remap_recall_checkpoint_anchors(
-                checkpoint, index_map=recall_anchor_index_map
+            checkpoint = remap_model_positions_in_checkpoint(
+                checkpoint, position_map=recall_anchor_index_map
             )
         try:
             with (
@@ -5948,8 +5942,8 @@ async def _build_context(
                 )
         except ContextBuildError as error:
             if error.checkpoint is not None and reverse_index_map is not None:
-                error.checkpoint = _remap_recall_checkpoint_anchors(
-                    error.checkpoint, index_map=reverse_index_map
+                error.checkpoint = remap_model_positions_in_checkpoint(
+                    error.checkpoint, position_map=reverse_index_map
                 )
             sanitize_context_build_error_checkpoint(
                 error,
@@ -5965,8 +5959,8 @@ async def _build_context(
                     _attach_context_build_termination_diagnostics(
                         error,
                         compaction_telemetry=[],
-                        checkpoint=_remap_recall_checkpoint_anchors(
-                            progress.checkpoint, index_map=reverse_index_map
+                        checkpoint=remap_model_positions_in_checkpoint(
+                            progress.checkpoint, position_map=reverse_index_map
                         ),
                         checkpoint_event_payload=progress.checkpoint_event_payload,
                     )
@@ -5979,8 +5973,8 @@ async def _build_context(
             safe_checkpoint if safe_checkpoint is not None else checkpoint
         )
         if safe_checkpoint is not None and reverse_index_map is not None:
-            safe_checkpoint = _remap_recall_checkpoint_anchors(
-                safe_checkpoint, index_map=reverse_index_map
+            safe_checkpoint = remap_model_positions_in_checkpoint(
+                safe_checkpoint, position_map=reverse_index_map
             )
         return (
             copy_context_messages(result.messages),

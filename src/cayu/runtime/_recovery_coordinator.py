@@ -302,6 +302,7 @@ from cayu.runtime._tool_invocation.admission import (
     policy_denial_payload_fields,
 )
 from cayu.runtime._tool_invocation.invocation import ToolInvocation
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import LoopPolicy
@@ -3636,7 +3637,7 @@ class RecoveryCoordinator:
         registered_provider: runtime_records.RegisteredProvider,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
-        transcript: list[Message],
+        transcript: DurableTranscript,
         semantics: _RecoveryInvocationSemantics,
         resolution: ToolApprovalRequest | UserInputResponse,
         task_id: str | None,
@@ -3653,7 +3654,7 @@ class RecoveryCoordinator:
         session_stream = self._engine.continue_run(
             RecoverySessionRunRequest(
                 session=session,
-                messages=transcript,
+                transcript=transcript,
                 messages_to_append=[],
                 max_steps=semantics.max_steps,
                 limits=semantics.limits,
@@ -3808,9 +3809,7 @@ class RecoveryCoordinator:
                 )
             transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
             try:
-                transcript = [
-                    detach_message(record.message) for record in transcript_snapshot.records
-                ]
+                transcript = DurableTranscript.from_snapshot(transcript_snapshot)
                 user_input_transcript_cursor = transcript_snapshot.cursor
             finally:
                 del transcript_snapshot
@@ -4455,7 +4454,7 @@ class RecoveryCoordinator:
                 )
             )
             pending_cleared = True
-            transcript.extend(transcript_messages)
+            transcript = transcript.extended(transcript_messages)
             await self._event_writer.fan_out_persisted([close_event])
             yield close_event
             if close_cancellation is not None:
@@ -5514,7 +5513,7 @@ class RecoveryCoordinator:
                 deferred_messages,
                 cancellation=close_cancellation,
             )
-            transcript = materialized.messages
+            continued_transcript = materialized.transcript
             close_cancellation = materialized.cancellation
             await self._event_writer.fan_out_persisted([clear_event])
             yield clear_event
@@ -5527,7 +5526,7 @@ class RecoveryCoordinator:
                 registered_provider=registered_provider,
                 execution_profile_snapshot=execution_profile_snapshot,
                 budget_policy=budget_policy,
-                transcript=transcript,
+                transcript=continued_transcript,
                 semantics=invocation_semantics,
                 resolution=request,
                 task_id=pending_approval.task_id,

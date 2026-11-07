@@ -106,6 +106,12 @@ from cayu.runtime._terminal_event_publication import (
     TerminalEventPublication,
 )
 from cayu.runtime._terminal_evidence_finalization import TerminalEvidenceFinalization
+from cayu.runtime._transcript_view import (
+    DurableTranscript,
+    effective_projection_cursor,
+    model_transcript_view,
+    remap_model_positions_in_checkpoint,
+)
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
@@ -447,7 +453,6 @@ from cayu.sessions._execution_profile_checkpoint import (
 from cayu.sessions._execution_profile_rules import (
     SessionModelTransition,
     execution_profile_adoption_request_fingerprint,
-    session_model_projection_cursor,
 )
 from cayu.sessions._foreground_child_checkpoint import (
     FOREGROUND_CHILD_TERMINAL_KEY,
@@ -4106,8 +4111,6 @@ class SessionEngine:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
-        loaded_projection_cursor = session_model_projection_cursor(loaded_session)
-
         stored_execution_profile = execution_profile_from_session_metadata(loaded_session.metadata)
         if stored_execution_profile.model_failover is not None:
             self.session_store._require_model_failover_stage_protocol()
@@ -4120,10 +4123,9 @@ class SessionEngine:
                 else None
             ),
         )
-        if expected_failover_progress is not None:
-            loaded_projection_cursor = max(
-                loaded_projection_cursor, expected_failover_progress.projection_cursor
-            )
+        loaded_projection_cursor = effective_projection_cursor(
+            loaded_session, expected_failover_progress
+        )
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
         stored_tool_capability_ceiling = (
             _session_execution_profile._session_tool_capability_ceiling(
@@ -5045,7 +5047,6 @@ class SessionEngine:
                 "A session model target cannot change while tool-round recovery or deferred "
                 "interaction input is pending."
             )
-        source_transcript: list[Message] | None = None
         source_transcript_digest: str | None = None
         source_transcript_cursor: int | None = None
         provider_state_parts_dropped = 0
@@ -5056,36 +5057,19 @@ class SessionEngine:
                 raise AssertionError("Changed model target lost its requested identity.")
             source_snapshot = await self.session_store.load_transcript_snapshot(loaded_session.id)
             try:
-                source_transcript = _transcript._transcript_snapshot_messages(source_snapshot)
-                source_transcript_cursor = source_snapshot.cursor
-                # Checkpoints address the previous model-facing history, which
-                # may already be shorter than the durable source after a switch.
-                previous_user_indexes = [
-                    index
-                    for index, message in enumerate(
-                        _transcript._project_model_target_snapshot(
-                            source_snapshot, loaded_projection_cursor
-                        ).messages
-                    )
-                    if message.role is MessageRole.USER
-                ]
+                source_durable = DurableTranscript.from_snapshot(source_snapshot)
             finally:
                 del source_snapshot
+            source_transcript_cursor = source_durable.cursor
             portable_projection = None
             try:
-                source_transcript_digest = session_input_messages_sha256(source_transcript)
-                portable_projection = model_target.project_portable_transcript(source_transcript)
-                recall_anchor_index_map = dict(
-                    zip(
-                        previous_user_indexes,
-                        (
-                            index
-                            for index, message in enumerate(portable_projection.messages)
-                            if message.role is MessageRole.USER
-                        ),
-                        strict=True,
-                    )
-                )
+                source_transcript_digest = session_input_messages_sha256(source_durable.messages)
+                portable_projection = model_transcript_view(source_durable, source_durable.cursor)
+                # Checkpoints address the previous model-facing history, which
+                # may already be shorter than the durable source after a switch.
+                recall_anchor_index_map = model_transcript_view(
+                    source_durable, loaded_projection_cursor
+                ).position_map_to(portable_projection)
                 provider_state_parts_dropped = portable_projection.provider_state_parts_dropped
                 thinking_parts_dropped = portable_projection.thinking_parts_dropped
                 if request_projection is None:
@@ -5143,8 +5127,7 @@ class SessionEngine:
                     "Queued dispatch target provider rejected its portable request material."
                 ) from exc
             finally:
-                source_transcript.clear()
-                portable_projection = None
+                portable_projection = source_durable = None
         if continuing_recovery_boundary:
             interaction_id = await self._session_finalization.activate_latest_open_interaction(
                 loaded_session.id
@@ -5345,11 +5328,9 @@ class SessionEngine:
             )
         claimed_checkpoint = claim_resumable_checkpoint(loaded_session, checkpoint)
         if target_changed:
-            from cayu.memory.context import _remap_recall_checkpoint_anchors
-
-            # Publish new anchor positions atomically with the target change.
-            claimed_checkpoint = _remap_recall_checkpoint_anchors(
-                claimed_checkpoint, index_map=recall_anchor_index_map
+            # Publish new model positions atomically with the target change.
+            claimed_checkpoint = remap_model_positions_in_checkpoint(
+                claimed_checkpoint, position_map=recall_anchor_index_map
             )
         if required_foreground_terminal is not None and required_foreground_continuation is None:
             existing_terminal = claimed_checkpoint.get(FOREGROUND_CHILD_TERMINAL_KEY)
@@ -5730,9 +5711,6 @@ class SessionEngine:
                         invocation_context=invocation_context,
                     )
                     return
-                projection_cursor = max(
-                    session_model_projection_cursor(session), loaded_projection_cursor
-                )
                 admitted_selection = model_failover_progress_for_session(
                     session=session,
                     execution_profile=invocation_profile,
@@ -5742,23 +5720,25 @@ class SessionEngine:
                         else None
                     ),
                 )
-                if admitted_selection is not None:
-                    projection_cursor = max(projection_cursor, admitted_selection.projection_cursor)
-                if projection_cursor:
-                    transcript_snapshot = await self.session_store.load_transcript_snapshot(
-                        session.id
+                projection_cursor = max(
+                    effective_projection_cursor(session, admitted_selection),
+                    loaded_projection_cursor,
+                )
+                transcript_snapshot = await self.session_store.load_transcript_snapshot(session.id)
+                try:
+                    transcript_view = model_transcript_view(
+                        DurableTranscript.from_snapshot(transcript_snapshot), projection_cursor
                     )
-                    try:
-                        transcript = list(
-                            _transcript._project_model_target_snapshot(
-                                transcript_snapshot,
-                                projection_cursor,
-                            ).messages
-                        )
-                    finally:
-                        del transcript_snapshot
-                else:
-                    transcript = await self.session_store.load_transcript(session.id)
+                finally:
+                    del transcript_snapshot
+                transcript = list(transcript_view.messages)
+                # Fresh input was appended at the durable end before this read.
+                input_start_index = (
+                    None
+                    if continuing_recovery_boundary or not request.messages
+                    else transcript_view.tail_start(len(interaction_source_messages))
+                )
+                del transcript_view
                 transcript, transcript_is_valid = session_request_boundary.redact_transcript(
                     transcript,
                     redactor=self._secret_redactor,
@@ -5909,13 +5889,11 @@ class SessionEngine:
                             SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
                                 session_input_contract_evidence(
                                     request,
-                                    message_start_index=(
-                                        len(transcript) - len(interaction_source_messages)
-                                    ),
+                                    message_start_index=input_start_index,
                                 )
                             )
                         }
-                        if not continuing_recovery_boundary and request.messages
+                        if input_start_index is not None
                         else {}
                     ),
                     **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
@@ -6032,6 +6010,17 @@ class SessionEngine:
             raise RuntimeError(
                 "Recovery run does not reference the active invocation execution profile."
             )
+        model_view = model_transcript_view(
+            request.transcript,
+            effective_projection_cursor(
+                request.session,
+                model_failover_progress_for_session(
+                    session=request.session,
+                    execution_profile=invocation_context.profile,
+                    checkpoint=checkpoint,
+                ),
+            ),
+        )
         initial_tool_exposure = (
             None
             if request.initial_model_step_tool_exposure is None
@@ -6046,7 +6035,7 @@ class SessionEngine:
             admitted_checkpoint=checkpoint,
             participant_context=request.participant_context,
             invocation_context=invocation_context,
-            messages=request.messages,
+            messages=list(model_view.messages),
             messages_to_append=request.messages_to_append,
             max_steps=request.max_steps,
             limits=request.limits,
@@ -6562,7 +6551,6 @@ class SessionEngine:
             await materialize_deferred_messages()
 
         provider = registered_provider.provider
-        model_projection_cursor = session_model_projection_cursor(outcome_state.session)
         selected_progress = model_failover_progress_for_session(
             session=outcome_state.session,
             execution_profile=execution_profile,
@@ -6572,30 +6560,22 @@ class SessionEngine:
                 else None
             ),
         )
-        if selected_progress is not None:
-            model_projection_cursor = max(
-                model_projection_cursor, selected_progress.projection_cursor
-            )
-        model_projection_source_prefix_count = 0
-        model_projection_prefix_count = 0
+        model_projection_cursor = effective_projection_cursor(
+            outcome_state.session, selected_progress
+        )
         if model_projection_cursor:
             model_projection_snapshot = await self.session_store.load_transcript_snapshot(
                 outcome_state.session.id
             )
             try:
-                if model_projection_cursor > model_projection_snapshot.cursor:
-                    raise ValueError(
-                        "Model-target projection cursor exceeds the session transcript."
-                    )
                 deferred_tail_count = len(messages_to_append) if messages_deferred else 0
                 retained_message_count = len(messages) - deferred_tail_count
-                model_projection = _transcript._project_model_target_snapshot(
-                    model_projection_snapshot,
-                    model_projection_cursor,
+                expected_retained_message_count = len(
+                    model_transcript_view(
+                        DurableTranscript.from_snapshot(model_projection_snapshot),
+                        model_projection_cursor,
+                    ).messages
                 )
-                model_projection_source_prefix_count = model_projection.source_prefix_count
-                model_projection_prefix_count = model_projection.projected_prefix_count
-                expected_retained_message_count = len(model_projection.messages)
                 if (
                     retained_message_count < 0
                     or retained_message_count != expected_retained_message_count
@@ -7317,27 +7297,18 @@ class SessionEngine:
                     outcome_state.session.id
                 )
                 try:
-                    pending_result_position = pending_snapshot.retained_position(
-                        pending_result_cursor
+                    pending_snapshot.retained_position(pending_result_cursor)
+                    if pending_result_cursor < model_projection_cursor:
+                        raise RuntimeError(
+                            "Pending tool round predates the model-target projection boundary."
+                        )
+                    pending_view = model_transcript_view(
+                        DurableTranscript.from_snapshot(pending_snapshot), model_projection_cursor
                     )
-                    if model_projection_cursor:
-                        pending_projection = _transcript._project_model_target_snapshot(
-                            pending_snapshot,
-                            model_projection_cursor,
-                        )
-                        if pending_result_position < model_projection_source_prefix_count:
-                            raise RuntimeError(
-                                "Pending tool round predates the model-target projection boundary."
-                            )
-                        pending_result_position = (
-                            pending_projection.projected_prefix_count
-                            + pending_result_position
-                            - model_projection_source_prefix_count
-                        )
-                        retained_pending_message_count = len(pending_projection.messages)
-                    else:
-                        retained_pending_message_count = len(pending_snapshot.records)
-                    expected_resume_message_count = retained_pending_message_count + (
+                    pending_result_position = pending_view.model_position(pending_result_cursor)
+                    if pending_result_position is None:
+                        raise AssertionError("A row after the projection boundary was omitted.")
+                    expected_resume_message_count = len(pending_view.messages) + (
                         len(messages_to_append) if messages_deferred else 0
                     )
                     if len(messages) != expected_resume_message_count:
@@ -7417,6 +7388,7 @@ class SessionEngine:
                 admit_replay=admit_replay,
                 finish_up=finish_decision is not None,
                 expected_transcript_cursor=recovery_expected_transcript_cursor,
+                projection_cursor=model_projection_cursor,
             ):
                 if event.type in {
                     EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -7659,6 +7631,7 @@ class SessionEngine:
                 run_limit_accounting=run_limit_accounting,
                 task_worker_id=task_worker_id,
             )
+            tool_round_runner.projection_cursor = model_projection_cursor
 
             def model_completion_recovery_context(
                 billing_identity: BillingIdentity | None,
@@ -8025,18 +7998,6 @@ class SessionEngine:
                         )
                     for event in queued_events:
                         yield event
-                # Recovery paths can rematerialize the durable transcript. Reapply the
-                # stable retained-prefix projection to the already boundary-sanitized
-                # in-memory messages without sanitizing runtime tool controls twice.
-                if model_projection_cursor:
-                    if len(messages) < model_projection_prefix_count:
-                        raise RuntimeError(
-                            "Model-facing transcript lost its retained projection prefix."
-                        )
-                    messages[:] = model_target.project_portable_transcript_prefix(
-                        messages,
-                        model_projection_prefix_count,
-                    ).messages
                 source_transcript_cursor = await self.session_store.load_transcript_cursor(
                     outcome_state.session.id
                 )
@@ -8174,16 +8135,8 @@ class SessionEngine:
                     # neutral turns and runtime controls, and keep the newly
                     # accepted provider's parts outside the invalidated prefix.
                     model_projection_cursor = source_transcript_cursor
-                    snapshot = await self.session_store.load_transcript_snapshot(
-                        outcome_state.session.id
-                    )
-                    durable_projection = _transcript._project_model_target_snapshot(
-                        snapshot, model_projection_cursor
-                    )
-                    model_projection_source_prefix_count = durable_projection.source_prefix_count
-                    portable = model_target.project_portable_transcript(messages)
-                    messages[:] = portable.messages
-                    model_projection_prefix_count = portable.projected_prefix_count
+                    tool_round_runner.projection_cursor = model_projection_cursor
+                    messages[:] = model_target.project_portable_transcript(messages).messages
                 await self._session_control.raise_if_interrupted(outcome_state.session.id)
                 assistant_step_result = model_step_flow_outcome.assistant_step_result
                 if assistant_step_result is None:

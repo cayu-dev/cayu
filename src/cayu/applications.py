@@ -7449,7 +7449,7 @@ class CayuApp(
         if session is None:
             raise PeerContentUnavailable()
 
-        cursor = len(await self.session_store.load_transcript(session_id))
+        cursor = await self.session_store.load_transcript_cursor(session_id)
 
         async def admit(request, *, pending_transcript_cursor):
             return await self._append_peer_content(

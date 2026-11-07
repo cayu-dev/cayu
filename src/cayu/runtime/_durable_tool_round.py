@@ -90,6 +90,7 @@ from cayu.runtime._tool_round_staging import (
     _tool_terminal_payload_limits,
     _ToolRoundPublicationCoordinator,
 )
+from cayu.runtime._transcript_view import DurableTranscript, model_transcript_view
 from cayu.runtime.stop_policy import StopDecision
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round as pending_rounds
@@ -176,6 +177,8 @@ class StructuredToolRoundPublication:
 
 @dataclass(frozen=True)
 class DeferredInputMaterialization:
+    transcript: DurableTranscript
+    # The transcript as the model sees it at the caller's projection cursor.
     messages: list[Message]
     cancellation: asyncio.CancelledError | None
 
@@ -986,8 +989,13 @@ class DurableToolRound:
         materialize_deferred_input_if_present: Callable[[str], Awaitable[bool]],
         materialize_expected_deferred_input: DeferredInputMaterializer,
         raise_if_interrupted: Callable[[str], Awaitable[None]],
+        projection_cursor: int = 0,
     ) -> AsyncGenerator[Event, None]:
-        """Publish skipped calls and close a limited round once, retaining completed effects."""
+        """Publish skipped calls and close a limited round once, retaining completed effects.
+
+        A run that keeps going to finish passes its ``projection_cursor`` so the
+        restored history is the model-facing view.
+        """
 
         session = self._session
         tool_round_identity = self._identity
@@ -1001,7 +1009,10 @@ class DurableToolRound:
             is not None
         ):
             await materialize_deferred_input_if_present(session.id)
-            messages[:] = await self._session_store.load_transcript(session.id)
+            snapshot = await self._session_store.load_transcript_snapshot(session.id)
+            messages[:] = model_transcript_view(
+                DurableTranscript.from_snapshot(snapshot), projection_cursor
+            ).messages
             return
 
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
@@ -2282,8 +2293,13 @@ class DeferredInteractionInput:
         expected_messages: list[Message],
         *,
         cancellation: asyncio.CancelledError | None = None,
+        projection_cursor: int = 0,
     ) -> DeferredInputMaterialization:
-        """Append a retained recovery tail without losing caller cancellation."""
+        """Append a retained recovery tail without losing caller cancellation.
+
+        ``projection_cursor`` is the session's model-target projection cursor; the
+        returned ``messages`` are the model-facing view at that cursor.
+        """
 
         expected = [detach_message(message) for message in expected_messages]
 
@@ -2297,7 +2313,7 @@ class DeferredInteractionInput:
                 for index, message in enumerate(messages)
             ]
 
-        async def materialize() -> list[Message]:
+        async def materialize() -> DurableTranscript:
             deferred = await self._session_store.load_deferred_interaction_input(session_id)
             if (
                 expected
@@ -2314,8 +2330,10 @@ class DeferredInteractionInput:
                     session_id,
                     interaction_id=deferred.interaction_id,
                 )
-            transcript = await self._session_store.load_transcript(session_id)
-            transcript_view = redacted_transcript_view(transcript)
+            snapshot = await self._session_store.load_transcript_snapshot(session_id)
+            durable = DurableTranscript.from_snapshot(snapshot)
+            del snapshot
+            transcript_view = redacted_transcript_view(durable.message_list())
             if expected and (
                 len(transcript_view) < len(expected)
                 or transcript_view[-len(expected) :] != expected
@@ -2323,7 +2341,7 @@ class DeferredInteractionInput:
                 raise RuntimeError(
                     "Deferred interaction input was not materialized after its tool result."
                 )
-            return transcript_view
+            return replace(durable, messages=tuple(transcript_view))
 
         outcome = await await_shielded_task_outcome(
             asyncio.create_task(materialize()),
@@ -2353,7 +2371,8 @@ class DeferredInteractionInput:
                 raise cancellation from missing_result
             raise missing_result
         return DeferredInputMaterialization(
-            messages=outcome.result,
+            transcript=outcome.result,
+            messages=list(model_transcript_view(outcome.result, projection_cursor).messages),
             cancellation=cancellation,
         )
 

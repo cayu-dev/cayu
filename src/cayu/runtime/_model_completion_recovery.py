@@ -790,19 +790,21 @@ class ModelCompletionRecovery:
                     {event.id: event for event in (*recovery_events, *recovered.events)}.values()
                 )
                 if recovered.status is ProviderOperationRecoveryStatus.PENDING:
-                    transcript = await self._session_store.load_transcript(session.id)
                     return ModelCompletionBoundaryReconciliation(
                         state="provider_operation_pending",
                         session=session,
-                        transcript_cursor=len(transcript),
+                        transcript_cursor=await self._session_store.load_transcript_cursor(
+                            session.id
+                        ),
                         recovery_events=recovery_events,
                     )
                 if recovered.status is ProviderOperationRecoveryStatus.UNAVAILABLE:
-                    transcript = await self._session_store.load_transcript(session.id)
                     return ModelCompletionBoundaryReconciliation(
                         state="provider_operation_unavailable",
                         session=session,
-                        transcript_cursor=len(transcript),
+                        transcript_cursor=await self._session_store.load_transcript_cursor(
+                            session.id
+                        ),
                         recovery_events=recovery_events,
                     )
                 if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:

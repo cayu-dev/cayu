@@ -431,6 +431,9 @@ class PendingToolRoundRecovery:
                 registered_agent=request.registered_agent,
                 registered_environment=request.registered_environment,
                 messages=request.messages,
+                # The interruption is re-raised after this close, so the run makes no
+                # further model request from these messages; keep the durable rows.
+                projection_cursor=0,
                 pending_round=pending_round,
                 retry_allowed=False,
                 expected_transcript_cursor=expected_transcript_cursor,
@@ -486,6 +489,8 @@ class PendingToolRoundRecovery:
             registered_agent=request.registered_agent,
             registered_environment=request.registered_environment,
             messages=request.messages,
+            # As above: the interruption ends the run after this close.
+            projection_cursor=0,
             pending_round=pending_round,
             lifecycle_events=lifecycle_events,
             synthesized_outcomes=interrupted_results,
@@ -814,6 +819,7 @@ class PendingToolRoundRecovery:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
+        projection_cursor: int,
         pending_round: pending_rounds.PendingToolRound,
         retry_allowed: bool,
         expected_transcript_cursor: int,
@@ -840,7 +846,10 @@ class PendingToolRoundRecovery:
                 invocation_context=invocation_context,
                 redactor=self._secret_redactor,
                 tool_redactor=self._secret_redactor,
-                materialize_expected_deferred_input=self._deferred_input.materialize_expected,
+                materialize_expected_deferred_input=partial(
+                    self._deferred_input.materialize_expected,
+                    projection_cursor=projection_cursor,
+                ),
                 interrupted=interrupted,
             )
         ) as events:
@@ -951,8 +960,12 @@ class PendingToolRoundRecovery:
         admit_replay: Callable[[ModelAttemptIdentity], Awaitable[bool]] | None = None,
         elect_replay: bool = False,
         finish_up: bool = False,
+        projection_cursor: int = 0,
     ) -> AsyncGenerator[Event, None]:
         """Repair one durable pending round strictly from recorded evidence.
+
+        ``messages`` is model-facing at ``projection_cursor``; a rematerialized
+        transcript is projected at the same cursor before it replaces them.
 
         ``elect_replay`` lets a takeover of a dead running execution keep the round
         open for its continuation to replay, raising ``ToolCallReplayRequired``.
@@ -1136,6 +1149,7 @@ class PendingToolRoundRecovery:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 messages=messages,
+                projection_cursor=projection_cursor,
                 pending_round=pending_round,
                 retry_allowed=session.status == SessionStatus.RUNNING and not finish_up,
                 expected_transcript_cursor=expected_transcript_cursor,
@@ -1377,6 +1391,7 @@ class PendingToolRoundRecovery:
             registered_agent=registered_agent,
             registered_environment=registered_environment,
             messages=messages,
+            projection_cursor=projection_cursor,
             pending_round=pending_round,
             lifecycle_events=lifecycle_events,
             synthesized_outcomes=synthesized_outcomes,
@@ -1945,6 +1960,7 @@ class PendingToolRoundRecovery:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
+        projection_cursor: int,
         pending_round: pending_rounds.PendingToolRound,
         lifecycle_events: list[Event],
         synthesized_outcomes: list[runtime_records.ToolCallOutcome],
@@ -1975,7 +1991,10 @@ class PendingToolRoundRecovery:
                 emit_result=self._tool_invocation.terminals.publish_result,
                 emit_terminal=self._tool_invocation.terminals.emit_staged,
                 emit_native_terminal=self.emit_confirmed_native_tool_terminal,
-                materialize_expected_deferred_input=self._deferred_input.materialize_expected,
+                materialize_expected_deferred_input=partial(
+                    self._deferred_input.materialize_expected,
+                    projection_cursor=projection_cursor,
+                ),
                 interrupted=interrupted,
                 confirmed_native_effect_records=confirmed_native_effect_records,
             )

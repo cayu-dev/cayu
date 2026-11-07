@@ -2036,12 +2036,10 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
             self.injected = False
 
         async def load_transcript_snapshot(self, session_id: str):
-            snapshot = await super().load_transcript_snapshot(session_id)
-            self.preflight_loaded = True
-            return snapshot
-
-        async def load_transcript(self, session_id: str) -> list[Message]:
-            if self.preflight_loaded and not self.injected:
+            # The preflight read runs before the run fence; the next read runs
+            # after it, when the session is already running.
+            running = (await self.load(session_id)).status is SessionStatus.RUNNING
+            if self.preflight_loaded and running and not self.injected:
                 self.injected = True
                 await self.append_transcript_messages(
                     session_id,
@@ -2057,7 +2055,9 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
                         )
                     ],
                 )
-            return await super().load_transcript(session_id)
+            snapshot = await super().load_transcript_snapshot(session_id)
+            self.preflight_loaded = True
+            return snapshot
 
     store = PostPreflightTranscriptStore()
     provider = FakeProvider([])

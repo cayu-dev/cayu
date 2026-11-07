@@ -19,8 +19,8 @@ class PortableTranscriptProjection:
     messages: tuple[Message, ...]
     provider_state_parts_dropped: int
     thinking_parts_dropped: int
-    source_prefix_count: int
-    projected_prefix_count: int
+    # Source-list position of each projected message, in order.
+    source_positions: tuple[int, ...]
 
 
 def project_portable_transcript(messages: list[Message]) -> PortableTranscriptProjection:
@@ -51,14 +51,13 @@ def project_portable_transcript_prefix(
     projected: list[Message] = []
     provider_state_parts_dropped = 0
     thinking_parts_dropped = 0
-    projected_prefix_count = 0
+    source_positions: list[int] = []
     for index, message in enumerate(messages):
         if type(message) is not Message:
             raise TypeError("Transcript messages must contain exact Message instances.")
         if index >= transcript_cursor or message.role is not MessageRole.ASSISTANT:
             projected.append(detach_message(message))
-            if index < transcript_cursor:
-                projected_prefix_count += 1
+            source_positions.append(index)
             continue
         parts = []
         for part in message.content:
@@ -72,11 +71,10 @@ def project_portable_transcript_prefix(
         if not parts:
             continue
         projected.append(Message(role=message.role, content=tuple(parts)))
-        projected_prefix_count += 1
+        source_positions.append(index)
     return PortableTranscriptProjection(
         messages=tuple(projected),
         provider_state_parts_dropped=provider_state_parts_dropped,
         thinking_parts_dropped=thinking_parts_dropped,
-        source_prefix_count=transcript_cursor,
-        projected_prefix_count=projected_prefix_count,
+        source_positions=tuple(source_positions),
     )

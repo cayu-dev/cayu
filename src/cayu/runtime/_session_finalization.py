@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any, NoReturn, TypeVar
 from uuid import uuid4
 
@@ -3500,6 +3501,7 @@ class SessionFinalization:
             decision=request.decision,
             tool_round_identity=request.tool_round_identity,
             execution_profile=request.execution_profile,
+            projection_cursor=request.projection_cursor,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for event in owned_stream:
@@ -3902,6 +3904,7 @@ class SessionFinalization:
         approval_resolution_request_digest: str | None = None,
         tool_round_identity: ToolRoundIdentity | None = None,
         execution_profile: ExecutionProfileIdentity | None,
+        projection_cursor: int = 0,
     ) -> AsyncGenerator[Event, None]:
         if tool_round_identity is None and pending_approval_to_clear is not None:
             tool_round_identity = ToolRoundIdentity(
@@ -4006,8 +4009,12 @@ class SessionFinalization:
                 execution_profile=execution_profile,
                 redactor=self._secret_redactor,
                 materialize_deferred_input_if_present=(self._deferred_input.materialize_if_present),
-                materialize_expected_deferred_input=(self._deferred_input.materialize_expected),
+                materialize_expected_deferred_input=partial(
+                    self._deferred_input.materialize_expected,
+                    projection_cursor=projection_cursor,
+                ),
                 raise_if_interrupted=self._session_control.raise_if_interrupted,
+                projection_cursor=projection_cursor,
             )
         ) as closure:
             async for event in closure:

@@ -194,6 +194,7 @@ from cayu.runtime._tool_effect_state import (
 from cayu.runtime._tool_invocation.admission import (
     ToolApprovalRequired,
 )
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.runtime._user_input_recovery_evidence import UserInputRecoveryEvidence
 from cayu.runtime._work_attempt_invocation import WorkAttemptInvocationAuthority
 from cayu.runtime._work_attempt_session_mutation import record_work_attempt_execution_stop
@@ -2290,7 +2291,9 @@ class IncompleteSessionRecovery:
                         RecoverySessionRunRequest(
                             session=claim.session,
                             invocation_context=invocation_context,
-                            messages=await self._session_store.load_transcript(session.id),
+                            transcript=DurableTranscript.from_snapshot(
+                                await self._session_store.load_transcript_snapshot(session.id)
+                            ),
                             messages_to_append=[],
                             max_steps=semantics.max_steps,
                             limits=semantics.limits,
@@ -3910,7 +3913,9 @@ class IncompleteSessionRecovery:
                         session=session,
                         invocation_context=invocation_context,
                         participant_context=participant_context,
-                        messages=await self._session_store.load_transcript(session.id),
+                        transcript=DurableTranscript.from_snapshot(
+                            await self._session_store.load_transcript_snapshot(session.id)
+                        ),
                         messages_to_append=[],
                         max_steps=semantics.max_steps,
                         limits=semantics.limits,
@@ -4072,7 +4077,9 @@ class IncompleteSessionRecovery:
                             session=session,
                             invocation_context=invocation_context,
                             participant_context=participant_context,
-                            messages=await self._session_store.load_transcript(session.id),
+                            transcript=DurableTranscript.from_snapshot(
+                                await self._session_store.load_transcript_snapshot(session.id)
+                            ),
                             messages_to_append=[],
                             max_steps=semantics.max_steps,
                             limits=semantics.limits,

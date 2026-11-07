@@ -1089,10 +1089,12 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             self.fail_transcript_load = True
             self.fail_terminal_append = True
 
-        async def load_transcript(self, session_id: str) -> list[Message]:
-            if self.fail_transcript_load:
+        async def load_transcript_snapshot(self, session_id: str):
+            # Fail resume's transcript read after it took the run fence.
+            running = (await self.load(session_id)).status is SessionStatus.RUNNING
+            if self.fail_transcript_load and running:
                 raise RuntimeError("transcript unavailable")
-            return await super().load_transcript(session_id)
+            return await super().load_transcript_snapshot(session_id)
 
         async def append_event(self, session_id: str, event: Event) -> None:
             if event.type == EventType.SESSION_FAILED and self.fail_terminal_append:

@@ -1254,8 +1254,7 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
             assert len(calls) == len(lookups) == len(provider.requests) == 1
             return
         if fault_phase == "terminal":
-            transcript_reader = "load_transcript_snapshot" if approval_gate else "load_transcript"
-            read_transcript = getattr(store, transcript_reader)
+            read_transcript = store.load_transcript_snapshot
             fail_once = True
 
             async def fail_after_receipt(*args, **kwargs):
@@ -1266,7 +1265,7 @@ def test_public_reconciliation_consumes_verified_outcome_without_external_replay
                     raise OSError("post-receipt transcript read unavailable")
                 return await read_transcript(*args, **kwargs)
 
-            monkeypatch.setattr(store, transcript_reader, fail_after_receipt)
+            monkeypatch.setattr(store, "load_transcript_snapshot", fail_after_receipt)
             if approval_gate:
                 # The existing approval closure owner publishes pre-close failure
                 # as a resumable interruption instead of raising it to the caller.

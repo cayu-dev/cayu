@@ -71,7 +71,6 @@ from cayu.memory.context import (
     _bounded_gather,
     _message_digest,
     _redacted_locator_json,
-    _remap_recall_checkpoint_anchors,
     _render_projection,
 )
 from cayu.memory.evidence import (
@@ -147,6 +146,7 @@ from cayu.runtime._memory_evidence import (
     recover_context_exposure,
     transition_context_exposure,
 )
+from cayu.runtime._transcript_view import remap_model_positions_in_checkpoint
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions._checkpoint_secret_validation import require_secret_free_durable_object
@@ -6797,19 +6797,19 @@ def test_history_projection_remaps_all_recall_checkpoint_anchors() -> None:
         }
 
     original = checkpoint_at(0, 2, 4)
-    projected = _remap_recall_checkpoint_anchors(original, index_map={0: 0, 2: 1, 4: 3})
+    projected = remap_model_positions_in_checkpoint(original, position_map={0: 0, 2: 1, 4: 3, 5: 4})
     assert projected == checkpoint_at(0, 1, 3)
     assert original == checkpoint_at(0, 2, 4)
     # A later switch remaps positions from the already projected history.
-    assert _remap_recall_checkpoint_anchors(
-        projected, index_map={0: 0, 1: 1, 3: 2}
+    assert remap_model_positions_in_checkpoint(
+        projected, position_map={0: 0, 1: 1, 3: 2, 4: 3}
     ) == checkpoint_at(0, 1, 2)
 
 
 @pytest.mark.parametrize("index", [1, -1, True, "2", None])
 def test_history_projection_does_not_repair_invalid_recall_anchors(index: Any) -> None:
     checkpoint = {"automatic_recall": {"anchor_transcript_index": index}}
-    projected = _remap_recall_checkpoint_anchors(checkpoint, index_map={0: 0, 2: 1})
+    projected = remap_model_positions_in_checkpoint(checkpoint, position_map={0: 0, 2: 1, 3: 2})
     assert projected["automatic_recall"]["anchor_transcript_index"] == (
         -1 if type(index) is int else index
     )

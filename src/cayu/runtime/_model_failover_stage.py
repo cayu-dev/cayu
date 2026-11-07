@@ -237,10 +237,10 @@ def model_failover_checkpoint_after_preparation(
         raise SessionModelCompletionStageConflict("Model failover predecessor changed.")
     updated = {} if current is None else current
     if not replayed and admission.recall_anchor_index_map is not None:
-        from cayu.memory.context import _remap_recall_checkpoint_anchors
+        from cayu.runtime._transcript_view import remap_model_positions_in_checkpoint
 
-        updated = _remap_recall_checkpoint_anchors(
-            updated, index_map=dict(admission.recall_anchor_index_map)
+        updated = remap_model_positions_in_checkpoint(
+            updated, position_map=dict(admission.recall_anchor_index_map)
         )
     updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
     updated[MODEL_FAILOVER_CHECKPOINT_KEY] = successor.payload()

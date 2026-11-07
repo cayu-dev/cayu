@@ -513,10 +513,12 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
         invocation_lifecycle_command_version = 1
         cancel_load = False
 
-        async def load_transcript(self, session_id: str) -> list[Message]:
-            if self.cancel_load:
+        async def load_transcript_snapshot(self, session_id: str):
+            # Resume reads the transcript after taking the run fence.
+            session = await self.load(session_id)
+            if self.cancel_load and session.status is SessionStatus.RUNNING:
                 raise asyncio.CancelledError()
-            return await super().load_transcript(session_id)
+            return await super().load_transcript_snapshot(session_id)
 
     store = CancellingTranscriptStore()
     app = CayuApp(session_store=store)
@@ -639,8 +641,11 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
     class BrokenTranscriptStore(InMemorySessionStore):
         invocation_lifecycle_command_version = 1
 
-        async def load_transcript(self, session_id: str) -> list[Message]:
-            raise RuntimeError("transcript unavailable")
+        async def load_transcript_snapshot(self, session_id: str):
+            # Resume reads the transcript after taking the run fence.
+            if (await self.load(session_id)).status is SessionStatus.RUNNING:
+                raise RuntimeError("transcript unavailable")
+            return await super().load_transcript_snapshot(session_id)
 
     store = BrokenTranscriptStore()
     provider = FakeProvider(

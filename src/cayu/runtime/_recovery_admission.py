@@ -57,6 +57,7 @@ from cayu.runtime._session_finalization import (
 from cayu.runtime._terminal_evidence_finalization import (
     TerminalEvidenceFinalization,
 )
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
@@ -688,7 +689,9 @@ class RecoveryAdmission:
         invocation_context.with_admitted_session(session)
         if pending_round.agent_name != invocation_context.registered_agent.spec.name:
             raise RuntimeError("Recovered continuation belongs to another agent.")
-        transcript = await self._session_store.load_transcript(session.id)
+        transcript = DurableTranscript.from_snapshot(
+            await self._session_store.load_transcript_snapshot(session.id)
+        )
         continued_run_limit_accounting = pending_round.run_limit_accounting
         if continued_run_limit_accounting is not None:
             recovery_events = await self._session_store.load_events(session.id)
@@ -710,7 +713,7 @@ class RecoveryAdmission:
             session=session,
             participant_context=participant_context,
             invocation_context=invocation_context,
-            messages=transcript,
+            transcript=transcript,
             messages_to_append=[],
             max_steps=invocation_semantics.max_steps,
             limits=invocation_semantics.limits,

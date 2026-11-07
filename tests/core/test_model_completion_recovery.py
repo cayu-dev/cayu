@@ -347,11 +347,11 @@ class _FailResumeSetupTranscriptStore(InMemorySessionStore):
             self._fail_next_transcript_load = True
         return transitioned
 
-    async def load_transcript(self, session_id: str) -> list[Message]:
+    async def load_transcript_snapshot(self, session_id: str):
         if self._fail_next_transcript_load:
             self._fail_next_transcript_load = False
             raise OSError("resume setup transcript load failed")
-        return await super().load_transcript(session_id)
+        return await super().load_transcript_snapshot(session_id)
 
 
 class _FailResumePromotionStore(InMemorySessionStore):
@@ -376,9 +376,9 @@ class _FailResumeCheckpointInspectionStore(_FailResumeSetupTranscriptStore):
         self.failure_mode = failure_mode
         self._fail_next_checkpoint_inspection = False
 
-    async def load_transcript(self, session_id: str) -> list[Message]:
+    async def load_transcript_snapshot(self, session_id: str):
         try:
-            return await super().load_transcript(session_id)
+            return await super().load_transcript_snapshot(session_id)
         except OSError:
             self._fail_next_checkpoint_inspection = True
             raise

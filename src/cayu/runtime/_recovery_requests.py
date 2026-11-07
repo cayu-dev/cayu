@@ -55,6 +55,7 @@ from cayu.runtime._run_limits import (
 from cayu.runtime._session_control import (
     ActiveSessionRun,
 )
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.runtime.stop_policy import StopDecision
 from cayu.runtime.tool_completion import ToolCompletionPolicy, ToolCompletionResult
 from cayu.sessions._interaction_transitions import InteractionTransitionSpec
@@ -71,7 +72,8 @@ from cayu.tools.exposure import (
 class RecoverySessionRunRequest:
     session: Session
     invocation_context: InvocationContext
-    messages: list[Message]
+    # Durable rows; the engine projects them once for the model at its entrance.
+    transcript: DurableTranscript
     messages_to_append: list[Message]
     max_steps: int | None
     limits: RunLimits
@@ -103,6 +105,8 @@ class RecoverySessionRunRequest:
     def __post_init__(self) -> None:
         if type(self.invocation_context) is not InvocationContext:
             raise TypeError("Recovery requires an authenticated InvocationContext.")
+        if type(self.transcript) is not DurableTranscript:
+            raise TypeError("Recovery requires the durable transcript, not a model-facing list.")
         self.invocation_context._validate()
         self.invocation_context.with_admitted_session(self.session)
 

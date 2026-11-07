@@ -69,6 +69,7 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._model_completion_contracts import model_completion_recovery_context_from_stage
 from cayu.runtime._recovery_requests import RecoverySessionRunRequest
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
@@ -545,7 +546,7 @@ def test_recovery_session_boundary_validates_full_active_profile_authority(
                 registered_environment=None,
                 budget_policy=None,
             ),
-            messages=[],
+            transcript=DurableTranscript(messages=(), indexes=(), cursor=0),
             messages_to_append=[],
             max_steps=1,
             limits=RunLimits(),

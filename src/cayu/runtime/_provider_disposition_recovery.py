@@ -64,6 +64,7 @@ from cayu.runtime._session_finalization import (
     SessionFinalization,
 )
 from cayu.runtime._terminal_event_publication import TerminalEventPublication
+from cayu.runtime._transcript_view import DurableTranscript
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
@@ -845,7 +846,9 @@ class ProviderDispositionRecovery:
                 "Provider-operation fallback substituted frozen invocation authority."
             )
 
-        transcript = await self._session_store.load_transcript(session.id)
+        transcript = DurableTranscript.from_snapshot(
+            await self._session_store.load_transcript_snapshot(session.id)
+        )
         recovery_events = await self._session_store.load_events(session.id)
         continued_accounting = recovery_context.run_limit_accounting
         if continued_accounting is not None:
@@ -874,7 +877,7 @@ class ProviderDispositionRecovery:
             RecoverySessionRunRequest(
                 session=session,
                 participant_context=participant_context,
-                messages=transcript,
+                transcript=transcript,
                 messages_to_append=[],
                 max_steps=recovery_context.max_steps,
                 limits=recovery_context.limits,

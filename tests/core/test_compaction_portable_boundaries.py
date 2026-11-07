@@ -1663,3 +1663,83 @@ def test_cayu_app_does_not_publish_forged_compaction_durable_value_diagnostics(
     rendered = json.dumps([event.model_dump(mode="json") for event in events])
     assert "workload-secret" not in rendered
     assert "workload-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("opaque_only", [False, True], ids=["text-bearing", "opaque-only"])
+def test_model_switch_keeps_compacted_history_on_the_same_rows(opaque_only: bool) -> None:
+    from tests.core.test_session_model_switch import _NamedProvider
+
+    from cayu.sessions import ModelTarget
+    from cayu.sessions.requests import ResumeRequest
+
+    async def scenario() -> None:
+        source = _NamedProvider(
+            "source",
+            [
+                [
+                    *([] if opaque_only else [ModelStreamEvent.text_delta("first answer")]),
+                    ModelStreamEvent.completed(
+                        {"provider_state": [{"provider": "source", "state": {"id": "r1"}}]}
+                    ),
+                ],
+                [ModelStreamEvent.text_delta("second answer"), ModelStreamEvent.completed()],
+            ],
+        )
+        target = _NamedProvider(
+            "target", [[ModelStreamEvent.text_delta("target answer"), ModelStreamEvent.completed()]]
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(source, default=True)
+        app.register_provider(target)
+        app.register_agent(
+            AgentSpec(name="assistant", model="source-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                max_user_turns=1, compact_after_messages=2
+            ),
+        )
+        session_id = "switch-compaction-cursor"
+        turns = [
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "first question")],
+            ),
+            ResumeRequest(
+                session_id=session_id, messages=[Message.text("user", "second question")]
+            ),
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "third question")],
+                target=ModelTarget(provider_name="target", model="target-model"),
+            ),
+        ]
+        for turn in turns:
+            stream = app.run(turn) if type(turn) is RunRequest else app.resume(turn)
+            events = [event async for event in stream]
+            assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+            if turn is turns[1]:
+                # The opaque-only answer is inside the compacted prefix.
+                checkpoint = await app.session_store.load_checkpoint(session_id)
+                assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 2
+        (request,) = target.requests
+        rendered = "\n".join(
+            part.text
+            for message in request.messages
+            for part in message.content
+            if type(part) is TextPart
+        )
+        for text in ("first question", "second question", "second answer", "third question"):
+            assert text in rendered, (text, rendered)
+        # The earlier summary is used, not dropped: the first question reaches the
+        # target only inside the summary, and the summary still covers the second.
+        texts = [
+            "".join(part.text for part in message.content if type(part) is TextPart)
+            for message in request.messages
+        ]
+        (summary,) = [text for text in texts if "summary" in text.lower()]
+        assert "first question" in summary and "second question" in summary
+        assert "first question" not in [text for text in texts if text is not summary]
+        assert texts[-1] == "third question"
+        await app.aclose()
+
+    asyncio.run(scenario())

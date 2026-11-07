@@ -260,6 +260,8 @@ class ToolRoundFinishCutoffRequest:
     completed_tool_outcomes: list[runtime_records.ToolCallOutcome]
     tool_round_identity: ToolRoundIdentity
     execution_profile: ExecutionProfileIdentity | None
+    # The session's model-target projection cursor; the run keeps going to finish.
+    projection_cursor: int = 0
 
 
 FinishCutoffEventStream = Callable[[ToolRoundFinishCutoffRequest], AsyncIterator[Event]]
@@ -1361,6 +1363,8 @@ class ToolRoundRun:
         ):
             raise ValueError("Tool-round execution lost frozen invocation authority.")
         self._invocation_context = invocation_context
+        # The run's model-target projection cursor; the run updates it on fallback.
+        self.projection_cursor = 0
         self.stopped_for_limit = False
         self.closed_for_finish = False
         self.user_input_pause_superseded = False
@@ -2102,6 +2106,7 @@ class ToolRoundRun:
                 completed_tool_outcomes=completed_tool_outcomes,
                 tool_round_identity=copy_tool_round_identity(tool_round_identity),
                 execution_profile=self._execution_profile,
+                projection_cursor=self.projection_cursor,
             )
         ):
             yield event
