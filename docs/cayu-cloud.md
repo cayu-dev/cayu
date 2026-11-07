@@ -45,6 +45,8 @@ cayu cloud service status --application my-agent
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
+- `connectors` and `connections list|show|add|agents|rotate|remove|bound|bind|unbind` for the
+  Organization's [connections](#connections);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
   `admin runtime-record show|forget-migration` to read
   [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, as a
@@ -977,8 +979,9 @@ Organization API key). It asks Cloud (`GET /v1/me`) before it changes anything. 
 are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollback`,
 `service destroy|pause|redeploy|restart|resume|sleep|wake`, `env set|unset`,
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
-`compass findings accept|dismiss`, `eval run|baseline`, `eval runs cancel` and
-`api-keys create|revoke`. Commands that only read say nothing.
+`compass findings accept|dismiss`, `eval run|baseline`, `eval runs cancel`,
+`api-keys create|revoke` and `connections add|agents|rotate|remove|bind|unbind`. Commands that
+only read say nothing.
 
 Each Agent also remembers where it deploys. The first successful `cayu cloud deploy` of an Agent
 from this machine records its Cloud and Organization in
@@ -1908,6 +1911,35 @@ Cloud kept (or keeps it now), or check with `cayu cloud api-keys list`.
 To rotate a key, create its replacement, move its holder to the new key file, then revoke the
 old key. A revoked key stops working at once and stays listed as inactive. The results report
 each key's `id`, `name`, `scopes`, `active` and `created_at`, never the key.
+
+## Connections
+
+A connection is one of the Organization's model credentials or app connectors, such as an
+Anthropic API key or a Snowflake key pair, under a name the Organization picks. Agents use it
+through Cayu Cloud and never hold the credential. `cayu cloud connectors` lists what this
+install can connect to.
+
+```console
+cayu cloud connections add anthropic --name team-anthropic --key-file ~/.config/cayu/anthropic-key
+cayu cloud connections add snowflake --name warehouse --agent support-desk \
+  --credential account=acme --credential user=cayu --credential private_key=@~/.keys/sf.p8
+cayu cloud connections list
+cayu cloud connections bind primary team-anthropic --application support-desk
+cayu cloud connections bound --application support-desk
+cayu cloud connections unbind primary --application support-desk
+cayu cloud connections agents warehouse --all
+cayu cloud connections rotate team-anthropic --key-file ~/.config/cayu/anthropic-key-2
+cayu cloud connections remove warehouse
+```
+
+Credentials come from files: `--key-file` for an API key and `--credential FIELD=@PATH` for
+any other field; `--credential FIELD=VALUE` is refused except for the fields that aren't secret
+(`account`, `user`). `--agent` and `--application` take an Agent's slug or name. No result
+prints a credential. Developers and admins add connections and bind them to an Agent's slots; a
+developer names the Agents a new connection is for with `--agent`, and an admin who names none
+makes it available to every Agent. Only an admin changes which Agents may use one (`agents`),
+rotates its credential or removes it, and Cloud refuses removing one while any Agent is bound to
+it. Members see only the connections the Agents they work with use.
 
 ## The install's system Agents
 

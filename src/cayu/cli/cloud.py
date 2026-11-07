@@ -47,6 +47,12 @@ from cayu.cli._cloud_auth import (
     switch_cloud_organization,
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
+from cayu.cli._cloud_connections import (
+    AGENT_ACTIONS,
+    add_connections_parsers,
+    connections_command,
+    connectors_command,
+)
 from cayu.cli._cloud_data import add_data_parser, data_command
 from cayu.cli._cloud_data_transfers import (
     COMMANDS as DATA_TRANSFER_COMMANDS,
@@ -158,6 +164,9 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("eval", "baseline"): "agent",
     ("api-keys", "create"): "organization",
     ("api-keys", "revoke"): "organization",
+    **{("connections", action): "organization" for action in ("add", "agents", "rotate", "remove")},
+    ("connections", "bind"): "agent",
+    ("connections", "unbind"): "agent",
 }
 _ORGANIZATION_HELP = (
     "The Organization (its id) this command must act in; it's refused in any other. Naming it "
@@ -1438,6 +1447,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_api_keys_parser(commands)
 
+    add_connections_parsers(commands)
+
     add_admin_parser(commands, application=_application_slug)
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
@@ -2421,6 +2432,23 @@ def _client_command(
         )
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
+    if arguments.command == "connectors":
+        return connectors_command(client)
+    if arguments.command == "connections":
+        return connections_command(
+            arguments,
+            client=client,
+            application_id=(
+                _application_id(client, arguments.application)
+                if arguments.connections_command in AGENT_ACTIONS
+                else None
+            ),
+            agents=(
+                _application_ids(client, arguments.agent)
+                if getattr(arguments, "agent", None)
+                else None
+            ),
+        )
     if arguments.command == "admin":
         return admin_command(
             arguments, client=client, recovery_arguments=_cloud_recovery_arguments(arguments)
@@ -4753,13 +4781,27 @@ def _archive_status(operation: dict[str, Any]) -> str:
 
 
 def _application_id(client: CloudApiClient, reference: str) -> str:
+    return _matching_application(_listed_agents(client), reference)
+
+
+def _application_ids(client: CloudApiClient, references: Sequence[str]) -> list[str]:
+    """Each reference's Agent id, from one read of the Organization's Agents."""
+
+    candidates = _listed_agents(client)
+    return [_matching_application(candidates, reference) for reference in references]
+
+
+def _listed_agents(client: CloudApiClient) -> list[dict[str, Any]]:
     # Archived Agents stay readable (status, logs, history), so resolve across lifecycles.
     applications = client.request("GET", "/v1/applications", query={"lifecycle": "all"}).get(
         "items", []
     )
     if not isinstance(applications, list):
         raise CloudApiError("api_response_invalid", "Application list is invalid.")
-    candidates = [application for application in applications if isinstance(application, dict)]
+    return [application for application in applications if isinstance(application, dict)]
+
+
+def _matching_application(candidates: list[dict[str, Any]], reference: str) -> str:
     # An exact slug always names its Agent: an archived Agent's reserved display name must
     # never make an active Agent's own slug ambiguous.
     matches = [application for application in candidates if application.get("id") == reference]
