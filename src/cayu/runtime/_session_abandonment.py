@@ -118,6 +118,7 @@ def abandoned_session_record(
     unknown_tool_calls: list[dict[str, str]],
     denied_approval: dict[str, Any] | None = None,
     closed: dict[str, Any] | None = None,
+    model_call: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     record = {
         "schema_version": 1,
@@ -134,7 +135,18 @@ def abandoned_session_record(
     if closed is not None:
         # A person closed the session while it waited; names what it waited on.
         record["closed"] = closed
+    if model_call is not None:
+        # The assistant model call the lost run was making, abandoned with it: its
+        # stage, and whether it reached the provider (its outcome is then unknown).
+        record["model_call"] = model_call
     return record
+
+
+def _unknown_model_calls(record: dict[str, Any]) -> list[dict[str, str]]:
+    call = record.get("model_call")
+    if call is None or not call["dispatched"]:
+        return []
+    return [{key: call[key] for key in _MODEL_CALL_STRING_FIELDS}]
 
 
 def abandoned_session_from_checkpoint(
@@ -155,6 +167,7 @@ def abandoned_session_from_checkpoint(
         or any(type(call) is not dict for call in record["unknown_tool_calls"])
         or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
         or ("closed" in record and not _valid_closed(record["closed"]))
+        or ("model_call" in record and not _valid_model_call(record["model_call"]))
     ):
         raise RuntimeError("Session retains malformed abandonment evidence.")
     return record
@@ -173,6 +186,16 @@ _DENIED_APPROVAL_STRING_FIELDS = (
 
 
 _CLOSED_FIELDS = frozenset({"tool_round_id", "approval_id", "input_id"})
+_MODEL_CALL_STRING_FIELDS = ("stage_id", "model_step_id", "model_attempt_id", "provider_name")
+
+
+def _valid_model_call(call: Any) -> bool:
+    return (
+        type(call) is dict
+        and set(call) == {*_MODEL_CALL_STRING_FIELDS, "dispatched"}
+        and all(type(call[field]) is str for field in _MODEL_CALL_STRING_FIELDS)
+        and type(call["dispatched"]) is bool
+    )
 
 
 def _unresumed_close(
@@ -247,6 +270,7 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
             "metadata": copy_durable_metadata(record["metadata"]),
             **record["closed"],
             "tool_effect_outcome_unknown": [dict(call) for call in record["unknown_tool_calls"]],
+            **_model_call_payload(record),
             "recovered": True,
         }
     return {
@@ -256,8 +280,17 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
         "reason": record["reason"],
         "metadata": copy_durable_metadata(record["metadata"]),
         "tool_effect_outcome_unknown": [dict(call) for call in record["unknown_tool_calls"]],
+        **_model_call_payload(record),
         "recovered": True,
     }
+
+
+def _model_call_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """``model_call_outcome_unknown`` for a run abandoned inside a model call."""
+
+    # Absent otherwise, so abandonments recorded before it kept their payload.
+    unknown = _unknown_model_calls(record)
+    return {"model_call_outcome_unknown": unknown} if unknown else {}
 
 
 def _abandonable_tool_round(
@@ -572,6 +605,7 @@ class SessionAbandonment:
             await self._session_store.load_checkpoint(session.id)
         )
         unknown = [] if record is None else record["unknown_tool_calls"]
+        unknown_model = [] if record is None else _unknown_model_calls(record)
         return IncompleteSessionRecoveryResult(
             session_id=session.id,
             previous_status=session.status,
@@ -590,6 +624,11 @@ class SessionAbandonment:
                     f" {len(unknown)} tool call(s) it was running have unknown outcomes and "
                     "were not dispatched again."
                     if unknown
+                    else ""
+                )
+                + (
+                    " The model call it was making has an unknown outcome and was not made again."
+                    if unknown_model
                     else ""
                 )
                 + f" Its environment {session.environment_name!r} isn't registered in this "
@@ -928,16 +967,23 @@ class SessionAbandonment:
         """Publish an abandoned session's terminal evidence and release its environment."""
 
         current = await self._session_store.load(session.id)
+        record = abandoned_session_from_checkpoint(
+            await self._session_store.load_checkpoint(session.id)
+        )
         if (
             current is None
             or current.instance_id != session.instance_id
             or current.status is not SessionStatus.FAILED
-            or abandoned_session_from_checkpoint(
-                await self._session_store.load_checkpoint(session.id)
-            )
-            is None
+            or record is None
         ):
             raise SessionStatusConflict("Closed session changed before its cleanup.")
+        if "model_call" in record:
+            # The model call the run was abandoned inside settles with its interaction,
+            # which ordinary recovery would otherwise leave to manual model recovery.
+            # An abandonment that died before it released its invocation is released
+            # first.
+            await self._incomplete_recovery.release_abandoned_model_call_invocation(session.id)
+            await self._session_recovery.settle_released_open_interaction(session.id)
         try:
             passes.append(
                 await self._session_recovery.recover_incomplete_session(

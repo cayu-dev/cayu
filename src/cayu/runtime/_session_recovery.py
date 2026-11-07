@@ -52,6 +52,7 @@ from cayu.runtime._recovery_coordinator import (
 from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
+from cayu.runtime._session_abandonment import abandoned_session_from_checkpoint
 from cayu.runtime._session_control import (
     SessionControl,
 )
@@ -817,20 +818,36 @@ class SessionRecovery:
 
         For a session abandoned without its environment, which no recovery owner
         reconstructed: its terminal evidence is durable and its invocation released,
-        so the interaction settles without invocation authority. Does nothing when the
-        latest interaction already ended or the invocation isn't released yet.
+        so the interaction settles without invocation authority. The model call the
+        abandonment record says the run was making settles with it, under the
+        released profile it was dispatched with. Does nothing when the latest
+        interaction already ended or the invocation isn't released yet.
         """
 
         session = await self.session_store.load(session_id)
         if session is None or session.status is not SessionStatus.FAILED:
             return None
-        active_profile = active_invocation_execution_profile_from_checkpoint(
-            await self.session_store.load_checkpoint(session_id)
-        )
+        checkpoint = await self.session_store.load_checkpoint(session_id)
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if active_profile is not None and not active_invocation_execution_profile_is_released(
             active_profile, session_id=session.id, run_epoch=session.run_epoch
         ):
             return None
+        record = abandoned_session_from_checkpoint(checkpoint)
+        model_call = None if record is None else record.get("model_call")
+        active_stage = (
+            None
+            if model_call is None
+            else await self.session_store.load_active_model_completion_stage(session_id)
+        )
+        settled_profile = (
+            active_profile.profile
+            if active_profile is not None
+            and model_call is not None
+            and active_stage is not None
+            and active_stage.stage.stage_id == model_call["stage_id"]
+            else None
+        )
         interaction_id = await self._session_finalization.activate_latest_open_interaction(
             session_id
         )
@@ -843,6 +860,7 @@ class SessionRecovery:
                 session=session,
                 recovered_active_through=active_through,
                 invocation_context=None,
+                released_execution_profile=settled_profile,
             )
             return event
         finally:
@@ -1032,12 +1050,16 @@ class SessionRecovery:
         session: Session,
         recovered_active_through: datetime | None,
         invocation_context: InvocationContext | None,
+        released_execution_profile: ExecutionProfileIdentity | None = None,
     ) -> tuple[Session, Event | None, bool]:
         """Publish terminal recovery evidence under the applicable authority.
 
         A context is mandatory once the session has ever acquired invocation
         authority.  The context-free branch is retained only for a terminal
-        session that was created and disposed before invocation admission.
+        session that was created and disposed before invocation admission, or
+        whose invocation was released. ``released_execution_profile``, the
+        released profile, lets that branch settle the model call an abandonment
+        recorded, as the profile the call was dispatched with.
         """
 
         if invocation_context is None:
@@ -1053,7 +1075,11 @@ class SessionRecovery:
                 run_epoch=session.run_epoch,
             ):
                 raise RuntimeError("Recovery interaction settlement lost its invocation context.")
-            execution_profile = None
+            if released_execution_profile is not None and (
+                active_profile is None or active_profile.profile != released_execution_profile
+            ):
+                raise RuntimeError("Recovery interaction settlement substituted its profile.")
+            execution_profile = released_execution_profile
         else:
             execution_profile = invocation_context.profile
 

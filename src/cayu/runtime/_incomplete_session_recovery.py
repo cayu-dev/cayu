@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal
@@ -206,8 +207,12 @@ from cayu.runtime.provider_operations import (
     ProviderOperationPendingDisposition,
     ProviderOperationResolutionAction,
     ProviderOperationUnavailableReason,
+    RecoverableProviderOperation,
+    RecoverableProviderOperationStart,
     checkpoint_with_provider_operation_disposition_execution_owner,
     load_pending_provider_operation_disposition,
+    load_recoverable_provider_operation,
+    load_recoverable_provider_operation_start,
     provider_operation_duplicate_request_risk,
     provider_operation_resolution_outcome_event_id,
 )
@@ -237,6 +242,7 @@ from cayu.sessions._invocation_lifecycle import (
 from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
+from cayu.sessions._model_stage import ModelCompletionStage
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -316,6 +322,33 @@ _UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES = frozenset(
         SessionStatus.FAILED,
     }
 )
+
+
+@dataclass(frozen=True)
+class _OrphanedModelCall:
+    """An assistant model call a lost run left in flight, which abandoning settles."""
+
+    stage: ModelCompletionStage
+    # Whether the call reached its provider; if so, its outcome is unknown.
+    dispatched: bool
+
+    @staticmethod
+    def identity(call: _OrphanedModelCall | None) -> tuple[str, str, bool] | None:
+        if call is None:
+            return None
+        return (call.stage.stage_id, call.stage.preparation_digest, call.dispatched)
+
+    def record(self) -> dict[str, Any]:
+        """The abandonment record's account of the call."""
+
+        intent = self.stage.intent
+        return {
+            "stage_id": self.stage.stage_id,
+            "model_step_id": self.stage.logical_step_id,
+            "model_attempt_id": str(intent.get("model_attempt_id", "")),
+            "provider_name": str(intent.get("provider_name", "")),
+            "dispatched": self.dispatched,
+        }
 
 
 if TYPE_CHECKING:
@@ -5255,17 +5288,22 @@ class IncompleteSessionRecovery:
         The session's run is fenced under a recovery claim, which a live owner or
         activity within ``inactive_for_seconds`` of store time refuses; each tool call
         it was running keeps an ``outcome_unknown`` record and is listed as unknown;
+        an assistant model call it was making is abandoned too (``_orphaned_model_call``):
+        one that reached its provider has an unknown outcome, its budget reservations
+        are charged at their reserved amount, and the abandonment record lists it;
         and the session fails as abandoned in the same fenced transition, which
         ``closed`` marks as a person's close. Its terminal ``session.failed`` is
-        published under the same claim. Abandoning continues nothing, so it needs
-        neither the environment nor a model: the environment binding and any
+        published under the same claim, and settling the run's interaction then
+        settles the abandoned model call's stage. Abandoning continues nothing, so it
+        needs neither the environment nor a model: the environment binding and any
         allocation the run started stay recorded, to be released where the
         environment is registered.
 
         ``expected`` is the session as read before ordinary recovery refused it. A
         session that changed since, is paused on an approval, a question or a wake,
-        has model work in flight, or a provider operation to settle, raises
-        ``SessionStatusConflict``; those keep their own recovery.
+        or holds model work this path can't settle (a background provider operation,
+        an answer not yet published, or a model call other than the assistant's
+        turn) raises ``SessionStatusConflict``, which names it.
         """
 
         session = await self._session_store.load(expected.id)
@@ -5297,7 +5335,7 @@ class IncompleteSessionRecovery:
             raise SessionStatusConflict(
                 f"{unavailable}, and the session waits on an approval, a question or a wake."
             )
-        await self._require_no_orphaned_model_work(session.id, unavailable=unavailable)
+        model_call = await self._orphaned_model_call(session, unavailable=unavailable)
         pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
@@ -5323,6 +5361,7 @@ class IncompleteSessionRecovery:
                 claim=claim,
                 recovery=lambda: self._abandon_claimed_orphan(
                     claim,
+                    model_call=model_call,
                     pending_round=pending_round,
                     reason=reason,
                     metadata=metadata,
@@ -5339,26 +5378,131 @@ class IncompleteSessionRecovery:
                 claim_has_not_dispatched_work=True,
             )
 
-    async def _require_no_orphaned_model_work(self, session_id: str, *, unavailable: str) -> None:
-        """Refuse a run with model work in flight; that work keeps its own recovery."""
+    async def release_abandoned_model_call_invocation(self, session_id: str) -> None:
+        """Release the invocation an abandonment inside a model call stopped holding.
 
-        if await self._session_store.load_active_model_completion_stage(session_id) is not None:
-            raise SessionStatusConflict(
-                f"{unavailable}, and the session's run stopped inside a model call, which "
-                "recovery settles where the environment is registered."
-            )
+        An orphan abandoned inside a model call fails first and releases its
+        invocation when its recovery claim ends; the call's stage then settles with
+        the run's interaction under the released invocation. A process that died in
+        between left the invocation held under a claim that has since lapsed, and
+        ordinary recovery leaves a model call that reached its provider to manual
+        recovery. This takes a new claim on the failed session and releases it,
+        dispatching nothing, so the recorded call can settle. Does nothing unless the
+        session failed with the stage its abandonment record names still active and
+        its invocation still held. Raises ``SessionStatusConflict`` while another
+        recovery holds a live claim on it.
+        """
+
+        session = await self._session_store.load(session_id)
+        if session is None or session.status is not SessionStatus.FAILED:
+            return
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        record = abandoned_session_from_checkpoint(checkpoint)
+        model_call = None if record is None else record.get("model_call")
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if (
-            await load_pending_provider_operation_disposition(self._session_store, session_id)
-            is not None
-        ):
-            raise SessionStatusConflict(
-                f"{unavailable}, and the session has a provider operation to settle."
+            model_call is None
+            or profile is None
+            or active_invocation_execution_profile_is_released(
+                profile, session_id=session.id, run_epoch=session.run_epoch
             )
+        ):
+            return
+        active = await self._session_store.load_active_model_completion_stage(session_id)
+        if active is None or active.stage.stage_id != model_call["stage_id"]:
+            return
+        claim = await self._recovery_ownership.claim(
+            session=session,
+            inactive_for_seconds=0,
+            execution_profile_snapshot=profile,
+            required_run_epoch=session.run_epoch,
+        )
+        if claim is None:
+            raise SessionStatusConflict(
+                "Another recovery owns the abandoned session; it finishes the abandonment."
+            )
+        await self._recovery_ownership.cleanup_claim(
+            authority=claim.require_authority(),
+            authoritative_failure=None,
+            claim_has_not_dispatched_work=True,
+        )
+
+    async def _orphaned_model_call(
+        self, session: Session, *, unavailable: str
+    ) -> _OrphanedModelCall | None:
+        """The assistant model call a lost run left in flight, if any.
+
+        Abandoning the run settles it without the environment, which is needed only
+        to continue the run. A call that never reached its provider had no effect.
+        One that did has an unknown outcome, like a tool call the run was making,
+        and is never made again.
+
+        Refuses, naming it, model work abandoning can't settle: a background provider
+        operation (it is cancelled or collected through the provider), a disposition
+        of one still to finish, an answer the provider gave that isn't published yet,
+        and a model call other than the assistant's turn (such as context
+        compaction). Recovery settles those where the environment is registered.
+        """
+
+        store = self._session_store
+        where_registered = (
+            "which recovery settles where the environment is registered: register "
+            f"environment {session.environment_name!r} in this application and run "
+            f"`cayu session close {session.id} --reason REASON` again"
+        )
+        pending_disposition = await load_pending_provider_operation_disposition(store, session.id)
+        if pending_disposition is not None:
+            disposition = pending_disposition[0]
+            raise SessionStatusConflict(
+                f"{unavailable}, and the provider operation of model stage "
+                f"{disposition.stage_id!r} has a {disposition.action.value} disposition "
+                f"still to finish, {where_registered}."
+            )
+        active = await store.load_active_model_completion_stage(session.id)
+        if active is None:
+            return None
+        stage = active.stage
+        if stage.state != "in_flight":
+            raise SessionStatusConflict(
+                f"{unavailable}, and the provider answered the model call of stage "
+                f"{stage.stage_id!r}, but the answer isn't published yet, {where_registered}."
+            )
+        operation: RecoverableProviderOperation | RecoverableProviderOperationStart | None
+        try:
+            operation = await load_recoverable_provider_operation(
+                store, stage
+            ) or await load_recoverable_provider_operation_start(store, stage)
+        except ProviderOperationEvidenceError:
+            operation, owned_by_provider = None, True
+        else:
+            owned_by_provider = (
+                operation is not None or stage.intent.get("provider_operation_start") is not None
+            )
+        if owned_by_provider:
+            named = (
+                f"background provider operation {operation.state.operation_id!r} at "
+                f"{operation.provider!r}"
+                if isinstance(operation, RecoverableProviderOperation)
+                else f"a background provider operation at {stage.intent.get('provider_name')!r}"
+            )
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session's run stopped inside {named} (model stage "
+                f"{stage.stage_id!r}), which has to be cancelled or collected through the "
+                f"provider, {where_registered}."
+            )
+        if stage.purpose != "assistant-turn":
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session's run stopped inside a {stage.purpose} "
+                f"model call (stage {stage.stage_id!r}), {where_registered}."
+            )
+        dispatch = await store.load_model_completion_stage_dispatch(session.id, stage.stage_id)
+        return _OrphanedModelCall(stage=stage, dispatched=dispatch is not None)
 
     async def _abandon_claimed_orphan(
         self,
         claim: _IncompleteRecoveryClaim,
         *,
+        model_call: _OrphanedModelCall | None,
         pending_round: pending_rounds.PendingToolRound | None,
         reason: str,
         metadata: dict[str, Any],
@@ -5367,15 +5511,28 @@ class IncompleteSessionRecovery:
         """Under ``claim``, fail the fenced run as abandoned and publish its evidence."""
 
         fenced = claim.session
-        # The lost run may have started model work after the first check and before the
-        # fence; now that its epoch is fenced it can start nothing more.
-        await self._require_no_orphaned_model_work(
-            fenced.id,
-            unavailable=(
-                f"The session's environment {fenced.environment_name!r} isn't registered "
-                "in this application"
-            ),
+        unavailable = (
+            f"The session's environment {fenced.environment_name!r} isn't registered "
+            "in this application"
         )
+        # The lost run may have started, dispatched or finished model work after the
+        # first check and before the fence; now that its epoch is fenced it can do
+        # nothing more. A run that moved on may still be live, so it is left alone.
+        if _OrphanedModelCall.identity(
+            await self._orphaned_model_call(fenced, unavailable=unavailable)
+        ) != _OrphanedModelCall.identity(model_call):
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session's run moved on to other model work after "
+                "it was checked, so its owner may be live; it was left alone."
+            )
+        if model_call is not None and model_call.dispatched:
+            # The call reached its provider, which may have charged for it.
+            try:
+                await self._model_completion_recovery.settle_abandoned_dispatch_budget(
+                    fenced, model_call.stage
+                )
+            except ModelCompletionManualRecoveryRequired as exc:
+                raise SessionStatusConflict(f"{unavailable}, and {exc}") from exc
         unknown_tool_calls: list[dict[str, str]] = []
         if pending_round is not None:
             calls = tuple(call.tool_call_id for call in pending_round.tool_calls)
@@ -5419,6 +5576,7 @@ class IncompleteSessionRecovery:
                 tool_round=durable_round,
                 unknown_tool_calls=unknown_tool_calls,
                 closed=closed_record,
+                model_call=None if model_call is None else model_call.record(),
             )
             return copied
 

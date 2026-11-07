@@ -2200,6 +2200,52 @@ class ModelCompletionRecovery:
             ),
         )
 
+    async def settle_abandoned_dispatch_budget(
+        self, session: Session, stage: ModelCompletionStage
+    ) -> None:
+        """Charge the budget an abandoned, dispatched assistant model call reserved.
+
+        The call reached its provider and no answer is recorded, so its spend is
+        unknown: each reservation is settled at its reserved amount, as
+        ``CayuApp.recover_model_completion_stage`` settles one. Repeating it after
+        the reservations settled changes nothing. Needs no registration: the stage
+        records the provider, model and reservations it dispatched with.
+        """
+
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        provider_name = stage.intent.get("provider_name")
+        pricing_provider_name = stage.intent.get("pricing_provider_name", provider_name)
+        model_attempt_id = stage.intent.get("model_attempt_id")
+        if (
+            stage.purpose != "assistant-turn"
+            or recovery_context is None
+            or type(pricing_provider_name) is not str
+            or type(model_attempt_id) is not str
+        ):
+            raise ModelCompletionManualRecoveryRequired(
+                "The abandoned model call lost its provider, attempt or budget identity."
+            )
+        target = model_failover_target_for_stored_stage(session=session, stage=stage)
+        await self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+            session=session, stage=stage, allow_outcome_unknown=True
+        )
+        await self._run_limit_controller.reconcile_manual_model_completion_reservations(
+            reservation_ids=stage.reservation_ids,
+            recovery_contexts=recovery_context.budget_reservations,
+            session=session,
+            provider_name=pricing_provider_name,
+            model=session.model if target is None else target.model,
+            model_attempt_identity=ModelAttemptIdentity(
+                model_step_id=stage.logical_step_id, model_attempt_id=model_attempt_id
+            ),
+            dispatch_id=stage.stage_id,
+        )
+        await self._run_limit_controller.require_model_completion_reservation_settlements(
+            reservation_ids=stage.reservation_ids,
+            recovery_contexts=recovery_context.budget_reservations,
+            dispatch_id=stage.stage_id,
+        )
+
     @staticmethod
     def validate_active_model_completion_stage(session: Session, stage) -> None:
         if stage.session_id != session.id:

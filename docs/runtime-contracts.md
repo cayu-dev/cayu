@@ -1814,7 +1814,9 @@ gone (as for `close_session` below) and whose tasks are all terminal is recovere
 unknown outcome. Where its environment isn't registered, it fails as abandoned
 instead, through the same fenced transition a close without the environment uses,
 with reason `orphaned_session_reconciled` and action `abandoned_orphaned_run` (or
-`abandoned_tool_effect` when it lists unknown calls). A session with a live owner, an
+`abandoned_tool_effect` when it lists unknown tool calls). A run that stopped inside
+an assistant model call ends the same way, with the model call abandoned as a close
+without the environment abandons it (below). A session with a live owner, an
 unfinished task, activity within the window, or no attested owner and no tasks is
 left alone and not reported; one session's failure is reported with a `failed` action
 and never stops the sweep. The sweep also finishes an abandonment that failed a
@@ -1868,9 +1870,26 @@ live owner refuses at store time), keeps each tool call that run had started as
 `outcome_unknown`, fails the session as closed in the same fenced transition from
 `running` or `interrupting`, and publishes `session.failed` under that claim; the
 environment binding and any allocation the run started stay recorded for recovery
-where the environment is registered. Without the environment, a run stopped inside a
-model call, one with a provider operation to settle, or one with child sessions other
-than forks that haven't ended is refused. Running or interrupting sessions whose
+where the environment is registered. A run stopped inside an assistant model call is
+settled without the environment too, since the environment is needed only to
+continue the run: under the same claim, a call that reached its provider has its
+budget reservations charged at their reserved amount (its spend is unknown), the
+abandonment record and `session.failed` list it in `model_call_outcome_unknown`
+(`stage_id`, `model_step_id`, `model_attempt_id`, `provider_name`), and the
+transition that fails the run's interaction settles its model stage with
+`provider_effect_outcome_unknown`; a call that never reached its provider is
+settled as failed before any effect, and its reservations released. The call is
+never made again. An abandonment that stopped before the stage settled, even one
+that died holding its recovery claim, is finished by a repeated close or by the
+sweep's unfinished-abandonment pass, which takes a new claim on the failed session to
+release the invocation, in an application with or without the environment. If the run moved on to other model work between the first check
+and the fence, its owner may be live and the close is refused. Without the
+environment, model work this can't settle is refused with a message naming it and
+saying how to settle it (register the environment and close again): a background
+provider operation, which has to be cancelled or collected through the provider, a
+provider-operation disposition still to finish, a provider answer not yet published,
+and a model call other than the assistant's turn, such as context compaction. So is a
+run with child sessions other than forks that haven't ended. Running or interrupting sessions whose
 owner is live or not known to be gone, running or interrupting children, finished
 sessions, sleeping sessions (interrupt one first, which cancels its wake), sessions
 with an unfinished task, and sessions whose agent isn't registered are refused with
