@@ -499,12 +499,22 @@ class DurableToolRound:
     ) -> tuple[dict[str, Any] | None, pending_rounds.PendingToolRound]:
         """Read one fresh snapshot; publication uses that same validated input."""
 
+        checkpoint, pending = await self._load_pending_round_if_present()
+        if pending is None:
+            raise RuntimeError(failure)
+        return checkpoint, pending
+
+    async def _load_pending_round_if_present(
+        self,
+    ) -> tuple[dict[str, Any] | None, pending_rounds.PendingToolRound | None]:
+        """Read this round's pending marker, or ``None`` once it is gone or replaced."""
+
         checkpoint, pending = await pending_round_reader.load_pending_tool_round(
             self._session_store,
             self._session.id,
         )
         if pending is None or pending_rounds.pending_tool_round_identity(pending) != self._identity:
-            raise RuntimeError(failure)
+            return checkpoint, None
         builder = current_builder()
         if builder is not None:
             builder.register_calls(pending.tool_calls)
@@ -1688,20 +1698,28 @@ class DurableToolRound:
 
         self.finish_dispatch()
         if execution.coordinator is not None:
+            if execution.admitted:
+                await self._synchronize_staged_outcomes(if_pending=True)
             async for event in self._publish_staged_terminals(
                 set(execution.staged_private_outcomes)
             ):
                 yield event
 
-    async def _synchronize_staged_outcomes(self) -> None:
-        """Refresh private limit/interruption bookkeeping from durable stages."""
+    async def _synchronize_staged_outcomes(self, *, if_pending: bool = False) -> None:
+        """Refresh private limit/interruption bookkeeping from durable stages.
+
+        With ``if_pending``, a round whose pending marker is already gone (it
+        was committed) keeps its in-memory bookkeeping instead of failing.
+        """
         execution = self._require_execution()
 
         if execution.coordinator is None:
             return
-        _, pending = await self._load_pending_round(
-            "Staged outcomes lost their pending tool-round owner."
-        )
+        _, pending = await self._load_pending_round_if_present()
+        if pending is None:
+            if if_pending:
+                return
+            raise RuntimeError("Staged outcomes lost their pending tool-round owner.")
         calls_by_id = {call.id: call for call in execution.tool_calls}
         execution.staged_private_outcomes.clear()
         for staged in pending.staged_terminals:
@@ -2054,6 +2072,12 @@ class DurableToolRound:
         if execution.coordinator is None:
             return
         self.finish_dispatch()
+        if execution.admitted:
+            # A parallel call cancelled right after committing its stage never
+            # refreshed the in-memory set. Dispatch is sealed, so the durable
+            # stages are now final and every one belongs to this round. A round
+            # already committed (closed at a limit, say) has nothing to refresh.
+            await self._synchronize_staged_outcomes(if_pending=True)
         if not execution.staged_private_outcomes:
             return
         async for event in self._publish_staged_terminals(set(execution.staged_private_outcomes)):
