@@ -34,6 +34,7 @@ from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelRequest, ModelStreamEvent
 from cayu.providers.base import ModelStreamEventType
 from cayu.runtime import _session_control
+from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory, BrokeredSandboxReuse
 from cayu.sandbox_broker import coding as coding_module
 from cayu.sessions import InMemorySessionStore
@@ -45,7 +46,9 @@ from cayu.tools import (
     SearchTextTool,
     WriteFileTool,
 )
+from cayu.tools._resources import invocation_workspace_handle
 from cayu.tools.base import ToolContext
+from cayu.vaults import SecretRedactor
 from cayu.workspaces import LocalWorkspace
 from tests.sandbox_broker.fake_broker import FakeBroker
 
@@ -75,6 +78,14 @@ BUDGETS: dict[str, dict[str, int]] = {
     "read_file several files": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 36},
     "write_file create": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 27},
     "edit_file": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 32},
+    # The same calls through the invocation workspace handle the Runtime gives tools,
+    # with no secret in scope.
+    "read_file line range under the Runtime": {
+        "sandbox_commands": 1,
+        "broker_requests": 2,
+        "command_kib": 32,
+    },
+    "edit_file under the Runtime": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 32},
     "search_text": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 1},
     "search_text with path": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 2},
     "search_text with glob": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 2},
@@ -232,6 +243,9 @@ class _BrokerMeter:
         return counts, breakdown
 
 
+_UNDER_THE_RUNTIME = " under the Runtime"
+
+
 def _tool_calls(*, with_search: bool) -> list[tuple[str, Tool, dict[str, Any]]]:
     calls: list[tuple[str, Tool, dict[str, Any]]] = [
         ("read_file whole", ReadFileTool(), {"path": "notes.txt"}),
@@ -267,6 +281,17 @@ def _tool_calls(*, with_search: bool) -> list[tuple[str, Tool, dict[str, Any]]]:
             "edit_file",
             EditFileTool(),
             {"path": "notes.txt", "edits": [{"old_text": "line 7\n", "new_text": "line seven\n"}]},
+        ),
+        (
+            "read_file line range" + _UNDER_THE_RUNTIME,
+            ReadFileTool(),
+            {"path": "notes.txt", "start_line": 5, "end_line": 9},
+        ),
+        # The revision comes from the edit above.
+        (
+            "edit_file" + _UNDER_THE_RUNTIME,
+            EditFileTool(),
+            {"path": "notes.txt", "edits": [{"old_text": "line 8\n", "new_text": "line eight\n"}]},
         ),
     ]
     if with_search:
@@ -321,14 +346,29 @@ async def _measure_brokered_session(
     observed["sandbox setup"] = setup
 
     context = ToolContext(session_id="coding", runner=bound.runner, workspace=bound.workspace)
+    # What the Runtime hands a tool: the workspace behind its invocation handle.
+    secrets = InvocationSecretTracker(SecretRedactor())
+    runtime_context = ToolContext(
+        session_id="coding",
+        runner=bound.runner,
+        workspace=invocation_workspace_handle(
+            bound.workspace,
+            redactor_snapshot_provider=secrets.snapshot,
+            capture_observer=secrets.record_ambiguous_output_capture,
+        ),
+        invocation_secret_snapshot_provider=secrets.snapshot,
+    )
     revision = None
     for name, tool, arguments in _tool_calls(with_search=with_search):
-        if name == "edit_file":
+        if name.startswith("edit_file"):
             arguments = {**arguments, "expected_revision": revision}
-        result = await tool.run(context, arguments)
+        under_runtime = name.endswith(_UNDER_THE_RUNTIME)
+        result = await tool.run(runtime_context if under_runtime else context, arguments)
         assert not result.is_error, (name, result.content)
         if name == "read_file whole":
             revision = result.structured["revision"]
+        elif name.startswith("edit_file"):
+            revision = result.structured["after_revision"]
         observed[name], breakdown[name] = meter.take()
 
     snapshot = await binding.finalize(bound, outcome="completed")

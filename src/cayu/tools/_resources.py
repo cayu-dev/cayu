@@ -17,6 +17,7 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
 )
+from cayu.tools._file_lines import locate_workspace_lines
 from cayu.tools._operation_boundary import await_invocation_operation
 from cayu.tools._redaction import (
     InvocationRedactorSnapshot,
@@ -36,7 +37,12 @@ from cayu.workspaces.base import (
     WorkspaceFileReadOutcome,
     WorkspaceFileReadRequest,
     WorkspaceLineRead,
+    WorkspaceLineReader,
+    WorkspaceLineSpan,
     WorkspaceManifestLimits,
+    WorkspaceTextEditor,
+    WorkspaceTextEditResult,
+    WorkspaceTextReplacement,
 )
 from cayu.workspaces.revisions import _runner_revision_manifest_capture
 
@@ -321,8 +327,16 @@ def _bounded_workspace_read_limit(workspace: Workspace, max_bytes: int) -> int:
     return value
 
 
-class InvocationWorkspaceHandle(Workspace, WorkspaceFileBatchReader):
-    """Workspace facade that redacts byte reads before their public bound."""
+class InvocationWorkspaceHandle(
+    Workspace, WorkspaceFileBatchReader, WorkspaceLineReader, WorkspaceTextEditor
+):
+    """Workspace facade that redacts byte reads before their public bound.
+
+    It forwards the delegate's batch reads, line reads and text edits. Line
+    reads and edits are forwarded only while no secret is in scope: a line
+    span counts the file's raw bytes and an edit plans from them, so with a
+    secret in scope both take the separate redacted reads instead.
+    """
 
     __slots__ = (
         "__capture_observer",
@@ -523,6 +537,182 @@ class InvocationWorkspaceHandle(Workspace, WorkspaceFileBatchReader):
             # batch cut short, is left to the file's own read.
             outcomes[index] = None if isinstance(projected, _ReadFailure) else projected
         return tuple(outcomes)
+
+    def _secrets_in_scope(self) -> bool:
+        snapshot = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+        return snapshot.redactor.has_values
+
+    def line_reader(self) -> WorkspaceLineReader | None:
+        if self.__workspace.line_reader() is None or self._secrets_in_scope():
+            return None
+        return self
+
+    async def read_lines(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None = None,
+        before_bytes: int = 0,
+        after_bytes: int = 0,
+        max_bytes: int,
+        head_bytes: int = 0,
+    ) -> WorkspaceLineRead:
+        """Read the lines in one delegate call while no secret is in scope.
+
+        With a secret in scope, or one that came into scope during the call,
+        the range is located and read through this handle's redacted
+        ``read_bytes``, as a caller without a line reader would.
+        """
+
+        snapshot = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+        reader = self.__workspace.line_reader()
+        if reader is not None and not snapshot.redactor.has_values:
+            captured = await _read_workspace_lines_delegate(
+                reader,
+                path=path,
+                start_line=start_line,
+                end_line=end_line,
+                before_bytes=before_bytes,
+                after_bytes=after_bytes,
+                max_bytes=max_bytes,
+                head_bytes=head_bytes,
+                redactor_snapshot_provider=self.__redactor_snapshot_provider,
+            )
+            if isinstance(captured, _ReadCancellation):
+                del path, snapshot, self
+                _raise_clean_read_cancellation(captured)
+            if isinstance(captured, _ReadFailure):
+                del path, snapshot, self
+                _raise_workspace_read_failure(captured)
+            current = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+            if current.revision == snapshot.revision and current.redactor.has_same_registry(
+                snapshot.redactor
+            ):
+                self.__capture_observer(current.revision)
+                return captured
+            del captured
+        return await self._read_lines_in_steps(
+            path,
+            start_line=start_line,
+            end_line=end_line,
+            before_bytes=before_bytes,
+            after_bytes=after_bytes,
+            max_bytes=max_bytes,
+            head_bytes=head_bytes,
+        )
+
+    async def _read_lines_in_steps(
+        self,
+        path: str,
+        *,
+        start_line: int,
+        end_line: int | None,
+        before_bytes: int,
+        after_bytes: int,
+        max_bytes: int,
+        head_bytes: int,
+    ) -> WorkspaceLineRead:
+        span = await locate_workspace_lines(self, path, start_line=start_line, end_line=end_line)
+        offset = span.start_offset - min(span.start_offset, before_bytes)
+        window_end = min(span.total_bytes, span.end_offset + after_bytes)
+        window = await self.read_bytes(
+            path, offset=offset, max_bytes=max(1, min(max_bytes, window_end - offset))
+        )
+        head = (
+            await self.read_bytes(path, max_bytes=head_bytes)
+            if head_bytes and span.start_offset
+            else None
+        )
+        if window.total_bytes != span.total_bytes and window.total_bytes >= span.end_offset:
+            # The file grew after it was located, as a log does. The located
+            # lines are where they were; the count past them is not known.
+            span = WorkspaceLineSpan(
+                start_offset=span.start_offset,
+                end_offset=span.end_offset,
+                total_bytes=window.total_bytes,
+                total_lines=None,
+            )
+        if head is not None and head.total_bytes != window.total_bytes:
+            # The caller reads the head itself.
+            head = None
+        try:
+            return WorkspaceLineRead(span=span, window=window, head=head)
+        except (TypeError, ValueError):
+            raise InvocationResourceReadError(
+                "Workspace file shrank while its lines were read."
+            ) from None
+
+    def text_editor(self) -> WorkspaceTextEditor | None:
+        if self.__workspace.text_editor() is None or self._secrets_in_scope():
+            return None
+        return self
+
+    async def edit_text(
+        self,
+        path: str,
+        replacements: Sequence[WorkspaceTextReplacement],
+        *,
+        expected_revision: str,
+        max_bytes: int,
+    ) -> WorkspaceTextEditResult:
+        """Edit in one delegate call while no secret is in scope.
+
+        With a secret in scope the edit is left unapplied, with the file read
+        through this handle's redacted ``read_bytes``, and the caller replaces
+        the file itself.
+        """
+
+        snapshot = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+        editor = self.__workspace.text_editor()
+        if (
+            editor is None
+            or snapshot.redactor.has_values
+            # The separate read is bounded by the workspace's read limit; an
+            # edit that limit cuts short is refused there, so it is left to it.
+            or _bounded_workspace_read_limit(self.__workspace, max_bytes) < max_bytes
+        ):
+            return WorkspaceTextEditResult(
+                read=await self.read_bytes(path, max_bytes=max_bytes), mutation=None
+            )
+        replacements = tuple(replacements)
+
+        async def edit() -> WorkspaceTextEditResult:
+            try:
+                edited = await editor.edit_text(
+                    path,
+                    replacements,
+                    expected_revision=expected_revision,
+                    max_bytes=max_bytes,
+                )
+            except (FileNotFoundError, ValueError) as error:
+                # A missing or refused path fails before anything is written,
+                # so it is reported as this handle's read_bytes reports it.
+                failure = _workspace_read_failure_exception(_workspace_failure_from_error(error))
+                del error
+                raise failure from None
+            return _copy_workspace_text_edit(edited, max_bytes=max_bytes)
+
+        def observe(result: Any) -> None:
+            observer = self.__direct_mutation_observer
+            if observer is None:
+                return
+            # An applied edit is the replace_bytes the caller would have made.
+            if type(result) is not WorkspaceTextEditResult:
+                with suppress(Exception):
+                    observer("replace_bytes", path, None)
+            elif result.mutation is not None:
+                with suppress(Exception):
+                    observer("replace_bytes", path, result.mutation)
+
+        if self.__mutation_owner is None:
+            edited = await edit()
+            observe(edited)
+        else:
+            edited = await self.__mutation_owner.run(edit, result_observer=observe)
+        # The edit's read reached the caller under this secret revision.
+        self.__capture_observer(snapshot.revision)
+        return edited
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return self.__workspace.bounded_read_limit(max_bytes)
@@ -929,6 +1119,40 @@ async def _read_workspace_delegate(
     return _copy_workspace_read_result(result, max_bytes=max_bytes)
 
 
+async def _read_workspace_lines_delegate(
+    reader: WorkspaceLineReader,
+    *,
+    path: str,
+    start_line: int,
+    end_line: int | None,
+    before_bytes: int,
+    after_bytes: int,
+    max_bytes: int,
+    head_bytes: int,
+    redactor_snapshot_provider: Callable[[], Any],
+) -> WorkspaceLineRead | _ReadFailure | _ReadCancellation:
+    def operation_factory(
+        reader: WorkspaceLineReader = reader,
+        path: str = path,
+    ) -> Awaitable[WorkspaceLineRead]:
+        return reader.read_lines(
+            path,
+            start_line=start_line,
+            end_line=end_line,
+            before_bytes=before_bytes,
+            after_bytes=after_bytes,
+            max_bytes=max_bytes,
+            head_bytes=head_bytes,
+        )
+
+    del reader, path
+    result = await _await_workspace_delegate(operation_factory, redactor_snapshot_provider)
+    del operation_factory, redactor_snapshot_provider
+    if isinstance(result, _ReadFailure | _ReadCancellation):
+        return result
+    return _copy_workspace_line_read(result, max_bytes=max_bytes, head_bytes=head_bytes)
+
+
 async def _read_workspace_batch_delegate(
     reader: WorkspaceFileBatchReader,
     requests: tuple[WorkspaceFileReadRequest, ...],
@@ -1018,19 +1242,43 @@ def _copy_workspace_read_result(
         return _ReadFailure("invalid_workspace_result")
 
 
-def _copy_workspace_line_read(result: object) -> WorkspaceLineRead | _ReadFailure:
+def _copy_workspace_line_read(
+    result: object, *, max_bytes: int | None = None, head_bytes: int | None = None
+) -> WorkspaceLineRead | _ReadFailure:
     """A delegate's line read, rebuilt; only when no secret is in scope to redact."""
 
     if type(result) is not WorkspaceLineRead:
         return _ReadFailure("invalid_workspace_result")
-    window = _copy_workspace_read_result(result.window, max_bytes=None)
-    head = None if result.head is None else _copy_workspace_read_result(result.head, max_bytes=None)
+    window = _copy_workspace_read_result(result.window, max_bytes=max_bytes)
+    head = (
+        None
+        if result.head is None
+        else _copy_workspace_read_result(result.head, max_bytes=head_bytes)
+    )
     if isinstance(window, _ReadFailure) or isinstance(head, _ReadFailure):
         return _ReadFailure("invalid_workspace_result")
     try:
         return WorkspaceLineRead(span=result.span, window=window, head=head)
     except BaseException:
         return _ReadFailure("invalid_workspace_result")
+
+
+def _copy_workspace_text_edit(result: object, *, max_bytes: int) -> WorkspaceTextEditResult:
+    """A delegate's text edit, rebuilt; only when no secret is in scope to redact."""
+
+    if type(result) is not WorkspaceTextEditResult:
+        raise InvocationResourceReadError("Workspace edit returned an invalid result.")
+    read = _copy_workspace_read_result(result.read, max_bytes=max_bytes)
+    if isinstance(read, _ReadFailure):
+        raise InvocationResourceReadError("Workspace edit returned an invalid result.")
+    mutation = result.mutation
+    try:
+        return WorkspaceTextEditResult(
+            read=read,
+            mutation=None if mutation is None else replace(mutation),
+        )
+    except (TypeError, ValueError):
+        raise InvocationResourceReadError("Workspace edit returned an invalid result.") from None
 
 
 async def _read_artifact_delegate(
