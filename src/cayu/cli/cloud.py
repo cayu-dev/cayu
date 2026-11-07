@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Never
 from urllib.parse import quote, urlsplit
 
+from cayu.cli._cloud_activity import activity_command, add_activity_parser
 from cayu.cli._cloud_agent_homes import (
     AgentOrganizationError,
     Organization,
@@ -1442,6 +1443,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_settings_parser(commands)
     add_sandboxes_parser(commands)
+    add_activity_parser(commands)
 
     add_data_parser(commands)
 
@@ -2461,6 +2463,12 @@ def _client_command(
         )
     if arguments.command == "sandboxes":
         return sandboxes_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+        )
+    if arguments.command == "activity":
+        return activity_command(
             arguments,
             client=client,
             application_id=_application_id(client, arguments.application),

@@ -39,6 +39,7 @@ cayu cloud service status --application my-agent
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
 - `sandboxes list|show` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
+- `activity status` to [read how Cloud reads an Agent's activity](#clouds-activity-reader);
 - `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
@@ -1741,6 +1742,39 @@ export CAYU_CLOUD_READER_TOKEN_SHA256=$(printf %s "$token" | shasum -a 256 | cut
 cayu serve
 curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/cloud/v1/activity
 ```
+
+### Cloud's activity reader
+
+`cayu cloud activity status --application NAME` shows where Cloud's reader for an Agent
+stands, for anyone who may see the Agent:
+
+```bash
+cayu cloud activity status --application cayu-scout
+cayu cloud activity status --application cayu-scout --json
+```
+
+It prints:
+
+- `availability`: `ready`, `catching_up` (more pages wait), `stale` (no page for five
+  minutes), `not_active` (no reader activated yet), or the last read's reason code, such as
+  `runtime_unavailable` for an Agent that timed out or answered with an error;
+- the event position the cursor names (`after event N`, or `before the first event`) and
+  when an accepted page last moved it on. A page that arrives without new activity leaves
+  it where it was, so `cursor advanced` can be older than `last page`;
+- the last read: whether a page arrived, timed out or failed (with its reason code), how
+  long it took, how many runs it asked for, and how many runs and touches it got;
+- the last ten reads that ran out Cloud's ten-second deadline;
+- how many runs the next page asks for, between 10 and 200. After a page read times out,
+  Cloud asks for a quarter as many runs and grows the size again as pages arrive. The size
+  is the one the Cloud process that read last left; a restarted one starts at 200 again.
+
+It prints a table by default; `--json` prints the JSON envelope the other `cayu cloud`
+commands print, with `schema_version` in its result and `reader: null` for an Agent Cloud
+has no reader for yet. Nothing in it is a credential: it carries no token, digest or URL,
+and only the cursor's event position, never the cursor. A Cloud without the route answers
+with category `activity_status_unsupported`. The command reads
+`GET /v1/applications/{id}/activity/reader`; `cayu.cli._cloud_activity.read_activity_reader_status`
+reads it with any signed-in `CloudApiClient`.
 
 ## Local deploy check
 
