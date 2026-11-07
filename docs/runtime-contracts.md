@@ -8192,10 +8192,18 @@ same non-claimable state.
 Cancelling an idle ordinary task terminalizes it immediately. Cancelling an
 ordinary task with a live worker instead records a durable
 `cancellation_requested` intent while retaining the exact worker and lease. The
-built-in worker observes that intent through its heartbeat, retains the handler
-without cancelling its potentially opaque wrapper, continues renewing the lease
-until the handler naturally settles, and then commits a
-claim-fenced `cancelled` terminalization and its immutable receipt. The stored
+built-in worker observes that intent through its heartbeat and delivers it to
+the handler: it requests the handler's `current_task_cancellation()` signal, so
+new top-level `app.run` calls in the handler are refused with
+`TaskCancellationRequested`, and after the worker's grace period
+(`execution_grace_s`) it cancels the handler once, so a run still in flight ends
+`session.interrupted`. `run_task_worker(interrupt_on_cancel=False)` keeps the
+signal but never cancels the handler. Either way the worker continues renewing
+the lease until the handler has actually stopped (a handler that resists
+cancellation keeps the claim), and then commits a claim-fenced `cancelled`
+terminalization and its immutable receipt. Cancelling an opaque wrapper does not
+stop a thread, subprocess or remote call it delegated to; such a handler should
+watch the signal or run with `interrupt_on_cancel=False`. The stored
 cancellation intent wins a concurrent completion or failure. Expired-claim
 reclamation excludes a cancellation-requested task because lease expiry proves
 only owner loss, not handler quiescence or external-effect settlement.
@@ -8379,9 +8387,10 @@ time is before the elapsed deadline. Success, cancellation, and every terminal
 disposition create no successor. Direct cancellation of an idle attempt
 atomically writes the ordinary retry settlement receipt/events. Cancellation of
 a worker-owned active attempt instead records a durable cancellation request
-while retaining its worker and lease. The built-in worker retains its handler
-without cancelling its potentially opaque wrapper, keeps heartbeating until the
-handler naturally settles, and only then writes the
+while retaining its worker and lease. The built-in worker delivers the request
+to its handler exactly as for an ordinary task (signal, then cancellation after
+the grace period unless `interrupt_on_cancel=False`), keeps heartbeating until
+the handler has stopped, and only then writes the
 terminal cancellation receipt. If the quiescent handler returns a typed attempt
 report, its token and cost usage is preserved in that operator-authoritative
 cancellation settlement; the report's disposition and payload cannot replace

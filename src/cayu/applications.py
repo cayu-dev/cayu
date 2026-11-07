@@ -741,6 +741,7 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphSnapshot,
 )
+from cayu.tasks.handler_cancellation import refuse_run_after_task_cancellation
 from cayu.tasks.records import Task
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
@@ -7057,6 +7058,8 @@ class CayuApp(
             parent.execution_deadline if parent is not None else ExecutionDeadline(),
         )
         boundary.require_admission("child_run" if parent is not None else "run")
+        if parent is None:
+            refuse_run_after_task_cancellation()
         handler_limit = admit_handler_run() if parent is None else None
         request = request.model_copy(update={"execution_deadline": boundary})
         if request.session_id is None:

@@ -50,10 +50,12 @@ from cayu._task_wait import (
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.approvals.tools import ResolutionActor, ResolutionActorSource
 from cayu.deadlines import (
+    _DEFAULT_HANDLER_GRACE_SECONDS,
     ExecutionDeadline,
     ExecutionDeadlineExceeded,
     HandlerTimeLimit,
     default_run_deadline,
+    handler_grace_seconds,
     require_handler_seconds,
 )
 from cayu.events import (
@@ -157,6 +159,7 @@ from cayu.tasks.cancellation import (
     _task_retry_cancellation_requested,
 )
 from cayu.tasks.continuation_claims import TaskContinuationExpectation, TaskContinuationUnsupported
+from cayu.tasks.handler_cancellation import TaskCancellationSignal
 from cayu.tasks.handoff import (
     InterruptedTaskContinuationClaimPage,
     TaskInterruptedHandoffConflict,
@@ -454,6 +457,34 @@ class _TaskRetryQuiescence:
 
 
 @dataclass(frozen=True)
+class _TaskCancellationDelivery:
+    """How a running handler hears that its task was asked to stop."""
+
+    signal: TaskCancellationSignal
+    # Seconds between the request and cancelling the handler; None never cancels it.
+    interrupt_after_s: float | None
+    # Whether the callback is still running and nothing else has cancelled it yet.
+    may_interrupt: Callable[[], bool]
+
+
+def _cancellation_grace_seconds(
+    *,
+    interrupt_on_cancel: bool,
+    execution_timeout_s: float | None,
+    execution_grace_s: float | None,
+) -> float | None:
+    """The grace a cancelled handler gets: the handler time limit's grace period."""
+
+    if not interrupt_on_cancel:
+        return None
+    if execution_grace_s is not None:
+        return execution_grace_s
+    if execution_timeout_s is not None:
+        return handler_grace_seconds(execution_timeout_s, None)
+    return _DEFAULT_HANDLER_GRACE_SECONDS
+
+
+@dataclass(frozen=True)
 class _InterruptedHandoffRecoveryPage:
     """One scheduler-bounded expired-owner recovery turn."""
 
@@ -524,6 +555,7 @@ async def run_task_worker(
     concurrency: int = 1,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
+    interrupt_on_cancel: bool = True,
 ) -> int:
     """Claim and handle durable tasks until stopped; return the number handled.
 
@@ -637,6 +669,19 @@ async def run_task_worker(
       limit by default, so this limit decides. When the worker claims a task
       whose event budget is shorter than ``execution_timeout_s``, it logs a
       warning once per task type; the budget still applies.
+    - ``interrupt_on_cancel`` decides what happens when a running task is
+      cancelled (``TaskStore.cancel_task``, ``cayu task cancel``). The worker
+      sees the request at its next heartbeat and requests the handler's
+      :func:`cayu.tasks.current_task_cancellation` signal, so new top-level
+      runs in the call are refused with ``TaskCancellationRequested`` and
+      handler code can stop work that is not an ``app.run``. With ``True``
+      (the default) the handler is then cancelled once the grace period
+      passes (``execution_grace_s``; without it the time limit's default
+      grace, or 30 seconds when there is no limit), so a run still in flight
+      ends ``session.interrupted``. With ``False`` the worker only signals and
+      waits, for handlers that must not be interrupted. Either way it keeps
+      renewing the lease until the handler has stopped and then settles the
+      task ``cancelled`` with the request's reason, whatever the handler did.
     """
     until_idle = _take_until_idle_state()
     if until_idle is not None and recovered_interrupted_task_handler is None:
@@ -651,6 +696,8 @@ async def run_task_worker(
         HandlerTimeLimit(execution_timeout_s, grace_s=execution_grace_s)
     elif execution_grace_s is not None:
         require_handler_seconds(execution_grace_s, "execution_grace_s")
+    if type(interrupt_on_cancel) is not bool:
+        raise TypeError("interrupt_on_cancel must be a bool.")
     if metrics is not None and not isinstance(metrics, DurableWorkerMetrics):
         raise TypeError("metrics must be a DurableWorkerMetrics instance.")
     demand_policy = DurableWorkerDemandPolicy(
@@ -1025,6 +1072,7 @@ async def run_task_worker(
                         stop=slot_stop,
                         execution_timeout_s=execution_timeout_s,
                         execution_grace_s=execution_grace_s,
+                        interrupt_on_cancel=interrupt_on_cancel,
                         event_budget_check=event_budget_check,
                     )
                 continuation_scan_scanned += continuation_page.scanned_candidates
@@ -1260,6 +1308,7 @@ async def run_task_worker(
                             lease_seconds,
                             execution_timeout_s=execution_timeout_s,
                             execution_grace_s=execution_grace_s,
+                            interrupt_on_cancel=interrupt_on_cancel,
                             event_budget_check=event_budget_check,
                         )
                 finally:
@@ -1503,6 +1552,7 @@ async def _handle_with_heartbeat(
     recover_interrupted_authority_loss: bool = False,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
+    interrupt_on_cancel: bool = True,
     event_budget_check: EventBudgetCheck | None = None,
 ) -> None:
     settlement = TaskExecutionSettlement(task_store, app._secret_redactor)
@@ -1519,6 +1569,7 @@ async def _handle_with_heartbeat(
             recover_interrupted_authority_loss=recover_interrupted_authority_loss,
             execution_timeout_s=execution_timeout_s,
             execution_grace_s=execution_grace_s,
+            interrupt_on_cancel=interrupt_on_cancel,
             event_budget_check=event_budget_check,
         )
         # This worker owns the settlement it created. A write that outlives one
@@ -1554,8 +1605,16 @@ async def _handle_with_heartbeat_owned(
     recover_interrupted_authority_loss: bool,
     execution_timeout_s: float | None,
     execution_grace_s: float | None,
+    interrupt_on_cancel: bool = True,
     event_budget_check: EventBudgetCheck | None = None,
 ) -> None:
+    # Cancellation keeps the worker's grace even when the event budget below
+    # leaves the time limit none.
+    cancellation_grace_s = _cancellation_grace_seconds(
+        interrupt_on_cancel=interrupt_on_cancel,
+        execution_timeout_s=execution_timeout_s,
+        execution_grace_s=execution_grace_s,
+    )
     # The task timeout may be shorter, but it can never extend its event.
     event_key = task.invocation.event_retry_key
     event_limit = False
@@ -1663,6 +1722,7 @@ async def _handle_with_heartbeat_owned(
                     time_limit=time_limit,
                     event_deadline=event_deadline,
                     event_dispatch_deadline=event_dispatch_deadline,
+                    cancellation_grace_s=cancellation_grace_s,
                 )
             except _TaskRetryElapsed as exc:
                 retry_elapsed = True
@@ -2074,6 +2134,7 @@ async def _await_task_handler(
     time_limit: HandlerTimeLimit | None,
     event_deadline: ExecutionDeadline | None,
     event_dispatch_deadline: float | None,
+    cancellation_grace_s: float | None = None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
@@ -2081,6 +2142,17 @@ async def _await_task_handler(
     settlement_authority = copy_task(task)
 
     callback_done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    # A cancellation request reaches the handler through this signal, then by
+    # cancelling it after the grace period unless the worker opted out. A
+    # callback that already returned (its acknowledgement may still be in
+    # flight) or that its time limit already cancelled is not cancelled again.
+    cancellation = _TaskCancellationDelivery(
+        signal=TaskCancellationSignal(),
+        interrupt_after_s=cancellation_grace_s,
+        may_interrupt=lambda: (
+            not callback_done.done() and (time_limit is None or not time_limit.cancelled)
+        ),
+    )
 
     async def invoke_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
         from cayu.deadlines import task_event_deadline_scope
@@ -2114,14 +2186,17 @@ async def _await_task_handler(
                 kind="tasks",
             ),
         ):
-            with default_run_deadline(
-                ExecutionDeadline.after(None, source="task_worker")
-                if time_limit is None
-                else (
-                    event_deadline
-                    if time_limit.source == "task_event" and event_deadline is not None
-                    else time_limit.run_deadline()
-                )
+            with (
+                cancellation.signal.bind(),
+                default_run_deadline(
+                    ExecutionDeadline.after(None, source="task_worker")
+                    if time_limit is None
+                    else (
+                        event_deadline
+                        if time_limit.source == "task_event" and event_deadline is not None
+                        else time_limit.run_deadline()
+                    )
+                ),
             ):
                 result = await handler(app, handler_view, worker_id)
         return result
@@ -2271,6 +2346,7 @@ async def _await_task_handler(
                 handler_task,
                 cancellation_baseline,
                 lease_authority,
+                cancellation=cancellation,
             )
             raise _TaskRetryCancellationRequested(
                 quiescence.owner_cancellation,
@@ -2299,6 +2375,7 @@ async def _await_task_handler(
                 handler_task,
                 cancellation_baseline,
                 lease_authority,
+                cancellation=cancellation,
             )
             raise _TaskRetryCancellationRequested(
                 quiescence.owner_cancellation,
@@ -3554,8 +3631,15 @@ async def _quiesce_task_retry_handler_before_terminalization(
     handler_task: asyncio.Future[Any],
     cancellation_baseline: int,
     lease_authority: _TaskLeaseAuthority,
+    *,
+    cancellation: _TaskCancellationDelivery | None = None,
 ) -> _TaskRetryQuiescence:
-    """Retain the claim until the handler naturally settles."""
+    """Retain the claim until the handler settles.
+
+    With ``cancellation``, the handler is first told that its task was asked to
+    stop and, unless the worker opted out, cancelled once the grace period
+    passes. The claim is still retained until the handler is actually done.
+    """
 
     interval = min(lease_seconds / 3, 1.0)
     owner_task = asyncio.current_task()
@@ -3563,9 +3647,25 @@ async def _quiesce_task_retry_handler_before_terminalization(
         raise RuntimeError("Task retry handler quiescence requires an owning task.")
     owner_cancellation: asyncio.CancelledError | None = None
     lease_maintenance_failure: BaseException | None = None
+    interrupt_at: float | None = None
+    if cancellation is not None and not handler_task.done():
+        cancellation.signal.request()
+        if cancellation.interrupt_after_s is not None:
+            interrupt_at = monotonic() + cancellation.interrupt_after_s
     while not handler_task.done():
         try:
-            completed, _pending = await asyncio.wait((handler_task,), timeout=interval)
+            timeout = interval
+            if interrupt_at is not None:
+                remaining = interrupt_at - monotonic()
+                if remaining <= 0:
+                    # Cancel once, as the handler time limit does. A handler
+                    # that resists keeps the claim until it returns.
+                    interrupt_at = None
+                    if cancellation is not None and cancellation.may_interrupt():
+                        handler_task.cancel()
+                    continue
+                timeout = min(interval, remaining)
+            completed, _pending = await asyncio.wait((handler_task,), timeout=timeout)
             if handler_task in completed:
                 break
             renewed = await task_store.heartbeat(
@@ -3585,10 +3685,7 @@ async def _quiesce_task_retry_handler_before_terminalization(
             if lease_maintenance_failure is None:
                 lease_maintenance_failure = exc
         except BaseException:
-            # The durable cancellation request keeps replacement disabled. Do
-            # not cancel an opaque wrapper: its delegated thread, subprocess,
-            # adapter, or remote call may still be running after the wrapper
-            # reports cancellation.
+            # The durable cancellation request keeps replacement disabled.
             raise
     report: TaskRetryAttemptReport | None = None
     try:
@@ -4566,6 +4663,7 @@ async def _run_recovered_interrupted_task_handler(
     stop: asyncio.Event | None = None,
     execution_timeout_s: float | None = None,
     execution_grace_s: float | None = None,
+    interrupt_on_cancel: bool = True,
     event_budget_check: EventBudgetCheck | None = None,
 ) -> InterruptedTaskContinuationClaimPage:
     """Scan one bounded page and supervise its optional continuation claim."""
@@ -4662,6 +4760,7 @@ async def _run_recovered_interrupted_task_handler(
         recover_interrupted_authority_loss=True,
         execution_timeout_s=execution_timeout_s,
         execution_grace_s=execution_grace_s,
+        interrupt_on_cancel=interrupt_on_cancel,
         event_budget_check=event_budget_check,
     )
     return page

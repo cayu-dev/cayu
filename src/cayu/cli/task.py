@@ -171,8 +171,12 @@ def add_task_parser(subparsers: Any) -> None:
         help="Cancel a task.",
         description=(
             "Cancel a task. Idle work is cancelled at once; a task a worker is running is "
-            "asked to stop and is cancelled once its worker has stopped (its reason shows "
-            "cancellation_requested until then). Tasks that depend on it are then skipped. "
+            "asked to stop and is cancelled once its handler has stopped (its reason shows "
+            "cancellation_requested until then). The worker sees the request at its next "
+            "heartbeat, refuses new runs in the handler, gives it the worker's grace period "
+            "(30 seconds by default) and then cancels it, so its running sessions end "
+            "interrupted, unless the worker was started with interrupt_on_cancel=False. "
+            "Tasks that depend on it are then skipped. "
             "Inspect the result with `cayu task show TASK_ID`."
         ),
     )

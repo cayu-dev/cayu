@@ -364,6 +364,13 @@ bounds a hung call. Which limit ends what:
   These are configurable retry limits, not a deadline that cancels a model call.
   Choose them for the provider and workload before retrying whole sessions;
   see `cayu guide providers#provider-retries`.
+- `cayu task cancel` (or `cancel_task`) ends a running handler early: at the
+  worker's next heartbeat `current_task_cancellation().requested` is true and new
+  runs are refused with `TaskCancellationRequested`; after the grace period the
+  handler is cancelled and a running session ends `session.interrupted`. The
+  task settles `cancelled` with the operator's reason once the handler stops.
+  Watch the signal (`await current_task_cancellation().wait()`) to stop a
+  subprocess or thread; `run_task_worker(interrupt_on_cancel=False)` only signals.
 
 A delivery still running at the limit is cancelled and may or may not have
 happened, so make it idempotent. Don't catch `asyncio.CancelledError`: a
