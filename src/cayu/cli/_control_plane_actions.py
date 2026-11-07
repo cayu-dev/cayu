@@ -317,18 +317,32 @@ def run_action(args: argparse.Namespace) -> int:
                 )
                 return 0
             except (CayuApiError, ValueError, OSError) as exc:
-                # Never echo server-controlled detail or arbitrary file contents on failure.
-                message = (
-                    str(exc)
-                    if not isinstance(exc, CayuApiError)
-                    else (
-                        "Mutation outcome is unknown; inspect the result and retain the same operation ID and input before retrying."
-                        if exc.category == "outcome_unknown"
-                        else f"Server refused the request ({exc.category}, HTTP {exc.status_code})."
+                # Never echo arbitrary file contents or a server body on failure; only the
+                # route's own bounded reason and code, which `CayuApi` already vetted.
+                error: dict[str, Any] = {}
+                if not isinstance(exc, CayuApiError):
+                    message = str(exc)
+                elif exc.category == "outcome_unknown":
+                    message = (
+                        "Mutation outcome is unknown; inspect the result and retain the same "
+                        "operation ID and input before retrying."
                     )
-                )
+                else:
+                    message = (
+                        f"Server refused the request ({exc.category}, HTTP {exc.status_code})"
+                        + (f": {exc.detail}" if exc.detail else ".")
+                        + (f" ({exc.code})" if exc.code else "")
+                    )
+                    error = {
+                        "category": exc.category,
+                        "status_code": exc.status_code,
+                        **({"detail": exc.detail} if exc.detail else {}),
+                        **({"code": exc.code} if exc.code else {}),
+                    }
                 if args.output_format == "json":
-                    print(json.dumps({"schema_version": "1", "error": {"message": message}}))
+                    print(
+                        json.dumps({"schema_version": "1", "error": {"message": message, **error}})
+                    )
                 else:
                     print(f"error: {terminal_safe(message)}", file=sys.stderr)
                 return 1

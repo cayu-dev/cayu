@@ -1401,8 +1401,12 @@ locally.
 A failure names its cause in `error.category`: `not_serving` when the Agent's service is
 stopped or failing, `no_address` when it serves no Cayu address (an Agent without a `[web]`
 process), `credentials_rejected` when the Agent doesn't accept its Developer dashboard
-login, `not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is
-older than the command needs.
+login (HTTP 401), `forbidden` when it accepts the login but refuses the request (HTTP 403,
+with the route's own reason and, when it gives one, its code, such as `role_forbidden`),
+`not_served` when it doesn't serve Cayu's API, and `unsupported` when its Cayu is older
+than the command needs. A refused `cayu task` or `cayu knowledge` action prints the
+route's reason too, and its JSON error carries `category`, `status_code`, `detail` and
+`code`.
 
 `cayu session list|show|interactions|usage|tools|events|transcript|output --application
 my-agent` reads the Agent's sessions the same way; see

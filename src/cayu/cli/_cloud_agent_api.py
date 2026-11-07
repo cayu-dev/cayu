@@ -19,6 +19,7 @@ import argparse
 import base64
 import ipaddress
 import math
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -38,6 +39,8 @@ _ROUTE_NOT_FOUND = "Not Found"
 # The most bytes one answer may carry; a full page of session events with payloads fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_DETAIL_CHARS = 512
+# A refusal code worth repeating: a short identifier, like `role_forbidden`.
+_REFUSAL_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
 # The answers a Cayu route gives for success: 200 for a read, 201 for a created resource (an
 # imported eval corpus) and 202 for accepted asynchronous work (an eval run admitted or
 # cancelled).
@@ -55,7 +58,8 @@ class CayuApiError(RuntimeError):
     """A Cayu API read that could not be answered, with a stable ``category``.
 
     ``detail`` is the route's own bounded reason for refusing the request, when it gave one,
-    for callers that tell one refusal of a route from another.
+    for callers that tell one refusal of a route from another, and ``code`` the machine code
+    of a structured refusal (such as ``role_forbidden``).
     """
 
     def __init__(
@@ -65,11 +69,13 @@ class CayuApiError(RuntimeError):
         *,
         status_code: int | None = None,
         detail: str | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.detail = detail
+        self.code = code
 
     @property
     def transient(self) -> bool:
@@ -394,11 +400,24 @@ class CayuApi:
             valid_json = True
             self.ensure_safe_output(body)
         detail = _detail(body)
-        if status in {401, 403}:
+        if status == 401:
             raise CayuApiError(
                 "credentials_rejected",
                 f"{self.description} did not accept the credentials for reading {resource}.",
                 status_code=status,
+            )
+        if status == 403:
+            # The credentials were accepted, but this caller may not do this: the role, an
+            # access scope or another rule refused it. Keep the route's own reason.
+            code = _code(body)
+            raise CayuApiError(
+                "forbidden",
+                f"{self.description} refused the {resource} request"
+                + (f": {detail}" if detail else ".")
+                + (f" ({code})" if code else ""),
+                status_code=status,
+                detail=detail,
+                code=code,
             )
         if status == 404:
             if detail is None or detail == _ROUTE_NOT_FOUND:
@@ -566,6 +585,17 @@ def cloud_agent_api(
         wake_timeout_seconds=wake_timeout_seconds,
         offers_wake_option=offers_wake_option,
     )
+
+
+def _code(body: Any) -> str | None:
+    """The machine code of a structured refusal (``{"detail": {"code": ...}}``), if plain."""
+
+    detail = body.get("detail") if isinstance(body, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    if not isinstance(code, str) or not _REFUSAL_CODE.fullmatch(code):
+        return None
+    # Screened like the reason: an identifier can still look like a token.
+    return safe_text(code, 64)
 
 
 def _detail(body: Any) -> str | None:

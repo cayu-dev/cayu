@@ -74,6 +74,52 @@ def test_client_reads_the_message_of_a_structured_refusal() -> None:
     assert raised.value.detail == "Session missing was not found."
 
 
+def test_a_refused_request_is_forbidden_with_its_reason_not_a_rejected_login() -> None:
+    answers = {
+        "/cayu/api/knowledge": httpx.Response(403, json={"detail": "Knowledge access denied."}),
+        "/cayu/api/inbox": httpx.Response(
+            403, json={"detail": {"code": "role_forbidden", "message": "Your role can't use this."}}
+        ),
+        "/cayu/api/tasks": httpx.Response(403, text="Cross-site request refused."),
+        "/cayu/api/artifacts": httpx.Response(
+            403, json={"detail": {"code": "sk-live-abcdefghijklmnop", "message": "No."}}
+        ),
+        "/cayu/api/sessions": httpx.Response(401, json={"detail": "Not authenticated"}),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers[request.url.path]
+
+    def refusal(path: str) -> CayuApiError:
+        with pytest.raises(CayuApiError) as raised:
+            _api(handler).get(path, resource=path.strip("/"))
+        return raised.value
+
+    denied = refusal("/knowledge")
+    assert (denied.category, denied.status_code, denied.detail, denied.code) == (
+        "forbidden",
+        403,
+        "Knowledge access denied.",
+        None,
+    )
+    assert str(denied) == (
+        "The Agent bug-hunter refused the knowledge request: Knowledge access denied."
+    )
+    role = refusal("/inbox")
+    assert (role.category, role.code) == ("forbidden", "role_forbidden")
+    assert str(role).endswith(": Your role can't use this. (role_forbidden)")
+    # A refusal that isn't Cayu's JSON (the router's own) still says it was refused.
+    plain = refusal("/tasks")
+    assert (plain.category, plain.detail, plain.code) == ("forbidden", None, None)
+    assert str(plain) == "The Agent bug-hunter refused the tasks request."
+    # A code that looks like a token is screened out like a reason would be.
+    token = refusal("/artifacts")
+    assert (token.category, token.detail, token.code) == ("forbidden", "No.", None)
+    assert "sk-live" not in str(token)
+    login = refusal("/sessions")
+    assert (login.category, login.status_code) == ("credentials_rejected", 401)
+
+
 def test_reader_sends_only_set_query_parameters_as_strings() -> None:
     seen: list[httpx.QueryParams] = []
 

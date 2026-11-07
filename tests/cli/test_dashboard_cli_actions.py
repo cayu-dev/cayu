@@ -469,14 +469,86 @@ def test_cli_refusal_does_not_echo_remote_body_or_credentials(status, monkeypatc
     from cayu.cli._cloud_agent_api import CayuApi
 
     seen = []
+    answers = iter(
+        [
+            # A body carrying the login itself, and one that isn't JSON.
+            httpx.Response(status, json={"detail": "login operator:secret-canary"}),
+            httpx.Response(status, text="<html>secret-canary</html>"),
+        ]
+    )
 
     def respond(request):
         seen.append(request.method)
         return (
             httpx.Response(200, json={"name": "Agent"})
             if request.method == "GET"
-            else httpx.Response(status, json={"detail": "secret-canary"})
+            else next(answers)
         )
+
+    for _ in range(2):
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            monkeypatch.setattr(
+                _control_plane_actions,
+                "open_action_api",
+                lambda args, http=http: CayuApi(
+                    "http://localhost",
+                    authorization="Basic b3BlcmF0b3I6c2VjcmV0LWNhbmFyeQ==",
+                    http=http,
+                ),
+            )
+            assert main(["task", "block", "one", "--json"]) == 1
+        captured = capsys.readouterr()
+        assert "secret-canary" not in captured.out + captured.err
+        assert json.loads(captured.out)["error"]
+    assert seen == ["GET", "POST", "GET", "POST"]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "category", "shown"),
+    [
+        (
+            403,
+            {"detail": "Knowledge access denied."},
+            "forbidden",
+            "Server refused the request (forbidden, HTTP 403): Knowledge access denied.",
+        ),
+        (
+            403,
+            {"detail": {"code": "role_forbidden", "message": "Your role can't use this."}},
+            "forbidden",
+            "Server refused the request (forbidden, HTTP 403): Your role can't use this. "
+            "(role_forbidden)",
+        ),
+        (
+            409,
+            {"detail": "Knowledge retirement conflicts with its current revision or scope."},
+            "request_rejected",
+            "Server refused the request (request_rejected, HTTP 409): Knowledge retirement "
+            "conflicts with its current revision or scope.",
+        ),
+        (
+            401,
+            {"detail": "Not authenticated"},
+            "credentials_rejected",
+            "Server refused the request (credentials_rejected, HTTP 401).",
+        ),
+    ],
+    ids=["forbidden", "role-code", "conflict", "login"],
+)
+def test_cli_refusal_keeps_the_routes_own_reason_and_code(
+    status, body, category, shown, monkeypatch, capsys
+):
+    """A 403 means the login was accepted and something else refused, so say what did."""
+
+    import httpx
+
+    from cayu.cli import _control_plane_actions
+    from cayu.cli._cloud_agent_api import CayuApi
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"name": "Agent"})
+        return httpx.Response(status, json=body)
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as http:
         monkeypatch.setattr(
@@ -484,11 +556,14 @@ def test_cli_refusal_does_not_echo_remote_body_or_credentials(status, monkeypatc
             "open_action_api",
             lambda args: CayuApi("http://localhost", http=http),
         )
-        assert main(["task", "block", "one", "--json"]) == 1
-    captured = capsys.readouterr()
-    assert "secret-canary" not in captured.out + captured.err
-    assert json.loads(captured.out)["error"]
-    assert seen == ["GET", "POST"]
+        assert main(["knowledge", "archive", "one", "--reason", "Stale", "--json"]) == 1
+        error = json.loads(capsys.readouterr().out)["error"]
+        assert error["message"] == shown
+        assert error["category"] == category
+        assert error["status_code"] == status
+        assert ("code" in error) is (shown.endswith("(role_forbidden)"))
+        assert main(["knowledge", "archive", "one", "--reason", "Stale"]) == 1
+        assert capsys.readouterr().err.strip() == f"error: {shown}"
 
 
 def test_invalid_json_and_remote_http_fail_before_any_mutation(tmp_path, monkeypatch, capsys):
