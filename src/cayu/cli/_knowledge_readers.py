@@ -1,7 +1,8 @@
 """One read seam for `cayu knowledge`: a local knowledge store or a Cayu server's API.
 
 Both readers return entries in the shape of the Cayu server's knowledge API (``GET
-/api/knowledge``, ``/api/knowledge/pending`` and their ``/{entry_id}`` details), so the
+/api/knowledge``, ``/api/knowledge/pending``, ``/api/knowledge/archived`` and their
+``/{entry_id}`` details), so the
 command renders one shape whichever it read. ``StoreKnowledgeReader`` takes any
 ``KnowledgeStore``; ``open_store_knowledge_reader`` opens a SQLite or Postgres one
 read-only. ``ApiKnowledgeReader`` takes any ``CayuApi``, such as a Cayu Cloud Agent's.
@@ -38,8 +39,6 @@ _DETAIL_MAX_BYTES = 128_000
 _CHUNK_READ_BYTES = 1_048_576
 _LIST_MAX_BYTES = 1_048_576
 _NO_KNOWLEDGE_STORE = "Knowledge store is not configured."
-# Statuses Cayu's API lists: kept (active) entries and pending proposals.
-API_STATUSES = (KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING)
 
 
 @dataclass(frozen=True)
@@ -113,6 +112,11 @@ class StoreKnowledgeReader:
                 **entry_projection(item.entry),
                 "chunk_count": item.chunk_count,
                 "text_preview": _text_preview(item.entry),
+                **(
+                    await self._archived_decision(item.entry)
+                    if request.status is KnowledgeStatus.ARCHIVED
+                    else {}
+                ),
             }
             for item in listed.entries
         ]
@@ -125,6 +129,15 @@ class StoreKnowledgeReader:
             ),
             truncated=more and not listed.entries,
         )
+
+    async def _archived_decision(self, entry: KnowledgeEntry) -> dict[str, Any]:
+        """The verified reviewed decision that published an archived entry, as the server's
+        archived list returns it."""
+
+        from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+
+        workflow = KnowledgeReviewWorkflow(self._store, access_scope=self._scope)
+        return await workflow.archived_decision(entry)
 
     async def load_entry(self, entry_id: str) -> dict[str, Any] | None:
         entry = await self._store.get_entry(entry_id, access_scope=self._scope)
@@ -161,11 +174,6 @@ class ApiKnowledgeReader:
         self.source = source
 
     async def list_entries(self, request: KnowledgeListRequest) -> KnowledgePage:
-        if request.status not in API_STATUSES:
-            raise CayuApiError(
-                "unsupported",
-                f"{self._api.description}'s Cayu API lists only active and pending knowledge.",
-            )
         query: dict[str, str | list[str]] = {"limit": str(request.limit)}
         if request.namespace is not None:
             query["namespace"] = request.namespace
@@ -178,6 +186,16 @@ class ApiKnowledgeReader:
         pending = request.status is KnowledgeStatus.PENDING
         if pending:
             body = self._get("/knowledge/pending", query, "pending knowledge")
+        elif request.status is KnowledgeStatus.ARCHIVED:
+            try:
+                body = self._get("/knowledge/archived", query, "archived knowledge")
+            except CayuApiError as exc:
+                if exc.category != "not_served":
+                    raise
+                # No API found yet. Where the kept list is served, the archived list isn't
+                # (a Cayu older than it), and asking again says so.
+                self._get("/knowledge", {"limit": "1"}, "knowledge")
+                body = self._get("/knowledge/archived", query, "archived knowledge")
         else:
             body = self._get("/knowledge", query, "knowledge")
         rows = body.get("entries") if isinstance(body, dict) else None
@@ -236,6 +254,19 @@ class ApiKnowledgeReader:
                     f"{self._api.description} runs a Cayu that shows only pending knowledge "
                     "entries; deploy it with a newer Cayu to show kept ones.",
                 ) from None
+        try:
+            return self._entry(
+                self._get(f"/knowledge/archived/{quoted}", None, "archived knowledge entries")
+            )
+        except CayuApiError as exc:
+            # A Cayu older than the archived route, or a caller without full access (a
+            # member), sees no archived entry: there's nothing to show.
+            if not isinstance(exc, CayuApiNotFound) and exc.category not in {
+                "unsupported",
+                "not_served",
+                "forbidden",
+            }:
+                raise
             return None
 
     async def close(self) -> None:

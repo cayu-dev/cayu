@@ -116,8 +116,8 @@ def add_knowledge_parser(subparsers: Any) -> None:
         choices=tuple(status.value for status in _LISTED_STATUSES),
         default=KnowledgeStatus.ACTIVE.value,
         help=(
-            "Kept (active, the default), pending proposals, or archived entries "
-            "(archived only from a local store)."
+            "Kept (active, the default), pending proposals, or archived entries (kept "
+            "entries archived and proposals dropped; from an Agent, with full access)."
         ),
     )
     list_parser.add_argument("--namespace", help="Only entries in this namespace.")

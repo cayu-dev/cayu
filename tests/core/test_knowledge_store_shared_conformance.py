@@ -2183,6 +2183,160 @@ def test_knowledge_store_reviewed_retirement_needs_no_archived_access(
     asyncio.run(run())
 
 
+def test_knowledge_store_bound_to_a_recall_scope_shows_what_its_review_archived(
+    knowledge_store_case,
+) -> None:
+    """A store bound to a recall scope (active and pending, as a scaffolded agent's is)
+    takes that scope's review scope for review reads: the review workflow shows and lists
+    what it archived, with the reason, and replays a recorded decision. Search and every
+    write still take the recall scope alone, so they see no archived entry."""
+
+    from cayu.knowledge.scopes import knowledge_review_scope
+    from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["recall"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    review = knowledge_review_scope(recall)
+    decision = {"reviewer_identity": "reviewer", "reviewer_version": "test-v1"}
+
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case, access_scope=recall)
+        try:
+            for entry_id, status in (
+                ("kept", KnowledgeStatus.ACTIVE),
+                ("proposal", KnowledgeStatus.PENDING),
+            ):
+                await store.create_entry(
+                    KnowledgeEntry(
+                        id=entry_id,
+                        namespace="recall",
+                        text=f"Made-up retiredquasar note {entry_id}",
+                        status=status,
+                    ),
+                    [
+                        KnowledgeChunk(
+                            id=f"{entry_id}:0",
+                            entry_id=entry_id,
+                            chunk_index=0,
+                            text=f"Made-up retiredquasar note {entry_id}",
+                        )
+                    ],
+                )
+            workflow = KnowledgeReviewWorkflow(store)
+            assert workflow.access_scope == recall
+            assert workflow.review_access_scope == review
+            archived = await workflow.archive_reviewed(
+                "kept",
+                expected_revision=1,
+                operation_id="archive-kept",
+                reason="Stale.",
+                **decision,
+            )
+            await workflow.reject_reviewed(
+                "proposal",
+                expected_revision=1,
+                operation_id="drop-proposal",
+                reason="Duplicate.",
+                **decision,
+            )
+
+            # The review workflow shows and lists what it archived, with the reason.
+            shown = await workflow.get_archived("kept")
+            assert shown == archived.entry
+            assert shown.metadata["cayu:review_archive"]["reason"] == "Stale."
+            assert await workflow.get_archived("missing") is None
+            chunks = await store.read_chunks(
+                "kept", access_scope=review, max_chunks=5, max_bytes=10_000
+            )
+            assert [chunk.entry_revision for chunk in chunks] == [2]
+            listed = await workflow.list_archived()
+            decisions = {
+                item.entry.id: await workflow.archived_decision(item.entry)
+                for item in listed.entries
+            }
+            assert decisions == {
+                "kept": {"decision": "archive", "decided_by": "reviewer", "reason": "Stale."},
+                "proposal": {"decision": "drop", "decided_by": "reviewer", "reason": "Duplicate."},
+            }
+            # The publication that wrote the archived revision, for the review scope only.
+            receipt = await store.load_entry_revision_publication_receipt(
+                shown, access_scope=review
+            )
+            assert receipt is not None and receipt.operation_id == "archive-kept"
+            assert await store.load_entry_revision_publication_receipt(shown) is None
+            # A recorded decision replays, though the recall scope can't read it.
+            replayed = await workflow.archive_reviewed(
+                "kept",
+                expected_revision=1,
+                operation_id="archive-kept",
+                reason="Stale.",
+                **decision,
+            )
+            assert replayed.receipt.replayed is True
+            assert replayed.entry == archived.entry
+            dropped = await workflow.reject_reviewed(
+                "proposal",
+                expected_revision=1,
+                operation_id="drop-proposal",
+                reason="Duplicate.",
+                **decision,
+            )
+            assert dropped.receipt.replayed is True
+            with pytest.raises(KnowledgePublicationConflict):
+                await workflow.archive_reviewed(
+                    "kept",
+                    expected_revision=1,
+                    operation_id="archive-kept",
+                    reason="Another reason.",
+                    **decision,
+                )
+
+            # The recall scope, which search and the agent's tools use, sees none of it.
+            assert await store.get_entry("kept") is None
+            archived_query = KnowledgeListQuery(statuses=[KnowledgeStatus.ARCHIVED])
+            assert (await store.list_entries(archived_query)).entries == []
+            searched = await store.search(
+                KnowledgeQuery(
+                    text="retiredquasar",
+                    namespace="recall",
+                    statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.ARCHIVED],
+                )
+            )
+            assert searched.hits == []
+            # The review scope is for review reads only: search and writes refuse it.
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.search(
+                    KnowledgeQuery(
+                        text="retiredquasar",
+                        namespace="recall",
+                        statuses=[KnowledgeStatus.ARCHIVED],
+                    ),
+                    access_scope=review,
+                )
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.transition_entry_status(
+                    "kept",
+                    expected_revision=2,
+                    access_scope=review,
+                    from_status=KnowledgeStatus.ARCHIVED,
+                    to_status=KnowledgeStatus.ACTIVE,
+                )
+            # Nor does a bound store take any wider scope for its review reads.
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.get_entry("kept", access_scope=_ACCESS_SCOPE)
+            other = knowledge_review_scope(KnowledgeAccessScope(allowed_namespaces=["other"]))
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.get_entry("kept", access_scope=other)
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
 def test_knowledge_store_historical_reads_require_current_and_snapshot_access(
     knowledge_store_case,
 ) -> None:

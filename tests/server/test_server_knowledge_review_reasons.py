@@ -443,3 +443,244 @@ def test_operator_records_decisions_on_a_recall_scope_as_on_cayu_cloud(store_kin
         close = getattr(bound, "close", None)
         if close is not None:
             asyncio.run(close())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_operator_reads_back_what_a_recall_scope_archived_as_on_cayu_cloud(store_kind, tmp_path):
+    """On Cayu Cloud the CLI sends the operator login, which proxy identity's fallback signs
+    in as an admin, to an Agent whose store is bound to the scaffold's recall scope (active
+    and pending only). The operator reads back what it archived or dropped, with the
+    reason, and a retry replays; search still finds none of it, and a member sees none."""
+
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from tests.server.test_proxy_identity import FakeJwks, _as, _auth, _token
+
+    from cayu.server import BasicAuth
+    from cayu.storage import KnowledgeChunk, SQLiteKnowledgeStore
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["default"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    bound = (
+        InMemoryKnowledgeStore(access_scope=recall)
+        if store_kind == "memory"
+        else SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=recall)
+    )
+    for entry_id, status in (
+        ("kept", KnowledgeStatus.ACTIVE),
+        ("proposal", KnowledgeStatus.PENDING),
+        ("plain", KnowledgeStatus.ACTIVE),
+    ):
+        text = f"Made-up retiredquasar {entry_id}"
+        asyncio.run(
+            bound.create_entry(
+                KnowledgeEntry(id=entry_id, namespace="default", text=text, status=status),
+                [KnowledgeChunk(id=f"{entry_id}:0", entry_id=entry_id, chunk_index=0, text=text)],
+            )
+        )
+    key = ec.generate_private_key(ec.SECP256R1())
+    auth = _auth(
+        FakeJwks(key), fallback=BasicAuth(username="operator", password="made-up-password")
+    )
+    operator = {"Authorization": "Basic " + base64.b64encode(b"operator:made-up-password").decode()}
+    member = _as(_token(key, role="member"))
+    app = CayuApp(knowledge_store=bound, knowledge_access_scope=recall, enable_logging=False)
+    try:
+        with TestClient(create_server(app, config=ServerConfig.protected(auth))) as client:
+            archive = {"headers": {**operator, "Idempotency-Key": "archive-kept"}}
+            archived = client.post(
+                "/api/knowledge/kept/retire", **archive, json={"reason": "Stale."}
+            )
+            assert archived.status_code == 200, archived.text
+            drop = {"headers": {**operator, "Idempotency-Key": "drop-proposal"}}
+            dropped = client.post(
+                "/api/knowledge/proposal/reject", **drop, json={"reason": "Duplicate."}
+            )
+            assert dropped.status_code == 200, dropped.text
+            plain = client.post(
+                "/api/knowledge/plain/retire", headers=operator, json={"expected_revision": 1}
+            )
+            assert plain.status_code == 200, plain.text
+
+            # Show and list return the archived entries, with the recorded reason.
+            shown = client.get("/api/knowledge/archived/kept", headers=operator)
+            assert shown.status_code == 200, shown.text
+            body = shown.json()
+            assert (body["status"], body["revision"]) == ("archived", 2)
+            assert body["metadata"]["cayu:review_archive"]["reason"] == "Stale."
+            assert body["metadata"]["cayu:review_archive"]["reviewer_identity"] == "operator"
+            assert [chunk["text"] for chunk in body["chunks"]] == ["Made-up retiredquasar kept"]
+            listed = client.get("/api/knowledge/archived", headers=operator)
+            assert listed.status_code == 200, listed.text
+            rows = {row["entry_id"]: row for row in listed.json()["entries"]}
+            assert {
+                entry_id: (row["status"], row["decision"], row["decided_by"], row["reason"])
+                for entry_id, row in rows.items()
+            } == {
+                "kept": ("archived", "archive", "operator", "Stale."),
+                "proposal": ("archived", "drop", "operator", "Duplicate."),
+                "plain": ("archived", None, None, None),
+            }
+            assert listed.json()["next_cursor"] is None
+            paged, cursor = [], None
+            while True:
+                page = client.get(
+                    "/api/knowledge/archived",
+                    headers=operator,
+                    params={"limit": 1} if cursor is None else {"limit": 1, "cursor": cursor},
+                )
+                assert page.status_code == 200, page.text
+                paged += [row["entry_id"] for row in page.json()["entries"]]
+                cursor = page.json()["next_cursor"]
+                if cursor is None:
+                    break
+            assert sorted(paged) == sorted(rows)
+            # A cursor continues only the listing that returned it.
+            first = client.get("/api/knowledge/archived", headers=operator, params={"limit": 1})
+            assert (
+                client.get(
+                    "/api/knowledge/archived",
+                    headers=operator,
+                    params={"limit": 1, "kind": "denial", "cursor": first.json()["next_cursor"]},
+                ).status_code
+                == 422
+            )
+            # An entry that was never archived answers 404.
+            assert client.get("/api/knowledge/archived/missing", headers=operator).status_code == (
+                404
+            )
+
+            # Retrying with the same operation ID replays the recorded decision.
+            replayed = client.post(
+                "/api/knowledge/kept/retire", **archive, json={"reason": "Stale."}
+            )
+            assert replayed.status_code == 200, replayed.text
+            assert replayed.json() == archived.json()
+            redropped = client.post(
+                "/api/knowledge/proposal/reject", **drop, json={"reason": "Duplicate."}
+            )
+            assert redropped.status_code == 200, redropped.text
+            assert redropped.json() == dropped.json()
+            changed = client.post(
+                "/api/knowledge/kept/retire", **archive, json={"reason": "Another reason."}
+            )
+            assert changed.status_code == 409
+            # An archived entry no decision of this operation wrote stays as hidden as it was.
+            fresh = client.post(
+                "/api/knowledge/kept/retire",
+                headers={**operator, "Idempotency-Key": "archive-again"},
+                json={"reason": "Stale."},
+            )
+            assert fresh.status_code == 404
+
+            # Search, recall and the kept list (the agent's recall scope) still see none of it.
+            assert client.get("/api/knowledge", headers=operator).json()["entries"] == []
+            for entry_id in ("kept", "proposal", "plain"):
+                assert asyncio.run(bound.get_entry(entry_id)) is None
+                assert (
+                    client.get(f"/api/knowledge/kept/{entry_id}", headers=operator).status_code
+                    == 404
+                )
+            found = asyncio.run(
+                bound.search(
+                    KnowledgeQuery(
+                        text="retiredquasar",
+                        statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.ARCHIVED],
+                    )
+                )
+            )
+            assert found.hits == []
+
+            # A member still sees no archived entry, as before.
+            for path in ("/api/knowledge/archived", "/api/knowledge/archived/kept"):
+                refused = client.get(path, headers=member)
+                assert refused.status_code == 403, refused.text
+                assert "Knowledge" not in refused.text
+            assert client.get("/api/knowledge/kept/kept", headers=member).status_code == 404
+            assert client.get("/api/knowledge", headers=member).json()["entries"] == []
+            # Replaying the operator's drop as the member records a different reviewer, so
+            # it conflicts without returning the entry.
+            mine = client.post(
+                "/api/knowledge/proposal/reject",
+                headers={**member, "Idempotency-Key": "drop-proposal"},
+                json={"reason": "Duplicate."},
+            )
+            assert mine.status_code == 409, mine.text
+            assert "retiredquasar" not in mine.text
+            probe = client.post(
+                "/api/knowledge/proposal/reject",
+                headers={**member, "Idempotency-Key": "drop-probe"},
+                json={"reason": "Duplicate."},
+            )
+            assert probe.status_code == 404, probe.text
+    finally:
+        close = getattr(bound, "close", None)
+        if close is not None:
+            asyncio.run(close())
+
+
+def test_archived_list_and_detail_withhold_a_tool_entrys_source_session(store):
+    """As the kept list: a tool entry's source session is shown only when verified, and
+    never to a caller the inbox access rule limits."""
+
+    from cayu.server.auth import AuthContext
+
+    async def everything(person, item):
+        return True
+
+    asyncio.run(
+        store.create_entry(
+            KnowledgeEntry(
+                id="tool-note",
+                text="Made-up tool note",
+                status=KnowledgeStatus.ARCHIVED,
+                source_type="tool",
+                source_id="private-session",
+            ),
+            access_scope=_SCOPE,
+        )
+    )
+    app = CayuApp(knowledge_store=store, knowledge_access_scope=_SCOPE, enable_logging=False)
+    server = create_server(
+        app,
+        config=ServerConfig.protected(lambda _: AuthContext(subject="reader")),
+        inbox_access=everything,
+    )
+    with TestClient(server) as client:
+        listed = client.get("/api/knowledge/archived")
+        assert listed.status_code == 200, listed.text
+        (row,) = listed.json()["entries"]
+        assert row["entry_id"] == "tool-note" and row["source_id"] is None
+        shown = client.get("/api/knowledge/archived/tool-note")
+        assert shown.status_code == 200, shown.text
+        assert shown.json()["source_id"] is None
+        assert "private-session" not in listed.text + shown.text
+
+
+def test_archived_list_survives_an_entry_relabeled_into_the_review_labels(store):
+    """An archived entry whose earlier revision is outside the review labels still lists;
+    its earlier revision just can't be read."""
+
+    entry = KnowledgeEntry(
+        id="moved",
+        text="Made-up moved note",
+        status=KnowledgeStatus.ARCHIVED,
+        labels={"team": "other"},
+    )
+    asyncio.run(store.create_entry(entry, access_scope=_SCOPE))
+    asyncio.run(
+        store.append_entry_revision(
+            entry.model_copy(update={"revision": 2, "labels": {"team": "mine"}}),
+            expected_revision=1,
+            access_scope=_SCOPE,
+        )
+    )
+    _propose(store, "mine", labels={"team": "mine"})
+    with _client(store, knowledge_review_labels={"team": "mine"}) as client:
+        listed = client.get("/api/knowledge/archived")
+        assert listed.status_code == 200, listed.text
+        (row,) = listed.json()["entries"]
+        assert (row["entry_id"], row["decision"]) == ("moved", None)

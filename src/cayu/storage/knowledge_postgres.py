@@ -160,8 +160,10 @@ from cayu.knowledge.maintenance_contracts import (
     prepare_knowledge_maintenance_decision,
 )
 from cayu.knowledge.publication_contracts import (
+    MAX_REVISION_PUBLICATION_RECEIPTS,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
+    _publication_receipt_of_revision,
     _validate_activation_publication_material,
     _validate_knowledge_publication_replay,
     _validate_revision_append,
@@ -625,7 +627,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -1208,11 +1210,37 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
+    async def load_entry_revision_publication_receipt(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgePublicationReceipt | None:
+        scope = self._review_read_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry.id)
+        _validate_knowledge_revision(entry.revision, "revision")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            await cur.execute(
+                "SELECT operation_id FROM cayu_knowledge_publication_receipts "
+                "WHERE entry_id = %s AND entry_revision = %s LIMIT %s",
+                (entry_id, entry.revision, MAX_REVISION_PUBLICATION_RECEIPTS),
+            )
+            receipts = []
+            for (operation_id,) in await cur.fetchall():
+                receipt = await self._load_publication_receipt_in_scope(cur, operation_id, scope)
+                if receipt is not None:
+                    receipts.append(receipt)
+        receipt = _publication_receipt_of_revision(receipts, entry)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
@@ -3074,7 +3102,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> KnowledgeEvidenceResult | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -3851,7 +3879,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -4033,7 +4061,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeListResult:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         query = copy_knowledge_list_query(query)
         where_sql, params = _postgres_knowledge_list_filter_sql(query)
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(scope)

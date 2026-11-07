@@ -486,15 +486,77 @@ def test_application_show_falls_back_to_pending_on_an_older_server(
     assert "shows only pending knowledge entries" in out["error"]["message"]
 
 
-def test_application_refuses_archived_listing(
+def test_application_lists_and_shows_archived_entries(
     agent: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
+    decision = {"decision": "archive", "decided_by": "operator", "reason": "Stale."}
+    agent["routes"]["/cayu/api/knowledge/archived"] = (
+        200,
+        {"entries": [_api_entry("old", status="archived", **decision)], "next_cursor": None},
+    )
+    recorded = {"reviewer_identity": "operator", "reviewer_version": "1", "reason": "Stale."}
+    agent["routes"]["/cayu/api/knowledge/archived/old"] = (
+        200,
+        _api_entry(
+            "old",
+            status="archived",
+            text="No longer true.",
+            metadata={"cayu:review_archive": recorded},
+            chunks=[],
+        ),
+    )
+    agent["routes"]["/cayu/api/knowledge/kept/old"] = (
+        404,
+        {"detail": "Knowledge entry not found."},
+    )
+    agent["routes"]["/cayu/api/knowledge/pending/old"] = (
+        409,
+        {"detail": "Knowledge entry 'old' is 'archived', not 'pending'."},
+    )
+    target = ("--application", "bug-hunter")
+
+    code, listed = _run(capsys, "list", "--status", "archived", *target, "--json")
+    assert code == 0
+    assert _ids(listed) == ["old"]
+    assert listed["entries"][0]["reason"] == "Stale."
+    path, _ = agent["requests"][-1]
+    assert path == "/cayu/api/knowledge/archived"
+
+    # Neither kept nor pending, so `show` finds it archived.
+    code, shown = _run(capsys, "show", "old", *target, "--json")
+    assert code == 0
+    assert shown["entry"]["text"] == "No longer true."
+    assert [path for path, _ in agent["requests"][-3:]] == [
+        "/cayu/api/knowledge/kept/old",
+        "/cayu/api/knowledge/pending/old",
+        "/cayu/api/knowledge/archived/old",
+    ]
+    assert main(["knowledge", "show", "old", *target]) == 0
+    table = capsys.readouterr().out
+    assert "archived_reason" in table and "Stale." in table
+
+
+def test_application_on_an_older_cayu_says_it_lists_no_archived_entries(
+    agent: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A Cayu older than the archived routes serves the kept list only.
+    agent["routes"]["/cayu/api/knowledge"] = (200, {"entries": [], "next_cursor": None})
+    for status in ("kept", "pending"):
+        agent["routes"][f"/cayu/api/knowledge/{status}/old"] = (
+            404,
+            {"detail": "Knowledge entry not found."},
+        )
+
     code, out = _run(
         capsys, "list", "--application", "bug-hunter", "--status", "archived", "--json"
     )
-
     assert code == 1
-    assert "lists only active and pending knowledge" in out["error"]["message"]
+    assert out["error"]["category"] == "unsupported"
+    assert "deploy it with a newer Cayu" in out["error"]["message"]
+
+    code, out = _run(capsys, "show", "old", "--application", "bug-hunter", "--json")
+    assert code == 1
+    assert "not found" in out["error"]["message"]
 
 
 def test_show_escapes_terminal_control_sequences(
@@ -526,7 +588,9 @@ def test_show_escapes_terminal_control_sequences(
     assert "line one\nline two \\x1b]52;c;Zm9v\\x07" in out
 
 
-def test_show_reads_out_of_scope_and_archived_entries_as_absent(tmp_path: Path) -> None:
+def test_show_reads_out_of_scope_entries_as_absent_and_shows_archived_ones(
+    tmp_path: Path,
+) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -559,7 +623,9 @@ def test_show_reads_out_of_scope_and_archived_entries_as_absent(tmp_path: Path) 
             reader = ApiKnowledgeReader(CayuApi("http://testserver/", http=client), source={})
             return await reader.load_entry("other"), await reader.load_entry("arch")
 
-    assert asyncio.run(read()) == (None, None)
+    other, archived = asyncio.run(read())
+    assert other is None
+    assert (archived["entry_id"], archived["status"]) == ("arch", "archived")
 
 
 def test_postgres_knowledge_store_can_be_opened_read_only_for_inspection() -> None:

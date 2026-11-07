@@ -3615,6 +3615,26 @@ class KeptKnowledgeListResponse(ApiBaseModel):
     usage_unavailable_reason: Literal["access_limited", "unsupported", "source_incomplete"] | None
 
 
+class ApiArchivedKnowledgeItem(ApiKnowledgeListItem):
+    """An archived entry: a kept entry archived, or a proposal dropped."""
+
+    decision: Literal["archive", "drop"] | None = Field(
+        description=(
+            "The reviewed decision the archived revision records: `archive` for a kept "
+            "entry archived with a reason or an Idempotency-Key, `drop` for a proposal "
+            "dropped that way; null when it records none (archived by revision alone)."
+        )
+    )
+    decided_by: str | None = Field(description="The reviewer the decision records.")
+    #: The reason the decision records, redacted; null when none was recorded.
+    reason: str | None
+
+
+class ArchivedKnowledgeListResponse(ApiBaseModel):
+    entries: list[ApiArchivedKnowledgeItem]
+    next_cursor: str | None
+
+
 #: The longest reason a knowledge review decision (keep, drop or retire) records.
 KNOWLEDGE_REVIEW_REASON_MAX_CHARS = 4096
 
@@ -3683,6 +3703,11 @@ class PendingKnowledgeDetailResponse(ApiKnowledgeEntryBase):
 
 class KeptKnowledgeDetailResponse(PendingKnowledgeDetailResponse):
     """One kept entry (`GET /api/knowledge/{entry_id}`), shaped like a pending one."""
+
+
+class ArchivedKnowledgeDetailResponse(PendingKnowledgeDetailResponse):
+    """One archived entry (`GET /api/knowledge/archived/{entry_id}`), shaped like a pending
+    one; its ``metadata`` holds the reviewed decision that archived it, if any."""
 
 
 STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {

@@ -34,6 +34,8 @@ from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server.auth import AuthContext
 from cayu.server.contracts import (
+    ArchivedKnowledgeDetailResponse,
+    ArchivedKnowledgeListResponse,
     KeptKnowledgeDetailResponse,
     KeptKnowledgeListResponse,
     PendingKnowledgeDetailResponse,
@@ -328,7 +330,9 @@ def register_kept_knowledge(
     ):
         """One kept (active) entry with its text and chunks; 404 for anything else."""
 
-        return await knowledge_detail(entry_id, max_chunks, max_bytes, auth_context, pending=False)
+        return await knowledge_detail(
+            entry_id, max_chunks, max_bytes, auth_context, KnowledgeStatus.ACTIVE
+        )
 
     @pending_router.get(
         "/knowledge/pending/{entry_id}",
@@ -340,19 +344,136 @@ def register_kept_knowledge(
         max_bytes: int = Query(default=128_000, ge=1, le=128_000),
         auth_context: AuthContext | None = auth_default,
     ):
-        return await knowledge_detail(entry_id, max_chunks, max_bytes, auth_context, pending=True)
+        return await knowledge_detail(
+            entry_id, max_chunks, max_bytes, auth_context, KnowledgeStatus.PENDING
+        )
+
+    @router.get(
+        "/knowledge/archived",
+        response_model=ArchivedKnowledgeListResponse,
+        dependencies=protected,
+    )
+    async def archived_knowledge(
+        cursor: str | None = Query(default=None, max_length=6144),
+        limit: int = Query(default=50, ge=1, le=100),
+        max_bytes: int = Query(default=100_000, ge=1, le=1_048_576),
+        namespace: str | None = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+        label: Annotated[list[str] | None, Query()] = None,
+        auth_context: AuthContext | None = auth_default,
+    ):
+        """Archived entries: kept entries archived and proposals dropped.
+
+        Read through the review scope, so a server whose knowledge scope admits only
+        active and pending entries still lists what it archived. Full access, as retiring.
+        """
+
+        owner = workflow()
+        listed_namespace, listed_labels, kinds = kept_filters(owner, namespace, kind, label)
+        binding: dict[str, Any] = {
+            "subject": None if auth_context is None else auth_context.subject,
+            "tenant": None if auth_context is None else auth_context.tenant,
+            "namespace": listed_namespace,
+            "labels": listed_labels,
+            "kinds": kinds,
+            "scope": owner.review_access_scope.model_dump(mode="json"),
+        }
+        position = None if cursor is None else seal.open("archived-knowledge", cursor, binding)
+        try:
+            listed = await owner.list_archived(
+                namespace=listed_namespace,
+                labels=listed_labels,
+                kinds=kinds,
+                cursor=position,
+                limit=limit,
+                max_bytes=max_bytes,
+            )
+        except ValidationError as exc:
+            fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})
+            raise HTTPException(
+                422, f"Invalid knowledge filters: {', '.join(fields) or 'query'}."
+            ) from None
+        except NotImplementedError:
+            raise HTTPException(501, "This store does not support knowledge reads.") from None
+        except PermissionError:
+            raise HTTPException(403, "Knowledge access denied.") from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        more = listed.truncated and (
+            listed.total_entries_known is None or listed.total_entries_known > len(listed.entries)
+        )
+        after = None
+        if more:
+            if not listed.entries:
+                raise HTTPException(413, "An archived entry exceeds the requested page byte bound.")
+            after = encode_knowledge_list_cursor(listed.entries[-1].entry)
+            if after == position:
+                raise HTTPException(409, "Knowledge listing could not advance.")
+        limited = gate.applies(auth_context)
+        visible = [
+            item
+            for item in listed.entries
+            if await gate.permits(auth_context, gate.knowledge_scope(item.entry))
+        ]
+        source_identities = await page_source_identities(
+            [item.entry for item in visible], limited=limited
+        )
+        rows = []
+        for item in visible:
+            entry = item.entry
+            row = serialize_item(item)
+            # As the kept list: redact the whole text before the preview cuts it.
+            row["text_preview"] = knowledge_preview(entry.text, app.redact_json)
+            if entry.source_type == "tool":
+                # As the kept list: the verified, exposed source session, or nothing.
+                row["source_id"] = await tool_source_session(
+                    entry, specialist_of(entry), limited=limited, identities=source_identities
+                )
+            row.update(await owner.archived_decision(entry))
+            rows.append(app.redact_json(row))
+        if len(json.dumps(rows, ensure_ascii=False).encode("utf-8")) > 1_048_576:
+            raise HTTPException(
+                413, "Archived entry metadata exceeds the public response byte bound."
+            )
+        return {
+            "entries": rows,
+            "next_cursor": seal.seal("archived-knowledge", after, binding)
+            if after is not None
+            else None,
+        }
+
+    @router.get(
+        "/knowledge/archived/{entry_id}",
+        response_model=ArchivedKnowledgeDetailResponse,
+        dependencies=protected,
+    )
+    async def archived_knowledge_entry(
+        entry_id: NonBlankString,
+        max_chunks: int = Query(default=50, ge=1, le=50),
+        max_bytes: int = Query(default=128_000, ge=1, le=128_000),
+        auth_context: AuthContext | None = auth_default,
+    ):
+        """One archived entry with its text, chunks and the decision that archived it; 404
+        for anything else. Read through the review scope, as the archived list."""
+
+        return await knowledge_detail(
+            entry_id, max_chunks, max_bytes, auth_context, KnowledgeStatus.ARCHIVED
+        )
 
     async def knowledge_detail(
         entry_id: str,
         max_chunks: int,
         max_bytes: int,
         auth_context: AuthContext | None,
-        *,
-        pending: bool,
+        status: KnowledgeStatus,
     ):
         owner = workflow()
         store = cast("KnowledgeStore", owner.store)
-        if pending:
+        # Archived entries are read, chunks too, through the review scope.
+        scope = (
+            owner.review_access_scope if status is KnowledgeStatus.ARCHIVED else owner.access_scope
+        )
+        if status is KnowledgeStatus.PENDING:
             try:
                 entry = await owner.get_pending(entry_id)
             except NotImplementedError:
@@ -365,14 +486,18 @@ def register_kept_knowledge(
                 raise HTTPException(409, str(exc)) from exc
         else:
             try:
-                entry = await owner.get_entry(entry_id)
+                entry = (
+                    await owner.get_archived(entry_id)
+                    if status is KnowledgeStatus.ARCHIVED
+                    else await owner.get_entry(entry_id)
+                )
             except NotImplementedError:
                 raise HTTPException(501, "This store does not support knowledge reads.") from None
             except PermissionError:
                 raise HTTPException(404, "Knowledge entry not found.") from None
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from None
-            if entry is None or entry.status is not KnowledgeStatus.ACTIVE:
+            if entry is None or entry.status is not status:
                 raise HTTPException(404, "Knowledge entry not found.")
         await gate.require_knowledge(auth_context, entry)
         try:
@@ -380,7 +505,7 @@ def register_kept_knowledge(
             read = await store.read_chunks(
                 entry.id,
                 revision=entry.revision,
-                access_scope=owner.access_scope,
+                access_scope=scope,
                 max_chunks=max_chunks,
                 max_bytes=_CHUNK_READ_BYTES,
             )
@@ -465,13 +590,17 @@ def register_kept_knowledge(
             )
         owner = workflow()
         store = cast("KnowledgeStore", owner.store)
+        operation_id = idempotency_key or f"server-knowledge-retire-{uuid4().hex}"
         try:
-            entry = await owner.get_entry(entry_id)
+            entry = (
+                await reviewed_decision_entry(owner, entry_id, operation_id)
+                if reviewed
+                else await owner.get_entry(entry_id)
+            )
             if entry is None:
                 raise HTTPException(404, "Knowledge entry not found.")
             await gate.require_knowledge(auth_context, entry)
             if reviewed:
-                operation_id = idempotency_key or f"server-knowledge-retire-{uuid4().hex}"
                 revision = await reviewed_decision_revision(
                     owner,
                     entry,
@@ -533,6 +662,32 @@ def register_kept_knowledge(
             ) from None
 
 
+async def reviewed_decision_entry(
+    owner: KnowledgeReviewWorkflow, entry_id: str, operation_id: str
+) -> KnowledgeEntry | None:
+    """The entry a reviewed drop or retirement under ``operation_id`` decides.
+
+    The current entry, as the workflow's access scope reads it. Once ``operation_id`` has
+    archived it, the archived entry, read through the review scope, so a retry replays
+    the decision even when the access scope can't read archived entries; an archived entry
+    no decision of this operation wrote stays as hidden as before.
+    """
+
+    entry = await owner.get_entry(entry_id)
+    if entry is not None:
+        return entry
+    try:
+        archived = await owner.get_archived(entry_id)
+    except PermissionError:
+        # Outside the review namespace or labels: as hidden as it was.
+        return None
+    if archived is None:
+        return None
+    raw = await owner.load_review_publication(operation_id)
+    recorded = raw is not None and copy_knowledge_publication_receipt(raw).entry_id == entry_id
+    return archived if recorded else None
+
+
 async def reviewed_decision_revision(
     owner: KnowledgeReviewWorkflow,
     entry: KnowledgeEntry,
@@ -549,9 +704,7 @@ async def reviewed_decision_revision(
     it when given. Raises ``KnowledgePublicationConflict`` otherwise.
     """
 
-    raw = await owner.store.load_entry_publication_receipt(
-        operation_id, access_scope=owner.access_scope
-    )
+    raw = await owner.load_review_publication(operation_id)
     if raw is not None:
         receipt = copy_knowledge_publication_receipt(raw)
         if receipt.entry_id != entry.id or receipt.expected_revision is None:

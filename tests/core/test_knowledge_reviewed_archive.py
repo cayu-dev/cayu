@@ -300,3 +300,235 @@ def test_reviewed_archive_copies_a_kept_entry_larger_than_a_proposal_may_be(open
             await _close(store)
 
     asyncio.run(scenario())
+
+
+def test_an_archive_by_revision_alone_records_no_earlier_reviewed_decision(open_store):
+    """A later revision copies the metadata of a reviewed archive unchanged; the archived
+    list attributes the decision only to the revision the decision wrote."""
+
+    async def scenario():
+        store = await open_store()
+        try:
+            workflow = KnowledgeReviewWorkflow(store, access_scope=_SCOPE)
+            kept = await _kept_entry(store, workflow, "restored")
+            archived = await workflow.archive_reviewed(
+                "restored",
+                expected_revision=kept.revision,
+                operation_id="archive-restored",
+                reviewer_identity="reviewer",
+                reviewer_version="1",
+                reason="Stale.",
+            )
+            assert await workflow.archived_decision(archived.entry) == {
+                "decision": "archive",
+                "decided_by": "reviewer",
+                "reason": "Stale.",
+            }
+            # Restored through the store, then retired by revision alone.
+            for revision, from_status, to_status in (
+                (archived.entry.revision, KnowledgeStatus.ARCHIVED, KnowledgeStatus.ACTIVE),
+                (archived.entry.revision + 1, KnowledgeStatus.ACTIVE, KnowledgeStatus.ARCHIVED),
+            ):
+                retired = await store.transition_entry_status(
+                    "restored",
+                    expected_revision=revision,
+                    access_scope=_SCOPE,
+                    from_status=from_status,
+                    to_status=to_status,
+                )
+            assert retired.metadata["cayu:review_archive"]["reason"] == "Stale."
+            (listed,) = (await workflow.list_archived()).entries
+            assert listed.entry.revision == retired.revision
+            assert await workflow.archived_decision(listed.entry) == {
+                "decision": None,
+                "decided_by": None,
+                "reason": None,
+            }
+            # Restored again and archived under a new operation with the same decision:
+            # that publication wrote this revision, so the decision is attributed to it.
+            restored = await store.transition_entry_status(
+                "restored",
+                expected_revision=retired.revision,
+                access_scope=_SCOPE,
+                from_status=KnowledgeStatus.ARCHIVED,
+                to_status=KnowledgeStatus.ACTIVE,
+            )
+            again = await workflow.archive_reviewed(
+                "restored",
+                expected_revision=restored.revision,
+                operation_id="archive-restored-again",
+                reviewer_identity="reviewer",
+                reviewer_version="1",
+                reason="Stale.",
+            )
+            assert again.entry.metadata == retired.metadata
+            assert await workflow.archived_decision(again.entry) == {
+                "decision": "archive",
+                "decided_by": "reviewer",
+                "reason": "Stale.",
+            }
+            receipt = await store.load_entry_revision_publication_receipt(
+                again.entry, access_scope=_SCOPE
+            )
+            assert receipt is not None and receipt.operation_id == "archive-restored-again"
+            assert (
+                await store.load_entry_revision_publication_receipt(retired, access_scope=_SCOPE)
+                is None
+            )
+        finally:
+            await _close(store)
+
+    asyncio.run(scenario())
+
+
+def test_a_reused_entry_id_attributes_each_archive_to_its_own_entry(open_store):
+    """Publication receipts outlive a hard delete, so a recreated entry id has receipts
+    for the same revision from its earlier life; each archive keeps its own decision."""
+
+    async def scenario():
+        store = await open_store()
+        try:
+            workflow = KnowledgeReviewWorkflow(store, access_scope=_SCOPE)
+            for life, reason in (("first", "Stale."), ("second", "Wrong.")):
+                kept = await store.create_entry(
+                    KnowledgeEntry(
+                        id="reused", text=f"The {life} note.", status=KnowledgeStatus.ACTIVE
+                    ),
+                    access_scope=_SCOPE,
+                )
+                archived = await workflow.archive_reviewed(
+                    "reused",
+                    expected_revision=kept.revision,
+                    operation_id=f"archive-{life}",
+                    reviewer_identity="reviewer",
+                    reviewer_version="1",
+                    reason=reason,
+                )
+                (listed,) = (await workflow.list_archived()).entries
+                assert listed.entry == archived.entry
+                assert await workflow.archived_decision(listed.entry) == {
+                    "decision": "archive",
+                    "decided_by": "reviewer",
+                    "reason": reason,
+                }
+                receipt = await store.load_entry_revision_publication_receipt(
+                    listed.entry, access_scope=_SCOPE
+                )
+                assert receipt is not None and receipt.operation_id == f"archive-{life}"
+                if life == "first":
+                    await store.delete_entry(
+                        "reused",
+                        expected_revision=archived.entry.revision,
+                        access_scope=_SCOPE,
+                        hard=True,
+                    )
+        finally:
+            await _close(store)
+
+    asyncio.run(scenario())
+
+
+def test_another_publication_of_copied_review_metadata_records_no_decision(open_store):
+    """A revision some other publication wrote, carrying an earlier decision's metadata,
+    isn't attributed to that decision: only the publication the decision itself makes is."""
+
+    from cayu.storage import KnowledgeChunk
+
+    async def scenario():
+        store = await open_store()
+        try:
+            workflow = KnowledgeReviewWorkflow(store, access_scope=_SCOPE)
+            kept = await _kept_entry(store, workflow, "edited")
+            archived = await workflow.archive_reviewed(
+                "edited",
+                expected_revision=kept.revision,
+                operation_id="archive-edited",
+                reviewer_identity="Alice",
+                reviewer_version="1",
+                reason="Old text is stale",
+            )
+            restored = await store.transition_entry_status(
+                "edited",
+                expected_revision=archived.entry.revision,
+                access_scope=_SCOPE,
+                from_status=KnowledgeStatus.ARCHIVED,
+                to_status=KnowledgeStatus.ACTIVE,
+            )
+            successor = restored.model_copy(
+                update={
+                    "revision": restored.revision + 1,
+                    "status": KnowledgeStatus.ARCHIVED,
+                    "text": "Edited text.",
+                }
+            )
+            await store.publish_entry_revision(
+                successor,
+                [
+                    KnowledgeChunk(
+                        id="edited:edit:0",
+                        entry_id="edited",
+                        entry_revision=successor.revision,
+                        chunk_index=0,
+                        text="Edited text.",
+                    )
+                ],
+                operation_id="publish-edited",
+                expected_revision=restored.revision,
+                access_scope=_SCOPE,
+            )
+            (listed,) = (await workflow.list_archived()).entries
+            assert listed.entry.metadata["cayu:review_archive"]["reviewer_identity"] == "Alice"
+            assert await workflow.archived_decision(listed.entry) == {
+                "decision": None,
+                "decided_by": None,
+                "reason": None,
+            }
+        finally:
+            await _close(store)
+
+    asyncio.run(scenario())
+
+
+def test_a_bound_store_without_review_reads_still_records_fresh_decisions():
+    """A bound store written before review reads refuses the review scope; reviewed drops
+    and archives still record there, as before, and archived entries just aren't shown."""
+
+    from cayu.storage import KnowledgeAccessDenied
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["default"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+
+    class OlderStore(InMemoryKnowledgeStore):
+        def _review_read_access_scope(self, access_scope):
+            return self._operation_access_scope(access_scope)
+
+    async def scenario():
+        store = OlderStore(access_scope=recall)
+        for entry_id, status in (
+            ("kept", KnowledgeStatus.ACTIVE),
+            ("proposal", KnowledgeStatus.PENDING),
+        ):
+            await store.create_entry(
+                KnowledgeEntry(id=entry_id, text=f"Made-up {entry_id}", status=status)
+            )
+        workflow = KnowledgeReviewWorkflow(store)
+        decision = {"reviewer_identity": "reviewer", "reviewer_version": "1"}
+        dropped = await workflow.reject_reviewed(
+            "proposal", expected_revision=1, operation_id="drop", reason="Duplicate.", **decision
+        )
+        archived = await workflow.archive_reviewed(
+            "kept", expected_revision=1, operation_id="archive", reason="Stale.", **decision
+        )
+        assert dropped.entry.status is archived.entry.status is KnowledgeStatus.ARCHIVED
+        assert await workflow.get_archived("kept") is None
+        assert await workflow.archived_decision(archived.entry) == {
+            "decision": None,
+            "decided_by": None,
+            "reason": None,
+        }
+        with pytest.raises(KnowledgeAccessDenied):
+            await workflow.list_archived()
+
+    asyncio.run(scenario())

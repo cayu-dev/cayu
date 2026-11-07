@@ -346,3 +346,24 @@ def _validate_revision_append(
             f"Knowledge revision must be {target_revision} for expected_revision "
             f"{expected_revision!r}."
         )
+
+
+#: The most retained publication receipts a store reads for one ``(entry id, revision)``.
+#: An entry id is reused only after a hard delete, and receipts outlive deletion.
+MAX_REVISION_PUBLICATION_RECEIPTS = 64
+
+
+def _publication_receipt_of_revision(
+    receipts: list[KnowledgePublicationReceipt], entry: KnowledgeEntry
+) -> KnowledgePublicationReceipt | None:
+    """The one receipt among ``receipts`` (all for ``entry``'s id and revision) that published
+    this incarnation of the entry, matched by its created and updated times; None when none,
+    or more than one, does."""
+
+    matching = [
+        receipt
+        for receipt in receipts
+        if receipt.entry_created_at == entry.created_at
+        and receipt.entry_updated_at == entry.updated_at
+    ]
+    return matching[0] if len(matching) == 1 else None

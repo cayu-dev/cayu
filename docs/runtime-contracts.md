@@ -18085,9 +18085,28 @@ replays and a different decision under that ID conflicts. The workflow's access 
 needn't admit archived entries: as `append_entry_revision` does, `publish_entry_revision`
 lets a scope that admits the current revision publish its archived or deleted successor
 (a new entry must still fit the scope in full), so an agent's recall scope (active and
-pending entries, as a scaffolded project's is) records these decisions without gaining
-read access to what they archive. Replaying a recorded decision reads the archived
-revision, so under such a scope the entry is simply no longer found.
+pending entries, as a scaffolded project's is) records these decisions. The workflow
+reads back through a separate `review_access_scope`, by default
+`knowledge_review_scope(access_scope)` (`cayu.knowledge.scopes`): the same scope plus
+the archived revisions of the entries it admits, which is what it may itself archive.
+`list_archived` reads through it; `get_archived`, `get_review_entry` and a replayed
+decision read through the access scope first and through the review scope only when that
+finds nothing, so a recorded decision replays and an archived entry can be shown under a
+recall scope, while a fresh decision reads as it always did (a bound store that predates
+review reads still records it, and shows no archived entry). Pass
+`review_access_scope=access_scope` to show none. A store bound to a
+scope (`access_scope=` at construction) accepts that scope's review scope for its
+review reads (`get_entry`, `read_chunks`, `read_evidence`, `list_entries` and
+`load_entry_publication_receipt`) and refuses it everywhere else, so search, recall,
+change feeds and writes, and the agent's knowledge tools on the bound scope, still see
+no archived entry. `KnowledgeStore.load_entry_revision_publication_receipt(entry)` returns the
+publication receipt that wrote that exact entry revision, if a publication did (matched
+by id, revision and its created and updated times, since receipts outlive a hard delete
+and an entry id can be reused). `KnowledgeReviewWorkflow.archived_decision` replays that
+publication as `load_review_archive` or `load_review_rejection` would, so it attributes
+the decision an archived revision's metadata records only to the revision that decision
+itself published; a later revision written another way copies the metadata unchanged and
+gets none.
 
 The packaged server/dashboard uses the same workflow when `CayuApp` is
 constructed with `knowledge_store=...`; `knowledge_review_namespace` and

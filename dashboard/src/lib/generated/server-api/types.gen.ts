@@ -503,6 +503,122 @@ export type ApiAgentSummary = {
 };
 
 /**
+ * ApiArchivedKnowledgeItem
+ *
+ * An archived entry: a kept entry archived, or a proposal dropped.
+ */
+export type ApiArchivedKnowledgeItem = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Chunk Count
+     */
+    chunk_count: number;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Decided By
+     *
+     * The reviewer the decision records.
+     */
+    decided_by: string | null;
+    /**
+     * Decision
+     *
+     * The reviewed decision the archived revision records: `archive` for a kept entry archived with a reason or an Idempotency-Key, `drop` for a proposal dropped that way; null when it records none (archived by revision alone).
+     */
+    decision: 'archive' | 'drop' | null;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Reason
+     */
+    reason: string | null;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text Preview
+     *
+     * The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.
+     */
+    text_preview: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
  * ApiArtifactSummary
  */
 export type ApiArtifactSummary = {
@@ -3431,6 +3547,141 @@ export type ApprovalRevision = {
      * Proposed Digest
      */
     proposed_digest: string;
+};
+
+/**
+ * ArchivedKnowledgeDetailResponse
+ *
+ * One archived entry (`GET /api/knowledge/archived/{entry_id}`), shaped like a pending
+ * one; its ``metadata`` holds the reviewed decision that archived it, if any.
+ */
+export type ArchivedKnowledgeDetailResponse = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Chunk Limit
+     */
+    chunk_limit: number;
+    /**
+     * Chunk Max Bytes
+     */
+    chunk_max_bytes: number;
+    /**
+     * Chunks
+     */
+    chunks: Array<ApiKnowledgeChunk>;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Content Redacted
+     */
+    content_redacted: true;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Expires At
+     */
+    expires_at: string | null;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
+ * ArchivedKnowledgeListResponse
+ */
+export type ArchivedKnowledgeListResponse = {
+    /**
+     * Entries
+     */
+    entries: Array<ApiArchivedKnowledgeItem>;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
 };
 
 /**
@@ -29194,6 +29445,95 @@ export type KeptKnowledgeApiKnowledgeGetResponses = {
 };
 
 export type KeptKnowledgeApiKnowledgeGetResponse = KeptKnowledgeApiKnowledgeGetResponses[keyof KeptKnowledgeApiKnowledgeGetResponses];
+
+export type ArchivedKnowledgeApiKnowledgeArchivedGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+        /**
+         * Namespace
+         */
+        namespace?: string | null;
+        /**
+         * Kind
+         */
+        kind?: Array<string> | null;
+        /**
+         * Label
+         */
+        label?: Array<string> | null;
+    };
+    url: '/api/knowledge/archived';
+};
+
+export type ArchivedKnowledgeApiKnowledgeArchivedGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ArchivedKnowledgeApiKnowledgeArchivedGetError = ArchivedKnowledgeApiKnowledgeArchivedGetErrors[keyof ArchivedKnowledgeApiKnowledgeArchivedGetErrors];
+
+export type ArchivedKnowledgeApiKnowledgeArchivedGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ArchivedKnowledgeListResponse;
+};
+
+export type ArchivedKnowledgeApiKnowledgeArchivedGetResponse = ArchivedKnowledgeApiKnowledgeArchivedGetResponses[keyof ArchivedKnowledgeApiKnowledgeArchivedGetResponses];
+
+export type ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Entry Id
+         */
+        entry_id: string;
+    };
+    query?: {
+        /**
+         * Max Chunks
+         */
+        max_chunks?: number;
+        /**
+         * Max Bytes
+         */
+        max_bytes?: number;
+    };
+    url: '/api/knowledge/archived/{entry_id}';
+};
+
+export type ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetError = ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetErrors[keyof ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetErrors];
+
+export type ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ArchivedKnowledgeDetailResponse;
+};
+
+export type ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetResponse = ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetResponses[keyof ArchivedKnowledgeEntryApiKnowledgeArchivedEntryIdGetResponses];
 
 export type KeptKnowledgeEntryApiKnowledgeKeptEntryIdGetData = {
     body?: never;

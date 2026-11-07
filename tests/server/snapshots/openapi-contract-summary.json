@@ -635,6 +635,237 @@
       "title": "ApiAgentSummary",
       "type": "object"
     },
+    "ApiArchivedKnowledgeItem": {
+      "additionalProperties": false,
+      "description": "An archived entry: a kept entry archived, or a proposal dropped.",
+      "properties": {
+        "aspects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aspects",
+          "type": "array"
+        },
+        "chunk_count": {
+          "minimum": 0.0,
+          "title": "Chunk Count",
+          "type": "integer"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created By"
+        },
+        "created_by_type": {
+          "title": "Created By Type",
+          "type": "string"
+        },
+        "decided_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reviewer the decision records.",
+          "title": "Decided By"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "enum": [
+                "archive",
+                "drop"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reviewed decision the archived revision records: `archive` for a kept entry archived with a reason or an Idempotency-Key, `drop` for a proposal dropped that way; null when it records none (archived by revision alone).",
+          "title": "Decision"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "impact_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Impact Targets",
+          "type": "array"
+        },
+        "importance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance"
+        },
+        "importance_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance Source"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Type"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text_preview": {
+          "description": "The start of the entry's text, whether or not it has a title: at most 200 characters, cut on a word boundary and ending with an ellipsis when cut. The text is redacted whole before it is cut.",
+          "title": "Text Preview",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "revision",
+        "namespace",
+        "kind",
+        "visibility",
+        "status",
+        "title",
+        "labels",
+        "aspects",
+        "impact_targets",
+        "source_type",
+        "source_uri",
+        "source_id",
+        "created_by_type",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "importance",
+        "importance_source",
+        "confidence",
+        "chunk_count",
+        "text_preview",
+        "decision",
+        "decided_by",
+        "reason"
+      ],
+      "title": "ApiArchivedKnowledgeItem",
+      "type": "object"
+    },
     "ApiArtifactSummary": {
       "additionalProperties": false,
       "properties": {
@@ -6769,6 +7000,261 @@
         "approved_digest"
       ],
       "title": "ApprovalRevision",
+      "type": "object"
+    },
+    "ArchivedKnowledgeDetailResponse": {
+      "additionalProperties": false,
+      "description": "One archived entry (`GET /api/knowledge/archived/{entry_id}`), shaped like a pending\none; its ``metadata`` holds the reviewed decision that archived it, if any.",
+      "properties": {
+        "aspects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Aspects",
+          "type": "array"
+        },
+        "chunk_limit": {
+          "minimum": 1.0,
+          "title": "Chunk Limit",
+          "type": "integer"
+        },
+        "chunk_max_bytes": {
+          "minimum": 1.0,
+          "title": "Chunk Max Bytes",
+          "type": "integer"
+        },
+        "chunks": {
+          "items": {
+            "$ref": "#/components/schemas/ApiKnowledgeChunk"
+          },
+          "title": "Chunks",
+          "type": "array"
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confidence"
+        },
+        "content_redacted": {
+          "const": true,
+          "title": "Content Redacted",
+          "type": "boolean"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "created_by": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created By"
+        },
+        "created_by_type": {
+          "title": "Created By Type",
+          "type": "string"
+        },
+        "entry_id": {
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "impact_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Impact Targets",
+          "type": "array"
+        },
+        "importance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance"
+        },
+        "importance_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Importance Source"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "namespace": {
+          "title": "Namespace",
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 2147483647.0,
+          "minimum": 1.0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "source_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Id"
+        },
+        "source_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Type"
+        },
+        "source_uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Source Uri"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        },
+        "visibility": {
+          "title": "Visibility",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "revision",
+        "namespace",
+        "kind",
+        "visibility",
+        "status",
+        "title",
+        "labels",
+        "aspects",
+        "impact_targets",
+        "source_type",
+        "source_uri",
+        "source_id",
+        "created_by_type",
+        "created_by",
+        "created_at",
+        "updated_at",
+        "importance",
+        "importance_source",
+        "confidence",
+        "content_redacted",
+        "text",
+        "metadata",
+        "expires_at",
+        "chunks",
+        "chunk_limit",
+        "chunk_max_bytes"
+      ],
+      "title": "ArchivedKnowledgeDetailResponse",
+      "type": "object"
+    },
+    "ArchivedKnowledgeListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/components/schemas/ApiArchivedKnowledgeItem"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "entries",
+        "next_cursor"
+      ],
+      "title": "ArchivedKnowledgeListResponse",
       "type": "object"
     },
     "ArtifactReadResponse": {
@@ -36360,6 +36846,187 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/KeptKnowledgeListResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/archived": {
+      "get": {
+        "operation_id": "archived_knowledge_api_knowledge_archived_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 6144,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "default": 100000,
+              "maximum": 1048576,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ArchivedKnowledgeListResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/archived/{entry_id}": {
+      "get": {
+        "operation_id": "archived_knowledge_entry_api_knowledge_archived__entry_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Entry Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_bytes",
+            "required": false,
+            "schema": {
+              "default": 128000,
+              "maximum": 128000,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_chunks",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Max Chunks",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ArchivedKnowledgeDetailResponse"
               }
             }
           },

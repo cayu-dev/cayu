@@ -213,6 +213,7 @@ from cayu.server._judge_calibration_routes import register_judge_calibration_rou
 from cayu.server._kept_knowledge import (
     KNOWLEDGE_REVIEWER_VERSION,
     register_kept_knowledge,
+    reviewed_decision_entry,
     reviewed_decision_revision,
 )
 from cayu.server._knowledge_preview import knowledge_preview
@@ -9837,9 +9838,11 @@ def create_router(
         reviewer_identity, reviewer_annotations = _knowledge_reviewer_attribution(auth_context)
 
         async def reject_reviewed(item_id: str) -> KnowledgeReviewRejection:
-            entry = await workflow.get_entry(item_id)
+            entry = await reviewed_decision_entry(workflow, item_id, operation_id)
             if entry is None:
                 raise KeyError(f"Knowledge entry {item_id!r} does not exist.")
+            # The archived entry a replay reads isn't the one checked before.
+            await inbox_gate.require_knowledge(auth_context, entry)
             try:
                 revision = await reviewed_decision_revision(
                     workflow,

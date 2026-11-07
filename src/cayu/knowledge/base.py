@@ -55,6 +55,7 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_review_scope,
 )
 from cayu.knowledge.search import (
     KnowledgeListQuery,
@@ -125,6 +126,26 @@ class KnowledgeStore(ABC):
         if default_scope is not None and explicit_scope != default_scope:
             raise KnowledgeAccessDenied("access_scope_override")
         return _intersect_resource_knowledge_scope(explicit_scope)
+
+    def _review_read_access_scope(
+        self,
+        access_scope: KnowledgeAccessScope | None,
+    ) -> KnowledgeAccessScope:
+        """The scope of a review read: one entry, its chunks, evidence or publication
+        receipts, or a listing.
+
+        A bound store also takes the review scope of its bound scope
+        (``knowledge_review_scope``) here, so a reviewer can read back the archived
+        entries the bound scope may archive. Search, recall, change feeds and every
+        write still take the bound scope alone.
+        """
+
+        default_scope = self._default_access_scope
+        if access_scope is not None and default_scope is not None:
+            review_scope = knowledge_review_scope(default_scope)
+            if copy_knowledge_access_scope(access_scope) == review_scope:
+                return _intersect_resource_knowledge_scope(review_scope)
+        return self._operation_access_scope(access_scope)
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
         """Return search modes this store can execute directly."""
@@ -339,6 +360,25 @@ class KnowledgeStore(ABC):
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
         """Load immutable publication evidence for one operation id."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support knowledge publication receipts."
+        )
+
+    async def load_entry_revision_publication_receipt(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgePublicationReceipt | None:
+        """The publication receipt of the operation that published exactly ``entry``: its
+        id and revision, and its created and updated times, which tell apart an entry id
+        reused after a hard delete. Under ``load_entry_publication_receipt``'s access policy.
+
+        None when no publication wrote that revision (a status transition or an append
+        did), it is out of scope, or the receipts can't tell which one did. Unsupported
+        stores raise NotImplementedError.
+        """
 
         raise NotImplementedError(
             "This KnowledgeStore does not support knowledge publication receipts."

@@ -30,7 +30,9 @@ from cayu.knowledge.maintenance_contracts import (
     KnowledgeMaintenanceDecisionReceipt,
     KnowledgeMaintenanceProposal,
 )
-from cayu.knowledge.publication_contracts import KnowledgePublicationReceipt
+from cayu.knowledge.publication_contracts import (
+    KnowledgePublicationReceipt,
+)
 from cayu.knowledge.records import (
     DEFAULT_KNOWLEDGE_LIMIT,
     DEFAULT_KNOWLEDGE_MAX_BYTES,
@@ -43,8 +45,10 @@ from cayu.knowledge.records import (
     KnowledgeVisibility,
 )
 from cayu.knowledge.scopes import (
+    KnowledgeAccessDenied,
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
+    knowledge_review_scope,
 )
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
 from cayu.storage._knowledge_rejection import (
@@ -54,6 +58,7 @@ from cayu.storage._knowledge_rejection import (
     load_review_archive,
     load_review_rejection,
     reject_reviewed,
+    verified_review_decision,
 )
 
 _KNOWLEDGE_REVIEW_STORE_METHODS = (
@@ -177,13 +182,23 @@ class _KnowledgeReviewStore(Protocol):
 
 
 class KnowledgeReviewWorkflow:
-    """App-side workflow for reviewing model-authored pending knowledge."""
+    """App-side workflow for reviewing model-authored pending knowledge.
+
+    Decisions are written through ``access_scope``. Review reads (archived entries, and
+    the revisions a recorded decision replays from) go through ``review_access_scope``,
+    by default ``knowledge_review_scope(access_scope)``: the same entries plus their
+    archived revisions. So a workflow on an agent's recall scope (active and pending
+    entries) can show what it archived and replay its decisions, while the agent's
+    search and recall still see no archived entry. Pass ``review_access_scope`` to read
+    through another scope, such as ``access_scope`` itself to show no archived entries.
+    """
 
     def __init__(
         self,
         store: _KnowledgeReviewStore,
         *,
         access_scope: KnowledgeAccessScope | None = None,
+        review_access_scope: KnowledgeAccessScope | None = None,
         namespace: str | None = None,
         labels: dict[str, str] | None = None,
         default_limit: int = DEFAULT_KNOWLEDGE_LIMIT,
@@ -198,6 +213,11 @@ class KnowledgeReviewWorkflow:
         if access_scope is None:
             raise ValueError("KnowledgeReviewWorkflow requires an access scope.")
         self.access_scope = copy_knowledge_access_scope(access_scope)
+        self.review_access_scope = (
+            knowledge_review_scope(self.access_scope)
+            if review_access_scope is None
+            else copy_knowledge_access_scope(review_access_scope)
+        )
         self.namespace = (
             require_clean_nonblank(namespace, "namespace") if namespace is not None else None
         )
@@ -256,6 +276,96 @@ class KnowledgeReviewWorkflow:
         if entry is not None:
             self._require_entry_in_scope(entry)
         return entry
+
+    async def get_review_entry(
+        self, entry_id: str, *, revision: int | None = None
+    ) -> KnowledgeEntry | None:
+        """Load one entry, or one exact revision of it, as a reviewer reads it: through the
+        access scope, then, when that finds nothing, through the review scope."""
+
+        entry, _ = await self._review_read(entry_id, revision=revision)
+        return entry
+
+    async def _review_read(
+        self, entry_id: str, *, revision: int | None = None
+    ) -> tuple[KnowledgeEntry | None, KnowledgeAccessScope]:
+        """``get_review_entry``, with the scope that read the entry, for its chunks."""
+
+        entry_id = require_clean_nonblank(entry_id, "entry_id")
+        entry = await self.store.get_entry(
+            entry_id, revision=revision, access_scope=self.access_scope
+        )
+        scope = self.access_scope
+        if entry is None and self.review_access_scope != self.access_scope:
+            try:
+                entry = await self.store.get_entry(
+                    entry_id, revision=revision, access_scope=self.review_access_scope
+                )
+            except KnowledgeAccessDenied as exc:
+                # A bound store that predates review reads: what the access scope read.
+                if exc.operation != "access_scope_override":
+                    raise
+            else:
+                scope = self.review_access_scope
+        if entry is not None:
+            self._require_entry_in_scope(entry)
+        return entry, scope
+
+    async def load_review_publication(
+        self, operation_id: str
+    ) -> KnowledgePublicationReceipt | None:
+        """The publication receipt ``operation_id`` recorded, as a reviewer reads it: through
+        the access scope, then, when that finds none, through the review scope."""
+
+        raw = await self.store.load_entry_publication_receipt(
+            operation_id, access_scope=self.access_scope
+        )
+        if raw is None and self.review_access_scope != self.access_scope:
+            try:
+                raw = await self.store.load_entry_publication_receipt(
+                    operation_id, access_scope=self.review_access_scope
+                )
+            except KnowledgeAccessDenied as exc:
+                if exc.operation != "access_scope_override":
+                    raise
+        return raw
+
+    async def get_archived(self, entry_id: str) -> KnowledgeEntry | None:
+        """The entry, when its current revision is archived and in the review scope."""
+
+        entry = await self.get_review_entry(entry_id)
+        return entry if entry is not None and entry.status is KnowledgeStatus.ARCHIVED else None
+
+    async def archived_decision(self, entry: KnowledgeEntry) -> dict[str, Any]:
+        """The reviewed archive or drop that published archived revision ``entry``:
+        ``decision``, ``decided_by`` and ``reason``, each ``None`` when no verified reviewed
+        decision did (``verified_review_decision``)."""
+
+        return await verified_review_decision(self, entry)
+
+    async def list_archived(
+        self,
+        *,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
+        kinds: Iterable[str] | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+        max_bytes: int | None = None,
+    ) -> KnowledgeListResult:
+        """List archived entries (archived kept entries and dropped proposals) in the review
+        scope."""
+
+        query = KnowledgeListQuery(
+            namespace=self._scoped_namespace(namespace),
+            labels=self._scoped_labels(labels),
+            kinds=_string_list(kinds, "kinds") if kinds is not None else None,
+            statuses=[KnowledgeStatus.ARCHIVED],
+            cursor=cursor,
+            limit=self.default_limit if limit is None else limit,
+            max_bytes=self.default_max_bytes if max_bytes is None else max_bytes,
+        )
+        return await self.store.list_entries(query, access_scope=self.review_access_scope)
 
     async def load_review_approval(self, operation_id: str) -> KnowledgeActivationReceipt | None:
         """Load the activation receipt one reviewed approval operation recorded."""

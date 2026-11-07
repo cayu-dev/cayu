@@ -169,6 +169,26 @@ def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessS
     )
 
 
+def knowledge_review_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessScope:
+    """The scope a reviewer reads ``scope``'s knowledge through: it, plus archived entries.
+
+    Every other dimension (namespaces, labels, visibility, sources, expiry) stays
+    ``scope``'s, so it adds only the archived revisions of entries ``scope`` admits, which
+    is what ``scope`` may itself archive. A scope that already admits archived entries is
+    returned unchanged. Deleted entries stay out.
+    """
+
+    scope = copy_knowledge_access_scope(scope)
+    if KnowledgeStatus.ARCHIVED in scope.allowed_statuses:
+        return scope
+    return KnowledgeAccessScope.model_validate(
+        {
+            **scope.model_dump(),
+            "allowed_statuses": [*scope.allowed_statuses, KnowledgeStatus.ARCHIVED],
+        }
+    )
+
+
 def _knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
     scope = copy_knowledge_access_scope(scope)
     return sha256(

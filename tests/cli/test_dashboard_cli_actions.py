@@ -461,6 +461,62 @@ def test_cli_archives_a_kept_entry_with_its_reason_and_retries(tmp_path, monkeyp
     assert "dropped_reason" in shown and "Duplicate" in shown
 
 
+def test_cli_shows_and_lists_what_it_archived_on_a_recall_scope(monkeypatch, capsys):
+    """On an Agent whose knowledge scope admits only active and pending entries (the
+    scaffold's), `show` and `list --status archived` read back an archived entry with its
+    reason, and repeating the archive replays it."""
+
+    from cayu.cli import _control_plane_actions, knowledge
+    from cayu.cli._cloud_agent_api import CayuApi
+    from cayu.cli._knowledge_readers import ApiKnowledgeReader
+    from cayu.knowledge.records import KnowledgeEntry, KnowledgeStatus
+    from cayu.knowledge.scopes import KnowledgeAccessScope
+    from cayu.storage.memory import InMemoryKnowledgeStore
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["default"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    store = InMemoryKnowledgeStore(
+        [KnowledgeEntry(id="stale", text="Made-up kept entry", status=KnowledgeStatus.ACTIVE)],
+        access_scope=recall,
+    )
+    app = CayuApp(knowledge_store=store, enable_logging=False)
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        monkeypatch.setattr(
+            _control_plane_actions,
+            "open_action_api",
+            lambda args: CayuApi("http://testserver", http=client),
+        )
+        monkeypatch.setattr(
+            knowledge,
+            "open_knowledge_reader",
+            lambda target: ApiKnowledgeReader(
+                CayuApi("http://testserver", http=client), source={"kind": "server"}
+            ),
+        )
+
+        def run(*args):
+            assert main(["knowledge", *args]) == 0
+            return capsys.readouterr().out
+
+        server = ("--server-url", "http://localhost")
+        archive = ("archive", "stale", "--operation-id", "archive-stale", "--reason", "Stale now")
+        archived = json.loads(run(*archive, "--json"))
+        assert archived["result"]["status"] == "archived"
+        assert json.loads(run(*archive, "--json")) == archived
+        listed = json.loads(run("list", "--status", "archived", *server, "--json"))
+        (row,) = listed["entries"]
+        assert (row["entry_id"], row["decision"], row["reason"]) == (
+            "stale",
+            "archive",
+            "Stale now",
+        )
+        assert json.loads(run("list", *server, "--json"))["entries"] == []
+        shown = run("show", "stale", *server)
+        assert "archived_reason" in shown and "Stale now" in shown
+
+
 @pytest.mark.parametrize("status", [401, 403, 409, 422])
 def test_cli_refusal_does_not_echo_remote_body_or_credentials(status, monkeypatch, capsys):
     import httpx

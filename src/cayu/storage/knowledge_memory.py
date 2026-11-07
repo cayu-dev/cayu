@@ -110,6 +110,7 @@ from cayu.knowledge.maintenance_contracts import (
 from cayu.knowledge.publication_contracts import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
+    _publication_receipt_of_revision,
     _validate_activation_publication_material,
     _validate_knowledge_publication_replay,
     _validate_revision_append,
@@ -463,7 +464,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -1467,7 +1468,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         receipt = self._publication_receipts.get(operation_id)
         if receipt is None:
@@ -1476,6 +1477,27 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if snapshot is None or not _knowledge_scope_allows_snapshot(scope, snapshot):
             return None
         return copy_knowledge_publication_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
+    async def load_entry_revision_publication_receipt(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgePublicationReceipt | None:
+        scope = self._review_read_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry.id)
+        _validate_knowledge_revision(entry.revision, "revision")
+        receipts = [
+            receipt
+            for operation_id, receipt in self._publication_receipts.items()
+            if receipt.entry_id == entry_id
+            and receipt.entry_revision == entry.revision
+            and (snapshot := self._publication_access.get(operation_id)) is not None
+            and _knowledge_scope_allows_snapshot(scope, snapshot)
+        ]
+        receipt = _publication_receipt_of_revision(receipts, entry)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
     async def load_entry_activation_receipt(
@@ -2755,7 +2777,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> KnowledgeEvidenceResult | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -3224,7 +3246,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -3390,7 +3412,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeListResult:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         knowledge_query = copy_knowledge_list_query(query)
         entries = [
             entry

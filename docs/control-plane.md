@@ -1002,7 +1002,19 @@ repeat, and every label must match. They stay inside the configured scope: a
 chunks (`max_chunks` up to 50, `max_bytes` up to 128,000), shaped like
 `GET /api/knowledge/pending/{entry_id}`. An entry that isn't active, is outside the
 scope, or is hidden from the caller answers 404 the same way.
-Both detail routes apply the application's redactor to complete content before
+
+`GET /api/knowledge/archived` lists archived entries (kept entries archived and
+proposals dropped), with the same filters, `limit`, `max_bytes` and sealed `cursor`;
+each row adds the reviewed `decision` that published its archived revision (`archive`
+or `drop`, null for one archived by revision alone), `decided_by` and the redacted
+`reason`. `GET /api/knowledge/archived/{entry_id}` returns one archived entry shaped
+like the kept detail, its `metadata` holding the decision. Both need full access, as
+retiring does, so members get 403, and both read through the review scope: the
+application's knowledge scope plus the archived revisions of the entries it admits
+(`knowledge_review_scope`). A server whose knowledge scope admits only active and
+pending entries, as a scaffolded project's does, still shows what it archived, while
+search, recall and the agent's knowledge tools still see no archived entry.
+The detail routes apply the application's redactor to complete content before
 bounding chunks and return `content_redacted: true`. This flag confirms redaction
 was applied, including when no secrets matched; it does not assert that content is
 secret-free. Pending-list previews likewise redact before shortening the text.
@@ -1111,17 +1123,18 @@ a Cloud Agent the CLI uses the Agent's operator login, which has it. An Agent on
 from before reasons makes the keep or drop without one, and the CLI warns that it
 wasn't recorded. All preserve the server's review scope and permissions. The server's
 knowledge scope needn't admit archived entries: with a scaffolded project's (active and
-pending only) drop and archive still record the decision, and the inbox answers a drop
-from the decision it just recorded; a retry after that no longer finds the entry, since
-the scope can't read the archived revision. Local store options remain read-only;
+pending only) drop and archive still record the decision, read it back through the
+review scope, and replay it when repeated with the same operation ID. The inbox answers
+a drop from the decision it just recorded, but repeating the inbox's Drop there still
+finds no item. Local store options remain read-only;
 mutations always go through the running server.
-`cayu knowledge show` on a local store prints who archived or dropped an entry and
-why (`archived_by`, `archived_reason`, `dropped_by`, `dropped_reason`); a Cloud Agent's
-API serves only kept and pending entries, so read an archived entry's reason from the
-archive command's answer.
+`cayu knowledge show` prints who archived or dropped an entry and why (`archived_by`,
+`archived_reason`, `dropped_by`, `dropped_reason`), from a local store or, with full
+access, from a server or Cloud Agent; an Agent on a Cayu from before the archived routes
+shows none.
 
-`--status` is `active` (kept, the default) or `pending`, and `archived` from a
-local store. `--kind` repeats for any of several kinds and `--label KEY=VALUE`
+`--status` is `active` (kept, the default), `pending` or `archived`; from a server or
+Cloud Agent, `archived` needs full access. `--kind` repeats for any of several kinds and `--label KEY=VALUE`
 repeats to require several labels. The table's preview column shows an entry's
 title, or the start of its text when it has none; `--json` and `--jsonl` give
 each entry's `title` and `text_preview`, the start of its text, as the routes

@@ -122,7 +122,9 @@ async def _prepare(
     operation_id: str,
     kind: _ReviewedKind = _REJECTION,
 ) -> tuple[str, KnowledgeEntry, list[KnowledgeChunk], list[KnowledgeEvidence], str]:
-    proposal = await workflow.get_entry(entry_id, revision=revision)
+    # Once the decision is recorded the entry is archived, and a replay reads the revision
+    # it archived from through the review scope; a fresh decision reads it as it decides.
+    proposal, scope = await workflow._review_read(entry_id, revision=revision)
     if proposal is not None:
         proposal = copy_knowledge_entry(proposal)
     if proposal is None or proposal.status is not kind.from_status:
@@ -130,7 +132,7 @@ async def _prepare(
     source_chunks = await workflow.store.read_chunks(
         proposal.id,
         revision=proposal.revision,
-        access_scope=workflow.access_scope,
+        access_scope=scope,
         # Retrieval truncates rather than reporting overflow. Probe one extra
         # chunk and four extra bytes (the maximum UTF-8 codepoint width). Any
         # truncated prefix must then exceed the accepted bound, even if its last
@@ -148,7 +150,7 @@ async def _prepare(
     source_evidence = await workflow.store.read_evidence(
         proposal.id,
         revision=proposal.revision,
-        access_scope=workflow.access_scope,
+        access_scope=scope,
         max_records=MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
         max_bytes=kind.max_bytes,
     )
@@ -186,9 +188,7 @@ async def load_review_rejection(
     operation_id: str,
     kind: _ReviewedKind = _REJECTION,
 ) -> KnowledgeReviewRejection | None:
-    raw = await workflow.store.load_entry_publication_receipt(
-        operation_id, access_scope=workflow.access_scope
-    )
+    raw = await workflow.load_review_publication(operation_id)
     if raw is None:
         return None
     receipt = copy_knowledge_publication_receipt(raw)
@@ -199,7 +199,7 @@ async def load_review_rejection(
         or receipt.entry_revision != revision + 1
     ):
         raise KnowledgePublicationConflict("operation_mismatch")
-    successor = await workflow.get_entry(entry_id, revision=revision + 1)
+    successor = await workflow.get_review_entry(entry_id, revision=revision + 1)
     if successor is not None:
         successor = copy_knowledge_entry(successor)
     if successor is None or successor.status is not KnowledgeStatus.ARCHIVED:
@@ -305,7 +305,49 @@ async def reject_reviewed(
     if receipt.request_sha256 != digest:
         raise KnowledgePublicationConflict("operation_mismatch")
     # The receipt's digest covers exactly the successor this call prepared, so that is the
-    # revision the store holds. It isn't read back: a scope that admits only the statuses an
-    # agent recalls (active, pending) may archive an entry it sees without being able to read
-    # archived entries, as for an unreviewed retirement.
+    # revision the store holds. It isn't read back: the workflow's review scope may not
+    # admit archived entries, while its access scope may still archive one it sees.
     return KnowledgeReviewRejection(copy_knowledge_entry(successor), decision, receipt)
+
+
+async def verified_review_decision(
+    workflow: KnowledgeReviewWorkflow, entry: KnowledgeEntry
+) -> dict[str, Any]:
+    """The reviewed archive or drop that published archived revision ``entry``: its
+    ``decision`` (``archive`` or ``drop``), ``decided_by`` and ``reason``, each ``None``
+    when no verified reviewed decision did.
+
+    The publication that wrote this exact revision (``load_entry_revision_publication_receipt``)
+    is replayed as ``load_review_archive`` and ``load_review_rejection`` replay it, so the
+    decision counts only when the revision is exactly what that decision publishes from the
+    revision before. Metadata a later revision copied, or a publication of another kind,
+    doesn't count.
+    """
+
+    none: dict[str, Any] = {"decision": None, "decided_by": None, "reason": None}
+    load = getattr(workflow.store, "load_entry_revision_publication_receipt", None)
+    if entry.status is not KnowledgeStatus.ARCHIVED or entry.revision <= 1 or not callable(load):
+        return none
+    try:
+        receipt = await load(entry, access_scope=workflow.review_access_scope)
+    except (NotImplementedError, KnowledgePublicationConflict, PermissionError):
+        # Unsupported, malformed, or a store without review reads: no attribution.
+        return none
+    if receipt is None or receipt.expected_revision != entry.revision - 1:
+        return none
+    for kind, decision in ((_ARCHIVE, "archive"), (_REJECTION, "drop")):
+        if entry.metadata.get(kind.metadata_key) is None:
+            continue
+        try:
+            verified = await load_review_rejection(
+                workflow, entry.id, entry.revision - 1, receipt.operation_id, kind
+            )
+        except (KnowledgePublicationConflict, PermissionError, NotImplementedError):
+            continue
+        if verified is not None and verified.entry == entry:
+            return {
+                "decision": decision,
+                "decided_by": verified.decision.reviewer_identity,
+                "reason": verified.decision.reason,
+            }
+    return none

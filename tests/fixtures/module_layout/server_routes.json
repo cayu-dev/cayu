@@ -99,6 +99,8 @@
   "POST /api/shared-allocations/release name=release_shared_allocation class=_BoundedControlPlaneRequestRoute POST=release_shared_allocation_api_shared_allocations_release_post",
   "GET /api/knowledge name=kept_knowledge class=_BoundedControlPlaneRequestRoute GET=kept_knowledge_api_knowledge_get",
   "GET /api/knowledge/kept/{entry_id} name=kept_knowledge_entry class=_BoundedControlPlaneRequestRoute GET=kept_knowledge_entry_api_knowledge_kept__entry_id__get",
+  "GET /api/knowledge/archived name=archived_knowledge class=_BoundedControlPlaneRequestRoute GET=archived_knowledge_api_knowledge_archived_get",
+  "GET /api/knowledge/archived/{entry_id} name=archived_knowledge_entry class=_BoundedControlPlaneRequestRoute GET=archived_knowledge_entry_api_knowledge_archived__entry_id__get",
   "POST /api/knowledge/{entry_id}/retire name=retire_knowledge class=_BoundedControlPlaneRequestRoute POST=retire_knowledge_api_knowledge__entry_id__retire_post",
   "POST /api/inbox/{item_id}/settle name=settle_inbox_item class=_BoundedControlPlaneRequestRoute POST=settle_inbox_item_api_inbox__item_id__settle_post",
   "POST /api/sessions/{session_id}/messages name=enqueue_session_message class=PrivateSessionMessageRoute POST=enqueue_session_message_api_sessions__session_id__messages_post",

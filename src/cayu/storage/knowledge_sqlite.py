@@ -153,8 +153,10 @@ from cayu.knowledge.maintenance_contracts import (
     prepare_knowledge_maintenance_decision,
 )
 from cayu.knowledge.publication_contracts import (
+    MAX_REVISION_PUBLICATION_RECEIPTS,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
+    _publication_receipt_of_revision,
     _validate_activation_publication_material,
     _validate_knowledge_publication_replay,
     _validate_revision_append,
@@ -430,7 +432,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -933,10 +935,40 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgePublicationReceipt | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         operation_id = _knowledge_publication_operation_id(operation_id)
         async with self._lock:
             receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
+    async def load_entry_revision_publication_receipt(
+        self,
+        entry: KnowledgeEntry,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgePublicationReceipt | None:
+        scope = self._review_read_access_scope(access_scope)
+        entry_id = _knowledge_entry_id(entry.id)
+        _validate_knowledge_revision(entry.revision, "revision")
+        async with self._lock:
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
+                rows = self._connection.execute(
+                    "SELECT operation_id FROM cayu_knowledge_publication_receipts "
+                    "WHERE entry_id = ? AND entry_revision = ? LIMIT ?",
+                    (entry_id, entry.revision, MAX_REVISION_PUBLICATION_RECEIPTS),
+                ).fetchall()
+                receipts = [
+                    receipt
+                    for row in rows
+                    if (
+                        receipt := self._load_publication_receipt_in_scope_unlocked(
+                            str(row["operation_id"]), scope
+                        )
+                    )
+                    is not None
+                ]
+        receipt = _publication_receipt_of_revision(receipts, entry)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     @runtime_knowledge_operation("read")
@@ -2463,7 +2495,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         max_records: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> KnowledgeEvidenceResult | None:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -3063,7 +3095,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         max_chunks: int = DEFAULT_KNOWLEDGE_LIMIT,
         max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES,
     ) -> list[KnowledgeChunk]:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
@@ -3386,7 +3418,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeListResult:
-        scope = self._operation_access_scope(access_scope)
+        scope = self._review_read_access_scope(access_scope)
         knowledge_query = copy_knowledge_list_query(query)
         where_sql, params = _knowledge_list_filter_sql(knowledge_query)
         access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
