@@ -6,6 +6,7 @@ Execution, recovered publication and the paused-round phase share this implement
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
@@ -46,7 +47,7 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._event_writer import prepare_runtime_event
+from cayu.runtime._event_writer import RuntimeEventWriter, prepare_runtime_event
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import current_builder, timed_phase
 from cayu.runtime._tool_effect_state import (
@@ -111,6 +112,15 @@ CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any],
 ]
+
+
+class StageWriter(Protocol):
+    """Apply one staged-terminal checkpoint change and return the stored stage."""
+
+    def __call__(
+        self, transform: CheckpointTransform, *, tool_call_id: str
+    ) -> Awaitable[tool_round_recovery.StagedToolCallTerminal | None]: ...
+
 
 _POLICY_DENIAL_CONTROL_PAYLOAD_FIELDS = frozenset(
     {
@@ -437,8 +447,14 @@ class _ToolRoundPublicationCoordinator:
     async def start_publication(
         self,
         staged: tool_round_recovery.StagedToolCallTerminal,
+        *,
+        write_stage: StageWriter | None = None,
     ) -> tool_round_recovery.StagedToolCallTerminal:
-        """Durably pin public timing before the first append attempt."""
+        """Durably pin public timing before the first append attempt.
+
+        ``write_stage`` (a ``StagedTerminalBatch``) defers the write to the
+        batch's one publication with the terminal events.
+        """
 
         builder = current_builder()
         if builder is not None:
@@ -483,7 +499,7 @@ class _ToolRoundPublicationCoordinator:
             lambda: _durable_payload_utf8_size(public_event.payload),
         )
         self.validate_staged_payload(staged.tool_call_id, public_payload_bytes)
-        transform, committed_stage = _committed_stage_capture(
+        stored = await (write_stage or self._write_stage)(
             tool_round_recovery.started_staged_terminal_publication_transform(
                 tool_round_identity=self._tool_round_identity,
                 tool_call_id=staged.tool_call_id,
@@ -495,8 +511,6 @@ class _ToolRoundPublicationCoordinator:
             ),
             tool_call_id=staged.tool_call_id,
         )
-        await self._session_store.transform_checkpoint(self._session_id, transform)
-        stored = committed_stage()
         if (
             stored is None
             or stored.publication_started_at != publication_started_at
@@ -822,10 +836,14 @@ class _ToolRoundPublicationCoordinator:
         self._staged_event_ids.add(stored.event.id)
 
     @timed_phase("staging")
-    async def record_projected_terminal(self, event: Event) -> Event:
+    async def record_projected_terminal(
+        self, event: Event, *, write_stage: StageWriter | None = None
+    ) -> Event:
         """Persist a public projection while retaining its current hook state."""
 
-        return await self._persist_projected_terminal(event, hooks_completed=False)
+        return await self._persist_projected_terminal(
+            event, hooks_completed=False, write_stage=write_stage
+        )
 
     @timed_phase("staging")
     async def record_workspace_capture(self, event: Event) -> Event:
@@ -834,16 +852,28 @@ class _ToolRoundPublicationCoordinator:
         return await self._persist_projected_terminal(event, hooks_completed=False)
 
     @timed_phase("staging")
-    async def complete_terminal_hooks(self, event: Event) -> Event:
+    async def complete_terminal_hooks(
+        self, event: Event, *, write_stage: StageWriter | None = None
+    ) -> Event:
         """Persist the final hook projection and mark its hooks complete."""
 
-        return await self._persist_projected_terminal(event, hooks_completed=True)
+        return await self._persist_projected_terminal(
+            event, hooks_completed=True, write_stage=write_stage
+        )
+
+    async def _write_stage(
+        self, transform: CheckpointTransform, *, tool_call_id: str
+    ) -> tool_round_recovery.StagedToolCallTerminal | None:
+        transform, committed_stage = _committed_stage_capture(transform, tool_call_id=tool_call_id)
+        await self._session_store.transform_checkpoint(self._session_id, transform)
+        return committed_stage()
 
     async def _persist_projected_terminal(
         self,
         event: Event,
         *,
         hooks_completed: bool,
+        write_stage: StageWriter | None = None,
     ) -> Event:
         if event.session_id != self._session_id:
             raise ValueError("Projected terminal belongs to a different session.")
@@ -863,7 +893,7 @@ class _ToolRoundPublicationCoordinator:
             if type(tool_call_id) is not str:
                 raise ValueError("Projected terminal lost its tool-call identity.")
             self.validate_staged_payload(tool_call_id, payload_bytes)
-            transform, committed_stage = _committed_stage_capture(
+            stored = await (write_stage or self._write_stage)(
                 (
                     tool_round_recovery.completed_staged_terminal_transform
                     if hooks_completed
@@ -875,8 +905,6 @@ class _ToolRoundPublicationCoordinator:
                 ),
                 tool_call_id=tool_call_id,
             )
-            await self._session_store.transform_checkpoint(self._session_id, transform)
-            stored = committed_stage()
             if (
                 stored is None
                 or stored.event.id != projected.id
@@ -1449,3 +1477,143 @@ async def _tool_terminal_payload_limits(
             argument_bytes += APPROVED_ARGUMENTS_NOTICE_MAX_BYTES
         limits[tool_call.id] = result_limit + argument_bytes
     return _TerminalPayloadLimits(limits, undeclared_tool_names=undeclared)
+
+
+_MISSING = object()
+
+
+class StagedTerminalBatch:
+    """Publish a round's staged terminals in two writes instead of three per result.
+
+    Each result's publication changes its stage twice (publication timing,
+    then hook completion) and appends its terminal event. With no after-tool
+    hooks to run in between, nothing outside the runtime observes those steps,
+    so the batch applies the stage changes to a copy of the checkpoint and
+    keeps the prepared events. It then writes every stage change in one
+    checkpoint transform, which rejects a stage that differs from the one the
+    batch predicted, and appends every event in one batch.
+
+    A loss before the first write leaves every result staged and unpublished,
+    and a loss after the second leaves every result published before the round
+    commit. A loss between them leaves every result with its hooks complete and
+    its event not yet appended, the state a loss just before a result-by-result
+    append left that result in. Recovery treats each staged result on its own.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: Session,
+        session_store: SessionStore,
+        event_writer: RuntimeEventWriter,
+        publication_governor: ToolTerminalPublicationGovernor,
+        checkpoint: dict[str, Any] | None,
+        emit_one: Callable[[Event], Awaitable[Event]],
+    ) -> None:
+        self._session = session
+        # A round with one result publishes it as result-by-result publication
+        # did, after the one stage write.
+        self._emit_one = emit_one
+        self._session_store = session_store
+        self._event_writer = event_writer
+        self._publication_governor = publication_governor
+        # The stage transforms copy the checkpoint they are given and return a
+        # new one, so these roots are only ever replaced, never changed.
+        self._source = checkpoint
+        self._checkpoint = checkpoint
+        self._changes: list[
+            tuple[CheckpointTransform, str, tool_round_recovery.StagedToolCallTerminal | None]
+        ] = []
+        self._events: list[Event] = []
+        self._unprepared: list[Event] = []
+
+    async def write_stage(
+        self, transform: CheckpointTransform, *, tool_call_id: str
+    ) -> tool_round_recovery.StagedToolCallTerminal | None:
+        capturing, committed_stage = _committed_stage_capture(transform, tool_call_id=tool_call_id)
+        self._checkpoint = capturing(self._session, self._checkpoint)
+        stored = committed_stage()
+        self._changes.append((transform, tool_call_id, stored))
+        return stored
+
+    async def emit(self, event: Event) -> Event:
+        # Off the event loop, as emit_staged prepares staged terminals: their
+        # nested content cannot be sized cheaply here.
+        prepared = await self._publication_governor.run_cpu(
+            max(
+                _terminal_publication_work_estimate(event),
+                TOOL_TERMINAL_PUBLICATION_SLICE_BYTES + 1,
+            ),
+            lambda: self._event_writer.prepare(event),
+        )
+        self._events.append(prepared)
+        self._unprepared.append(copy_event(event))
+        return copy_event(prepared)
+
+    async def publish(
+        self, *, persisted_observer: Callable[[Event], None] | None = None
+    ) -> list[Event]:
+        """Write the batch; return its events as fanned out, with durable sequences."""
+
+        if not self._changes and not self._events:
+            return []
+        changes = tuple(self._changes)
+        events = [copy_event(event) for event in self._events]
+        source, predicted = self._source, self._checkpoint
+
+        source_root = source or {}
+        changed_keys = (
+            ()
+            if predicted is None
+            else tuple(
+                key
+                for key in {*source_root, *predicted}
+                if source_root.get(key, _MISSING) != predicted.get(key, _MISSING)
+            )
+        )
+
+        def apply_changes(session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+            if (
+                predicted is not None
+                and checkpoint is not None
+                and all(
+                    checkpoint.get(key, _MISSING) == source_root.get(key, _MISSING)
+                    for key in changed_keys
+                )
+            ):
+                # The roots the changes touch are as the batch found them, so
+                # the same transforms give the same roots: reuse them without
+                # decoding the round again.
+                updated = dict(checkpoint)
+                for key in changed_keys:
+                    if key in predicted:
+                        updated[key] = copy.deepcopy(predicted[key])
+                    else:
+                        updated.pop(key, None)
+                return updated
+            updated = checkpoint
+            for transform, tool_call_id, expected in changes:
+                capturing, committed_stage = _committed_stage_capture(
+                    transform, tool_call_id=tool_call_id
+                )
+                updated = capturing(session, updated)
+                if committed_stage() != expected:
+                    raise RuntimeError("A staged terminal changed before its batched publication.")
+            if updated is None:  # pragma: no cover - a stage change always returns its root
+                raise RuntimeError("Batched terminal publication lost its checkpoint.")
+            return updated
+
+        # Two writes, not one: the stage changes first, so a loss before the
+        # events leaves every result's hooks marked complete, as a loss
+        # before a result-by-result append did. Neither is shielded or
+        # reconciled, like the writes they replace.
+        if changes:
+            await self._session_store.transform_checkpoint(self._session.id, apply_changes)
+        if not events:
+            return []
+        if len(events) == 1:
+            return [await self._emit_one(self._unprepared[0])]
+        await self._session_store.append_events(self._session.id, events)
+        return await self._event_writer.fan_out_atomically_persisted(
+            events, persisted_observer=persisted_observer
+        )

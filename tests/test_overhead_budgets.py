@@ -108,9 +108,9 @@ BUDGETS: dict[str, dict[str, int]] = {
     "session start to model request 1": {"store_calls": 36},
     "model reply 1 to first tool start": {"store_calls": 21},
     "between tool calls in round 1": {"store_calls": 13},
-    "round 1 last tool result to model request 2": {"store_calls": 41},
+    "round 1 last tool result to model request 2": {"store_calls": 39},
     "model reply 2 to first tool start": {"store_calls": 21},
-    "round 2 last tool result to model request 3": {"store_calls": 37},
+    "round 2 last tool result to model request 3": {"store_calls": 36},
     "model reply 3 to session end": {"store_calls": 35},
     "during the model calls": {"store_calls": 2},
     # One Cloud activity page (GET /cloud/v1/activity) over an in-memory store.

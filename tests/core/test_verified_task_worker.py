@@ -1301,9 +1301,15 @@ def test_worker_recovers_tool_publication_after_process_exit(
                     admission
                 )
                 if call_count == 2:
+                    # With no after-tool hook the round marks every result's
+                    # hooks complete before it appends any of them; with one,
+                    # it publishes result by result and stops at the first.
                     assert [
                         (item.tool_call_id, item.hooks_state) for item in pending.staged_terminals
-                    ] == [("record-effect", "completed"), ("record-effect-2", "pending")]
+                    ] == [
+                        ("record-effect", "completed"),
+                        ("record-effect-2", "completed" if hook_mode == "none" else "pending"),
+                    ]
             if hook_mode == "cancel":
                 async with VerifiedTaskWorker(
                     app, handler, worker_id="replacement", callback_timeout_seconds=0.1

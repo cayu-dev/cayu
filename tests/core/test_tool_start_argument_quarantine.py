@@ -4188,16 +4188,15 @@ def test_observational_stage_tracks_projected_result_after_lost_acknowledgement(
         assert (
             completed.payload["result"]["artifacts"][-1]["type"] == "cayu.tool_result_artifact.v1"
         )
-        unavailable = next(
+        second = next(
             event for event in terminals if event.payload["tool_call_id"] == "call_external_two"
         )
-        assert unavailable.type is EventType.TOOL_CALL_FAILED
-        assert unavailable.payload["result"]["structured"] == {
-            "error": "invalid_tool_output",
-            "reason": "recovery_hook_secret_scope_unavailable",
-            "outcome_unknown": True,
-            "recovered": True,
-        }
+        # The round has no after-tool hooks, so both results were appended
+        # together before the acknowledgement was lost: the second is kept.
+        # Published result by result, the second never got its hooks marked
+        # complete, and recovery could only report its secret scope lost.
+        assert second.type is EventType.TOOL_CALL_COMPLETED
+        assert second.payload["result"]["artifacts"][-1]["type"] == "cayu.tool_result_artifact.v1"
         publication_status = app.tool_terminal_publication_status()
         assert publication_status.active_round_reservations == 0
         assert publication_status.active_exclusive_rounds == 0

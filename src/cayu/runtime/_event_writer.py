@@ -438,6 +438,23 @@ class RuntimeEventWriter:
         }:
             _mark_session_invocation_terminal_event(event)
 
+    async def fan_out_atomically_persisted(
+        self,
+        events: list[Event],
+        *,
+        persisted_observer: Callable[[Event], None] | None = None,
+    ) -> list[Event]:
+        """Observe and fan out prepared events a store publication just committed.
+
+        For events this writer prepared and the caller published with other
+        durable state in one store write: they are observed as ``emit``
+        observes an append, then their handoffs are delivered.
+        """
+
+        for event in events:
+            self._observe_persisted_event(event, persisted_observer)
+        return await self.fan_out_persisted(events)
+
     async def fan_out_persisted(self, events: list[Event]) -> list[Event]:
         """Apply budget/sink side effects after a store-owned atomic publication."""
 

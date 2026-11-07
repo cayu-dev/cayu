@@ -89,6 +89,7 @@ from cayu.execution_units import (
 )
 from cayu.mcp.tools import McpToolAdapter, McpToolset
 from cayu.messages import Message
+from cayu.observability.hooks import RuntimeHookPhase, _runtime_hook_supports_phase
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runners._cleanup import (
     attach_runner_cancellation_failure,
@@ -1680,6 +1681,19 @@ class ToolRoundRun:
                 self._registered_agent.executable_tool(tool_call.name) for tool_call in tool_calls
             )
         )
+        runtime_hooks = (
+            executor.invocation.hooks.registrations
+            if self._invocation_context is None
+            else self._invocation_context.runtime_hooks
+        )
+        # With no after-tool hook to run between a result's publication steps,
+        # the round's results publish in one write.
+        batch_terminals = defer_round_terminals and not any(
+            _runtime_hook_supports_phase(
+                hook=registered_hook.hook, phase=RuntimeHookPhase.AFTER_TOOL_CALL
+            )
+            for registered_hook in (*runtime_hooks, *self._registered_agent.runtime_hooks)
+        )
         round_owner = DurableToolRound.for_execution(
             session=session,
             tool_round_identity=tool_round_identity,
@@ -1707,6 +1721,7 @@ class ToolRoundRun:
             emit_result=executor.invocation.terminals.publish_result,
             emit_terminal=executor.invocation.terminals.emit_staged,
             defer_terminals=defer_round_terminals,
+            batch_terminals=batch_terminals,
             terminal_payload_limits=(
                 await _tool_terminal_payload_limits(
                     self._registered_agent,

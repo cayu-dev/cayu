@@ -493,7 +493,10 @@ def test_parallel_dispatch_overlaps_call_execution(sqlite_resources):
             for call in record.calls:
                 phases = {p.name: p for p in call.phases}
                 assert phases["staging"].store_transaction_count > 0
-                assert phases["publication"].store_transaction_count > 0
+            # With no after-tool hooks the round's results publish in one
+            # write, which belongs to the round rather than to one call.
+            round_phases = {p.name: p for p in record.phases}
+            assert round_phases["publication"].store_transaction_count > 0
 
     asyncio.run(scenario())
 

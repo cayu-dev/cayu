@@ -14,8 +14,10 @@ from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 from typing import Any, Literal, Protocol, TypeVar
 
+from cayu._exception_groups import add_exception_note_safely
 from cayu._task_wait import (
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
@@ -80,6 +82,7 @@ from cayu.runtime._tool_effect_state import (
 )
 from cayu.runtime._tool_round_continuation import ToolRoundContinuation
 from cayu.runtime._tool_round_staging import (
+    StagedTerminalBatch,
     ToolTerminalPublisher,
     _redactor_for_tool_calls,
     _staged_terminal_argument_projections,
@@ -203,6 +206,9 @@ class _ToolRoundExecution:
     emit_result: ToolTerminalPublisher
     emit_terminal: Callable[[Event], Awaitable[Event]]
     coordinator: _ToolRoundPublicationCoordinator | None
+    # No after-tool hook runs between a result's publication steps, so the
+    # round's results publish in one write (see StagedTerminalBatch).
+    batch_terminals: bool = False
     admitted: bool = False
     durable_events: list[Event] = field(default_factory=list)
     staged_hook_modes: dict[str, tuple[bool, bool]] = field(default_factory=dict)
@@ -254,6 +260,7 @@ class DurableToolRound:
         emit_terminal: Callable[[Event], Awaitable[Event]],
         defer_terminals: bool,
         terminal_payload_limits: Mapping[str, int | None] | None,
+        batch_terminals: bool = False,
     ) -> DurableToolRound:
         """Attach the dispatch and staging dependencies for an ordinary round."""
 
@@ -293,6 +300,7 @@ class DurableToolRound:
             emit_result=emit_result,
             emit_terminal=emit_terminal,
             coordinator=coordinator,
+            batch_terminals=batch_terminals,
         )
         return owner
 
@@ -1798,18 +1806,6 @@ class DurableToolRound:
         await self._synchronize_staged_outcomes()
         return staged_event
 
-    async def _complete_terminal_hooks(self, event: Event) -> Event:
-        execution = self._require_execution()
-        if execution.coordinator is None:
-            raise AssertionError("Hook finalization requires a publication coordinator.")
-        return await execution.coordinator.complete_terminal_hooks(event)
-
-    async def _record_terminal_projection(self, event: Event) -> Event:
-        execution = self._require_execution()
-        if execution.coordinator is None:
-            raise AssertionError("Projection recording requires a publication coordinator.")
-        return await execution.coordinator.record_projected_terminal(event)
-
     @timed_owned_stage("staging")
     async def record_workspace_capture(self, event: Event) -> Event:
         if self._continuation is not None:
@@ -1831,7 +1827,7 @@ class DurableToolRound:
             if expected_stage_ids:
                 raise AssertionError("Staged publication requires a coordinator.")
             return
-        _, staged_round = await self._load_pending_round(
+        staged_checkpoint, staged_round = await self._load_pending_round(
             "Staged terminal publication lost its pending tool round."
         )
         staged_by_id = {item.tool_call_id: item for item in staged_round.staged_terminals}
@@ -1856,11 +1852,102 @@ class DurableToolRound:
         if not expected_stage_ids.issubset(calls_by_id):
             raise RuntimeError("Staged terminal publication names an unknown tool call.")
         final_outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
+        batch = (
+            StagedTerminalBatch(
+                session=self._session,
+                session_store=self._session_store,
+                event_writer=self._event_writer,
+                publication_governor=execution.publication_governor,
+                checkpoint=staged_checkpoint,
+                emit_one=execution.emit_terminal,
+            )
+            if execution.batch_terminals and expected_stage_ids
+            else None
+        )
+        batched: list[tuple[Event, runtime_records.ToolCallOutcome | None]] = []
+
+        def publish_terminal(
+            event: Event, outcome: runtime_records.ToolCallOutcome | None
+        ) -> Event:
+            if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                execution.publication_governor.published(
+                    session_id=self._session.id,
+                    event_id=event.id,
+                    published_at=execution.clock(),
+                )
+                coordinator.terminal_published(event.id)
+                execution.durable_events.append(copy_event(event))
+            if outcome is not None:
+                final_outcomes[outcome.call.id] = outcome
+            return event
+
+        async def publish_batch() -> list[Event]:
+            # Results published so far, as result-by-result publication would
+            # have left them when a later result stopped the round.
+            assert batch is not None
+            with phase_scope("publication"):
+                published = await batch.publish(
+                    persisted_observer=lambda persisted: execution.publication_governor.published(
+                        session_id=persisted.session_id,
+                        event_id=persisted.id,
+                        published_at=execution.clock(),
+                    )
+                )
+            published_by_id = {event.id: event for event in published}
+            return [
+                publish_terminal(published_by_id.get(event.id, event), outcome)
+                for event, outcome in batched
+            ]
+
+        try:
+            async for event in self._publish_each_staged_terminal(
+                execution, coordinator, staged_by_id, batch=batch, batched=batched
+            ):
+                yield publish_terminal(event[0], event[1])
+        except BaseException as stopped:
+            if batch is not None:
+                try:
+                    published = await publish_batch()
+                except Exception as error:
+                    # The stop (a cancellation, say) stays the outcome; the
+                    # failed flush leaves its results staged for recovery.
+                    add_exception_note_safely(
+                        stopped,
+                        "Publishing the round's earlier results also failed: "
+                        f"{type(error).__name__}.",
+                    )
+                    raise stopped from None
+                for event in published:
+                    yield event
+            raise
+        if batch is not None:
+            for event in await publish_batch():
+                yield event
+        if set(final_outcomes) != expected_stage_ids:
+            raise RuntimeError("Staged terminal publication lost a public outcome.")
+        current_by_id = {outcome.call.id: outcome for outcome in execution.outcomes}
+        current_by_id.update(final_outcomes)
+        execution.outcomes[:] = [
+            current_by_id[call.id] for call in execution.tool_calls if call.id in current_by_id
+        ]
+
+    async def _publish_each_staged_terminal(
+        self,
+        execution: _ToolRoundExecution,
+        coordinator: _ToolRoundPublicationCoordinator,
+        staged_by_id: dict[str, tool_round_recovery.StagedToolCallTerminal],
+        *,
+        batch: StagedTerminalBatch | None,
+        batched: list[tuple[Event, runtime_records.ToolCallOutcome | None]],
+    ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
+        """Publish each staged terminal in call order, or add it to ``batch``."""
+
+        write_stage = None if batch is None else batch.write_stage
         for tool_call in execution.tool_calls:
             staged = staged_by_id.get(tool_call.id)
             if staged is None:
                 continue
-            staged = await coordinator.start_publication(staged)
+            staged = await coordinator.start_publication(staged, write_stage=write_stage)
             staged_bytes = staged.payload_bytes or _terminal_publication_work_estimate(staged.event)
             staged_event = await execution.publication_governor.run_cpu(
                 staged_bytes,
@@ -1922,37 +2009,24 @@ class DurableToolRound:
                 allow_modification=allow_modification,
                 publish_before_hooks=publish_before_hooks,
                 deferred_terminal_projection_recorder=(
-                    self._record_terminal_projection
+                    partial(coordinator.record_projected_terminal, write_stage=write_stage)
                     if publish_before_hooks and not hooks_already_completed
                     else None
                 ),
                 deferred_terminal_finalizer=(
-                    None if hooks_already_completed else self._complete_terminal_hooks
+                    None
+                    if hooks_already_completed
+                    else partial(coordinator.complete_terminal_hooks, write_stage=write_stage)
                 ),
-                terminal_event_emitter=execution.emit_terminal,
+                terminal_event_emitter=(execution.emit_terminal if batch is None else batch.emit),
                 hooks_already_completed=hooks_already_completed,
             )
             async with aclosing(terminal_stream) as terminal_events:
                 async for event, outcome in terminal_events:
-                    if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
-                        execution.publication_governor.published(
-                            session_id=self._session.id,
-                            event_id=event.id,
-                            published_at=execution.clock(),
-                        )
-                        coordinator.terminal_published(event.id)
-                    yield event
-                    if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
-                        execution.durable_events.append(copy_event(event))
-                    if outcome is not None:
-                        final_outcomes[outcome.call.id] = outcome
-        if set(final_outcomes) != expected_stage_ids:
-            raise RuntimeError("Staged terminal publication lost a public outcome.")
-        current_by_id = {outcome.call.id: outcome for outcome in execution.outcomes}
-        current_by_id.update(final_outcomes)
-        execution.outcomes[:] = [
-            current_by_id[call.id] for call in execution.tool_calls if call.id in current_by_id
-        ]
+                    if batch is None:
+                        yield event, outcome
+                    else:
+                        batched.append((event, outcome))
 
     async def publish_before_limit(self) -> AsyncIterator[Event]:
         execution = self._require_execution()

@@ -4,6 +4,7 @@ import asyncio
 from contextlib import aclosing
 
 import pytest
+from tests.core._runtime_hook_fixtures import NoopAfterToolHook
 
 from cayu import (
     AgentSpec,
@@ -27,7 +28,7 @@ from cayu.tools.base import ToolEffect
 from cayu.vaults.redaction import SecretRedactor
 
 
-def _app(call_count, effect=ToolEffect.EXTERNAL):
+def _app(call_count, effect=ToolEffect.EXTERNAL, *, result_by_result=False):
     calls = []
 
     class Echo(Tool):
@@ -63,7 +64,11 @@ def _app(call_count, effect=ToolEffect.EXTERNAL):
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="worker", model="scripted-model"), tools=[Echo()])
+    app.register_agent(
+        AgentSpec(name="worker", model="scripted-model"),
+        tools=[Echo()],
+        runtime_hooks=[NoopAfterToolHook()] if result_by_result else None,
+    )
     return app, store, calls
 
 
@@ -127,7 +132,9 @@ def test_owner_requires_admission_before_evidence_or_publication(monkeypatch, ef
 
 def test_closing_deferred_publication_closes_its_hook_stream_before_return(monkeypatch):
     async def scenario():
-        app, _store, calls = _app(2)
+        # A batched round's hook streams have all closed before it yields;
+        # result-by-result publication yields with the next one still open.
+        app, _store, calls = _app(2, result_by_result=True)
         emit = app._tool_round_executor.invocation.terminals.publish_result
         closed = []
 
