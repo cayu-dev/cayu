@@ -388,10 +388,9 @@ def test_nested_tail_cleanup_outcome_survives_drain_expiry(mode, close_failure):
 @pytest.mark.parametrize("close_failure", [False, True])
 def test_caller_cancellation_during_tail_preserves_cleanup_evidence(subscription, close_failure):
     async def run():
-        reading = asyncio.Event()
-
         class Source:
             started = False
+            tail_reached = False
             close_attempted = False
 
             def __aiter__(self):
@@ -401,7 +400,10 @@ def test_caller_cancellation_during_tail_preserves_cleanup_evidence(subscription
                 if not self.started:
                     self.started = True
                     return frame(terminal())
-                reading.set()
+                self.tail_reached = True
+                # The caller cancels while this tail read is pending, before the
+                # 50 ms post-terminal drain can end it on its own.
+                task.cancel()
                 await asyncio.Event().wait()
 
             async def aclose(self):
@@ -418,12 +420,15 @@ def test_caller_cancellation_during_tail_preserves_cleanup_evidence(subscription
                         yield chunk
 
         body = Wrapped([])
-        task = asyncio.create_task(consume(body, subscription=subscription))
+        # The tail read is reached only through the drain, so no semantic
+        # deadline may end the stream first on a loaded runner.
+        task = asyncio.create_task(
+            consume(body, subscription=subscription, deadlines=DRAIN_ONLY_DEADLINES)
+        )
         try:
-            await asyncio.wait_for(reading.wait(), 1)
-            task.cancel()
             with pytest.raises(asyncio.CancelledError) as raised:
-                await asyncio.wait_for(task, 1)
+                await asyncio.wait_for(task, 10)
+            assert source.tail_reached
             failures = provider_cancellation_failures(raised.value)
             assert bool(failures) is close_failure
             if close_failure:

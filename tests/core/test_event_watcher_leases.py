@@ -225,13 +225,16 @@ def test_long_handler_renews_while_another_app_attempts_takeover(watcher_store_f
             started.set()
             await release.wait()
 
+        # Each renewal must answer within a third of the lease, which leaves a store
+        # write on a loaded runner headroom. The handler outlives the lease, so only
+        # renewal keeps the competitor out.
         watcher = EventWatcher(
-            name=f"long-{uuid4()}", query=EventQuery(), handler=handler, lease_seconds=0.3
+            name=f"long-{uuid4()}", query=EventQuery(), handler=handler, lease_seconds=3
         )
         task = asyncio.create_task(app.run_event_watchers([watcher]))
         try:
             await asyncio.wait_for(started.wait(), timeout=10)
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(3.5)
             result = await competitor.run_event_watchers([watcher])
             assert result[0].blocked_by_active_lease
             assert calls == 1

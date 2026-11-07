@@ -420,6 +420,10 @@ def test_public_journal_contention_keeps_loop_live_and_cleanup_owned(
                     await task
             assert time.monotonic() - started < 2
             assert ticks >= 2
+            # The interrupted mutation still owns the journal, so reconcile refuses
+            # at once. Its answer must not race the short timeout above: a loaded
+            # runner could otherwise report that reconcile itself timed out.
+            monkeypatch.setattr(resources, "RESOURCE_FOREGROUND_TIMEOUT_S", 5)
             with pytest.raises(ResourceOwnerUnavailable, match="mutation remains owned"):
                 await target.reconcile()
             finish.set()

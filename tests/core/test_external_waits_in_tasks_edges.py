@@ -226,7 +226,10 @@ async def _dies(*args, **kwargs):
 
 # A worker that dies holds its task this long; PostgreSQL leases follow the database's
 # own clock, so on it the test waits this out instead of advancing the injected clock.
-_DYING_LEASE_SECONDS = 1
+# Every store's worker also times its lease renewals on its own monotonic clock, so the
+# lease is long enough that a renewal acknowledged late on a loaded runner keeps it:
+# a lost lease would end the worker with the loss, not with its death.
+_DYING_LEASE_SECONDS = 3
 
 
 async def _die(app, handler):

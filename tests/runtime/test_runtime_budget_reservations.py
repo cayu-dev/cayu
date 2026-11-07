@@ -322,9 +322,13 @@ def test_cayu_app_validates_budget_lease_immediately_before_provider_dispatch(
         store = AbandonmentAcknowledgementLostStore()
         session_id = f"sess_expired_at_{pause_at.value}"
         now = [datetime.now(UTC)]
+        # The lease expires on the ledger's clock while the stream is paused.
+        # The reservation heartbeat runs on the event loop's clock every TTL/3,
+        # so the TTL is long enough that it can't fire during the test and
+        # lose the lease before the dispatch check is the one that sees it.
         ledger = InMemoryBudgetLedger(
             clock=lambda: now[0],
-            reservation_ttl_seconds=1,
+            reservation_ttl_seconds=3600,
         )
         limit = BudgetLimit(
             scope="app",
@@ -358,7 +362,7 @@ def test_cayu_app_validates_budget_lease_immediately_before_provider_dispatch(
                 break
 
         assert provider.started.is_set() is False
-        now[0] += timedelta(seconds=2)
+        now[0] += timedelta(hours=2)
         replacement = await ledger.reserve(
             limit=limit,
             session_id=f"sess_replacement_for_{pause_at.value}",

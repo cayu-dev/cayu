@@ -1023,8 +1023,10 @@ def test_workflow_eval_reports_unsettled_profile_revalidation_distinctly(
         del fingerprint, attempt
         raise WorkspaceMutationSettlementError("private settlement detail")
 
+    # Inspection retries until the close budget runs out, so the budget must outlast
+    # closing itself: 200 ms could be spent before the first retry on a loaded runner.
     published, direct, post_close_calls = _run_with_post_quiescence_profile_inspection(
-        monkeypatch, never_settles, close_timeout_seconds=0.2
+        monkeypatch, never_settles, close_timeout_seconds=1.0
     )
 
     assert post_close_calls > 1

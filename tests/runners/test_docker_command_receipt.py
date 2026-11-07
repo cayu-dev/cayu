@@ -176,7 +176,9 @@ def test_supervisor_sigterm_contains_work_without_publishing_success(tmp_path):
     started = tmp_path / "started"
     launch = _launch(
         tmp_path,
-        f"import os,time; open({str(started)!r},'w').write(str(os.getpid())); time.sleep(30)",
+        # Publish the PID by rename so the file never exists without it.
+        f"import os,time; open({str(started)!r}+'.tmp','w').write(str(os.getpid())); "
+        f"os.replace({str(started)!r}+'.tmp',{str(started)!r}); time.sleep(30)",
     )
     owner = subprocess.Popen(
         [sys.executable, "-I", "-S", "-c", guest_program()], stdin=subprocess.PIPE
@@ -293,7 +295,8 @@ if worker == 0:
                          stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     p.communicate(launch)
     os._exit(p.returncode)
-pathlib.Path({str(worker_pid)!r}).write_text(str(worker))
+pathlib.Path({str(worker_pid)!r}+'.tmp').write_text(str(worker))
+os.replace({str(worker_pid)!r}+'.tmp',{str(worker_pid)!r})
 pid,status = os.waitpid(worker,0)
 assert os.waitstatus_to_exitcode(status) == -9
 while True:
@@ -309,6 +312,7 @@ while True:
         witness.stdin.write((json.dumps(launch) + "\n").encode())
         witness.stdin.close()
         _wait_file(started)
+        _wait_file(worker_pid)
         assert not (tmp_path / "operation/receipt.json").exists()
         os.kill(int(worker_pid.read_text()), signal.SIGKILL)
         release.touch()

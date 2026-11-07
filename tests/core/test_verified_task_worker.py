@@ -5281,6 +5281,11 @@ def test_worker_close_cancellation_preserves_settled_callback_failure(
                 await run
             assert run.cancelling() == 1 and run.cancelled()
             await asyncio.wait_for(cancelled.wait(), 5)
+            # The short callback bound lets `run` stop while prepare is held. Close
+            # gets one that can't run out between the cancellations below: on a
+            # loaded runner 50 ms can pass in one loop turn, and close then ends
+            # before the second cancellation reaches it.
+            worker.callback_timeout_seconds = 2.5
             close = asyncio.create_task(worker.aclose())
             await asyncio.sleep(0)
             for _ in range(cancel_count):

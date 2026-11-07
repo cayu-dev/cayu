@@ -209,8 +209,11 @@ def test_resolve_applies_result_and_replays_without_registered_resolver() -> Non
 
 def test_runtime_publication_expiry_is_not_rejected_by_short_secret_collision() -> None:
     async def scenario() -> None:
+        # The secret is part of every timestamp written this month, the publication
+        # expiry's among them. The year alone can also turn up in a random hex
+        # identity or digest, which is rightly refused; a hyphenated date can't.
         app, _session_store, _task_store, decision_id = await _prepared_app_with_stores(
-            secret_redactor=SecretRedactor(str(datetime.now(UTC).year)),
+            secret_redactor=SecretRedactor(datetime.now(UTC).strftime("%Y-%m-")),
         )
         app.register_completion_result_resolver(
             _contract().result_resolver,

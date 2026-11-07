@@ -498,9 +498,14 @@ def test_specialist_variants_keep_schema_approval_and_shared_package_mcp_sources
 
 
 def test_tool_usage_postgres_exact_links(tmp_path, postgres_dsn):
+    from tests.core.postgres_contention_support import drop_cayu_tables
+
     from cayu.storage import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
 
+    # The module shares one database; tool calls another test in it recorded first
+    # would be counted with this test's own.
+    asyncio.run(drop_cayu_tables(postgres_dsn))
     test_tool_usage_counts_real_repeated_calls_and_returns_exact_recent_links(
         tmp_path, "postgres", PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
     )

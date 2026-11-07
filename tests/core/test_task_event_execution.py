@@ -116,14 +116,21 @@ def test_admission_exhaustion_does_not_cancel_running_attempts(backend, tmp_path
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
 def test_hung_active_handler_is_cancelled_by_event_deadline(backend, tmp_path, request):
+    # The store's clock stands still while the worker runs: however long a loaded
+    # runner takes to claim and admit the task, its event can't expire while it
+    # waits, and the worker, which ends the handler on a local deadline from the
+    # budget it read, always settles the task before the store sees the event
+    # expire. On a real clock a slow runner could let the event's own expiry cancel
+    # the task first. The clock then moves past the deadline.
+    now = [datetime.now(UTC)]
+
     async def scenario():
-        store = _store(backend, tmp_path, request)
+        store = _store(backend, tmp_path, request, clock=lambda: now[0])
         app = CayuApp(task_store=store, enable_logging=False)
         task = await app.create_task(
             TaskCreate(
                 type="job",
                 event_id="one",
-                # Leave admission time; this test exercises cancellation of an active handler.
                 retry_budget=TaskRetryBudget(max_attempts=None, max_elapsed_seconds=1.0),
             )
         )
@@ -143,7 +150,8 @@ def test_hung_active_handler_is_cancelled_by_event_deadline(backend, tmp_path, r
             assert started.is_set() and stopped.is_set()
             final = await store.load_task(task.id)
             assert final.status is TaskStatus.FAILED
-            state = await store.load_task_retry_key(task.invocation.event_retry_key)
+            now[0] += timedelta(seconds=2)
+            state = await store.refresh_task_retry_key(task.invocation.event_retry_key)
             assert state.status is TaskRetryKeyStatus.GIVEN_UP
             assert state.given_up_reason.value == "elapsed_exhausted"
             assert final.error["code"] == "event_elapsed_exhausted"

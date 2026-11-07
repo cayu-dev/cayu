@@ -1295,11 +1295,13 @@ class FailingHealthEndpointTransport(FakeEndpointTransport):
 
 class MismatchedProtocolEndpointTransport(FakeEndpointTransport):
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
+        self.health_calls.append({"endpoint": endpoint, "token": token, "timeout_s": timeout_s})
         return {"status": "ok", "protocol_version": "1"}
 
 
 class LegacyEndpointTransport(FakeEndpointTransport):
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
+        self.health_calls.append({"endpoint": endpoint, "token": token, "timeout_s": timeout_s})
         return {"status": "ok"}
 
 
@@ -2196,28 +2198,34 @@ async def test_lambda_microvm_runner_terminates_new_microvm_when_readiness_fails
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "transport",
-    [MismatchedProtocolEndpointTransport(), LegacyEndpointTransport()],
+    "transport_type",
+    [MismatchedProtocolEndpointTransport, LegacyEndpointTransport],
 )
 async def test_lambda_microvm_runner_rejects_sidecar_protocol_mismatch(
-    transport: FakeEndpointTransport,
+    transport_type: type[FakeEndpointTransport],
 ) -> None:
     client = FakeLambdaMicroVMClient()
+    transport = transport_type()
 
     with pytest.raises(
         LambdaMicroVMProtocolError,
         match=f"expected {lambda_microvm_module.LAMBDA_MICROVM_PROTOCOL_VERSION}",
     ):
+        # A healthy sidecar speaking another protocol is refused on its first
+        # answer, not polled until the readiness timeout. Polling would sleep an
+        # hour between answers; the outer bound only guards against a hang.
         await asyncio.wait_for(
             LambdaMicroVMRunner.create(
                 "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
                 client=client,
                 endpoint_transport=transport,
-                ready_timeout_s=30,
+                ready_timeout_s=7200,
+                poll_interval_s=3600,
             ),
-            timeout=0.2,
+            timeout=30,
         )
 
+    assert len(transport.health_calls) == 1
     assert client.terminate_calls == [{"microvmIdentifier": "mvm-123"}]
 
 

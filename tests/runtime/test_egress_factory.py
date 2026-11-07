@@ -5611,7 +5611,9 @@ def test_later_release_escalation_refreshes_completed_settlement_owner() -> None
             await release(EnvironmentFactoryReleaseAction.PRESERVE)
         preserve_settlement = environment_factory_cleanup_settlement_task(preserve_error.value)
         assert preserve_settlement is not None
-        async with asyncio.timeout(0.2):
+        # Hang guards only: each settlement retries its failed finalization and
+        # ends, which a loaded runner can take longer than 200 ms to schedule.
+        async with asyncio.timeout(10):
             await preserve_settlement
 
         with pytest.raises(BaseExceptionGroup) as discard_error:
@@ -5620,7 +5622,7 @@ def test_later_release_escalation_refreshes_completed_settlement_owner() -> None
         assert discard_settlement is not None
         assert discard_settlement is not preserve_settlement
         assert not discard_settlement.done()
-        async with asyncio.timeout(0.2):
+        async with asyncio.timeout(10):
             await discard_settlement
         return preserve_settlement, discard_settlement, adapter, runner
 

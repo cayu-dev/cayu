@@ -90,14 +90,15 @@ def test_background_interruption_shutdown_cancels_shared_workers_and_keeps_marke
 def test_pending_interruption_startup_waits_for_dead_claim_expiry(monkeypatch):
     async def run():
         monkeypatch.setattr(
-            interruption_coordinator_module, "_BACKGROUND_INTERRUPTION_LEASE_SECONDS", 0.05
-        )
-        monkeypatch.setattr(
             interruption_coordinator_module,
             "_BACKGROUND_INTERRUPTION_HEARTBEAT_RETRY_SECONDS",
             0.005,
         )
-        store = InMemorySessionStore()
+        # The durable claim lives on the store's clock, which the test moves. Real
+        # time then only paces the deferred retries: it can't expire the dead claim
+        # early or late, or this process's own claim before it is acknowledged.
+        store_now = [datetime.now(UTC)]
+        store = InMemorySessionStore(ownership_clock=lambda: store_now[0])
         app = CayuApp(
             session_store=store,
             enable_logging=False,
@@ -127,22 +128,26 @@ def test_pending_interruption_startup_waits_for_dead_claim_expiry(monkeypatch):
                 "pending_interruption_cascade": {
                     "attempt_id": "cascade-dead-claim-attempt",
                     "interrupt_payload": payload,
-                    "created_at": datetime.now(UTC).isoformat(),
+                    "created_at": store_now[0].isoformat(),
                     "generation": 1,
                     "claim_id": "dead-process-claim",
-                    "claim_expires_at": (datetime.now(UTC) + timedelta(seconds=0.05)).isoformat(),
+                    "claim_expires_at": (store_now[0] + timedelta(seconds=60)).isoformat(),
                 }
             },
         )
-
         scheduled = await app.resume_pending_interruption_cascades()
-        await asyncio.sleep(0.06)
+        # The dead process's claim is still live, so startup only defers.
+        waiting = (await store.load_checkpoint(parent_id))["pending_interruption_cascade"]
+        store_now[0] += timedelta(seconds=61)
+        async with asyncio.timeout(10):
+            while "pending_interruption_cascade" in await store.load_checkpoint(parent_id):
+                await asyncio.sleep(0.005)
         drained = await app.drain_background_interruptions(timeout_s=1)
-        return scheduled, drained, await store.load_checkpoint(parent_id)
+        return scheduled, waiting, drained, await store.load_checkpoint(parent_id)
 
-    scheduled, drained, checkpoint = asyncio.run(run())
-
+    scheduled, waiting, drained, checkpoint = asyncio.run(run())
     assert scheduled == 1
+    assert waiting["claim_id"] == "dead-process-claim"
     assert drained is True
     assert "pending_interruption_cascade" not in checkpoint
 

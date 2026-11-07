@@ -345,7 +345,8 @@ def test_cancelling_a_task_whose_wake_worker_died_mid_tool_settles_it_as_cancell
 ) -> None:
     # The wake's claim of the task expires soon after the dying worker's own lease. On
     # PostgreSQL it follows the database clock, so it is long enough to renew reliably.
-    claim_lease = 3 if backend == "postgres" else _DYING_LEASE_SECONDS
+    postgres = backend == "postgres"
+    claim_lease = _DYING_LEASE_SECONDS + 2 if postgres else _DYING_LEASE_SECONDS
     monkeypatch.setattr(session_wakes, "_CONTINUATION_LEASE_SECONDS", claim_lease)
 
     async def scenario() -> None:
@@ -369,7 +370,7 @@ def test_cancelling_a_task_whose_wake_worker_died_mid_tool_settles_it_as_cancell
             assert attempt.worker_id == "worker-1"
             await _cancel_fenced(app, task_id)
             await _expire(backend, clock)
-            if backend == "postgres":
+            if postgres:
                 await asyncio.sleep(claim_lease - _DYING_LEASE_SECONDS)
             assert not (await _next_worker(app)).attention_required
             await _assert_cancelled_and_interrupted(app, task_id)

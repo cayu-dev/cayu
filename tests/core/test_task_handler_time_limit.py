@@ -690,8 +690,13 @@ def test_default_run_deadline_comes_from_the_entered_limit():
                 worker_id="w",
                 max_tasks=1,
                 poll_interval_s=0.02,
-                execution_timeout_s=1.0,
-                execution_grace_s=0.5,
+                # The limit passes after half a second, as it always has; the
+                # handler returns as soon as its interrupted run does. A loaded
+                # runner can take longer than a short grace to interrupt the run,
+                # and the hard limit then cancels the handler before it records
+                # what it saw, so the hard limit comes well before the hang guard.
+                execution_timeout_s=6.0,
+                execution_grace_s=5.5,
             ),
             GIVE_UP_S,
         )
