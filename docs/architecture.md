@@ -311,6 +311,8 @@ by fork and resume. Session discovery initialization and validation live in
 admission and publication boundaries.
 
 `RecoveryCoordinator` owns paused continuations and manual outcome reconciliation.
+The invocation settings a continuation restores from its pending record are pure
+functions in `runtime/_manual_recovery/effective_settings.py`.
 `IncompleteSessionRecovery` owns incomplete-session inspection and repair;
 `ProviderDispositionRecovery` settles accepted provider decisions and their exact
 continuations. These owners call the engine's execution operations directly.

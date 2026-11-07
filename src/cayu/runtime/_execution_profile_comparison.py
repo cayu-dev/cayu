@@ -41,7 +41,7 @@ from cayu.runtime._execution_profile_continuation import (
     ExecutionProfileContinuation,
     _runtime_version,
 )
-from cayu.runtime._recovery_coordinator import recorded_pending_invocation_semantics
+from cayu.runtime._manual_recovery.effective_settings import recorded_pending_invocation_semantics
 from cayu.runtime._resume_configuration import (
     inherit_resume_configuration,
     recorded_admitted_configuration,

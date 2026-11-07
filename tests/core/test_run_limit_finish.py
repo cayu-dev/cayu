@@ -467,7 +467,7 @@ def test_legacy_null_pending_step_limit_does_not_gain_unlimited_authority():
     from tests.core.test_recovery_coordinator import _pending_approval
 
     from cayu.approvals.tools import copy_pending_tool_approval
-    from cayu.runtime._recovery_coordinator import _effective_approval_max_steps
+    from cayu.runtime._manual_recovery.effective_settings import _effective_approval_max_steps
 
     legacy = _pending_approval()
     with pytest.raises(ValueError, match="requires recorded invocation max_steps"):
