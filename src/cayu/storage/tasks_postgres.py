@@ -87,6 +87,16 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._failure_scrub import (
+    TaskFailureScrub,
+    TaskFailureScrubResult,
+    scrub_skip_reason,
+    scrub_snapshot,
+    scrub_task_failure,
+)
+from cayu.tasks._failure_scrub import (
+    failure_scrub_page_limit as _failure_scrub_page_limit,
+)
 from cayu.tasks._lifecycle import (
     _can_attach_claimed_task_state,
     _copy_optional_status_payload,
@@ -4181,6 +4191,116 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             except BaseException:
                 await conn.rollback()
                 raise
+
+    @runtime_task_mutation
+    async def scrub_task_failure_text(
+        self, task_id: str, scrub: TaskFailureScrub
+    ) -> TaskFailureScrubResult:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> TaskFailureScrubResult:
+            del conn
+            task = await self._load_task_locked(cur, task_id)
+            skipped = scrub_skip_reason(task)
+            if skipped is not None:
+                return TaskFailureScrubResult(task_id=task_id, skipped_reason=skipped)
+            scrubbed, fields, masked = scrub_task_failure(task, scrub)
+            writes: list[tuple[str, tuple[Any, ...]]] = []
+            for table, key_column in (
+                ("cayu_task_terminalization_receipts", "idempotency_key"),
+                ("cayu_task_interrupted_handoff_receipts", "handoff_id"),
+            ):
+                await cur.execute(
+                    f"SELECT {key_column}, task_json FROM {table} WHERE task_id = %s FOR UPDATE",
+                    (task_id,),
+                )
+                for key, task_json in await cur.fetchall():
+                    snapshot = scrub_snapshot(
+                        Task.model_validate(pg_support._json_obj(task_json)), scrub
+                    )
+                    if snapshot is not None:
+                        writes.append(
+                            (
+                                f"UPDATE {table} SET task_json = %s "
+                                f"WHERE task_id = %s AND {key_column} = %s",
+                                (
+                                    pg_support._dumps(snapshot.model_dump(mode="json")),
+                                    task_id,
+                                    key,
+                                ),
+                            )
+                        )
+            await cur.execute(
+                "SELECT idempotency_key, receipt_json FROM cayu_task_retry_settlements "
+                "WHERE task_id = %s FOR UPDATE",
+                (task_id,),
+            )
+            for key, receipt_json in await cur.fetchall():
+                settled = TaskRetrySettlementResult.model_validate(
+                    pg_support._json_obj(receipt_json)
+                )
+                snapshot = scrub_snapshot(settled.task, scrub)
+                if snapshot is not None:
+                    writes.append(
+                        (
+                            "UPDATE cayu_task_retry_settlements SET receipt_json = %s "
+                            "WHERE task_id = %s AND idempotency_key = %s",
+                            (
+                                json.dumps(
+                                    settled.model_copy(update={"task": snapshot}).model_dump(
+                                        mode="json"
+                                    )
+                                ),
+                                task_id,
+                                key,
+                            ),
+                        )
+                    )
+            applied = not scrub.dry_run and bool(fields or writes)
+            if applied:
+                if fields:
+                    await self._update_task_snapshot(cur, scrubbed)
+                for statement, parameters in writes:
+                    await cur.execute(cast("LiteralString", statement), parameters)
+            return TaskFailureScrubResult(
+                task_id=task_id,
+                fields=fields,
+                masked_values=masked,
+                receipts=len(writes),
+                applied=applied,
+            )
+
+        return await self._run_owned_mutation(operation)
+
+    async def list_task_ids_with_failure_text(
+        self, *, after_task_id: str | None = None, limit: int = 100
+    ) -> list[str]:
+        from cayu.resource_access import current_data_bounds
+        from cayu.tasks.access import sql_predicate
+
+        limit = _failure_scrub_page_limit(limit)
+        bounds = await current_data_bounds("tasks")
+        clauses = ["(error IS NOT NULL OR jsonb_typeof(status_payload -> 'error') = 'object')"]
+        params: list[Any] = []
+        if after_task_id is not None:
+            clauses.append('id COLLATE "C" > %s')
+            params.append(after_task_id)
+        if bounds is not None:
+            clause, values = sql_predicate(bounds, postgres=True)
+            clauses.append(clause)
+            params.extend(values)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"SELECT id FROM cayu_tasks WHERE {' AND '.join(clauses)} "
+                    'ORDER BY id COLLATE "C" LIMIT %s',
+                ),
+                (*params, limit),
+            )
+            return [row[0] for row in await cur.fetchall()]
 
     @runtime_task_mutation
     async def cancel_task(

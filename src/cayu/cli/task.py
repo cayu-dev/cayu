@@ -203,6 +203,29 @@ def add_task_parser(subparsers: Any) -> None:
     replay.add_argument("--operation-id", required=True, help="Retain this ID for exact retry.")
     add_action_target_options(replay)
 
+    scrub = commands.add_parser(
+        "scrub-error",
+        help="Re-redact a task's stored error, or every task's with --all.",
+        description=(
+            "Apply the current redaction (the agent's registered secrets, then credential "
+            "shapes such as Authorization headers and tokens) to a task's stored error, the "
+            "error a pending cancellation keeps, and every receipt copy of the task. Use it "
+            "after a redaction fix, for records written before it. Each changed field records "
+            "the scrub under `cayu_scrub`; output names tasks, fields and counts, never the "
+            "text. --all sweeps every task that keeps failure text; --dry-run writes nothing. "
+            "A task a worker holds is skipped. Against a running server or a Cloud Agent "
+            "(--server-url, --application) it uses the agent's API and needs full access; a "
+            "local store (--sqlite, --postgres or the project's) is changed directly and "
+            "only credential shapes are masked there. Inspect the result with "
+            "`cayu task show TASK_ID`."
+        ),
+    )
+    from cayu.cli._task_failure_scrub import add_scrub_arguments
+
+    add_scrub_arguments(scrub)
+    add_read_target_options(scrub)
+    add_output_options(scrub, formats=("table", "json"), default="table")
+
     list_parser = commands.add_parser(
         "list",
         help="List tasks, most recently updated first.",
@@ -290,6 +313,10 @@ def run_task(args: argparse.Namespace) -> int:
 
 
 async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int:
+    if args.task_command == "scrub-error":
+        from cayu.cli._task_failure_scrub import run_scrub
+
+        return await run_scrub(args, target)
     reader = open_task_reader(target)
     try:
         if args.task_command == "list":

@@ -97,6 +97,16 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._failure_scrub import (
+    TaskFailureScrub,
+    TaskFailureScrubResult,
+    scrub_skip_reason,
+    scrub_snapshot,
+    scrub_task_failure,
+)
+from cayu.tasks._failure_scrub import (
+    failure_scrub_page_limit as _failure_scrub_page_limit,
+)
 from cayu.tasks._lifecycle import (
     _can_attach_claimed_task_state,
     _copy_optional_status_payload,
@@ -6347,6 +6357,105 @@ class SQLiteTaskStore(TaskStore):
             except BaseException:
                 self._connection.rollback()
                 raise
+
+    @runtime_task_mutation
+    async def scrub_task_failure_text(
+        self, task_id: str, scrub: TaskFailureScrub
+    ) -> TaskFailureScrubResult:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                task = self._require_task_unlocked(task_id)
+                skipped = scrub_skip_reason(task)
+                if skipped is not None:
+                    return TaskFailureScrubResult(task_id=task_id, skipped_reason=skipped)
+                scrubbed, fields, masked = scrub_task_failure(task, scrub)
+                writes: list[tuple[str, tuple[Any, ...]]] = []
+                for table, key_column in (
+                    ("cayu_task_terminalization_receipts", "idempotency_key"),
+                    ("cayu_task_interrupted_handoff_receipts", "handoff_id"),
+                ):
+                    rows = self._connection.execute(
+                        f"SELECT {key_column}, task_json FROM {table} WHERE task_id = ?",
+                        (task_id,),
+                    ).fetchall()
+                    for key, task_json in rows:
+                        snapshot = scrub_snapshot(Task.model_validate_json(task_json), scrub)
+                        if snapshot is not None:
+                            writes.append(
+                                (
+                                    f"UPDATE {table} SET task_json = ? "
+                                    f"WHERE task_id = ? AND {key_column} = ?",
+                                    (
+                                        sqlite_records.json_dumps(snapshot.model_dump(mode="json")),
+                                        task_id,
+                                        key,
+                                    ),
+                                )
+                            )
+                rows = self._connection.execute(
+                    "SELECT idempotency_key, receipt_json FROM cayu_task_retry_settlements "
+                    "WHERE task_id = ?",
+                    (task_id,),
+                ).fetchall()
+                for key, receipt_json in rows:
+                    settled = TaskRetrySettlementResult.model_validate_json(receipt_json)
+                    snapshot = scrub_snapshot(settled.task, scrub)
+                    if snapshot is not None:
+                        writes.append(
+                            (
+                                "UPDATE cayu_task_retry_settlements SET receipt_json = ? "
+                                "WHERE task_id = ? AND idempotency_key = ?",
+                                (
+                                    sqlite_records.json_dumps(
+                                        settled.model_copy(update={"task": snapshot}).model_dump(
+                                            mode="json"
+                                        )
+                                    ),
+                                    task_id,
+                                    key,
+                                ),
+                            )
+                        )
+                applied = not scrub.dry_run and bool(fields or writes)
+                if applied:
+                    if fields:
+                        self._update_task_snapshot_unlocked(scrubbed)
+                    for statement, parameters in writes:
+                        self._connection.execute(statement, parameters)
+                return TaskFailureScrubResult(
+                    task_id=task_id,
+                    fields=fields,
+                    masked_values=masked,
+                    receipts=len(writes),
+                    applied=applied,
+                )
+
+    async def list_task_ids_with_failure_text(
+        self, *, after_task_id: str | None = None, limit: int = 100
+    ) -> list[str]:
+        from cayu.resource_access import current_data_bounds
+        from cayu.tasks.access import sql_predicate
+
+        limit = _failure_scrub_page_limit(limit)
+        bounds = await current_data_bounds("tasks")
+        clauses = [
+            "(error_json IS NOT NULL OR json_type(status_payload_json, '$.error') = 'object')"
+        ]
+        params: list[Any] = []
+        if after_task_id is not None:
+            clauses.append("id > ?")
+            params.append(after_task_id)
+        if bounds is not None:
+            clause, values = sql_predicate(bounds, postgres=False)
+            clauses.append(clause)
+            params.extend(values)
+        async with self._lock:
+            rows = self._connection.execute(
+                f"SELECT id FROM cayu_tasks WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     @runtime_task_mutation
     async def cancel_task(

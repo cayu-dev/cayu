@@ -3488,6 +3488,51 @@ class ApiTaskDetail(ApiTaskListItem):
     started_at: str | None
 
 
+class TaskFailureScrubRequest(ApiBaseModel):
+    """`POST /api/tasks/{task_id}/scrub-error`: report what would change without writing."""
+
+    dry_run: StrictBool = False
+
+
+class TaskFailureSweepRequest(ApiBaseModel):
+    """`POST /api/tasks/scrub-errors`: one page of the store-wide scrub."""
+
+    dry_run: StrictBool = False
+    #: Continue after this task id, the previous page's ``next_after_task_id``.
+    after_task_id: Annotated[str, StringConstraints(min_length=1)] | None = None
+    limit: StrictInt = Field(default=100, ge=1, le=100)
+
+
+class ApiTaskFailureScrub(ApiBaseModel):
+    """What scrubbing one task's failure text changed; never the text itself."""
+
+    task_id: str
+    #: Whether the store wrote the change. False on a dry run, a skip or nothing to mask.
+    applied: StrictBool
+    dry_run: StrictBool
+    #: Fields whose text the redaction masked: ``error``, ``status_payload.error``.
+    fields: list[str]
+    #: Text values masked in the task.
+    masked_values: StrictInt = Field(ge=0)
+    #: Stored receipt copies of the task rewritten with it.
+    receipts: StrictInt = Field(ge=0)
+    #: Why the task was left unchanged: ``leased`` (a worker holds it), ``session_failure``
+    #: (its error is a session's recorded runtime failure, bound by the session's events) or
+    #: ``cancellation_reconciliation`` (a reconciliation receipt binds a digest of it).
+    skipped_reason: Literal["leased", "session_failure", "cancellation_reconciliation"] | None
+
+
+class ApiTaskFailureSweep(ApiBaseModel):
+    """One page of the store-wide scrub: the tasks it changed, would change or skipped."""
+
+    dry_run: StrictBool
+    #: Tasks with stored failure text this page examined.
+    examined: StrictInt = Field(ge=0)
+    tasks: list[ApiTaskFailureScrub]
+    #: Pass as ``after_task_id`` for the next page; null when the sweep is done.
+    next_after_task_id: str | None
+
+
 class ApiKnowledgeEntryBase(ApiBaseModel):
     entry_id: str
     revision: StrictInt = Field(ge=1, le=MAX_KNOWLEDGE_REVISION)

@@ -87,6 +87,16 @@ from cayu.tasks._cancellation import (
     _validated_task_cancellation,
     _validated_task_retry_cancellation,
 )
+from cayu.tasks._failure_scrub import (
+    TaskFailureScrub,
+    TaskFailureScrubResult,
+    scrub_skip_reason,
+    scrub_snapshot,
+    scrub_task_failure,
+)
+from cayu.tasks._failure_scrub import (
+    failure_scrub_page_limit as _failure_scrub_page_limit,
+)
 from cayu.tasks._lifecycle import (
     _can_attach_claimed_task,
     _copy_optional_status_payload,
@@ -4017,6 +4027,82 @@ class InMemoryTaskStore(TaskStore):
             )
             self._retry_settlements[receipt_key] = receipt
             return receipt.model_copy(deep=True)
+
+    @runtime_task_mutation
+    async def scrub_task_failure_text(
+        self, task_id: str, scrub: TaskFailureScrub
+    ) -> TaskFailureScrubResult:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        async with self._lock:
+            task = self._require_task(task_id)
+            skipped = scrub_skip_reason(task)
+            if skipped is not None:
+                return TaskFailureScrubResult(task_id=task_id, skipped_reason=skipped)
+            scrubbed, fields, masked = scrub_task_failure(task, scrub)
+            terminalizations = {
+                key: snapshot
+                for key, receipt in self._terminalization_receipts.items()
+                if key[0] == task_id
+                and (snapshot := scrub_snapshot(receipt.task, scrub)) is not None
+            }
+            handoffs = {
+                key: snapshot
+                for key, receipt in self._interrupted_handoff_receipts.items()
+                if key[0] == task_id
+                and (snapshot := scrub_snapshot(receipt.task, scrub)) is not None
+            }
+            settlements = {
+                key: snapshot
+                for key, settled in self._retry_settlements.items()
+                if key[0] == task_id
+                and (snapshot := scrub_snapshot(settled.task, scrub)) is not None
+            }
+            receipts = len(terminalizations) + len(handoffs) + len(settlements)
+            applied = not scrub.dry_run and bool(fields or receipts)
+            if applied:
+                self._tasks[task_id] = scrubbed
+                for key, snapshot in terminalizations.items():
+                    self._terminalization_receipts[key] = self._terminalization_receipts[
+                        key
+                    ].model_copy(update={"task": snapshot})
+                for key, snapshot in handoffs.items():
+                    self._interrupted_handoff_receipts[key] = self._interrupted_handoff_receipts[
+                        key
+                    ].model_copy(update={"task": snapshot})
+                for key, snapshot in settlements.items():
+                    self._retry_settlements[key] = self._retry_settlements[key].model_copy(
+                        update={"task": snapshot}
+                    )
+            return TaskFailureScrubResult(
+                task_id=task_id,
+                fields=fields,
+                masked_values=masked,
+                receipts=receipts,
+                applied=applied,
+            )
+
+    async def list_task_ids_with_failure_text(
+        self, *, after_task_id: str | None = None, limit: int = 100
+    ) -> list[str]:
+        from cayu.resource_access import current_data_bounds
+        from cayu.tasks.access import visible
+
+        limit = _failure_scrub_page_limit(limit)
+        bounds = await current_data_bounds("tasks")
+        async with self._lock:
+            return sorted(
+                task.id
+                for task in self._tasks.values()
+                if (after_task_id is None or task.id > after_task_id)
+                and (bounds is None or visible(task, bounds))
+                and (
+                    task.error is not None
+                    or (
+                        task.status_payload is not None
+                        and isinstance(task.status_payload.get("error"), dict)
+                    )
+                )
+            )[:limit]
 
     @runtime_task_mutation
     async def cancel_task(

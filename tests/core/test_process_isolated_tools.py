@@ -1988,7 +1988,7 @@ def test_terminal_response_cannot_race_past_buffered_stdout_overflow(
         asyncio.run(
             _execute(
                 _tool(
-                    mode="terminal_then_stdout_overflow",
+                    mode="buffered_stdout_overflow",
                     deadline_seconds=10,
                     max_stdout_bytes=128,
                 )

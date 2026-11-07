@@ -80,6 +80,8 @@
   "POST /api/tasks/{task_id}/replay name=replay_task class=_BoundedControlPlaneRequestRoute POST=replay_task_api_tasks__task_id__replay_post",
   "POST /api/tasks/{task_id}/cancel name=cancel_task class=_BoundedControlPlaneRequestRoute POST=cancel_task_api_tasks__task_id__cancel_post",
   "GET /api/tasks/{task_id}/dependents name=dependents class=_BoundedControlPlaneRequestRoute GET=dependents_api_tasks__task_id__dependents_get",
+  "POST /api/tasks/{task_id}/scrub-error name=scrub_task_error class=_BoundedControlPlaneRequestRoute POST=scrub_task_error_api_tasks__task_id__scrub_error_post",
+  "POST /api/tasks/scrub-errors name=scrub_task_errors class=_BoundedControlPlaneRequestRoute POST=scrub_task_errors_api_tasks_scrub_errors_post",
   "POST /api/diagnostics/model-check name=run_model_check class=_BoundedControlPlaneRequestRoute POST=run_model_check_api_diagnostics_model_check_post",
   "GET /api/data-volume/entry name=read_data_volume_entry class=_BoundedControlPlaneRequestRoute GET=read_data_volume_entry_api_data_volume_entry_get",
   "GET /api/data-volume/entries name=list_data_volume_entries class=_BoundedControlPlaneRequestRoute GET=list_data_volume_entries_api_data_volume_entries_get",

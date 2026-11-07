@@ -5118,6 +5118,109 @@
         "title": "ApiTaskDetail",
         "type": "object"
       },
+      "ApiTaskFailureScrub": {
+        "additionalProperties": false,
+        "description": "What scrubbing one task's failure text changed; never the text itself.",
+        "properties": {
+          "applied": {
+            "title": "Applied",
+            "type": "boolean"
+          },
+          "dry_run": {
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "masked_values": {
+            "minimum": 0.0,
+            "title": "Masked Values",
+            "type": "integer"
+          },
+          "receipts": {
+            "minimum": 0.0,
+            "title": "Receipts",
+            "type": "integer"
+          },
+          "skipped_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "leased",
+                  "session_failure",
+                  "cancellation_reconciliation"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skipped Reason"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "applied",
+          "dry_run",
+          "fields",
+          "masked_values",
+          "receipts",
+          "skipped_reason"
+        ],
+        "title": "ApiTaskFailureScrub",
+        "type": "object"
+      },
+      "ApiTaskFailureSweep": {
+        "additionalProperties": false,
+        "description": "One page of the store-wide scrub: the tasks it changed, would change or skipped.",
+        "properties": {
+          "dry_run": {
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "examined": {
+            "minimum": 0.0,
+            "title": "Examined",
+            "type": "integer"
+          },
+          "next_after_task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next After Task Id"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/ApiTaskFailureScrub"
+            },
+            "title": "Tasks",
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "examined",
+          "tasks",
+          "next_after_task_id"
+        ],
+        "title": "ApiTaskFailureSweep",
+        "type": "object"
+      },
       "ApiTaskIndex": {
         "additionalProperties": false,
         "properties": {
@@ -45021,6 +45124,51 @@
         "title": "TaskExecutionSource",
         "type": "string"
       },
+      "TaskFailureScrubRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/tasks/{task_id}/scrub-error`: report what would change without writing.",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          }
+        },
+        "title": "TaskFailureScrubRequest",
+        "type": "object"
+      },
+      "TaskFailureSweepRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/tasks/scrub-errors`: one page of the store-wide scrub.",
+        "properties": {
+          "after_task_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After Task Id"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "TaskFailureSweepRequest",
+        "type": "object"
+      },
       "TaskGraphCreationResponse": {
         "properties": {
           "graph_id": {
@@ -61963,6 +62111,51 @@
         "summary": "Reschedule Task"
       }
     },
+    "/api/tasks/scrub-errors": {
+      "post": {
+        "operationId": "scrub_task_errors_api_tasks_scrub_errors_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TaskFailureSweepRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTaskFailureSweep"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Scrub Task Errors"
+      }
+    },
     "/api/tasks/{task_id}": {
       "get": {
         "operationId": "get_task_api_tasks__task_id__get",
@@ -62491,6 +62684,63 @@
           }
         },
         "summary": "List Task Schedule Events"
+      }
+    },
+    "/api/tasks/{task_id}/scrub-error": {
+      "post": {
+        "operationId": "scrub_task_error_api_tasks__task_id__scrub_error_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TaskFailureScrubRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTaskFailureScrub"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Scrub Task Error"
       }
     },
     "/api/tool-approvals/recover": {

@@ -224,6 +224,11 @@ removing the secrets Cayu knows, and bound it only after redaction.
 Remaining risk is the same as for providers: an unregistered secret that matches
 none of these shapes is shown if the failing component echoes it.
 
+Task errors and other records written before a redaction fix keep the text they were
+stored with. `cayu task scrub-error` applies the current redaction to a task's stored error
+again, or to every task's with `--all`; see
+[scrubbing stored failure text](control-plane.md#scrubbing-stored-failure-text).
+
 OpenRouter upstream provider names follow the same rule. A short plain name
 (letters, digits, spaces and common punctuation, at most 64 characters, no word
 longer than 24) is reported as-is unless it contains a registered workload

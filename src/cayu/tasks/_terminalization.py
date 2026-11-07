@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from datetime import datetime
+from typing import TypeVar
 
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks.records import (
@@ -125,19 +127,34 @@ async def terminalize_task_with_retry(
             else:
                 if current_task is not None and type(current_task) is not Task:
                     raise TypeError("Task loads must return Task instances.")
-                reconciled_task = _replay_task_terminalization_receipt(
-                    request=request,
-                    request_sha256=request_sha256,
-                    receipt=receipt,
-                    current_task=current_task,
-                )
-                return TaskTerminalizationRetryResult(
-                    task=reconciled_task,
-                    attempt_count=attempt,
-                    receipt_reconciled=True,
-                    elapsed_seconds=max(0.0, clock.time() - started_at),
-                    applied_backoff_seconds=applied_backoff_seconds,
-                )
+                reread: TaskTerminalizationReceipt | None = receipt
+                if current_task != receipt.task:
+                    try:
+                        reread = await _receipt_after_scrub(
+                            receipt,
+                            task_store.load_task_terminalization_receipt(
+                                request.task_id, request.idempotency_key
+                            ),
+                            timeout=policy.attempt_timeout_seconds,
+                        )
+                    except _ReceiptRereadUnavailable as exc:
+                        # The write committed; only this read failed, so try again.
+                        last_error_category = exc.category
+                        reread = None
+                if reread is not None:
+                    reconciled_task = _replay_task_terminalization_receipt(
+                        request=request,
+                        request_sha256=request_sha256,
+                        receipt=reread,
+                        current_task=current_task,
+                    )
+                    return TaskTerminalizationRetryResult(
+                        task=reconciled_task,
+                        attempt_count=attempt,
+                        receipt_reconciled=True,
+                        elapsed_seconds=max(0.0, clock.time() - started_at),
+                        applied_backoff_seconds=applied_backoff_seconds,
+                    )
 
         if attempt == policy.max_attempts:
             raise TaskTerminalizationUncertain(
@@ -233,12 +250,31 @@ async def settle_task_retry_attempt_with_retry(
                     raise
                 last_error_category = _task_terminalization_error_category(exc)
             else:
-                return _replay_task_retry_settlement(
-                    request=request,
-                    request_sha256=request_sha256,
-                    receipt=receipt,
-                    current_task=current_task,
-                )
+                settled: TaskRetrySettlementResult | None = receipt
+                if current_task != receipt.task:
+                    try:
+                        settled = _validate_task_retry_settlement_receipt_identity(
+                            await _receipt_after_scrub(
+                                receipt,
+                                task_store.load_task_retry_settlement(
+                                    request.task_id, request.idempotency_key
+                                ),
+                                timeout=policy.attempt_timeout_seconds,
+                            ),
+                            request=request,
+                            request_sha256=request_sha256,
+                        )
+                    except _ReceiptRereadUnavailable as exc:
+                        # The write committed; only this read failed, so try again.
+                        last_error_category = exc.category
+                        settled = None
+                if settled is not None:
+                    return _replay_task_retry_settlement(
+                        request=request,
+                        request_sha256=request_sha256,
+                        receipt=settled,
+                        current_task=current_task,
+                    )
 
         if attempt == policy.max_attempts:
             raise TaskTerminalizationUncertain(
@@ -255,6 +291,42 @@ async def settle_task_retry_attempt_with_retry(
         delay = min(delay * policy.backoff_multiplier, policy.max_backoff_seconds)
 
     raise AssertionError("Task retry settlement loop exited without an outcome.")
+
+
+_R = TypeVar("_R", TaskTerminalizationReceipt, TaskRetrySettlementResult)
+
+
+class _ReceiptRereadUnavailable(Exception):
+    """Reading a receipt again after a scrub failed in a way a retry may get past."""
+
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
+
+
+async def _receipt_after_scrub(receipt: _R, reread: Awaitable[_R | None], *, timeout: float) -> _R:
+    """The receipt read again, after the task, when the first read doesn't match it.
+
+    `cayu task scrub-error` rewrites a task and its receipt copies in one transaction, so a
+    receipt read before a scrub and the task read after it differ though both are settled.
+    The receipt read after the task matches it again. One that's gone keeps the first read,
+    whose mismatch the replay reports. A read that fails the way a retry may get past raises
+    ``_ReceiptRereadUnavailable``.
+    """
+
+    try:
+        fresher = await asyncio.wait_for(reread, timeout=timeout)
+    except Exception as exc:
+        if not _task_terminalization_error_is_acknowledgement_ambiguous(exc):
+            raise
+        # The first read is known not to match, so replaying it would report a conflict
+        # that isn't there; the caller retries instead.
+        raise _ReceiptRereadUnavailable(_task_terminalization_error_category(exc)) from exc
+    if fresher is None:
+        return receipt
+    if type(fresher) is not type(receipt):
+        raise TypeError("Receipt loads must return receipts of the type first loaded.")
+    return fresher
 
 
 async def _terminalize_claimed_task(

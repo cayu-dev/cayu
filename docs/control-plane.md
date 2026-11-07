@@ -851,6 +851,56 @@ retry. `resume` accepts a task that goes back
 to wait for its prerequisites or group (`waiting_dependencies`, `waiting_group`). With `--application NAME` each command reaches a Cayu Cloud Agent. The input defaults to
 `{}` when `--input-file` is omitted.
 
+#### Scrubbing stored failure text
+
+A task's `error` is redacted when it is written, with the redaction of that time. After a
+redaction fix, such as a credential shape that exception diagnostics now mask, records
+written before it still hold the text. Two full-access routes apply the current
+redaction again: the application's registered secrets first, then credential shapes
+(`Authorization` values, bearer tokens, Git `x-access-token` credentials and prefixed tokens
+such as GitHub's), the same parts exception diagnostics use.
+
+- `POST /api/tasks/{task_id}/scrub-error` with an optional `{"dry_run": true}` scrubs one
+  task's `error`, the `error` a pending cancellation keeps in its `status_payload`, and
+  every terminalization, interrupted-handoff and retry-settlement receipt that keeps a copy
+  of the task, in one store transaction, so a worker's retried terminalization still replays
+  against the scrubbed row. It answers `task_id`, `applied`, `dry_run`, `fields` (`error`,
+  `status_payload.error`), `masked_values`, `receipts` and `skipped_reason`; never the text.
+  A task is left unchanged, with a `skipped_reason`, when a worker holds its lease
+  (`leased`), when its error is a session's recorded runtime failure (`session_failure`:
+  the session's append-only events and checkpoint bind that payload exactly, so a rewrite
+  would make the session's failure replay conflict), or when a cancellation reconciliation
+  receipt binds a digest of it (`cancellation_reconciliation`). An
+  unknown task answers 404, a store without support 501.
+- `POST /api/tasks/scrub-errors` with `{"dry_run", "after_task_id", "limit"}` (`limit` 1-100,
+  default 100) does the same for one page of the tasks that keep failure text, in task-id
+  order. It answers `examined`, the `tasks` it changed, would change or skipped, and
+  `next_after_task_id` to continue with, null once the sweep is done.
+
+The scrub doesn't change `updated_at`. Each field it changed records the scrub under
+`cayu_scrub`: `{"scrubs": [{"scrubbed_at", "redaction", "masked_values"}]}`, the latest 20.
+Each applied scrub also writes one JSON line to standard error, `{"event":
+"cayu.task.failure_scrubbed", "task_id", "fields", "masked_values", "receipts", "subject",
+"at"}`; Cayu Cloud keeps it with the Agent's logs. Neither holds the masked text. Members
+can't use these routes. Task events (`task.failed` and the others) carry no failure text, so
+there is nothing to scrub there; a session's own events are append-only and aren't changed.
+
+From the command line:
+
+```bash
+cayu task scrub-error TASK_ID --dry-run --application my-agent
+cayu task scrub-error TASK_ID --application my-agent
+cayu task scrub-error --all --dry-run --server-url http://127.0.0.1:8000 --json
+cayu task scrub-error --all --sqlite .cayu/cayu.db
+```
+
+With `--server-url` or `--application` the command calls these routes, and `--all` follows
+the pages to the end (`--after TASK_ID` continues an interrupted sweep). With a local store
+(`--sqlite`, `--postgres`, or the project's store) it opens the store for writing and scrubs
+it directly; a bare store knows no registered secrets, so only credential shapes are masked
+there. Output names tasks, fields and counts, never the text; `cayu task show TASK_ID` shows
+the scrubbed error.
+
 `cayu task graph-create graph.json --operation-id daily-report --json` admits
 a whole dependency graph atomically. For example, `graph.json` can contain:
 

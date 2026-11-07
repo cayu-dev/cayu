@@ -240,6 +240,7 @@ from cayu.server._suite_authoring_routes import register_suite_authoring_routes
 from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server._task_controls_routes import register_task_controls_routes
+from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
 from cayu.server._task_index import read_task_index
 from cayu.server.auth import (
     AuthContext,
@@ -4852,6 +4853,12 @@ def create_router(
         serialize_task=_serialize_task_detail,
         serialize_list=_serialize_task_list_item,
         cursor_seal=inbox_cursor,
+        optional_auth_context=optional_auth_context,
+    )
+    register_task_failure_scrub_routes(
+        bounded_control_plane_router,
+        cayu_app=cayu_app,
+        protected=protected,
         optional_auth_context=optional_auth_context,
     )
 

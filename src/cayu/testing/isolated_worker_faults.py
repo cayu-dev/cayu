@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             terminal,
             max_bytes=max_response_bytes,
         )
-    elif mode == "terminal_then_stdout_overflow":
+    elif mode == "buffered_stdout_overflow":
         terminal = encode_isolated_tool_success(
             request_sha256=request["request_sha256"],
             result=ToolResult(content="must not be accepted"),
@@ -61,14 +61,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         return 65
+    # Buffer the overflow before publishing the terminal frame; the parent may
+    # terminate the child as soon as that frame arrives.
+    if mode == "buffered_stdout_overflow":
+        sys.stdout.write("x" * 4096)
+        sys.stdout.flush()
     with os.fdopen(result_fd, "wb", closefd=True) as stream:
         stream.write(wire)
         stream.flush()
     terminal = b""
     wire = b""
-    if mode == "terminal_then_stdout_overflow":
-        sys.stdout.write("x" * 4096)
-        sys.stdout.flush()
     while True:
         signal.pause()
 

@@ -249,6 +249,11 @@ Cayu server older than `error_code` doesn't send it, so there a settled row's `f
 `null` and `show` is where to read it. Table output is the default;
 `--json` (and `--jsonl` for `list`) prints the same data with a `schema_version`.
 
+`cayu task scrub-error TASK_ID` (or `--all`) applies the current redaction again to a task's
+stored error and its receipt copies, for records written before a redaction fix; `--dry-run`
+writes nothing. It is the one `cayu task` command here that writes to a local store. See
+[scrubbing stored failure text](control-plane.md#scrubbing-stored-failure-text).
+
 A task Cayu settled after its worker was lost also gets a `Worker loss` section
 (`cancellation.worker_loss` in JSON, `null` otherwise). It says in a sentence which worker
 was lost, when its lease expired, and when Cayu cancelled the task, then lists the details:

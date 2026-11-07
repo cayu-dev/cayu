@@ -2475,6 +2475,66 @@ export type ApiTaskDetail = {
 };
 
 /**
+ * ApiTaskFailureScrub
+ *
+ * What scrubbing one task's failure text changed; never the text itself.
+ */
+export type ApiTaskFailureScrub = {
+    /**
+     * Applied
+     */
+    applied: boolean;
+    /**
+     * Dry Run
+     */
+    dry_run: boolean;
+    /**
+     * Fields
+     */
+    fields: Array<string>;
+    /**
+     * Masked Values
+     */
+    masked_values: number;
+    /**
+     * Receipts
+     */
+    receipts: number;
+    /**
+     * Skipped Reason
+     */
+    skipped_reason: 'leased' | 'session_failure' | 'cancellation_reconciliation' | null;
+    /**
+     * Task Id
+     */
+    task_id: string;
+};
+
+/**
+ * ApiTaskFailureSweep
+ *
+ * One page of the store-wide scrub: the tasks it changed, would change or skipped.
+ */
+export type ApiTaskFailureSweep = {
+    /**
+     * Dry Run
+     */
+    dry_run: boolean;
+    /**
+     * Examined
+     */
+    examined: number;
+    /**
+     * Next After Task Id
+     */
+    next_after_task_id: string | null;
+    /**
+     * Tasks
+     */
+    tasks: Array<ApiTaskFailureScrub>;
+};
+
+/**
  * ApiTaskIndex
  */
 export type ApiTaskIndex = {
@@ -22503,6 +22563,38 @@ export type TaskCreationResponse = {
 export type TaskExecutionSource = 'http_run' | 'http_task' | 'product_operation' | 'scheduled' | 'sdk_task' | 'task_dispatch' | 'webhook';
 
 /**
+ * TaskFailureScrubRequest
+ *
+ * `POST /api/tasks/{task_id}/scrub-error`: report what would change without writing.
+ */
+export type TaskFailureScrubRequest = {
+    /**
+     * Dry Run
+     */
+    dry_run?: boolean;
+};
+
+/**
+ * TaskFailureSweepRequest
+ *
+ * `POST /api/tasks/scrub-errors`: one page of the store-wide scrub.
+ */
+export type TaskFailureSweepRequest = {
+    /**
+     * After Task Id
+     */
+    after_task_id?: string | null;
+    /**
+     * Dry Run
+     */
+    dry_run?: boolean;
+    /**
+     * Limit
+     */
+    limit?: number;
+};
+
+/**
  * TaskGraphCreationResponse
  */
 export type TaskGraphCreationResponse = {
@@ -31719,6 +31811,34 @@ export type RescheduleTaskApiTasksScheduleReschedulePostResponses = {
 
 export type RescheduleTaskApiTasksScheduleReschedulePostResponse = RescheduleTaskApiTasksScheduleReschedulePostResponses[keyof RescheduleTaskApiTasksScheduleReschedulePostResponses];
 
+export type ScrubTaskErrorsApiTasksScrubErrorsPostData = {
+    /**
+     * Body
+     */
+    body?: TaskFailureSweepRequest | null;
+    path?: never;
+    query?: never;
+    url: '/api/tasks/scrub-errors';
+};
+
+export type ScrubTaskErrorsApiTasksScrubErrorsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ScrubTaskErrorsApiTasksScrubErrorsPostError = ScrubTaskErrorsApiTasksScrubErrorsPostErrors[keyof ScrubTaskErrorsApiTasksScrubErrorsPostErrors];
+
+export type ScrubTaskErrorsApiTasksScrubErrorsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskFailureSweep;
+};
+
+export type ScrubTaskErrorsApiTasksScrubErrorsPostResponse = ScrubTaskErrorsApiTasksScrubErrorsPostResponses[keyof ScrubTaskErrorsApiTasksScrubErrorsPostResponses];
+
 export type GetTaskApiTasksTaskIdGetData = {
     body?: never;
     path: {
@@ -32050,6 +32170,39 @@ export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses = {
 };
 
 export type ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponse = ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses[keyof ListTaskScheduleEventsApiTasksTaskIdScheduleEventsGetResponses];
+
+export type ScrubTaskErrorApiTasksTaskIdScrubErrorPostData = {
+    /**
+     * Body
+     */
+    body?: TaskFailureScrubRequest | null;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}/scrub-error';
+};
+
+export type ScrubTaskErrorApiTasksTaskIdScrubErrorPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ScrubTaskErrorApiTasksTaskIdScrubErrorPostError = ScrubTaskErrorApiTasksTaskIdScrubErrorPostErrors[keyof ScrubTaskErrorApiTasksTaskIdScrubErrorPostErrors];
+
+export type ScrubTaskErrorApiTasksTaskIdScrubErrorPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskFailureScrub;
+};
+
+export type ScrubTaskErrorApiTasksTaskIdScrubErrorPostResponse = ScrubTaskErrorApiTasksTaskIdScrubErrorPostResponses[keyof ScrubTaskErrorApiTasksTaskIdScrubErrorPostResponses];
 
 export type RecoverToolApprovalApiToolApprovalsRecoverPostData = {
     body: ToolApprovalRecoveryBody;

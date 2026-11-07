@@ -10,6 +10,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
+    from cayu.tasks._failure_scrub import TaskFailureScrub, TaskFailureScrubResult
     from cayu.tasks._group_maintenance import TaskGroupMaintenance
     from cayu.tasks.continuation_claims import TaskContinuationExpectation
     from cayu.tasks.graphs import (
@@ -176,6 +177,30 @@ class TaskStore(ABC):
         Filter before limiting; never derive uniqueness from a capped task page.
         """
         raise NotImplementedError("This TaskStore cannot resolve exact task replay sources.")
+
+    async def scrub_task_failure_text(
+        self, task_id: str, scrub: TaskFailureScrub
+    ) -> TaskFailureScrubResult:
+        """Re-redact one task's stored failure text and every receipt copy of the task.
+
+        Applies ``cayu.tasks._failure_scrub.scrub_task_failure`` to the task row and,
+        in the same transaction, to each terminalization, interrupted-handoff and
+        retry-settlement receipt that keeps a copy of it, so receipt replay still
+        matches the row. Leaves unchanged a task a worker holds the lease of
+        (``skipped_reason="leased"``) or whose error another record binds exactly
+        (``"session_failure"``, ``"cancellation_reconciliation"``; see
+        ``cayu.tasks._failure_scrub.scrub_skip_reason``), and writes nothing on
+        ``scrub.dry_run``. Raises
+        ``KeyError`` for an unknown task.
+        """
+        raise NotImplementedError("This TaskStore does not support scrubbing failure text.")
+
+    async def list_task_ids_with_failure_text(
+        self, *, after_task_id: str | None = None, limit: int = 100
+    ) -> list[str]:
+        """Ids of tasks that keep failure text (an ``error``, or one in ``status_payload``),
+        ascending after ``after_task_id``, at most ``limit``, within the caller's bounds."""
+        raise NotImplementedError("This TaskStore does not support scrubbing failure text.")
 
     supports_task_creation_operations: ClassVar[bool] = False
 
