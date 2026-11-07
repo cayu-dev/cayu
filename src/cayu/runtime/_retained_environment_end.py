@@ -15,7 +15,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,6 +93,38 @@ class RetainedEnvironmentEndWatches:
         self._settle = settle
         self._clear_completion_marker = clear_completion_marker
         self._watches: dict[str, _Watch] = {}
+        self._attempts: dict[str, asyncio.Future[None]] = {}
+
+    @contextlib.asynccontextmanager
+    async def attempt(self, session_id: str) -> AsyncIterator[None]:
+        """Hold one settlement attempt of ``session_id``'s retained owner open.
+
+        An attempt publishes its lifecycle progress only after it gives up its
+        claim on the owner, so a second attempt could retire the owner and record
+        that before the first records it was still retained. Watches and the
+        lifecycle's settlement sweep start no attempt while another is open, and
+        a drain isn't settled until every open attempt has returned.
+        """
+
+        if session_id in self._attempts:
+            raise RuntimeError("A settlement attempt of this session is already open.")
+        settled = asyncio.get_running_loop().create_future()
+        self._attempts[session_id] = settled
+        try:
+            yield
+        finally:
+            del self._attempts[session_id]
+            settled.set_result(None)
+
+    def attempting(self, session_id: str) -> bool:
+        """Whether a settlement attempt of ``session_id``'s owner is open."""
+
+        return session_id in self._attempts
+
+    def settling(self) -> tuple[asyncio.Future[None], ...]:
+        """One future per open settlement attempt, done when it returns."""
+
+        return tuple(self._attempts.values())
 
     def observe(self, session_id: str) -> None:
         owner = self._setups.get(session_id)
@@ -175,12 +207,13 @@ class RetainedEnvironmentEndWatches:
         backoff = _RETRY_FIRST_SECONDS
         while self._watches.get(session_id) is watch and self._setups.get(session_id) is owner:
             watch.changed.clear()
-            if not release_is_retained(owner):
+            if not release_is_retained(owner) or self.attempting(session_id):
                 # Another cleanup attempt holds the owner; it signals when done.
                 await watch.changed.wait()
                 continue
             try:
-                await self._settle(session_id, owner)
+                async with self.attempt(session_id):
+                    await self._settle(session_id, owner)
             except Exception as error:
                 logger.warning(
                     "Settling session %s's environment %r after it ended failed (%s).",

@@ -2864,15 +2864,18 @@ class EnvironmentLifecycle:
             expected_owner: _ActiveEnvironmentSetup,
         ) -> _EnvironmentCleanupSettlementOutcome:
             try:
-                if self._active_environment_setups.get(session_id) is not expected_owner:
+                if self._active_environment_setups.get(
+                    session_id
+                ) is not expected_owner or self._retained_environment_ends.attempting(session_id):
                     return _EnvironmentCleanupSettlementOutcome()
-                await self.abort_environment_setup(
-                    session_id=session_id,
-                    original_error=None,
-                    allow_deferred_settlement=True,
-                    execution_profile=expected_owner.execution_profile,
-                    invocation_context=expected_owner.invocation_context,
-                )
+                async with self._retained_environment_ends.attempt(session_id):
+                    await self.abort_environment_setup(
+                        session_id=session_id,
+                        original_error=None,
+                        allow_deferred_settlement=True,
+                        execution_profile=expected_owner.execution_profile,
+                        invocation_context=expected_owner.invocation_context,
+                    )
             except asyncio.CancelledError as error:
                 task = asyncio.current_task()
                 return _EnvironmentCleanupSettlementOutcome(
@@ -2951,7 +2954,7 @@ class EnvironmentLifecycle:
             if task is not None:
                 polled.append((session_id, setup_owner))
                 continue
-            if available_slots == 0:
+            if available_slots == 0 or self._retained_environment_ends.attempting(session_id):
                 continue
             setup_owner.cleanup_settlement_task = asyncio.create_task(
                 settle_one(session_id, setup_owner),
@@ -6473,15 +6476,20 @@ class EnvironmentLifecycle:
                 for owner in self._active_environment_setups.values()
                 if owner.cleanup_ready_for_retry
             )
+            settling = self._retained_environment_ends.settling()
             if (
                 not retained
                 and not self._deferred_factory_cleanup_tasks
                 and not self._deferred_run_fence_release_tasks
+                and not settling
             ):
                 return True
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return False
+            if not retained and settling:
+                await asyncio.wait(settling, timeout=remaining)
+                continue
             # A retained mutation fence is part of the cleanup owner's
             # authority. Explicit operator drain is therefore also a valid
             # positive-settlement entrance; polling guarded finalization alone
@@ -6522,6 +6530,7 @@ class EnvironmentLifecycle:
                     )
                     and not self._deferred_factory_cleanup_tasks
                     and not self._deferred_run_fence_release_tasks
+                    and not self._retained_environment_ends.settling()
                 )
             if (
                 not any(
@@ -6531,7 +6540,7 @@ class EnvironmentLifecycle:
                 and not self._deferred_factory_cleanup_tasks
                 and not self._deferred_run_fence_release_tasks
             ):
-                return True
+                continue
             if fence_unavailable:
                 return False
             if (

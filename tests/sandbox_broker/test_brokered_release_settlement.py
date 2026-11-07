@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pytest
 from pydantic import SecretStr
 from tests.core.test_human_review import identity
 from tests.sandbox_broker.fake_broker import FakeBroker, _error
@@ -130,10 +131,45 @@ class _Sessions:
         return events
 
 
+def _hold_retained_records(monkeypatch) -> list[bool]:
+    """Once armed, hold each "retained" cleanup record until a retirement is recorded.
+
+    On a loaded runner one cleanup attempt can publish that the owner is still
+    retained after another attempt has retired it and recorded that; the
+    retirement must still be the session's last record. A record is held for at
+    most 1.5 s, past the watch's first retry, so a correct ordering only waits.
+    """
+
+    from cayu.environments.lifecycle import (
+        EnvironmentLifecyclePhase,
+        EnvironmentLifecycleProgressStatus,
+    )
+    from cayu.runtime import _environment_lifecycle as lifecycle
+
+    finish = lifecycle._finish_environment_lifecycle
+    armed: list[bool] = []
+    retired = asyncio.Event()
+
+    async def held(reporter, *, status, phase=None, retained_owner=False):
+        cleanup = phase is EnvironmentLifecyclePhase.RETAINED_CLEANUP
+        if armed and cleanup and status is EnvironmentLifecycleProgressStatus.RETAINED:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(retired.wait(), 1.5)
+        progress = await finish(reporter, status=status, phase=phase, retained_owner=retained_owner)
+        if cleanup and status is EnvironmentLifecycleProgressStatus.COMPLETED:
+            retired.set()
+        return progress
+
+    monkeypatch.setattr(lifecycle, "_finish_environment_lifecycle", held)
+    return armed
+
+
+@pytest.mark.parametrize("late_retained_record", [False, True], ids=["prompt", "late"])
 def test_a_refused_finalize_holds_the_workspace_only_until_the_sandbox_is_gone(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, late_retained_record: bool
 ) -> None:
     monkeypatch.setattr(runner_module, "_DESTROYED_POLL_SECONDS", 0.02)
+    hold_retained_records = _hold_retained_records(monkeypatch) if late_retained_record else []
     source = _project(tmp_path)
     broker = _RefusingBroker(tmp_path / "cloud")
 
@@ -149,6 +185,8 @@ def test_a_refused_finalize_holds_the_workspace_only_until_the_sandbox_is_gone(
             assert broker.sandboxes[sandbox.id].status == "ready"
             renewals = broker.renewals
             # Its lease lapses unrenewed, Cloud destroys it, and the reservation goes.
+            if late_retained_record:
+                hold_retained_records.append(True)
             broker.expire(sandbox.id)
             assert await sessions.app.drain_environment_cleanups(timeout_s=5)
             progress = [

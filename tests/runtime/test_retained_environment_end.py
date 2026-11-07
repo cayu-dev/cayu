@@ -116,6 +116,44 @@ def test_a_running_cleanup_attempt_is_not_overtaken() -> None:
     asyncio.run(scenario())
 
 
+def test_an_attempt_that_gave_up_its_claim_is_not_overtaken_until_it_returns() -> None:
+    binding = _Binding()
+    owner = _owner(binding)
+    setups: dict[str, Any] = {"session": owner}
+    settled: list[str] = []
+
+    async def settle(session_id: str, settled_owner: Any) -> None:
+        settled.append(session_id)
+        del setups[session_id]
+
+    async def clear(session_id: str) -> None:
+        del session_id
+
+    watches = RetainedEnvironmentEndWatches(
+        setups, owner_type=_Owner, settle=settle, clear_completion_marker=clear
+    )
+
+    async def scenario() -> None:
+        watches.observe("session")
+        binding.ends[-1].set_result("sandbox destroyed")
+        # Another attempt has given up its claim (cleanup_settlement_started is
+        # False) but hasn't returned, so it hasn't recorded its outcome yet.
+        async with watches.attempt("session"):
+            assert not watches.attempting("other")
+            (open_attempt,) = watches.settling()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert settled == []
+        assert open_attempt.done()
+        watches.observe("session")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert settled == ["session"]
+        assert watches.settling() == ()
+
+    asyncio.run(scenario())
+
+
 def test_a_refused_retirement_backs_off_instead_of_settling_again_at_once() -> None:
     binding = _Binding()
     owner = _owner(binding)
