@@ -353,3 +353,93 @@ def test_retire_past_the_archive_bound_says_so(store, monkeypatch):
         assert _current(store, "big").status is KnowledgeStatus.ACTIVE
         plain = client.post("/api/knowledge/big/retire", json={"expected_revision": 1})
         assert plain.status_code == 200
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_operator_records_decisions_on_a_recall_scope_as_on_cayu_cloud(store_kind, tmp_path):
+    """The scaffold's knowledge scope admits active and pending entries only. On Cayu Cloud
+    the CLI sends the operator login, which proxy identity's fallback signs in as an admin;
+    archiving and dropping with a reason must work there, as they do by revision alone."""
+
+    import base64
+
+    import httpx
+
+    from cayu.server import BasicAuth, ProxyIdentityAuth
+    from cayu.storage import SQLiteKnowledgeStore
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["default"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    bound = (
+        InMemoryKnowledgeStore(access_scope=recall)
+        if store_kind == "memory"
+        else SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=recall)
+    )
+    for entry_id, status in (
+        ("kept", KnowledgeStatus.ACTIVE),
+        ("proposal", KnowledgeStatus.PENDING),
+        ("inbox-proposal", KnowledgeStatus.PENDING),
+    ):
+        asyncio.run(
+            bound.create_entry(
+                KnowledgeEntry(
+                    id=entry_id, namespace="default", text=f"Made-up {entry_id}", status=status
+                )
+            )
+        )
+    auth = ProxyIdentityAuth(
+        issuer="https://sign-in.example.com",
+        audience="agent:app-1",
+        jwks_url="https://sign-in.example.com/jwks",
+        # No request here carries an identity, so the keys are never fetched.
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(404))),
+        fallback=BasicAuth(username="operator", password="made-up-password"),
+    )
+    operator = {"Authorization": "Basic " + base64.b64encode(b"operator:made-up-password").decode()}
+    app = CayuApp(knowledge_store=bound, knowledge_access_scope=recall, enable_logging=False)
+    try:
+        with TestClient(create_server(app, config=ServerConfig.protected(auth))) as client:
+            archived = client.post(
+                "/api/knowledge/kept/retire",
+                headers={**operator, "Idempotency-Key": "archive-kept"},
+                json={"reason": "Stale."},
+            )
+            assert archived.status_code == 200, archived.text
+            assert archived.json() == {
+                "entry_id": "kept",
+                "revision": 2,
+                "status": "archived",
+                "reason": "Stale.",
+            }
+            assert client.get("/api/knowledge", headers=operator).json()["entries"] == []
+            dropped = client.post(
+                "/api/knowledge/proposal/reject",
+                headers={**operator, "Idempotency-Key": "drop-proposal"},
+                json={"reason": "Duplicate."},
+            )
+            assert dropped.status_code == 200, dropped.text
+            assert dropped.json()["status"] == "archived"
+            assert dropped.json()["reason"] == "Duplicate."
+            (item,) = client.get("/api/inbox", headers=operator).json()["items"]
+            settled = client.post(
+                f"/api/inbox/{item['id']}/settle",
+                headers=operator,
+                json={"decision": "drop", "reason": "Duplicate too."},
+            )
+            assert settled.status_code == 200, settled.text
+            assert settled.json()["replayed"] is False
+            answered = settled.json()["item"]
+            assert answered["id"] == item["id"]
+            assert answered["status"] == "settled"
+            assert answered["settlement"]["decision"] == "drop"
+            assert answered["settlement"]["reason"] == "Duplicate too."
+            assert client.get("/api/inbox", headers=operator).json()["items"] == []
+        for entry_id in ("kept", "proposal", "inbox-proposal"):
+            # Out of the recall scope, which still reads no archived entry.
+            assert asyncio.run(bound.get_entry(entry_id)) is None
+    finally:
+        close = getattr(bound, "close", None)
+        if close is not None:
+            asyncio.run(close())

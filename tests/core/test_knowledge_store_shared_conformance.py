@@ -2085,6 +2085,104 @@ def test_knowledge_store_shared_access_contract(knowledge_store_case) -> None:
     asyncio.run(run())
 
 
+def test_knowledge_store_reviewed_retirement_needs_no_archived_access(
+    knowledge_store_case,
+) -> None:
+    """A recall scope (active and pending, as a scaffolded agent's is) records a reviewed
+    archive or drop of an entry it sees, as an unreviewed retirement does, without being able
+    to read archived entries afterwards or to start a new entry archived."""
+
+    from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["recall"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    decision = {"reviewer_identity": "reviewer", "reviewer_version": "test-v1"}
+
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            for entry_id, status in (
+                ("kept", KnowledgeStatus.ACTIVE),
+                ("proposal", KnowledgeStatus.PENDING),
+            ):
+                await store.create_entry(
+                    KnowledgeEntry(
+                        id=entry_id,
+                        namespace="recall",
+                        text=f"Made-up note {entry_id}",
+                        status=status,
+                    ),
+                    access_scope=recall,
+                )
+            review = KnowledgeReviewWorkflow(store, access_scope=recall)
+
+            archived = await review.archive_reviewed(
+                "kept",
+                expected_revision=1,
+                operation_id="archive-kept",
+                reason="Stale.",
+                **decision,
+            )
+            assert archived.entry.status is KnowledgeStatus.ARCHIVED
+            assert archived.entry.revision == archived.receipt.entry_revision == 2
+            assert archived.decision.reason == "Stale."
+            dropped = await review.reject_reviewed(
+                "proposal",
+                expected_revision=1,
+                operation_id="drop-proposal",
+                reason="Duplicate.",
+                **decision,
+            )
+            assert dropped.entry.status is KnowledgeStatus.ARCHIVED
+            assert dropped.decision.reason == "Duplicate."
+            # The recall scope still reads no archived entry.
+            assert await store.get_entry("kept", access_scope=recall) is None
+            assert await store.get_entry("kept", revision=2, access_scope=recall) is None
+            assert await store.get_entry("proposal", access_scope=recall) is None
+            # The archived revisions hold the decisions, for a scope that may read them.
+            kept = await store.get_entry("kept", access_scope=_ACCESS_SCOPE)
+            assert kept is not None and kept.status is KnowledgeStatus.ARCHIVED
+            assert kept.metadata["cayu:review_archive"]["reason"] == "Stale."
+            proposal = await store.get_entry("proposal", access_scope=_ACCESS_SCOPE)
+            assert proposal is not None and proposal.status is KnowledgeStatus.ARCHIVED
+            assert proposal.metadata["cayu:review_rejection"]["reason"] == "Duplicate."
+
+            # Only a revision the scope sees may be retired this way: a new entry can't
+            # start out archived.
+            fresh = KnowledgeEntry(
+                id="fresh",
+                namespace="recall",
+                text="Made-up note fresh",
+                status=KnowledgeStatus.ARCHIVED,
+            )
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.publish_entry_revision(
+                    fresh,
+                    [
+                        KnowledgeChunk(
+                            id="fresh:0", entry_id="fresh", chunk_index=0, text=fresh.text
+                        )
+                    ],
+                    operation_id="publish-fresh-archived",
+                    access_scope=recall,
+                )
+            assert await store.get_entry("fresh", access_scope=_ACCESS_SCOPE) is None
+            assert (
+                await store.load_entry_publication_receipt(
+                    "publish-fresh-archived", access_scope=_ACCESS_SCOPE
+                )
+                is None
+            )
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
 def test_knowledge_store_historical_reads_require_current_and_snapshot_access(
     knowledge_store_case,
 ) -> None:

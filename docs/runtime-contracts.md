@@ -18017,7 +18017,13 @@ kept (active) revision; both publish the archived successor through
 `publish_entry_revision` with the reviewer, version, optional reason and
 annotations in its metadata (`cayu:review_rejection` or `cayu:review_archive`),
 authenticated by the publication receipt of the operation ID, so an exact retry
-replays and a different decision under that ID conflicts.
+replays and a different decision under that ID conflicts. The workflow's access scope
+needn't admit archived entries: as `append_entry_revision` does, `publish_entry_revision`
+lets a scope that admits the current revision publish its archived or deleted successor
+(a new entry must still fit the scope in full), so an agent's recall scope (active and
+pending entries, as a scaffolded project's is) records these decisions without gaining
+read access to what they archive. Replaying a recorded decision reads the archived
+revision, so under such a scope the entry is simply no longer found.
 
 The packaged server/dashboard uses the same workflow when `CayuApp` is
 constructed with `knowledge_store=...`; `knowledge_review_namespace` and

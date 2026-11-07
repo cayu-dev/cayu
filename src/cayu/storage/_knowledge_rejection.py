@@ -304,7 +304,8 @@ async def reject_reviewed(
     receipt = copy_knowledge_publication_receipt(receipt)
     if receipt.request_sha256 != digest:
         raise KnowledgePublicationConflict("operation_mismatch")
-    result = await load_review_rejection(workflow, entry_id, revision, operation_id, kind)
-    if result is None:
-        raise KnowledgePublicationConflict("missing_receipt")
-    return result
+    # The receipt's digest covers exactly the successor this call prepared, so that is the
+    # revision the store holds. It isn't read back: a scope that admits only the statuses an
+    # agent recalls (active, pending) may archive an entry it sees without being able to read
+    # archived entries, as for an unreviewed retirement.
+    return KnowledgeReviewRejection(copy_knowledge_entry(successor), decision, receipt)

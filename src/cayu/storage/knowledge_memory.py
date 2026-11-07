@@ -722,7 +722,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             expected_revision=expected_revision,
             activation_authority=activation_authority,
         )
-        _require_knowledge_entry_access(scope, copied_entry, operation="publish_entry_revision")
+        # Like `append_entry_revision`: a scope that may change the current revision may
+        # retire it without admitting the archived status. A new entry is checked in full
+        # once the store shows there is no current revision.
+        _require_knowledge_successor_access(scope, copied_entry, operation="publish_entry_revision")
         copied_authority = (
             None
             if activation_authority is None
@@ -787,10 +790,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             raise KnowledgePublicationConflict("operation_occupied")
         existing_entry = self._current_entry(copied_entry.id)
         actual_revision = None if existing_entry is None else existing_entry.revision
-        if existing_entry is not None:
-            _require_knowledge_entry_access(
-                scope, existing_entry, operation="publish_entry_revision"
-            )
+        # The current revision, or the new entry in full when there is none.
+        _require_knowledge_entry_access(
+            scope,
+            copied_entry if existing_entry is None else existing_entry,
+            operation="publish_entry_revision",
+        )
         retirement = self._activation_retirements.get(copied_entry.id)
         if retirement is not None:
             _require_knowledge_activation_retirement_access(

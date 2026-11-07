@@ -1109,8 +1109,12 @@ and reason on the archived revision, and repeating the same command with the sam
 operation ID replays it instead of reporting a conflict. Archive needs full access; on
 a Cloud Agent the CLI uses the Agent's operator login, which has it. An Agent on a Cayu
 from before reasons makes the keep or drop without one, and the CLI warns that it
-wasn't recorded. All preserve the server's review scope and permissions. Local store
-options remain read-only; mutations always go through the running server.
+wasn't recorded. All preserve the server's review scope and permissions. The server's
+knowledge scope needn't admit archived entries: with a scaffolded project's (active and
+pending only) drop and archive still record the decision, and the inbox answers a drop
+from the decision it just recorded; a retry after that no longer finds the entry, since
+the scope can't read the archived revision. Local store options remain read-only;
+mutations always go through the running server.
 `cayu knowledge show` on a local store prints who archived or dropped an entry and
 why (`archived_by`, `archived_reason`, `dropped_by`, `dropped_reason`); a Cloud Agent's
 API serves only kept and pending entries, so read an archived entry's reason from the

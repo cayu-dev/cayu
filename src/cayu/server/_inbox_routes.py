@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     from cayu.runtime.loop_policies import LoopPolicy
     from cayu.server.auth import AuthContext
     from cayu.sessions.store import SessionStore
+    from cayu.storage._knowledge_rejection import KnowledgeReviewRejection
     from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 
 _ITEM_ID_PREFIX = INBOX_ITEM_ID_PREFIX
@@ -1162,6 +1163,18 @@ def register_inbox_routes(
 
     # ── Knowledge proposals ──────────────────────────────────────────────────
 
+    def drop_settlement(reviewed: KnowledgeReviewRejection) -> InboxSettlement:
+        """The settlement of a reviewed drop, from its receipt and recorded decision."""
+
+        return InboxSettlement(
+            decision="drop",
+            decided_at=reviewed.receipt.committed_at,
+            decided_by=_knowledge_decider(
+                reviewed.decision.annotations, reviewed.decision.reviewer_identity
+            ),
+            reason=cayu_app.redact_json(reviewed.decision.reason),
+        )
+
     async def knowledge_item_state(
         workflow: KnowledgeReviewWorkflow, locator: _KnowledgeLocator
     ) -> tuple[InboxItemState, KnowledgeEntry] | None:
@@ -1238,14 +1251,7 @@ def register_inbox_routes(
                 except (KnowledgePublicationConflict, TypeError, ValueError):
                     reviewed = None
             if reviewed is not None:
-                settlement = InboxSettlement(
-                    decision="drop",
-                    decided_at=reviewed.receipt.committed_at,
-                    decided_by=_knowledge_decider(
-                        reviewed.decision.annotations, reviewed.decision.reviewer_identity
-                    ),
-                    reason=cayu_app.redact_json(reviewed.decision.reason),
-                )
+                settlement = drop_settlement(reviewed)
             elif lifecycle_only:
                 settlement = InboxSettlement(decision="drop", decided_at=successor.updated_at)
             else:
@@ -1275,6 +1281,7 @@ def register_inbox_routes(
             settled is not None and settled.decision != body.decision
         ):
             raise _state_conflict(state)
+        dropped = None
         try:
             identity, annotations = _knowledge_reviewer_attribution(auth_context)
             if body.decision == "keep":
@@ -1290,7 +1297,7 @@ def register_inbox_routes(
                     expected_revision=locator.revision,
                 )
             else:
-                await workflow.reject_reviewed(
+                dropped = await workflow.reject_reviewed(
                     locator.entry_id,
                     expected_revision=locator.revision,
                     operation_id=_knowledge_operation_id(locator, "drop"),
@@ -1318,6 +1325,18 @@ def register_inbox_routes(
                 raise _conflict("conflict", str(exc), current[0]) from exc
             raise _state_conflict(current[0]) from exc
         current = await knowledge_item_state(workflow, locator)
+        if current is None and dropped is not None:
+            # A scope without the archived status (an agent's recall scope) can't read the
+            # proposal back once it is dropped, so answer from the drop just recorded.
+            return InboxSettleResponse(
+                replayed=dropped.receipt.replayed,
+                item=InboxItemState(
+                    id=state.id,
+                    kind="knowledge",
+                    status="settled",
+                    settlement=drop_settlement(dropped),
+                ),
+            )
         if current is None:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
         return InboxSettleResponse(replayed=settled is not None, item=current[0])
