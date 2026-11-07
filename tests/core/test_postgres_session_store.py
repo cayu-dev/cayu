@@ -238,6 +238,50 @@ async def _truncate(dsn: str) -> None:
         await conn.commit()
 
 
+async def _store_clock(dsn: str) -> datetime:
+    """Postgres's clock, which stamps session activity; the host clock can drift from it."""
+    import psycopg
+
+    async with (
+        await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
+        await cur.execute("SELECT clock_timestamp()")
+        row = await cur.fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def _await_event_visibility_horizon(dsn: str, *, timeout: float = 30.0) -> None:
+    """Wait until cross-session cursor reads can see every committed event.
+
+    Those reads hide events at or above the server-wide snapshot xmin. A transaction
+    another test holds open in its own database on the same server keeps that
+    horizon back, so tests that assert such reads right after writing wait first.
+    """
+    import psycopg
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    async with (
+        await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
+        while True:
+            await cur.execute(
+                "SELECT NOT EXISTS (SELECT 1 FROM cayu_events "
+                "WHERE insert_xid >= pg_snapshot_xmin(pg_current_snapshot()))"
+            )
+            row = await cur.fetchone()
+            if row is not None and row[0]:
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(
+                    "An open transaction on the Postgres server held the event "
+                    f"visibility horizon back for {timeout} seconds."
+                )
+            await asyncio.sleep(0.05)
+
+
 def _new_store(dsn: str):
     from cayu.storage.migrations import SchemaMode
     from cayu.storage.postgres import PostgresSessionStore
@@ -3457,7 +3501,7 @@ def test_postgres_session_store_filters_sessions_by_last_activity(postgres_dsn):
                 ),
                 identity=_identity(),
             )
-        inactive_before = datetime.now(UTC)
+        inactive_before = await _store_clock(postgres_dsn)
         await asyncio.sleep(0.001)
         await store.append_event(
             "sess_pg_activity_recent",
@@ -3658,6 +3702,7 @@ def test_postgres_session_store_query_events_with_filters_cursors_and_batching(p
             ),
         )
 
+        await _await_event_visibility_horizon(postgres_dsn)
         all_records = await store.query_events(EventQuery(limit=10))
         desc_records = await store.query_events(
             EventQuery(order_by=EventOrder.SEQUENCE_DESC, limit=2)
@@ -4100,6 +4145,7 @@ def test_postgres_session_store_batches_large_event_session_id_queries(postgres_
             "sess_batch_1",
             "sess_batch_3",
         )
+        await _await_event_visibility_horizon(postgres_dsn)
         records = await store.query_events(EventQuery(session_ids=session_ids, limit=10))
         limited_records = await store.query_events(EventQuery(session_ids=session_ids, limit=3))
         cursor_records = await store.query_events(
