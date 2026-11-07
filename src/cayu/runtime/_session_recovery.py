@@ -624,6 +624,7 @@ class SessionRecovery:
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
         abandon_unknown_tool_effects: bool = False,
+        recover_abandoned_models: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         request = copy_incomplete_session_recovery_request(request)
         (
@@ -684,6 +685,7 @@ class SessionRecovery:
                 participant_context=participant_context,
                 execution_to_wait=execution_to_wait,
                 abandon_unknown_tool_effects=abandon_unknown_tool_effects,
+                recover_abandoned_models=recover_abandoned_models,
             )
         finally:
             if interaction_id is not None:
@@ -750,6 +752,7 @@ class SessionRecovery:
         participant_context: CollaborationAccessContext | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
         abandon_unknown_tool_effects: bool = False,
+        recover_abandoned_models: bool = False,
     ) -> IncompleteSessionRecoveryResult:
         retained_invocation_context: InvocationContext | None = None
 
@@ -768,6 +771,10 @@ class SessionRecovery:
             request,
             execution_to_wait=execution_to_wait,
             abandon_unknown_tool_effects=abandon_unknown_tool_effects,
+            # A lost ordinary model call settles as unknown, as the abandoned sweep does.
+            recover_abandoned_model=(
+                self._settle_abandoned_model_dispatch_hook if recover_abandoned_models else None
+            ),
             before_mutation=before_mutation,
             participant_context=participant_context,
             retain_open_interaction_invocation=(interaction_id is not None),
@@ -797,6 +804,49 @@ class SessionRecovery:
                 invocation_context=retained_invocation_context,
             )
         return await self._reap_shared_allocations(reconciled)
+
+    async def _settle_abandoned_model_dispatch_hook(
+        self, session: Session, invocation_context: InvocationContext
+    ) -> tuple[Event, ...]:
+        return await self._settle_abandoned_model_dispatch(
+            session, invocation_context=invocation_context
+        )
+
+    async def settle_released_open_interaction(self, session_id: str) -> Event | None:
+        """Fail the interaction a lost run left open, once its session failed for good.
+
+        For a session abandoned without its environment, which no recovery owner
+        reconstructed: its terminal evidence is durable and its invocation released,
+        so the interaction settles without invocation authority. Does nothing when the
+        latest interaction already ended or the invocation isn't released yet.
+        """
+
+        session = await self.session_store.load(session_id)
+        if session is None or session.status is not SessionStatus.FAILED:
+            return None
+        active_profile = active_invocation_execution_profile_from_checkpoint(
+            await self.session_store.load_checkpoint(session_id)
+        )
+        if active_profile is not None and not active_invocation_execution_profile_is_released(
+            active_profile, session_id=session.id, run_epoch=session.run_epoch
+        ):
+            return None
+        interaction_id = await self._session_finalization.activate_latest_open_interaction(
+            session_id
+        )
+        if interaction_id is None:
+            return None
+        try:
+            active_through = await self._latest_interaction_activity_at(session_id, interaction_id)
+            _set_session_interaction_recovered_active_through(session_id, active_through)
+            _, event, _ = await self._publish_durable_recovery_interaction_transition(
+                session=session,
+                recovered_active_through=active_through,
+                invocation_context=None,
+            )
+            return event
+        finally:
+            _deactivate_session_interaction(session_id)
 
     async def _reap_shared_allocations(
         self, result: IncompleteSessionRecoveryResult

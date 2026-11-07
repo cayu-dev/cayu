@@ -9293,7 +9293,7 @@ def create_router(
         "/sessions/{session_id}/close",
         response_model=ApiSessionCloseResult,
         dependencies=protected,
-        summary="Close a session that is not running and won't continue",
+        summary="Close a session nobody will continue, or one a lost worker left running",
     )
     async def close_session(
         session_id: NonBlankString,
@@ -9304,8 +9304,12 @@ def create_router(
 
         The session's pending approval or question leaves the inbox, and the
         reason and the caller are recorded on its ``session.failed`` event. A
-        session that is running, already ended, or has unfinished tasks or child
-        sessions is refused with 409. Repeating a close returns the closed session.
+        running session is closed when its owner is provably gone (a lapsed
+        execution lease, a process that died, or every task of it finished),
+        including where its environment isn't registered. A running session
+        whose owner is live or not known to be gone, one already ended, or one
+        with unfinished tasks or child sessions is refused with 409. Repeating a
+        close returns the closed session.
         """
 
         try:

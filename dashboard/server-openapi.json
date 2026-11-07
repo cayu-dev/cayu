@@ -58083,7 +58083,7 @@
     },
     "/api/sessions/{session_id}/close": {
       "post": {
-        "description": "Fail a pending or interrupted session as closed, keeping its history.\n\nThe session's pending approval or question leaves the inbox, and the\nreason and the caller are recorded on its ``session.failed`` event. A\nsession that is running, already ended, or has unfinished tasks or child\nsessions is refused with 409. Repeating a close returns the closed session.",
+        "description": "Fail a pending or interrupted session as closed, keeping its history.\n\nThe session's pending approval or question leaves the inbox, and the\nreason and the caller are recorded on its ``session.failed`` event. A\nrunning session is closed when its owner is provably gone (a lapsed\nexecution lease, a process that died, or every task of it finished),\nincluding where its environment isn't registered. A running session\nwhose owner is live or not known to be gone, one already ended, or one\nwith unfinished tasks or child sessions is refused with 409. Repeating a\nclose returns the closed session.",
         "operationId": "close_session_api_sessions__session_id__close_post",
         "parameters": [
           {
@@ -58129,7 +58129,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Close a session that is not running and won't continue"
+        "summary": "Close a session nobody will continue, or one a lost worker left running"
       }
     },
     "/api/sessions/{session_id}/compact": {

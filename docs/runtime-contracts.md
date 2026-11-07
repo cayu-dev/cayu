@@ -1805,6 +1805,27 @@ The built-in `ask_user` tool (`UserInputTool`, opt-in — register it only on ag
 
 The built-in `sleep_until` tool (`SleepUntilTool`, opt-in, refused at registration without a scheduling task store) is a durable one-shot self-wake with its own pause kind. A call with a future deadline atomically replaces the pending round with a `pending_wake` checkpoint under the exact `wake-open:{wake_id}` receipt, interrupts the session with `interruption_type="wake_scheduled"`, and idempotently creates the future task `cayu-session-wake-{wake_id}`; `reconcile_session_wakes` (run by `run_task_worker` at start and on its reclaim cadence) restores a missing, ended or lease-lost attempt while the wake is open. Only a due wake task closes it: `wake-close:{wake_id}` hands the round to the shared pause claim, which resolves the call with the deterministic timer result, resumes with `interruption_type="wake_scheduled"` and closes under `user-input-close:{wake_id}`, so the continuation is claimed and published once; duplicates replay as `already_delivered`. A failed attempt keeps its error on its task and schedules a successor with capped backoff for 24 hours after the deadline. An admitted interruption cancels pending attempts and supersedes the sleeping round in the same atomic transition that stops the session, whether the wake is asleep, still opening or handed over; deletion cancels the attempts too; a late attempt is a `closed` no-op. A delivery whose continuation stops before the call receives its result fails that attempt, so a successor retries it, unless the woken round stopped on a tool that started without a result: that attempt settles as `manual_recovery_required`, no successor follows, and the pending action is that tool's `manual_recovery`, settled with `recover_user_input`. A subagent of the woken round that pauses for a person leaves the wake delivered, and its ended child continues the round under the wake's own retained authority. `resolve_user_input`, `resume` and `fork` refuse a sleeping session. The runtime's pending action kind `wake` has no attention identity, and people-facing reads and the server pending-action API never list it. Sleep time is excluded from run-scoped limits like other pauses. A task-owned session parks its task: the worker's handoff receipt records `parked` (a `TaskParkedWait` naming the wake), every continuation scan leaves a parked handoff out (storage revision 137), and only a bound continuation claim presenting that exact wait (`TaskContinuationExpectation.parked_wait`) may claim it, which the wake attempt makes before delivering under the task's authority; an ended owning task makes the wake stop the sleep instead, an interruption cancels the wake's attempts and `reconcile_parked_handoffs` (on the worker's reclaim cadence) releases any parked handoff whose session no longer waits on its wait, through a bound claim presenting that wait, and deleting the session is refused while its task runs. Registration requires a task store that declares `supports_bound_interrupted_task_handoffs` and `supports_parked_interrupted_task_handoffs` on its own class. A subagent sleeps the same way: a foreground parent's call waits on it as on a subagent's approval or input, with a `delegated_action` whose `action_kind` is `wake` (not listed by the server pending-action API), and continues once the subagent ends; `subagent_result` reports a sleeping background or durable subagent as `status="sleeping"` with `wake_at`; a parent a worker runs under a task parks its task on the subagent's wake (`TaskParkedWait.session_id` names the subagent), and only the wake's attempt continues the subagent and then each parent, under its bound claim on that task; any other delivery of a subagent's ending acknowledges it and leaves the parent to that attempt. Interrupting the parent unparks its task, cancelling the task stops the chain, and a subagent whose chain a task-backed run without a worker owns, or that runs inside an approval or answer still being carried out under a task, does not sleep. Rounds that paused for approval do not sleep yet, and a task-backed run without a task worker (or an admitted work attempt) never does, since nothing hands its task off; the call returns an error result saying it did not pause. The runtime writes checkpoint schema 12 for every checkpoint it persists, so, as for any checkpoint bump, rolling back to a runtime that reads only schema 11 is not supported. See [task scheduling](task-scheduling.md#let-an-agent-sleep-and-continue-later).
 
+`CayuApp.reconcile_orphaned_sessions(inactive_for_seconds=3600)` ends the runs a lost
+worker left holding sessions `running`, such as one a deploy replaced mid-run. Each
+`running` or `interrupting` session inactive for the window whose owner is provably
+gone (as for `close_session` below) and whose tasks are all terminal is recovered as
+`recover_abandoned_sessions` recovers it: left `interrupted`, with
+`pending_tool_effect` (an inbox recovery item) when a call it was running has an
+unknown outcome. Where its environment isn't registered, it fails as abandoned
+instead, through the same fenced transition a close without the environment uses,
+with reason `orphaned_session_reconciled` and action `abandoned_orphaned_run` (or
+`abandoned_tool_effect` when it lists unknown calls). A session with a live owner, an
+unfinished task, activity within the window, or no attested owner and no tasks is
+left alone and not reported; one session's failure is reported with a `failed` action
+and never stops the sweep. The sweep also finishes an abandonment that failed a
+session but stopped before publishing `session.failed` or settling the run's
+interaction (a process that died in between), for sessions that ended up to seven
+days before the window. The server built by `create_server` (`cayu serve`) runs it
+every `ServerLifecycleConfig.orphaned_session_reconcile_interval_seconds` (default
+600; `None` turns it off) with `orphaned_session_inactive_after_seconds` (default
+3600). An application that mounts Cayu into its own server, or runs without one,
+calls it itself.
+
 `CayuApp.close_session(session_id, reason=..., closed_by=...)` ends any pending or
 interrupted session as abandoned, including one paused on an approval or a question
 it will never resume from. A session stopped on an unknown tool outcome is
@@ -1836,9 +1857,23 @@ reports `skipped_execution_owner` when another process holds the closed session'
 recovery claim. Closers that race (two sweeps, or a sweep and a person repeating the
 close) settle through the same fenced transition, and one that finds the child
 already closed replays that close, so each child gets one `session.failed`. A subagent whose foreground parent waits on it is
-refused, so close the parent instead. Running or interrupting sessions or children, finished sessions,
-sleeping sessions (interrupt one first, which cancels its wake), sessions with an
-unfinished task, and sessions whose agent isn't registered are refused with
+refused, so close the parent instead. A running or interrupting session is closed
+only when its owner is provably gone: the store records the owner of its current run
+epoch with a lapsed execution lease or a process that died, or, without such a
+record, the session has tasks and every one is terminal. Recovery then takes it over
+and it is closed as above. Where its environment isn't registered in this
+application (a per-run environment only the worker that ran it registered), recovery
+can't take it over, so the close fences the lost run under a recovery claim (which a
+live owner refuses at store time), keeps each tool call that run had started as
+`outcome_unknown`, fails the session as closed in the same fenced transition from
+`running` or `interrupting`, and publishes `session.failed` under that claim; the
+environment binding and any allocation the run started stay recorded for recovery
+where the environment is registered. Without the environment, a run stopped inside a
+model call, one with a provider operation to settle, or one with child sessions other
+than forks that haven't ended is refused. Running or interrupting sessions whose
+owner is live or not known to be gone, running or interrupting children, finished
+sessions, sleeping sessions (interrupt one first, which cancels its wake), sessions
+with an unfinished task, and sessions whose agent isn't registered are refused with
 `SessionStatusConflict`. `POST /api/sessions/{id}/close` (`reason`, optional
 `waiting_on`, and `closed_by` only without authentication) and the inbox's
 `dismiss` of an approval or question, which passes the item's own ID as

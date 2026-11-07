@@ -61,6 +61,8 @@ class IncompleteSessionRecoveryAction(StrEnum):
     REPAIRED_PROVIDER_OPERATION_RESOLUTION = "repaired_provider_operation_resolution"
     INTERRUPTED_ABANDONED = "interrupted_abandoned"
     ABANDONED_TOOL_EFFECT = "abandoned_tool_effect"
+    # A running session whose owner was provably gone failed as abandoned.
+    ABANDONED_ORPHANED_RUN = "abandoned_orphaned_run"
     CLOSED = "closed"
     FINALIZED_INTERRUPT = "finalized_interrupt"
     FAILED = "failed"

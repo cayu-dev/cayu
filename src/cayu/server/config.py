@@ -60,6 +60,8 @@ DEFAULT_SERVER_TITLE = "Cayu"
 DEFAULT_DASHBOARD_PATH = "/cayu"
 DEFAULT_LOCAL_CORS_ORIGIN = "http://localhost:5173"
 DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS = 300
+DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS = 600.0
+DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS = 3600
 DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS = 10.0
 DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS = 10.0
@@ -573,6 +575,12 @@ class ServerLifecycleConfig(BaseModel):
     session_follow_max_streams_per_session: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS
+    # How often the server ends runs a lost worker left holding sessions running
+    # (``CayuApp.reconcile_orphaned_sessions``); ``None`` turns it off.
+    orphaned_session_reconcile_interval_seconds: float | None = (
+        DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS
+    )
+    orphaned_session_inactive_after_seconds: int = DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS
     event_side_effect_startup_timeout_seconds: float = (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     )
@@ -580,6 +588,13 @@ class ServerLifecycleConfig(BaseModel):
     knowledge_publication_shutdown_grace_seconds: float = (
         DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS
     )
+
+    @field_validator("orphaned_session_reconcile_interval_seconds", mode="before")
+    @classmethod
+    def validate_orphan_reconcile_interval(cls, value: object) -> float | None:
+        if value is None:
+            return None
+        return _positive_seconds(value, "orphaned_session_reconcile_interval_seconds")
 
     @field_validator(
         "replay_idle_timeout_s",
@@ -604,11 +619,13 @@ class ServerLifecycleConfig(BaseModel):
             raise ValueError(f"{info.field_name} must be a positive integer.")
         return value
 
-    @field_validator("recovery_inactive_after_seconds", mode="before")
+    @field_validator(
+        "recovery_inactive_after_seconds", "orphaned_session_inactive_after_seconds", mode="before"
+    )
     @classmethod
-    def validate_recovery_inactivity(cls, value: object) -> int:
+    def validate_recovery_inactivity(cls, value: object, info) -> int:
         if type(value) is not int or value < 0:
-            raise ValueError("recovery_inactive_after_seconds must be a non-negative integer.")
+            raise ValueError(f"{info.field_name} must be a non-negative integer.")
         return value
 
     @field_validator("startup_recovery_statuses", mode="before")
@@ -827,6 +844,12 @@ class ServerConfig(BaseModel):
                     else sorted(status.value for status in self.lifecycle.startup_recovery_statuses)
                 ),
                 "recovery_inactive_after_seconds": (self.lifecycle.recovery_inactive_after_seconds),
+                "orphaned_session_reconcile_interval_seconds": (
+                    self.lifecycle.orphaned_session_reconcile_interval_seconds
+                ),
+                "orphaned_session_inactive_after_seconds": (
+                    self.lifecycle.orphaned_session_inactive_after_seconds
+                ),
                 "event_side_effect_startup_timeout_seconds": (
                     self.lifecycle.event_side_effect_startup_timeout_seconds
                 ),

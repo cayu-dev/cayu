@@ -10,7 +10,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4, uuid5
 
 from cayu._validation import (
@@ -655,6 +655,7 @@ class IncompleteSessionRecovery:
         _work_attempt: WorkAttemptInvocationAuthority | None = None,
         execution_to_wait: _ExternalExecutionToWait | None = None,
         abandon_unknown_tool_effects: bool = False,
+        recover_abandoned_model: AbandonedModelRecoveryHook | None = None,
     ) -> IncompleteSessionRecoveryResult:
         """Repair incomplete state, including an exact post-close child continuation.
 
@@ -708,6 +709,7 @@ class IncompleteSessionRecovery:
         recovered = await self.recover_incomplete_session_scoped(
             execution_to_wait=execution_to_wait,
             abandon_unknown_tool_effects=abandon_unknown_tool_effects,
+            recover_abandoned_model=recover_abandoned_model,
             participant_context=participant_context,
             _work_attempt=_work_attempt,
             preserve_interaction_id=preserve_interaction_id,
@@ -5210,6 +5212,232 @@ class IncompleteSessionRecovery:
             raise SessionStatusConflict(
                 f"{unavailable}, and its paused round holds no unknown tool outcome to abandon."
             )
+        return abandoned
+
+    async def execution_owner(self, session: Session) -> Literal["live", "lost", "unattested"]:
+        """What the store attests about the owner of the session's current run.
+
+        ``live`` when this process runs the session or the store records a live owner
+        for the run; ``lost`` when it records an owner for this run whose lease lapsed
+        or whose process died; ``unattested`` when it records none (a custom store,
+        or a run an older release started), which proves nothing either way.
+        """
+
+        if self._session_control.has_active_tasks(session.id):
+            return "live"
+        if not self._session_store.supports_session_execution:
+            return "unattested"
+        # Owner liveness only: the public projection reports a retained approval or
+        # question as waiting, which would hide a dead owner of the approved run.
+        execution = await self._session_store._inspect_session_execution_owner(session.id)
+        if execution.state == "executing":
+            return "live"
+        if execution.state == "owner_lost" and execution.run_epoch == session.run_epoch:
+            return "lost"
+        return "unattested"
+
+    async def abandon_orphaned_without_environment(
+        self,
+        expected: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        inactive_for_seconds: int,
+        closed: dict[str, str] | None = None,
+    ) -> Session:
+        """Fail a running session whose owner is gone and whose environment isn't here.
+
+        For a session a lost worker left ``running`` or ``interrupting`` (for example
+        one a deploy cut off) where ordinary recovery can't take it over because this
+        application has no registration of its environment. The caller has proved the
+        owner gone (``execution_owner`` is ``lost``, or every task of the session
+        finished).
+        The session's run is fenced under a recovery claim, which a live owner or
+        activity within ``inactive_for_seconds`` of store time refuses; each tool call
+        it was running keeps an ``outcome_unknown`` record and is listed as unknown;
+        and the session fails as abandoned in the same fenced transition, which
+        ``closed`` marks as a person's close. Its terminal ``session.failed`` is
+        published under the same claim. Abandoning continues nothing, so it needs
+        neither the environment nor a model: the environment binding and any
+        allocation the run started stay recorded, to be released where the
+        environment is registered.
+
+        ``expected`` is the session as read before ordinary recovery refused it. A
+        session that changed since, is paused on an approval, a question or a wake,
+        has model work in flight, or a provider operation to settle, raises
+        ``SessionStatusConflict``; those keep their own recovery.
+        """
+
+        session = await self._session_store.load(expected.id)
+        if session is None:
+            raise KeyError(f"Session not found: {expected.id}")
+        if (session.instance_id, session.run_epoch) != (expected.instance_id, expected.run_epoch):
+            raise SessionStatusConflict("Session changed before it was abandoned.")
+        unavailable = (
+            f"The session's environment {session.environment_name!r} isn't registered in "
+            "this application"
+        )
+        running = {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+        if session.status not in running:
+            raise SessionStatusConflict(
+                f"Only a running session's run can be abandoned this way; this one is "
+                f"{session.status.value}."
+            )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if ABANDONED_SESSION_CHECKPOINT_KEY in (checkpoint or {}):
+            raise SessionStatusConflict("Session was already abandoned.")
+        if any(
+            key in (checkpoint or {})
+            for key in (
+                PENDING_WAKE_CHECKPOINT_KEY,
+                PENDING_USER_INPUT_CHECKPOINT_KEY,
+                pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+            )
+        ):
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session waits on an approval, a question or a wake."
+            )
+        await self._require_no_orphaned_model_work(session.id, unavailable=unavailable)
+        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        claim = await self._recovery_ownership.claim(
+            session=session,
+            inactive_for_seconds=inactive_for_seconds,
+            execution_profile_snapshot=active_invocation_execution_profile_from_checkpoint(
+                checkpoint
+            ),
+            required_run_epoch=session.run_epoch,
+        )
+        if claim is None:
+            raise SessionStatusConflict(
+                "The session's owner is live, another recovery owns the session, or it had "
+                f"activity within the last {inactive_for_seconds} seconds; it was left alone."
+            )
+        failure: BaseException | None = None
+        try:
+            return await self._recovery_ownership.run_with_heartbeat(
+                claim=claim,
+                recovery=lambda: self._abandon_claimed_orphan(
+                    claim,
+                    pending_round=pending_round,
+                    reason=reason,
+                    metadata=metadata,
+                    closed=closed,
+                ),
+            )
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            await self._recovery_ownership.cleanup_claim(
+                authority=claim.require_authority(),
+                authoritative_failure=failure,
+                claim_has_not_dispatched_work=True,
+            )
+
+    async def _require_no_orphaned_model_work(self, session_id: str, *, unavailable: str) -> None:
+        """Refuse a run with model work in flight; that work keeps its own recovery."""
+
+        if await self._session_store.load_active_model_completion_stage(session_id) is not None:
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session's run stopped inside a model call, which "
+                "recovery settles where the environment is registered."
+            )
+        if (
+            await load_pending_provider_operation_disposition(self._session_store, session_id)
+            is not None
+        ):
+            raise SessionStatusConflict(
+                f"{unavailable}, and the session has a provider operation to settle."
+            )
+
+    async def _abandon_claimed_orphan(
+        self,
+        claim: _IncompleteRecoveryClaim,
+        *,
+        pending_round: pending_rounds.PendingToolRound | None,
+        reason: str,
+        metadata: dict[str, Any],
+        closed: dict[str, str] | None,
+    ) -> Session:
+        """Under ``claim``, fail the fenced run as abandoned and publish its evidence."""
+
+        fenced = claim.session
+        # The lost run may have started model work after the first check and before the
+        # fence; now that its epoch is fenced it can start nothing more.
+        await self._require_no_orphaned_model_work(
+            fenced.id,
+            unavailable=(
+                f"The session's environment {fenced.environment_name!r} isn't registered "
+                "in this application"
+            ),
+        )
+        unknown_tool_calls: list[dict[str, str]] = []
+        if pending_round is not None:
+            calls = tuple(call.tool_call_id for call in pending_round.tool_calls)
+            # The calls the lost run had started become unknown, as recovery does.
+            await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+                fenced, tool_round_id=pending_round.tool_round_id, tool_call_ids=calls
+            )
+            unknown_tool_calls = await self._unknown_tool_calls(
+                fenced,
+                pending_round.tool_round_id,
+                [(call.tool_call_id, call.tool_name) for call in pending_round.tool_calls],
+            )
+        closed_record = None
+        if closed is not None:
+            closed_record = dict(closed)
+            if pending_round is not None:
+                closed_record["tool_round_id"] = pending_round.tool_round_id
+
+        def abandon(current_session: Session, checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+            persisted_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+            if (
+                (current_session.instance_id, current_session.run_epoch)
+                != (fenced.instance_id, fenced.run_epoch)
+                or persisted_claim is None
+                or persisted_claim[0] != claim.claim_id
+            ):
+                raise RuntimeError("Session changed before it was abandoned.")
+            if pending_round is not None:
+                copied, durable_round = self._checkpoint_without_pending_tool_round(
+                    current_session, checkpoint, pending_round
+                )
+            else:
+                if pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY in (checkpoint or {}):
+                    raise RuntimeError("Session started a tool round before it was abandoned.")
+                copied, durable_round = copy_durable_record(checkpoint or {}, "checkpoint"), {}
+            if ABANDONED_SESSION_CHECKPOINT_KEY in copied:
+                raise RuntimeError("Session already retains abandonment evidence.")
+            copied[ABANDONED_SESSION_CHECKPOINT_KEY] = abandoned_session_record(
+                reason=reason,
+                metadata=metadata,
+                tool_round=durable_round,
+                unknown_tool_calls=unknown_tool_calls,
+                closed=closed_record,
+            )
+            return copied
+
+        try:
+            abandoned = await self._commit_abandonment(
+                fenced,
+                task_id=None if pending_round is None else pending_round.task_id,
+                from_statuses={SessionStatus.RUNNING, SessionStatus.INTERRUPTING},
+                checkpoint_transform=abandon,
+            )
+        except RuntimeError as exc:
+            raise SessionStatusConflict(str(exc)) from exc
+        await self.terminal_finalization.repair(
+            session=abandoned,
+            terminal_run_epoch=claim.session_before_fence.run_epoch,
+            terminal_timestamp=abandoned.updated_at,
+            previous_status=claim.session_before_fence.status,
+            claim_id=claim.claim_id,
+        )
         return abandoned
 
     async def deny_stranded_approval(

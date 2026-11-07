@@ -887,9 +887,14 @@ true`, the reason and who closed it under `metadata`, and the `approval_id` or
 whose outcome is uncertain stays recorded as unknown and never runs again, and its
 transcript and events are kept. Recovery then releases its environment. Its pending
 or interrupted child sessions are closed with it; a subagent whose parent waits on
-it is refused, so close the parent. A session that is running or interrupting,
-already completed or failed, asleep (interrupt it first, which cancels its wake), or
-has a task or a child session still running is refused. Repeating a close returns
+it is refused, so close the parent. A running session is closed only when the worker
+that ran it is provably gone: its execution lease lapsed or its process died, or every
+task of it finished, as for one a deploy cut off. It closes even where the session's
+environment isn't registered (a per-run environment only that worker registered);
+the calls it was running are listed as unknown and the environment binding stays
+recorded. A session that is running or interrupting with a live owner or one not
+known to be gone, already completed or failed, asleep (interrupt it first, which
+cancels its wake), or has a task or a child session still running is refused. Repeating a close returns
 the closed session, and closes any child sessions a close that stopped part way
 left open, after checking every remaining child can close. Independent forks of a
 closed session are left alone by a repeated close. A retry also traverses children
@@ -902,6 +907,15 @@ window permits immediate recovery. While one of the remaining children is
 running again, the sweep closes none of them and reports `skipped_active` for the
 closed session; interrupt that child and the next sweep, or a repeated close,
 closes the rest.
+
+You often don't have to close such a session yourself. `cayu serve` reconciles,
+every 10 minutes, each running session whose owner is provably gone and that has
+been quiet for an hour (`CayuApp.reconcile_orphaned_sessions`): it is left
+interrupted, with a recovery item in the inbox when a call it was running has an
+unknown outcome, or, where its environment isn't registered, it fails with reason
+`orphaned_session_reconciled`. `ServerLifecycleConfig` sets both times
+(`orphaned_session_reconcile_interval_seconds`, `None` to turn it off, and
+`orphaned_session_inactive_after_seconds`).
 
 With `--application NAME` it goes through the Agent's own Cayu API as you, like the
 reads below, which needs a developer or admin. Without it, it opens the project's

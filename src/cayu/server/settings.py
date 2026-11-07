@@ -46,6 +46,8 @@ from cayu.server.config import (
     DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
     DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
     DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS,
+    DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
+    DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
     DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
     DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     DEFAULT_SERVER_DEPLOYMENT_NAME,
@@ -220,6 +222,10 @@ class ServerLifecycleSettings(BaseModel):
     session_follow_max_streams_per_session: int = DEFAULT_SESSION_FOLLOW_MAX_STREAMS_PER_SESSION
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS
+    orphaned_session_reconcile_interval_seconds: float | None = (
+        DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS
+    )
+    orphaned_session_inactive_after_seconds: int = DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS
     event_side_effect_startup_timeout_seconds: float = (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     )
@@ -753,6 +759,12 @@ class ServerSettings(BaseSettings):
                 ),
                 startup_recovery_statuses=self.lifecycle.startup_recovery_statuses,
                 recovery_inactive_after_seconds=(self.lifecycle.recovery_inactive_after_seconds),
+                orphaned_session_reconcile_interval_seconds=(
+                    self.lifecycle.orphaned_session_reconcile_interval_seconds
+                ),
+                orphaned_session_inactive_after_seconds=(
+                    self.lifecycle.orphaned_session_inactive_after_seconds
+                ),
                 event_side_effect_startup_timeout_seconds=(
                     self.lifecycle.event_side_effect_startup_timeout_seconds
                 ),

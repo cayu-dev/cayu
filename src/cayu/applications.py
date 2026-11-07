@@ -37,6 +37,7 @@ from cayu._application_human_review import HumanReviewEntrances
 from cayu._application_managed_settings import ManagedSettingsEntrances
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
+from cayu._application_session_abandonment import SessionAbandonmentEntrances
 from cayu._application_session_deletion import delete_app_session, export_app_session_closure
 from cayu._application_task_types import ApplicationTaskTypes
 from cayu._application_workflow_entrances import WorkflowEntrances
@@ -52,7 +53,6 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.agents import AgentSpec
-from cayu.approvals.actors import ResolutionActor
 from cayu.approvals.review import (
     HumanReviewPolicy,
 )
@@ -937,7 +937,9 @@ class _ParticipantExecutionSettlementReader(PermitSettlementReader):
 _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
-class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances):
+class CayuApp(
+    WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances, SessionAbandonmentEntrances
+):
     """Application runtime for registered specialists, providers, and session state."""
 
     def __init__(
@@ -7747,112 +7749,6 @@ class CayuApp(WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances)
         if type(request) is not RecoveryExecutionRequest:
             raise TypeError("Recovery execution requires a RecoveryExecutionRequest.")
         return await self._recovery_plan_coordinator.execute_recovery(request)
-
-    @_admitted_entrance
-    @execution_owned_by("recovery")
-    async def recover_abandoned_sessions(
-        self,
-        *,
-        inactive_for_seconds: int = 3600,
-        abandon_sessions_of_terminal_tasks: bool = False,
-    ) -> tuple[IncompleteSessionRecoveryResult, ...]:
-        """Recover running sessions whose process died and that nothing has resumed since.
-
-        A continuation recovers its own session when it takes it over, so this
-        is for conversations an application never returns to: run it at startup
-        or on a schedule. It uses paginated incomplete-session recovery for
-        running and interrupting sessions inactive for ``inactive_for_seconds``,
-        which skips sessions with a live execution owner. Ordinary lost model
-        calls are settled as unknown without redispatch, including their budget
-        reservations; provider operations and contracted tasks keep their own
-        recovery paths. Keep the window longer than the gap after which a
-        conversation's next message would still take
-        its session over, so that message's takeover replays interrupted calls.
-
-        A session stopped on an unknown external tool outcome is left
-        ``interrupted`` with ``pending_tool_effect``. With
-        ``abandon_sessions_of_terminal_tasks``, such a session is abandoned
-        as by :meth:`abandon_session` when it has at least one task and every
-        one of its tasks is terminal, which requires a ``task_store``. The
-        sweep then also revisits interrupted sessions whose tasks finished
-        later, and abandoned sessions whose cleanup did not finish. Every sweep
-        finishes a ``close_session`` that stopped before closing the children.
-        """
-
-        return tuple(
-            [
-                await self._project_incomplete_recovery_result_for_public_api(result)
-                for result in await self._session_abandonment.recover_abandoned(
-                    inactive_for_seconds=inactive_for_seconds,
-                    abandon_sessions_of_terminal_tasks=abandon_sessions_of_terminal_tasks,
-                )
-            ]
-        )
-
-    @_admitted_entrance
-    @execution_owned_by("recovery")
-    async def abandon_session(
-        self,
-        session_id: str,
-        *,
-        reason: str = "session_abandoned",
-        metadata: dict[str, Any] | None = None,
-        inactive_for_seconds: int = 0,
-    ) -> IncompleteSessionRecoveryResult:
-        """End a session stopped on an unknown tool outcome and release its environment.
-
-        Use this when the application will never continue the session, for
-        example after cancelling its work across a restart. The session may be
-        ``interrupted`` with ``pending_tool_effect`` or not yet recovered after
-        its process died. Each unknown external effect keeps its
-        ``outcome_unknown`` record and is never dispatched again; the pending
-        round is retained as evidence but leaves resumable work. The session
-        then fails with a ``session.failed`` event whose payload has
-        ``error_type: "SessionAbandoned"`` and lists the unknown calls, and
-        recovery finalizes its environment binding through the factory. No
-        model call is made.
-
-        The result reports ``abandoned_tool_effect`` on success. A session
-        with no unknown tool outcome is recovered normally and left as it
-        was. Refuses while any task of the session is not terminal, and skips a
-        session with a live execution owner or activity within
-        ``inactive_for_seconds``. Repeating the call after an interruption
-        finishes the cleanup. An abandoned session can no longer be resumed;
-        fork it to continue its conversation.
-        """
-
-        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
-            raise ValueError("inactive_for_seconds must be a non-negative integer.")
-        result = await self._session_abandonment.abandon(
-            await self._resolve_public_session_id(session_id),
-            reason=reason,
-            metadata={} if metadata is None else metadata,
-            inactive_for_seconds=inactive_for_seconds,
-        )
-        return await self._project_incomplete_recovery_result_for_public_api(result)
-
-    @_admitted_entrance
-    @execution_owned_by("recovery")
-    async def close_session(
-        self,
-        session_id: str,
-        *,
-        reason: str,
-        closed_by: ResolutionActor | None = None,
-        waiting_on: str | None = None,
-    ) -> IncompleteSessionRecoveryResult:
-        """End a pending or interrupted session nobody will continue, keeping its history.
-
-        ``waiting_on`` is an approval or input ID the session must still wait on.
-        ``docs/runtime-contracts.md`` says what it records, closes and refuses.
-        """
-        result = await self._session_abandonment.close(
-            await self._resolve_public_session_id(session_id),
-            reason=reason,
-            closed_by=closed_by,
-            waiting_on=waiting_on,
-        )
-        return await self._project_incomplete_recovery_result_for_public_api(result)
 
     @_admitted_entrance
     @execution_owned_by("recovery")

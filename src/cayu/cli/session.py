@@ -434,14 +434,17 @@ def add_session_parser(subparsers: Any) -> None:
 
     close_parser = commands.add_parser(
         "close",
-        help="End a session that is not running and won't continue.",
+        help="End a session nobody will continue, or one a lost worker left running.",
         description=(
             "Close a pending or interrupted session nobody will continue, such as one "
-            "waiting on a question or an approval it can no longer resume from. The "
-            "session fails with your reason and name recorded on its session.failed event, "
-            "its pending approval or question leaves the inbox, and its transcript and "
-            "events are kept. A session that is running, already ended, or has unfinished "
-            "tasks or child sessions is refused. With --application NAME it closes a Cayu "
+            "waiting on a question or an approval it can no longer resume from, or a "
+            "running session whose worker is provably gone (its execution lease lapsed, "
+            "its process died, or every task of it finished), such as one a deploy cut "
+            "off. The session fails with your reason and name recorded on its "
+            "session.failed event, its pending approval or question leaves the inbox, and "
+            "its transcript and events are kept. A running session whose owner is live or "
+            "not known to be gone, one already ended, or one with unfinished tasks or "
+            "child sessions is refused. With --application NAME it closes a Cayu "
             "Cloud Agent's session through the Agent's API (developer or admin). Without it, "
             "it opens the project's application in this process, as `cayu inbox` does, "
             "because closing settles the session's environment through that application; "

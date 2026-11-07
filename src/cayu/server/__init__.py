@@ -50,6 +50,7 @@ from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
 from cayu.sessions.event_delivery import safe_error
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
+    IncompleteSessionRecoveryAction,
     RecoveryBlockerCode,
     RecoveryExecutionRequest,
     RecoveryPlan,
@@ -421,6 +422,7 @@ def create_server(
         attention_repair_task: asyncio.Task[None] | None = None
         event_watcher_task: asyncio.Task[None] | None = None
         storage_growth_task: asyncio.Task[None] | None = None
+        orphan_reconciliation_task: asyncio.Task[None] | None = None
         try:
             # aclose() owns stopping them, within the shutdown deadline.
             await app.start_model_policy()
@@ -438,12 +440,14 @@ def create_server(
             attention_repair_task = _start_human_attention_repair(app)
             event_watcher_task = _start_registered_event_watchers(app)
             storage_growth_task = _start_storage_growth_report(app)
+            orphan_reconciliation_task = _start_orphaned_session_reconciliation(app, lifecycle)
             yield
         finally:
             try:
                 try:
                     # Stop the server's own loops before the app seals, so
                     # neither starts new work against a closing application.
+                    await _cancel_background_task(orphan_reconciliation_task)
                     await _cancel_background_task(event_watcher_task)
                     await _cancel_background_task(storage_growth_task)
                     await _cancel_background_task(incomplete_session_recovery_task)
@@ -1506,6 +1510,48 @@ def _start_storage_growth_report(app: CayuApp) -> asyncio.Task[None] | None:
             logger.debug("Session store growth inspection failed.", exc_info=True)
 
     return asyncio.create_task(report(), name="cayu-storage-growth-report")
+
+
+async def _reconcile_orphaned_sessions_forever(
+    app: CayuApp, *, interval_seconds: float, inactive_for_seconds: int
+) -> None:
+    """End, on a schedule, the runs a lost worker left holding sessions running."""
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            results = await app.reconcile_orphaned_sessions(
+                inactive_for_seconds=inactive_for_seconds
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Orphaned-session reconciliation failed; it retries next interval.")
+            continue
+        if results:
+            logger.info(
+                "Reconciled %d orphaned running session(s); %d could not be reconciled.",
+                sum(IncompleteSessionRecoveryAction.FAILED not in r.actions for r in results),
+                sum(IncompleteSessionRecoveryAction.FAILED in r.actions for r in results),
+            )
+
+
+def _start_orphaned_session_reconciliation(
+    app: CayuApp, lifecycle: ServerLifecycleConfig
+) -> asyncio.Task[None] | None:
+    """Run ``CayuApp.reconcile_orphaned_sessions`` every configured interval, if any."""
+
+    interval = lifecycle.orphaned_session_reconcile_interval_seconds
+    if interval is None:
+        return None
+    return asyncio.create_task(
+        _reconcile_orphaned_sessions_forever(
+            app,
+            interval_seconds=interval,
+            inactive_for_seconds=lifecycle.orphaned_session_inactive_after_seconds,
+        ),
+        name="cayu-orphaned-session-reconciliation",
+    )
 
 
 def _start_human_attention_repair(app: CayuApp) -> asyncio.Task[None] | None:

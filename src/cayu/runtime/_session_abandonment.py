@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid5
 
@@ -33,6 +33,10 @@ from cayu.sessions._pending_approval_reader import pending_approval_from_checkpo
 from cayu.sessions._pending_tool_round_reader import pending_tool_round_from_checkpoint
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+)
 from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
@@ -57,6 +61,9 @@ if TYPE_CHECKING:
 # The abandonment reason a session closed by a person fails with; the person and
 # their reason are its metadata.
 SESSION_CLOSED_REASON = "session_closed"
+# The abandonment reason a running session whose owner was provably gone fails with
+# when its environment isn't registered where it was reconciled.
+ORPHANED_SESSION_RECONCILED_REASON = "orphaned_session_reconciled"
 STRANDED_APPROVAL_DENIAL_REASON = "tool_approval_denied_after_profile_change"
 # The session's execution deadline passed while its approval waited, so the
 # denied round could not continue either.
@@ -279,6 +286,9 @@ def _abandonable_tool_round(
 logger = logging.getLogger(__name__)
 # A child in one of these statuses still runs, so its parent can't be closed.
 _CLOSE_BLOCKING_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
+# How far back, before its inactivity window, the reconciliation sweep looks for an
+# abandonment that failed a session but stopped before publishing its evidence.
+_UNFINISHED_ABANDONMENT_LOOKBACK = timedelta(days=7)
 _OPEN_STATUSES = (SessionStatus.PENDING, SessionStatus.INTERRUPTED)
 
 
@@ -501,6 +511,92 @@ class SessionAbandonment:
             ),
         )
 
+    async def owner_gone(self, session: Session) -> bool:
+        """Whether the run holding a running session has provably ended.
+
+        It has when the store attests its owner is gone (the execution lease lapsed
+        or the owner's process died), or, for a store or run without such an owner,
+        when the session has tasks and every one of them is terminal. A live owner,
+        or the session running in this process, keeps it.
+        """
+
+        owner = await self._incomplete_recovery.execution_owner(session)
+        if owner == "lost":
+            return True
+        if owner == "live":
+            return False
+        return await self.tasks_are_terminal(session.id, require_task=True)
+
+    async def _abandon_orphan_without_environment(
+        self,
+        session: Session,
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+        inactive_for_seconds: int,
+        closed: dict[str, str] | None,
+    ) -> IncompleteSessionRecoveryResult:
+        """Fail a running session whose owner is gone, where its environment isn't.
+
+        ``session`` is the session as read before ordinary recovery, which refused a
+        live owner or active work in this process before it needed the environment.
+        The caller has proved its owner gone (``owner_gone``) and checked its agent is
+        registered. Child sessions other than forks that haven't ended, and a subagent
+        whose parent waits on it, are refused; see
+        ``IncompleteSessionRecovery.abandon_orphaned_without_environment`` for the rest.
+        """
+
+        if any(
+            child.invocation.source is not SessionExecutionSource.FORK
+            for child in await self._open_children(session.id)
+        ):
+            raise SessionStatusConflict(
+                f"The session's environment {session.environment_name!r} isn't registered "
+                "in this application, and the session has child sessions that haven't "
+                "ended; end them first."
+            )
+        if await self._foreground_parent_waits(session):
+            raise SessionStatusConflict(
+                "This subagent's parent session waits on it; end the parent session instead."
+            )
+        abandoned = await self._incomplete_recovery.abandon_orphaned_without_environment(
+            session,
+            reason=reason,
+            metadata=metadata,
+            inactive_for_seconds=inactive_for_seconds,
+            closed=closed,
+        )
+        # No recovery owner reconstructed the run, so nothing closed its interaction.
+        await self._session_recovery.settle_released_open_interaction(session.id)
+        record = abandoned_session_from_checkpoint(
+            await self._session_store.load_checkpoint(session.id)
+        )
+        unknown = [] if record is None else record["unknown_tool_calls"]
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=session.status,
+            status=abandoned.status,
+            actions=(
+                IncompleteSessionRecoveryAction.CLOSED
+                if closed is not None
+                else IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT
+                if unknown
+                else IncompleteSessionRecoveryAction.ABANDONED_ORPHANED_RUN,
+            ),
+            message=(
+                ("Closed" if closed is not None else "Failed")
+                + " the session its lost worker left running; it can no longer continue."
+                + (
+                    f" {len(unknown)} tool call(s) it was running have unknown outcomes and "
+                    "were not dispatched again."
+                    if unknown
+                    else ""
+                )
+                + f" Its environment {session.environment_name!r} isn't registered in this "
+                "application, so its binding is left to be released where it is."
+            ),
+        )
+
     async def close(
         self,
         session_id: str,
@@ -561,22 +657,47 @@ class SessionAbandonment:
         )
         passes: list[IncompleteSessionRecoveryResult] = []
         if session.status in {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}:
-            # Only a session whose process died can be closed; recovery takes it
-            # over (skipping a live owner) and leaves it interrupted. A session that
+            # Only a session whose owner is provably gone can be closed; recovery takes
+            # it over (skipping a live owner) and leaves it interrupted. A session that
             # is already pending or interrupted is closed as it is: its continuation
             # may be refused (for example after its execution profile changed), and
             # closing never continues it.
-            passes.append(
-                await self._session_recovery.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=session_id,
-                        inactive_for_seconds=0,
-                        reason=SESSION_CLOSED_REASON,
-                        metadata=metadata,
-                    ),
-                    abandon_unknown_tool_effects=True,
+            if not await self.owner_gone(session):
+                raise SessionStatusConflict(
+                    f"Session is {session.status.value}, and nothing shows its owner is gone "
+                    "(a lapsed execution lease, a process that died, or a finished task); "
+                    "interrupt it first, then close it."
                 )
-            )
+            try:
+                passes.append(
+                    await self._session_recovery.recover_incomplete_session(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=session_id,
+                            inactive_for_seconds=0,
+                            reason=SESSION_CLOSED_REASON,
+                            metadata=metadata,
+                        ),
+                        abandon_unknown_tool_effects=True,
+                    )
+                )
+            except KeyError:
+                # Recovery reconnects the session's environment, which a per-run one
+                # (registered only by the worker that ran it) never is here. Closing
+                # continues nothing and needs no environment.
+                if not await self._environment_unregistered(session_id):
+                    raise
+                if waiting_on is not None:
+                    # A running session waits on no approval or question.
+                    raise SessionStatusConflict(
+                        "Session no longer waits on that approval or question."
+                    ) from None
+                return await self._abandon_orphan_without_environment(
+                    session,
+                    reason=SESSION_CLOSED_REASON,
+                    metadata=metadata,
+                    inactive_for_seconds=0,
+                    closed={},
+                )
         if not passes or (
             IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT not in passes[-1].actions
         ):
@@ -817,16 +938,36 @@ class SessionAbandonment:
             is None
         ):
             raise SessionStatusConflict("Closed session changed before its cleanup.")
-        passes.append(
-            await self._session_recovery.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(
-                    session_id=session.id,
-                    inactive_for_seconds=0,
-                    reason=SESSION_CLOSED_REASON,
-                    metadata=metadata,
+        try:
+            passes.append(
+                await self._session_recovery.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session.id,
+                        inactive_for_seconds=0,
+                        reason=SESSION_CLOSED_REASON,
+                        metadata=metadata,
+                    )
                 )
             )
-        )
+        except KeyError:
+            # Recovery repairs missing terminal evidence without the environment, so
+            # what remains needs it: releasing the binding or an allocation the run
+            # started, which happens where the environment is registered.
+            if not await self._environment_unregistered(session.id):
+                raise
+            passes.append(
+                _unresumed_close(
+                    session.id,
+                    IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,
+                    "The session is closed. Its environment "
+                    f"{session.environment_name!r} isn't registered in this application, "
+                    "so its binding is left to be released where it is.",
+                )
+            )
+        if await self._environment_unregistered(session.id):
+            # No recovery owner reconstructed the run, so nothing closed its
+            # interaction; one an abandonment that stopped part way left open is too.
+            await self._session_recovery.settle_released_open_interaction(session.id)
         return _merged_recovery_results(passes)
 
     async def recover_abandoned(
@@ -868,6 +1009,191 @@ class SessionAbandonment:
             if page.next_cursor == cursor:
                 raise RuntimeError("Abandoned-session recovery returned a repeated cursor.")
             cursor = page.next_cursor
+
+    async def reconcile_orphaned(
+        self, *, inactive_for_seconds: int
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Run ``CayuApp.reconcile_orphaned_sessions``' sweep, unprojected.
+
+        Each running or interrupting session inactive for ``inactive_for_seconds``
+        whose owner is provably gone (``owner_gone``) and whose tasks are all terminal
+        is recovered as ``recover_abandoned_sessions`` would: interrupted, with
+        ``pending_tool_effect`` when a tool call it was running has an unknown outcome.
+        Where its environment isn't registered, so recovery can't take it over, it
+        fails as abandoned instead (``abandon_orphaned_without_environment``). Any
+        other session is left alone and not reported. It then finishes abandonments
+        that failed a session but stopped before its terminal evidence
+        (``_finish_unfinished_abandonments``). One session's failure is reported, not
+        raised, so it can't hold up the rest.
+        """
+
+        if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
+            raise ValueError("inactive_for_seconds must be a non-negative integer.")
+        results: list[IncompleteSessionRecoveryResult] = []
+        for status in (SessionStatus.RUNNING, SessionStatus.INTERRUPTING):
+            cursor: str | None = None
+            while True:
+                page = await self._session_store.list_sessions(
+                    SessionQuery(
+                        status=status,
+                        inactive_for_seconds=inactive_for_seconds,
+                        order_by=SessionOrder.CREATED_AT_ASC,
+                        limit=1000,
+                        cursor=cursor,
+                    )
+                )
+                for session in page.sessions:
+                    result = await self._reconcile_orphaned_isolated(
+                        session, inactive_for_seconds=inactive_for_seconds
+                    )
+                    if result is not None:
+                        results.append(result)
+                if page.next_cursor is None or page.next_cursor == cursor:
+                    break
+                cursor = page.next_cursor
+        results.extend(await self._finish_unfinished_abandonments(inactive_for_seconds))
+        return results
+
+    async def _finish_unfinished_abandonments(
+        self, inactive_for_seconds: int
+    ) -> list[IncompleteSessionRecoveryResult]:
+        """Finish abandonments that failed a session but stopped before its evidence.
+
+        An abandonment commits ``failed`` before it publishes ``session.failed`` and
+        settles the run's interaction, so a process that died in between, or a
+        publication that failed, leaves a failed session no running-session sweep
+        selects again. This revisits failed sessions that ended within
+        ``_UNFINISHED_ABANDONMENT_LOOKBACK`` before the inactivity window, newest
+        first, and finishes each abandoned one still missing that evidence.
+        """
+
+        results: list[IncompleteSessionRecoveryResult] = []
+        cutoff = datetime.now(UTC) - timedelta(seconds=inactive_for_seconds)
+        cutoff -= _UNFINISHED_ABANDONMENT_LOOKBACK
+        cursor: str | None = None
+        while True:
+            page = await self._session_store.list_sessions(
+                SessionQuery(
+                    status=SessionStatus.FAILED,
+                    inactive_for_seconds=inactive_for_seconds,
+                    order_by=SessionOrder.UPDATED_AT_DESC,
+                    limit=1000,
+                    cursor=cursor,
+                )
+            )
+            for session in page.sessions:
+                if session.updated_at < cutoff:
+                    return results
+                try:
+                    record = await self._unfinished_abandonment(session)
+                    if record is None:
+                        continue
+                    results.append(
+                        await self._finish(session, metadata=record["metadata"], passes=[])
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Finishing the abandonment of session %s failed: error_type=%s",
+                        session.id,
+                        type(exc).__name__,
+                    )
+                    results.append(
+                        _unresumed_close(
+                            session.id,
+                            IncompleteSessionRecoveryAction.FAILED,
+                            f"Finishing the session's abandonment failed: {type(exc).__name__}.",
+                        )
+                    )
+            if page.next_cursor is None or page.next_cursor == cursor:
+                return results
+            cursor = page.next_cursor
+
+    async def _unfinished_abandonment(self, session: Session) -> dict[str, Any] | None:
+        """The abandonment record of a failed session still missing its evidence, if any."""
+
+        record = abandoned_session_from_checkpoint(
+            await self._session_store.load_checkpoint(session.id)
+        )
+        if record is None:
+            return None
+        [failure] = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_type=EventType.SESSION_FAILED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        ) or [None]
+        if failure is None or failure.event.payload.get("error_type") != "SessionAbandoned":
+            return record
+        [latest] = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=INTERACTION_LIFECYCLE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        ) or [None]
+        if latest is not None and latest.event.type not in INTERACTION_TERMINAL_EVENT_TYPES:
+            return record
+        return None
+
+    async def _reconcile_orphaned_isolated(
+        self, session: Session, *, inactive_for_seconds: int
+    ) -> IncompleteSessionRecoveryResult | None:
+        try:
+            if (
+                session.runtime_name == "external_agent"
+                or not self._agent_registered(session.agent_name)
+                or not await self.owner_gone(session)
+                or not await self.tasks_are_terminal(session.id)
+            ):
+                return None
+            try:
+                return await self._session_recovery.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(
+                        session_id=session.id,
+                        inactive_for_seconds=inactive_for_seconds,
+                        reason=ORPHANED_SESSION_RECONCILED_REASON,
+                    ),
+                    recover_abandoned_models=True,
+                )
+            except KeyError:
+                if not await self._environment_unregistered(session.id):
+                    raise
+                return await self._abandon_orphan_without_environment(
+                    session,
+                    reason=ORPHANED_SESSION_RECONCILED_REASON,
+                    metadata={},
+                    inactive_for_seconds=inactive_for_seconds,
+                    closed=None,
+                )
+        except Exception as exc:
+            # A refusal (the session moved on, or holds work this path leaves to its
+            # own recovery) is expected; anything else is worth a warning.
+            refused = isinstance(exc, SessionStatusConflict)
+            logger.log(
+                logging.INFO if refused else logging.WARNING,
+                "Orphaned-session reconciliation %s session %s: error_type=%s",
+                "left" if refused else "failed for",
+                session.id,
+                type(exc).__name__,
+            )
+            try:
+                current = await self._session_store.load(session.id)
+            except Exception:
+                current = None
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=session.status,
+                status=session.status if current is None else current.status,
+                actions=(IncompleteSessionRecoveryAction.FAILED,),
+                message=(
+                    f"Orphaned-session reconciliation refused: {exc}"
+                    if refused
+                    else f"Orphaned-session reconciliation failed: {type(exc).__name__}."
+                ),
+            )
 
     async def resume_stopped_closes(
         self, *, inactive_for_seconds: int
@@ -1129,7 +1455,11 @@ class SessionAbandonment:
             assert checkpoint is not None
             if PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY in checkpoint:
                 return True
-            if checkpoint.get("environment_factory_reconnect"):
+            if checkpoint.get("environment_factory_reconnect") and not (
+                await self._environment_unregistered(session.id)
+            ):
+                # Where the environment isn't registered, nothing here can release the
+                # binding; recovery where it is does.
                 active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
                 if active_profile is not None and (
                     await self._environment_lifecycle.prepare_terminal_binding_finalization(
