@@ -67,6 +67,8 @@ from cayu.tools.display import ToolDisplay
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.base import (
     Workspace,
+    WorkspaceFileReadOutcome,
+    WorkspaceFileReadRequest,
     WorkspaceLineRead,
     WorkspaceLineReader,
     WorkspaceLineSpan,
@@ -619,9 +621,17 @@ async def _read_workspace_bytes(
     *,
     offset: int = 0,
     max_bytes: int,
-    prefetched: WorkspaceReadResult | None = None,
+    prefetched: WorkspaceReadResult | Exception | None = None,
 ) -> tuple[WorkspaceReadResult, int]:
     read_limit = _bounded_workspace_read_limit(workspace, max_bytes)
+    if isinstance(prefetched, Exception):
+        # A batch read already failed this file as its own read would have.
+        # An offset error belongs to the offset it was read at.
+        if not isinstance(prefetched, WorkspaceReadOffsetError) or prefetched.offset == offset:
+            if isinstance(prefetched, FileNotFoundError):
+                raise _WorkspaceFileNotFoundError from prefetched
+            raise prefetched
+        prefetched = None
     result = _page_from_prefetched(prefetched, offset=offset, max_bytes=read_limit)
     if result is not None:
         return result, read_limit
@@ -743,7 +753,7 @@ async def _read_workspace_text(
     options: ReadFileOptions,
     preserve_line_breaks: bool = False,
     page_bytes: int | None = None,
-    prefetched: WorkspaceReadResult | None = None,
+    prefetched: WorkspaceReadResult | Exception | None = None,
 ) -> _WorkspaceText | ToolResult:
     """Read one page of text; ``page_bytes`` caps the raw page below ``options.max_bytes``.
 
@@ -754,14 +764,9 @@ async def _read_workspace_text(
         page_bytes = options.max_bytes
 
     async def read_window(redactor):
-        if redactor.has_values:
-            redaction_overlap = redactor.pagination_overlap_utf8_bytes
-            fetch_offset = max(0, offset - redaction_overlap - 3)
-            trailing_window_bytes = redaction_overlap + 4
-        else:
-            redaction_overlap = 0
-            fetch_offset = offset
-            trailing_window_bytes = 0
+        redaction_overlap, fetch_offset, trailing_window_bytes = _text_read_margins(
+            redactor, offset
+        )
         prefix_bytes = offset - fetch_offset
         requested_read_limit = prefix_bytes + page_bytes + trailing_window_bytes
         result, effective_read_limit = await _read_workspace_bytes(
@@ -950,6 +955,15 @@ async def _read_workspace_text(
     )
 
 
+def _text_read_margins(redactor: SecretRedactor, offset: int) -> tuple[int, int, int]:
+    """A text page's redaction overlap, where its read starts, and the bytes read past it."""
+
+    if not redactor.has_values:
+        return 0, offset, 0
+    overlap = redactor.pagination_overlap_utf8_bytes
+    return overlap, max(0, offset - overlap - 3), overlap + 4
+
+
 async def _read_workspace_lines(
     ctx: ToolContext,
     workspace: Workspace,
@@ -959,6 +973,7 @@ async def _read_workspace_lines(
     line_range: _LineRange,
     options: ReadFileOptions,
     line_cut_hint: str = _LINE_CUT_RETRY_HINT,
+    prefetched: WorkspaceLineRead | Exception | None = None,
 ) -> _WorkspaceText | ToolResult:
     """Select whole lines from the redacted text of a file.
 
@@ -968,6 +983,7 @@ async def _read_workspace_lines(
     that shrinks below the range fails. Other edits between the steps can
     shift the window, as they can between byte pages. A workspace with a line
     reader locates the range and reads it, and the file's head, in one call.
+    A ``prefetched`` line read, from a batch read, stands in for that call.
     """
 
     start = line_range.start
@@ -975,7 +991,12 @@ async def _read_workspace_lines(
     reader = workspace.line_reader()
     line_read: WorkspaceLineRead | None = None
     try:
-        if reader is None:
+        if isinstance(prefetched, Exception):
+            raise prefetched
+        if prefetched is not None:
+            line_read = prefetched
+            span = line_read.span
+        elif reader is None:
             span = await locate_workspace_lines(
                 workspace, path, start_line=start, end_line=line_range.end
             )
@@ -1130,23 +1151,35 @@ async def _read_lines_at_once(
     goes back to the workspace.
     """
 
-    if redactor.has_values:
-        margin = redactor.pagination_overlap_utf8_bytes
-        before_bytes, page_bytes, after_bytes = margin + 3, MAX_READ_LIMIT_BYTES, 2 * (margin + 4)
-    else:
-        before_bytes, page_bytes, after_bytes = 0, options.max_bytes, 0
     line_read = await reader.read_lines(
         path,
         start_line=line_range.start,
         end_line=line_range.end,
-        before_bytes=before_bytes,
-        after_bytes=after_bytes,
-        max_bytes=_bounded_workspace_read_limit(workspace, before_bytes + page_bytes + after_bytes),
-        head_bytes=_bounded_workspace_read_limit(workspace, _BINARY_SNIFF_BYTES),
+        **_line_read_arguments(workspace, redactor, options.max_bytes),
     )
     if type(line_read) is not WorkspaceLineRead:
         raise TypeError(f"{type(workspace).__name__} line reader must return a WorkspaceLineRead.")
     return line_read
+
+
+def _line_read_arguments(
+    workspace: Workspace, redactor: SecretRedactor, max_bytes: int
+) -> dict[str, int]:
+    """The byte bounds a line read asks for: around its range, in all, and of the head."""
+
+    if redactor.has_values:
+        margin = redactor.pagination_overlap_utf8_bytes
+        before_bytes, page_bytes, after_bytes = margin + 3, MAX_READ_LIMIT_BYTES, 2 * (margin + 4)
+    else:
+        before_bytes, page_bytes, after_bytes = 0, max_bytes, 0
+    return {
+        "before_bytes": before_bytes,
+        "after_bytes": after_bytes,
+        "max_bytes": _bounded_workspace_read_limit(
+            workspace, before_bytes + page_bytes + after_bytes
+        ),
+        "head_bytes": _bounded_workspace_read_limit(workspace, _BINARY_SNIFF_BYTES),
+    }
 
 
 def _workspace_file_changed_result(path: str) -> ToolResult:
@@ -1244,10 +1277,13 @@ async def _read_workspace_files(
     remaining = max_bytes
     sections: list[str] = []
     files: list[dict] = []
+    prefetched = await _prefetch_workspace_entries(ctx, workspace, entries, max_bytes=max_bytes)
     for index, entry in enumerate(entries):
         # Each file may use an equal share of what earlier files left unused.
         budget = -(-remaining // (len(entries) - index))
-        read = await _read_workspace_entry(ctx, workspace, entry, max_bytes=budget)
+        read = await _read_workspace_entry(
+            ctx, workspace, entry, max_bytes=budget, prefetched=prefetched[index]
+        )
         if isinstance(read, _WorkspaceText):
             remaining -= len(read.text.encode("utf-8"))
             files.append(read.structured)
@@ -1279,12 +1315,81 @@ async def _read_workspace_files(
     )
 
 
+async def _prefetch_workspace_entries(
+    ctx: ToolContext,
+    workspace: Workspace,
+    entries: tuple[_ReadFileEntry, ...],
+    *,
+    max_bytes: int,
+) -> tuple[WorkspaceFileReadOutcome, ...]:
+    """Read every file of a batch in one workspace call, when the workspace can.
+
+    No file can take more than the whole ``max_bytes``, so each is asked for
+    what its own read would ask with that budget. A file's reads then cut
+    their pages from its outcome, or read again where it falls short, so the
+    results are the same as reading one file at a time. ``None`` marks a file
+    left to its own read.
+    """
+
+    outcomes: list[WorkspaceFileReadOutcome] = [None] * len(entries)
+    reader = workspace.file_batch_reader()
+    if reader is None:
+        return tuple(outcomes)
+    redactor = active_secret_redactor_snapshot(ctx).redactor
+    requests: list[tuple[int, WorkspaceFileReadRequest]] = []
+    for index, entry in enumerate(entries):
+        if entry.path_error is not None or _is_workspace_file_attachment_content_type(
+            _guess_workspace_content_type(entry.path)
+        ):
+            continue
+        requests.append((index, _batch_read_request(workspace, entry, max_bytes, redactor)))
+    if len(requests) < 2:
+        return tuple(outcomes)
+    try:
+        read = tuple(await reader.read_files([request for _, request in requests]))
+    except Exception:
+        # Each file's own read reports whatever failed here.
+        return tuple(outcomes)
+    if len(read) != len(requests):
+        return tuple(outcomes)
+    for (index, request), outcome in zip(requests, read, strict=True):
+        expected = WorkspaceLineRead if request.reads_lines else WorkspaceReadResult
+        if outcome is None or isinstance(outcome, Exception) or type(outcome) is expected:
+            outcomes[index] = outcome
+    return tuple(outcomes)
+
+
+def _batch_read_request(
+    workspace: Workspace,
+    entry: _ReadFileEntry,
+    max_bytes: int,
+    redactor: SecretRedactor,
+) -> WorkspaceFileReadRequest:
+    """What ``_read_workspace_text`` or ``_read_lines_at_once`` asks for with a ``max_bytes`` budget."""
+
+    if entry.line_range is None:
+        _, fetch_offset, trailing = _text_read_margins(redactor, entry.offset)
+        limit = (entry.offset - fetch_offset) + max_bytes + trailing
+        return WorkspaceFileReadRequest(
+            path=entry.path,
+            offset=fetch_offset,
+            max_bytes=_bounded_workspace_read_limit(workspace, limit),
+        )
+    return WorkspaceFileReadRequest(
+        path=entry.path,
+        start_line=entry.line_range.start,
+        end_line=entry.line_range.end,
+        **_line_read_arguments(workspace, redactor, max_bytes),
+    )
+
+
 async def _read_workspace_entry(
     ctx: ToolContext,
     workspace: Workspace,
     entry: _ReadFileEntry,
     *,
     max_bytes: int,
+    prefetched: WorkspaceFileReadOutcome = None,
 ) -> _WorkspaceText | ToolResult:
     if entry.path_error is not None:
         return invalid_tool_arguments_result(ValueError(entry.path_error))
@@ -1309,6 +1414,7 @@ async def _read_workspace_entry(
         offset=entry.offset,
         line_range=entry.line_range,
         options=ReadFileOptions(max_bytes=max_bytes),
+        prefetched=prefetched,
     )
 
 
@@ -1322,6 +1428,7 @@ async def _read_workspace_window(
     line_range: _LineRange | None,
     options: ReadFileOptions,
     line_cut_hint: str = _LINE_CUT_RETRY_HINT,
+    prefetched: WorkspaceFileReadOutcome = None,
 ) -> _WorkspaceText | ToolResult:
     if line_range is None:
         return await _read_workspace_text(
@@ -1331,6 +1438,7 @@ async def _read_workspace_window(
             content_type=content_type,
             offset=offset,
             options=options,
+            prefetched=None if isinstance(prefetched, WorkspaceLineRead) else prefetched,
         )
     return await _read_workspace_lines(
         ctx,
@@ -1340,6 +1448,7 @@ async def _read_workspace_window(
         line_range=line_range,
         options=options,
         line_cut_hint=line_cut_hint,
+        prefetched=None if isinstance(prefetched, WorkspaceReadResult) else prefetched,
     )
 
 

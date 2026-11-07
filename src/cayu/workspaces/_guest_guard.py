@@ -42,11 +42,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, cast
+from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
+    WorkspaceFileReadOutcome,
+    WorkspaceFileReadRequest,
     WorkspaceGitMode,
     WorkspaceLineRead,
     WorkspaceLineSpan,
@@ -927,32 +929,32 @@ def apply_text_edits(text, edits, max_bytes):
     return "".join(parts)
 
 
+def read_located_lines(leaf_fd, start_line, end_line, before, after, limit, head_limit):
+    total, start, end, lines = locate_lines(leaf_fd, start_line, end_line)
+    # Reads stop at the size the scan saw, so all three agree.
+    offset = start - min(start, before)
+    window = read_range(leaf_fd, offset, min(limit, min(total, end + after) - offset))
+    reads = [(offset, window)]
+    if head_limit and start:
+        reads.append((0, read_range(leaf_fd, 0, min(head_limit, total))))
+    metadata = {
+        "span": [start, end, total, lines],
+        "reads": [[at, read_identity(leaf_fd, at, content, total)] for at, content in reads],
+    }
+    return metadata, [content for _, content in reads]
+
+
 def read_lines_mode(leaf_name, parent_fd):
-    start_line, end_line, before, after, limit, head_limit = (
-        int(value) for value in sys.argv[4:10]
-    )
     leaf_fd, _ = open_guarded_regular(leaf_name, parent_fd)
     try:
-        total, start, end, lines = locate_lines(leaf_fd, start_line, end_line)
-        # Reads stop at the size the scan saw, so all three agree.
-        offset = start - min(start, before)
-        window = read_range(leaf_fd, offset, min(limit, min(total, end + after) - offset))
-        reads = [(offset, window)]
-        if head_limit and start:
-            reads.append((0, read_range(leaf_fd, 0, min(head_limit, total))))
-        identities = [read_identity(leaf_fd, at, content, total) for at, content in reads]
+        metadata, contents = read_located_lines(
+            leaf_fd, *(int(value) for value in sys.argv[4:10])
+        )
     finally:
         os.close(leaf_fd)
     print("ok")
-    print(
-        json.dumps(
-            {
-                "span": [start, end, total, lines],
-                "reads": [[at, identity] for (at, _), identity in zip(reads, identities)],
-            }
-        )
-    )
-    for _, content in reads:
+    print(json.dumps(metadata))
+    for content in contents:
         print(base64.b64encode(content).decode("ascii"))
 
 
@@ -1015,18 +1017,126 @@ def combined_main():
 """
 
 
+# "read-files" reads several files in one command, each under its own path
+# lock and with main()'s containment, as "read" or "read-lines" would read it
+# alone. The requests come as JSON on stdin. When their bytes could exceed the
+# output the runner returns ("total"), a first pass sizes each file and the
+# total is shared out, smallest first, so a large file can't starve the rest;
+# a file given less than it asked for comes back as a shorter read. The answer
+# is "ok", one JSON line with an outcome per request, then each read's bytes as
+# one base64 line. An outcome's "s" is "ok", a guard status, or "error" with
+# the OSError's text.
+GUEST_READ_FILES_SOURCE = r"""
+def share_out(wants, total):
+    shares = list(wants)
+    order = sorted(range(len(wants)), key=lambda index: wants[index])
+    for done, index in enumerate(order):
+        shares[index] = min(wants[index], total // (len(order) - done))
+        total -= shares[index]
+    return shares
+
+
+def under_path_lock(root_fd, rel_path, action):
+    try:
+        with workspace_path_lock(root_fd, rel_path):
+            parent_fd, leaf_name = open_guarded_parent(root_fd, guarded_parts(rel_path), False)
+            try:
+                leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
+            finally:
+                os.close(parent_fd)
+            try:
+                return action(leaf_fd, info)
+            finally:
+                os.close(leaf_fd)
+    except GuardPathError as exc:
+        return {"s": exc.status}, []
+    except OSError as exc:
+        return {"s": "error", "detail": str(exc)[:300]}, []
+
+
+def file_want(request, info):
+    if request[0] == "bytes":
+        return max(0, min(request[3], info.st_size - request[2]))
+    return min(request[6], info.st_size) + min(request[7], info.st_size)
+
+
+def read_request(request, share, leaf_fd, info):
+    if request[0] == "bytes":
+        offset = request[2]
+        if offset > info.st_size:
+            return {"s": "offset", "total": info.st_size}, []
+        content = read_range(leaf_fd, offset, min(request[3], share))
+        identity = read_identity(leaf_fd, offset, content, info.st_size)
+        return {"s": "ok", "total": info.st_size, "reads": [[offset, identity]]}, [content]
+    start_line, end_line, before, after, limit, head_limit = request[2:8]
+    # The head takes no more than the file holds, and the window gets the rest.
+    head_limit = min(head_limit, info.st_size, share)
+    metadata, contents = read_located_lines(
+        leaf_fd, start_line, end_line, before, after, min(limit, share - head_limit), head_limit
+    )
+    metadata["s"] = "ok"
+    return metadata, contents
+
+
+def read_files_main():
+    batch = json.loads(sys.stdin.read())
+    requests = batch["requests"]
+    total = batch["total"]
+    outcomes = [None] * len(requests)
+    blobs = []
+    root_fd = None
+    try:
+        root_fd = open_guard_root(sys.argv[2])
+        with workspace_source_lock(root_fd, False):
+            shares = [float("inf")] * len(requests)
+            if total is not None:
+                wanted = [0] * len(requests)
+                for index, request in enumerate(requests):
+                    outcome, want = under_path_lock(
+                        root_fd, request[1], lambda fd, info: (None, file_want(request, info))
+                    )
+                    if outcome is None:
+                        wanted[index] = want
+                    else:
+                        outcomes[index] = outcome
+                shares = share_out(wanted, total)
+            for index, request in enumerate(requests):
+                if outcomes[index] is None:
+                    share = shares[index]
+                    outcomes[index], contents = under_path_lock(
+                        root_fd,
+                        request[1],
+                        lambda fd, info: read_request(request, share, fd, info),
+                    )
+                    blobs.extend(contents)
+    except GuardPathError as exc:
+        finish(exc.status)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    print("ok")
+    print(json.dumps(outcomes))
+    for content in blobs:
+        print(base64.b64encode(content).decode("ascii"))
+"""
+
+
 _COMBINED_MODES = frozenset({"read-lines", "edit-text"})
+_READ_FILES_MODE = "read-files"
 
 
 def _guard_program(mode: str) -> str:
     """The guard program, with the combined modes only when ``mode`` is one."""
 
-    if mode not in _COMBINED_MODES:
+    if mode not in _COMBINED_MODES and mode != _READ_FILES_MODE:
         return GUEST_GUARD_PROGRAM
     program = GUEST_GUARD_PROGRAM.removesuffix("\nmain()\n")
     if program == GUEST_GUARD_PROGRAM:
         raise RuntimeError("The guest guard program must end by calling main().")
-    return program + "\n" + GUEST_COMBINED_MODES_SOURCE + "\ncombined_main()\n"
+    program += "\n" + GUEST_COMBINED_MODES_SOURCE
+    if mode == _READ_FILES_MODE:
+        return program + "\n" + GUEST_READ_FILES_SOURCE + "\nread_files_main()\n"
+    return program + "\ncombined_main()\n"
 
 
 def guard_read_limit(runner: Runner) -> int | None:
@@ -1294,10 +1404,179 @@ async def guard_edit_text(
         ) from exc
 
 
+# Output beyond the files' bytes, per file: its outcome's JSON (two reads'
+# identities, or an error's text) and its base64 lines' padding and newlines.
+_READ_FILES_OUTPUT_HEADROOM_PER_FILE_BYTES = 768
+
+
+async def guard_read_files(
+    runner: Runner,
+    *,
+    root: str,
+    requests: Sequence[WorkspaceFileReadRequest],
+    backend: str,
+    timeout_s: int | None = None,
+    python_executable: str = GUEST_PYTHON,
+) -> tuple[WorkspaceFileReadOutcome, ...]:
+    """Read several contained files in one command, each as its single read would.
+
+    Each outcome is the request's result or the exception its ``guard_read``
+    or ``guard_read_lines`` would raise. When the runner caps command output,
+    the files share what fits, and a file given less than it asked for comes
+    back as a shorter read; when even the outcomes would not fit, every
+    outcome is ``None`` and nothing runs. Raises when the command fails as a
+    whole.
+    """
+
+    requests = tuple(requests)
+    if not requests:
+        return ()
+    headroom = _READ_OUTPUT_HEADROOM_BYTES + len(requests) * (
+        _READ_FILES_OUTPUT_HEADROOM_PER_FILE_BYTES
+    )
+    asked = sum(request.max_bytes + request.head_bytes for request in requests)
+    total: int | None = None
+    output_cap = runner.max_exec_output_bytes
+    if output_cap is not None:
+        if output_cap <= headroom:
+            return (None,) * len(requests)
+        fits = (output_cap - headroom) // 4 * 3
+        if asked > fits:
+            total = fits
+    output_limit = 4 * (((asked if total is None else total) + 2) // 3) + headroom
+    batch = {
+        "requests": [
+            (
+                [
+                    "lines",
+                    request.path,
+                    request.start_line,
+                    request.end_line or 0,
+                    request.before_bytes,
+                    request.after_bytes,
+                    request.max_bytes,
+                    request.head_bytes,
+                ]
+                if request.reads_lines
+                else ["bytes", request.path, request.offset, request.max_bytes]
+            )
+            for request in requests
+        ],
+        "total": total,
+    }
+    label = f"{len(requests)} files"
+    result = await _exec_guard(
+        runner,
+        _READ_FILES_MODE,
+        root,
+        "-",
+        stdin=json.dumps(batch, ensure_ascii=False),
+        timeout_s=timeout_s,
+        output_limit_bytes=output_limit,
+        python_executable=python_executable,
+    )
+    status, payload = _guard_status(result, mode="read", backend=backend, original_path=label)
+    if status != _STATUS_OK:
+        _raise_common_status(status, mode="read", backend=backend, original_path=label)
+        raise RuntimeError(
+            f"Failed to read {backend} workspace files: unexpected guard status {status!r}"
+        )
+    try:
+        outcomes_line, *encoded = payload.splitlines()
+        outcomes = json.loads(outcomes_line)
+        if type(outcomes) is not list or len(outcomes) != len(requests):
+            raise ValueError("one outcome per request")
+        blobs = iter(encoded)
+        parsed = tuple(
+            _guest_file_outcome(request, outcome, blobs, backend=backend)
+            for request, outcome in zip(requests, outcomes, strict=True)
+        )
+        if next(blobs, None) is not None:
+            raise ValueError("unclaimed read payload")
+        return parsed
+    except (TypeError, ValueError, KeyError, StopIteration, binascii.Error) as exc:
+        raise RuntimeError(f"{backend} workspace guard returned an invalid batch read") from exc
+
+
+def _guest_file_outcome(
+    request: WorkspaceFileReadRequest,
+    outcome: Any,
+    blobs: Iterator[str],
+    *,
+    backend: str,
+) -> WorkspaceFileReadOutcome:
+    """One file of a batch read: its result, or the exception its own read raises.
+
+    ``None`` when its share of the output left a read empty before the end of
+    the file, so the caller reads it on its own.
+    """
+
+    status = outcome["s"]
+    path = request.path
+    if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
+        return FileNotFoundError(f"Workspace file not found: {path}")
+    if status == _STATUS_OFFSET and not request.reads_lines:
+        return WorkspaceReadOffsetError(request.offset, _guest_int(outcome["total"]))
+    if status == "error":
+        detail = outcome["detail"]
+        return RuntimeError(f"Failed to read {backend} workspace file: {path}: {detail}")
+    if status != _STATUS_OK:
+        try:
+            _raise_common_status(str(status), mode="read", backend=backend, original_path=path)
+        except (ValueError, RuntimeError) as exc:
+            return exc
+        raise ValueError("unexpected file status")
+    reads = outcome["reads"]
+    if not request.reads_lines:
+        ((offset, identity),) = reads
+        return _guest_batch_read(offset, identity, next(blobs), _guest_int(outcome["total"]))
+    start_offset, end_offset, total_bytes, total_lines = (
+        _guest_int(value) for value in outcome["span"]
+    )
+    span = WorkspaceLineSpan(
+        start_offset=start_offset,
+        end_offset=end_offset,
+        total_bytes=total_bytes,
+        total_lines=total_lines,
+    )
+    if not 1 <= len(reads) <= 2:
+        raise ValueError("a line read has a window and at most a head")
+    results = [
+        _guest_batch_read(offset, identity, next(blobs), total_bytes) for offset, identity in reads
+    ]
+    if any(result is None for result in results):
+        return None
+    window, *head = cast("list[WorkspaceReadResult]", results)
+    return WorkspaceLineRead(span=span, window=window, head=head[0] if head else None)
+
+
+def _guest_int(value: object) -> int:
+    if type(value) is not int:
+        raise TypeError("expected an integer")
+    return value
+
+
 def _guest_read_result(
     offset: int, identity: Sequence[str | None], encoded: str, total_bytes: int
 ) -> WorkspaceReadResult:
     content = base64.b64decode(encoded.strip(), validate=True)
+    return _guest_read(offset, identity, content, total_bytes)
+
+
+def _guest_batch_read(
+    offset: int, identity: Sequence[str | None], encoded: str, total_bytes: int
+) -> WorkspaceReadResult | None:
+    """A batch read, or ``None`` when its share left it empty before the end of the file."""
+
+    content = base64.b64decode(encoded.strip(), validate=True)
+    if not content and offset < total_bytes:
+        return None
+    return _guest_read(offset, identity, content, total_bytes)
+
+
+def _guest_read(
+    offset: int, identity: Sequence[str | None], content: bytes, total_bytes: int
+) -> WorkspaceReadResult:
     revision, digest, git_mode = identity
     if git_mode not in {None, "100644", "100755"}:
         raise ValueError("invalid Git mode")

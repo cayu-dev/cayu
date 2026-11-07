@@ -12,8 +12,11 @@ from cayu.workspaces.base import TarStreamWriter as TarStreamWriter
 from cayu.workspaces.base import TarWriter as TarWriter
 from cayu.workspaces.base import Workspace as Workspace
 from cayu.workspaces.base import WorkspaceDirectoryPruner as WorkspaceDirectoryPruner
+from cayu.workspaces.base import WorkspaceFileBatchReader as WorkspaceFileBatchReader
 from cayu.workspaces.base import WorkspaceFileIdentity as WorkspaceFileIdentity
 from cayu.workspaces.base import WorkspaceFileIdentityReader as WorkspaceFileIdentityReader
+from cayu.workspaces.base import WorkspaceFileReadOutcome as WorkspaceFileReadOutcome
+from cayu.workspaces.base import WorkspaceFileReadRequest as WorkspaceFileReadRequest
 from cayu.workspaces.base import WorkspaceGitEntry as WorkspaceGitEntry
 from cayu.workspaces.base import WorkspaceGitEntryListResult as WorkspaceGitEntryListResult
 from cayu.workspaces.base import (

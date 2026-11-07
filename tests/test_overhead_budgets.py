@@ -72,6 +72,7 @@ BUDGETS: dict[str, dict[str, int]] = {
     "read_file whole": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 27},
     "read_file byte page": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 27},
     "read_file line range": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 32},
+    "read_file several files": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 36},
     "write_file create": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 27},
     "edit_file": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 32},
     "search_text": {"sandbox_commands": 1, "broker_requests": 2, "command_kib": 1},
@@ -238,6 +239,18 @@ def _tool_calls(*, with_search: bool) -> list[tuple[str, Tool, dict[str, Any]]]:
             "read_file line range",
             ReadFileTool(),
             {"path": "notes.txt", "start_line": 5, "end_line": 9},
+        ),
+        (
+            "read_file several files",
+            ReadFileTool(),
+            {
+                "files": [
+                    {"path": "notes.txt", "start_line": 20, "end_line": 22},
+                    {"path": "pkg0/m000.py"},
+                    {"path": "pkg1/m001.py"},
+                    {"path": "pkg2/m002.py"},
+                ]
+            },
         ),
         (
             "write_file create",

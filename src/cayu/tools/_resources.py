@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn
 
 from cayu._exception_groups import exception_tree_contains, rebuild_exception_group
@@ -30,7 +30,14 @@ from cayu.workspaces import (
     WorkspaceMutationResult,
     WorkspaceReadResult,
 )
-from cayu.workspaces.base import WorkspaceContentManifest, WorkspaceManifestLimits
+from cayu.workspaces.base import (
+    WorkspaceContentManifest,
+    WorkspaceFileBatchReader,
+    WorkspaceFileReadOutcome,
+    WorkspaceFileReadRequest,
+    WorkspaceLineRead,
+    WorkspaceManifestLimits,
+)
 from cayu.workspaces.revisions import _runner_revision_manifest_capture
 
 
@@ -314,7 +321,7 @@ def _bounded_workspace_read_limit(workspace: Workspace, max_bytes: int) -> int:
     return value
 
 
-class InvocationWorkspaceHandle(Workspace):
+class InvocationWorkspaceHandle(Workspace, WorkspaceFileBatchReader):
     """Workspace facade that redacts byte reads before their public bound."""
 
     __slots__ = (
@@ -411,51 +418,111 @@ class InvocationWorkspaceHandle(Workspace):
         )
         if not isinstance(captured, WorkspaceReadResult):
             return captured
-        if captured.offset != fetch_offset:
-            return _ReadFailure("invalid_workspace_result")
-        window_source_bytes = captured.source_bytes_read
-        if window_source_bytes is None:  # pragma: no cover - dataclass invariant
-            return _ReadFailure("invalid_workspace_result")
-        window_end = captured.offset + window_source_bytes
-        if window_end < offset:
-            return _ReadFailure("redaction_window_unavailable")
-        requested_end = (
-            captured.total_bytes
-            if max_bytes is None
-            else min(captured.total_bytes, offset + max_bytes)
-        )
-        page_end = min(requested_end, window_end)
-        source_bytes_read = page_end - offset
-        if source_bytes_read == 0:
-            projected = b""
-            redaction_truncated = False
-        else:
-            required_window_end = min(captured.total_bytes, page_end + overlap)
-            source_complete = window_end >= required_window_end
-            projection_limit = (
-                source_bytes_read if max_bytes is None else min(max_bytes, source_bytes_read)
-            )
-            projected, redaction_truncated = snapshot.redactor.redact_bytes_page(
-                captured.content,
-                window_offset=captured.offset,
-                page_offset=offset,
-                page_end=page_end,
-                max_bytes=max(1, projection_limit),
-                source_complete=source_complete,
-            )
-        raw_truncated = page_end < captured.total_bytes
-        complete = offset == 0 and not raw_truncated
-        return WorkspaceReadResult(
-            content=projected,
-            total_bytes=captured.total_bytes,
-            truncated=raw_truncated,
+        return _project_workspace_page(
+            captured,
+            fetch_offset=fetch_offset,
             offset=offset,
-            revision=captured.revision if complete else None,
-            sha256=captured.sha256 if complete else None,
-            git_mode=captured.git_mode if complete else None,
-            source_bytes_read=source_bytes_read,
-            redaction_truncated=redaction_truncated,
+            max_bytes=max_bytes,
+            snapshot=snapshot,
         )
+
+    def file_batch_reader(self) -> WorkspaceFileBatchReader | None:
+        return self if self.__workspace.file_batch_reader() is not None else None
+
+    async def read_files(
+        self, requests: Sequence[WorkspaceFileReadRequest]
+    ) -> tuple[WorkspaceFileReadOutcome, ...]:
+        """Read the files in one delegate call, each projected as ``read_bytes`` would be.
+
+        A file's outcome is what its own ``read_bytes`` here would return or
+        raise. With secrets in scope, line reads are left to the caller
+        (``None``): their spans count the file's raw bytes, which redaction
+        may change.
+        """
+
+        requests = tuple(requests)
+        for request in requests:
+            if type(request) is not WorkspaceFileReadRequest:
+                raise TypeError("Invocation workspace batch reads take WorkspaceFileReadRequest.")
+        snapshot = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+        for _ in range(2):
+            captured = await self._capture_workspace_batch(requests, snapshot)
+            if isinstance(captured, _ReadCancellation):
+                del requests, snapshot, self
+                _raise_clean_read_cancellation(captured)
+            if isinstance(captured, _ReadFailure):
+                return (None,) * len(requests)
+            current = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
+            if current.revision == snapshot.revision and current.redactor.has_same_registry(
+                snapshot.redactor
+            ):
+                self.__capture_observer(current.revision)
+                return captured
+            del captured
+            snapshot = current
+        return (None,) * len(requests)
+
+    async def _capture_workspace_batch(
+        self,
+        requests: tuple[WorkspaceFileReadRequest, ...],
+        snapshot: InvocationRedactorSnapshot,
+    ) -> tuple[WorkspaceFileReadOutcome, ...] | _ReadFailure | _ReadCancellation:
+        reader = self.__workspace.file_batch_reader()
+        outcomes: list[WorkspaceFileReadOutcome] = [None] * len(requests)
+        if reader is None:
+            return tuple(outcomes)
+        overlap = snapshot.redactor.pagination_overlap_utf8_bytes
+        sent: list[tuple[int, WorkspaceFileReadRequest]] = []
+        for index, request in enumerate(requests):
+            if request.reads_lines:
+                if not snapshot.redactor.has_values:
+                    sent.append((index, request))
+                continue
+            # Widen each page as read_bytes does, so it projects the same way.
+            fetch_offset = max(0, request.offset - overlap)
+            fetch_max = _bounded_workspace_read_limit(
+                self.__workspace, request.offset - fetch_offset + request.max_bytes + overlap
+            )
+            sent.append((index, replace(request, offset=fetch_offset, max_bytes=fetch_max)))
+        if not sent:
+            return tuple(outcomes)
+        captured = await _read_workspace_batch_delegate(
+            reader,
+            tuple(request for _, request in sent),
+            redactor_snapshot_provider=self.__redactor_snapshot_provider,
+        )
+        if not isinstance(captured, tuple):
+            return captured
+        for (index, fetched), outcome in zip(sent, captured, strict=True):
+            request = requests[index]
+            if outcome is None:
+                continue
+            if isinstance(outcome, BaseException):
+                outcomes[index] = _workspace_read_failure_exception(
+                    _workspace_failure_from_error(outcome)
+                )
+                continue
+            if request.reads_lines:
+                projected: WorkspaceFileReadOutcome | _ReadFailure = _copy_workspace_line_read(
+                    outcome
+                )
+            else:
+                copied = _copy_workspace_read_result(outcome, max_bytes=fetched.max_bytes)
+                projected = (
+                    copied
+                    if isinstance(copied, _ReadFailure)
+                    else _project_workspace_page(
+                        copied,
+                        fetch_offset=fetched.offset,
+                        offset=request.offset,
+                        max_bytes=request.max_bytes,
+                        snapshot=snapshot,
+                    )
+                )
+            # A window that can't be projected, such as one its share of a capped
+            # batch cut short, is left to the file's own read.
+            outcomes[index] = None if isinstance(projected, _ReadFailure) else projected
+        return tuple(outcomes)
 
     def bounded_read_limit(self, max_bytes: int) -> int:
         return self.__workspace.bounded_read_limit(max_bytes)
@@ -782,6 +849,62 @@ class InvocationArtifactStoreHandle(ArtifactStore):
         await self.__artifact_store.delete(artifact_id)
 
 
+def _project_workspace_page(
+    captured: WorkspaceReadResult,
+    *,
+    fetch_offset: int,
+    offset: int,
+    max_bytes: int | None,
+    snapshot: InvocationRedactorSnapshot,
+) -> WorkspaceReadResult | _ReadFailure:
+    """The redacted page at ``offset`` from a raw window read at ``fetch_offset``."""
+
+    overlap = snapshot.redactor.pagination_overlap_utf8_bytes
+    if captured.offset != fetch_offset:
+        return _ReadFailure("invalid_workspace_result")
+    window_source_bytes = captured.source_bytes_read
+    if window_source_bytes is None:  # pragma: no cover - dataclass invariant
+        return _ReadFailure("invalid_workspace_result")
+    window_end = captured.offset + window_source_bytes
+    if window_end < offset:
+        return _ReadFailure("redaction_window_unavailable")
+    requested_end = (
+        captured.total_bytes if max_bytes is None else min(captured.total_bytes, offset + max_bytes)
+    )
+    page_end = min(requested_end, window_end)
+    source_bytes_read = page_end - offset
+    if source_bytes_read == 0:
+        projected = b""
+        redaction_truncated = False
+    else:
+        required_window_end = min(captured.total_bytes, page_end + overlap)
+        source_complete = window_end >= required_window_end
+        projection_limit = (
+            source_bytes_read if max_bytes is None else min(max_bytes, source_bytes_read)
+        )
+        projected, redaction_truncated = snapshot.redactor.redact_bytes_page(
+            captured.content,
+            window_offset=captured.offset,
+            page_offset=offset,
+            page_end=page_end,
+            max_bytes=max(1, projection_limit),
+            source_complete=source_complete,
+        )
+    raw_truncated = page_end < captured.total_bytes
+    complete = offset == 0 and not raw_truncated
+    return WorkspaceReadResult(
+        content=projected,
+        total_bytes=captured.total_bytes,
+        truncated=raw_truncated,
+        offset=offset,
+        revision=captured.revision if complete else None,
+        sha256=captured.sha256 if complete else None,
+        git_mode=captured.git_mode if complete else None,
+        source_bytes_read=source_bytes_read,
+        redaction_truncated=redaction_truncated,
+    )
+
+
 async def _read_workspace_delegate(
     workspace: Workspace,
     *,
@@ -798,8 +921,45 @@ async def _read_workspace_delegate(
     ) -> Awaitable[WorkspaceReadResult]:
         return workspace.read_bytes(path, offset=offset, max_bytes=max_bytes)
 
+    del workspace, path
+    result = await _await_workspace_delegate(operation_factory, redactor_snapshot_provider)
+    del operation_factory, redactor_snapshot_provider
+    if isinstance(result, _ReadFailure | _ReadCancellation):
+        return result
+    return _copy_workspace_read_result(result, max_bytes=max_bytes)
+
+
+async def _read_workspace_batch_delegate(
+    reader: WorkspaceFileBatchReader,
+    requests: tuple[WorkspaceFileReadRequest, ...],
+    *,
+    redactor_snapshot_provider: Callable[[], Any],
+) -> tuple[object, ...] | _ReadFailure | _ReadCancellation:
+    def operation_factory(
+        reader: WorkspaceFileBatchReader = reader,
+        requests: tuple[WorkspaceFileReadRequest, ...] = requests,
+    ) -> Awaitable[tuple[WorkspaceFileReadOutcome, ...]]:
+        return reader.read_files(requests)
+
+    count = len(requests)
+    del reader, requests
+    result = await _await_workspace_delegate(operation_factory, redactor_snapshot_provider)
+    del operation_factory, redactor_snapshot_provider
+    if isinstance(result, _ReadFailure | _ReadCancellation):
+        return result
+    if type(result) is not tuple or len(result) != count:
+        return _ReadFailure("invalid_workspace_result")
+    return result
+
+
+async def _await_workspace_delegate(
+    operation_factory: Callable[[], Awaitable[Any]],
+    redactor_snapshot_provider: Callable[[], Any],
+) -> Any:
+    """Run a delegate read; its result, or the failure or cancellation a caller may see."""
+
     operation = await_invocation_operation(operation_factory)
-    del operation_factory, workspace, path
+    del operation_factory
     try:
         outcome = await operation
     finally:
@@ -831,6 +991,12 @@ async def _read_workspace_delegate(
         del outcome, result, error, caller_cancellation, redactor_snapshot_provider
         return failure
     del outcome, error, caller_cancellation, redactor_snapshot_provider
+    return result
+
+
+def _copy_workspace_read_result(
+    result: object, *, max_bytes: int | None
+) -> WorkspaceReadResult | _ReadFailure:
     if type(result) is not WorkspaceReadResult:
         return _ReadFailure("invalid_workspace_result")
     try:
@@ -848,6 +1014,21 @@ async def _read_workspace_delegate(
         if max_bytes is not None and len(copied.content) > max_bytes:
             return _ReadFailure("invalid_workspace_result")
         return copied
+    except BaseException:
+        return _ReadFailure("invalid_workspace_result")
+
+
+def _copy_workspace_line_read(result: object) -> WorkspaceLineRead | _ReadFailure:
+    """A delegate's line read, rebuilt; only when no secret is in scope to redact."""
+
+    if type(result) is not WorkspaceLineRead:
+        return _ReadFailure("invalid_workspace_result")
+    window = _copy_workspace_read_result(result.window, max_bytes=None)
+    head = None if result.head is None else _copy_workspace_read_result(result.head, max_bytes=None)
+    if isinstance(window, _ReadFailure) or isinstance(head, _ReadFailure):
+        return _ReadFailure("invalid_workspace_result")
+    try:
+        return WorkspaceLineRead(span=result.span, window=window, head=head)
     except BaseException:
         return _ReadFailure("invalid_workspace_result")
 

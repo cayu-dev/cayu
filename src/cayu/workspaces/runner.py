@@ -5,6 +5,7 @@ import io
 import json
 import posixpath
 from collections.abc import Iterable, Sequence
+from dataclasses import replace
 from typing import Any, BinaryIO
 
 from cayu._validation import (
@@ -29,6 +30,7 @@ from cayu.workspaces._guest_guard import (
     guard_locate_lines,
     guard_move_if_revision,
     guard_read,
+    guard_read_files,
     guard_read_limit,
     guard_read_lines,
     guard_replace,
@@ -44,6 +46,9 @@ from cayu.workspaces.base import (
     TarWriter,
     WorkspaceContentManifest,
     WorkspaceDirectoryPruner,
+    WorkspaceFileBatchReader,
+    WorkspaceFileReadOutcome,
+    WorkspaceFileReadRequest,
     WorkspaceGitEntry,
     WorkspaceGitEntryListResult,
     WorkspaceLineLocator,
@@ -1058,6 +1063,7 @@ class RunnerWorkspace(
     WorkspaceDirectoryPruner,
     WorkspaceLineLocator,
     WorkspaceLineReader,
+    WorkspaceFileBatchReader,
     WorkspaceTextEditor,
     RunnerBoundWorkspace,
     BoundedTarReader,
@@ -1273,6 +1279,41 @@ class RunnerWorkspace(
             backend="Runner",
             python_executable=self.python_executable,
         )
+
+    def file_batch_reader(self) -> WorkspaceFileBatchReader | None:
+        # A subclass that changes how files are read keeps one read per file.
+        if not _inherits_runner_methods(self, "read_bytes", "locate_lines", "read_lines"):
+            return None
+        return self
+
+    async def read_files(
+        self, requests: Sequence[WorkspaceFileReadRequest]
+    ) -> tuple[WorkspaceFileReadOutcome, ...]:
+        requests = tuple(requests)
+        outcomes: list[WorkspaceFileReadOutcome] = [None] * len(requests)
+        sent: list[tuple[int, WorkspaceFileReadRequest]] = []
+        for index, request in enumerate(requests):
+            if type(request) is not WorkspaceFileReadRequest:
+                raise TypeError("RunnerWorkspace read_files takes WorkspaceFileReadRequest values.")
+            # A path its single read would refuse is refused here, for that file only.
+            try:
+                path = _validate_relative_path(request.path)
+                self._require_path_allowed(path)
+            except ValueError as exc:
+                outcomes[index] = exc
+                continue
+            sent.append((index, replace(request, path=path)))
+        if sent:
+            read = await guard_read_files(
+                self._runner,
+                root=self._runner.resolve_cwd(self.cwd),
+                requests=[request for _, request in sent],
+                backend="Runner",
+                python_executable=self.python_executable,
+            )
+            for (index, _), outcome in zip(sent, read, strict=True):
+                outcomes[index] = outcome
+        return tuple(outcomes)
 
     def text_editor(self) -> WorkspaceTextEditor | None:
         # A subclass that changes how files are read or replaced keeps the

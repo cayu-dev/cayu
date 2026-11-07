@@ -5099,8 +5099,10 @@
           "TarWriter",
           "Workspace",
           "WorkspaceDirectoryPruner",
+          "WorkspaceFileBatchReader",
           "WorkspaceFileIdentity",
           "WorkspaceFileIdentityReader",
+          "WorkspaceFileReadRequest",
           "WorkspaceGitEntry",
           "WorkspaceGitEntryListResult",
           "WorkspaceGitEntryObservationUnsupportedError",
@@ -5217,6 +5219,7 @@
         "DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT",
         "DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES",
         "MAX_GIT_REMOTE_FETCH_FILES",
+        "WorkspaceFileReadOutcome",
         "WorkspaceGitMode",
         "WorkspaceMoveFidelity"
       ]

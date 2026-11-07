@@ -780,6 +780,15 @@ class Workspace(ABC):
 
         return None
 
+    def file_batch_reader(self) -> WorkspaceFileBatchReader | None:
+        """Return a capability that reads several files in one call, if any.
+
+        Without one, a ``read_file`` call with several files reads them one at
+        a time.
+        """
+
+        return None
+
     def text_editor(self) -> WorkspaceTextEditor | None:
         """Return a capability that reads and conditionally edits text in one call, if any.
 
@@ -1101,6 +1110,81 @@ class WorkspaceLineReader(ABC):
         transport can't return all of them at once. The span, window and head
         describe one observation of the file. Raises ``FileNotFoundError``
         when ``path`` is not a regular file.
+        """
+
+
+@dataclass(frozen=True)
+class WorkspaceFileReadRequest:
+    """One file of a batch read: a byte page, or a line range with the bytes around it.
+
+    Without ``start_line`` it asks for what ``read_bytes(path, offset=offset,
+    max_bytes=max_bytes)`` returns. With ``start_line`` it asks for what
+    ``WorkspaceLineReader.read_lines`` returns for the same arguments, and
+    ``offset`` must be 0.
+    """
+
+    path: str
+    max_bytes: int
+    offset: int = 0
+    start_line: int | None = None
+    end_line: int | None = None
+    before_bytes: int = 0
+    after_bytes: int = 0
+    head_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.path) is not str:
+            raise TypeError("WorkspaceFileReadRequest path must be a string.")
+        if type(self.max_bytes) is not int or self.max_bytes <= 0:
+            raise ValueError("WorkspaceFileReadRequest max_bytes must be a positive integer.")
+        for name in ("offset", "before_bytes", "after_bytes", "head_bytes"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"WorkspaceFileReadRequest {name} must be a non-negative integer.")
+        if self.start_line is None:
+            if self.end_line is not None:
+                raise ValueError("WorkspaceFileReadRequest end_line requires start_line.")
+            return
+        if type(self.start_line) is not int or self.start_line < 1:
+            raise ValueError("WorkspaceFileReadRequest start_line must be a positive integer.")
+        if self.end_line is not None and (
+            type(self.end_line) is not int or self.end_line < self.start_line
+        ):
+            raise ValueError(
+                "WorkspaceFileReadRequest end_line must be an integer no less than start_line."
+            )
+        if self.offset:
+            raise ValueError("WorkspaceFileReadRequest line reads start at offset 0.")
+
+    @property
+    def reads_lines(self) -> bool:
+        return self.start_line is not None
+
+
+WorkspaceFileReadOutcome = WorkspaceReadResult | WorkspaceLineRead | Exception | None
+
+
+class WorkspaceFileBatchReader(ABC):
+    """Nominal capability for reading several files in one call.
+
+    A backend whose every call is a round trip, such as a remote sandbox,
+    implements this so a ``read_file`` call with several files costs one call
+    instead of one per file.
+    """
+
+    @abstractmethod
+    async def read_files(
+        self, requests: Sequence[WorkspaceFileReadRequest]
+    ) -> tuple[WorkspaceFileReadOutcome, ...]:
+        """Read each request as its single read would, returning one outcome per request.
+
+        An outcome is the request's result (a ``WorkspaceReadResult``, or a
+        ``WorkspaceLineRead`` for a line request), the exception its single
+        read would raise, such as ``FileNotFoundError``, or ``None`` when this
+        call did not read it and the caller must. Like any bounded read, a
+        result may come back shorter than asked when the transport can't
+        return every file's bytes at once. Raises when the whole call fails;
+        the caller then reads each file itself.
         """
 
 
