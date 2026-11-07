@@ -287,6 +287,49 @@ See OpenAI's [data controls](https://developers.openai.com/api/docs/guides/your-
 and [background mode](https://developers.openai.com/api/docs/guides/background)
 guides for the current provider policy.
 
+## OpenAI Responses over a WebSocket
+
+By default every Responses call sends the whole conversation over HTTP. With
+`WebSocketOpenAITransport` (`pip install 'cayu[openai-websocket]'`), streaming
+calls go over one persistent WebSocket per conversation lineage instead, and a
+follow-up call sends only the input that is new since the previous response,
+chained with `previous_response_id`:
+
+```python
+from cayu.providers import OpenAIProvider, WebSocketOpenAITransport
+
+provider = OpenAIProvider(transport=WebSocketOpenAITransport())
+```
+
+The endpoint must serve the Responses WebSocket protocol on `/v1/responses`
+(`wss://`, or `ws://` with `allow_http=True` on both the provider and the
+transport). Calls that do not stream, such as token counts and embeddings, go
+over HTTP. The handshake does not follow redirects, as the HTTP transport does
+not; a 3xx answer fails the call.
+
+A connection keeps its latest response in memory, under `store=false` too, so
+the default `reasoning_state="inline"` needs no stored responses. A call is sent
+as new items plus `previous_response_id` only when it goes out on the connection
+that produced the previous response, that response completed, every field except
+`input` is unchanged (model, instructions, tools, options, `store`,
+`prompt_cache_key`), and its input starts with exactly the previous call's input
+followed by that response's output. The server then sees the same input as the
+full request, so the model sees the same conversation and the prompt cache keeps
+the same prefix. Anything else is sent in full, as over HTTP: the first call on a
+connection, a reconnect, a changed setting, history compacted, redacted or edited
+since the previous response, and a previous response that did not complete. When
+the server no longer holds the previous response (`previous_response_not_found`),
+Cayu sends the call again in full on the same connection before any output
+reaches the session. Cayu's transcript and request records always hold the full
+conversation; only the wire request is smaller.
+
+Idle connections stay pooled for `idle_timeout_s` (300 s) and are keyed by
+endpoint, credentials and `prompt_cache_key`, so concurrent calls of one lineage
+use separate connections. `incremental_input=False` keeps the connections but
+always sends the full input. Stream deadlines, error classification, retries and
+stale-chain recovery for `reasoning_state="server"` work as over HTTP. Background
+mode is HTTP only.
+
 ## OpenRouter
 
 `cayu new APP --provider openrouter` generates the first-class preset. Set

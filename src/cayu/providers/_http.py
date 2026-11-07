@@ -434,6 +434,22 @@ _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
 )
 
 
+def provider_ssl_context() -> ssl.SSLContext:
+    """Return the TLS context provider transports verify servers with.
+
+    Public roots always come from certifi. A trusted runtime may additionally
+    set ``CAYU_PROVIDER_CA_BUNDLE`` to a PEM bundle for a private provider or
+    virtual-egress broker. That bundle augments certifi rather than replacing it.
+    """
+    context = ssl.create_default_context(cafile=certifi.where())
+    extra_ca_bundle = os.environ.get(_PROVIDER_CA_BUNDLE_ENV)
+    if extra_ca_bundle is not None:
+        context.load_verify_locations(
+            cafile=require_nonblank(extra_ca_bundle, _PROVIDER_CA_BUNDLE_ENV)
+        )
+    return context
+
+
 def new_async_client(*, keepalive_expiry_s: float | None = None) -> httpx.AsyncClient:
     """Build an httpx.AsyncClient with explicit, optionally augmented CA trust.
 
@@ -449,12 +465,7 @@ def new_async_client(*, keepalive_expiry_s: float | None = None) -> httpx.AsyncC
     ``keepalive_expiry_s`` keeps idle pooled connections open that long
     instead of httpx's 5 seconds; httpx's other pool limits stay as they are.
     """
-    context = ssl.create_default_context(cafile=certifi.where())
-    extra_ca_bundle = os.environ.get(_PROVIDER_CA_BUNDLE_ENV)
-    if extra_ca_bundle is not None:
-        context.load_verify_locations(
-            cafile=require_nonblank(extra_ca_bundle, _PROVIDER_CA_BUNDLE_ENV)
-        )
+    context = provider_ssl_context()
     if keepalive_expiry_s is None:
         return httpx.AsyncClient(verify=context)
     return httpx.AsyncClient(

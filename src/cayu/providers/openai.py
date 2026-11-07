@@ -7871,7 +7871,8 @@ def _validate_reasoning_state(value: str) -> str:
 
 def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | None:
     """Bounded configuration material for runtime exact-type identity selection."""
-    if type(provider.transport) is not HttpxOpenAITransport or provider.extra_headers:
+    transport = _transport_profile_material(provider.transport)
+    if transport is None or provider.extra_headers:
         return None
     material = {
         "base_url": provider.base_url,
@@ -7888,4 +7889,22 @@ def _execution_profile_material(provider: OpenAIProvider) -> dict[str, Any] | No
         material["streaming"] = False
     if provider.allow_http:
         material["allow_http"] = True
+    material.update(transport)
     return material
+
+
+def _transport_profile_material(transport: object) -> dict[str, Any] | None:
+    """Material for a built-in transport; None for one Cayu cannot identify."""
+    if type(transport) is HttpxOpenAITransport:
+        return {}
+    from cayu.providers.openai_websocket import WebSocketOpenAITransport
+
+    if (
+        type(transport) is WebSocketOpenAITransport
+        and type(transport.http_transport) is HttpxOpenAITransport
+    ):
+        return {
+            "responses_transport": "websocket",
+            "incremental_input": transport.incremental_input,
+        }
+    return None

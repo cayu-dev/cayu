@@ -130,6 +130,7 @@ from cayu.providers.openai_subscription import (
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider as OpenAISubscriptionProvider,
 )
+from cayu.providers.openai_websocket import WebSocketOpenAITransport as WebSocketOpenAITransport
 from cayu.providers.operations import (
     PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES as PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES,
 )

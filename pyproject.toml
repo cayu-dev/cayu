@@ -105,6 +105,10 @@ aws = [
   # Botocore's browser-based `aws login` credential provider requires CRT.
   "boto3[crt]>=1.43.44,<2",
 ]
+openai-websocket = [
+  # WebSocketOpenAITransport: OpenAI Responses over a persistent WebSocket.
+  "websockets>=17.0.1,<17.1",
+]
 postgres = [
   "psycopg[binary]>=3.2",
   "psycopg_pool>=3.2",
@@ -183,6 +187,7 @@ all-runtime-extras = [
   "egress",
   "files",
   "oidc",
+  "openai-websocket",
   "otel",
   "postgres",
   "recording",

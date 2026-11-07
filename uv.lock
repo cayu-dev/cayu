@@ -334,6 +334,9 @@ oidc = [
     { name = "watchfiles" },
     { name = "websockets" },
 ]
+openai-websocket = [
+    { name = "websockets" },
+]
 otel = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
@@ -461,11 +464,12 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'all'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'oidc'", specifier = ">=17.0.1,<17.1" },
+    { name = "websockets", marker = "extra == 'openai-websocket'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'recording'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=17.0.1,<17.1" },
     { name = "websockets", marker = "extra == 'server-settings'", specifier = ">=17.0.1,<17.1" },
 ]
-provides-extras = ["claude-agent-sdk", "codex", "dev", "console", "recording", "browser", "aws", "postgres", "files", "e2b", "egress", "otel", "vertex", "server", "server-settings", "oidc", "all"]
+provides-extras = ["claude-agent-sdk", "codex", "dev", "console", "recording", "browser", "aws", "openai-websocket", "postgres", "files", "e2b", "egress", "otel", "vertex", "server", "server-settings", "oidc", "all"]
 
 [package.metadata.requires-dev]
 nightly = [
