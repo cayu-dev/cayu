@@ -3303,6 +3303,28 @@ class SessionModelCallsResponse(ApiBaseModel):
     price_book: ApiPriceBookIdentity | None = None
 
 
+class ApiSessionRunnerCommand(ApiBaseModel):
+    """One runner command a tool call ran, from its `runner.exec.completed` event.
+
+    `runtime_ms` is how long the Runtime waited for the runner. When the
+    runner's backend keeps its own record of the command, such as a sandbox
+    broker, `id` is the backend's command id and the times are the backend's:
+    `accepted_at` when it took the request, `started_at` when it handed the
+    command to the machine that runs it, `finished_at` when the command ended,
+    with `backend_ms`, `queue_ms` and `run_ms` between them."""
+
+    id: str | None
+    adapter: str | None
+    completed_at: str
+    runtime_ms: StrictInt | None = Field(ge=0)
+    accepted_at: str | None
+    started_at: str | None
+    finished_at: str | None
+    backend_ms: StrictInt | None = Field(ge=0)
+    queue_ms: StrictInt | None = Field(ge=0)
+    run_ms: StrictInt | None = Field(ge=0)
+
+
 class ApiSessionToolCall(ApiBaseModel):
     """One paired tool call. `tool_call_id` is the call's public `tool_call_correlation_id`,
     the value its tool events carry; the private model step, attempt and round are withheld."""
@@ -3326,6 +3348,7 @@ class ApiSessionToolCall(ApiBaseModel):
     artifact_bytes: StrictInt | None = Field(ge=0)
     returned: StrictInt | None = Field(ge=0)
     truncated: StrictBool | None
+    runner_commands: list[ApiSessionRunnerCommand] = Field(default_factory=list)
 
 
 class SessionTimingResponse(SessionTiming):

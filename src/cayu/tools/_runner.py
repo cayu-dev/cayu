@@ -39,6 +39,7 @@ from cayu.runners import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerCommandRecord,
     RunnerExecutionError,
     RunnerUnavailableError,
     RunnerWorkloadAuthority,
@@ -1246,6 +1247,10 @@ async def _capture_runner_dispatch_outcome(
                 "cancelled": result.cancelled,
             }
         )
+        if type(result.runner_command) is RunnerCommandRecord:
+            completed_payload["runner_command"] = _runner_command_record_evidence(
+                result.runner_command
+            )
     if isinstance(error, asyncio.CancelledError):
         completed_payload["cancelled"] = True
     if error is not None:
@@ -1265,6 +1270,23 @@ async def _capture_runner_dispatch_outcome(
             settlement_error=settlement_error,
         )
     return outcome
+
+
+def _runner_command_record_evidence(record: RunnerCommandRecord) -> dict[str, str | None]:
+    """The ``runner_command`` a ``runner.exec.completed`` event carries: the backend's
+    command id and its accepted, started and finished times."""
+
+    return {
+        "id": record.id,
+        **{
+            field: None if value is None else value.isoformat()
+            for field, value in (
+                ("accepted_at", record.accepted_at),
+                ("started_at", record.started_at),
+                ("finished_at", record.finished_at),
+            )
+        },
+    }
 
 
 def _private_runner_exec_result(

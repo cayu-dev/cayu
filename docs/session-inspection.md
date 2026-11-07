@@ -516,6 +516,19 @@ cayu session output SESSION_ID
 cayu session output SESSION_ID --interaction-id INTERACTION_ID --table
 ```
 
+### Runner commands of a tool call
+
+Each `cayu session tools` row lists the runner commands its call ran, in
+`runner_commands`, from the call's `runner.exec.completed` events. `runtime_ms` is how
+long the Runtime waited for the runner. When the runner's backend keeps its own record
+of the command, as the sandbox broker does, `id` is the backend's command id, the one
+`cayu cloud sandboxes show` lists, and `accepted_at`, `started_at` and `finished_at` are
+the backend's times: when it took the request, when it handed the command to the
+sandbox, and when the command ended. `backend_ms` (accepted to finished), `queue_ms`
+(accepted to started) and `run_ms` (started to finished) split them, so a slow call
+reads as Runtime time, broker time and command time. A backend that doesn't report a
+time leaves it `null`. `--table` shows each command as its id followed by those times.
+
 ### Session overviews
 
 `cayu session list --overview` adds an `overview` object to each row: the projection

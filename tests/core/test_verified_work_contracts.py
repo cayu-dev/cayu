@@ -7569,7 +7569,7 @@ def test_unproven_worker_claim_mutations_are_rejected_before_dispatch() -> None:
     asyncio.run(scenario())
 
 
-def test_declared_quiescent_task_claim_settles_before_cancellation_returns() -> None:
+def test_cancelled_unacknowledged_quiescent_claim_is_left_to_expire() -> None:
     class QuiescentClaimStore(InMemoryTaskStore):
         verified_work_mutations_are_cancellation_quiescent = True
 
@@ -7625,12 +7625,14 @@ def test_declared_quiescent_task_claim_settles_before_cancellation_returns() -> 
 
         assert worker.cancelling() == 1
         assert worker.cancelled()
-        # The claim committed with the cancellation; the worker never started
-        # it, so it returns the claim before its cancellation returns.
+        # The mutation settled, but cancellation hid its acknowledgement.
+        # Without claim authority the worker must leave it to lease expiry.
         persisted = await task_store.load_task(task.id)
         assert persisted is not None
-        assert persisted.status is TaskStatus.PENDING
-        assert persisted.worker_id is None
+        assert persisted.status is TaskStatus.CLAIMED
+        assert persisted.worker_id == "quiescent-claim-settlement-worker"
+        assert persisted.started_at is None
+        assert persisted.lease_expires_at is not None
 
     asyncio.run(scenario())
 

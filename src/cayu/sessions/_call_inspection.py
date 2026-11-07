@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -455,7 +455,16 @@ _TOOL_EXECUTION_TERMINAL_TYPES = frozenset(
 )
 
 
-def tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
+# A tool call's runner commands come from these, joined to it by call identity.
+RUNNER_INSPECTION_EVENT_TYPES = (EventType.RUNNER_EXEC_COMPLETED,)
+
+
+def tool_call_rows(
+    records: list[EventRecord],
+    runner_records: Sequence[EventRecord] = (),
+) -> list[dict[str, Any]]:
+    """Paired tool calls; ``runner_records`` (``runner.exec.completed``) list each call's commands."""
+
     starts: dict[_ToolCallKey, EventRecord] = {}
     terminals: dict[_ToolCallKey, EventRecord] = {}
     approval_requests: dict[_ToolCallKey, EventRecord] = {}
@@ -813,6 +822,14 @@ def tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         round_key = (model_step_id or "", model_attempt_id or "", round_id)
         round_widths[round_key] = round_widths.get(round_key, 0) + 1
 
+    runner_commands: dict[_ToolCallKey, list[dict[str, Any]]] = {}
+    for record in runner_records:
+        call_id = _tool_event_call_id(record)
+        if call_id is not None:
+            runner_commands.setdefault(_tool_call_key(record, call_id), []).append(
+                _runner_command_row(record)
+            )
+
     rows: list[dict[str, Any]] = []
     ordered_call_keys = sorted(
         call_keys,
@@ -999,9 +1016,82 @@ def tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                     if structured is not None and type(structured.get("truncated")) is bool
                     else None
                 ),
+                "runner_commands": [] if evidence_conflict else runner_commands.get(call_key, []),
             }
         )
     return rows
+
+
+def _runner_command_row(record: EventRecord) -> dict[str, Any]:
+    """One runner command of a call: the Runtime's time, and the backend's record if any."""
+
+    payload = record.event.payload
+    backend = payload.get("runner_command")
+    backend = backend if type(backend) is dict else {}
+    accepted_at, started_at, finished_at = (
+        _optional_timestamp(backend.get(field))
+        for field in ("accepted_at", "started_at", "finished_at")
+    )
+    return {
+        "id": _optional_string(backend.get("id")),
+        "adapter": _optional_string(payload.get("adapter")),
+        "completed_at": record.event.timestamp.isoformat(),
+        # What the Runtime waited, from dispatch to the runner's answer.
+        "runtime_ms": _optional_nonnegative_int(payload.get("duration_ms")),
+        "accepted_at": None if accepted_at is None else accepted_at.isoformat(),
+        "started_at": None if started_at is None else started_at.isoformat(),
+        "finished_at": None if finished_at is None else finished_at.isoformat(),
+        # The backend's own times: accepted to finished, accepted to started
+        # (waiting for the machine), started to finished (the command itself).
+        "backend_ms": _elapsed_ms(accepted_at, finished_at),
+        "queue_ms": _elapsed_ms(accepted_at, started_at),
+        "run_ms": _elapsed_ms(started_at, finished_at),
+    }
+
+
+def _optional_timestamp(value: object) -> datetime | None:
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _elapsed_ms(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return max(round((end - start).total_seconds() * 1000), 0)
+
+
+def runner_inspection_record(record: EventRecord) -> EventRecord:
+    """A ``runner.exec.completed`` record cut to what a tool call's command row shows."""
+
+    event = record.event
+    payload = {
+        key: event.payload[key]
+        for key in (
+            "tool_call_id",
+            "model_step_id",
+            "model_attempt_id",
+            "tool_round_id",
+            "adapter",
+            "duration_ms",
+        )
+        if key in event.payload
+    }
+    backend = event.payload.get("runner_command")
+    if type(backend) is dict:
+        payload["runner_command"] = {
+            key: backend[key]
+            for key in ("id", "accepted_at", "started_at", "finished_at")
+            if key in backend
+        }
+    return EventRecord(
+        sequence=record.sequence,
+        event=event.model_copy(update={"payload": payload}),
+    )
 
 
 _ToolCallKey = tuple[str | None, str | None, str | None, str, str | None]
@@ -1187,8 +1277,7 @@ def _duration_ms(
 ) -> int | None:
     if started is None or terminal is None:
         return None
-    duration = terminal.event.timestamp - started.event.timestamp
-    return max(round(duration.total_seconds() * 1000), 0)
+    return _elapsed_ms(started.event.timestamp, terminal.event.timestamp)
 
 
 def bounded_json_summary(value: object, *, max_bytes: int) -> str:
@@ -1725,7 +1814,16 @@ async def inspect_tool_calls(
         before_sequence=window.before_sequence,
         interaction_id=window.interaction_id,
     )
-    calls = tool_call_rows(records)
+    runner_records = await collect_inspection_records(
+        reader,
+        session_id,
+        event_types=RUNNER_INSPECTION_EVENT_TYPES,
+        project_record=runner_inspection_record,
+        after_sequence=window.after_sequence,
+        before_sequence=window.before_sequence,
+        interaction_id=window.interaction_id,
+    )
+    calls = tool_call_rows(records, runner_records)
     page = calls[offset : offset + limit]
     next_offset = offset + len(page)
     has_more = next_offset < len(calls)

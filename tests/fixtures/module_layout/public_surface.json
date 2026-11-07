@@ -2980,6 +2980,7 @@
           "RemoteWorkspaceBranchCapability",
           "Runner",
           "RunnerBinaryStreamCapability",
+          "RunnerCommandRecord",
           "RunnerExecutionAdmissionObserver",
           "RunnerExecutionError",
           "RunnerInteractiveProcess",

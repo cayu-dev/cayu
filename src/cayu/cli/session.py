@@ -1974,7 +1974,11 @@ async def _session_tools(args: argparse.Namespace, reader: SessionReader) -> int
     _render_collection(
         args.output_format,
         payload,
-        page,
+        (
+            [{**call, "runner_commands": _runner_commands_cell(call)} for call in page]
+            if args.output_format == "table"
+            else page
+        ),
         headers=(
             "sequence",
             "tool",
@@ -1995,9 +1999,34 @@ async def _session_tools(args: argparse.Namespace, reader: SessionReader) -> int
             "artifact_bytes",
             "returned",
             "truncated",
+            "runner_commands",
         ),
     )
     return 0
+
+
+def _runner_commands_cell(call: dict[str, Any]) -> str | None:
+    """A call's runner commands in one cell: each id (or runner), then its times."""
+
+    commands = call.get("runner_commands")
+    if not isinstance(commands, list) or not commands:
+        return None
+    cells = []
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        times = " ".join(
+            f"{label}={command[field]}ms"
+            for label, field in (
+                ("runtime", "runtime_ms"),
+                ("backend", "backend_ms"),
+                ("queue", "queue_ms"),
+                ("run", "run_ms"),
+            )
+            if command.get(field) is not None
+        )
+        cells.append(f"{command.get('id') or command.get('adapter') or '-'} {times}".strip())
+    return "; ".join(cells) or None
 
 
 async def _session_events(args: argparse.Namespace, reader: SessionReader) -> int:

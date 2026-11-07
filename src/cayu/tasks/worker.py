@@ -1142,13 +1142,13 @@ async def run_task_worker(
                     maximum_active_s=lease_seconds,
                 )
             except BaseException as claim_failure:
-                # The claim may have committed with its acknowledgement lost.
+                # A lost acknowledgement carries no authority to release a claim.
                 if claim_dispatched:
                     await release_unstarted_claims(
                         task_store,
                         worker_id,
                         claim_failure,
-                        claims=claimed_by_call or (None if concurrency == 1 else []),
+                        claims=claimed_by_call,
                     )
                 raise
             task = claim.value

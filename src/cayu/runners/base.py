@@ -8,6 +8,7 @@ import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -965,8 +966,32 @@ def copy_exec_command(command: ExecCommand) -> ExecCommand:
     _raise_clean_command_validation_failure(validation_failure)
 
 
+class RunnerCommandRecord(BaseModel):
+    """A backend's own record of one command, for a runner whose backend keeps one.
+
+    ``id`` is the backend's id for the command, such as a sandbox broker's
+    command id, so a command can be found in the backend's records.
+    ``accepted_at`` is when the backend took the request, ``started_at``
+    when it handed the command to the machine that runs it, and
+    ``finished_at`` when the command ended; each is ``None`` when the backend
+    doesn't report it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1, max_length=256)
+    accepted_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class ExecResult(BaseModel):
-    """Observed command outcome, including bounded capture and full byte totals."""
+    """Observed command outcome, including bounded capture and full byte totals.
+
+    ``runner_command`` is the backend's record of the command when the runner
+    has one (see ``RunnerCommandRecord``). It stays in process: serializing a
+    result leaves it out.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -980,6 +1005,7 @@ class ExecResult(BaseModel):
     stdout_bytes: StrictInt | None = Field(default=None, ge=0)
     stderr_bytes: StrictInt | None = Field(default=None, ge=0)
     artifacts: list[dict] = Field(default_factory=list)
+    runner_command: RunnerCommandRecord | None = Field(default=None, exclude=True)
 
     @field_validator("artifacts", mode="before")
     @classmethod

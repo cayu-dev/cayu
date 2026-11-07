@@ -3915,6 +3915,133 @@
         "title": "ApiSessionOutcome",
         "type": "object"
       },
+      "ApiSessionRunnerCommand": {
+        "additionalProperties": false,
+        "description": "One runner command a tool call ran, from its `runner.exec.completed` event.\n\n`runtime_ms` is how long the Runtime waited for the runner. When the\nrunner's backend keeps its own record of the command, such as a sandbox\nbroker, `id` is the backend's command id and the times are the backend's:\n`accepted_at` when it took the request, `started_at` when it handed the\ncommand to the machine that runs it, `finished_at` when the command ended,\nwith `backend_ms`, `queue_ms` and `run_ms` between them.",
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "backend_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backend Ms"
+          },
+          "completed_at": {
+            "title": "Completed At",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "queue_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Queue Ms"
+          },
+          "run_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Ms"
+          },
+          "runtime_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Ms"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          }
+        },
+        "required": [
+          "id",
+          "adapter",
+          "completed_at",
+          "runtime_ms",
+          "accepted_at",
+          "started_at",
+          "finished_at",
+          "backend_ms",
+          "queue_ms",
+          "run_ms"
+        ],
+        "title": "ApiSessionRunnerCommand",
+        "type": "object"
+      },
       "ApiSessionSummaryItem": {
         "additionalProperties": false,
         "properties": {
@@ -4037,6 +4164,13 @@
               }
             ],
             "title": "Returned"
+          },
+          "runner_commands": {
+            "items": {
+              "$ref": "#/components/schemas/ApiSessionRunnerCommand"
+            },
+            "title": "Runner Commands",
+            "type": "array"
           },
           "sequence": {
             "minimum": 1.0,

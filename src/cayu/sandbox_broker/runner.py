@@ -43,6 +43,7 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerCommandRecord,
     RunnerExecutionAdmissionObserver,
     RunnerInteractiveProcess,
     RunnerInteractiveProcessCapability,
@@ -448,6 +449,12 @@ class BrokeredSandboxRunner(Runner):
             artifacts=[_kill_receipt("completed")] if killed else [],
             stdout_truncated=finished.stdout_truncated or stdout_cut,
             stderr_truncated=finished.stderr_truncated or stderr_cut,
+            runner_command=RunnerCommandRecord(
+                id=command_id,
+                accepted_at=finished.started_at,
+                started_at=finished.dispatched_at,
+                finished_at=finished.finished_at,
+            ),
         )
 
     async def put_archive(

@@ -570,7 +570,10 @@ class SandboxCommand(BaseModel):
     stderr: str = ""
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    #: When the broker accepted the command.
     started_at: datetime | None = None
+    #: When the broker handed it to the sandbox; brokers that don't report it leave it out.
+    dispatched_at: datetime | None = None
     finished_at: datetime | None = None
     duration_ms: int | None = None
     interactive: bool = False

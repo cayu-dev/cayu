@@ -54,6 +54,7 @@ from cayu.runners.base import ExecResult as ExecResult
 from cayu.runners.base import RemoteWorkspaceBranchCapability as RemoteWorkspaceBranchCapability
 from cayu.runners.base import Runner as Runner
 from cayu.runners.base import RunnerBinaryStreamCapability as RunnerBinaryStreamCapability
+from cayu.runners.base import RunnerCommandRecord as RunnerCommandRecord
 from cayu.runners.base import RunnerExecutionAdmissionObserver as RunnerExecutionAdmissionObserver
 from cayu.runners.base import RunnerExecutionError as RunnerExecutionError
 from cayu.runners.base import RunnerInteractiveProcess as RunnerInteractiveProcess

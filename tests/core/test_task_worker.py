@@ -460,6 +460,66 @@ def test_task_worker_revalidates_before_dispatch_after_delayed_claim_acknowledge
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("replace_claim", [False, True])
+def test_lost_claim_acknowledgement_does_not_release_discovered_authority(replace_claim) -> None:
+    async def scenario() -> None:
+        store_time = [datetime(2026, 9, 1, tzinfo=UTC)]
+
+        class LostAcknowledgementStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            def __init__(self) -> None:
+                super().__init__(ownership_clock=lambda: store_time[0])
+                self.claim_committed = asyncio.Event()
+                self.fail_acknowledgement = asyncio.Event()
+
+            async def claim_task(self, worker_id, query=None, *, lease_seconds=300):
+                await super().claim_task(worker_id, query, lease_seconds=lease_seconds)
+                self.claim_committed.set()
+                await self.fail_acknowledgement.wait()
+                raise ConnectionError("claim response lost")
+
+        store = LostAcknowledgementStore()
+        await store.create_task(TaskCreate(task_id="lost-claim", type="job"))
+        app = CayuApp(task_store=store, enable_logging=False)
+        dispatched = []
+
+        async def handler(*args):
+            dispatched.append(True)
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="shared-worker",
+                lease_seconds=60,
+                reclaim=False,
+                max_tasks=1,
+            )
+        )
+        await asyncio.wait_for(store.claim_committed.wait(), timeout=5)
+        if replace_claim:
+            store_time[0] += timedelta(seconds=61)
+            await store.reclaim_expired()
+            replacement = await InMemoryTaskStore.claim_task(
+                store,
+                "shared-worker",
+                lease_seconds=60,
+            )
+            assert replacement is not None
+        expected = await store.load_task("lost-claim")
+        store.fail_acknowledgement.set()
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(worker, timeout=5)
+        current = await store.load_task("lost-claim")
+        assert current == expected
+        assert current.status is TaskStatus.CLAIMED
+        assert not dispatched
+
+    asyncio.run(scenario())
+
+
 def test_task_worker_rejects_heartbeat_acknowledged_after_its_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

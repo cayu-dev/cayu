@@ -3365,8 +3365,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     runner_policy = _observed_policy(
         "adapter approval_id cancelled command duration_ms error error_type execution_id execution_profile_fingerprint "
-        "exit_code idempotency_key input_id model_attempt_id model_step_id timed_out tool_call_id "
-        "tool_round_id",
+        "exit_code idempotency_key input_id model_attempt_id model_step_id runner_command timed_out "
+        "tool_call_id tool_round_id",
+        # The backend's own record of the command (RunnerCommandRecord).
+        owned_nested_paths={
+            ("runner_command", field)
+            for field in ("id", "accepted_at", "started_at", "finished_at")
+        },
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={"command"},

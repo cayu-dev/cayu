@@ -67,7 +67,9 @@ reruns the scenario in a fresh event loop for each point and fault:
   durable transcript indexes run `0..cursor-1`, and every tool result follows
   its call.
 - `task-held-by-exited-worker`: no task stays `claimed` or `running` after its
-  worker has returned or died, and the second worker settles it in recovery.
+  worker has returned or died, except an unstarted claim with a live lease whose
+  acknowledgement was lost to cancellation. That claim awaits lease expiry;
+  the second worker must settle every task in recovery.
 - `task-outcome-disagrees-with-session`: a task completes exactly when its
   linked session completes.
 - `task-group-execution-obligation-unsettled`: every execution a quiescent task

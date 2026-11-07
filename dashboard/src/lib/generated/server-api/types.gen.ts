@@ -1917,6 +1917,61 @@ export type ApiSessionOutcome = {
 };
 
 /**
+ * ApiSessionRunnerCommand
+ *
+ * One runner command a tool call ran, from its `runner.exec.completed` event.
+ *
+ * `runtime_ms` is how long the Runtime waited for the runner. When the
+ * runner's backend keeps its own record of the command, such as a sandbox
+ * broker, `id` is the backend's command id and the times are the backend's:
+ * `accepted_at` when it took the request, `started_at` when it handed the
+ * command to the machine that runs it, `finished_at` when the command ended,
+ * with `backend_ms`, `queue_ms` and `run_ms` between them.
+ */
+export type ApiSessionRunnerCommand = {
+    /**
+     * Accepted At
+     */
+    accepted_at: string | null;
+    /**
+     * Adapter
+     */
+    adapter: string | null;
+    /**
+     * Backend Ms
+     */
+    backend_ms: number | null;
+    /**
+     * Completed At
+     */
+    completed_at: string;
+    /**
+     * Finished At
+     */
+    finished_at: string | null;
+    /**
+     * Id
+     */
+    id: string | null;
+    /**
+     * Queue Ms
+     */
+    queue_ms: number | null;
+    /**
+     * Run Ms
+     */
+    run_ms: number | null;
+    /**
+     * Runtime Ms
+     */
+    runtime_ms: number | null;
+    /**
+     * Started At
+     */
+    started_at: string | null;
+};
+
+/**
  * ApiSessionSummaryItem
  */
 export type ApiSessionSummaryItem = {
@@ -1976,6 +2031,10 @@ export type ApiSessionToolCall = {
      * Returned
      */
     returned: number | null;
+    /**
+     * Runner Commands
+     */
+    runner_commands?: Array<ApiSessionRunnerCommand>;
     /**
      * Sequence
      */

@@ -593,7 +593,21 @@ async def run_case(scenario: Scenario, fault: FaultKind | None, point: str | Non
         record(stage, await bounded(stage, store_violations(world.store), _CHECK_TIMEOUT_S) or [])
         if world.tasks is not None:
             found = await bounded(
-                stage, task_violations(world.tasks, world.store), _CHECK_TIMEOUT_S
+                stage,
+                task_violations(
+                    world.tasks,
+                    world.store,
+                    unacknowledged_at=(
+                        world.clock()
+                        if stage in {Stage.LIVE, Stage.AFTER_SHUTDOWN}
+                        and fault in {FaultKind.CANCEL, FaultKind.GROUPED_CANCEL}
+                        and injector.fired is not None
+                        and point is not None
+                        and point.startswith("store.claim_task:")
+                        else None
+                    ),
+                ),
+                _CHECK_TIMEOUT_S,
             )
             record(stage, found or [])
             if recovery is not None:

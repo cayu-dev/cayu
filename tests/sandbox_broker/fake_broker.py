@@ -100,6 +100,7 @@ class FakeCommand:
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "started_at": "2026-10-18T12:00:00Z",
+            "dispatched_at": "2026-10-18T12:00:00.250000Z",
             "finished_at": None if self.status == "running" else "2026-10-18T12:00:01Z",
             "duration_ms": 1,
             "interactive": self.interactive,

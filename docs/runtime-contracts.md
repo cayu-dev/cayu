@@ -14156,6 +14156,13 @@ host Python errno table, never from exception messages or custom attributes;
 an unrecognized numeric errno retains its number with a null symbolic code.
 These are host OS codes, not an inferred guest exit status or historical cause.
 
+A runner whose backend keeps its own record of each command returns it on
+`ExecResult.runner_command`, a `RunnerCommandRecord` with the backend's command `id`
+and its `accepted_at`, `started_at` and `finished_at` times. It stays in process:
+serializing a result leaves it out. `runner.exec.completed` then carries it as
+`runner_command`, with the times as ISO 8601 strings, so the event links to the
+backend's record. `BrokeredSandboxRunner` fills it from the broker's command record.
+
 Execution phases are the fixed values `launch`, `transport`, `stream_handling`,
 `process_wait`, `filesystem`, `cleanup`, and `unknown`. Only a boundary that
 knows the operation tags it: the shared subprocess path identifies host process

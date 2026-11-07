@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 from cayu._exception_groups import iter_exception_tree
 from cayu.runtime._run_exit import RunExitKind, classify_run_exit
 from cayu.tasks._execution_settlement import has_task_execution_settlement_pending
-from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 
 if TYPE_CHECKING:
@@ -105,7 +104,7 @@ async def release_unstarted_claims(
     worker_id: str,
     failure: BaseException,
     *,
-    claims: list[UnstartedClaim] | None,
+    claims: list[UnstartedClaim],
 ) -> None:
     """Return claims this worker holds but never started to the queue.
 
@@ -116,8 +115,8 @@ async def release_unstarted_claims(
     started, is released, shielded from the caller's cancellation. ``claims``
     names the claims this worker's claim calls returned, and only that claim (a
     lease this worker was acknowledged for it) is released: a newer claim under
-    the same worker id belongs to its own owner. ``None`` scans this worker's claims, which only
-    an owner that runs one claim at a time may do. A process-level stop is left
+    the same worker id belongs to its own owner. Unacknowledged claims are left
+    to lease expiry because their authority cannot be recovered by worker id. A process-level stop is left
     to lease expiry, and a claim whose execution entry is still pending stays
     with that entry's settlement owner.
     """
@@ -132,18 +131,7 @@ async def release_unstarted_claims(
         return
 
     async def release() -> None:
-        candidates = (
-            [
-                UnstartedClaim.of(task)
-                for task in await task_store.list_tasks(
-                    TaskQuery(status=TaskStatus.CLAIMED, limit=1000)
-                )
-                if task.worker_id == worker_id
-            ]
-            if claims is None
-            else claims
-        )
-        for candidate in candidates:
+        for candidate in claims:
             current = await task_store.load_task(candidate.task_id)
             if (
                 current is None

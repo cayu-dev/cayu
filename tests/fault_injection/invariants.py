@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from cayu.events import EventType
@@ -134,17 +135,28 @@ async def transcript_violations(store: SessionStore, session_id: str) -> list[tu
     return violations
 
 
-async def task_violations(tasks: TaskStore, store: SessionStore) -> list[tuple[str, str]]:
+async def task_violations(
+    tasks: TaskStore, store: SessionStore, *, unacknowledged_at: datetime | None = None
+) -> list[tuple[str, str]]:
     """Tasks held by a worker that has exited, or settled unlike their session.
 
     Every check runs after the phase's worker has returned or died, so a claimed
     or running task still names an owner that no longer exists. A task whose
     linked session completed must have completed with it, and the reverse.
+    An unacknowledged, unstarted claim may await its live lease expiry; recovery
+    checks pass no exception and require that a second worker settles it.
     """
 
     violations: list[tuple[str, str]] = []
     for task in await tasks.list_tasks():
-        if task.status in _HELD_TASK_STATUSES:
+        awaiting_expiry = (
+            unacknowledged_at is not None
+            and task.status is TaskStatus.CLAIMED
+            and task.started_at is None
+            and task.lease_expires_at is not None
+            and task.lease_expires_at > unacknowledged_at
+        )
+        if task.status in _HELD_TASK_STATUSES and not awaiting_expiry:
             violations.append(
                 (
                     Invariant.TASK_UNSETTLED,
