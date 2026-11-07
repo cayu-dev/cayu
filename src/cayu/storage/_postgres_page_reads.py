@@ -6,6 +6,7 @@ for every session of the page. Session IDs travel as one text array parameter.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from typing import Any, LiteralString, cast
 
@@ -14,8 +15,20 @@ from cayu.events import Event, EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
 from cayu.sessions.event_delivery import restore_persisted_event_authority
-from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, SessionStepCounts, session_status_outcome
+from cayu.sessions.records import (
+    EventRecord,
+    Session,
+    SessionLineage,
+    SessionStatus,
+    TranscriptRecord,
+    stored_session_lineage,
+)
+from cayu.sessions.summaries import (
+    SessionEventPositions,
+    SessionOutcome,
+    SessionStepCounts,
+    session_status_outcome,
+)
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_session_queries import load_session_labels_batch
@@ -40,10 +53,13 @@ async def load_sessions(cur: Any, session_ids: Sequence[str]) -> dict[str, Sessi
     )
     rows = await cur.fetchall()
     labels = await load_session_labels_batch(cur, [row[0] for row in rows])
-    by_id = {
-        row[0]: pg_support.session_from_row(row, labels=labels.get(row[0], {})) for row in rows
-    }
+    # A page's rows are decoded and validated off the event loop.
+    by_id = await asyncio.to_thread(_sessions_from_rows, rows, labels)
     return {session_id: by_id[session_id] for session_id in session_ids if session_id in by_id}
+
+
+def _sessions_from_rows(rows: list[Any], labels: dict[str, dict[str, str]]) -> dict[str, Session]:
+    return {row[0]: pg_support.session_from_row(row, labels=labels.get(row[0], {})) for row in rows}
 
 
 async def load_checkpoints(cur: Any, session_ids: Sequence[str]) -> dict[str, Any]:
@@ -67,6 +83,22 @@ async def load_session_instance_ids(cur: Any, session_ids: Sequence[str]) -> dic
         (list(session_ids),),
     )
     found = {row[0]: row[1] for row in await cur.fetchall()}
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+async def load_session_lineages(cur: Any, session_ids: Sequence[str]) -> dict[str, SessionLineage]:
+    if not session_ids:
+        return {}
+    await cur.execute(
+        "SELECT id, instance_id, parent_session_id, invocation->>'source', "
+        "metadata ? 'cayu:run_lineage', metadata->'cayu:run_lineage' "
+        "FROM cayu_sessions WHERE id = ANY(%s::text[])",
+        (list(session_ids),),
+    )
+    found = {
+        row[0]: stored_session_lineage(row[0], row[1], row[2], row[3], row[4], row[5])
+        for row in await cur.fetchall()
+    }
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
@@ -155,6 +187,30 @@ async def count_session_steps(cur: Any, session_ids: Sequence[str]) -> dict[str,
     )
     found = {
         row[0]: SessionStepCounts(model_steps=int(row[1]), tool_calls=int(row[2]))
+        for row in await cur.fetchall()
+    }
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+async def summarize_event_positions(
+    cur: Any, session_ids: Sequence[str], event_types: Sequence[EventType]
+) -> dict[str, SessionEventPositions]:
+    if not session_ids:
+        return {}
+    await cur.execute(
+        """
+        SELECT cayu_sessions.id, COUNT(cayu_events.sequence), COALESCE(MAX(cayu_events.sequence), 0)
+        FROM cayu_sessions
+        LEFT JOIN cayu_events
+            ON cayu_events.session_id = cayu_sessions.id
+            AND cayu_events.event_type = ANY(%s::text[])
+        WHERE cayu_sessions.id = ANY(%s::text[])
+        GROUP BY cayu_sessions.id
+        """,
+        ([str(event_type) for event_type in event_types], list(session_ids)),
+    )
+    found = {
+        row[0]: SessionEventPositions(count=int(row[1]), last_sequence=int(row[2]))
         for row in await cur.fetchall()
     }
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}

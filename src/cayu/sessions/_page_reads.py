@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     )
     from cayu.sessions.records import EventRecord, Session
     from cayu.sessions.store import SessionStore
-    from cayu.sessions.summaries import SessionOutcome, SessionStepCounts
+    from cayu.sessions.summaries import SessionEventPositions, SessionOutcome, SessionStepCounts
     from cayu.sessions.transcript_queries import TranscriptRecord
 
 # One overview page holds at most this many sessions (the session list limit).
@@ -147,6 +147,39 @@ async def count_session_steps_one_by_one(
             tool_calls=by_type.get(str(EventType.TOOL_CALL_STARTED), 0),
         )
     return counts
+
+
+async def summarize_event_positions_one_by_one(
+    store: SessionStore, session_ids: Sequence[str], event_types: Sequence[EventType]
+) -> dict[str, SessionEventPositions]:
+    from cayu.sessions.event_queries import EventOrder, EventQuery
+    from cayu.sessions.summaries import SessionEventPositions
+
+    types = tuple(event_types)
+    page = page_session_ids(session_ids)
+    found = await store.load_session_instance_ids(page)
+    positions: dict[str, SessionEventPositions] = {}
+    for session_id in page:
+        if session_id not in found:
+            continue
+        count = last = 0
+        after = 0
+        while True:
+            heads = await store.query_event_heads(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=types,
+                    after_sequence=after,
+                    limit=5000,
+                    order_by=EventOrder.SEQUENCE_ASC,
+                )
+            )
+            if not heads:
+                break
+            count += len(heads)
+            last = after = heads[-1].sequence
+        positions[session_id] = SessionEventPositions(count=count, last_sequence=last)
+    return positions
 
 
 async def summarize_outcomes_one_by_one(

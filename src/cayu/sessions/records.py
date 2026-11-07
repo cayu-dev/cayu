@@ -46,6 +46,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     execution_profile_from_session_metadata,
 )
 from cayu.sessions.invocation import (
+    SessionExecutionSource,
     SessionInvocation,
     SessionInvocationBinding,
     copy_session_invocation,
@@ -219,6 +220,75 @@ class EventHead:
     def of(cls, record: EventRecord) -> EventHead:
         event = record.event
         return cls(record.sequence, event.session_id, event.id, event.type, event.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLineage:
+    """Which session a session runs under, without the rest of its row.
+
+    ``run_lineage`` is the value its metadata holds under the run-lineage key,
+    and ``has_run_lineage`` whether the metadata holds that key at all, as a
+    loaded ``Session`` gives them.
+    """
+
+    id: str
+    instance_id: str
+    parent_session_id: str | None
+    source: SessionExecutionSource
+    has_run_lineage: bool
+    run_lineage: Any = None
+
+    @classmethod
+    def of(cls, session: Session) -> SessionLineage:
+        from cayu.session_metadata import RUN_LINEAGE_METADATA_KEY
+
+        return cls(
+            id=session.id,
+            instance_id=session.instance_id,
+            parent_session_id=session.parent_session_id,
+            source=session.invocation.source,
+            has_run_lineage=RUN_LINEAGE_METADATA_KEY in session.metadata,
+            run_lineage=copy_durable_json_value(
+                session.metadata.get(RUN_LINEAGE_METADATA_KEY), "run_lineage"
+            ),
+        )
+
+    @property
+    def run_id(self) -> str:
+        """The incarnation's run identity, as ``session_run_id`` names it."""
+
+        from cayu.sessions._run_identity import incarnation_run_id
+
+        return incarnation_run_id(self.id, self.instance_id)
+
+    @property
+    def parent_run_id(self) -> str | None:
+        """The retained parent run, as ``session_run_lineage`` reads it."""
+
+        marker = self.run_lineage
+        if not isinstance(marker, dict) or marker.get("is_root") is True:
+            return None
+        return marker["parent_run_id"]
+
+
+def stored_session_lineage(
+    session_id: str,
+    instance_id: str,
+    parent_session_id: str | None,
+    source: str,
+    has_run_lineage: bool,
+    run_lineage: object,
+) -> SessionLineage:
+    """A lineage from stored columns, as a loaded ``Session`` gives it."""
+
+    return SessionLineage(
+        id=session_id,
+        instance_id=instance_id,
+        parent_session_id=parent_session_id,
+        source=SessionExecutionSource(source),
+        has_run_lineage=bool(has_run_lineage),
+        run_lineage=copy_durable_json_value(run_lineage, "run_lineage"),
+    )
 
 
 _EVENT_TIMESTAMP = TypeAdapter(datetime)

@@ -15,8 +15,20 @@ from cayu._validation import DurableValueError
 from cayu.events import EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
-from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, SessionStepCounts, session_status_outcome
+from cayu.sessions.records import (
+    EventRecord,
+    Session,
+    SessionLineage,
+    SessionStatus,
+    TranscriptRecord,
+    stored_session_lineage,
+)
+from cayu.sessions.summaries import (
+    SessionEventPositions,
+    SessionOutcome,
+    SessionStepCounts,
+    session_status_outcome,
+)
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript_content as transcript_content
 
@@ -99,6 +111,28 @@ def load_session_instance_ids(
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
+def load_session_lineages(
+    connection: sqlite3.Connection, session_ids: Sequence[str]
+) -> dict[str, SessionLineage]:
+    if not session_ids:
+        return {}
+    rows = connection.execute(
+        "SELECT id, instance_id, parent_session_id, "
+        "json_extract(invocation_json, '$.source'), "
+        "json_type(metadata_json, '$.\"cayu:run_lineage\"') IS NOT NULL, "
+        "json_quote(json_extract(metadata_json, '$.\"cayu:run_lineage\"')) "
+        f"FROM cayu_sessions WHERE id IN ({_PAGE_IDS})",
+        (_ids(session_ids),),
+    ).fetchall()
+    found = {
+        row[0]: stored_session_lineage(
+            row[0], row[1], row[2], row[3], row[4], None if row[5] is None else json.loads(row[5])
+        )
+        for row in rows
+    }
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
 def load_checkpoint_fields(
     connection: sqlite3.Connection, session_ids: Sequence[str], keys: Sequence[str]
 ) -> dict[str, dict[str, Any]]:
@@ -165,6 +199,30 @@ def count_session_steps(
         row["id"]: SessionStepCounts(model_steps=row["model_steps"], tool_calls=row["tool_calls"])
         for row in rows
     }
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
+
+
+def summarize_event_positions(
+    connection: sqlite3.Connection, session_ids: Sequence[str], event_types: Sequence[EventType]
+) -> dict[str, SessionEventPositions]:
+    if not session_ids:
+        return {}
+    rows = connection.execute(
+        f"""
+        SELECT cayu_sessions.id, COUNT(cayu_events.sequence), COALESCE(MAX(cayu_events.sequence), 0)
+        FROM cayu_sessions
+        LEFT JOIN cayu_events
+            ON cayu_events.session_id = cayu_sessions.id
+            AND cayu_events.event_type IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        WHERE cayu_sessions.id IN ({_PAGE_IDS})
+        GROUP BY cayu_sessions.id
+        """,
+        (
+            sqlite_records.json_dumps([str(event_type) for event_type in event_types]),
+            _ids(session_ids),
+        ),
+    ).fetchall()
+    found = {row[0]: SessionEventPositions(count=row[1], last_sequence=row[2]) for row in rows}
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 

@@ -14,11 +14,12 @@ or question, so a resolution's request is the nearest matching request before it
 
 from __future__ import annotations
 
+import asyncio
 import re
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import ValidationError
 
@@ -65,6 +66,7 @@ from cayu.sessions.supervision_events import (
 if TYPE_CHECKING:
     from cayu.sessions.store import SessionStore
 
+_T = TypeVar("_T")
 _EVIDENCE_PAGE_LIMIT = 50
 _EVIDENCE_LOOKUP_PAGES = 20
 _CANDIDATE_BATCH_LIMIT = 500
@@ -115,6 +117,13 @@ class _SessionEvidence:
         self._store = store
         self._sessions: dict[str, Session | None] = {}
         self._forked: dict[str, bool] = {}
+        self._batch: _EvidenceReadBatch | None = None
+
+    def adopt(self, sessions: Mapping[str, Session]) -> None:
+        """Use rows the caller already read, as ``preload`` would have read them."""
+
+        for session_id, session in sessions.items():
+            self._sessions.setdefault(session_id, session)
 
     async def preload(self, session_ids: Iterable[str]) -> None:
         """Load every session not yet loaded with one store read."""
@@ -133,6 +142,26 @@ class _SessionEvidence:
         if session_id not in self._sessions:
             self._sessions[session_id] = await self._store.load(session_id)
         return self._sessions[session_id]
+
+    async def preload_forked(self, session_ids: Iterable[str]) -> None:
+        """Settle ``forked`` for several sessions, reading their fork events together."""
+
+        pending: list[str] = []
+        for session_id in dict.fromkeys(session_ids):
+            if session_id in self._forked:
+                continue
+            session = await self.session(session_id)
+            if (
+                session is not None
+                and (await resolve_fork_lineage_async(session, self.session)).forked
+            ):
+                self._forked[session_id] = True
+            else:
+                pending.append(session_id)
+        if pending:
+            forks = await self._store.query_latest_events(pending, (EventType.SESSION_FORKED,))
+            for session_id in pending:
+                self._forked[session_id] = session_id in forks
 
     async def forked(self, session_id: str) -> bool:
         """Whether the session is in a forked lineage: a fork or created under one.
@@ -252,7 +281,11 @@ class _SessionEvidence:
 
     async def _page(self, query: EventQuery) -> list[EventRecord]:
         try:
-            return await self._store.query_events_bounded(query, max_bytes=_EVIDENCE_READ_MAX_BYTES)
+            if self._batch is None:
+                return await self._store.query_events_bounded(
+                    query, max_bytes=_EVIDENCE_READ_MAX_BYTES
+                )
+            return await self._batch.read(query)
         except EventQueryResultTooLarge:
             if query.limit == 1:
                 raise SupervisionEventResultTooLarge(
@@ -377,7 +410,10 @@ async def supervision_page_with_anchors(
 
 
 async def classify_supervision_anchors(
-    store: SessionStore, anchors: Iterable[EventHead]
+    store: SessionStore,
+    anchors: Iterable[EventHead],
+    *,
+    sessions: Mapping[str, Session] | None = None,
 ) -> list[tuple[Session, SupervisionEvent]]:
     """Classify scanned anchors into touches without content, in scan order.
 
@@ -386,37 +422,54 @@ async def classify_supervision_anchors(
     touch has exactly one anchor, so a reader that passes every anchor of a
     range of the store's sequence once sees each touch in that range once.
     Session rows and the final incarnation check are read once for all anchors.
+    ``sessions`` are rows the caller read after the anchors' events; they are
+    used instead of reading those rows again.
     """
 
     anchors = list(anchors)
     evidence = _SessionEvidence(store)
+    evidence.adopt(sessions or {})
     await evidence.preload(anchor.session_id for anchor in anchors)
-    classified: list[tuple[Session, SupervisionEvent]] = []
-    for anchor in anchors:
+    live = [anchor for anchor in anchors if await evidence.session(anchor.session_id) is not None]
+    retained = await _retained_anchor_records(store, live)
+    await evidence.preload_forked(anchor.session_id for anchor in live)
+    pending: list[tuple[Session, EventRecord]] = []
+    for anchor in live:
         session = await evidence.session(anchor.session_id)
-        if session is None:
-            continue
+        assert session is not None
         # The scan can race deletion and reuse of a session ID. The anchor
         # must still belong to the incarnation we just loaded, not its old row.
-        retained = await store.query_events(
-            EventQuery(
-                session_id=session.id,
-                event_id=anchor.event_id,
-                after_sequence=anchor.sequence - 1,
-                limit=1,
-            )
-        )
-        if not retained or retained[0].sequence != anchor.sequence:
+        record = retained.get(anchor.sequence)
+        if (
+            record is None
+            or record.event.session_id != session.id
+            or record.event.id != anchor.event_id
+        ):
             continue
-        event = await _classify(
-            retained[0],
-            session=session,
-            forked=await evidence.forked(session.id),
-            evidence=evidence,
-            content=False,
-        )
-        if event is not None:
-            classified.append((session, event))
+        pending.append((session, record))
+
+    def classify(session: Session, record: EventRecord) -> Callable[[], Awaitable[Any]]:
+        async def call() -> SupervisionEvent | None:
+            return await _classify(
+                record,
+                session=session,
+                forked=await evidence.forked(session.id),
+                evidence=evidence,
+                content=False,
+            )
+
+        return call
+
+    batch = evidence._batch = _EvidenceReadBatch(store)
+    try:
+        events = await batch.run([classify(session, record) for session, record in pending])
+    finally:
+        evidence._batch = None
+    classified = [
+        (session, event)
+        for (session, _), event in zip(pending, events, strict=True)
+        if event is not None
+    ]
     if not classified:
         return []
     # Classification read evidence after the rows; a session replaced since
@@ -429,6 +482,125 @@ async def classify_supervision_anchors(
         for session, event in classified
         if current.get(session.id) == session.instance_id
     ]
+
+
+class _EvidenceReadBatch:
+    """Classify several anchors at once, sending their evidence reads together.
+
+    Each anchor is classified as on its own, in its own task. A read waits
+    until every unfinished task is waiting on one, then all waiting reads go to
+    the store in one ``query_events_bounded_many`` call. A page then costs one
+    store call per round of lookups, not one per lookup of every touch.
+    """
+
+    def __init__(self, store: SessionStore) -> None:
+        self._store = store
+        self._waiting: list[tuple[EventQuery, asyncio.Future[list[EventRecord]]]] = []
+        self._running = 0
+        self._all_waiting = asyncio.Event()
+
+    async def read(self, query: EventQuery) -> list[EventRecord]:
+        future: asyncio.Future[list[EventRecord]] = asyncio.get_running_loop().create_future()
+        self._waiting.append((query, future))
+        self._running -= 1
+        if self._running == 0:
+            self._all_waiting.set()
+        return await future
+
+    async def run(self, calls: Sequence[Callable[[], Awaitable[_T]]]) -> list[_T]:
+        """Run every call to completion, in its own task; results in call order."""
+
+        async def tracked(call: Callable[[], Awaitable[_T]]) -> _T:
+            try:
+                return await call()
+            finally:
+                self._running -= 1
+                if self._running == 0:
+                    self._all_waiting.set()
+
+        self._running = len(calls)
+        tasks = [asyncio.ensure_future(tracked(call)) for call in calls]
+        try:
+            while not all(task.done() for task in tasks):
+                waiter = asyncio.ensure_future(self._all_waiting.wait())
+                try:
+                    await asyncio.wait(
+                        {waiter, *(task for task in tasks if not task.done())},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    waiter.cancel()
+                for task in tasks:
+                    if task.done() and (error := task.exception()) is not None:
+                        raise error
+                if self._running == 0 and self._waiting:
+                    await self._flush()
+            return [task.result() for task in tasks]
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for _, future in self._waiting:
+                future.cancel()
+
+    async def _flush(self) -> None:
+        batch, self._waiting = self._waiting, []
+        self._all_waiting.clear()
+        results = await self._store.query_events_bounded_many(
+            [query for query, _ in batch], max_bytes=_EVIDENCE_READ_MAX_BYTES
+        )
+        if len(results) != len(batch):
+            raise RuntimeError("The store answered a batch of evidence reads with another count.")
+        self._running += len(batch)
+        for (_, future), result in zip(batch, results, strict=True):
+            if isinstance(result, EventQueryResultTooLarge):
+                future.set_exception(result)
+            else:
+                future.set_result(result)
+
+
+async def _retained_anchor_records(
+    store: SessionStore, anchors: Sequence[EventHead]
+) -> dict[int, EventRecord]:
+    """The stored record at each anchor's sequence, read for all anchors at once.
+
+    The scan's anchors are every anchor event of their sessions between the
+    first and the last, so one read of those events finds each. An anchor the
+    read does not return, because its session was deleted or the read was cut
+    at its limit, is looked up on its own as before.
+    """
+
+    if not anchors:
+        return {}
+    first = min(anchor.sequence for anchor in anchors)
+    last = max(anchor.sequence for anchor in anchors)
+    records = await store.query_events(
+        EventQuery(
+            session_ids=tuple(dict.fromkeys(anchor.session_id for anchor in anchors)),
+            event_types=SUPERVISION_ANCHOR_EVENT_TYPES,
+            after_sequence=first - 1,
+            before_sequence=last + 1,
+            limit=_RETAINED_ANCHOR_READ_LIMIT,
+        )
+    )
+    found = {record.sequence: record for record in records}
+    for anchor in anchors:
+        if anchor.sequence in found:
+            continue
+        single = await store.query_events(
+            EventQuery(
+                session_id=anchor.session_id,
+                event_id=anchor.event_id,
+                after_sequence=anchor.sequence - 1,
+                limit=1,
+            )
+        )
+        if single and single[0].sequence == anchor.sequence:
+            found[anchor.sequence] = single[0]
+    return found
+
+
+_RETAINED_ANCHOR_READ_LIMIT = 1000
 
 
 def _cursor_audience(origin_tenant: str | None) -> str | None:

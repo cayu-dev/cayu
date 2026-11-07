@@ -301,7 +301,7 @@ from cayu.sessions.event_delivery import (
     _copy_optional_event_id,
     restore_persisted_event_authority,
 )
-from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
 from cayu.sessions.exports import _require_session_export_target
 from cayu.sessions.forks import (
     ForkCheckpointAuthorityDecoder,
@@ -361,6 +361,7 @@ from cayu.sessions.records import (
     Session,
     SessionIdentity,
     SessionInvocationSnapshot,
+    SessionLineage,
     SessionRuntimeIdentity,
     SessionStateSnapshot,
     SessionStatus,
@@ -384,6 +385,7 @@ from cayu.sessions.requests import (
 from cayu.sessions.store import SessionStore
 from cayu.sessions.summaries import (
     EventSummary,
+    SessionEventPositions,
     SessionOperationalSnapshot,
     SessionOutcome,
     SessionStepCounts,
@@ -1656,6 +1658,14 @@ class PostgresSessionStore(
         async with self._connection() as conn, conn.cursor() as cur:
             return await page_read_ops.load_sessions(cur, page)
 
+    async def load_session_lineages(self, session_ids: Sequence[str]) -> dict[str, SessionLineage]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_lineages(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.load_session_lineages(cur, page)
+
     async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
         page = page_reads.page_session_ids(session_ids)
         if await page_reads.page_reads_are_bounded():
@@ -1698,6 +1708,18 @@ class PostgresSessionStore(
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             return await page_read_ops.count_session_steps(cur, page)
+
+    async def summarize_event_positions(
+        self, session_ids: Sequence[str], event_types: Sequence[EventType]
+    ) -> dict[str, SessionEventPositions]:
+        page = page_reads.page_session_ids(session_ids)
+        if not event_types:
+            raise ValueError("event_types must not be empty.")
+        if await page_reads.page_reads_are_bounded():
+            return await super().summarize_event_positions(page, event_types)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.summarize_event_positions(cur, page, tuple(event_types))
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         page = page_reads.page_session_ids(session_ids)
@@ -6232,6 +6254,16 @@ class PostgresSessionStore(
         self, identities: Collection[tuple[str, str]]
     ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
         return await session_queries.knowledge_lookup_totals(self._ready_connection, identities)
+
+    async def query_events_bounded_many(
+        self,
+        queries: Sequence[EventQuery],
+        *,
+        max_bytes: int,
+    ) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+        return await session_queries.query_events_bounded_many(
+            self._ready_connection, tuple(queries), max_bytes=max_bytes
+        )
 
     async def query_events_bounded(
         self,

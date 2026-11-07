@@ -125,10 +125,12 @@ BUDGETS: dict[str, dict[str, int]] = {
     "model reply 3 to session end": {"store_calls": 35},
     "during the model calls": {"store_calls": 2},
     # One Cloud activity page (GET /cloud/v1/activity) over an in-memory store.
-    # Its runs are replies and tool calls, and one denied approval; a page costs
-    # the same calls whatever the number of its runs.
-    "cloud activity page of 3 runs": {"store_calls": 22},
-    "cloud activity page of 12 runs": {"store_calls": 22},
+    # Its runs are replies and tool calls, and denied approvals; a page costs
+    # the same calls whatever the number of its runs and touches.
+    "cloud activity page of 3 runs": {"store_calls": 20},
+    "cloud activity page of 12 runs": {"store_calls": 20},
+    # Read from a cursor, so one more call checks the cursor's event.
+    "cloud activity page of 9 runs and 3 touches": {"store_calls": 21},
     # Events stored, split where each model call starts (its model.started event).
     "events before model call 1": {"events": 4},
     "events from model call 1 to 2": {"events": 8},
@@ -684,22 +686,30 @@ def test_a_cloud_activity_page_costs_the_same_store_calls_whatever_its_runs(
         store = InMemorySessionStore()
         app = _activity_app(store)
 
-        async def page(runs: int) -> list[str]:
+        async def page(runs: int, touches: int, cursor: str | None = None) -> Any:
             timeline: list[tuple[str, str]] = []
             with _record_store_calls(store, timeline, monkeypatch):
-                read = await read_cloud_activity(app)
-            assert len(read.runs) == runs
-            return [name for _, name in timeline]
+                read = await read_cloud_activity(app, cursor=cursor)
+            assert (len(read.runs), len(read.touches)) == (runs, touches)
+            return read, [name for _, name in timeline]
 
-        # One touch on each page: classifying a touch reads its own evidence.
         await _workload(app, "first")
-        small = await page(3)
+        _, small = await page(3, 1)
         for index in range(3):
             await _workload(app, f"more-{index}", touch=False)
-        return [small, await page(12)]
+        large_page, large = await page(12, 1)
+        # The touches' evidence is read together, a round of lookups at a time.
+        for index in range(3):
+            await _workload(app, f"touched-{index}")
+        _, touched = await page(9, 3, large_page.next_cursor)
+        return [small, large, touched]
 
     pages = asyncio.run(scenario())
-    names = ("cloud activity page of 3 runs", "cloud activity page of 12 runs")
+    names = (
+        "cloud activity page of 3 runs",
+        "cloud activity page of 12 runs",
+        "cloud activity page of 9 runs and 3 touches",
+    )
     _check_budgets(
         {name: {"store_calls": len(calls)} for name, calls in zip(names, pages, strict=True)},
         {name: dict(Counter(calls)) for name, calls in zip(names, pages, strict=True)},

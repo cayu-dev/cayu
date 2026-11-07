@@ -74,10 +74,16 @@ def validated_run_lineage_metadata(metadata: dict[str, Any]) -> RunLineageMetada
 def session_run_id(session: Session) -> str:
     """Name an incarnation without exposing its private instance UUID."""
 
+    return incarnation_run_id(session.id, session.instance_id)
+
+
+def incarnation_run_id(session_id: str, instance_id: str) -> str:
+    """``session_run_id`` of the session incarnation with these identities."""
+
     return (
         "run_"
         + sha256(
-            canonical_durable_json_bytes([session.id, session.instance_id], "run identity")
+            canonical_durable_json_bytes([session_id, instance_id], "run identity")
         ).hexdigest()
     )
 

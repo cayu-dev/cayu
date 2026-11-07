@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Collection
+import asyncio
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, LiteralString, cast
@@ -691,6 +692,10 @@ async def read_cost_accounting(
         )
         columns = "cayu_events.sequence, cayu_events.event, cayu_events.session_id, cayu_events.event_id, cayu_events.event_type"
 
+        def add_rows(rows: list[Any]) -> None:
+            for row in rows:
+                reducer.add(row[0], Event(**pg_support._json_obj(row[1])))
+
         async def add_group(key: tuple[str, bool, str]) -> None:
             statement, params = cost_group_lookup_statement(
                 columns=columns, plan=source_plan, key=key, postgres=True
@@ -698,8 +703,7 @@ async def read_cost_accounting(
             async with conn.cursor(name=f"cost_group_{uuid4().hex}") as group_cursor:
                 await group_cursor.execute(cast("LiteralString", statement), params)
                 while rows := await group_cursor.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
-                    for row in rows:
-                        reducer.add(row[0], Event(**pg_support._json_obj(row[1])))
+                    await asyncio.to_thread(add_rows, rows)
 
         if reducer.incremental:
             statement, params = changed_cost_groups_statement(reducer, dialect=SQL_DIALECT)
@@ -725,8 +729,8 @@ async def read_cost_accounting(
                     cast("LiteralString", statement), (*group_params, *source_plan.params)
                 )
                 while rows := await cur.fetchmany(COST_ACCOUNTING_PAGE_SIZE):
-                    for row in rows:
-                        reducer.add(row[0], Event(**pg_support._json_obj(row[1])))
+                    # Each page of events is decoded and priced off the event loop.
+                    await asyncio.to_thread(add_rows, rows)
         result = reducer.snapshot()
         # Global sequence allocation is not commit order. A later commit can
         # become visible below this snapshot's maximum sequence, so it is not
@@ -748,6 +752,28 @@ async def query_events_bounded(
         return await _query_events_bounded_snapshot(
             cur, fold.query, max_bytes=max_bytes, exact_snapshot=False
         )
+
+
+@runtime_session_query
+async def query_events_bounded_many(
+    connect: PostgresConnection, queries: Sequence[EventQuery], *, max_bytes: int
+) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+    bounded = [
+        EventSnapshotFold(query, max_bytes=max_bytes, max_pages=1).query for query in queries
+    ]
+    results: list[list[EventRecord] | EventQueryResultTooLarge] = []
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        for query in bounded:
+            try:
+                results.append(
+                    await _query_events_bounded_snapshot(
+                        cur, query, max_bytes=max_bytes, exact_snapshot=False
+                    )
+                )
+            except EventQueryResultTooLarge as error:
+                results.append(error)
+    return results
 
 
 @runtime_session_query

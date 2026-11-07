@@ -7,11 +7,13 @@ its callers; neither the application facade nor a server is a dependency here.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import Field, model_validator
@@ -23,7 +25,7 @@ from cayu._time_buckets import (
     bucket_index,
     time_buckets,
 )
-from cayu._validation import revalidate_model_input
+from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
 from cayu.budgets.usage import AggregateCount, SessionUsageSummary
 from cayu.releases import recorded_release_identity
@@ -32,10 +34,8 @@ from cayu.sessions._foreground_child_checkpoint import (
     foreground_child_state_from_checkpoint,
 )
 from cayu.sessions._run_identity import (
-    RUN_LINEAGE_METADATA_KEY,
     is_eval_trial,
     session_run_id,
-    session_run_lineage,
 )
 from cayu.sessions._supervision_projection import RELEASE_MARKER_EVENT_TYPES
 from cayu.sessions.event_queries import EventQuery
@@ -54,7 +54,7 @@ from cayu.sessions.queries import (
     _session_matches,
     session_query_from_aggregate_filter,
 )
-from cayu.sessions.records import PendingActionKind, Session, SessionStatus
+from cayu.sessions.records import PendingActionKind, Session, SessionLineage, SessionStatus
 from cayu.sessions.summaries import SessionStepCounts
 
 if TYPE_CHECKING:
@@ -198,11 +198,46 @@ class SessionOverviewCounts:
         return sum(self.counts_by_state.values())
 
 
+_CostKey = tuple[str, str, int, int, str]
+
+
+class SessionCostCache:
+    """Sessions' cost totals, reused while their cost-bearing events stay the same.
+
+    A total is reused for the same session incarnation, the same count and
+    latest sequence of its cost-bearing events, and the same price book. Events
+    are only appended, and removing one lowers the count, so equal positions
+    mean the same events, priced the same. Holds at most ``max_sessions``
+    totals, dropping the least recently used.
+    """
+
+    def __init__(self, *, max_sessions: int = 4096) -> None:
+        if type(max_sessions) is not int or max_sessions < 1:
+            raise ValueError("max_sessions must be a positive integer.")
+        self._max_sessions = max_sessions
+        self._totals: OrderedDict[_CostKey, SessionCostTotals | None] = OrderedDict()
+
+    def _get(self, key: _CostKey) -> tuple[bool, SessionCostTotals | None]:
+        if key not in self._totals:
+            return False, None
+        self._totals.move_to_end(key)
+        totals = self._totals[key]
+        return True, None if totals is None else totals.model_copy(deep=True)
+
+    def _put(self, key: _CostKey, totals: SessionCostTotals | None) -> None:
+        self._totals[key] = None if totals is None else totals.model_copy(deep=True)
+        self._totals.move_to_end(key)
+        while len(self._totals) > self._max_sessions:
+            self._totals.popitem(last=False)
+
+
 class SessionOverviewReader:
     """Summarizes the sessions of one page, sharing session loads among them.
 
     With ``token_usage=False`` a summary carries only its step counts, which the
-    store counts without reading events, and ``usage`` is ``None``.
+    store counts without reading events, and ``usage`` is ``None``. With a
+    ``cost_cache``, a page prices only the sessions whose cost-bearing events
+    changed since the cache last priced them.
     """
 
     def __init__(
@@ -211,15 +246,21 @@ class SessionOverviewReader:
         *,
         pricing: PriceBook | None = None,
         token_usage: bool = True,
+        cost_cache: SessionCostCache | None = None,
     ) -> None:
         if type(token_usage) is not bool:
             raise TypeError("token_usage must be a bool.")
+        if cost_cache is not None and type(cost_cache) is not SessionCostCache:
+            raise TypeError("cost_cache must be a SessionCostCache.")
         self._store = store
         self._pricing = pricing
         self._token_usage = token_usage
+        self._cost_cache = cost_cache
         # Whether a parent's retained wait names a child, by both incarnations.
         self._retained_waits: dict[tuple[str, str | None, str, str | None], bool] = {}
         self._loaded: dict[str, Session | None] = {}
+        # What a scan follows from each session: its parent, never its whole row.
+        self._lineages: dict[str, SessionLineage | None] = {}
         self._loading: dict[str, asyncio.Future[Session | None]] = {}
         self._load_waiters: dict[asyncio.Future[Session | None], int] = {}
 
@@ -256,25 +297,41 @@ class SessionOverviewReader:
         return session
 
     async def prefetch(self, session_ids: Iterable[str]) -> None:
-        """Load the sessions and the parents ``affected_by`` follows, a level at a time.
+        """Load the lineages of the sessions and the parents ``affected_by`` follows.
 
-        A scan calls this once per batch of events, so ``affected_by`` reads
-        no session row of its own for any session the batch names.
+        A level at a time. A scan calls this once per batch of events, so
+        ``affected_by`` reads no session of its own for any session the batch
+        names. Only lineages are read; ``read`` reads the rows it summarizes.
         """
 
         level = list(dict.fromkeys(session_ids))
         for _depth in range(MAX_FOREGROUND_CHAIN_DEPTH + 1):
-            await self._load_many(level)
+            await self._load_lineages(level)
             level = [
                 parent_id
                 for session_id in level
-                if (session := self._loaded.get(session_id)) is not None
-                and (parent_id := session.parent_session_id) is not None
-                and session.invocation.source is not SessionExecutionSource.FORK
-                and parent_id not in self._loaded
+                if (lineage := self._lineages.get(session_id)) is not None
+                and (parent_id := lineage.parent_session_id) is not None
+                and lineage.source is not SessionExecutionSource.FORK
+                and parent_id not in self._lineages
             ]
             if not level:
                 return
+
+    async def _load_lineages(self, session_ids: Iterable[str]) -> None:
+        missing = [
+            session_id
+            for session_id in dict.fromkeys(session_ids)
+            if session_id not in self._lineages
+        ]
+        if missing:
+            loaded = await self._store.load_session_lineages(missing)
+            for session_id in missing:
+                self._lineages[session_id] = loaded.get(session_id)
+
+    async def _lineage(self, session_id: str) -> SessionLineage | None:
+        await self._load_lineages((session_id,))
+        return self._lineages[session_id]
 
     async def affected_by(self, session_id: str) -> list[str]:
         """The session and the sessions above it whose summaries a change in it can alter.
@@ -285,24 +342,24 @@ class SessionOverviewReader:
         """
 
         affected = [session_id]
-        session = await self._load(session_id)
+        session = await self._lineage(session_id)
         for _depth in range(MAX_FOREGROUND_CHAIN_DEPTH):
             if (
                 session is None
                 or session.parent_session_id is None
-                or session.invocation.source is SessionExecutionSource.FORK
+                or session.source is SessionExecutionSource.FORK
             ):
                 break
-            parent = await self._load(session.parent_session_id)
+            parent = await self._lineage(session.parent_session_id)
             if parent is None:
                 break
-            if RUN_LINEAGE_METADATA_KEY not in session.metadata:
+            if not session.has_run_lineage:
                 # Legacy rows lack retained ancestry, but the parent's current
                 # foreground wait can still prove this exact dependency. This
                 # refreshes a summary; it does not invent historical run links.
                 follows = await self._retained_wait_matches(parent, session)
             else:
-                follows = session_run_lineage(session)[1] == session_run_id(parent)
+                follows = session.parent_run_id == parent.run_id
             if not follows:
                 break
             affected.append(parent.id)
@@ -312,15 +369,32 @@ class SessionOverviewReader:
     async def read(self, session_ids: tuple[str, ...]) -> tuple[SessionOverviewFacts, ...]:
         """Summarize the sessions from reads made after the scan.
 
-        The scan read session rows only to find their verified parents,
-        and kept reading events after it read them. Reading again now
-        means every summary reflects at least every event up to the page's
-        cursor, and any later change has a later sequence, so a later page
-        reports the session again.
+        The scan read only their lineages, and kept reading events after it
+        read them. Reading the rows now means every summary reflects at least
+        every event up to the page's cursor, and any later change has a later
+        sequence, so a later page reports the session again.
+        """
+
+        await self.load_rows(session_ids)
+        return await self.read_loaded(session_ids)
+
+    async def load_rows(self, session_ids: tuple[str, ...]) -> dict[str, Session]:
+        """Read the rows ``read`` summarizes, so a caller can use them first.
+
+        ``read_loaded`` then summarizes these rows without reading them again.
         """
 
         self._loaded.clear()
         await self._load_many(session_ids)
+        return {
+            session_id: session
+            for session_id in session_ids
+            if (session := self._loaded.get(session_id)) is not None
+        }
+
+    async def read_loaded(self, session_ids: tuple[str, ...]) -> tuple[SessionOverviewFacts, ...]:
+        """``read`` from the rows ``load_rows`` read."""
+
         return await self._read(
             [session for session_id in session_ids if (session := self._loaded.get(session_id))]
         )
@@ -352,14 +426,7 @@ class SessionOverviewReader:
         else:
             usage_by_session = {}
             steps = await self._store.count_session_steps(query.session_ids)
-        cost = (
-            None
-            if self._pricing is None
-            else await self._store.read_cost_accounting(query, self._pricing, by_session=True)
-        )
-        cost_by_session = (
-            {} if cost is None else {totals.session_id: totals for totals in cost.session_totals}
-        )
+        cost_by_session = await self._costs(sessions)
         # Every read below covers the whole page, so a page costs the same
         # number of store reads however many sessions it holds.
         while sessions:
@@ -412,6 +479,66 @@ class SessionOverviewReader:
         # replacement must never donate its cost or status to the old run.
         current = await self._current(sessions)
         return tuple(run for run in runs if run.session.id in current)
+
+    async def _costs(self, sessions: Sequence[Session]) -> dict[str, SessionCostTotals]:
+        """Each session's cost totals; sessions without cost-bearing events are absent."""
+
+        pricing = self._pricing
+        if pricing is None:
+            return {}
+        session_ids = tuple(session.id for session in sessions)
+        cache = self._cost_cache
+        costs: dict[str, SessionCostTotals] = {}
+        keys: dict[str, _CostKey] = {}
+        if cache is not None:
+            from cayu.runtime._cost_accounting import COST_EVENT_TYPES
+
+            positions = await self._store.summarize_event_positions(session_ids, COST_EVENT_TYPES)
+            prices = _price_book_digest(pricing)
+            for session in sessions:
+                position = positions.get(session.id)
+                if position is None:
+                    continue
+                key = (
+                    session.id,
+                    session.instance_id,
+                    position.count,
+                    position.last_sequence,
+                    prices,
+                )
+                found, totals = cache._get(key)
+                if not found:
+                    keys[session.id] = key
+                elif totals is not None:
+                    costs[session.id] = totals
+            unpriced = tuple(
+                session_id
+                for session_id in session_ids
+                if session_id in keys or session_id not in positions
+            )
+        else:
+            unpriced = session_ids
+        if unpriced:
+            cost = await self._store.read_cost_accounting(
+                EventQuery(session_ids=unpriced), pricing, by_session=True
+            )
+            priced = {totals.session_id: totals for totals in cost.session_totals}
+            costs.update(priced)
+            if cache is not None and keys:
+                from cayu.runtime._cost_accounting import COST_EVENT_TYPES
+
+                # A total is kept only for a session whose cost-bearing events
+                # were the same before and after it was priced, so the totals
+                # count exactly the events its key names.
+                after = await self._store.summarize_event_positions(tuple(keys), COST_EVENT_TYPES)
+                for session_id, key in keys.items():
+                    position = after.get(session_id)
+                    if (
+                        position is not None
+                        and (position.count, position.last_sequence) == key[2:4]
+                    ):
+                        cache._put(key, priced.get(session_id))
+        return costs
 
     async def _load_many(self, session_ids: Iterable[str]) -> None:
         """Cache every session not yet loaded for this page with one store read."""
@@ -818,7 +945,9 @@ class SessionOverviewReader:
             cursors.add(page.next_cursor)
             cursor = page.next_cursor
 
-    async def _retained_wait_matches(self, parent: Session, child: Session) -> bool:
+    async def _retained_wait_matches(
+        self, parent: Session | SessionLineage, child: Session | SessionLineage
+    ) -> bool:
         # A scan asks once per event of the child; the parent's checkpoint is
         # read once per pair of incarnations.
         key = (parent.id, parent.instance_id, child.id, child.instance_id)
@@ -879,7 +1008,17 @@ class _PendingCollector:
         }
 
 
-def _wait_matches(checkpoint: dict[str, Any] | None, parent: Session, child: Session) -> bool:
+def _price_book_digest(pricing: PriceBook) -> str:
+    return sha256(
+        canonical_durable_json_bytes(pricing.model_dump(mode="json"), "cost pricing")
+    ).hexdigest()
+
+
+def _wait_matches(
+    checkpoint: dict[str, Any] | None,
+    parent: Session | SessionLineage,
+    child: Session | SessionLineage,
+) -> bool:
     # A reused child ID can have the same parent. Verify the exact wait's
     # retained incarnation as well as the relationship, never just names.
     wait, _ = foreground_child_state_from_checkpoint(checkpoint)

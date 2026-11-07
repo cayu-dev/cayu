@@ -32,6 +32,19 @@ class SessionStepCounts:
     tool_calls: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class SessionEventPositions:
+    """How many events of some types a session holds, and its latest one's sequence.
+
+    A session with none has ``count`` 0 and ``last_sequence`` 0. Events are only
+    appended, and removing one lowers ``count``, so equal positions read at two
+    times mean the session holds the same such events.
+    """
+
+    count: int = 0
+    last_sequence: int = 0
+
+
 class SessionOperationalSnapshot(BaseModel):
     """Exact current session counts captured by one store-local read snapshot."""
 

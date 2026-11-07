@@ -276,7 +276,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectStatus,
     _copy_optional_event_id,
 )
-from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.event_queries import EventQuery, EventQueryResultTooLarge
 from cayu.sessions.exports import _require_session_export_target
 from cayu.sessions.forks import (
     FORK_EXECUTION_PROFILE_METADATA_KEY,
@@ -337,6 +337,7 @@ from cayu.sessions.records import (
     Session,
     SessionIdentity,
     SessionInvocationSnapshot,
+    SessionLineage,
     SessionRuntimeIdentity,
     SessionStateSnapshot,
     SessionStatus,
@@ -360,6 +361,7 @@ from cayu.sessions.requests import (
 from cayu.sessions.store import SessionStore
 from cayu.sessions.summaries import (
     EventSummary,
+    SessionEventPositions,
     SessionOperationalSnapshot,
     SessionOutcome,
     SessionStepCounts,
@@ -2130,6 +2132,14 @@ class SQLiteSessionStore(
             lambda connection: page_read_ops.load_sessions(connection, page)
         )
 
+    async def load_session_lineages(self, session_ids: Sequence[str]) -> dict[str, SessionLineage]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_lineages(page)
+        return await self._run_read(
+            lambda connection: page_read_ops.load_session_lineages(connection, page)
+        )
+
     async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
         page = page_reads.page_session_ids(session_ids)
         if await page_reads.page_reads_are_bounded():
@@ -2172,6 +2182,20 @@ class SQLiteSessionStore(
             return await super().count_session_steps(page)
         return await self._run_read(
             lambda connection: page_read_ops.count_session_steps(connection, page)
+        )
+
+    async def summarize_event_positions(
+        self, session_ids: Sequence[str], event_types: Sequence[EventType]
+    ) -> dict[str, SessionEventPositions]:
+        page = page_reads.page_session_ids(session_ids)
+        if not event_types:
+            raise ValueError("event_types must not be empty.")
+        if await page_reads.page_reads_are_bounded():
+            return await super().summarize_event_positions(page, event_types)
+        return await self._run_read(
+            lambda connection: page_read_ops.summarize_event_positions(
+                connection, page, tuple(event_types)
+            )
         )
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
@@ -6587,6 +6611,16 @@ class SQLiteSessionStore(
                 max_bytes=max_bytes,
                 max_pages=max_pages,
             )
+
+    async def query_events_bounded_many(
+        self,
+        queries: Sequence[EventQuery],
+        *,
+        max_bytes: int,
+    ) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+        return await session_queries.query_events_bounded_many(
+            self._run_read, tuple(queries), max_bytes=max_bytes
+        )
 
     async def query_events_bounded(
         self,

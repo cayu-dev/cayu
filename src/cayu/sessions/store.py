@@ -133,7 +133,7 @@ from cayu.sessions.event_delivery import (
     PersistedEventSideEffectQuery,
     PersistedEventSideEffectStatus,
 )
-from cayu.sessions.event_queries import EventOrder, EventQuery
+from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResultTooLarge
 from cayu.sessions.execution import SessionExecutionState
 from cayu.sessions.forks import (
     ForkCheckpointAuthorityDecoder,
@@ -174,6 +174,7 @@ from cayu.sessions.records import (
     Session,
     SessionIdentity,
     SessionInvocationSnapshot,
+    SessionLineage,
     SessionRuntimeIdentity,
     SessionStateSnapshot,
     SessionStatus,
@@ -184,6 +185,7 @@ from cayu.sessions.records import (
 from cayu.sessions.requests import RunRequest
 from cayu.sessions.summaries import (
     EventSummary,
+    SessionEventPositions,
     SessionOperationalSnapshot,
     SessionOutcome,
     SessionStepCounts,
@@ -4953,6 +4955,28 @@ class SessionStore(ABC):
             f"{type(self).__name__} does not implement byte-bounded event queries."
         )
 
+    async def query_events_bounded_many(
+        self,
+        queries: Sequence[EventQuery],
+        *,
+        max_bytes: int,
+    ) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+        """``query_events_bounded`` for several queries in one store call.
+
+        Each entry is its query's events, or the ``EventQueryResultTooLarge`` its
+        own ``query_events_bounded`` raises. Native stores read every query in
+        one transaction, so a caller with many independent lookups waits for
+        one store call instead of one per lookup.
+        """
+
+        results: list[list[EventRecord] | EventQueryResultTooLarge] = []
+        for query in queries:
+            try:
+                results.append(await self.query_events_bounded(query, max_bytes=max_bytes))
+            except EventQueryResultTooLarge as error:
+                results.append(error)
+        return results
+
     async def load_bounded(self, session_id: str, *, max_bytes: int) -> Session | None:
         """Load a full session only after bounding transport bytes in one snapshot."""
         raise NotImplementedError("This SessionStore does not support byte-bounded session loads.")
@@ -5286,6 +5310,17 @@ class SessionStore(ABC):
 
         return await page_reads.load_sessions_one_by_one(self, session_ids)
 
+    async def load_session_lineages(self, session_ids: Sequence[str]) -> dict[str, SessionLineage]:
+        """Which session each session runs under, without the rest of its row.
+
+        Each is what ``SessionLineage.of`` gives for the session ``load_sessions``
+        would return. IDs with no session are absent. Native stores read only
+        those columns, so a reader that follows parents need not read whole rows.
+        """
+
+        sessions = await self.load_sessions(session_ids)
+        return {session_id: SessionLineage.of(session) for session_id, session in sessions.items()}
+
     async def load_session_instance_ids(self, session_ids: Sequence[str]) -> dict[str, str]:
         """The incarnation ``load_sessions`` would return for each session, without its row.
 
@@ -5326,6 +5361,20 @@ class SessionStore(ABC):
         """
 
         return await page_reads.count_session_steps_one_by_one(self, session_ids)
+
+    async def summarize_event_positions(
+        self, session_ids: Sequence[str], event_types: Sequence[EventType]
+    ) -> dict[str, SessionEventPositions]:
+        """Each session's count of events of ``event_types`` and the latest one's sequence.
+
+        Sessions not found are absent. Native stores count the events without
+        reading them, so a reader can tell cheaply whether a session's events of
+        those types changed since it last read them.
+        """
+
+        if not event_types:
+            raise ValueError("event_types must not be empty.")
+        return await page_reads.summarize_event_positions_one_by_one(self, session_ids, event_types)
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         """``summarize_outcome`` for several sessions; sessions not found are absent."""

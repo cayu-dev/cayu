@@ -20839,12 +20839,19 @@ more. Continue from `next_cursor` while `has_more` is true. When it is false,
 read again later from the same `next_cursor`; it equals the cursor read when
 nothing changed.
 
-A page's store reads do not grow with the number of its runs or with the
-history the store keeps. The scan reads event heads, a batch of sessions and
-their parents at a time; each run's step counts come from `count_session_steps`,
-not from folding its usage events; and anchors are classified with one session
-read and one incarnation check for the page. Only its cost estimate reads each
-run's model completions.
+A page's store reads do not grow with the number of its runs or touches, or
+with the history the store keeps. The scan reads event heads and the lineages
+of a batch of sessions and their parents at a time (`load_session_lineages`),
+then reads each changed session's row once, after the scan. Each run's step
+counts come from `count_session_steps`, not from folding its usage events.
+Anchors are classified with the rows the summaries read, one read of all the
+page's anchor events, one fork check and one incarnation check for the page;
+the touches' evidence lookups go to the store together, one
+`query_events_bounded_many` call per round of lookups. A run's cost estimate is
+priced from its model completions only when its cost-bearing events changed
+since the agent last priced it (`summarize_event_positions`), and Cloud's
+PostgreSQL reads decode the page's session rows and price its events off the
+event loop.
 
 `task_health` is the agent's current task state when the page was read, not a
 change since the cursor, and `null` when the agent has no task store. Its
@@ -21261,6 +21268,16 @@ the matching single-session read answers; IDs with nothing to report are absent.
 sequence, session ID, event ID, type and timestamp, the same matches in the same
 order, for a scan that needs no payloads; the SQLite and PostgreSQL stores read
 no event bodies for it.
+`load_session_lineages` returns, without the rest of the row, what
+`SessionLineage.of` gives for each session `load_sessions` would return: its
+incarnation, parent, execution source and run-lineage metadata.
+`summarize_event_positions(session_ids, event_types)` counts each session's
+events of those types and gives the latest one's sequence, without reading
+them, so a reader can tell whether they changed since it last read them.
+`query_events_bounded_many(queries, max_bytes=...)` answers several
+`query_events_bounded` calls in one store call, each entry the query's events
+or the `EventQueryResultTooLarge` its own call raises; the SQLite and PostgreSQL
+stores read them in one transaction.
 Two narrower reads skip what a caller does not use: `load_session_instance_ids`
 returns the incarnation `load_sessions` would, without the row, and
 `load_checkpoint_fields(session_ids, keys)` returns `load_checkpoints` cut down to

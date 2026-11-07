@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -780,6 +780,32 @@ async def query_events_bounded(
         connection.execute("BEGIN")
         try:
             return _query_events_bounded_snapshot(connection, fold.query, max_bytes=max_bytes)
+        finally:
+            connection.rollback()
+
+    return await run_read(read)
+
+
+@runtime_session_query
+async def query_events_bounded_many(
+    run_read: SQLiteOperationRunner, queries: Sequence[EventQuery], *, max_bytes: int
+) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+    bounded = [
+        EventSnapshotFold(query, max_bytes=max_bytes, max_pages=1).query for query in queries
+    ]
+
+    def read(connection: sqlite3.Connection) -> list[list[EventRecord] | EventQueryResultTooLarge]:
+        connection.execute("BEGIN")
+        try:
+            results: list[list[EventRecord] | EventQueryResultTooLarge] = []
+            for query in bounded:
+                try:
+                    results.append(
+                        _query_events_bounded_snapshot(connection, query, max_bytes=max_bytes)
+                    )
+                except EventQueryResultTooLarge as error:
+                    results.append(error)
+            return results
         finally:
             connection.rollback()
 

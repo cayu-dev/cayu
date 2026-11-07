@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -375,9 +376,9 @@ def test_replacement_during_read_never_mixes_incarnations(monkeypatch, phase: st
         if phase == "classification":
             classify = cloud_reporting.classify_supervision_anchors
 
-            async def classify_after_replacement(store, records):
+            async def classify_after_replacement(store, records, **kwargs):
                 await replace()
-                return await classify(store, records)
+                return await classify(store, records, **kwargs)
 
             monkeypatch.setattr(
                 cloud_reporting, "classify_supervision_anchors", classify_after_replacement
@@ -442,6 +443,14 @@ def test_disappearance_during_summary_omits_only_that_incarnation(
                 return await original(*args, **kwargs)
 
             monkeypatch.setattr(store, method, while_reading)
+            if phase == "cost":
+                # Read every run's cost from its events, not from what the
+                # first page priced, so the page reads costs while it races.
+                from cayu.sessions.overview import SessionCostCache
+
+                monkeypatch.setattr(
+                    cloud_reporting, "_cost_cache", lambda _app, _store_id: SessionCostCache()
+                )
             raced = await read_cloud_activity(app)
             assert changed
             assert [run.session_id for run in raced.runs] == ["survivor"]
@@ -958,14 +967,27 @@ def test_legacy_ancestors_refresh_only_from_exact_retained_waits(
                 loaded = await load_page(session_ids)
                 return {session_id: legacy(session) for session_id, session in loaded.items()}
 
+            load_lineages = store.load_session_lineages
+
+            async def legacy_load_session_lineages(session_ids):
+                loaded = await load_lineages(session_ids)
+                return {
+                    session_id: dataclasses.replace(
+                        lineage, has_run_lineage=False, run_lineage=None
+                    )
+                    for session_id, lineage in loaded.items()
+                }
+
             monkeypatch.setattr(store, "load", legacy_load)
             monkeypatch.setattr(store, "load_sessions", legacy_load_sessions)
+            monkeypatch.setattr(store, "load_session_lineages", legacy_load_session_lineages)
             waiting = await read_cloud_activity(app)
             leaf = next(run.session_id for run in waiting.runs if run.agent_name == "leaf")
             # The adapter changes only the feed's legacy read view. Runtime
             # execution requires the store's concrete unmodified protocol.
             monkeypatch.delattr(store, "load")
             monkeypatch.delattr(store, "load_sessions")
+            monkeypatch.delattr(store, "load_session_lineages")
             approval = await _pending(app, leaf)
             await _drain(
                 app.resolve_tool_approval(
@@ -981,6 +1003,7 @@ def test_legacy_ancestors_refresh_only_from_exact_retained_waits(
             )
             monkeypatch.setattr(store, "load", legacy_load)
             monkeypatch.setattr(store, "load_sessions", legacy_load_sessions)
+            monkeypatch.setattr(store, "load_session_lineages", legacy_load_session_lineages)
             checkpoint = store.load_checkpoint
             checkpoints = store.load_checkpoints
 

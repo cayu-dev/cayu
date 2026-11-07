@@ -30,6 +30,7 @@ from decimal import Decimal
 from functools import cache
 from hashlib import sha256
 from typing import TYPE_CHECKING, cast
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict
 
@@ -52,7 +53,7 @@ from cayu.sessions._supervision_projection import (
 )
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.overview import SessionOverviewFacts, SessionOverviewReader
+from cayu.sessions.overview import SessionCostCache, SessionOverviewFacts, SessionOverviewReader
 from cayu.sessions.overview import SessionOverviewStatus as CloudRunStatus
 from cayu.sessions.pending_action_contracts import (
     PendingActionRecord,
@@ -491,7 +492,12 @@ async def read_cloud_activity(
     store = app.session_store
     # Cloud shows step counts, never token totals, so the reader counts steps
     # instead of folding every usage event of the page's sessions.
-    reader = SessionOverviewReader(store, pricing=_bundled_price_book(), token_usage=False)
+    reader = SessionOverviewReader(
+        store,
+        pricing=_bundled_price_book(),
+        token_usage=False,
+        cost_cache=_cost_cache(app, store_id),
+    )
     changed: dict[str, None] = {}
     anchors: list[EventHead] = []
     scanned = 0
@@ -526,8 +532,11 @@ async def read_cloud_activity(
             position, last = record.sequence, record
         if has_more or len(batch) < batch_limit:
             break
-    touches = await classify_supervision_anchors(store, anchors)
-    summaries = await reader.read(tuple(changed))
+    # The rows are read once, after the scan. Every anchor's session changed on
+    # this page, so classification uses the same rows the summaries do.
+    rows = await reader.load_rows(tuple(changed))
+    touches = await classify_supervision_anchors(store, anchors, sessions=rows)
+    summaries = await reader.read_loaded(tuple(changed))
     parked, gone = await _parked_external_waits(app, summaries)
     return CloudActivityPage(
         runs=tuple(
@@ -689,6 +698,18 @@ async def _parked_external_waits(
             item = _external_waiting_item(app, record, parked_at)
             parked[ticket.session_id] = (*parked.get(ticket.session_id, ()), item)
     return parked, frozenset(gone)
+
+
+# Cloud reads each run's cost on every page it changes on. A run's total is
+# priced again only when its cost-bearing events change, in the same store.
+_COST_CACHES: WeakKeyDictionary[CayuApp, tuple[str, SessionCostCache]] = WeakKeyDictionary()
+
+
+def _cost_cache(app: CayuApp, store_id: str) -> SessionCostCache:
+    held = _COST_CACHES.get(app)
+    if held is None or held[0] != store_id:
+        held = _COST_CACHES[app] = (store_id, SessionCostCache())
+    return held[1]
 
 
 @cache

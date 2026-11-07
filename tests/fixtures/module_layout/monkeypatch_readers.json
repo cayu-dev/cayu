@@ -990,6 +990,9 @@
   "cayu.cloud_reporting:_SCAN_BUDGET": [
     "read_cloud_activity"
   ],
+  "cayu.cloud_reporting:_cost_cache": [
+    "read_cloud_activity"
+  ],
   "cayu.cloud_reporting:classify_supervision_anchors": [
     "read_cloud_activity"
   ],
@@ -3145,7 +3148,8 @@
   ],
   "cayu.storage._postgres_session_queries:_query_events_bounded_snapshot": [
     "fold_event_snapshot.<locals>.read",
-    "query_events_bounded"
+    "query_events_bounded",
+    "query_events_bounded_many"
   ],
   "cayu.storage._postgres_support:_json_obj": [
     "cayu.storage._postgres_base:_PostgresStoreBase._backfill_interrupted_handoff_generations",
@@ -3174,8 +3178,7 @@
     "cayu.storage._postgres_session_queries:load_user_input_supersession_events",
     "cayu.storage._postgres_session_queries:query_child_session_lifecycle",
     "cayu.storage._postgres_session_queries:query_latest_interaction_events",
-    "cayu.storage._postgres_session_queries:read_cost_accounting",
-    "cayu.storage._postgres_session_queries:read_cost_accounting.<locals>.add_group",
+    "cayu.storage._postgres_session_queries:read_cost_accounting.<locals>.add_rows",
     "cayu.storage._postgres_session_queries:read_usage_accounting",
     "cayu.storage._postgres_terminal_evidence:_load_evidence",
     "cayu.storage._postgres_tool_grants:bind_targeted_tool_grant_use",
