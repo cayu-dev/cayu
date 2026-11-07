@@ -15,7 +15,7 @@ from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
 from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, session_status_outcome
+from cayu.sessions.summaries import SessionOutcome, SessionStepCounts, session_status_outcome
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_session_queries import load_session_labels_batch
@@ -131,6 +131,33 @@ def _event_record(sequence: Any, event: Any) -> EventRecord | None:
     if sequence is None:
         return None
     return EventRecord(sequence=sequence, event=Event(**pg_support._json_obj(event)))
+
+
+async def count_session_steps(cur: Any, session_ids: Sequence[str]) -> dict[str, SessionStepCounts]:
+    if not session_ids:
+        return {}
+    # The event types are literals so the partial step-count index applies.
+    await cur.execute(
+        """
+        SELECT cayu_sessions.id,
+               COUNT(cayu_events.session_id)
+                   FILTER (WHERE cayu_events.event_type = 'model.completed'),
+               COUNT(cayu_events.session_id)
+                   FILTER (WHERE cayu_events.event_type = 'tool.call.started')
+        FROM cayu_sessions
+        LEFT JOIN cayu_events
+            ON cayu_events.session_id = cayu_sessions.id
+            AND cayu_events.event_type IN ('model.completed', 'tool.call.started')
+        WHERE cayu_sessions.id = ANY(%s::text[])
+        GROUP BY cayu_sessions.id
+        """,
+        (list(session_ids),),
+    )
+    found = {
+        row[0]: SessionStepCounts(model_steps=int(row[1]), tool_calls=int(row[2]))
+        for row in await cur.fetchall()
+    }
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
 async def summarize_outcomes(cur: Any, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:

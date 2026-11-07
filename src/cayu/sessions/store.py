@@ -168,6 +168,7 @@ from cayu.sessions.pending_action_contracts import PendingActionListResult, Pend
 from cayu.sessions.queries import SessionAggregateFilter, SessionListResult, SessionQuery
 from cayu.sessions.records import (
     CheckpointTransform,
+    EventHead,
     EventRecord,
     RunnerObservedEventIdentity,
     Session,
@@ -181,7 +182,12 @@ from cayu.sessions.records import (
     TranscriptRecord,
 )
 from cayu.sessions.requests import RunRequest
-from cayu.sessions.summaries import EventSummary, SessionOperationalSnapshot, SessionOutcome
+from cayu.sessions.summaries import (
+    EventSummary,
+    SessionOperationalSnapshot,
+    SessionOutcome,
+    SessionStepCounts,
+)
 from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceLimits
 from cayu.sessions.topology import SessionTopologyQuery, SessionTopologyStoreResult
@@ -4840,6 +4846,16 @@ class SessionStore(ABC):
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         """Query stored events with durable sequence cursors."""
 
+    async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
+        """``query_events`` without the events: where each match sits and what it is.
+
+        The same matches, order and visibility as ``query_events``, for a scan
+        that needs only sequences, sessions and types. Native stores read no
+        event payloads.
+        """
+
+        return [EventHead.of(record) for record in await self.query_events(query)]
+
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False
     ) -> UsageAccountingSnapshot:
@@ -5300,6 +5316,16 @@ class SessionStore(ABC):
             session_id: {key: checkpoint[key] for key in page if key in checkpoint}
             for session_id, checkpoint in checkpoints.items()
         }
+
+    async def count_session_steps(self, session_ids: Sequence[str]) -> dict[str, SessionStepCounts]:
+        """Each session's model steps and tool calls, counted without reading its events.
+
+        The numbers ``read_usage_accounting`` reports as ``model_steps`` and
+        ``tool_calls``: the session's ``model.completed`` and ``tool.call.started``
+        events. Sessions not found are absent.
+        """
+
+        return await page_reads.count_session_steps_one_by_one(self, session_ids)
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         """``summarize_outcome`` for several sessions; sessions not found are absent."""

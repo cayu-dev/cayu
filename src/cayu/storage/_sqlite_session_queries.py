@@ -77,10 +77,12 @@ from cayu.sessions.queries import (
 )
 from cayu.sessions.records import (
     RUNTIME_BUILD_PROVENANCE_METADATA_KEY,
+    EventHead,
     EventRecord,
     Session,
     SessionStatus,
     runtime_build_provenance_from_session_metadata,
+    stored_event_head,
 )
 from cayu.sessions.summaries import (
     EventSummary,
@@ -428,6 +430,33 @@ async def load_tool_round_lifecycle_events_for_round(
         return [sqlite_records.event_from_row(row) for row in rows]
 
     return await run_read(query)
+
+
+@runtime_session_query
+async def query_event_heads(run_read: SQLiteOperationRunner, query: EventQuery) -> list[EventHead]:
+    query = copy_event_query(query)
+    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+        return [EventHead.of(record) for record in await query_events(run_read, query)]
+    plan = session_store_sql.build_event_query_sql(query, dialect=SQL_DIALECT)
+    params = [*plan.params, query.limit]
+    source = _event_query_source(query)
+
+    def run_query(connection: sqlite3.Connection) -> list[EventHead]:
+        rows = connection.execute(
+            f"""
+            SELECT cayu_events.sequence, cayu_events.session_id, cayu_events.event_id,
+                   cayu_events.event_type, cayu_events.timestamp
+            FROM {source}
+            JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+            {plan.where_sql}
+            ORDER BY cayu_events.sequence {plan.order_direction}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [stored_event_head(*row) for row in rows]
+
+    return await run_read(run_query)
 
 
 @runtime_session_query

@@ -14,11 +14,11 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
+from cayu.events import EventType
 from cayu.sessions._run_identity import session_run_id, session_run_lineage
 from cayu.sessions.invocation import SessionExecutionSource
 
 if TYPE_CHECKING:
-    from cayu.events import EventType
     from cayu.messages import MessageRole
     from cayu.sessions.authority import CheckpointRootFieldGuard
     from cayu.sessions.pending_action_contracts import (
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     )
     from cayu.sessions.records import EventRecord, Session
     from cayu.sessions.store import SessionStore
-    from cayu.sessions.summaries import SessionOutcome
+    from cayu.sessions.summaries import SessionOutcome, SessionStepCounts
     from cayu.sessions.transcript_queries import TranscriptRecord
 
 # One overview page holds at most this many sessions (the session list limit).
@@ -125,6 +125,28 @@ async def load_checkpoints_one_by_one(
         if checkpoint is not None:
             loaded[session_id] = checkpoint
     return loaded
+
+
+async def count_session_steps_one_by_one(
+    store: SessionStore, session_ids: Sequence[str]
+) -> dict[str, SessionStepCounts]:
+    from cayu.sessions.summaries import SessionStepCounts
+
+    counts: dict[str, SessionStepCounts] = {}
+    for session_id in page_session_ids(session_ids):
+        try:
+            summary = await store.summarize_events(session_id)
+        except KeyError:
+            # As for outcomes: only a session that is not there is left out.
+            if await store.load(session_id) is not None:
+                raise
+            continue
+        by_type = summary.counts_by_type
+        counts[session_id] = SessionStepCounts(
+            model_steps=by_type.get(str(EventType.MODEL_COMPLETED), 0),
+            tool_calls=by_type.get(str(EventType.TOOL_CALL_STARTED), 0),
+        )
+    return counts
 
 
 async def summarize_outcomes_one_by_one(

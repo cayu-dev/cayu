@@ -10,7 +10,15 @@ from hashlib import sha256
 from typing import Any, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -191,6 +199,44 @@ class EventRecord(BaseModel):
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+
+@dataclass(frozen=True, slots=True)
+class EventHead:
+    """Where a stored event sits and what it is, without its payload.
+
+    ``timestamp`` is the event's own, as ``Event`` reads it, so anything derived
+    from a head matches what the full record gives.
+    """
+
+    sequence: int
+    session_id: str
+    event_id: str
+    type: EventType | str
+    timestamp: datetime
+
+    @classmethod
+    def of(cls, record: EventRecord) -> EventHead:
+        event = record.event
+        return cls(record.sequence, event.session_id, event.id, event.type, event.timestamp)
+
+
+_EVENT_TIMESTAMP = TypeAdapter(datetime)
+_EVENT_TYPES = frozenset(EventType)
+
+
+def stored_event_head(
+    sequence: int, session_id: str, event_id: str, event_type: str, timestamp: object
+) -> EventHead:
+    """A head from stored columns, its type and timestamp validated as ``Event`` validates them."""
+
+    return EventHead(
+        sequence=sequence,
+        session_id=session_id,
+        event_id=event_id,
+        type=EventType(event_type) if event_type in _EVENT_TYPES else event_type,
+        timestamp=_EVENT_TIMESTAMP.validate_python(timestamp),
+    )
 
 
 @dataclass(frozen=True, slots=True)

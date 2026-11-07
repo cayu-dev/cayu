@@ -46,7 +46,7 @@ from cayu.sessions.event_queries import EventOrder, EventQuery, EventQueryResult
 from cayu.sessions.fork_overlays import resolve_fork_lineage_async
 from cayu.sessions.pending_action_contracts import human_attention_id
 from cayu.sessions.queries import SessionQuery, session_query_from_aggregate_filter
-from cayu.sessions.records import EventRecord, PendingActionKind, Session
+from cayu.sessions.records import EventHead, EventRecord, PendingActionKind, Session
 from cayu.sessions.supervision_events import (
     SupervisionAttentionState,
     SupervisionEvent,
@@ -115,6 +115,19 @@ class _SessionEvidence:
         self._store = store
         self._sessions: dict[str, Session | None] = {}
         self._forked: dict[str, bool] = {}
+
+    async def preload(self, session_ids: Iterable[str]) -> None:
+        """Load every session not yet loaded with one store read."""
+
+        missing = [
+            session_id
+            for session_id in dict.fromkeys(session_ids)
+            if session_id not in self._sessions
+        ]
+        if missing:
+            loaded = await self._store.load_sessions(missing)
+            for session_id in missing:
+                self._sessions[session_id] = loaded.get(session_id)
 
     async def session(self, session_id: str) -> Session | None:
         if session_id not in self._sessions:
@@ -364,20 +377,23 @@ async def supervision_page_with_anchors(
 
 
 async def classify_supervision_anchors(
-    store: SessionStore, records: Iterable[EventRecord]
+    store: SessionStore, anchors: Iterable[EventHead]
 ) -> list[tuple[Session, SupervisionEvent]]:
-    """Classify scanned anchor records into touches without content, in record order.
+    """Classify scanned anchors into touches without content, in scan order.
 
-    A record that settles no touch, such as the resume that follows an approval
-    decision, yields nothing, and so does a record of a deleted session. Each
+    An anchor that settles no touch, such as the resume that follows an approval
+    decision, yields nothing, and so does an anchor of a deleted session. Each
     touch has exactly one anchor, so a reader that passes every anchor of a
     range of the store's sequence once sees each touch in that range once.
+    Session rows and the final incarnation check are read once for all anchors.
     """
 
-    events: list[tuple[Session, SupervisionEvent]] = []
-    for record in records:
-        evidence = _SessionEvidence(store)
-        session = await evidence.session(record.event.session_id)
+    anchors = list(anchors)
+    evidence = _SessionEvidence(store)
+    await evidence.preload(anchor.session_id for anchor in anchors)
+    classified: list[tuple[Session, SupervisionEvent]] = []
+    for anchor in anchors:
+        session = await evidence.session(anchor.session_id)
         if session is None:
             continue
         # The scan can race deletion and reuse of a session ID. The anchor
@@ -385,24 +401,34 @@ async def classify_supervision_anchors(
         retained = await store.query_events(
             EventQuery(
                 session_id=session.id,
-                event_id=record.event.id,
-                after_sequence=record.sequence - 1,
+                event_id=anchor.event_id,
+                after_sequence=anchor.sequence - 1,
                 limit=1,
             )
         )
-        if not retained or retained[0].sequence != record.sequence:
+        if not retained or retained[0].sequence != anchor.sequence:
             continue
         event = await _classify(
-            record,
+            retained[0],
             session=session,
             forked=await evidence.forked(session.id),
             evidence=evidence,
             content=False,
         )
-        current = await store.load(session.id)
-        if event is not None and current is not None and current.instance_id == session.instance_id:
-            events.append((session, event))
-    return events
+        if event is not None:
+            classified.append((session, event))
+    if not classified:
+        return []
+    # Classification read evidence after the rows; a session replaced since
+    # must not lend its touches to the incarnation loaded above.
+    current = await store.load_session_instance_ids(
+        tuple(dict.fromkeys(session.id for session, _ in classified))
+    )
+    return [
+        (session, event)
+        for session, event in classified
+        if current.get(session.id) == session.instance_id
+    ]
 
 
 def _cursor_audience(origin_tenant: str | None) -> str | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,6 +18,18 @@ from cayu.budgets.aggregates import AggregateAccuracy, AggregateCount
 from cayu.events import Event, EventType
 from cayu.sessions.queries import SessionStatusCounts
 from cayu.sessions.records import EventRecord, Session, SessionStatus, copy_session
+
+
+@dataclass(frozen=True, slots=True)
+class SessionStepCounts:
+    """A session's model steps and tool calls, as its usage summary counts them.
+
+    ``model_steps`` counts its ``model.completed`` events and ``tool_calls`` its
+    ``tool.call.started`` events, the same numbers ``SessionUsageSummary`` holds.
+    """
+
+    model_steps: int = 0
+    tool_calls: int = 0
 
 
 class SessionOperationalSnapshot(BaseModel):

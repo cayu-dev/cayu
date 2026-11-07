@@ -20725,6 +20725,13 @@ more. Continue from `next_cursor` while `has_more` is true. When it is false,
 read again later from the same `next_cursor`; it equals the cursor read when
 nothing changed.
 
+A page's store reads do not grow with the number of its runs or with the
+history the store keeps. The scan reads event heads, a batch of sessions and
+their parents at a time; each run's step counts come from `count_session_steps`,
+not from folding its usage events; and anchors are classified with one session
+read and one incarnation check for the page. Only its cost estimate reads each
+run's model completions.
+
 `task_health` is the agent's current task state when the page was read, not a
 change since the cursor, and `null` when the agent has no task store. Its
 `fenced_after_worker_loss` counts tasks fenced after their worker's lease
@@ -21127,12 +21134,19 @@ An overview page reads its sessions a page at a time, so a page costs a fixed
 number of store reads however many sessions it holds. `SessionStore` page reads
 take up to 1000 session IDs: `load_sessions`, `load_checkpoints`,
 `summarize_outcomes`, `load_session_operations`, `query_latest_events`,
-`count_child_runs`, `query_pending_actions_for_sessions` (one cursor page of
+`count_child_runs`, `count_session_steps` (each session's `model.completed` and
+`tool.call.started` events, the `model_steps` and `tool_calls` its usage summary
+counts, read from a partial index at storage revision 141 without reading the
+events), `query_pending_actions_for_sessions` (one cursor page of
 `query_pending_actions` restricted to those sessions) and
 `query_first_transcript_records(session_ids, role)` (the record
 `query_transcript` returns for that role with `limit=1`, tool results that live
 in their tool event included). Each answers exactly what
 the matching single-session read answers; IDs with nothing to report are absent.
+`SessionStore.query_event_heads(query)` answers `query_events` with each match's
+sequence, session ID, event ID, type and timestamp, the same matches in the same
+order, for a scan that needs no payloads; the SQLite and PostgreSQL stores read
+no event bodies for it.
 Two narrower reads skip what a caller does not use: `load_session_instance_ids`
 returns the incarnation `load_sessions` would, without the row, and
 `load_checkpoint_fields(session_ids, keys)` returns `load_checkpoints` cut down to

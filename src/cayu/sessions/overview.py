@@ -55,6 +55,7 @@ from cayu.sessions.queries import (
     session_query_from_aggregate_filter,
 )
 from cayu.sessions.records import PendingActionKind, Session, SessionStatus
+from cayu.sessions.summaries import SessionStepCounts
 
 if TYPE_CHECKING:
     from cayu.sessions.store import SessionStore
@@ -71,6 +72,7 @@ _PENDING_ACTION_STATUSES = frozenset(
 OVERVIEW_READ_CONCURRENCY = 4
 
 _T = TypeVar("_T")
+_NO_STEPS = SessionStepCounts()
 
 
 async def gather_in_order(
@@ -121,6 +123,8 @@ class SessionOverviewFacts:
     session: Session
     status: SessionOverviewStatus
     outcome: SessionOutcome
+    #: ``None`` when the session recorded no usage, or the reader was asked
+    #: for step counts only.
     usage: SessionUsageSummary | None
     cost: SessionCostTotals | None
     forked: bool
@@ -128,6 +132,7 @@ class SessionOverviewFacts:
     release_id: str | None
     waiting: tuple[tuple[PendingActionRecord, Session | None], ...]
     pending_complete: bool
+    steps: SessionStepCounts = _NO_STEPS
 
     @property
     def ended_at(self) -> datetime | None:
@@ -194,11 +199,26 @@ class SessionOverviewCounts:
 
 
 class SessionOverviewReader:
-    """Summarizes the sessions of one page, sharing session loads among them."""
+    """Summarizes the sessions of one page, sharing session loads among them.
 
-    def __init__(self, store: SessionStore, *, pricing: PriceBook | None = None) -> None:
+    With ``token_usage=False`` a summary carries only its step counts, which the
+    store counts without reading events, and ``usage`` is ``None``.
+    """
+
+    def __init__(
+        self,
+        store: SessionStore,
+        *,
+        pricing: PriceBook | None = None,
+        token_usage: bool = True,
+    ) -> None:
+        if type(token_usage) is not bool:
+            raise TypeError("token_usage must be a bool.")
         self._store = store
         self._pricing = pricing
+        self._token_usage = token_usage
+        # Whether a parent's retained wait names a child, by both incarnations.
+        self._retained_waits: dict[tuple[str, str | None, str, str | None], bool] = {}
         self._loaded: dict[str, Session | None] = {}
         self._loading: dict[str, asyncio.Future[Session | None]] = {}
         self._load_waiters: dict[asyncio.Future[Session | None], int] = {}
@@ -234,6 +254,27 @@ class SessionOverviewReader:
                     await asyncio.gather(pending, return_exceptions=True)
         self._loaded[session_id] = session
         return session
+
+    async def prefetch(self, session_ids: Iterable[str]) -> None:
+        """Load the sessions and the parents ``affected_by`` follows, a level at a time.
+
+        A scan calls this once per batch of events, so ``affected_by`` reads
+        no session row of its own for any session the batch names.
+        """
+
+        level = list(dict.fromkeys(session_ids))
+        for _depth in range(MAX_FOREGROUND_CHAIN_DEPTH + 1):
+            await self._load_many(level)
+            level = [
+                parent_id
+                for session_id in level
+                if (session := self._loaded.get(session_id)) is not None
+                and (parent_id := session.parent_session_id) is not None
+                and session.invocation.source is not SessionExecutionSource.FORK
+                and parent_id not in self._loaded
+            ]
+            if not level:
+                return
 
     async def affected_by(self, session_id: str) -> list[str]:
         """The session and the sessions above it whose summaries a change in it can alter.
@@ -301,13 +342,21 @@ class SessionOverviewReader:
         if not sessions:
             return ()
         query = EventQuery(session_ids=tuple(session.id for session in sessions))
-        usage = await self._store.read_usage_accounting(query, by_session=True)
+        if self._token_usage:
+            usage = await self._store.read_usage_accounting(query, by_session=True)
+            usage_by_session = {summary.session_id: summary for summary in usage.session_summaries}
+            steps = {
+                session_id: SessionStepCounts(summary.model_steps, summary.tool_calls)
+                for session_id, summary in usage_by_session.items()
+            }
+        else:
+            usage_by_session = {}
+            steps = await self._store.count_session_steps(query.session_ids)
         cost = (
             None
             if self._pricing is None
             else await self._store.read_cost_accounting(query, self._pricing, by_session=True)
         )
-        usage_by_session = {summary.session_id: summary for summary in usage.session_summaries}
         cost_by_session = (
             {} if cost is None else {totals.session_id: totals for totals in cost.session_totals}
         )
@@ -356,6 +405,7 @@ class SessionOverviewReader:
                     release_id=None if release is None else release.id,
                     waiting=tuple(zip(state.pending.actions, children, strict=True)),
                     pending_complete=state.complete,
+                    steps=steps.get(session.id, _NO_STEPS),
                 )
             )
         # Accounting and outcome reads are separate store snapshots. A
@@ -769,7 +819,14 @@ class SessionOverviewReader:
             cursor = page.next_cursor
 
     async def _retained_wait_matches(self, parent: Session, child: Session) -> bool:
-        return _wait_matches(await self._store.load_checkpoint(parent.id), parent, child)
+        # A scan asks once per event of the child; the parent's checkpoint is
+        # read once per pair of incarnations.
+        key = (parent.id, parent.instance_id, child.id, child.instance_id)
+        matched = self._retained_waits.get(key)
+        if matched is None:
+            matched = _wait_matches(await self._store.load_checkpoint(parent.id), parent, child)
+            self._retained_waits[key] = matched
+        return matched
 
 
 class _PendingCollector:

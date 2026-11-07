@@ -587,6 +587,9 @@ REVISIONS: tuple[Revision, ...] = (
     # write can carry the session store's alias check on the server. Older
     # binaries never call it. Postgres session stores require it.
     Revision(revision=140, kind=RevisionKind.ADDITIVE, compatible_from=139),
+    # A partial index that counts each session's model steps and tool calls.
+    # Older binaries never use it and keep working beside it.
+    Revision(revision=141, kind=RevisionKind.ADDITIVE, compatible_from=139),
 )
 
 #: The revision an empty database is initialized to.

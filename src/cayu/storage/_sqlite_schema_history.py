@@ -742,6 +742,11 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     138: SQLITE_EVAL_RUN_TRIAL_SLOT_DDL,
     139: "",  # Retry-key JSON provenance; compatibility fence only.
     140: "",  # The Postgres alias-check function; SQLite checks in-process.
+    # Activity and overview pages count each session's model steps and tool
+    # calls from this index instead of reading the events.
+    141: """CREATE INDEX IF NOT EXISTS idx_cayu_events_session_steps
+        ON cayu_events(session_id, event_type)
+        WHERE event_type IN ('model.completed', 'tool.call.started');""",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

@@ -353,6 +353,7 @@ from cayu.sessions.queries import (
 )
 from cayu.sessions.records import (
     CheckpointTransform,
+    EventHead,
     EventRecord,
     PendingActionKind,
     PendingActionSession,
@@ -385,6 +386,7 @@ from cayu.sessions.summaries import (
     EventSummary,
     SessionOperationalSnapshot,
     SessionOutcome,
+    SessionStepCounts,
     session_outcome,
 )
 from cayu.sessions.terminal_evidence import (
@@ -1688,6 +1690,14 @@ class PostgresSessionStore(
             session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
             for session_id, value in values.items()
         }
+
+    async def count_session_steps(self, session_ids: Sequence[str]) -> dict[str, SessionStepCounts]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().count_session_steps(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await page_read_ops.count_session_steps(cur, page)
 
     async def summarize_outcomes(self, session_ids: Sequence[str]) -> dict[str, SessionOutcome]:
         page = page_reads.page_session_ids(session_ids)
@@ -6140,6 +6150,9 @@ class PostgresSessionStore(
 
     async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
         return await session_queries.query_events(self._ready_connection, query)
+
+    async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
+        return await session_queries.query_event_heads(self._ready_connection, query)
 
     async def event_exists(self, query: EventQuery) -> bool:
         return await session_queries.event_exists(self._ready_connection, query)

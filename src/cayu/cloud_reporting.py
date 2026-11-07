@@ -57,7 +57,7 @@ from cayu.sessions.overview import SessionOverviewStatus as CloudRunStatus
 from cayu.sessions.pending_action_contracts import (
     PendingActionRecord,
 )
-from cayu.sessions.records import Session
+from cayu.sessions.records import EventHead, Session
 from cayu.sessions.supervision_events import (
     SupervisionEvent,
     SupervisionEventKind,
@@ -69,7 +69,6 @@ from cayu.tasks.queries import TaskQuery
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.sessions.external_waits import ExternalWaitRecord
-    from cayu.sessions.records import EventRecord
 
 CLOUD_AGENT_CONTRACT = "cayu.cloud-agent"
 #: The contract versions this Runtime serves, oldest first.
@@ -414,11 +413,10 @@ async def _store_identity(app: CayuApp) -> str:
     return identity
 
 
-def _event_mark(record: EventRecord) -> str:
+def _event_mark(head: EventHead) -> str:
     """Name the exact event at a sequence, so a store that reissued it is told apart."""
 
-    event = record.event
-    identity = [record.sequence, event.session_id, event.id, event.timestamp.isoformat()]
+    identity = [head.sequence, head.session_id, head.event_id, head.timestamp.isoformat()]
     return sha256(canonical_durable_json_bytes(identity, "activity cursor")).hexdigest()[:32]
 
 
@@ -452,7 +450,7 @@ async def _cursor_position(
     position, mark = int(match[2]), match[3]
     if position > MAX_DURABLE_JSON_INTEGER:
         raise CloudActivityCursorInvalid("Invalid activity cursor.")
-    held = await app.session_store.query_events(
+    held = await app.session_store.query_event_heads(
         EventQuery(after_sequence=position - 1, limit=1, order_by=EventOrder.SEQUENCE_ASC)
     )
     if held and held[0].sequence == position and _event_mark(held[0]) != mark:
@@ -489,11 +487,13 @@ async def read_cloud_activity(
         raise ValueError(f"limit must be between 1 and {CLOUD_ACTIVITY_MAX_LIMIT}.")
     store_id = await _store_identity(app)
     position, mark = await _cursor_position(app, store_id, cursor)
-    last: EventRecord | None = None
+    last: EventHead | None = None
     store = app.session_store
-    reader = SessionOverviewReader(store, pricing=_bundled_price_book())
+    # Cloud shows step counts, never token totals, so the reader counts steps
+    # instead of folding every usage event of the page's sessions.
+    reader = SessionOverviewReader(store, pricing=_bundled_price_book(), token_usage=False)
     changed: dict[str, None] = {}
-    anchors: list[EventRecord] = []
+    anchors: list[EventHead] = []
     scanned = 0
     has_more = False
     while True:
@@ -501,13 +501,16 @@ async def read_cloud_activity(
         if batch_limit == 0:
             has_more = await store.event_exists(_scan_query(position, 1))
             break
-        batch = await store.query_events(_scan_query(position, batch_limit))
+        # Heads only: the scan needs where each event sits, and classification
+        # reads each anchor's full record itself.
+        batch = await store.query_event_heads(_scan_query(position, batch_limit))
         scanned += len(batch)
+        await reader.prefetch(record.session_id for record in batch)
         for record in batch:
-            anchor = record.event.type in _ANCHOR_EVENT_TYPES
+            anchor = record.type in _ANCHOR_EVENT_TYPES
             affected = [
                 session_id
-                for session_id in await reader.affected_by(record.event.session_id)
+                for session_id in await reader.affected_by(record.session_id)
                 if session_id not in changed
             ]
             if (changed and len(changed) + len(affected) > limit) or (
@@ -697,7 +700,7 @@ def _project_run(
     app: CayuApp, facts: SessionOverviewFacts, parked: tuple[CloudWaitingItem, ...]
 ) -> CloudRun:
     session, outcome, status = facts.session, facts.outcome, facts.status
-    usage, cost, release_id = facts.usage, facts.cost, facts.release_id
+    steps, cost, release_id = facts.steps, facts.cost, facts.release_id
     origin = session.invocation.origin
     root_run_id, parent_run_id = session_run_lineage(session)
     marker = session.metadata.get(RUN_LINEAGE_METADATA_KEY)
@@ -730,8 +733,8 @@ def _project_run(
         started_at=session.created_at,
         ended_at=facts.ended_at,
         release_id=_text(app, release_id),
-        model_steps=0 if usage is None else usage.model_steps,
-        tool_calls=0 if usage is None else usage.tool_calls,
+        model_steps=steps.model_steps,
+        tool_calls=steps.tool_calls,
         cost=_cost(cost),
         waiting_for=(
             *(_waiting_item(app, action, child) for action, child in facts.waiting),

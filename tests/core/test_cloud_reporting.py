@@ -383,14 +383,14 @@ def test_replacement_during_read_never_mixes_incarnations(monkeypatch, phase: st
                 cloud_reporting, "classify_supervision_anchors", classify_after_replacement
             )
         else:
-            accounting = app.session_store.read_usage_accounting
+            accounting = app.session_store.count_session_steps
 
             async def accounting_after_replacement(*args, **kwargs):
                 await replace()
                 return await accounting(*args, **kwargs)
 
             monkeypatch.setattr(
-                app.session_store, "read_usage_accounting", accounting_after_replacement
+                app.session_store, "count_session_steps", accounting_after_replacement
             )
         raced = await read_cloud_activity(app)
         after = await read_cloud_activity(app, cursor=raced.next_cursor)
@@ -410,7 +410,7 @@ def test_replacement_during_read_never_mixes_incarnations(monkeypatch, phase: st
 
 
 @pytest.mark.store_semantics
-@pytest.mark.parametrize("phase", ["usage", "cost", "outcome"])
+@pytest.mark.parametrize("phase", ["steps", "cost", "outcome"])
 @pytest.mark.parametrize("replace", [False, True])
 def test_disappearance_during_summary_omits_only_that_incarnation(
     session_store_case, monkeypatch, phase: str, replace: bool
@@ -424,7 +424,8 @@ def test_disappearance_during_summary_omits_only_that_incarnation(
             before = await read_cloud_activity(app)
             changed = False
             method = {
-                "usage": "read_usage_accounting",
+                # The page counts steps instead of reading token usage.
+                "steps": "count_session_steps",
                 "cost": "read_cost_accounting",
                 # The page summarizes every session's outcome in one read.
                 "outcome": "summarize_outcomes",

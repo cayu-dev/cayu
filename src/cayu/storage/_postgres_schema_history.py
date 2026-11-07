@@ -821,6 +821,9 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     138: POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL,
     139: (),  # Retry-key JSON provenance; compatibility fence only.
     140: (POSTGRES_PUBLIC_AUTHORITY_ALIAS_CHECK_FUNCTION,),
+    # The step-count index on cayu_events is built CONCURRENTLY; see
+    # _CONCURRENT_INDEX_MIGRATIONS.
+    141: (),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
@@ -4706,6 +4709,25 @@ class _ConcurrentIndexMigration:
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    # Activity and overview pages count each session's model steps and tool
+    # calls from this index instead of reading the events. Built without
+    # blocking the event writes of revision-139 binaries still running.
+    141: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_session_steps",
+            table_name="cayu_events",
+            key_definitions=("session_id", "event_type"),
+            predicate_definition=(
+                "event_type = ANY (ARRAY['model.completed', 'tool.call.started'])"
+            ),
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_cayu_events_session_steps "
+                "ON cayu_events (session_id, event_type) "
+                "WHERE event_type IN ('model.completed', 'tool.call.started')"
+            ),
+            drop_statement="DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_session_steps",
+        ),
+    ),
     129: (
         _ConcurrentIndexMigration(
             index_name="idx_cayu_sessions_root_session_created",

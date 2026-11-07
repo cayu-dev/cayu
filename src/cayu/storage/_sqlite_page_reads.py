@@ -16,7 +16,7 @@ from cayu.events import EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
 from cayu.sessions.records import EventRecord, Session, SessionStatus, TranscriptRecord
-from cayu.sessions.summaries import SessionOutcome, session_status_outcome
+from cayu.sessions.summaries import SessionOutcome, SessionStepCounts, session_status_outcome
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript_content as transcript_content
 
@@ -137,6 +137,35 @@ def _json_field(json_type: str, value: Any) -> Any:
     if json_type in ("true", "false"):
         return json_type == "true"
     return value
+
+
+def count_session_steps(
+    connection: sqlite3.Connection, session_ids: Sequence[str]
+) -> dict[str, SessionStepCounts]:
+    if not session_ids:
+        return {}
+    # The event types are literals so the partial step-count index applies.
+    rows = connection.execute(
+        f"""
+        SELECT cayu_sessions.id AS id,
+               COUNT(CASE WHEN cayu_events.event_type = 'model.completed' THEN 1 END)
+                   AS model_steps,
+               COUNT(CASE WHEN cayu_events.event_type = 'tool.call.started' THEN 1 END)
+                   AS tool_calls
+        FROM cayu_sessions
+        LEFT JOIN cayu_events
+            ON cayu_events.session_id = cayu_sessions.id
+            AND cayu_events.event_type IN ('model.completed', 'tool.call.started')
+        WHERE cayu_sessions.id IN ({_PAGE_IDS})
+        GROUP BY cayu_sessions.id
+        """,
+        (_ids(session_ids),),
+    ).fetchall()
+    found = {
+        row["id"]: SessionStepCounts(model_steps=row["model_steps"], tool_calls=row["tool_calls"])
+        for row in rows
+    }
+    return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
 def summarize_outcomes(

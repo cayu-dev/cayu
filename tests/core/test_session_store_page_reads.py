@@ -153,6 +153,21 @@ def test_page_reads_match_single_session_reads(session_store_case):
                 assert operations == await SessionStore.load_session_operations(store, PAGE, key)
             assert (await store.load_session_operations(PAGE, "page-read-operation"))["asked"]
 
+            steps = await store.count_session_steps(PAGE)
+            assert list(steps) == list(SESSIONS)
+            assert steps == await SessionStore.count_session_steps(store, PAGE)
+            usage = await store.read_usage_accounting(
+                EventQuery(session_ids=tuple(SESSIONS)), by_session=True
+            )
+            assert {
+                summary.session_id: (summary.model_steps, summary.tool_calls)
+                for summary in usage.session_summaries
+            } == {
+                sid: (count.model_steps, count.tool_calls)
+                for sid, count in steps.items()
+                if count.model_steps or count.tool_calls
+            }
+
             parents = [sessions[sid] for sid in SESSIONS]
             children = await store.count_child_runs(parents)
             # The fork's source is its parent too, but a fork is not a child run.
@@ -459,6 +474,7 @@ def test_page_reads_validate_their_session_ids(session_store_case):
             assert await store.load_checkpoints(()) == {}
             assert await store.summarize_outcomes(()) == {}
             assert await store.count_child_runs(()) == {}
+            assert await store.count_session_steps(()) == {}
             with pytest.raises(TypeError):
                 await store.load_sessions("written")
             with pytest.raises(ValueError):

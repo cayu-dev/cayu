@@ -87,9 +87,11 @@ from cayu.sessions.queries import (
     session_query_from_aggregate_filter,
 )
 from cayu.sessions.records import (
+    EventHead,
     EventRecord,
     Session,
     SessionStatus,
+    stored_event_head,
 )
 from cayu.sessions.summaries import (
     EventSummary,
@@ -453,6 +455,35 @@ async def query_events(
         return await _query_events_by_session_id_batches(connect, query)
     async with connect() as conn, conn.cursor() as cur:
         return await _query_events(cur, query, safe_insert_xid=None)
+
+
+@runtime_session_query
+async def query_event_heads(connect: PostgresConnection, query: EventQuery) -> list[EventHead]:
+    query = copy_event_query(query)
+    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+        return [EventHead.of(record) for record in await query_events(connect, query)]
+    async with connect() as conn, conn.cursor() as cur:
+        plan, params = await _event_query_plan(cur, query, safe_insert_xid=None)
+        # The timestamp comes from the stored event, as Event reads it.
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT cayu_events.sequence,
+                       cayu_events.session_id,
+                       cayu_events.event_id,
+                       cayu_events.event_type,
+                       cayu_events.event ->> 'timestamp'
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {plan.where_sql}
+                ORDER BY cayu_events.sequence {plan.order_direction}
+                LIMIT %s
+                """,
+            ),
+            params,
+        )
+        return [stored_event_head(*row) for row in await cur.fetchall()]
 
 
 @runtime_session_query
@@ -1638,14 +1669,16 @@ async def list_sessions(
     return SessionListResult(sessions=sessions, next_cursor=next_cursor, total_count=total_count)
 
 
-async def _query_events(
+async def _event_query_plan(
     cur: Any,
     query: EventQuery,
     *,
     safe_insert_xid: Any,
     force_snapshot_cutoff: bool = False,
     exact_snapshot: bool = False,
-) -> list[EventRecord]:
+) -> tuple[session_store_sql.EventQuerySqlPlan, list[object]]:
+    """The WHERE clause and parameters of an event query, its LIMIT value last."""
+
     needs_snapshot_cutoff = not exact_snapshot and (
         force_snapshot_cutoff or _event_query_needs_snapshot_cutoff(query)
     )
@@ -1671,8 +1704,24 @@ async def _query_events(
         dialect=SQL_DIALECT,
         extra_after_sequence_clauses=extra_clauses,
     )
-    params = [*plan.params, query.limit]
+    return plan, [*plan.params, query.limit]
 
+
+async def _query_events(
+    cur: Any,
+    query: EventQuery,
+    *,
+    safe_insert_xid: Any,
+    force_snapshot_cutoff: bool = False,
+    exact_snapshot: bool = False,
+) -> list[EventRecord]:
+    plan, params = await _event_query_plan(
+        cur,
+        query,
+        safe_insert_xid=safe_insert_xid,
+        force_snapshot_cutoff=force_snapshot_cutoff,
+        exact_snapshot=exact_snapshot,
+    )
     # where_sql is built only from hard-coded clause literals; all values
     # are bound via %s params, so the assembled text carries no user input.
     await cur.execute(

@@ -113,6 +113,11 @@ BUDGETS: dict[str, dict[str, int]] = {
     "round 2 last tool result to model request 3": {"store_calls": 37},
     "model reply 3 to session end": {"store_calls": 35},
     "during the model calls": {"store_calls": 2},
+    # One Cloud activity page (GET /cloud/v1/activity) over an in-memory store.
+    # Its runs are replies and tool calls, and one denied approval; a page costs
+    # the same calls whatever the number of its runs.
+    "cloud activity page of 3 runs": {"store_calls": 22},
+    "cloud activity page of 12 runs": {"store_calls": 22},
     # Events stored, split where each model call starts (its model.started event).
     "events before model call 1": {"events": 4},
     "events from model call 1 to 2": {"events": 8},
@@ -627,3 +632,35 @@ def test_session_store_calls_per_model_step_and_tool_round_stay_within_budget(
         observed[name] = {"events": len(types)}
         breakdown[name] = dict(Counter(types))
     _check_budgets(observed, breakdown)
+
+
+def test_a_cloud_activity_page_costs_the_same_store_calls_whatever_its_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cloud_reporting import read_cloud_activity
+    from tests.core.test_cloud_activity_reads import _activity_app, _workload
+
+    async def scenario() -> list[list[str]]:
+        store = InMemorySessionStore()
+        app = _activity_app(store)
+
+        async def page(runs: int) -> list[str]:
+            timeline: list[tuple[str, str]] = []
+            with _record_store_calls(store, timeline, monkeypatch):
+                read = await read_cloud_activity(app)
+            assert len(read.runs) == runs
+            return [name for _, name in timeline]
+
+        # One touch on each page: classifying a touch reads its own evidence.
+        await _workload(app, "first")
+        small = await page(3)
+        for index in range(3):
+            await _workload(app, f"more-{index}", touch=False)
+        return [small, await page(12)]
+
+    pages = asyncio.run(scenario())
+    names = ("cloud activity page of 3 runs", "cloud activity page of 12 runs")
+    _check_budgets(
+        {name: {"store_calls": len(calls)} for name, calls in zip(names, pages, strict=True)},
+        {name: dict(Counter(calls)) for name, calls in zip(names, pages, strict=True)},
+    )
