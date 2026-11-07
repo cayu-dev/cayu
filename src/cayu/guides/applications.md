@@ -117,7 +117,13 @@ the check accepts without executing them:
   members, and a nested literal `ExecutionProfileBehaviorIdentity(...)` or a
   module-level constant holding one. This is the shape `cayu generate tool`
   emits.
-- `logging.getLogger(__name__)` or with a literal name.
+- `logging.getLogger(__name__)` or with a literal name. Configuring a logger at
+  import (creating handlers, `setFormatter`, `addHandler`, `setLevel`,
+  `propagate = False`) is reported with `reason: import_time_logging_setup`: it
+  changes logging in every process that imports the module, including
+  `cayu check` and the test suite, and `propagate = False` hides the records from
+  pytest's `caplog`. Do it in a function that the application factory calls, or in
+  the constructor of the class that writes the log.
 - Dataclass fields `field(default=<literal>)`,
   `field(default_factory=list|dict|set|tuple|frozenset)` or
   `field(default_factory=lambda: ...)` with literal flags, and empty
@@ -162,12 +168,41 @@ The finding names the construct and says why: `reason: import_time_effect` for a
 call that clearly performs I/O, network, process or file work (for example
 `subprocess.run(...)` or `Path(...).write_text(...)`), and
 `reason: unsupported_expression` for a shape the check cannot prove inert (for
-example an application function call such as `load(...)`, including one nested
+example a call to a function from an installed package, including one nested
 inside a `ToolSpec`). Move either kind into a builder, lifecycle hook or tool
-`run`. A module-level call to your own helper, such as
-`RANKER = _helper_agent("ranker", ...)` returning an `AgentSpec`, is an application
-function call too: write the `AgentSpec(...)` out at module level, or build it in a
-function the factory calls.
+`run`.
+
+A module-level call to a function your application defines, such as
+`provider_options=scout_provider_options()` or
+`RANKER = _helper_agent("ranker", ...)`, passes when the check can prove the
+function's body inert. It reads the body without running it, and decides by what
+the body does, not by the function's name. The function must be one undecorated
+module-level `def` in project source, bound once, reached directly or through
+explicit `from module import name` imports and re-exports; functions from
+installed packages are never followed. Its body may hold docstrings, `pass`,
+assignments to local names, `if`/`else`, `return`, `assert`, and `raise` of a
+builtin exception. Its expressions may use literals, f-strings, comparisons,
+`and`/`or`/`not`, `+ - | & ^`, subscripts, collection displays and
+comprehensions (a generator expression only when it is passed straight to a call
+that iterates it at once, such as `tuple(...)`, `sorted(...)` or
+`"/".join(...)`, because a stored generator runs later with whatever its
+variables hold then), read-only `str`, `dict`, `tuple` and `set` methods such as
+`strip`, `split`, `join` and `get`, builtins such as `len`, `sorted`, `tuple`
+and `str`, settings read with `os.environ.get(...)`, `os.environ[...]` or
+`os.getenv(...)`, the reviewed forms above (`AgentSpec(...)`,
+`configured_model()`, `logging.getLogger(...)`), and calls to other functions
+that pass the same proof. Those operations need values the check knows are
+plain strings, numbers and builtin collections; an object, such as a `Path`
+argument, can be passed along or returned, but calling its methods is refused
+(`Path.replace` renames a file). A module-level constant counts as plain data
+when it is built from literals: always for strings, numbers and tuples of them,
+and for a list, dict or set only while no module or class body in the
+application uses augmented assignment at import (`CONFIG |= {...}` changes the
+dict in place, even from another module). Loops, `try`, `with`, `global`, augmented
+assignment, attribute or item assignment, recursion and call chains more than four
+helpers deep are refused. A refused helper call is reported at the call, and the
+finding's message, `obstacle` and `obstacle_location` name the construct in the
+body that could not be proven.
 
 Build `ZoneInfo(...)` values lazily, inside a function or the factory, not at
 import: a zone missing from the system database is loaded from the `tzdata`

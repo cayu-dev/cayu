@@ -5,12 +5,17 @@ from __future__ import annotations
 import ast
 import builtins
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 from cayu._import_migration import import_replacement, replacement_import
+from cayu.cli._import_helper_calls import (
+    MAX_HELPER_DEPTH,
+    HelperCallProver,
+    HelperObstacle,
+)
 from cayu.cli._scaffold_test_tools import extra_only_dev_requirements
 from cayu.cli._task_retry_checks import task_retry_policy_diagnostics
 from cayu.cli.scaffold_convention import local_database_path
@@ -980,6 +985,7 @@ def _check_import_inertness(
     # a failing definition elsewhere is not reported again: the cause blocks the
     # import of every module that depends on it.
     locations: set[str] = set()
+    context = _ImportFindingContext(root, declaration_proofs.helper_calls)
 
     def report(path: Path, finding: ProjectDiagnostic) -> None:
         if finding.path not in locations:
@@ -995,7 +1001,10 @@ def _check_import_inertness(
             continue
         relative = path.relative_to(root).as_posix()
         for statement, unsafe_node in declaration_proofs.causes.get(path, ()):
-            report(path, _import_side_effect_diagnostic(relative, statement, unsafe_node))
+            report(
+                path,
+                _import_side_effect_diagnostic(relative, statement, unsafe_node, context, path),
+            )
         for base, obstacle, dependents in declaration_proofs.base_obstacles.get(path, ()):
             report(path, _unproven_base_diagnostic(relative, base, obstacle, len(dependents)))
             # The subclasses' modules are explained by this finding.
@@ -1009,7 +1018,10 @@ def _check_import_inertness(
             continue
         relative = path.relative_to(root).as_posix()
         for statement, unsafe_node in failures:
-            report(path, _import_side_effect_diagnostic(relative, statement, unsafe_node))
+            report(
+                path,
+                _import_side_effect_diagnostic(relative, statement, unsafe_node, context, path),
+            )
     return tuple(diagnostics)
 
 
@@ -1213,10 +1225,210 @@ def _narrowed_unsafe_node(node: ast.expr | ast.stmt) -> ast.expr | ast.stmt:
     return node
 
 
+class _ImportFindingContext:
+    """What explaining an import finding needs beyond the statement itself."""
+
+    def __init__(self, root: Path, prover: HelperCallProver) -> None:
+        self.root = root
+        self._prover = prover
+        self._logging_names: dict[Path, frozenset[str]] = {}
+        self._logging_modules: dict[Path, tuple[frozenset[str], frozenset[str]]] = {}
+        targets = _configured_entry_targets(root)
+        self.factory = targets[0] if targets else None
+
+    def relative(self, path: Path) -> str:
+        return (
+            path.relative_to(self.root).as_posix() if path.is_relative_to(self.root) else path.name
+        )
+
+    def helper_obstacle(
+        self, path: Path, statement: ast.stmt, node: ast.expr | ast.stmt
+    ) -> HelperObstacle | None:
+        """Why a call to an application function in *statement* is unproven, if it is one."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            return None
+        for expression, shadowed in _import_time_expression_uses(statement):
+            if any(item is node for item in ast.walk(expression)):
+                return self._prover.check(path, node, expression, shadowed).obstacle
+        return None
+
+    def is_logging_setup(self, path: Path, node: ast.expr | ast.stmt) -> bool:
+        """Handler, formatter, level or propagation setup on the logging module or a logger."""
+        if path not in self._logging_modules:
+            tree = _parsed_module(path)
+            bindings = _import_bindings(tree) if tree is not None else {}
+            modules = frozenset(
+                name
+                for name, (module, symbol) in bindings.items()
+                if symbol is None and (module == "logging" or module.startswith("logging."))
+            )
+            symbols = frozenset(
+                name
+                for name, (module, symbol) in bindings.items()
+                if symbol is not None
+                and symbol != "getLogger"
+                and (module == "logging" or module.startswith("logging."))
+            )
+            self._logging_modules[path] = (modules, symbols)
+            # Module names bound to a logger, handler or formatter.
+            bound: set[str] = set()
+            for statement in tree.body if tree is not None else ():
+                if (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and isinstance(statement.value, ast.Call)
+                    and _expression_root_name(statement.value.func) in modules | symbols
+                ):
+                    bound.add(statement.targets[0].id)
+            self._logging_names[path] = frozenset(bound)
+        modules, symbols = self._logging_modules[path]
+        values = self._logging_names[path]
+        if isinstance(node, ast.Call):
+            function = node.func
+            name = (
+                function.attr
+                if isinstance(function, ast.Attribute)
+                else function.id
+                if isinstance(function, ast.Name)
+                else None
+            )
+            if name is None or not (
+                name in _LOGGING_SETUP_CALLS or name.endswith(("Handler", "Formatter"))
+            ):
+                return False
+            root_name = _expression_root_name(function)
+            return root_name in modules or root_name in symbols or root_name in values
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Store)
+            and node.attr in _LOGGING_SETUP_ATTRIBUTES
+            and isinstance(node.value, ast.Name)
+            and node.value.id in values
+        )
+
+
+_LOGGING_SETUP_CALLS = frozenset(
+    {
+        "addFilter",
+        "addHandler",
+        "addLevelName",
+        "basicConfig",
+        "captureWarnings",
+        "dictConfig",
+        "disable",
+        "fileConfig",
+        "removeFilter",
+        "removeHandler",
+        "setFormatter",
+        "setLevel",
+        "setLoggerClass",
+        "setLogRecordFactory",
+    }
+)
+_LOGGING_SETUP_ATTRIBUTES = frozenset(
+    {"disabled", "filters", "formatter", "handlers", "level", "propagate"}
+)
+
+
+def _helper_obstacle_construct(node: ast.AST) -> str:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    if isinstance(node, ast.GeneratorExp):
+        return "generator expression"
+    if isinstance(node, ast.AugAssign):
+        operator = _AUGMENTED_OPERATORS.get(type(node.op), "")
+        return f"{_construct_name(node.target)} {operator}= ..."
+    if isinstance(node, ast.stmt):
+        return _STATEMENT_KEYWORDS.get(type(node), type(node).__name__)
+    if isinstance(node, ast.expr):
+        return _construct_name(node)
+    return type(node).__name__
+
+
+_AUGMENTED_OPERATORS: dict[type[ast.operator], str] = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.BitOr: "|",
+    ast.BitAnd: "&",
+    ast.BitXor: "^",
+}
+_STATEMENT_KEYWORDS: dict[type[ast.stmt], str] = {
+    ast.For: "for",
+    ast.AsyncFor: "async for",
+    ast.While: "while",
+    ast.Try: "try",
+    ast.With: "with",
+    ast.AsyncWith: "async with",
+    ast.Global: "global",
+    ast.Nonlocal: "nonlocal",
+    ast.Import: "import",
+    ast.ImportFrom: "import",
+    ast.Delete: "del",
+    ast.Match: "match",
+    ast.ClassDef: "class",
+}
+
+
+def _helper_obstacle_detail(obstacle: HelperObstacle, context: _ImportFindingContext) -> str:
+    node = obstacle.node
+    construct = _helper_obstacle_construct(node)
+    where = f"{context.relative(obstacle.path)}:{getattr(node, 'lineno', obstacle.helper_line)}"
+    if obstacle.reason == "recursion":
+        return (
+            f"`{construct}` at {where} calls a helper that is already running, and "
+            "recursive helpers are not followed"
+        )
+    if obstacle.reason == "depth_limit":
+        return (
+            f"`{construct}` at {where} is more than {MAX_HELPER_DEPTH} nested helper calls "
+            "deep, beyond what the check follows"
+        )
+    if obstacle.reason == "proof_limit":
+        return "its body is larger or more deeply nested than the check reads"
+    if isinstance(node, ast.GeneratorExp):
+        return (
+            f"the generator expression at {where} runs later, when something iterates it; "
+            "the check follows one only when it is passed straight to a call that iterates "
+            "it at once, such as `tuple(...)`, `sorted(...)` or `str.join(...)`"
+        )
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (
+            f"`{construct}` at {where} is decorated, a generator, or takes `*args` or "
+            "`**kwargs`, so the call does not just run its body"
+        )
+    if isinstance(node, ast.AugAssign):
+        return f"`{construct}` at {where} can change a shared list, set or dict in place"
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return f"the `{construct}` statement at {where} lets it rebind a module-level name"
+    if isinstance(node, ast.stmt):
+        return f"the `{construct}` statement at {where} is not one the check can prove inert"
+    if isinstance(node, ast.expr) and _demonstrated_effect(node):
+        return f"`{construct}` at {where} performs I/O, network, process or file work"
+    if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+        node.ctx, (ast.Store, ast.Del)
+    ):
+        return f"`{construct}` at {where} changes an attribute or item of a shared object"
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return (
+            f"`{construct}` at {where} calls a method the check cannot show is free of "
+            "side effects on that value"
+        )
+    if isinstance(node, ast.Call):
+        return (
+            f"`{construct}` at {where} calls something that is neither a proven "
+            "application helper nor a reviewed form"
+        )
+    return f"`{construct}` at {where} is not a form the check can prove inert"
+
+
 def _import_side_effect_diagnostic(
     relative: str,
     statement: ast.stmt,
     unsafe_node: ast.expr | ast.stmt,
+    context: _ImportFindingContext | None = None,
+    path: Path | None = None,
 ) -> ProjectDiagnostic:
     unproven_base = any(
         unsafe_node is base for base, _scope in _import_time_class_base_uses(statement)
@@ -1224,7 +1436,27 @@ def _import_side_effect_diagnostic(
     if not unproven_base:
         unsafe_node = _narrowed_unsafe_node(unsafe_node)
     construct = _construct_name(unsafe_node)
-    effect = not unproven_base and _demonstrated_effect(unsafe_node)
+    helper = (
+        context.helper_obstacle(path, statement, unsafe_node)
+        if context is not None and path is not None and not unproven_base
+        else None
+    )
+    effect = not unproven_base and (
+        _demonstrated_effect(unsafe_node)
+        or (
+            helper is not None
+            and isinstance(helper.node, (ast.expr, ast.stmt))
+            and _demonstrated_effect(helper.node)
+        )
+    )
+    logging_setup = (
+        context is not None
+        and path is not None
+        and not unproven_base
+        and helper is None
+        and context.is_logging_setup(path, unsafe_node)
+    )
+    extra: dict[str, object] = {}
     if unproven_base:
         reason = "unproven_class_base"
         message = (
@@ -1244,6 +1476,49 @@ def _import_side_effect_diagnostic(
         hint = (
             "Read the setting at call time in a configuration/settings.py function "
             "(the generated configured_* helpers show the pattern)."
+        )
+    elif helper is not None:
+        assert context is not None
+        reason = "import_time_effect" if effect else "unsupported_expression"
+        helper_location = f"{context.relative(helper.helper_path)}:{helper.helper_line}"
+        message = (
+            f"`{construct}` runs application function `{helper.helper}` ({helper_location}) "
+            "when the module is imported, and its body cannot be proven side-effect free: "
+            f"{_helper_obstacle_detail(helper, context)}."
+        )
+        hint = (
+            "Keep a helper called at import to literals, its arguments, settings reads such "
+            "as `os.environ.get(...)` and calls to helpers like it (see `cayu guide "
+            "applications`), or call it from a builder or lifecycle entry point instead."
+        )
+        extra = {
+            "helper": helper.helper,
+            "helper_location": helper_location,
+            "obstacle": _helper_obstacle_construct(helper.node),
+            "obstacle_location": (
+                f"{context.relative(helper.path)}:"
+                f"{getattr(helper.node, 'lineno', helper.helper_line)}"
+            ),
+            "obstacle_kind": helper.reason,
+        }
+    elif logging_setup:
+        assert context is not None
+        reason = "import_time_logging_setup"
+        factory = (
+            f"the application factory (`{context.factory}`)"
+            if context.factory
+            else "the application factory"
+        )
+        message = (
+            f"`{construct}` configures logging when the module is imported, which changes "
+            "logging for every process that imports the module, including `cayu check` and "
+            "the test suite."
+        )
+        hint = (
+            "Keep `logger = logging.getLogger(...)` at module level. Move the handler, "
+            f"formatter, level and `propagate` setup into a function that {factory} calls, "
+            "or into the constructor of the class that writes the log, and skip it when the "
+            "logger already has its handler."
         )
     elif effect:
         reason = "import_time_effect"
@@ -1284,6 +1559,7 @@ def _import_side_effect_diagnostic(
             "expression_kind": type(unsafe_node).__name__,
             "line": unsafe_node.lineno,
             "module": relative,
+            **extra,
         },
         severity=DiagnosticSeverity.ERROR,
         tags=_IMPORT_SAFETY_TAGS,
@@ -2382,7 +2658,13 @@ def _unsafe_import_time_expression(
     declarative_subscriptions: frozenset[str],
     project_root: Path,
     declarative_bases: Mapping[str, _DeclarativeBinding],
+    helper_calls: _HelperCalls | None = None,
 ) -> ast.expr | ast.stmt | None:
+    """Return the first construct of *node* that cannot be proven inert at import.
+
+    *helper_calls* proves module-level calls to application functions; without
+    it every such call is unproven.
+    """
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         return (
             None
@@ -2787,13 +3069,16 @@ def _unsafe_import_time_expression(
                 call, import_bindings, expression_rebound_names, project_root, expression_proofs
             ):
                 continue
-            if not _import_call_is_declarative(
+            if _import_call_is_declarative(
                 call,
                 import_bindings=import_bindings,
                 rebound_names=expression_rebound_names,
                 declarative_identities=declarative_identities,
             ):
-                return call
+                continue
+            if helper_calls is not None and helper_calls(call, expression, class_rebound_names):
+                continue
+            return call
     return None
 
 
@@ -3350,6 +3635,26 @@ class _DeclarationGraph:
     ]
     blockers: dict[Path, frozenset[Path]]
     migrations: dict[Path, tuple[ProjectDiagnostic, ...]]
+    # The prover that accepted application helper calls, for explaining findings.
+    helper_calls: HelperCallProver
+
+
+def _augments_at_import(trees: Iterable[ast.Module]) -> bool:
+    """Whether any module or class body runs an augmented assignment at import.
+
+    ``NAMES += [...]`` and ``CONFIG |= {...}`` change a list, dict or set in
+    place, including one another module defined, so while any remain no
+    module-level mutable value can be trusted to hold what it was written with.
+    """
+
+    def visit(node: ast.AST) -> bool:
+        if isinstance(node, ast.AugAssign):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        return any(visit(child) for child in ast.iter_child_nodes(node))
+
+    return any(visit(statement) for tree in trees for statement in tree.body)
 
 
 def _project_declaration_proofs(
@@ -3560,10 +3865,17 @@ def _project_declaration_proofs(
         return proofs
 
     proofs = prove()
+    prover = _helper_call_prover(
+        root, mutable_constants_are_data=not _augments_at_import(trees.values())
+    )
     unproven = {
         path: failed
         for path, tree in trees.items()
-        if (failed := _module_declaration_failures(root, path, tree, proofs[path]))
+        if (
+            failed := _module_declaration_failures(
+                root, path, tree, proofs[path], helper_calls=prover
+            )
+        )
     }
     # Report each failure that remains when every failing definition is assumed
     # to be what it declares. The others only depend on those definitions, so
@@ -3587,6 +3899,7 @@ def _project_declaration_proofs(
             trees[path],
             assumed_proofs[path],
             statements=frozenset(statement for statement, _ in failed),
+            helper_calls=prover,
         ):
             base_name = (
                 unsafe.id
@@ -3634,7 +3947,12 @@ def _project_declaration_proofs(
             }
             remaining.extend(
                 _module_declaration_failures(
-                    root, path, trees[path], with_base, statements=frozenset({statement})
+                    root,
+                    path,
+                    trees[path],
+                    with_base,
+                    statements=frozenset({statement}),
+                    helper_calls=prover,
                 )
             )
         if remaining:
@@ -3671,6 +3989,7 @@ def _project_declaration_proofs(
         {path: tuple(found) for path, found in obstacles.items()},
         {path: frozenset(found) for path, found in blockers.items() if found},
         migrations,
+        prover,
     )
 
 
@@ -3879,6 +4198,7 @@ def _module_declaration_failures(
     bases: Mapping[str, _DeclarativeBinding],
     *,
     statements: frozenset[ast.stmt] | None = None,
+    helper_calls: HelperCallProver | None = None,
 ) -> tuple[tuple[ast.stmt, ast.expr | ast.stmt], ...]:
     """Return each unproven top-level statement with the expression to report.
 
@@ -3891,6 +4211,11 @@ def _module_declaration_failures(
         tree, import_bindings=bindings, rebound_names=rebound
     )
     subscriptions = _declarative_subscription_names(root, tree)
+    prover = helper_calls
+
+    def proven_helper_call(call: ast.Call, enclosing: ast.expr, shadowed: frozenset[str]) -> bool:
+        return prover is not None and prover.check(path, call, enclosing, shadowed).proven
+
     failures: list[tuple[ast.stmt, ast.expr | ast.stmt]] = []
     for statement in tree.body:
         if statements is not None and statement not in statements:
@@ -3926,6 +4251,7 @@ def _module_declaration_failures(
                     if own
                     else bases
                 ),
+                helper_calls=proven_helper_call,
             )
         if unsafe is not None:
             failures.append((statement, unsafe))
@@ -4932,6 +5258,46 @@ def _memoizing_decorator_call_is_declarative(
             keyword.arg in {"maxsize", "typed"} and _literal_collection_is_data_only(keyword.value)
             for keyword in call.keywords
         )
+    )
+
+
+# Proves a module-level application function call: (call, enclosing expression,
+# class-body names visible at the call).
+_HelperCalls = Callable[[ast.Call, ast.expr, frozenset[str]], bool]
+
+
+def _helper_call_prover(root: Path, *, mutable_constants_are_data: bool) -> HelperCallProver:
+    """A prover for one scan, reading the same reviewed call forms as the module check."""
+    namespaces: dict[Path, tuple[dict[str, tuple[str, str | None]], frozenset[str]] | None] = {}
+
+    def resolve_import(path: Path, module: str | None, level: int) -> tuple[bool, Path | None]:
+        return _project_local_import_module_path(
+            root, importing_path=path, module=module, level=level
+        )
+
+    def reviewed_call(path: Path, call: ast.Call) -> bool:
+        if path not in namespaces:
+            tree = _parsed_module(path)
+            namespaces[path] = (
+                None if tree is None else (_import_bindings(tree), _module_rebound_names(tree))
+            )
+        namespace = namespaces[path]
+        if namespace is None:
+            return False
+        import_bindings, rebound_names = namespace
+        return _import_call_is_declarative(
+            call,
+            import_bindings=import_bindings,
+            rebound_names=rebound_names,
+            declarative_identities=frozenset(),
+        )
+
+    return HelperCallProver(
+        root=root,
+        resolve_import=resolve_import,
+        reviewed_call=reviewed_call,
+        mutable_constants_are_data=mutable_constants_are_data,
+        appendable_collections=_INERT_GENERATED_COLLECTION_NAMES,
     )
 
 

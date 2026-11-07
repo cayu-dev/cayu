@@ -110,8 +110,10 @@ _REJECTED = {
         "Path(...).write_text(...)",
     ),
     "open": ('CONFIG = open("config.txt").read()\n', "import_time_effect", "open(...).read(...)"),
+    # An application function call passes only when its body is proven inert;
+    # tests/cli/test_scaffold_import_helpers.py covers the accepted bodies.
     "application_call": (
-        "def load():\n    return 1\n\n\nVALUE = load()\n",
+        "def load():\n    return object()\n\n\nVALUE = load()\n",
         "unsupported_expression",
         "load(...)",
     ),
