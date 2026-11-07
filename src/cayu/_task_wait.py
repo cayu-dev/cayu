@@ -82,6 +82,37 @@ def consume_pending_task_cancellation(
     return captured
 
 
+async def absorb_consumed_cancellation_delivery() -> None:
+    """Take the pending delivery of a cancellation request this task already consumed.
+
+    Since Python 3.13, ``Task.uncancel()`` rescinds a pending request once the count
+    reaches zero. On 3.11 and 3.12 a request made while the task was running, such as one
+    ``restore_task_cancellation_requests`` reissued, stays pending after
+    ``consume_pending_task_cancellation`` consumed it. The task's next await then raises a
+    new ``CancelledError``, and a task that returns its outcome right away ends cancelled
+    instead. Either way the new error has none of the consumed signal's cause.
+
+    Call this after consuming, before the task's next await or its return. It does nothing
+    on 3.13 and later, or while a request is still outstanding. Otherwise it yields once and
+    takes that delivery. A request a caller makes during that yield arrives with it and is
+    consumed too, as it would have found the task already settled on 3.13.
+    """
+
+    current_task = asyncio.current_task()
+    if (
+        current_task is None
+        or current_task.cancelling()
+        # asyncio exposes no public accessor for a pending request; CPython's Task keeps it
+        # here on every supported version.
+        or getattr(current_task, "_must_cancel", False) is not True
+    ):
+        return
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        consume_pending_task_cancellation()
+
+
 def restore_task_cancellation_requests(
     count: int,
     *,

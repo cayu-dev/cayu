@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import runpy
+import shlex
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -281,10 +282,10 @@ def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
     runner = _dry_runner()
     _run_sqlite_cancellation_version(runner, "3.12")
 
-    assert [item.status for item in runner.evidence] == ["PLANNED"] * 5
+    assert [item.status for item in runner.evidence] == ["PLANNED"] * 6
     assert runner.evidence[0].command == "uv python install 3.12"
     assert "--python 3.12" in runner.evidence[1].command
-    attempts = runner.evidence[2:]
+    attempts = runner.evidence[2:5]
     assert len(attempts) == 3
     assert len({item.command for item in attempts}) == 1
     assert "<10 canonical SQLite cancellation nodes>" in attempts[0].command
@@ -292,6 +293,11 @@ def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:
         "tests/runtime/test_runtime_environment_cleanup.py::"
         "test_cancelled_sqlite_factory_checkpoint_preserves_committed_allocation"
     ) in _RUNNER["_SQLITE_CANCELLATION_TESTS"]
+    # Version-sensitive cancellation tests run once more on each supported Python.
+    assert runner.evidence[5].command == shlex.join(
+        ("uv", "run", "--no-sync", "pytest", "-q", *_RUNNER["_VERSIONED_CANCELLATION_TESTS"])
+    )
+    assert "tests/core/test_task_wait.py" in runner.evidence[5].command
 
 
 def test_fault_injection_lane_runs_the_sample_unless_exhaustive() -> None:

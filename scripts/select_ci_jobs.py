@@ -61,6 +61,7 @@ _SQLITE_EXACT_PATHS = {
     "tests/core/test_runtime_event_writer.py",
     "tests/core/test_subagent_cancellation.py",
     "tests/core/test_task_wait.py",
+    "tests/core/test_verified_task_worker.py",
 }
 # The fault-injection scenarios run CayuApp over the Runtime, so they cover the
 # SQLite cancellation lane's Runtime inventory (including tests/runtime/, whose

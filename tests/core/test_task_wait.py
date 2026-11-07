@@ -6,7 +6,13 @@ import contextlib
 import pytest
 
 import cayu._task_wait as task_wait
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import (
+    absorb_consumed_cancellation_delivery,
+    await_shielded_task_outcome,
+    consume_pending_task_cancellation,
+    restore_task_cancellation_requests,
+)
+from cayu.verification._leased_adapter_runner import capture_owned_task_outcome
 
 
 @pytest.mark.parametrize("child_fails", [False, True])
@@ -425,3 +431,53 @@ def test_shielded_task_outcome_does_not_mask_fatal_signal_with_pending_child(
                 await child
 
     asyncio.run(run())
+
+
+def test_consumed_restored_cancellation_does_not_cancel_a_returning_task() -> None:
+    # Before Python 3.13, uncancel() leaves a request made while the task ran pending at zero,
+    # and the task would end cancelled instead of returning its outcome.
+    async def body() -> str:
+        restore_task_cancellation_requests(1, cancellation=asyncio.CancelledError("restored"))
+        consume_pending_task_cancellation()
+        await absorb_consumed_cancellation_delivery()
+        return "outcome"
+
+    async def scenario() -> tuple[str, int]:
+        task = asyncio.create_task(body())
+        return await task, task.cancelling()
+
+    assert asyncio.run(scenario()) == ("outcome", 0)
+
+
+def test_absorbing_leaves_an_outstanding_request_to_its_task() -> None:
+    async def body() -> None:
+        asyncio.current_task().cancel("outstanding")
+        await absorb_consumed_cancellation_delivery()
+        await asyncio.sleep(0)
+
+    async def scenario() -> asyncio.CancelledError:
+        task = asyncio.create_task(body())
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value
+
+    assert asyncio.run(scenario()).args == ("outstanding",)
+
+
+def test_captured_owned_cancellation_keeps_its_cause_through_task_completion() -> None:
+    cleanup = ValueError("cleanup failed")
+
+    async def cancelled_with_cause() -> None:
+        cancellation = asyncio.CancelledError("stop")
+        # The owner restores the request it consumed just before the cancellation escapes.
+        restore_task_cancellation_requests(1, cancellation=cancellation)
+        raise cancellation from cleanup
+
+    async def scenario():
+        task = asyncio.create_task(capture_owned_task_outcome(cancelled_with_cause))
+        return await task
+
+    outcome = asyncio.run(scenario())
+    assert type(outcome.error) is asyncio.CancelledError
+    assert outcome.error.args == ("stop",)
+    assert outcome.error.__cause__ is cleanup

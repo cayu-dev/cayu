@@ -69,6 +69,14 @@ _ALL_SPECIALIST_LANES = tuple(
 _SQLITE_PYTHON_VERSIONS = ("3.11", "3.12", "3.13", "3.14")
 _MINIMUM_NODE_VERSION = (22, 18, 0)
 
+# Run once on every supported Python after the canonical nodes. The general lanes run
+# 3.14 only, and these depend on each version's Task.uncancel() and cancellation delivery.
+_VERSIONED_CANCELLATION_TESTS = (
+    "tests/core/test_task_wait.py",
+    "tests/core/test_verified_task_worker.py::"
+    "test_worker_close_cancellation_preserves_settled_callback_failure",
+)
+
 _SQLITE_CANCELLATION_TESTS = (
     "tests/core/test_sqlite_session_store.py::"
     "test_sqlite_off_thread_writer_retains_connection_ownership_during_cancellation",
@@ -821,6 +829,10 @@ def _run_sqlite_cancellation_version(runner: LocalCiRunner, python_version: str)
                 f"# sha256={hashlib.sha256(shlex.join(command).encode()).hexdigest()}"
             ),
         )
+    runner.run(
+        f"Cancellation semantics Python {python_version}",
+        ("uv", "run", "--no-sync", "pytest", "-q", *_VERSIONED_CANCELLATION_TESTS),
+    )
 
 
 def _run_sqlite_cancellation(runner: LocalCiRunner) -> None:
