@@ -80,8 +80,10 @@ class SessionAbandonmentEntrances:
         registered, as for a per-run environment only its worker registered, recovery
         can't take it over, so it fails as abandoned instead (``session.failed`` with
         ``error_type: "SessionAbandoned"`` and reason ``orphaned_session_reconciled``,
-        listing any unknown tool calls, and the assistant model call it was making in
-        ``model_call_outcome_unknown``); its environment binding stays recorded.
+        listing any unknown tool calls, and a model call it was making in
+        ``model_call_outcome_unknown``, or in ``model_call_settled`` when its recorded
+        answer was published or its background provider operation cancelled); its
+        environment binding stays recorded.
 
         A session with a live owner, an unfinished task, or activity within the
         window is left alone, as is one without attested ownership and tasks. The

@@ -2240,18 +2240,27 @@ async def clear_pending_provider_operation_disposition(
         _session,
         checkpoint: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        current = pending_provider_operation_disposition_from_checkpoint(checkpoint)
-        if current is None:
-            return checkpoint
-        if current != pending:
-            raise ProviderOperationResolutionConflict(
-                "Provider-operation disposition ownership changed before completion."
-            )
-        updated = copy_durable_json_object(checkpoint, "checkpoint")
-        updated.pop(_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY)
-        return updated
+        return checkpoint_without_pending_provider_operation_disposition(checkpoint, pending)
 
     await session_store.transform_checkpoint(pending.session_id, clear_marker)
+
+
+def checkpoint_without_pending_provider_operation_disposition(
+    checkpoint: dict[str, Any] | None,
+    pending: ProviderOperationPendingDisposition,
+) -> dict[str, Any] | None:
+    """``checkpoint`` without ``pending``, which must be the disposition it holds, if any."""
+
+    current = pending_provider_operation_disposition_from_checkpoint(checkpoint)
+    if current is None:
+        return checkpoint
+    if current != pending:
+        raise ProviderOperationResolutionConflict(
+            "Provider-operation disposition ownership changed before completion."
+        )
+    updated = copy_durable_json_object(checkpoint, "checkpoint")
+    updated.pop(_PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY)
+    return updated
 
 
 def validate_provider_operation_retry_preparation(

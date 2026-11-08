@@ -438,8 +438,13 @@ class ProviderDispositionRecovery:
         *,
         pending: ProviderOperationPendingDisposition,
         result: ProviderOperationResolutionResult,
+        abandoning: bool = False,
     ) -> tuple[Event, ...]:
-        """Settle the source dispatch before replacement or terminalization."""
+        """Settle the source dispatch before replacement or terminalization.
+
+        ``abandoning`` settles it for a run abandoned without continuing: a
+        fallback that will never be dispatched needs no tool exposure to retry with.
+        """
 
         stage = await self._session_store.load_model_completion_stage(
             pending.session_id,
@@ -450,7 +455,7 @@ class ProviderDispositionRecovery:
                 "Provider-operation disposition lost its source stage."
             )
         recovery_context = model_completion_recovery_context_from_stage(stage)
-        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY:
+        if pending.action is ProviderOperationResolutionAction.FALLBACK_RETRY and not abandoning:
             if recovery_context is None:
                 raise ProviderOperationEvidenceError(
                     "Provider-operation fallback requires durable model-completion context."

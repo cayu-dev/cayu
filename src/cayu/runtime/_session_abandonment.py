@@ -126,6 +126,7 @@ def abandoned_session_record(
     denied_approval: dict[str, Any] | None = None,
     closed: dict[str, Any] | None = None,
     model_call: dict[str, Any] | None = None,
+    provider_operation_disposition: dict[str, Any] | None = None,
     after_failure: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     record = {
@@ -144,15 +145,24 @@ def abandoned_session_record(
         # A person closed the session while it waited; names what it waited on.
         record["closed"] = closed
     if model_call is not None:
-        # The assistant model call the lost run was making, abandoned with it: its
-        # stage, and whether it reached the provider (its outcome is then unknown).
+        # The model call the lost run was making, abandoned with it: its stage and
+        # purpose, whether it reached the provider, and how it settled (``outcome``:
+        # unknown, not dispatched, its recorded answer published, or its background
+        # provider operation cancelled, which ``provider_operation`` details).
         record["model_call"] = model_call
+    if provider_operation_disposition is not None:
+        # Retire an accepted disposition with its source call charged.
+        record["provider_operation_disposition"] = provider_operation_disposition
     if after_failure is not None:
-        # The session had already failed, with its own terminal evidence, when it was
-        # abandoned: the abandonment retired the round its failure left retained, and
-        # publishes no second ``session.failed``. Names when it was abandoned.
+        # Preserve the prior terminal evidence without a second session.failed.
         record["after_failure"] = after_failure
     return record
+
+
+def _model_call_outcome(call: dict[str, Any]) -> str:
+    """How an abandoned model call settled; an older record has no outcome field."""
+
+    return call.get("outcome", "unknown" if call["dispatched"] else "not_dispatched")
 
 
 def abandoned_after_failure(record: dict[str, Any] | None) -> bool:
@@ -161,11 +171,16 @@ def abandoned_after_failure(record: dict[str, Any] | None) -> bool:
     return record is not None and "after_failure" in record
 
 
-def _unknown_model_calls(record: dict[str, Any]) -> list[dict[str, str]]:
+def _unknown_model_calls(record: dict[str, Any]) -> list[dict[str, Any]]:
     call = record.get("model_call")
-    if call is None or not call["dispatched"]:
+    if call is None or _model_call_outcome(call) != "unknown":
         return []
-    return [{key: call[key] for key in _MODEL_CALL_STRING_FIELDS}]
+    unknown: dict[str, Any] = {key: call[key] for key in _MODEL_CALL_STRING_FIELDS}
+    if "purpose" in call:
+        unknown["purpose"] = call["purpose"]
+    if "provider_operation" in call:
+        unknown["provider_operation"] = dict(call["provider_operation"])
+    return [unknown]
 
 
 def abandoned_session_from_checkpoint(
@@ -187,6 +202,10 @@ def abandoned_session_from_checkpoint(
         or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
         or ("closed" in record and not _valid_closed(record["closed"]))
         or ("model_call" in record and not _valid_model_call(record["model_call"]))
+        or (
+            "provider_operation_disposition" in record
+            and not _valid_disposition(record["provider_operation_disposition"])
+        )
         or ("after_failure" in record and not _valid_after_failure(record["after_failure"]))
     ):
         raise RuntimeError("Session retains malformed abandonment evidence.")
@@ -209,12 +228,39 @@ _CLOSED_FIELDS = frozenset({"tool_round_id", "approval_id", "input_id"})
 _MODEL_CALL_STRING_FIELDS = ("stage_id", "model_step_id", "model_attempt_id", "provider_name")
 
 
+_MODEL_CALL_OPTIONAL_FIELDS = frozenset({"purpose", "outcome", "provider_operation"})
+_MODEL_CALL_OUTCOMES = frozenset({"unknown", "not_dispatched", "published", "cancelled"})
+
+
 def _valid_model_call(call: Any) -> bool:
+    if type(call) is not dict:
+        return False
+    operation = call.get("provider_operation")
     return (
-        type(call) is dict
-        and set(call) == {*_MODEL_CALL_STRING_FIELDS, "dispatched"}
+        {*_MODEL_CALL_STRING_FIELDS, "dispatched"}
+        <= set(call)
+        <= {*_MODEL_CALL_STRING_FIELDS, "dispatched", *_MODEL_CALL_OPTIONAL_FIELDS}
         and all(type(call[field]) is str for field in _MODEL_CALL_STRING_FIELDS)
         and type(call["dispatched"]) is bool
+        and type(call.get("purpose", "")) is str
+        and call.get("outcome", "unknown") in _MODEL_CALL_OUTCOMES
+        and (
+            operation is None
+            or (
+                type(operation) is dict
+                and set(operation) == {"operation_id", "cancellation"}
+                and type(operation["operation_id"]) in {str, type(None)}
+                and type(operation["cancellation"]) is str
+            )
+        )
+    )
+
+
+def _valid_disposition(disposition: Any) -> bool:
+    return (
+        type(disposition) is dict
+        and set(disposition) == {"stage_id", "resolution_id", "action"}
+        and all(type(value) is str for value in disposition.values())
     )
 
 
@@ -314,11 +360,28 @@ def abandoned_session_failure_payload(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _model_call_payload(record: dict[str, Any]) -> dict[str, Any]:
-    """``model_call_outcome_unknown`` for a run abandoned inside a model call."""
+    """How the model work of a run abandoned inside it settled.
 
-    # Absent otherwise, so abandonments recorded before it kept their payload.
+    ``model_call_outcome_unknown`` lists a call that reached its provider and has no
+    known outcome, ``model_call_settled`` one that settled otherwise (its answer
+    published, or its background operation cancelled), and
+    ``provider_operation_disposition`` a retired disposition. Each is absent
+    otherwise, so abandonments recorded before them keep their payload.
+    """
+
+    payload: dict[str, Any] = {}
     unknown = _unknown_model_calls(record)
-    return {"model_call_outcome_unknown": unknown} if unknown else {}
+    if unknown:
+        payload["model_call_outcome_unknown"] = unknown
+    call = record.get("model_call")
+    if call is not None and _model_call_outcome(call) in {"published", "cancelled"}:
+        settled = dict(call)
+        if "provider_operation" in call:
+            settled["provider_operation"] = dict(call["provider_operation"])
+        payload["model_call_settled"] = [settled]
+    if "provider_operation_disposition" in record:
+        payload["provider_operation_disposition"] = dict(record["provider_operation_disposition"])
+    return payload
 
 
 # What holds a round for a person or a timer rather than leaving it to recovery.
@@ -738,6 +801,8 @@ class SessionAbandonment:
         )
         unknown = [] if record is None else record["unknown_tool_calls"]
         unknown_model = [] if record is None else _unknown_model_calls(record)
+        call = None if record is None else record.get("model_call")
+        outcome = None if call is None else _model_call_outcome(call)
         return IncompleteSessionRecoveryResult(
             session_id=session.id,
             previous_status=session.status,
@@ -761,6 +826,15 @@ class SessionAbandonment:
                 + (
                     " The model call it was making has an unknown outcome and was not made again."
                     if unknown_model
+                    else " The answer its model call had recorded was published."
+                    if outcome == "published"
+                    else " The background provider operation of its model call was cancelled."
+                    if outcome == "cancelled"
+                    else ""
+                )
+                + (
+                    " The provider-operation disposition it had accepted was retired."
+                    if record is not None and "provider_operation_disposition" in record
                     else ""
                 )
                 + f" Its environment {session.environment_name!r} isn't registered in this "

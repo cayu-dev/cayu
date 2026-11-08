@@ -27,12 +27,16 @@ from cayu.context.structured_output import (
     StructuredOutputStrategy,
 )
 from cayu.events import Event, EventType, copy_event, event_with_runtime_payload_authority
-from cayu.execution_profiles import event_with_execution_profile_authority
+from cayu.execution_profiles import (
+    ExecutionProfileIdentity,
+    event_with_execution_profile_authority,
+)
 from cayu.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.memory.evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.messages import Message, MessageRole, StructuredOutputPart, ToolCallPart, ToolResultPart
 from cayu.providers.operations import (
     ProviderOperationAdapter,
+    ProviderOperationCancellationSupport,
     ProviderOperationMode,
     ProviderOperationSnapshot,
     ProviderOperationStatus,
@@ -645,48 +649,7 @@ class ModelCompletionRecovery:
                 )
                 is None
             ):
-                await close_context_exposure_without_provider_effect(
-                    store=self._session_store,
-                    session_id=session.id,
-                    stage_id=stage.stage_id,
-                    stage_intent=stage.intent,
-                    evidence_ref_suffix="dispatch-receipt-absent",
-                )
-                recovery_context = model_completion_recovery_context_from_stage(stage)
-                budget_recovery_contexts = (
-                    () if recovery_context is None else recovery_context.budget_reservations
-                )
-                if stage.purpose == "auxiliary-inference":
-                    from cayu.runtime._auxiliary_inference_contract import (
-                        auxiliary_budget_recovery_contexts,
-                    )
-
-                    budget_recovery_contexts = auxiliary_budget_recovery_contexts(stage)
-                budget_dispatch_id = stage.stage_id
-                if stage.purpose in {"context-compaction", "auxiliary-inference"}:
-                    model_attempt_id = stage.intent.get("model_attempt_id")
-                    if type(model_attempt_id) is not str:
-                        raise ModelCompletionManualRecoveryRequired(
-                            "Receipt-less model-stage recovery lost its budget dispatch identity."
-                        )
-                    budget_dispatch_id = require_clean_nonblank(
-                        model_attempt_id,
-                        "model_attempt_id",
-                    )
-                release_events = await (
-                    self._run_limit_controller.release_pre_provider_dispatch_reservations(
-                        reservation_ids=stage.reservation_ids,
-                        recovery_contexts=budget_recovery_contexts,
-                        dispatch_id=budget_dispatch_id,
-                    )
-                )
-                await self._session_store.abandon_model_completion_stage(
-                    session.id,
-                    stage_id=stage.stage_id,
-                    preparation_digest=stage.preparation_digest,
-                    expected_run_epoch=session.run_epoch,
-                    stage_source_run_epoch=stage.source_run_epoch,
-                )
+                release_events = await self.abandon_undispatched_stage(session, stage)
                 active = None
                 state = "prepared_abandoned"
                 recovery_events = tuple(
@@ -825,64 +788,12 @@ class ModelCompletionRecovery:
                     f"status ({session.status.value}); expected {stage.source_status.value}."
                 )
             else:
-                if stage.purpose == "auxiliary-inference":
-                    from cayu.runtime._auxiliary_inference_contract import (
-                        auxiliary_budget_recovery_contexts,
-                        validate_auxiliary_publication,
-                    )
-
-                    publication = stage.publication
-                    if publication is None:
-                        raise ModelCompletionManualRecoveryRequired(
-                            "Auxiliary terminal stage lost its publication."
-                        )
-                    validate_auxiliary_publication(publication, session_id=session.id, stage=stage)
-                    budget_events = (
-                        await self._run_limit_controller.reconcile_model_completion_settlements(
-                            publication.events[0],
-                            reservation_ids=stage.reservation_ids,
-                        )
-                    )
-                    await (
-                        self._run_limit_controller.require_model_completion_reservation_settlements(
-                            reservation_ids=stage.reservation_ids,
-                            recovery_contexts=auxiliary_budget_recovery_contexts(stage),
-                            dispatch_id=stage.intent["model_attempt_id"],
-                        )
-                    )
-                    recovery_events = tuple(
-                        {event.id: event for event in (*recovery_events, *budget_events)}.values()
-                    )
-                if stage.purpose == "context-compaction" and stage.reservation_ids:
-                    budget_events = await compaction_recovery.reconcile_completed_stage(
-                        session=session,
-                        stage=stage,
-                        run_limit_controller=self._run_limit_controller,
-                    )
-                    recovery_events = tuple(
-                        {event.id: event for event in (*recovery_events, *budget_events)}.values()
-                    )
-                await recover_context_exposure(
-                    store=self._session_store,
-                    session_id=session.id,
-                    stage_id=stage.stage_id,
-                    stage_intent=stage.intent,
-                    state=ContextExposureState.COMPLETED,
-                    evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
-                    evidence_ref=f"model-stage:{stage.stage_id}:completed",
+                session, promotion_events = await self._promote_completed_stage(
+                    session=session, stage=stage
                 )
-                session = await self._promote_completed_model_stage(
-                    session=session,
-                    stage_id=stage.stage_id,
+                recovery_events = tuple(
+                    {event.id: event for event in (*recovery_events, *promotion_events)}.values()
                 )
-                if stage.purpose == "auxiliary-inference":
-                    assert stage.publication is not None
-                    terminal_events = await self._event_writer.fan_out_persisted(
-                        list(stage.publication.events)
-                    )
-                    recovery_events = tuple(
-                        {event.id: event for event in (*recovery_events, *terminal_events)}.values()
-                    )
                 state = "promoted"
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -2112,15 +2023,6 @@ class ModelCompletionRecovery:
         invocation: InvocationContext,
     ) -> None:
         """Retain unknown consumption without manufacturing a response or redispatch."""
-        from cayu.budgets.billing import BillingIdentity
-        from cayu.events import event_with_runtime_nested_payload_authority
-        from cayu.runtime._auxiliary_inference_contract import (
-            AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS,
-            auxiliary_budget_recovery_contexts,
-            auxiliary_terminal_publication,
-        )
-        from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
-        from cayu.sessions._model_stage import ModelCompletionStageRecoveryFence
 
         invocation._validate()
         if invocation.recovery_claim_id is None:
@@ -2137,6 +2039,144 @@ class ModelCompletionRecovery:
             raise ModelCompletionManualRecoveryRequired(
                 "Auxiliary recovery invocation conflicts with its stage."
             )
+        await self._record_unknown_auxiliary_attempt(
+            session=session,
+            stage=stage,
+            interaction_id=binding.interaction_id,
+            agent_name=binding.agent_name,
+            environment_name=binding.environment_name,
+            provider_name=binding.provider_name,
+            model=binding.model,
+            profile=invocation.profile,
+            active_profile=invocation.active_profile,
+            session_instance_id=binding.session_instance_id,
+            run_epoch=binding.run_epoch,
+            recovery_claim_id=invocation.recovery_claim_id,
+        )
+
+    async def record_abandoned_auxiliary_attempt(
+        self, session: Session, stage: ModelCompletionStage, *, recovery_claim_id: str
+    ) -> None:
+        """Record an abandoned run's dispatched auxiliary call with an unknown outcome.
+
+        As recovery records one, with ``model.auxiliary.attempt_settled`` (outcome
+        unknown, usage missing) and its reservations charged at their reserved
+        amount, but under the abandoned run's claim and the active profile it
+        rebound, rather than a reconstructed invocation, which would need the
+        environment. The completed stage is then published like any recorded answer.
+        """
+
+        intent = stage.intent
+        active_profile = active_invocation_execution_profile_from_checkpoint(
+            await self._session_store.load_checkpoint(session.id)
+        )
+        if (
+            stage.purpose != "auxiliary-inference"
+            or active_profile is None
+            or active_profile.run_epoch != session.run_epoch
+            or intent.get("session_instance_id") != session.instance_id
+            or intent.get("interaction_id") != active_profile.interaction_id
+            or intent.get("execution_profile_fingerprint") != active_profile.profile.fingerprint
+            or type(intent.get("provider_name")) is not str
+            or type(intent.get("requested_model")) is not str
+        ):
+            raise ModelCompletionManualRecoveryRequired(
+                "The abandoned auxiliary call conflicts with its run's profile."
+            )
+        await self._record_unknown_auxiliary_attempt(
+            session=session,
+            stage=stage,
+            interaction_id=active_profile.interaction_id,
+            agent_name=session.agent_name,
+            environment_name=session.environment_name,
+            provider_name=intent["provider_name"],
+            model=intent["requested_model"],
+            profile=active_profile.profile,
+            active_profile=active_profile,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
+            recovery_claim_id=recovery_claim_id,
+        )
+
+    async def abandon_undispatched_stage(
+        self, session: Session, stage: ModelCompletionStage
+    ) -> list[Event]:
+        """Abandon a stage that never reached its provider, releasing its reservations.
+
+        No provider saw the request, so nothing about it is unknown and its
+        context exposure closes without an effect. Needs no registration.
+        """
+
+        await close_context_exposure_without_provider_effect(
+            store=self._session_store,
+            session_id=session.id,
+            stage_id=stage.stage_id,
+            stage_intent=stage.intent,
+            evidence_ref_suffix="dispatch-receipt-absent",
+        )
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        budget_recovery_contexts = (
+            () if recovery_context is None else recovery_context.budget_reservations
+        )
+        if stage.purpose == "auxiliary-inference":
+            from cayu.runtime._auxiliary_inference_contract import (
+                auxiliary_budget_recovery_contexts,
+            )
+
+            budget_recovery_contexts = auxiliary_budget_recovery_contexts(stage)
+        budget_dispatch_id = stage.stage_id
+        if stage.purpose in {"context-compaction", "auxiliary-inference"}:
+            model_attempt_id = stage.intent.get("model_attempt_id")
+            if type(model_attempt_id) is not str:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Receipt-less model-stage recovery lost its budget dispatch identity."
+                )
+            budget_dispatch_id = require_clean_nonblank(
+                model_attempt_id,
+                "model_attempt_id",
+            )
+        release_events = (
+            await self._run_limit_controller.release_pre_provider_dispatch_reservations(
+                reservation_ids=stage.reservation_ids,
+                recovery_contexts=budget_recovery_contexts,
+                dispatch_id=budget_dispatch_id,
+            )
+        )
+        await self._session_store.abandon_model_completion_stage(
+            session.id,
+            stage_id=stage.stage_id,
+            preparation_digest=stage.preparation_digest,
+            expected_run_epoch=session.run_epoch,
+            stage_source_run_epoch=stage.source_run_epoch,
+        )
+        return release_events
+
+    async def _record_unknown_auxiliary_attempt(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        interaction_id: str,
+        agent_name: str,
+        environment_name: str | None,
+        provider_name: str,
+        model: str,
+        profile: ExecutionProfileIdentity,
+        active_profile: ActiveInvocationExecutionProfile,
+        session_instance_id: str,
+        run_epoch: int,
+        recovery_claim_id: str,
+    ) -> None:
+        from cayu.budgets.billing import BillingIdentity
+        from cayu.events import event_with_runtime_nested_payload_authority
+        from cayu.runtime._auxiliary_inference_contract import (
+            AUXILIARY_ATTRIBUTION_AUTHORITY_PATHS,
+            auxiliary_budget_recovery_contexts,
+            auxiliary_terminal_publication,
+        )
+        from cayu.runtime._durable_model_terminalization import terminalization_plan_owner
+        from cayu.sessions._model_stage import ModelCompletionStageRecoveryFence
+
         identity = ModelAttemptIdentity.model_validate(
             {
                 "model_step_id": stage.intent.get("model_step_id"),
@@ -2156,17 +2196,17 @@ class ModelCompletionRecovery:
         event = Event(
             type=EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED,
             session_id=session.id,
-            interaction_id=binding.interaction_id,
-            agent_name=binding.agent_name,
-            environment_name=binding.environment_name,
+            interaction_id=interaction_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
             payload={
                 **identity.payload(),
                 "auxiliary_inference": stage.intent["auxiliary_inference"],
-                "provider_name": binding.provider_name,
-                "requested_model": binding.model,
+                "provider_name": provider_name,
+                "requested_model": model,
                 "provider": pricing_provider,
-                "model": binding.model,
-                "execution_profile_fingerprint": invocation.profile.fingerprint,
+                "model": model,
+                "execution_profile_fingerprint": profile.fingerprint,
                 "auxiliary_outcome": "outcome_unknown",
                 "attempt": stage.dispatch_ordinal + 1,
                 "usage_status": "missing",
@@ -2174,7 +2214,7 @@ class ModelCompletionRecovery:
         )
         event = event_with_execution_profile_authority(
             event_with_runtime_payload_authority(event, "model_step_id", "model_attempt_id"),
-            invocation.profile,
+            profile,
         )
         event = await self._run_limit_controller.recover_model_completion_budget_evidence(
             event_with_runtime_nested_payload_authority(
@@ -2193,10 +2233,10 @@ class ModelCompletionRecovery:
             stage_id=stage.stage_id,
             publication=auxiliary_terminal_publication(stage, event),
             recovery_fence=ModelCompletionStageRecoveryFence(
-                expected_session_instance_id=binding.session_instance_id,
-                expected_run_epoch=binding.run_epoch,
-                expected_active_profile=invocation.active_profile,
-                recovery_claim_id=invocation.recovery_claim_id,
+                expected_session_instance_id=session_instance_id,
+                expected_run_epoch=run_epoch,
+                expected_active_profile=active_profile,
+                recovery_claim_id=recovery_claim_id,
                 preparation_digest=stage.preparation_digest,
                 recovery_plan_ownership=terminalization_plan_owner(),
             ),
@@ -2205,48 +2245,161 @@ class ModelCompletionRecovery:
     async def settle_abandoned_dispatch_budget(
         self, session: Session, stage: ModelCompletionStage
     ) -> None:
-        """Charge the budget an abandoned, dispatched assistant model call reserved.
+        """Charge the budget an abandoned, dispatched model call reserved.
 
         The call reached its provider and no answer is recorded, so its spend is
         unknown: each reservation is settled at its reserved amount, as
-        ``CayuApp.recover_model_completion_stage`` settles one. Repeating it after
-        the reservations settled changes nothing. Needs no registration: the stage
-        records the provider, model and reservations it dispatched with.
+        ``CayuApp.recover_model_completion_stage`` settles one. That holds for an
+        assistant turn (including one in a background provider operation), a
+        context compaction and an auxiliary inference call, each under the dispatch
+        identity its purpose reserved with. Repeating it after the reservations
+        settled changes nothing. Needs no registration: the stage records the
+        provider, model and reservations it dispatched with.
         """
 
-        recovery_context = model_completion_recovery_context_from_stage(stage)
-        provider_name = stage.intent.get("provider_name")
-        pricing_provider_name = stage.intent.get("pricing_provider_name", provider_name)
-        model_attempt_id = stage.intent.get("model_attempt_id")
-        if (
-            stage.purpose != "assistant-turn"
-            or recovery_context is None
-            or type(pricing_provider_name) is not str
-            or type(model_attempt_id) is not str
-        ):
-            raise ModelCompletionManualRecoveryRequired(
-                "The abandoned model call lost its provider, attempt or budget identity."
-            )
-        target = model_failover_target_for_stored_stage(session=session, stage=stage)
+        contexts, provider_name, model, dispatch_id, identity = self._abandoned_stage_budget(
+            session, stage
+        )
         await self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
             session=session, stage=stage, allow_outcome_unknown=True
         )
         await self._run_limit_controller.reconcile_manual_model_completion_reservations(
             reservation_ids=stage.reservation_ids,
-            recovery_contexts=recovery_context.budget_reservations,
+            recovery_contexts=contexts,
             session=session,
-            provider_name=pricing_provider_name,
-            model=session.model if target is None else target.model,
-            model_attempt_identity=ModelAttemptIdentity(
-                model_step_id=stage.logical_step_id, model_attempt_id=model_attempt_id
-            ),
-            dispatch_id=stage.stage_id,
+            provider_name=provider_name,
+            model=model,
+            model_attempt_identity=identity,
+            dispatch_id=dispatch_id,
+            is_automatic_context_compaction=stage.purpose == "context-compaction",
         )
         await self._run_limit_controller.require_model_completion_reservation_settlements(
             reservation_ids=stage.reservation_ids,
-            recovery_contexts=recovery_context.budget_reservations,
-            dispatch_id=stage.stage_id,
+            recovery_contexts=contexts,
+            dispatch_id=dispatch_id,
         )
+
+    @staticmethod
+    def _abandoned_stage_budget(
+        session: Session, stage: ModelCompletionStage
+    ) -> tuple[tuple[Any, ...], str, str, str, ModelAttemptIdentity]:
+        """The reservations, provider, model and dispatch identity a stage reserved with."""
+
+        from cayu.runtime._auxiliary_inference_contract import auxiliary_budget_recovery_contexts
+
+        intent = stage.intent
+        provider_name = intent.get("provider_name")
+        pricing_provider_name = intent.get("pricing_provider_name", provider_name)
+        model_attempt_id = intent.get("model_attempt_id")
+        requested_model = intent.get("requested_model")
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if (
+            type(pricing_provider_name) is not str
+            or type(model_attempt_id) is not str
+            or (stage.purpose != "auxiliary-inference" and recovery_context is None)
+            or (stage.purpose != "assistant-turn" and type(requested_model) is not str)
+        ):
+            raise ModelCompletionManualRecoveryRequired(
+                "The abandoned model call lost its provider, attempt or budget identity."
+            )
+        # An auxiliary call reserves under the parent model step it runs within.
+        model_step_id = (
+            intent.get("model_step_id")
+            if stage.purpose == "auxiliary-inference"
+            else stage.logical_step_id
+        )
+        if type(model_step_id) is not str:
+            raise ModelCompletionManualRecoveryRequired(
+                "The abandoned model call lost its model step identity."
+            )
+        identity = ModelAttemptIdentity(
+            model_step_id=model_step_id, model_attempt_id=model_attempt_id
+        )
+        if stage.purpose == "assistant-turn":
+            assert recovery_context is not None
+            target = model_failover_target_for_stored_stage(session=session, stage=stage)
+            return (
+                recovery_context.budget_reservations,
+                pricing_provider_name,
+                session.model if target is None else target.model,
+                stage.stage_id,
+                identity,
+            )
+        assert isinstance(requested_model, str)
+        if stage.purpose == "auxiliary-inference":
+            contexts = auxiliary_budget_recovery_contexts(stage)
+        else:
+            assert recovery_context is not None
+            contexts = recovery_context.budget_reservations
+        # A context compaction or auxiliary call reserves under its attempt identity.
+        return contexts, pricing_provider_name, requested_model, model_attempt_id, identity
+
+    async def publish_abandoned_answer(self, session: Session, stage: ModelCompletionStage) -> None:
+        """Publish the answer a lost run recorded and didn't publish, settling its budget.
+
+        For a run abandoned between recording its provider's answer and publishing
+        it. The answer is durable, so it is published as the run would have, and
+        its reservations settle from the usage it reports (budget first, so a lost
+        acknowledgement after it leaves nothing to settle twice). Publishing needs
+        no registration: the stage holds the exact publication, including any tool
+        round the answer requested, which then never starts. A context compaction's
+        summary is accounted for but not applied, since the run doesn't continue.
+        """
+
+        publication = stage.publication
+        if stage.state != "completed" or publication is None:
+            raise ModelCompletionManualRecoveryRequired(
+                "The abandoned model call has no recorded answer to publish."
+            )
+        if stage.purpose == "assistant-turn":
+            await (
+                self._run_limit_controller.reconcile_borrowed_automatic_compaction_budget_authority(
+                    session=session, stage=stage, allow_outcome_unknown=True
+                )
+            )
+            if stage.reservation_ids:
+                await self._run_limit_controller.reconcile_model_completion_settlements(
+                    publication.events[0], reservation_ids=stage.reservation_ids
+                )
+        await self._promote_completed_stage(session=session, stage=stage)
+        if stage.purpose != "auxiliary-inference":
+            # An auxiliary call's events were fanned out with its promotion.
+            await self._event_writer.fan_out_persisted(list(publication.events))
+
+    async def cancel_abandoned_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_provider: runtime_records.RegisteredProvider,
+    ) -> tuple[str, bool]:
+        """Cancel the background operation an abandoned run left at its provider.
+
+        Through the provider's operation adapter, recorded as interruption records
+        it, without the environment or an invocation: abandoning continues nothing,
+        so a result the provider already finished isn't collected. Returns the
+        cancellation's outcome and whether it settled the stage's budget (only a
+        confirmed cancellation does; otherwise the caller charges it). Repeating it
+        replays the recorded outcome without calling the provider again.
+        """
+
+        registered_agent = self._resolve_registered_agent(session.agent_name)
+        snapshot = await self._model_step_executor.cancel_provider_operation_for_abandonment(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=session.environment_name,
+        )
+        if snapshot is None:
+            adapter = registered_provider.provider.provider_operations
+            unsupported = (
+                adapter is None
+                or adapter.cancellation_support is ProviderOperationCancellationSupport.UNSUPPORTED
+            )
+            return ("unsupported" if unsupported else "unconfirmed"), False
+        return snapshot.status.value, snapshot.status is ProviderOperationStatus.CANCELLED
 
     @staticmethod
     def validate_active_model_completion_stage(session: Session, stage) -> None:
@@ -2256,6 +2409,68 @@ class ModelCompletionRecovery:
             raise RuntimeError(
                 "The active model-completion stage was prepared by a future run epoch."
             )
+
+    async def _promote_completed_stage(
+        self, *, session: Session, stage: ModelCompletionStage
+    ) -> tuple[Session, tuple[Event, ...]]:
+        """Settle a completed stage's purpose-specific accounting, then promote it.
+
+        An auxiliary call's and a context compaction's reservations settle from
+        their recorded usage first; an assistant turn's settle from its published
+        model step. Returns the promoted session and the events it produced.
+        """
+
+        events: tuple[Event, ...] = ()
+        if stage.purpose == "auxiliary-inference":
+            from cayu.runtime._auxiliary_inference_contract import (
+                auxiliary_budget_recovery_contexts,
+                validate_auxiliary_publication,
+            )
+
+            publication = stage.publication
+            if publication is None:
+                raise ModelCompletionManualRecoveryRequired(
+                    "Auxiliary terminal stage lost its publication."
+                )
+            validate_auxiliary_publication(publication, session_id=session.id, stage=stage)
+            budget_events = await self._run_limit_controller.reconcile_model_completion_settlements(
+                publication.events[0],
+                reservation_ids=stage.reservation_ids,
+            )
+            await self._run_limit_controller.require_model_completion_reservation_settlements(
+                reservation_ids=stage.reservation_ids,
+                recovery_contexts=auxiliary_budget_recovery_contexts(stage),
+                dispatch_id=stage.intent["model_attempt_id"],
+            )
+            events = tuple(budget_events)
+        if stage.purpose == "context-compaction" and stage.reservation_ids:
+            events = tuple(
+                await compaction_recovery.reconcile_completed_stage(
+                    session=session,
+                    stage=stage,
+                    run_limit_controller=self._run_limit_controller,
+                )
+            )
+        await recover_context_exposure(
+            store=self._session_store,
+            session_id=session.id,
+            stage_id=stage.stage_id,
+            stage_intent=stage.intent,
+            state=ContextExposureState.COMPLETED,
+            evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
+            evidence_ref=f"model-stage:{stage.stage_id}:completed",
+        )
+        session = await self._promote_completed_model_stage(
+            session=session,
+            stage_id=stage.stage_id,
+        )
+        if stage.purpose == "auxiliary-inference":
+            assert stage.publication is not None
+            terminal_events = await self._event_writer.fan_out_persisted(
+                list(stage.publication.events)
+            )
+            events = (*events, *terminal_events)
+        return session, events
 
     async def _promote_completed_model_stage(
         self,

@@ -1054,6 +1054,27 @@ class ModelStepExecutor:
             model_execution_selection=model_execution_selection,
         )
 
+    async def cancel_provider_operation_for_abandonment(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+    ) -> ProviderOperationSnapshot | None:
+        """Cancel the operation of a run abandoned without its environment."""
+
+        return await self._provider_operation_cancellation.cancel_for_abandonment(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+        )
+
     async def recover_provider_operation_start(
         self,
         *,

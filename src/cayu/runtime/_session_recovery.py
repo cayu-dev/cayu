@@ -848,6 +848,14 @@ class SessionRecovery:
             and active_stage.stage.stage_id == model_call["stage_id"]
             else None
         )
+        # A background operation's stage settles here once its abandonment settled it.
+        abandoned_operation_stage_id = (
+            model_call["stage_id"]
+            if settled_profile is not None
+            and model_call is not None
+            and "provider_operation" in model_call
+            else None
+        )
         interaction_id = await self._session_finalization.activate_latest_open_interaction(
             session_id
         )
@@ -861,6 +869,7 @@ class SessionRecovery:
                 recovered_active_through=active_through,
                 invocation_context=None,
                 released_execution_profile=settled_profile,
+                abandoned_provider_operation_stage_id=abandoned_operation_stage_id,
             )
             return event
         finally:
@@ -1051,6 +1060,7 @@ class SessionRecovery:
         recovered_active_through: datetime | None,
         invocation_context: InvocationContext | None,
         released_execution_profile: ExecutionProfileIdentity | None = None,
+        abandoned_provider_operation_stage_id: str | None = None,
     ) -> tuple[Session, Event | None, bool]:
         """Publish terminal recovery evidence under the applicable authority.
 
@@ -1059,7 +1069,9 @@ class SessionRecovery:
         session that was created and disposed before invocation admission, or
         whose invocation was released. ``released_execution_profile``, the
         released profile, lets that branch settle the model call an abandonment
-        recorded, as the profile the call was dispatched with.
+        recorded, as the profile the call was dispatched with, and
+        ``abandoned_provider_operation_stage_id`` names that call's stage when a
+        background provider operation the abandonment settled owned it.
         """
 
         if invocation_context is None:
@@ -1094,6 +1106,7 @@ class SessionRecovery:
                 from_statuses={session.status},
                 recovered_active_through=recovered_active_through,
                 execution_profile=execution_profile,
+                abandoned_provider_operation_stage_id=abandoned_provider_operation_stage_id,
             )
         except asyncio.CancelledError as cancellation:
             if _is_interaction_transition_run_fence(cancellation):
@@ -1147,6 +1160,7 @@ class SessionRecovery:
                     from_statuses={session.status},
                     recovered_active_through=recovered_active_through,
                     execution_profile=execution_profile,
+                    abandoned_provider_operation_stage_id=abandoned_provider_operation_stage_id,
                 )
 
             await _run_interaction_transition_cancellation_cleanup_steps(

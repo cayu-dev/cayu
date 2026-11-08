@@ -799,6 +799,7 @@ class ProviderOperationCancellationOwner:
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
         settle_budget: bool = False,
+        collect_completed: bool = True,
     ) -> ProviderOperationSnapshot | None:
         heartbeat_control: _ProviderOperationCancellationHeartbeat | None = None
         cancellation_ownership_lost: asyncio.Event | None = None
@@ -1036,9 +1037,11 @@ class ProviderOperationCancellationOwner:
             ProviderOperationStatus.EXPIRED: "failed",
         }[snapshot.status]
         await require_cancellation_owner()
-        retain_claim_after_resolution = snapshot.status is ProviderOperationStatus.COMPLETED or (
-            snapshot.status is ProviderOperationStatus.CANCELLED and bool(stage.reservation_ids)
-        )
+        # A completed operation keeps the claim for the recovery that collects its
+        # result; an abandoned run collects nothing.
+        retain_claim_after_resolution = (
+            snapshot.status is ProviderOperationStatus.COMPLETED and collect_completed
+        ) or (snapshot.status is ProviderOperationStatus.CANCELLED and bool(stage.reservation_ids))
         if durable_resolution is None:
             await self._persist_provider_operation_cancellation_event(
                 event_type=EventType.PROVIDER_OPERATION_CANCEL_RESOLVED,
@@ -1139,6 +1142,58 @@ class ProviderOperationCancellationOwner:
                 "Provider-operation cancellation substituted frozen invocation authority."
             )
 
+        return await self._cancel_identified_operation(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            selected_model=selected_model,
+            collect_completed=True,
+        )
+
+    async def cancel_for_abandonment(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+    ) -> ProviderOperationSnapshot | None:
+        """Cancel the operation of a run abandoned without its environment.
+
+        As ``cancel_for_interruption``, with no invocation to authenticate: the
+        caller holds the abandoned run's fenced recovery claim, and nothing
+        continues the run, so a routed stage is addressed by the provider and
+        model it recorded, and a completed result is not kept for collection.
+        """
+
+        return await self._cancel_identified_operation(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            selected_model=_provider_operation_target_model(session, stage),
+            collect_completed=False,
+        )
+
+    async def _cancel_identified_operation(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        selected_model: str,
+        collect_completed: bool,
+    ) -> ProviderOperationSnapshot | None:
         provider = registered_provider.provider
         adapter = provider.provider_operations
         if (
@@ -1171,4 +1226,5 @@ class ProviderOperationCancellationOwner:
             max_attempts=operation.max_attempts,
             model_attempt_identity=operation.model_attempt_identity,
             settle_budget=True,
+            collect_completed=collect_completed,
         )

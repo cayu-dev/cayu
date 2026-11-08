@@ -1025,12 +1025,16 @@ that ran it is provably gone: its execution lease lapsed or its process died, or
 task of it finished, as for one a deploy cut off. It closes even where the session's
 environment isn't registered (a per-run environment only that worker registered);
 the calls it was running are listed as unknown and the environment binding stays
-recorded. A run that stopped inside the agent's model call closes too: the call is
-listed in `model_call_outcome_unknown` on `session.failed`, its budget is charged
-at the reserved amount, and it is never made again. Model work that can't be settled
-without the environment (a background provider operation, or an answer the provider
-gave that isn't published yet) is refused with a message that names it and says
-how to settle it. A session that is running or interrupting with a live owner or one not
+recorded. A run that stopped inside a model call closes too, whether the agent's
+turn, a context compaction or a tool's auxiliary call: the call is listed in
+`model_call_outcome_unknown` on `session.failed`, its budget is charged at the
+reserved amount, and it is never made again. A background provider operation is
+cancelled through the provider first, and an answer the provider gave that wasn't
+published yet is published, its budget settled from its usage; both are listed in
+`model_call_settled` (or as unknown, if the provider didn't confirm the
+cancellation). A background operation whose provider isn't registered with its
+background operations is refused with a message that names it and says to register
+the provider and close again. A session that is running or interrupting with a live owner or one not
 known to be gone, already completed or failed, asleep (interrupt it first, which
 cancels its wake), or has a task or a child session still running is refused. Repeating a close returns
 the closed session, and closes any child sessions a close that stopped part way

@@ -2089,8 +2089,17 @@ class SessionFinalization:
         terminal_event: Event | None = None,
         terminal_decision: InvocationTerminalDecision | None = None,
         tool_completion_result: ToolCompletionResult | None = None,
+        abandoned_provider_operation_stage_id: str | None = None,
         completed_decision_context: SessionOutcomeContext | None = None,
     ) -> tuple[Session, Event | None, bool]:
+        """Publish the interaction's transition, settling any active model stage.
+
+        A stage a background provider operation owns is left to provider-operation
+        recovery, except ``abandoned_provider_operation_stage_id``: an abandonment
+        without the environment cancelled or recorded that operation and settled
+        its budget, so the stage settles here like any other abandoned call.
+        """
+
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext or not isinstance(
                 invocation_context.binding,
@@ -2162,6 +2171,13 @@ class SessionFinalization:
                 )
             except ProviderOperationEvidenceError:
                 provider_operation_owned = True
+        if (
+            provider_operation_owned
+            and active_model_completion is not None
+            and abandoned_provider_operation_stage_id is not None
+            and active_model_completion.stage.stage_id == abandoned_provider_operation_stage_id
+        ):
+            provider_operation_owned = False
         if active_model_completion is not None and not provider_operation_owned:
             model_completion_dispatched = (
                 await self.session_store.load_model_completion_stage_dispatch(

@@ -254,14 +254,11 @@ def _orphan(
     crash: str = "tool",
     database_url: str | None = None,
     entry: str = "_run_worker",
+    module: str = __name__,
 ) -> None:
     database = {} if database_url is None else {"CAYU_ORPHAN_TEST_DATABASE_URL": database_url}
     child = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"from tests.runtime.test_orphaned_session_reconciliation import {entry}; {entry}()",
-        ],
+        [sys.executable, "-c", f"from {module} import {entry}; {entry}()"],
         env={
             **os.environ,
             # The worker imports what this process does.
@@ -513,7 +510,10 @@ def test_the_server_reconciles_on_its_schedule(tmp_path) -> None:
 
     async def failed() -> None:
         for _attempt in range(400):
-            if (await store.load("scan")).status is SessionStatus.FAILED:
+            # The sweep fails the session, then publishes session.failed.
+            if (await store.load("scan")).status is SessionStatus.FAILED and any(
+                event.type is EventType.SESSION_FAILED for event in await store.load_events("scan")
+            ):
                 return
             await asyncio.sleep(0.05)
         raise AssertionError("The server did not reconcile the orphaned session.")
@@ -934,64 +934,6 @@ def test_an_abandoned_model_call_settles_once_across_a_lost_acknowledgement(
         await _require_abandoned_model_call(stores, stage, payload)
         await reader.aclose()
         await stores.close()
-
-    asyncio.run(scenario())
-
-
-def _unsettleable(stage, kind: str):
-    if kind == "background":
-        return stage.model_copy(
-            update={"intent": {**stage.intent, "provider_operation_start": {"start_id": "s-1"}}}
-        )
-    if kind == "answered":
-        return stage.model_copy(update={"state": "completed"})
-    return stage.model_copy(update={"purpose": "context-compaction"})
-
-
-@pytest.mark.parametrize(
-    ("kind", "named"),
-    [
-        ("background", "background provider operation at 'fake'"),
-        ("answered", "the answer isn't published yet"),
-        ("compaction", "inside a context-compaction model call"),
-    ],
-)
-def test_model_work_abandoning_cant_settle_is_named_with_its_way_forward(
-    tmp_path, monkeypatch, kind, named
-) -> None:
-    path = tmp_path / "sessions.sqlite"
-    _orphan(path, "scan", crash="model")
-
-    async def scenario() -> None:
-        store = SQLiteSessionStore(path)
-        reader = _application(store)
-        runtime_store = reader._incomplete_recovery._session_store
-        load_stage = runtime_store.load_active_model_completion_stage
-
-        async def unsettleable(session_id):
-            active = await load_stage(session_id)
-            return active.model_copy(update={"stage": _unsettleable(active.stage, kind)})
-
-        monkeypatch.setattr(runtime_store, "load_active_model_completion_stage", unsettleable)
-        with pytest.raises(SessionStatusConflict) as refused:
-            await reader._incomplete_recovery.abandon_orphaned_without_environment(
-                await store.load("scan"),
-                reason="orphaned_session_reconciled",
-                metadata={},
-                inactive_for_seconds=0,
-            )
-        message = str(refused.value)
-        assert named in message
-        stage = (await load_stage("scan")).stage
-        assert stage.stage_id in message
-        assert (
-            f"register environment '{_ENVIRONMENT}' in this application and run "
-            "`cayu session close scan --reason REASON` again"
-        ) in message
-        assert (await store.load("scan")).status is SessionStatus.RUNNING
-        assert "abandoned_session" not in (await store.load_checkpoint("scan") or {})
-        await reader.aclose()
-        await store.close()
 
     asyncio.run(scenario())
 
