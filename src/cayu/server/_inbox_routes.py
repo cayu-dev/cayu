@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     from cayu.knowledge.records import KnowledgeEntry
     from cayu.runtime.loop_policies import LoopPolicy
     from cayu.server.auth import AuthContext
+    from cayu.server.proxy_identity import ControlPlaneRoles
     from cayu.sessions.store import SessionStore
     from cayu.storage._knowledge_rejection import KnowledgeReviewRejection
     from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
@@ -564,8 +565,13 @@ def register_inbox_routes(
     optional_auth_context: Depends,
     inbox_gate: InboxAccessGate,
     inbox_cursor: InboxCursorSeal,
+    control_plane_roles: ControlPlaneRoles | None = None,
 ) -> None:
-    """Register the inbox list, read and settle routes."""
+    """Register the inbox list, read and settle routes.
+
+    ``control_plane_roles`` says which callers have full access; without it, every
+    caller has.
+    """
 
     from cayu.server.routes import (
         _accepted_detached_mutation,
@@ -1206,20 +1212,23 @@ def register_inbox_routes(
         )
 
     async def knowledge_item_state(
-        workflow: KnowledgeReviewWorkflow, locator: _KnowledgeLocator
+        workflow: KnowledgeReviewWorkflow, locator: _KnowledgeLocator, *, review: bool = False
     ) -> tuple[InboxItemState, KnowledgeEntry] | None:
         """What happened to one exact proposal revision, from the revision after it.
 
         Returns the state with the proposal revision itself, which describes the
-        item to the inbox access rule.
+        item to the inbox access rule. With ``review`` the revisions are read as a
+        reviewer reads them (``get_review_entry``), so a proposal the access scope can no
+        longer read once dropped (an agent's recall scope) is found.
         """
 
+        read = workflow.get_review_entry if review else workflow.get_entry
         try:
-            proposal = await workflow.get_entry(locator.entry_id, revision=locator.revision)
+            proposal = await read(locator.entry_id, revision=locator.revision)
             successor = (
                 None
                 if proposal is None
-                else await workflow.get_entry(locator.entry_id, revision=locator.revision + 1)
+                else await read(locator.entry_id, revision=locator.revision + 1)
             )
         except (PermissionError, ValueError):
             return None
@@ -1228,7 +1237,7 @@ def register_inbox_routes(
         item_id = _knowledge_item_id(locator)
         if successor is None:
             try:
-                current = await workflow.get_entry(locator.entry_id)
+                current = await read(locator.entry_id)
             except (PermissionError, ValueError):
                 return None
             if current is not None and current.revision == locator.revision:
@@ -1746,7 +1755,15 @@ def register_inbox_routes(
         auth_context: AuthContext | None = inbox_auth_context,
     ) -> InboxSettleResponse:
         response.headers.update(_NO_STORE)
-        state, source = await visible_item(item_id, auth_context)
+        try:
+            state, source = await visible_item(item_id, auth_context)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            repeated = await repeated_hidden_drop(item_id, body, auth_context)
+            if repeated is None:
+                raise
+            return repeated
         if isinstance(source, _SessionItem):
             answer = await settle_session_item(source, body, auth_context)
         else:
@@ -1761,3 +1778,59 @@ def register_inbox_routes(
                 answer.item,
             )
         return answer
+
+    def full_access(auth_context: AuthContext | None) -> bool:
+        """Whether the caller has full access: no role policy limits it."""
+
+        if auth_context is None or control_plane_roles is None:
+            return True
+        role = auth_context.claims.get(control_plane_roles.role_claim)
+        return type(role) is str and role in control_plane_roles.full_access
+
+    async def repeated_hidden_drop(
+        item_id: str, body: InboxSettleRequest, auth_context: AuthContext | None
+    ) -> InboxSettleResponse | None:
+        """Answer a repeated Drop of a proposal the knowledge scope can no longer read.
+
+        An agent's recall scope (active and pending entries) can't read a proposal once it
+        is dropped, so the item isn't found. Read as a reviewer, the drop is replayed to
+        anyone the inbox access rule lets see the proposal. Who dropped it and why go only
+        to that person or a full-access caller. ``None`` when there's no such drop, so the
+        route answers 404 as before.
+        """
+
+        locator = _decode_item_id(item_id)
+        if not isinstance(locator, _KnowledgeLocator) or knowledge_review_workflow is None:
+            return None
+        workflow = knowledge_review_workflow()
+        if workflow.review_access_scope == workflow.access_scope:
+            return None
+        known = await knowledge_item_state(workflow, locator, review=True)
+        if known is None:
+            return None
+        state, proposal = known
+        if not await inbox_gate.permits(auth_context, inbox_gate.knowledge_scope(proposal)):
+            return None
+        settled = state.settlement
+        if state.status != "settled" or settled is None or settled.decision != "drop":
+            return None
+        if body.decision not in INBOX_DECISIONS["knowledge"]:
+            raise HTTPException(
+                status_code=422, detail="A knowledge proposal accepts keep or drop."
+            )
+        identity, annotations = _knowledge_reviewer_attribution(auth_context)
+        mine = settled.decided_by == _knowledge_decider(annotations, identity)
+        shown = (
+            state
+            if mine or full_access(auth_context)
+            else state.model_copy(
+                update={
+                    "settlement": settled.model_copy(update={"decided_by": None, "reason": None})
+                }
+            )
+        )
+        if body.decision != "drop" or (
+            mine and settled.reason != cayu_app.redact_json(body.reason)
+        ):
+            raise _state_conflict(shown)
+        return InboxSettleResponse(replayed=True, item=shown)

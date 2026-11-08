@@ -684,3 +684,122 @@ def test_archived_list_survives_an_entry_relabeled_into_the_review_labels(store)
         assert listed.status_code == 200, listed.text
         (row,) = listed.json()["entries"]
         assert (row["entry_id"], row["decision"]) == ("moved", None)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_a_repeated_inbox_drop_on_a_recall_scope_replays_as_on_cayu_cloud(store_kind, tmp_path):
+    """The recall scope can't read a proposal once the inbox drops it. Repeating that Drop
+    replays the settlement to anyone the inbox access rule lets see the proposal; who
+    dropped it and why go only to that person and to full-access callers."""
+
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from tests.server.test_proxy_identity import FakeJwks, _as, _auth, _token
+
+    from cayu.server import BasicAuth
+    from cayu.storage import SQLiteKnowledgeStore
+
+    recall = KnowledgeAccessScope(
+        allowed_namespaces=["default"],
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    bound = (
+        InMemoryKnowledgeStore(access_scope=recall)
+        if store_kind == "memory"
+        else SQLiteKnowledgeStore(tmp_path / "knowledge.sqlite", access_scope=recall)
+    )
+    asyncio.run(
+        bound.create_entry(
+            KnowledgeEntry(
+                id="proposal",
+                namespace="default",
+                text="Made-up droppedquasar proposal",
+                status=KnowledgeStatus.PENDING,
+            )
+        )
+    )
+
+    async def inbox_access(person, item):
+        # The third member may not see knowledge proposals.
+        return person.subject != "person-3"
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    auth = _auth(
+        FakeJwks(key), fallback=BasicAuth(username="operator", password="made-up-password")
+    )
+    operator = {"Authorization": "Basic " + base64.b64encode(b"operator:made-up-password").decode()}
+    dropper, other, outsider = (
+        _as(_token(key, role="member", sub=subject))
+        for subject in ("person-1", "person-2", "person-3")
+    )
+    app = CayuApp(knowledge_store=bound, knowledge_access_scope=recall, enable_logging=False)
+    server = create_server(app, config=ServerConfig.protected(auth), inbox_access=inbox_access)
+    try:
+        with TestClient(server) as client:
+            (item,) = client.get("/api/inbox", headers=dropper).json()["items"]
+            settle = f"/api/inbox/{item['id']}/settle"
+            drop = {"decision": "drop", "reason": "Duplicate."}
+            first = client.post(settle, headers=dropper, json=drop)
+            assert first.status_code == 200, first.text
+            assert first.json()["replayed"] is False
+            recorded = first.json()["item"]["settlement"]
+
+            # The member who dropped it gets the settlement replayed, with who and why.
+            again = client.post(settle, headers=dropper, json=drop)
+            assert again.status_code == 200, again.text
+            assert again.json() == {"replayed": True, "item": first.json()["item"]}
+            assert recorded["decided_by"]["subject"] == "person-1"
+            assert recorded["reason"] == "Duplicate."
+            changed = client.post(
+                settle, headers=dropper, json={"decision": "drop", "reason": "Another."}
+            )
+            assert changed.status_code == 409, changed.text
+
+            # Another member who may see it gets the settlement without who and why.
+            seen = client.post(settle, headers=other, json={"decision": "drop"})
+            assert seen.status_code == 200, seen.text
+            settlement = seen.json()["item"]["settlement"]
+            assert seen.json()["replayed"] is True
+            assert seen.json()["item"]["status"] == "settled"
+            assert settlement == {
+                "decision": "drop",
+                "decided_at": recorded["decided_at"],
+                "decided_by": None,
+                "reason": None,
+            }
+            kept = client.post(settle, headers=other, json={"decision": "keep"})
+            assert kept.status_code == 409, kept.text
+            assert "Duplicate." not in kept.text and "person-1" not in kept.text
+
+            # A member the inbox access rule doesn't let see it gets 404, as before.
+            assert client.post(settle, headers=outsider, json=drop).status_code == 404
+
+            # The operator has full access, so gets who and why.
+            full = client.post(settle, headers=operator, json={"decision": "drop"})
+            assert full.status_code == 200, full.text
+            assert full.json()["item"]["settlement"] == recorded
+
+            # A fresh operation key on the dropped entry still finds nothing.
+            fresh = client.post(
+                "/api/knowledge/proposal/reject",
+                headers={**operator, "Idempotency-Key": "fresh-key"},
+                json={"reason": "Duplicate."},
+            )
+            assert fresh.status_code == 404, fresh.text
+            # Members still can't use the archived routes.
+            assert client.get("/api/knowledge/archived", headers=other).status_code == 403
+        # Search, with the agent's recall scope, still finds nothing archived.
+        found = asyncio.run(
+            bound.search(
+                KnowledgeQuery(
+                    text="droppedquasar",
+                    statuses=[KnowledgeStatus.PENDING, KnowledgeStatus.ARCHIVED],
+                )
+            )
+        )
+        assert found.hits == []
+    finally:
+        close = getattr(bound, "close", None)
+        if close is not None:
+            asyncio.run(close())

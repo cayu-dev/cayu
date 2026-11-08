@@ -1125,8 +1125,12 @@ wasn't recorded. All preserve the server's review scope and permissions. The ser
 knowledge scope needn't admit archived entries: with a scaffolded project's (active and
 pending only) drop and archive still record the decision, read it back through the
 review scope, and replay it when repeated with the same operation ID. The inbox answers
-a drop from the decision it just recorded, but repeating the inbox's Drop there still
-finds no item. Local store options remain read-only;
+a drop from the decision it just recorded, and a repeated Drop replays the settlement
+(`replayed: true`, decision `drop` and when) to anyone the inbox access rule lets see the
+proposal. Who dropped it and why go only to that person and to full-access callers; other
+members get the settlement without them. The item itself stays out of the inbox and
+`GET /api/inbox/{item_id}`, since the scope can't read it. Local store options remain
+read-only;
 mutations always go through the running server.
 `cayu knowledge show` prints who archived or dropped an entry and why (`archived_by`,
 `archived_reason`, `dropped_by`, `dropped_reason`), from a local store or, with full

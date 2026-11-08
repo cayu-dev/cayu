@@ -9917,6 +9917,7 @@ def create_router(
         optional_auth_context=optional_auth_context,
         inbox_gate=inbox_gate,
         inbox_cursor=inbox_cursor,
+        control_plane_roles=role_policy if isinstance(role_policy, ControlPlaneRoles) else None,
     )
 
     @router.get("/health", response_model=HealthResponse)
