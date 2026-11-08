@@ -304,6 +304,19 @@ checkpoint, publication, and extension transforms therefore cannot create,
 replace, delete, or reinterpret invocation lifecycle receipts. Only the
 authenticated lifecycle command adapter may mutate this root.
 
+Every checkpoint a store returns carries the whole receipt ledger under this
+root. The SQLite and PostgreSQL stores keep the ledger out of the checkpoint
+row: from storage revision 144 the row holds a reference with the ledger's
+`record_sha256`, and `cayu_invocation_receipt_ledgers` holds the ledger, keyed
+by session and digest. A write that carries a ledger stores it there, in the
+same transaction, and a session keeps at most the version its checkpoint row
+refers to and the newest one. Runtime publications and generic checkpoint
+transforms never see the ledger, so they read, check and rewrite only the
+checkpoint row. A row that still holds its ledger inline is read as before and
+moves it out on its next ledger write. A reference whose ledger row is missing
+fails the read. Revision 144 is breaking: older binaries cannot read a
+reference and refuse the database.
+
 The version 6 to version 7 upcaster reserves
 `invocation_terminal_decision` for the runtime-owned winner when external
 interruption races a linked task failure. Historical roots do not gain an
@@ -321,9 +334,10 @@ recovery finds them without scanning historical checkpoints; the SQLite and
 PostgreSQL stores read it from a partial checkpoint index, and a custom store
 that does not implement it raises `NotImplementedError`. Storage revision 143
 adds that index and is breaking, because older binaries reject both records:
-stop every process that opens the database, run `cayu storage migrate
---acknowledge-breaking 143` before the new binary serves traffic, then start
-the new binaries. Older binaries must not open a migrated database; they
+stop every process that opens the database and run `cayu storage migrate` before
+starting the new binaries. Acknowledge each pending breaking revision: 143 for
+this index and 144 for the separate receipt ledger, using
+`--acknowledge-breaking REVISION` for each. Older binaries must not open a migrated database; they
 refuse it as too new. On PostgreSQL the index is built `CONCURRENTLY`.
 
 Custom `SessionStore` implementations must accept the optional

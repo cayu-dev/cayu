@@ -68,10 +68,15 @@ async def load_checkpoints(cur: Any, session_ids: Sequence[str]) -> dict[str, An
     if not session_ids:
         return {}
     await cur.execute(
-        "SELECT session_id, state FROM cayu_checkpoints WHERE session_id = ANY(%s::text[])",
+        "SELECT checkpoint.session_id, checkpoint.state, ledger.record_sha256, ledger.ledger "
+        "FROM cayu_checkpoints AS checkpoint "
+        "LEFT JOIN cayu_invocation_receipt_ledgers AS ledger "
+        "ON ledger.session_id = checkpoint.session_id AND ledger.record_sha256 = "
+        "checkpoint.state->'invocation_lifecycle_receipt'->>'record_sha256' "
+        "WHERE checkpoint.session_id = ANY(%s::text[])",
         (list(session_ids),),
     )
-    found = {row[0]: row[1] for row in await cur.fetchall()}
+    found = {row[0]: (row[1], row[2], row[3]) for row in await cur.fetchall()}
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
@@ -109,26 +114,35 @@ async def load_checkpoint_fields(
 
     if not session_ids:
         return {}
+    # A receipt ledger field that refers to its own row is joined in the same
+    # statement, so both come from one snapshot.
     await cur.execute(
         """
-        SELECT session_id,
-               jsonb_typeof(state),
-               CASE WHEN jsonb_typeof(state) = 'object' THEN
+        SELECT checkpoint.session_id,
+               jsonb_typeof(checkpoint.state),
+               CASE WHEN jsonb_typeof(checkpoint.state) = 'object' THEN
                    (SELECT jsonb_object_agg(field.key, field.value)
-                    FROM jsonb_each(state) AS field
-                    WHERE field.key = ANY(%s::text[]))
-               END
-        FROM cayu_checkpoints
-        WHERE session_id = ANY(%s::text[])
+                    FROM jsonb_each(checkpoint.state) AS field
+                    WHERE field.key = ANY(%(keys)s::text[]))
+               END,
+               ledger.record_sha256,
+               ledger.ledger
+        FROM cayu_checkpoints AS checkpoint
+        LEFT JOIN cayu_invocation_receipt_ledgers AS ledger
+            ON 'invocation_lifecycle_receipt' = ANY(%(keys)s::text[])
+            AND ledger.session_id = checkpoint.session_id
+            AND ledger.record_sha256 =
+                checkpoint.state->'invocation_lifecycle_receipt'->>'record_sha256'
+        WHERE checkpoint.session_id = ANY(%(ids)s::text[])
         """,
-        (list(keys), list(session_ids)),
+        {"keys": list(keys), "ids": list(session_ids)},
     )
     found: dict[str, Any] = {}
-    for session_id, root_type, fields in await cur.fetchall():
+    for session_id, root_type, fields, ledger_sha256, ledger in await cur.fetchall():
         # A checkpoint is an object, as the whole-checkpoint read requires.
         if root_type != "object":
             raise DurableValueError("invalid_json_object", "checkpoint")
-        found[session_id] = {} if fields is None else fields
+        found[session_id] = ({} if fields is None else fields, ledger_sha256, ledger)
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 

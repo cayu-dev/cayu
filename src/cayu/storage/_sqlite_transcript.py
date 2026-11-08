@@ -348,6 +348,10 @@ async def replace_initial_transcript_messages(
                     "DELETE FROM cayu_checkpoints WHERE session_id = ?",
                     (session_id,),
                 )
+                connection.execute(
+                    "DELETE FROM cayu_invocation_receipt_ledgers WHERE session_id = ?",
+                    (session_id,),
+                )
             else:
                 connection.execute(
                     """
@@ -369,7 +373,8 @@ async def replace_initial_transcript_messages(
                         pending_action_metrics_ready =
                             excluded.pending_action_metrics_ready
                     """,
-                    sqlite_records.checkpoint_row_values(
+                    sqlite_records.checkpoint_row(
+                        connection,
                         session_id,
                         checkpoint,
                         updated_at,
@@ -555,7 +560,7 @@ async def append_transcript_messages_and_transform_checkpoint(
                     pending_action_flags = excluded.pending_action_flags,
                     pending_action_metrics_ready = excluded.pending_action_metrics_ready
                 """,
-                sqlite_records.checkpoint_row_values(session_id, transformed, updated_at),
+                sqlite_records.checkpoint_row(connection, session_id, transformed, updated_at),
             )
             connection.commit()
         except Exception:

@@ -182,6 +182,7 @@ class SessionRetentionBackend(ABC):
     event_payload: str = "payload_json"
     transcript_message: str = "message_json"
     checkpoint_state: str = "state_json"
+    receipt_ledger: str = "ledger_json"
     operation_record: str = "record_json"
     eval_sources: tuple[tuple[str, str], ...] = (
         ("cayu_eval_runs", "scenario_progress_json"),
@@ -278,6 +279,7 @@ class PostgresSessionRetentionBackend(SessionRetentionBackend):
     event_payload = "payload"
     transcript_message = "message"
     checkpoint_state = "state"
+    receipt_ledger = "ledger"
     operation_record = "record"
     eval_sources = (
         ("cayu_eval_runs", "scenario_progress_json"),
@@ -1357,10 +1359,13 @@ async def _deletion_size(
         "FROM cayu_transcript_messages WHERE session_id = ?",
         (session_id,),
     )
+    # The checkpoint's receipt ledger is kept in its own rows.
     checkpoint = await sql.one(
         f"SELECT COALESCE(SUM({sql.size(backend.checkpoint_state)}), 0) "
+        f"+ (SELECT COALESCE(SUM({sql.size(backend.receipt_ledger)}), 0) "
+        "FROM cayu_invocation_receipt_ledgers WHERE session_id = ?) "
         "FROM cayu_checkpoints WHERE session_id = ?",
-        (session_id,),
+        (session_id, session_id),
     )
     operations = await sql.one(
         f"SELECT COUNT(*), COALESCE(SUM({sql.size(backend.operation_record)}), 0) "

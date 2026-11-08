@@ -294,6 +294,10 @@ async def replace_initial_transcript_messages(
                         "DELETE FROM cayu_checkpoints WHERE session_id = %s",
                         (session_id,),
                     )
+                    await cur.execute(
+                        "DELETE FROM cayu_invocation_receipt_ledgers WHERE session_id = %s",
+                        (session_id,),
+                    )
                 else:
                     await upsert_checkpoint(cur, session_id, checkpoint, updated_at)
                 await touch_activity(cur, session_id, updated_at)

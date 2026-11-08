@@ -73,6 +73,7 @@ from cayu.storage._context_selection_fence import PostgresContextSelectionFenceM
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
+from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
@@ -445,7 +446,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 143
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 144
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -1688,8 +1689,8 @@ class PostgresSessionStore(
         async with self._connection() as conn, conn.cursor() as cur:
             values = await page_read_ops.load_checkpoints(cur, page)
         return {
-            session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
-            for session_id, value in values.items()
+            session_id: locked_reads.decode_checkpoint_row(row)
+            for session_id, row in values.items()
         }
 
     async def load_checkpoint_fields(
@@ -1703,8 +1704,14 @@ class PostgresSessionStore(
         async with self._connection() as conn, conn.cursor() as cur:
             values = await page_read_ops.load_checkpoint_fields(cur, page, fields)
         return {
-            session_id: copy_durable_json_object(pg_support._json_obj(value), "checkpoint")
-            for session_id, value in values.items()
+            session_id: join_receipt_ledger(
+                copy_durable_json_object(pg_support._json_obj(value), "checkpoint"),
+                ledger_sha256,
+                None
+                if ledger is None
+                else copy_durable_json_object(pg_support._json_obj(ledger), "ledger"),
+            )
+            for session_id, (value, ledger_sha256, ledger) in values.items()
         }
 
     async def count_session_steps(self, session_ids: Sequence[str]) -> dict[str, SessionStepCounts]:
@@ -5952,8 +5959,9 @@ class PostgresSessionStore(
             ),
             (
                 "checkpoint",
-                "SELECT state FROM cayu_checkpoints WHERE session_id = %s LIMIT %s",
-                lambda row: pg_support._json_obj(row[0]),
+                # The logical checkpoint, its receipt ledger joined from its own row.
+                locked_reads.CHECKPOINT_WITH_RECEIPT_LEDGER_QUERY + " LIMIT %s",
+                lambda row: locked_reads.decode_checkpoint_row(row),
             ),
             (
                 "queued_messages",
@@ -7765,7 +7773,7 @@ class PostgresSessionStore(
                     _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = await self._session_store_now(cur)
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
-                    await self._load_checkpoint(cur, session_id),
+                    await self._load_checkpoint_for_transform(cur, session_id),
                     copied,
                     session_id=session_id,
                 )
@@ -7789,7 +7797,7 @@ class PostgresSessionStore(
                         session_id,
                         locked_reads.store_now(),
                         locked_reads.closure_owners((session_id,)),
-                        locked_reads.checkpoint(session_id),
+                        locked_reads.checkpoint_for_transform(session_id),
                     )
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
@@ -7835,7 +7843,7 @@ class PostgresSessionStore(
                         cur,
                         session_id,
                         locked_reads.closure_owners((session_id,)),
-                        locked_reads.checkpoint(session_id),
+                        locked_reads.checkpoint_for_transform(session_id),
                         locked_reads.store_now(),
                     )
                     if session is None:
@@ -8041,6 +8049,13 @@ class PostgresSessionStore(
         await cur.execute(read.query, read.parameters)
         return locked_reads.decode_checkpoint(await cur.fetchall())
 
+    async def _load_checkpoint_for_transform(
+        self, cur: Any, session_id: str
+    ) -> dict[str, Any] | None:
+        read = locked_reads.checkpoint_for_transform(session_id)
+        await cur.execute(read.query, read.parameters)
+        return locked_reads.decode_checkpoint(await cur.fetchall())
+
     async def _upsert_checkpoint(
         self,
         cur: Any,
@@ -8050,6 +8065,7 @@ class PostgresSessionStore(
         *,
         owned: bool = False,
     ) -> None:
+        checkpoint = await _store_receipt_ledger(cur, session_id, checkpoint)
         await cur.execute(
             """
             INSERT INTO cayu_checkpoints (
@@ -8089,6 +8105,44 @@ class PostgresSessionStore(
         return None
 
 
+async def _store_receipt_ledger(
+    cur: Any, session_id: str, checkpoint: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep a checkpoint's receipt ledger in its own row; return the row to store.
+
+    Ledger rows are keyed by their content digest, so storing one never
+    changes what the session's current checkpoint row refers to. A new
+    version replaces every other one except the version that row refers to,
+    so a session keeps at most two. One round trip either way.
+    """
+
+    from cayu.storage._receipt_ledger_rows import split_receipt_ledger
+
+    row, ledger = split_receipt_ledger(checkpoint)
+    if ledger is None:
+        return checkpoint
+    digest = ledger["record_sha256"]
+    await cur.execute(
+        """
+        WITH inserted AS (
+            INSERT INTO cayu_invocation_receipt_ledgers (session_id, record_sha256, ledger)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (session_id, record_sha256) DO NOTHING
+            RETURNING session_id
+        )
+        DELETE FROM cayu_invocation_receipt_ledgers AS stale
+        WHERE stale.session_id IN (SELECT session_id FROM inserted)
+            AND stale.record_sha256 <> %s
+            AND stale.record_sha256 IS DISTINCT FROM (
+                SELECT state->'invocation_lifecycle_receipt'->>'record_sha256'
+                FROM cayu_checkpoints WHERE session_id = %s
+            )
+        """,
+        (session_id, digest, pg_support._dumps(ledger), digest, session_id),
+    )
+    return row
+
+
 def _checkpoint_row_values(
     session_id: str,
     checkpoint: dict[str, Any],
@@ -8104,13 +8158,16 @@ def _checkpoint_row_values(
     """
 
     from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
+    from cayu.storage._receipt_ledger_rows import require_logical_checkpoint_limits
 
     if not owned:
         checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+    serialized = pg_support._dumps(checkpoint)
+    require_logical_checkpoint_limits(checkpoint, serialized)
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,
-        pg_support._dumps(checkpoint),
+        serialized,
         pg_support.to_utc(updated_at),
         source_bytes,
         tool_call_count,

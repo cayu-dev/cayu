@@ -24,6 +24,7 @@ from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 from cayu.sessions import checkpoints
 from cayu.storage import SQLiteSessionStore
+from cayu.storage import _receipt_ledger_rows as receipt_ledger_rows
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.tools.base import ToolContext
 
@@ -89,6 +90,11 @@ class _Meter:
                 and checkpoints.CHECKPOINT_SCHEMA_VERSION_KEY in value
             ):
                 meter._count("checkpoint_walks")
+                ledger = value.get(checkpoints.INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY)
+                if type(ledger) is dict and ledger.get("record_type") == (
+                    checkpoints.INVOCATION_LIFECYCLE_RECEIPT_LEDGER_RECORD_TYPE
+                ):
+                    meter._count("walks_with_receipt_ledger")
                 meter._walking = True
                 try:
                     return walk(value, field_name, **kwargs)
@@ -111,6 +117,16 @@ class _Meter:
 
         monkeypatch.setattr(sqlite_records, "checkpoint_row_values", counted_sqlite_row)
         monkeypatch.setattr(postgres_store, "_checkpoint_row_values", counted_postgres_row)
+
+        split = receipt_ledger_rows.split_receipt_ledger
+
+        def counted_split(checkpoint: Any) -> Any:
+            row, ledger = split(checkpoint)
+            if ledger is not None:
+                meter._count("ledger_writes")
+            return row, ledger
+
+        monkeypatch.setattr(receipt_ledger_rows, "split_receipt_ledger", counted_split)
 
         store = self.store
 
@@ -213,6 +229,19 @@ def test_publications_decode_once_and_skip_unchanged_rewrites(
     # row as it reads it (PostgreSQL) adds that read.
     assert meter.per_call(publication, "checkpoint_walks") == (3 if backend == "sqlite" else 4)
     assert meter.per_call(publication, "row_writes") == 1
+    # The receipt ledger stays in its own row: a publication neither checks
+    # nor rewrites it.
+    assert meter.counts[publication]["walks_with_receipt_ledger"] == 0
+    assert meter.counts[publication]["ledger_writes"] == 0
+    # Lifecycle commands store new ledger versions; publications and the effect
+    # journal never do.
+    assert sum(counts["ledger_writes"] for counts in meter.counts.values()) > 0
+    assert not {
+        label
+        for label, counts in meter.counts.items()
+        if counts["ledger_writes"]
+        and label.startswith(("publish_runtime_publication", "publish_session_operation"))
+    }
 
     operation = "publish_session_operation"
     assert meter.calls[operation] >= _ROUNDS

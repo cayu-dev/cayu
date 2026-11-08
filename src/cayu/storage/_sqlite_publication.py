@@ -620,7 +620,8 @@ async def publish_runtime(
             checkpoint_values = (
                 None
                 if stored_target_checkpoint is None or not request.mutation.operations
-                else sqlite_records.checkpoint_row_values(
+                else sqlite_records.checkpoint_row(
+                    connection,
                     session_id,
                     stored_target_checkpoint,
                     published_at,
@@ -1037,8 +1038,8 @@ async def publish_checkpoint_events(
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
                     # Preservation returned a fresh validated copy.
-                    sqlite_records.checkpoint_row_values(
-                        session_id, transformed, updated_at, owned=True
+                    sqlite_records.checkpoint_row(
+                        connection, session_id, transformed, updated_at, owned=True
                     ),
                 )
             if operation_records:

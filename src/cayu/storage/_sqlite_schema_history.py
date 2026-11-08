@@ -757,6 +757,17 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     143: """CREATE INDEX IF NOT EXISTS idx_cayu_checkpoints_invocation_terminal_decision
         ON cayu_checkpoints(session_id)
         WHERE json_type(state_json, '$.invocation_terminal_decision') IS NOT NULL;""",
+    # Each session's invocation lifecycle receipt ledger, out of its checkpoint
+    # row. The row refers to one version by digest; a session keeps at most two.
+    144: """CREATE TABLE IF NOT EXISTS cayu_invocation_receipt_ledgers (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id)
+            ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+        record_sha256 TEXT NOT NULL CHECK (
+            length(record_sha256) = 64 AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        ledger_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, record_sha256)
+    );""",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

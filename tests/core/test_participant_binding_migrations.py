@@ -29,6 +29,7 @@ from cayu.sessions.requests import ResumeRequest, RunRequest
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.storage import _sqlite_functions as sqlite_functions
 from cayu.storage import _sqlite_public_authority as public_authority_ops
+from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_schema_history as sqlite_schema_history
 from cayu.storage import _sqlite_support as sql
 from cayu.storage import migrations as schema
@@ -96,7 +97,13 @@ def test_historical_sqlite_upgrade_continues_session(
 
         return store
 
-    seed_store = asyncio.run(seed_data())
+    # A historical binary kept the receipt ledger inside the checkpoint row,
+    # and the historical schema has no ledger table to copy it into.
+    with monkeypatch.context() as inline:
+        inline.setattr(
+            sqlite_records, "store_receipt_ledger", lambda _connection, _session, state: state
+        )
+        seed_store = asyncio.run(seed_data())
     with closing(sqlite3.connect(seed)) as connection:
         seeded = _rows(connection)
         seeded_columns = {
@@ -281,6 +288,15 @@ def test_historical_postgres_upgrade_continues_session(postgres_dsn, revision, m
             )
             store = pg.PostgresSessionStore(postgres_dsn, schema_mode=schema.SchemaMode.CREATE)
             try:
+                # This build reads checkpoints with their receipt ledger table,
+                # which the historical schema lacks; revision 144 creates it
+                # with IF NOT EXISTS, so creating it here leaves the upgrade as is.
+                await store.load("existing")
+                async with await psycopg.AsyncConnection.connect(
+                    postgres_dsn, autocommit=True
+                ) as connection:
+                    for statement in postgres_schema_history._MIGRATION_STEPS[144]:
+                        await connection.execute(statement)
                 events = [
                     event
                     async for event in _app(store).run(

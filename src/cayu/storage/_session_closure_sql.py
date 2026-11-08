@@ -164,6 +164,11 @@ def closure_size_statement(*, postgres: bool) -> tuple[str, int]:
         ("cayu_transcript_messages", "session_id", ("message_bytes", "interaction_id")),
         ("cayu_checkpoints", "session_id", ("state" if postgres else "state_json",)),
         (
+            "cayu_invocation_receipt_ledgers",
+            "session_id",
+            ("record_sha256", "ledger" if postgres else "ledger_json"),
+        ),
+        (
             "cayu_session_message_queue",
             "session_id",
             (

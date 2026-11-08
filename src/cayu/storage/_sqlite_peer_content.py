@@ -144,11 +144,9 @@ async def append_peer_content(
                 request.append_key.consumer_participant_incarnation,
                 target_instance,
             )
-            checkpoint_row = connection.execute(
-                "SELECT state_json FROM cayu_checkpoints WHERE session_id = ?",
-                (target_id,),
-            ).fetchone()
-            checkpoint = None if checkpoint_row is None else json.loads(checkpoint_row[0])
+            checkpoint = (
+                None if target_id is None else sqlite_records.load_checkpoint(connection, target_id)
+            )
             parked_target = False
             if session is not None and session.status in {"completed", "failed", "interrupted"}:
                 from cayu.storage._peer_attempts import (

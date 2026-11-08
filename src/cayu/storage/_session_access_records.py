@@ -115,6 +115,15 @@ async def sqlite_read(
             session = bounds.require_read(sqlite_records.load_session(connection, session_id))
             if kind == "checkpoint":
                 bounds.require_action(session, "inspect_state")
+                # The checkpoint as stores hand it out, its receipt ledger joined back.
+                stored = sqlite_records.load_checkpoint_row(connection, session_id)
+                if (
+                    stored is not None
+                    and len(stored[0].encode()) + len((stored[2] or "").encode()) > max_bytes
+                ):
+                    raise ValueError("Session record page exceeds its byte bound.")
+                records = [] if stored is None else [sqlite_records.checkpoint_from_row(stored)]
+                return page(records, offset=offset, limit=limit, max_bytes=max_bytes)
             # A transcript row's recorded size includes a tool result read from its event.
             size = (
                 "COALESCE(message_bytes, length(CAST(message_json AS BLOB)))"
@@ -164,6 +173,22 @@ async def postgres_read(
         session = bounds.require_read(await store._load(cur, session_id))
         if kind == "checkpoint":
             bounds.require_action(session, "inspect_state")
+            from cayu.storage import _postgres_locked_reads as locked_reads
+
+            # The checkpoint as stores hand it out, its receipt ledger joined back.
+            await cur.execute(
+                "SELECT octet_length(checkpoint.state::text) "
+                "+ COALESCE(octet_length(ledger.ledger::text), 0) "
+                + locked_reads.CHECKPOINT_WITH_RECEIPT_LEDGER_SOURCE,
+                (session_id,),
+            )
+            sized = await cur.fetchone()
+            if sized is not None and sized[0] > max_bytes:
+                raise ValueError("Session record page exceeds its byte bound.")
+            await cur.execute(locked_reads.CHECKPOINT_WITH_RECEIPT_LEDGER_QUERY, (session_id,))
+            checkpoint = locked_reads.decode_checkpoint(await cur.fetchall())
+            records = [] if checkpoint is None else [checkpoint]
+            return page(records, offset=offset, limit=limit, max_bytes=max_bytes)
         size = (
             "COALESCE(message_bytes, octet_length(message::text))"
             if kind == "transcript"

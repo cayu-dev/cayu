@@ -28,6 +28,7 @@ from cayu.sessions.records import Session
 from cayu.storage import _postgres_alias_checks as alias_checks
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import timed_postgres_connection
+from cayu.storage._receipt_ledger_rows import join_receipt_ledger, ledger_reference_digest
 
 Rows = list[tuple[Any, ...]]
 
@@ -64,7 +65,38 @@ def closure_owners(targets: Iterable[str]) -> FollowRead:
     )
 
 
+# A checkpoint row and the receipt ledger row it refers to, as ``checkpoint``
+# and ``ledger``.
+CHECKPOINT_WITH_RECEIPT_LEDGER_SOURCE = (
+    "FROM cayu_checkpoints AS checkpoint "
+    "LEFT JOIN cayu_invocation_receipt_ledgers AS ledger "
+    "ON ledger.session_id = checkpoint.session_id AND ledger.record_sha256 = "
+    "checkpoint.state->'invocation_lifecycle_receipt'->>'record_sha256' "
+    "WHERE checkpoint.session_id = %s"
+)
+CHECKPOINT_WITH_RECEIPT_LEDGER_QUERY = (
+    "SELECT checkpoint.state, ledger.record_sha256, ledger.ledger "
+    + CHECKPOINT_WITH_RECEIPT_LEDGER_SOURCE
+)
+
+
 def checkpoint(session_id: str) -> FollowRead:
+    """The logical checkpoint, its receipt ledger joined from its own row."""
+
+    return FollowRead(CHECKPOINT_WITH_RECEIPT_LEDGER_QUERY, (session_id,), decode_checkpoint)
+
+
+def checkpoint_for_transform(session_id: str) -> FollowRead:
+    """The checkpoint a publication or transform changes, the ledger left in its row if it can.
+
+    A callback without lifecycle authority never sees the receipt ledger, and
+    the store keeps it as stored, so the ledger is not read for it.
+    """
+
+    from cayu.sessions._checkpoint_preservation import checkpoint_callbacks_see_receipt_ledger
+
+    if checkpoint_callbacks_see_receipt_ledger():
+        return checkpoint(session_id)
     return FollowRead(
         "SELECT state FROM cayu_checkpoints WHERE session_id = %s",
         (session_id,),
@@ -109,9 +141,23 @@ def decode_closure_owners(rows: Rows) -> tuple[dict[str, Any], ...]:
 
 
 def decode_checkpoint(rows: Rows) -> dict[str, Any] | None:
+    """A checkpoint row, with its receipt ledger joined back when the read selected it."""
+
     if not rows:
         return None
-    return copy_durable_json_object(pg_support._json_obj(rows[0][0]), "checkpoint")
+    return decode_checkpoint_row(rows[0])
+
+
+def decode_checkpoint_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    """One stored checkpoint, with its receipt ledger joined back when the row carries it."""
+
+    decoded = copy_durable_json_object(pg_support._json_obj(row[0]), "checkpoint")
+    if len(row) == 1 or ledger_reference_digest(decoded) is None:
+        return decoded
+    ledger = (
+        None if row[2] is None else copy_durable_json_object(pg_support._json_obj(row[2]), "ledger")
+    )
+    return join_receipt_ledger(decoded, row[1], ledger)
 
 
 def _decode_store_now(rows: Rows) -> datetime:

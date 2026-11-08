@@ -885,7 +885,8 @@ async def deliver_queued_session_messages(
                                 pending_action_metrics_ready =
                                     excluded.pending_action_metrics_ready
                             """,
-                        sqlite_records.checkpoint_row_values(
+                        sqlite_records.checkpoint_row(
+                            connection,
                             session_id,
                             repaired_checkpoint,
                             store_now(),
@@ -1274,7 +1275,8 @@ async def deliver_queued_session_messages(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                    sqlite_records.checkpoint_row_values(
+                    sqlite_records.checkpoint_row(
+                        connection,
                         session_id,
                         rebound_checkpoint,
                         delivered_at,
@@ -1422,7 +1424,8 @@ async def repair_queued_interaction_profile_handoff(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                sqlite_records.checkpoint_row_values(
+                sqlite_records.checkpoint_row(
+                    connection,
                     session_id,
                     repaired_checkpoint,
                     store_now(),

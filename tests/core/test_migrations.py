@@ -824,3 +824,15 @@ def test_alias_check_function_keeps_older_binaries_working():
         m.validate_migration_input(m.SchemaState(revision=139, compatible_from=139))[0].revision
         == 140
     )
+
+
+def test_separate_invocation_ledgers_fence_old_binaries():
+    current = m.SchemaState(revision=144, compatible_from=144)
+    with pytest.raises(m.SchemaTooNew):
+        m.validate(current, app_latest=143, app_min_supported=143)
+    with pytest.raises(m.SchemaTooOld):
+        m.validate(m.SchemaState(revision=143, compatible_from=143))
+    assert (
+        m.validate_migration_input(m.SchemaState(revision=143, compatible_from=143))[0].revision
+        == 144
+    )

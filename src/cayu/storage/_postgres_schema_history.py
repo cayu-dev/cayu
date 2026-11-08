@@ -836,6 +836,17 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     # The terminal-decision index on cayu_checkpoints is built CONCURRENTLY; see
     # _CONCURRENT_INDEX_MIGRATIONS.
     143: (),
+    # Each session's invocation lifecycle receipt ledger, out of its checkpoint
+    # row. The row refers to one version by digest; a session keeps at most two.
+    144: (
+        """CREATE TABLE IF NOT EXISTS cayu_invocation_receipt_ledgers (
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id)
+            ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+        record_sha256 TEXT NOT NULL CHECK (record_sha256 ~ '^[0-9a-f]{64}$'),
+        ledger JSONB NOT NULL,
+        PRIMARY KEY (session_id, record_sha256)
+    )""",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

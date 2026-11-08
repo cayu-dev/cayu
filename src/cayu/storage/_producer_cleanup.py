@@ -105,7 +105,7 @@ async def sqlite_cleanup(store, registration, *, authority=None, commit=False):
             now = store._ownership_clock()
             conn.execute(
                 "INSERT INTO cayu_checkpoints (session_id, state_json, updated_at, pending_action_source_bytes, pending_action_tool_call_count, pending_action_flags, pending_action_metrics_ready) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at, pending_action_source_bytes = excluded.pending_action_source_bytes, pending_action_tool_call_count = excluded.pending_action_tool_call_count, pending_action_flags = excluded.pending_action_flags, pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                sqlite_records.checkpoint_row_values(sid, checkpoint, now),
+                sqlite_records.checkpoint_row(conn, sid, checkpoint, now),
             )
             conn.executemany(
                 "INSERT INTO cayu_session_operations (session_id, idempotency_key, record_json, updated_at) VALUES (?, ?, ?, ?)",

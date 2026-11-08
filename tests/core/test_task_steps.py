@@ -287,11 +287,8 @@ def test_step_revision_is_additive_and_only_step_stores_require_it(tmp_path) -> 
     # only from a later breaking revision, never from the step table.
     with pytest.raises(schema.SchemaTooOld, match=f"requires >= {TASK_STEPS_REVISION}\\."):
         SQLiteTaskStepStore(path)
-    task_floor = next(
-        candidate.revision
-        for candidate in reversed(schema.REVISIONS)
-        if candidate.kind is schema.RevisionKind.BREAKING
-    )
+    from cayu.storage.tasks_sqlite import _SQLITE_TASK_MIN_REQUIRED_REVISION as task_floor
+
     assert task_floor > TASK_STEPS_REVISION
     with pytest.raises(schema.SchemaTooOld, match=f"requires >= {task_floor}\\."):
         asyncio.run(SQLiteTaskStore(path, schema_mode=schema.SchemaMode.VALIDATE).close())

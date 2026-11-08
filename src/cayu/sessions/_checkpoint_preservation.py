@@ -207,6 +207,20 @@ def _workspace_observation_authority_mutation_scope():
         _WORKSPACE_OBSERVATION_AUTHORITY_MUTATION_ALLOWED.reset(token)
 
 
+def checkpoint_callbacks_see_receipt_ledger() -> bool:
+    """Whether a checkpoint transform in this scope is handed the receipt ledger.
+
+    Only lifecycle and execution-snapshot authority see it; every other
+    callback gets the checkpoint without it and the store keeps it as stored.
+    """
+
+    return (
+        _INVOCATION_LIFECYCLE_AUTHORITY_MUTATION_ALLOWED.get()
+        or _INVOCATION_LIFECYCLE_AUTHORITY_READ_ALLOWED.get()
+        or _EXECUTION_SNAPSHOT_AUTHORITY_MUTATION_ALLOWED.get()
+    )
+
+
 def _replace_checkpoint_preserving_completion_result_event_publications(
     current: dict[str, Any] | None,
     replacement: dict[str, Any],

@@ -409,7 +409,6 @@ from cayu.storage import migrations as schema
 from cayu.storage._sqlite_connection import (
     _run_off_thread_with_connection_ownership as _run_off_thread_with_connection_ownership,
 )
-from cayu.storage._validated_cache import validated_row_cache
 from cayu.storage.tasks_sqlite import (
     _SQLITE_TASK_MIN_REQUIRED_REVISION as _SQLITE_TASK_MIN_REQUIRED_REVISION,
 )
@@ -437,7 +436,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 143
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 144
 _T = TypeVar("_T")
 
 
@@ -588,22 +587,37 @@ def _touch_session_activity(
         _raise_session_write_conflict(connection, session_id, expected_run_epoch)
 
 
-@validated_row_cache
-def _checkpoint_from_json(value: str) -> dict[str, Any]:
-    return copy_durable_json_object(json.loads(value), "checkpoint")
+_checkpoint_from_json = sqlite_records.checkpoint_from_json
+_load_checkpoint_row = sqlite_records.load_checkpoint_row
+_checkpoint_from_row = sqlite_records.checkpoint_from_row
 
 
 def _load_checkpoint_json(connection: sqlite3.Connection, session_id: str) -> str | None:
+    """The checkpoint row as stored, its receipt ledger left as a reference."""
+
     row = connection.execute(
         "SELECT state_json FROM cayu_checkpoints WHERE session_id = ?", (session_id,)
     ).fetchone()
     return None if row is None else row["state_json"]
 
 
-def _load_checkpoint_state(
+_load_checkpoint_state = sqlite_records.load_checkpoint
+
+
+def _load_checkpoint_for_transform(
     connection: sqlite3.Connection,
     session_id: str,
 ) -> dict[str, Any] | None:
+    """The checkpoint a publication or transform changes, the ledger left in its row if it can.
+
+    A callback without lifecycle authority never sees the receipt ledger, and
+    the store keeps it as stored, so the ledger is not read for it.
+    """
+
+    from cayu.sessions._checkpoint_preservation import checkpoint_callbacks_see_receipt_ledger
+
+    if checkpoint_callbacks_see_receipt_ledger():
+        return _load_checkpoint_state(connection, session_id)
     value = _load_checkpoint_json(connection, session_id)
     return None if value is None else _checkpoint_from_json(value)
 
@@ -2162,9 +2176,7 @@ class SQLiteSessionStore(
             lambda connection: page_read_ops.load_checkpoint_json(connection, page)
         )
         return await asyncio.to_thread(
-            lambda: {
-                session_id: _checkpoint_from_json(value) for session_id, value in values.items()
-            }
+            lambda: {session_id: _checkpoint_from_row(row) for session_id, row in values.items()}
         )
 
     async def load_checkpoint_fields(
@@ -3876,8 +3888,8 @@ class SQLiteSessionStore(
                             pending_action_flags = excluded.pending_action_flags,
                             pending_action_metrics_ready = excluded.pending_action_metrics_ready
                         """,
-                        sqlite_records.checkpoint_row_values(
-                            session_id, transformed_checkpoint, updated_at
+                        sqlite_records.checkpoint_row(
+                            self._connection, session_id, transformed_checkpoint, updated_at
                         ),
                     )
                 if admission is not None:
@@ -4268,7 +4280,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_records.checkpoint_row_values(session_id, transformed, now),
+                    sqlite_records.checkpoint_row(self._connection, session_id, transformed, now),
                 )
                 self._connection.commit()
                 return loaded
@@ -4376,7 +4388,8 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_records.checkpoint_row_values(
+                    sqlite_records.checkpoint_row(
+                        self._connection,
                         session_id,
                         transformed,
                         updated_at,
@@ -4441,7 +4454,9 @@ class SQLiteSessionStore(
                         "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                         "pending_action_flags = excluded.pending_action_flags, "
                         "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                        sqlite_records.checkpoint_row_values(session_id, checkpoint, updated_at),
+                        sqlite_records.checkpoint_row(
+                            self._connection, session_id, checkpoint, updated_at
+                        ),
                     )
                 cursor = self._connection.execute(
                     "UPDATE cayu_sessions SET status = ?, updated_at = ?, "
@@ -4856,7 +4871,8 @@ class SQLiteSessionStore(
                                 pending_action_flags = excluded.pending_action_flags,
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
-                            sqlite_records.checkpoint_row_values(
+                            sqlite_records.checkpoint_row(
+                                connection,
                                 session_id,
                                 transformed_checkpoint,
                                 updated_at,
@@ -4937,7 +4953,8 @@ class SQLiteSessionStore(
                         "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                         "pending_action_flags = excluded.pending_action_flags, "
                         "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                        sqlite_records.checkpoint_row_values(
+                        sqlite_records.checkpoint_row(
+                            connection,
                             session_id,
                             settled_checkpoint,
                             updated_at,
@@ -5353,7 +5370,8 @@ class SQLiteSessionStore(
                     "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                     "pending_action_flags = excluded.pending_action_flags, "
                     "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                    sqlite_records.checkpoint_row_values(
+                    sqlite_records.checkpoint_row(
+                        connection,
                         copied.session_id,
                         updated_checkpoint,
                         session.updated_at,
@@ -5941,7 +5959,7 @@ class SQLiteSessionStore(
             _model_completion_stage=_model_completion_stage,
             run_write=self._run_write,
             load_session=self._load_unlocked,
-            load_checkpoint=self._load_checkpoint_unlocked,
+            load_checkpoint=self._load_checkpoint_for_transform_unlocked,
             closure_owners=self._closure_lineage_owners_unlocked,
             first_existing_event_id=_first_existing_event_id,
         )
@@ -6042,8 +6060,8 @@ class SQLiteSessionStore(
                 plans = plan_preparation(prepared, snapshots, now)
                 # Serialize and validate every row before starting either write.
                 checkpoints = {
-                    session_id: sqlite_records.checkpoint_row_values(
-                        session_id, plan.checkpoint, now
+                    session_id: sqlite_records.checkpoint_row(
+                        connection, session_id, plan.checkpoint, now
                     )
                     for session_id, plan in plans.items()
                 }
@@ -6150,7 +6168,7 @@ class SQLiteSessionStore(
             preserve_completion_result_publications=preserve_completion_result_publications,
             run_write=self._run_write,
             load_session=self._load_unlocked,
-            load_checkpoint=self._load_checkpoint_unlocked,
+            load_checkpoint=self._load_checkpoint_for_transform_unlocked,
             store_now=self._ownership_clock,
             closure_owners=self._closure_lineage_owners_unlocked,
             first_existing_event_id=_first_existing_event_id,
@@ -8529,7 +8547,7 @@ class SQLiteSessionStore(
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
                 replacement = _replace_checkpoint_preserving_completion_result_event_publications(
-                    self._load_checkpoint_unlocked(session_id),
+                    self._load_checkpoint_for_transform_unlocked(session_id),
                     checkpoint,
                     session_id=session_id,
                 )
@@ -8552,7 +8570,7 @@ class SQLiteSessionStore(
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_records.checkpoint_row_values(session_id, replacement, updated_at),
+                    sqlite_records.checkpoint_row(connection, session_id, replacement, updated_at),
                 )
                 connection.commit()
             except BaseException:
@@ -8580,7 +8598,7 @@ class SQLiteSessionStore(
                 _assert_session_run_epoch(session_id, session)
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
-                current = self._load_checkpoint_unlocked(session_id)
+                current = self._load_checkpoint_for_transform_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
                     _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -8615,8 +8633,8 @@ class SQLiteSessionStore(
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
                             # The preservation step returns a fresh validated copy.
-                            sqlite_records.checkpoint_row_values(
-                                session_id, transformed, updated_at, owned=True
+                            sqlite_records.checkpoint_row(
+                                connection, session_id, transformed, updated_at, owned=True
                             ),
                         )
                 connection.commit()
@@ -8650,7 +8668,7 @@ class SQLiteSessionStore(
                 _assert_session_run_epoch(session_id, session)
                 for owner in self._closure_lineage_owners_unlocked((session_id,)):
                     _check_closure_lineage_owner(owner, (session_id,))
-                current = self._load_checkpoint_unlocked(session_id)
+                current = self._load_checkpoint_for_transform_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
                     _copy_checkpoint_for_transform(current, session_id=session_id),
@@ -8686,8 +8704,8 @@ class SQLiteSessionStore(
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
                             # The preservation step returns a fresh validated copy.
-                            sqlite_records.checkpoint_row_values(
-                                session_id, transformed, now, owned=True
+                            sqlite_records.checkpoint_row(
+                                connection, session_id, transformed, now, owned=True
                             ),
                         )
                 connection.commit()
@@ -8709,14 +8727,14 @@ class SQLiteSessionStore(
                 connection,
                 access_bounds,
                 session_id,
-                lambda conn: _load_checkpoint_json(conn, session_id),
+                lambda conn: _load_checkpoint_row(conn, session_id),
                 action="inspect_state",
             )
         )
 
         if value is None:
             return None
-        return await asyncio.to_thread(_checkpoint_from_json, value)
+        return await asyncio.to_thread(_checkpoint_from_row, value)
 
     async def load_execution_snapshot_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
@@ -8756,6 +8774,9 @@ class SQLiteSessionStore(
 
     def _load_checkpoint_unlocked(self, session_id: str) -> dict[str, Any] | None:
         return _load_checkpoint_state(self._connection, session_id)
+
+    def _load_checkpoint_for_transform_unlocked(self, session_id: str) -> dict[str, Any] | None:
+        return _load_checkpoint_for_transform(self._connection, session_id)
 
     async def close(self) -> None:
         self._closed = True

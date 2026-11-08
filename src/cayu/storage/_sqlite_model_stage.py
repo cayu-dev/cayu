@@ -593,7 +593,9 @@ async def prepare(
                     "pending_action_tool_call_count = excluded.pending_action_tool_call_count, "
                     "pending_action_flags = excluded.pending_action_flags, "
                     "pending_action_metrics_ready = excluded.pending_action_metrics_ready",
-                    sqlite_records.checkpoint_row_values(session_id, route_checkpoint, prepared_at),
+                    sqlite_records.checkpoint_row(
+                        connection, session_id, route_checkpoint, prepared_at
+                    ),
                 )
             connection.execute(
                 "INSERT INTO cayu_session_operations "

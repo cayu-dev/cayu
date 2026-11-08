@@ -599,6 +599,8 @@ REVISIONS: tuple[Revision, ...] = (
     # recovery lists those decisions from a partial index. Older binaries reject
     # both records, so they must not open it.
     Revision(revision=143, kind=RevisionKind.BREAKING, compatible_from=143),
+    # Checkpoint ledger references require the separate receipt ledger table.
+    Revision(revision=144, kind=RevisionKind.BREAKING, compatible_from=144),
 )
 
 #: The revision an empty database is initialized to.

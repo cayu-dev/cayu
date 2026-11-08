@@ -33,6 +33,12 @@ def export_size_statement(*, postgres: bool) -> tuple[str, int]:
         # tool event is read back into the message, so count it here too.
         ("cayu_transcript_messages", "session_id", ("message_bytes",)),
         ("cayu_checkpoints", "session_id", ("state",) if postgres else ("state_json",)),
+        # The checkpoint's receipt ledger, kept in its own row (at most two versions).
+        (
+            "cayu_invocation_receipt_ledgers",
+            "session_id",
+            ("ledger",) if postgres else ("ledger_json",),
+        ),
         (
             "cayu_deferred_interaction_inputs",
             "session_id",

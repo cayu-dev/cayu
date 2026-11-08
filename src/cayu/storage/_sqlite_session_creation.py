@@ -403,7 +403,8 @@ async def create(
                                 pending_action_metrics_ready
                             ) VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                        sqlite_records.checkpoint_row_values(
+                        sqlite_records.checkpoint_row(
+                            connection,
                             session.id,
                             _initial_transcript_pending_checkpoint(
                                 session,
@@ -433,7 +434,8 @@ async def create(
                                     pending_action_metrics_ready
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                                 """,
-                            sqlite_records.checkpoint_row_values(
+                            sqlite_records.checkpoint_row(
+                                connection,
                                 session.id,
                                 transformed,
                                 session.updated_at,
@@ -467,7 +469,8 @@ async def create(
                                 pending_action_flags = excluded.pending_action_flags,
                                 pending_action_metrics_ready = excluded.pending_action_metrics_ready
                             """,
-                        sqlite_records.checkpoint_row_values(
+                        sqlite_records.checkpoint_row(
+                            connection,
                             session.id,
                             _checkpoint_transform_result_preserving_completion_result_event_publications(
                                 current_checkpoint,
@@ -754,8 +757,8 @@ async def create_fork(
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                    sqlite_records.checkpoint_row_values(
-                        fork.id, copied_checkpoint, fork.updated_at
+                    sqlite_records.checkpoint_row(
+                        connection, fork.id, copied_checkpoint, fork.updated_at
                     ),
                 )
             if events:

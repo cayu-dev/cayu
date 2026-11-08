@@ -484,23 +484,124 @@ def checkpoint_row_values(
 
     ``owned`` is only for a checkpoint the calling statement just produced with
     ``copy_durable_json_object`` and has not shared, so copying it again would
-    repeat the same validation on the same private object.
+    repeat the same validation on the same private object. A row that refers
+    to its receipt ledger is checked as the whole logical checkpoint.
     """
 
     from cayu.sessions.pending_actions import pending_action_checkpoint_metrics
+    from cayu.storage._receipt_ledger_rows import require_logical_checkpoint_limits
 
     if not owned:
         checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+    serialized = json_dumps(checkpoint)
+    require_logical_checkpoint_limits(checkpoint, serialized)
     source_bytes, tool_call_count, flags = pending_action_checkpoint_metrics(checkpoint)
     return (
         session_id,
-        json_dumps(checkpoint),
+        serialized,
         format_datetime(updated_at),
         source_bytes,
         tool_call_count,
         flags,
         1,
     )
+
+
+@validated_row_cache
+def checkpoint_from_json(value: str) -> dict[str, Any]:
+    return copy_durable_json_object(json.loads(value), "checkpoint")
+
+
+CheckpointRow = tuple[str, str | None, str | None]
+
+
+def load_checkpoint_row(connection: sqlite3.Connection, session_id: str) -> CheckpointRow | None:
+    """The checkpoint row and the receipt ledger row it refers to, in one read."""
+
+    row = connection.execute(
+        "SELECT checkpoint.state_json, ledger.record_sha256, ledger.ledger_json "
+        "FROM cayu_checkpoints AS checkpoint "
+        "LEFT JOIN cayu_invocation_receipt_ledgers AS ledger "
+        "ON ledger.session_id = checkpoint.session_id AND ledger.record_sha256 = "
+        "json_extract(checkpoint.state_json, '$.invocation_lifecycle_receipt.record_sha256') "
+        "WHERE checkpoint.session_id = ?",
+        (session_id,),
+    ).fetchone()
+    return None if row is None else (row[0], row[1], row[2])
+
+
+def checkpoint_from_row(row: CheckpointRow) -> dict[str, Any]:
+    """The logical checkpoint: the stored row with its receipt ledger joined back."""
+
+    from cayu.storage._receipt_ledger_rows import join_receipt_ledger, ledger_reference_digest
+
+    state_json, ledger_digest, ledger_json = row
+    checkpoint = checkpoint_from_json(state_json)
+    if ledger_reference_digest(checkpoint) is None:
+        return checkpoint
+    return join_receipt_ledger(
+        checkpoint,
+        ledger_digest,
+        None if ledger_json is None else checkpoint_from_json(ledger_json),
+    )
+
+
+def load_checkpoint(connection: sqlite3.Connection, session_id: str) -> dict[str, Any] | None:
+    """The session's logical checkpoint, its receipt ledger joined from its own row."""
+
+    row = load_checkpoint_row(connection, session_id)
+    return None if row is None else checkpoint_from_row(row)
+
+
+def checkpoint_row(
+    connection: sqlite3.Connection,
+    session_id: str,
+    checkpoint: dict[str, Any],
+    updated_at: datetime,
+    *,
+    owned: bool = False,
+) -> tuple[object, ...]:
+    """Serialize one checkpoint row, its receipt ledger stored in its own row.
+
+    The ledger row is written in the caller's transaction, before the
+    checkpoint row it is serialized for.
+    """
+
+    row = store_receipt_ledger(connection, session_id, checkpoint)
+    return checkpoint_row_values(session_id, row, updated_at, owned=owned)
+
+
+def store_receipt_ledger(
+    connection: sqlite3.Connection, session_id: str, checkpoint: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep a checkpoint's receipt ledger in its own row; return the row to store.
+
+    Ledger rows are keyed by their content digest, so storing one never
+    changes what the session's current checkpoint row refers to. A new
+    version replaces every other one except the version that row refers to,
+    so a session keeps at most two.
+    """
+
+    from cayu.storage._receipt_ledger_rows import split_receipt_ledger
+
+    row, ledger = split_receipt_ledger(checkpoint)
+    if ledger is None:
+        return checkpoint
+    digest = ledger["record_sha256"]
+    inserted = connection.execute(
+        "INSERT INTO cayu_invocation_receipt_ledgers (session_id, record_sha256, ledger_json) "
+        "VALUES (?, ?, ?) ON CONFLICT(session_id, record_sha256) DO NOTHING",
+        (session_id, digest, json_dumps(ledger)),
+    ).rowcount
+    if inserted:
+        connection.execute(
+            "DELETE FROM cayu_invocation_receipt_ledgers "
+            "WHERE session_id = ? AND record_sha256 <> ? AND record_sha256 IS NOT ("
+            "SELECT json_extract(state_json, '$.invocation_lifecycle_receipt.record_sha256') "
+            "FROM cayu_checkpoints WHERE session_id = ?)",
+            (session_id, digest, session_id),
+        )
+    return row
 
 
 def session_order_sql(order_by: SessionOrder) -> str:

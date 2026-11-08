@@ -423,7 +423,7 @@ async def publish_runtime(
                             row[0]: Event(**pg_support._json_obj(row[1])) for row in rows
                         },
                     )
-                batch["checkpoint"] = locked_reads.checkpoint(session_id)
+                batch["checkpoint"] = locked_reads.checkpoint_for_transform(session_id)
                 if tool_round_identity is not None:
                     execution_identity, tool_call_ids = tool_round_identity
                     lookup_keys = [
@@ -964,7 +964,7 @@ async def publish_checkpoint_events(
                     locked_reads.transcript_cursor(session_id),
                 ]
                 if context_view_compaction_cursor is None:
-                    follow_reads.append(locked_reads.checkpoint(session_id))
+                    follow_reads.append(locked_reads.checkpoint_for_transform(session_id))
                     if operation_read:
                         assert operation_idempotency_key is not None
                         follow_reads.append(

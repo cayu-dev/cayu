@@ -15,6 +15,7 @@ from cayu._validation import DurableValueError
 from cayu.events import EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
+from cayu.sessions.checkpoints import INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY
 from cayu.sessions.records import (
     EventRecord,
     Session,
@@ -31,6 +32,7 @@ from cayu.sessions.summaries import (
 )
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_transcript_content as transcript_content
+from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 
 _SESSION_COLUMNS = """
     id, instance_id, agent_name, provider_name, model, parent_session_id,
@@ -63,14 +65,22 @@ def load_sessions(connection: sqlite3.Connection, session_ids: Sequence[str]) ->
 
 def load_checkpoint_json(
     connection: sqlite3.Connection, session_ids: Sequence[str]
-) -> dict[str, str]:
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """Each checkpoint row with the receipt ledger row it refers to, if any."""
+
     if not session_ids:
         return {}
     rows = connection.execute(
-        f"SELECT session_id, state_json FROM cayu_checkpoints WHERE session_id IN ({_PAGE_IDS})",
+        "SELECT checkpoint.session_id, checkpoint.state_json, "
+        "ledger.record_sha256, ledger.ledger_json "
+        "FROM cayu_checkpoints AS checkpoint "
+        "LEFT JOIN cayu_invocation_receipt_ledgers AS ledger "
+        "ON ledger.session_id = checkpoint.session_id AND ledger.record_sha256 = "
+        "json_extract(checkpoint.state_json, '$.invocation_lifecycle_receipt.record_sha256') "
+        f"WHERE checkpoint.session_id IN ({_PAGE_IDS})",
         (_ids(session_ids),),
     ).fetchall()
-    found = {row["session_id"]: row["state_json"] for row in rows}
+    found = {row[0]: (row[1], row[2], row[3]) for row in rows}
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 
@@ -145,10 +155,21 @@ def load_checkpoint_fields(
             json_type(cayu_checkpoints.state_json) AS root_type,
             field.key,
             field.type,
-            field.value
+            field.value,
+            ledger.record_sha256 AS ledger_sha256,
+            ledger.ledger_json
         FROM cayu_checkpoints
         LEFT JOIN json_each(cayu_checkpoints.state_json) AS field
             ON field.key IN ({_PAGE_IDS})
+        -- A receipt ledger field that refers to its own row is joined in the
+        -- same statement, so both come from one snapshot.
+        LEFT JOIN cayu_invocation_receipt_ledgers AS ledger
+            ON field.key = 'invocation_lifecycle_receipt'
+            AND field.type = 'object'
+            AND ledger.session_id = cayu_checkpoints.session_id
+            AND ledger.record_sha256 = json_extract(
+                cayu_checkpoints.state_json, '$.invocation_lifecycle_receipt.record_sha256'
+            )
         WHERE cayu_checkpoints.session_id IN ({_PAGE_IDS})
         """,
         (_ids(keys), _ids(session_ids)),
@@ -161,6 +182,12 @@ def load_checkpoint_fields(
         fields = found.setdefault(row["session_id"], {})
         if row["key"] is not None:
             fields[row["key"]] = _json_field(row["type"], row["value"])
+            if row["key"] == INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY:
+                join_receipt_ledger(
+                    fields,
+                    row["ledger_sha256"],
+                    None if row["ledger_json"] is None else json.loads(row["ledger_json"]),
+                )
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}
 
 

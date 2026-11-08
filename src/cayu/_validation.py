@@ -924,6 +924,34 @@ def inspect_bounded_durable_json(
     )
 
 
+def measure_durable_json(
+    value: Any,
+    field_name: str,
+    *,
+    limits: DurableJsonLimits = DURABLE_DOCUMENT_LIMITS,
+) -> tuple[int, int]:
+    """Validate one durable JSON value and return its size and node count as the walk counts them.
+
+    These are the numbers ``limits`` bounds, so parts measured apart can be
+    checked against one whole document's limits.
+    """
+
+    measured: list[int] = []
+    _walk_bounded_durable_json(
+        value,
+        field_name,
+        max_bytes=limits.max_bytes,
+        max_nodes=limits.max_nodes,
+        max_nesting=limits.max_nesting,
+        max_object_entries=None,
+        max_array_entries=None,
+        detach=False,
+        canonical_numbers=False,
+        measured=measured,
+    )
+    return measured[0], measured[1]
+
+
 def _walk_bounded_durable_json(
     value: Any,
     field_name: str,
@@ -938,6 +966,7 @@ def _walk_bounded_durable_json(
     allow_tuples: bool = False,
     allow_models: bool = False,
     fractional_floats: list[float] | None = None,
+    measured: list[int] | None = None,
 ) -> Any:
     if type(max_bytes) is not int or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer.")
@@ -1241,6 +1270,8 @@ def _walk_bounded_durable_json(
                 break
             else:
                 break
+        if measured is not None:
+            measured[:] = (max_bytes - remaining, node_count)
         return result
     finally:
         current = None

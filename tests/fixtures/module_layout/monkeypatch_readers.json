@@ -22,6 +22,7 @@
     "_canonical_walked_durable_json_bytes",
     "copy_bounded_durable_json_value",
     "inspect_bounded_durable_json",
+    "measure_durable_json",
     "scripts/benchmark_tool_round.py:observe_store"
   ],
   "cayu._validation:canonical_durable_json_bytes": [
@@ -3155,7 +3156,7 @@
     "cayu.storage._postgres_base:_PostgresStoreBase._backfill_interrupted_handoff_generations",
     "cayu.storage._postgres_event_delivery:_lease_claimable_delivery",
     "cayu.storage._postgres_event_publication:append_tool_effect_conflict",
-    "cayu.storage._postgres_locked_reads:decode_checkpoint",
+    "cayu.storage._postgres_locked_reads:decode_checkpoint_row",
     "cayu.storage._postgres_locked_reads:operation_record.<locals>.<lambda>",
     "cayu.storage._postgres_model_stage:mark_dispatched",
     "cayu.storage._postgres_model_stage:prepare",
@@ -3209,7 +3210,6 @@
     "cayu.storage.postgres:PostgresSessionStore._require_session_erasure_quiescence",
     "cayu.storage.postgres:PostgresSessionStore._update_display_or_user_metadata",
     "cayu.storage.postgres:PostgresSessionStore.load_checkpoint_fields",
-    "cayu.storage.postgres:PostgresSessionStore.load_checkpoints",
     "cayu.storage.postgres:PostgresSessionStore.load_interaction_transition_receipt",
     "cayu.storage.postgres:PostgresSessionStore.load_session_export_snapshot",
     "cayu.storage.postgres:PostgresSessionStore.load_session_operation",
@@ -3256,6 +3256,10 @@
     "memory_retirement",
     "postgres_retirement",
     "sqlite_retirement.<locals>.transaction"
+  ],
+  "cayu.storage._receipt_ledger_rows:split_receipt_ledger": [
+    "cayu.storage._sqlite_records:store_receipt_ledger",
+    "cayu.storage.postgres:_store_receipt_ledger"
   ],
   "cayu.storage._sqlite_aggregates:MAX_USAGE_PRICING_RAW_CANDIDATES": [
     "_add_pricing_input_from_row",
@@ -3314,6 +3318,9 @@
     "cayu.storage.sqlite:SQLiteSessionStore._run_read.<locals>.guarded",
     "cayu.storage.sqlite:SQLiteSessionStore._run_write.<locals>.guarded",
     "cayu.storage.sqlite:SQLiteSessionStore.create"
+  ],
+  "cayu.storage._sqlite_records:checkpoint_row_values": [
+    "checkpoint_row"
   ],
   "cayu.storage._sqlite_records:event_from_row": [
     "cayu.storage._session_access_records:sqlite_read.<locals>.read",
@@ -3380,6 +3387,9 @@
     "cayu.storage.sqlite:SQLiteSessionStore.release_session_invocation.<locals>.statement",
     "cayu.storage.sqlite:SQLiteSessionStore.summarize_outcome.<locals>.query",
     "cayu.storage.sqlite:_record_invocation_terminal_event_receipts"
+  ],
+  "cayu.storage._sqlite_records:store_receipt_ledger": [
+    "checkpoint_row"
   ],
   "cayu.storage._sqlite_schema_history:_MIGRATION_STEPS": [
     "cayu.storage._sqlite_support:_apply_revision",
@@ -3538,6 +3548,14 @@
     "cayu.runtime._host_continuation_discovery:_require_session",
     "cayu.sessions._participant_discovery:discover_participant_sessions",
     "cayu.storage.application:_open_postgres_stores"
+  ],
+  "cayu.storage.postgres:_checkpoint_row_values": [
+    "PostgresSessionStore._create_fork",
+    "PostgresSessionStore._publish_runtime_publication_atomic",
+    "PostgresSessionStore._upsert_checkpoint"
+  ],
+  "cayu.storage.postgres:_store_receipt_ledger": [
+    "PostgresSessionStore._upsert_checkpoint"
   ],
   "cayu.storage.sqlite:_SQLITE_SESSION_MIN_REQUIRED_REVISION": [
     "SQLiteSessionStore._initialize_schema"

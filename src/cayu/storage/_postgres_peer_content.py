@@ -34,6 +34,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.records import Session
 from cayu.storage import _creation_fence
+from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_support as pg_support
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -163,11 +164,10 @@ async def append_peer_content(
                 target_instance,
             )
             await cur.execute(
-                "SELECT state FROM cayu_checkpoints WHERE session_id = %s",
+                locked_reads.CHECKPOINT_WITH_RECEIPT_LEDGER_QUERY,
                 (target_id,),
             )
-            checkpoint_row = await cur.fetchone()
-            checkpoint = None if checkpoint_row is None else checkpoint_row[0]
+            checkpoint = locked_reads.decode_checkpoint(await cur.fetchall())
             parked_target = False
             if session is not None and session[2] in {"completed", "failed", "interrupted"}:
                 assert target_id is not None
