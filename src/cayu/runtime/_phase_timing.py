@@ -413,7 +413,27 @@ class _Builder:
                 phases=self.phases(_ROUND_PHASES, aggregate=True),
                 calls=calls,
             )
-        self.recorder.publish(self.session_id, tuple(self.calls), record)
+        self.recorder.publish(
+            self.session_id,
+            tuple(self.calls),
+            record,
+            round_id=None if self.preparation else self.identity.tool_round_id,
+        )
+
+
+@dataclass(frozen=True)
+class RecentTiming:
+    """One record in the recent view with the private identities it was built from.
+
+    ``round_id`` (``None`` for a preparation record) and ``call_ids``, in the order of
+    ``record.calls``, are the original identities; the record itself may carry
+    redaction references in their place.
+    """
+
+    session_id: str
+    record: RuntimeTimingRecord
+    round_id: str | None
+    call_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -493,8 +513,8 @@ class RuntimeTimingRecorder:
             # Non-durable observation must not inherit any invocation authority.
             self.worker = asyncio.create_task(self._deliver(self.queue), context=Context())
 
-    def publish(self, session_id, call_ids, record):
-        self.recent.append((session_id, record))
+    def publish(self, session_id, call_ids, record, *, round_id=None):
+        self.recent.append(RecentTiming(session_id, record, round_id, tuple(call_ids)))
         if not self.sinks:
             return
         try:
@@ -578,13 +598,18 @@ class RuntimeTimingRecorder:
                     _LOG.warning("Runtime timing delivery failed: %s", type(exc).__name__)
 
     def inspect(self, session_id, limit, record_type):
+        return tuple(entry.record for entry in self.inspect_entries(session_id, limit, record_type))
+
+    def inspect_entries(self, session_id, limit, record_type=None):
+        """The newest ``limit`` recent entries of one session, newest first, of
+        ``record_type`` or of either kind."""
         if type(limit) is not int or not 1 <= limit <= 1024:
             raise ValueError("Timing limit must be an integer between 1 and 1024.")
         return tuple(
-            record
-            for private_id, record in reversed(self.recent)
-            if (private_id == session_id or record.session_id == session_id)
-            and type(record) is record_type
+            entry
+            for entry in reversed(self.recent)
+            if (entry.session_id == session_id or entry.record.session_id == session_id)
+            and (record_type is None or type(entry.record) is record_type)
         )[:limit]
 
     def status(self):

@@ -126,6 +126,7 @@ from cayu.evals.suite_authoring import (
 from cayu.evals.trial_policy import EvalSuiteRunExposureV1
 from cayu.events import EVENT_ID_MAX_CHARS
 from cayu.knowledge.records import MAX_KNOWLEDGE_REVISION
+from cayu.observability.timing import RuntimePhaseTiming
 from cayu.releases import RELEASE_ID_MAX_CHARS
 from cayu.runtime.build_provenance import RuntimeBuildProvenance
 from cayu.runtime.system_diagnostics import (
@@ -3355,6 +3356,79 @@ class SessionTimingResponse(SessionTiming):
     """`cayu session show`'s time breakdown for one session; see `SessionTiming`."""
 
     session_id: str
+
+
+class ApiRuntimeTimingCall(ApiBaseModel):
+    """One tool call of a timed round, named by its public `tool_call_correlation_id`."""
+
+    tool_call_id: str
+    tool_name: str
+    phases: list[RuntimePhaseTiming]
+    tool_effect_completed_at: datetime | None = None
+    tool_terminal_staged_at: datetime | None = None
+    tool_terminal_publication_started_at: datetime | None = None
+
+
+class ApiRuntimeTimingRecord(ApiBaseModel):
+    """A `ToolRoundTiming` or `ModelStepPreparationTiming` without its private ids.
+
+    ``kind`` says which. A preparation record has no ``calls``, ``recovered`` or
+    ``calls_truncated``; ``after_tool_round`` says whether it followed a tool round.
+    """
+
+    kind: Literal["tool_round", "model_step_preparation"]
+    started_at: datetime
+    completed_at: datetime
+    duration_seconds: float = Field(ge=0)
+    incomplete: StrictBool
+    phases: list[RuntimePhaseTiming]
+    after_tool_round: StrictBool | None = None
+    recovered: StrictBool | None = None
+    calls_truncated: StrictInt | None = Field(default=None, ge=0)
+    calls: list[ApiRuntimeTimingCall] | None = None
+
+
+class ApiRuntimeTimingProcess(ApiBaseModel):
+    """The process that answered, by the opaque id its session executions carry."""
+
+    owner_id: str
+
+
+class ApiRuntimeTimingSessionExecution(ApiBaseModel):
+    """Where the session runs now, from its execution presence (`GET .../state`)."""
+
+    state: str
+    owner_id: str | None
+    in_this_process: StrictBool
+
+
+class ApiRuntimeTimingRecorder(ApiBaseModel):
+    """This process's recorder: whether it records, how many recent records it keeps for
+    all sessions together, and its delivery counters."""
+
+    enabled: StrictBool
+    recent_capacity: StrictInt = Field(ge=0)
+    recent_records: StrictInt = Field(ge=0)
+    queued_records: StrictInt = Field(ge=0)
+    dropped_records: StrictInt = Field(ge=0)
+    failed_deliveries: StrictInt = Field(ge=0)
+
+
+class SessionRuntimeTimingResponse(ApiBaseModel):
+    """`cayu session runtime-timing`: the recent runtime timing records one process holds.
+
+    The records live in the memory of the process that ran the rounds and steps, so this
+    covers only work that ran in the process that answered, since it started, and only
+    while its bounded recent buffer still holds them.
+    """
+
+    session_id: str
+    scope: Literal["process"] = "process"
+    process: ApiRuntimeTimingProcess
+    session_execution: ApiRuntimeTimingSessionExecution
+    recorder: ApiRuntimeTimingRecorder
+    limit: StrictInt = Field(ge=1)
+    records: list[ApiRuntimeTimingRecord]
 
 
 class SessionToolCallsResponse(ApiBaseModel):

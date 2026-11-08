@@ -251,6 +251,10 @@ def add_session_parser(subparsers: Any) -> None:
     _add_target_options(show_parser)
     add_output_options(show_parser, formats=FORMAT_CHOICES)
 
+    from cayu.cli._runtime_timing import add_runtime_timing_parser
+
+    add_runtime_timing_parser(commands)
+
     workflow_parser = commands.add_parser(
         "workflow",
         help="Show a workflow run: its steps, their child sessions, usage and custom events.",
@@ -547,6 +551,10 @@ def add_session_parser(subparsers: Any) -> None:
 def run_session(args: argparse.Namespace) -> int:
     """Resolve a read-only target and dispatch one session-inspection command."""
 
+    if args.session_command == "runtime-timing":
+        from cayu.cli._runtime_timing import run_runtime_timing
+
+        return run_runtime_timing(args)
     try:
         with output_destination(args.output):
             return _run_session(args)

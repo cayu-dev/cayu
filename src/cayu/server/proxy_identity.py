@@ -172,6 +172,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/sessions/{session_id}/interactions/{interaction_id}",
             "/sessions/{session_id}/messages",
             "/sessions/{session_id}/model-calls",
+            "/sessions/{session_id}/runtime-timing",
             "/sessions/{session_id}/state",
             "/sessions/{session_id}/summary",
             "/sessions/{session_id}/task-replay",

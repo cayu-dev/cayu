@@ -2916,6 +2916,260 @@
       "title": "ApiReviewedKnowledgeEntry",
       "type": "object"
     },
+    "ApiRuntimeTimingCall": {
+      "additionalProperties": false,
+      "description": "One tool call of a timed round, named by its public `tool_call_correlation_id`.",
+      "properties": {
+        "phases": {
+          "items": {
+            "$ref": "#/components/schemas/RuntimePhaseTiming"
+          },
+          "title": "Phases",
+          "type": "array"
+        },
+        "tool_call_id": {
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_effect_completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Effect Completed At"
+        },
+        "tool_name": {
+          "title": "Tool Name",
+          "type": "string"
+        },
+        "tool_terminal_publication_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Terminal Publication Started At"
+        },
+        "tool_terminal_staged_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Terminal Staged At"
+        }
+      },
+      "required": [
+        "tool_call_id",
+        "tool_name",
+        "phases"
+      ],
+      "title": "ApiRuntimeTimingCall",
+      "type": "object"
+    },
+    "ApiRuntimeTimingProcess": {
+      "additionalProperties": false,
+      "description": "The process that answered, by the opaque id its session executions carry.",
+      "properties": {
+        "owner_id": {
+          "title": "Owner Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner_id"
+      ],
+      "title": "ApiRuntimeTimingProcess",
+      "type": "object"
+    },
+    "ApiRuntimeTimingRecord": {
+      "additionalProperties": false,
+      "description": "A `ToolRoundTiming` or `ModelStepPreparationTiming` without its private ids.\n\n``kind`` says which. A preparation record has no ``calls``, ``recovered`` or\n``calls_truncated``; ``after_tool_round`` says whether it followed a tool round.",
+      "properties": {
+        "after_tool_round": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "After Tool Round"
+        },
+        "calls": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/ApiRuntimeTimingCall"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Calls"
+        },
+        "calls_truncated": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Calls Truncated"
+        },
+        "completed_at": {
+          "format": "date-time",
+          "title": "Completed At",
+          "type": "string"
+        },
+        "duration_seconds": {
+          "minimum": 0.0,
+          "title": "Duration Seconds",
+          "type": "number"
+        },
+        "incomplete": {
+          "title": "Incomplete",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "tool_round",
+            "model_step_preparation"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "phases": {
+          "items": {
+            "$ref": "#/components/schemas/RuntimePhaseTiming"
+          },
+          "title": "Phases",
+          "type": "array"
+        },
+        "recovered": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Recovered"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "started_at",
+        "completed_at",
+        "duration_seconds",
+        "incomplete",
+        "phases"
+      ],
+      "title": "ApiRuntimeTimingRecord",
+      "type": "object"
+    },
+    "ApiRuntimeTimingRecorder": {
+      "additionalProperties": false,
+      "description": "This process's recorder: whether it records, how many recent records it keeps for\nall sessions together, and its delivery counters.",
+      "properties": {
+        "dropped_records": {
+          "minimum": 0.0,
+          "title": "Dropped Records",
+          "type": "integer"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "failed_deliveries": {
+          "minimum": 0.0,
+          "title": "Failed Deliveries",
+          "type": "integer"
+        },
+        "queued_records": {
+          "minimum": 0.0,
+          "title": "Queued Records",
+          "type": "integer"
+        },
+        "recent_capacity": {
+          "minimum": 0.0,
+          "title": "Recent Capacity",
+          "type": "integer"
+        },
+        "recent_records": {
+          "minimum": 0.0,
+          "title": "Recent Records",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "recent_capacity",
+        "recent_records",
+        "queued_records",
+        "dropped_records",
+        "failed_deliveries"
+      ],
+      "title": "ApiRuntimeTimingRecorder",
+      "type": "object"
+    },
+    "ApiRuntimeTimingSessionExecution": {
+      "additionalProperties": false,
+      "description": "Where the session runs now, from its execution presence (`GET .../state`).",
+      "properties": {
+        "in_this_process": {
+          "title": "In This Process",
+          "type": "boolean"
+        },
+        "owner_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Owner Id"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "owner_id",
+        "in_this_process"
+      ],
+      "title": "ApiRuntimeTimingSessionExecution",
+      "type": "object"
+    },
     "ApiSession": {
       "additionalProperties": false,
       "properties": {
@@ -25775,6 +26029,100 @@
       "title": "RuntimeManifest",
       "type": "object"
     },
+    "RuntimePhaseTiming": {
+      "additionalProperties": false,
+      "description": "Exclusive phase time; SQL execution includes database lock acquisition.\n\n``first_started_at`` and ``last_completed_at`` bound the observed entries;\na phase can be entered more than once, so the window can exceed its duration.",
+      "properties": {
+        "duration_seconds": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Duration Seconds",
+          "type": "number"
+        },
+        "first_started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "First Started At"
+        },
+        "last_completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Completed At"
+        },
+        "name": {
+          "enum": [
+            "authorization",
+            "admission",
+            "started_persistence",
+            "effect_state",
+            "execution",
+            "result_processing",
+            "staging",
+            "sibling_wait",
+            "publication_queue_wait",
+            "publication",
+            "round_commit",
+            "unattributed",
+            "handoff",
+            "context_policy",
+            "recall",
+            "counting",
+            "preparation"
+          ],
+          "title": "Name",
+          "type": "string"
+        },
+        "store_bytes_written": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Store Bytes Written",
+          "type": "integer"
+        },
+        "store_commit_seconds": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Store Commit Seconds",
+          "type": "number"
+        },
+        "store_execution_seconds": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Store Execution Seconds",
+          "type": "number"
+        },
+        "store_lock_wait_seconds": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Store Lock Wait Seconds",
+          "type": "number"
+        },
+        "store_transaction_count": {
+          "default": 0,
+          "minimum": 0.0,
+          "title": "Store Transaction Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "title": "RuntimePhaseTiming",
+      "type": "object"
+    },
     "ServerContractActor": {
       "additionalProperties": false,
       "description": "Bounded actor projection that deliberately excludes arbitrary claims.",
@@ -27647,6 +27995,53 @@
         }
       },
       "title": "SessionRollupQuery",
+      "type": "object"
+    },
+    "SessionRuntimeTimingResponse": {
+      "additionalProperties": false,
+      "description": "`cayu session runtime-timing`: the recent runtime timing records one process holds.\n\nThe records live in the memory of the process that ran the rounds and steps, so this\ncovers only work that ran in the process that answered, since it started, and only\nwhile its bounded recent buffer still holds them.",
+      "properties": {
+        "limit": {
+          "minimum": 1.0,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "process": {
+          "$ref": "#/components/schemas/ApiRuntimeTimingProcess"
+        },
+        "recorder": {
+          "$ref": "#/components/schemas/ApiRuntimeTimingRecorder"
+        },
+        "records": {
+          "items": {
+            "$ref": "#/components/schemas/ApiRuntimeTimingRecord"
+          },
+          "title": "Records",
+          "type": "array"
+        },
+        "scope": {
+          "const": "process",
+          "default": "process",
+          "title": "Scope",
+          "type": "string"
+        },
+        "session_execution": {
+          "$ref": "#/components/schemas/ApiRuntimeTimingSessionExecution"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "process",
+        "session_execution",
+        "recorder",
+        "limit",
+        "records"
+      ],
+      "title": "SessionRuntimeTimingResponse",
       "type": "object"
     },
     "SessionStartBucket": {
@@ -40856,6 +41251,57 @@
             "content": {}
           },
           "413": {
+            "content": {}
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/runtime-timing": {
+      "get": {
+        "operation_id": "get_session_runtime_timing_api_sessions__session_id__runtime_timing_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 1024,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionRuntimeTimingResponse"
+              }
+            }
+          },
+          "404": {
             "content": {}
           },
           "422": {

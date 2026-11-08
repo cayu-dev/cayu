@@ -47,6 +47,7 @@
   "POST /api/sessions/{session_id}/model-calls name=post_session_model_calls class=_BoundedSessionPricingRoute POST=post_session_model_calls_api_sessions__session_id__model_calls_post",
   "GET /api/sessions/{session_id}/tool-calls name=get_session_tool_calls class=APIRoute GET=get_session_tool_calls_api_sessions__session_id__tool_calls_get",
   "GET /api/sessions/{session_id}/timing name=get_session_timing class=APIRoute GET=get_session_timing_api_sessions__session_id__timing_get",
+  "GET /api/sessions/{session_id}/runtime-timing name=get_session_runtime_timing class=APIRoute GET=get_session_runtime_timing_api_sessions__session_id__runtime_timing_get",
   "POST /api/sessions/rollup name=post_session_rollup class=_BoundedSessionPricingRoute POST=post_session_rollup_api_sessions_rollup_post",
   "POST /api/sessions/rollup name=post_session_rollup class=APIRoute POST=post_session_rollup_api_sessions_rollup_post",
   "GET /api/sessions/{session_id}/trace name=get_session_trace class=APIRoute GET=get_session_trace_api_sessions__session_id__trace_get",

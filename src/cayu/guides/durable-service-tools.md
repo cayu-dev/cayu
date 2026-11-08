@@ -312,6 +312,12 @@ with `RuntimeTimingConfig(recent_capacity=..., max_calls_per_round=...)` passed
 as `CayuApp(runtime_timing=...)`; `calls_truncated` reports omitted calls.
 `RuntimeTimingConfig(enabled=False)` disables collection and delivery.
 
+A running Cayu server serves the same view at
+`GET /api/sessions/{session_id}/runtime-timing`, without private model step,
+attempt and round ids. `cayu session runtime-timing SESSION_ID --server-url URL`
+or `--application NAME` reads it. It holds only work the answering process ran:
+a session run by a task worker has its records in that worker.
+
 A `ToolRoundTiming` has aggregate `phases` plus `calls`, each with the same
 twelve phase names. Shared round work, such as planning the complete approval
 set and committing the transcript, belongs to the round rather than being

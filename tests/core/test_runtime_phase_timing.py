@@ -749,9 +749,9 @@ def test_subagent_child_time_stays_in_the_parent_call_execution(sqlite_resources
             assert manifest_counters[0] is parent_counters
             (parent,) = await app.inspect_recent_tool_round_timing("parent")
             child = next(
-                record
-                for _, record in app._event_writer.timing.recent
-                if isinstance(record, ToolRoundTiming) and record.session_id != "parent"
+                entry.record
+                for entry in app._event_writer.timing.recent
+                if isinstance(entry.record, ToolRoundTiming) and entry.record.session_id != "parent"
             )
             assert not child.incomplete
             assert [c.tool_call_id for c in child.calls] == ["call-child"]

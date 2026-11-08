@@ -486,6 +486,10 @@ cayu session list --owner-lost --table --application bug-hunter
 # A workflow run as a whole: steps, child sessions, usage and custom events.
 cayu session workflow SESSION_ID --table
 
+# The runtime's own timing records a running server or Cloud Agent holds in memory:
+# tool rounds and model step preparation, with the database time inside each phase.
+cayu session runtime-timing SESSION_ID --application bug-hunter --table
+
 # Submit one explicit disposition through the authenticated server. The full
 # Authorization value is read from CAYU_API_AUTHORIZATION by default.
 export CAYU_API_AUTHORIZATION='Bearer ...'
@@ -796,6 +800,58 @@ count the lag they saw. A session
 slowed by its process shows lag here; one slowed by its own work doesn't. A Cloud Agent
 whose Cayu predates these events reports `event_loop_lag` as `null`.
 
+### Runtime timing records
+
+The runtime times each tool round and the gap before each model step, split into phases
+with the database work inside them (see [Attributing runtime time around a
+tool](../src/cayu/guides/durable-service-tools.md#attributing-runtime-time-around-a-tool),
+`cayu guide durable-service-tools`). It keeps the newest records, 64 for all sessions
+by default, in the memory of the process that ran the work; they are never written to the
+session store. `cayu session runtime-timing SESSION_ID` reads them from a running Cayu
+server through `GET /api/sessions/{id}/runtime-timing`:
+
+```console
+cayu session runtime-timing SESSION_ID --application bug-hunter --table
+cayu session runtime-timing SESSION_ID --server-url https://cayu.example.com --json
+cayu session runtime-timing SESSION_ID --application bug-hunter --limit 200
+```
+
+`--server-url` reads the Authorization header from `CAYU_API_AUTHORIZATION`
+(`--authorization-env NAME` names another variable), and `--application` signs in as
+the other `--application` commands do; neither credential is printed. `--sqlite` and
+`--postgres` are refused, since a store holds no records.
+
+The answer covers only the process that answered:
+
+| Field | Meaning |
+| --- | --- |
+| `scope` | Always `process`. |
+| `process.owner_id` | The opaque id of the answering process, the one its session executions carry as `owner_id`. |
+| `session_execution` | The session's execution presence now: `state`, the `owner_id` of the process running it, and `in_this_process`. |
+| `recorder` | Whether the process records (`enabled`), how many records it keeps for all sessions (`recent_capacity`) and holds (`recent_records`), and its sink delivery counters. |
+| `records` | The newest `--limit` records (default 50, at most 1,024), oldest first. |
+| `phase_totals` | Each phase summed over the records: `records`, `duration_seconds`, `store_transaction_count`, `store_lock_wait_seconds`, `store_execution_seconds` and `store_commit_seconds`. Added by the CLI. |
+
+Each record has its `kind` (`tool_round` or `model_step_preparation`), `started_at`,
+`completed_at`, `duration_seconds`, `incomplete` and `phases`, each phase with the
+store fields above and `store_bytes_written`. A preparation record says whether it
+followed a tool round (`after_tool_round`); a tool round has `recovered`,
+`calls_truncated` and its `calls`, each with `tool_name`, its own `phases` and the
+effect, staging and publication timestamps. A call's `tool_call_id` is its public
+`tool_call_correlation_id`, the value `cayu session tools` and its tool events show;
+model step, attempt and round ids are withheld, as in the other session APIs. The table
+prints one row per record with its slowest phases and its transactions, SQL, commit and
+lock/pool wait time, then the phase totals. These store figures overlap rather than add
+up: lock wait covers local lock and connection-pool admission and also the time spent
+acquiring a database lock (SQLite `BEGIN IMMEDIATE`, PostgreSQL `FOR UPDATE`), which the
+SQL time counts too.
+
+Work another process ran isn't there: a Cloud Agent's API is served by its web process,
+so the records of a session a task worker runs stay in that worker, and the table says
+when the session runs in another process. Records are lost when the process restarts or
+when newer records of any session push them out of the buffer. An Agent whose Cayu
+predates the route answers that it doesn't serve it yet.
+
 ### Workflow runs
 
 `cayu session workflow SESSION_ID` shows one workflow run as a whole. `SESSION_ID` is the
@@ -982,7 +1038,7 @@ settles the session's environment through that application, so it doesn't take
 ### Sessions of a Cloud Agent
 
 Add `--application NAME` to `list`, `rollup`, `show`, `workflow`, `interactions`, `usage`,
-`tools`, `events`, `transcript` or `output` to read a Cayu Cloud Agent's sessions instead of a local
+`tools`, `events`, `transcript`, `output` or `runtime-timing` to read a Cayu Cloud Agent's sessions instead of a local
 store. `NAME` is the Agent's id, name or slug, as in `cayu cloud` commands. The CLI signs
 in the same way: `CAYU_CLOUD_API_KEY` or an API-key file, the selected private context
 (`--context PATH`, `CAYU_CLOUD_CONTEXT`, or `cayu cloud context use`), or `cayu cloud login`.

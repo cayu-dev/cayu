@@ -1567,6 +1567,154 @@ export type ApiReviewedKnowledgeEntry = {
 };
 
 /**
+ * ApiRuntimeTimingCall
+ *
+ * One tool call of a timed round, named by its public `tool_call_correlation_id`.
+ */
+export type ApiRuntimeTimingCall = {
+    /**
+     * Phases
+     */
+    phases: Array<RuntimePhaseTiming>;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+    /**
+     * Tool Effect Completed At
+     */
+    tool_effect_completed_at?: string | null;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Tool Terminal Publication Started At
+     */
+    tool_terminal_publication_started_at?: string | null;
+    /**
+     * Tool Terminal Staged At
+     */
+    tool_terminal_staged_at?: string | null;
+};
+
+/**
+ * ApiRuntimeTimingProcess
+ *
+ * The process that answered, by the opaque id its session executions carry.
+ */
+export type ApiRuntimeTimingProcess = {
+    /**
+     * Owner Id
+     */
+    owner_id: string;
+};
+
+/**
+ * ApiRuntimeTimingRecord
+ *
+ * A `ToolRoundTiming` or `ModelStepPreparationTiming` without its private ids.
+ *
+ * ``kind`` says which. A preparation record has no ``calls``, ``recovered`` or
+ * ``calls_truncated``; ``after_tool_round`` says whether it followed a tool round.
+ */
+export type ApiRuntimeTimingRecord = {
+    /**
+     * After Tool Round
+     */
+    after_tool_round?: boolean | null;
+    /**
+     * Calls
+     */
+    calls?: Array<ApiRuntimeTimingCall> | null;
+    /**
+     * Calls Truncated
+     */
+    calls_truncated?: number | null;
+    /**
+     * Completed At
+     */
+    completed_at: string;
+    /**
+     * Duration Seconds
+     */
+    duration_seconds: number;
+    /**
+     * Incomplete
+     */
+    incomplete: boolean;
+    /**
+     * Kind
+     */
+    kind: 'tool_round' | 'model_step_preparation';
+    /**
+     * Phases
+     */
+    phases: Array<RuntimePhaseTiming>;
+    /**
+     * Recovered
+     */
+    recovered?: boolean | null;
+    /**
+     * Started At
+     */
+    started_at: string;
+};
+
+/**
+ * ApiRuntimeTimingRecorder
+ *
+ * This process's recorder: whether it records, how many recent records it keeps for
+ * all sessions together, and its delivery counters.
+ */
+export type ApiRuntimeTimingRecorder = {
+    /**
+     * Dropped Records
+     */
+    dropped_records: number;
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Failed Deliveries
+     */
+    failed_deliveries: number;
+    /**
+     * Queued Records
+     */
+    queued_records: number;
+    /**
+     * Recent Capacity
+     */
+    recent_capacity: number;
+    /**
+     * Recent Records
+     */
+    recent_records: number;
+};
+
+/**
+ * ApiRuntimeTimingSessionExecution
+ *
+ * Where the session runs now, from its execution presence (`GET .../state`).
+ */
+export type ApiRuntimeTimingSessionExecution = {
+    /**
+     * In This Process
+     */
+    in_this_process: boolean;
+    /**
+     * Owner Id
+     */
+    owner_id: string | null;
+    /**
+     * State
+     */
+    state: string;
+};
+
+/**
  * ApiSession
  */
 export type ApiSession = {
@@ -19907,6 +20055,53 @@ export type RuntimeManifest = {
 };
 
 /**
+ * RuntimePhaseTiming
+ *
+ * Exclusive phase time; SQL execution includes database lock acquisition.
+ *
+ * ``first_started_at`` and ``last_completed_at`` bound the observed entries;
+ * a phase can be entered more than once, so the window can exceed its duration.
+ */
+export type RuntimePhaseTiming = {
+    /**
+     * Duration Seconds
+     */
+    duration_seconds?: number;
+    /**
+     * First Started At
+     */
+    first_started_at?: string | null;
+    /**
+     * Last Completed At
+     */
+    last_completed_at?: string | null;
+    /**
+     * Name
+     */
+    name: 'authorization' | 'admission' | 'started_persistence' | 'effect_state' | 'execution' | 'result_processing' | 'staging' | 'sibling_wait' | 'publication_queue_wait' | 'publication' | 'round_commit' | 'unattributed' | 'handoff' | 'context_policy' | 'recall' | 'counting' | 'preparation';
+    /**
+     * Store Bytes Written
+     */
+    store_bytes_written?: number;
+    /**
+     * Store Commit Seconds
+     */
+    store_commit_seconds?: number;
+    /**
+     * Store Execution Seconds
+     */
+    store_execution_seconds?: number;
+    /**
+     * Store Lock Wait Seconds
+     */
+    store_lock_wait_seconds?: number;
+    /**
+     * Store Transaction Count
+     */
+    store_transaction_count?: number;
+};
+
+/**
  * RuntimeSessionCreateClaimReference
  *
  * Secret-free keyed identity for reconstructing one private create claim.
@@ -21443,6 +21638,37 @@ export type SessionRollupQuery = {
      * Until
      */
     until?: string | null;
+};
+
+/**
+ * SessionRuntimeTimingResponse
+ *
+ * `cayu session runtime-timing`: the recent runtime timing records one process holds.
+ *
+ * The records live in the memory of the process that ran the rounds and steps, so this
+ * covers only work that ran in the process that answered, since it started, and only
+ * while its bounded recent buffer still holds them.
+ */
+export type SessionRuntimeTimingResponse = {
+    /**
+     * Limit
+     */
+    limit: number;
+    process: ApiRuntimeTimingProcess;
+    recorder: ApiRuntimeTimingRecorder;
+    /**
+     * Records
+     */
+    records: Array<ApiRuntimeTimingRecord>;
+    /**
+     * Scope
+     */
+    scope?: 'process';
+    session_execution: ApiRuntimeTimingSessionExecution;
+    /**
+     * Session Id
+     */
+    session_id: string;
 };
 
 /**
@@ -31468,6 +31694,45 @@ export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses = {
 };
 
 export type PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponse = PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses[keyof PostSessionModelCallsApiSessionsSessionIdModelCallsPostResponses];
+
+export type GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/sessions/{session_id}/runtime-timing';
+};
+
+export type GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetErrors = {
+    /**
+     * The session does not exist.
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetError = GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetErrors[keyof GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetErrors];
+
+export type GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionRuntimeTimingResponse;
+};
+
+export type GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetResponse = GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetResponses[keyof GetSessionRuntimeTimingApiSessionsSessionIdRuntimeTimingGetResponses];
 
 export type GetSessionStateApiSessionsSessionIdStateGetData = {
     body?: never;

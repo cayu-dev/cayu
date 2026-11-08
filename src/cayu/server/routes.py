@@ -221,6 +221,7 @@ from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._model_check_routes import register_model_check_route
 from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server._request_validation import invalid_parameters_detail
+from cayu.server._runtime_timing_routes import register_runtime_timing_route
 from cayu.server._scenario_routes import (
     register_scenario_authoring_routes,
     register_scenario_launch_routes,
@@ -8811,6 +8812,16 @@ def create_router(
         redact=cayu_app.redact_json,
         codec=lambda: cayu_app._public_authority_alias_codec,
         pricing_route=_BoundedSessionPricingRoute,
+    )
+    register_runtime_timing_route(
+        router,
+        protected=protected,
+        cayu_app=cayu_app,
+        store=session_store,
+        timing_recorder=lambda: cayu_app._event_writer.timing,
+        resolve_session=_resolve_public_session_id,
+        redact=cayu_app.redact_json,
+        codec=lambda: cayu_app._public_authority_alias_codec,
     )
     register_session_rollup_route(
         router,
