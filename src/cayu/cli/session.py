@@ -242,9 +242,10 @@ def add_session_parser(subparsers: Any) -> None:
         "show",
         help="Show a compact session overview.",
         description=(
-            "Show a compact session overview, including its execution presence: who holds "
-            "the running session, until when its lease runs, and whether that owner is "
-            "gone (owner_lost). Use usage, tools, events, or transcript for bounded detail."
+            "Show a compact session overview, including execution ownership, lease expiry "
+            "and owner_lost state. Also shows the run epoch, active model_stage "
+            "(purpose, dispatch state, provider and model), and latest provider_operation "
+            "by identity and state only. Use usage, tools, events, or transcript for bounded detail."
         ),
     )
     show_parser.add_argument("session_id")
@@ -509,9 +510,11 @@ def add_session_parser(subparsers: Any) -> None:
         help="Explicitly retry or fail unavailable provider work.",
         description=(
             "Send a run-epoch-fenced fallback_retry or fail disposition to the Cayu "
-            "server. Read stage_id and run_epoch from `cayu session show` or the "
-            "session state API. Authorization is read from CAYU_API_AUTHORIZATION by "
-            "default and is never printed."
+            "server. `cayu session show SESSION_ID` prints what it needs: --stage-id is "
+            "model_stage.stage_id (also provider_operation.stage_id), --run-epoch is "
+            "session.run_epoch, and provider_operation.allowed_resolutions lists the "
+            "actions the operation accepts now. Authorization is read from "
+            "CAYU_API_AUTHORIZATION by default and is never printed."
         ),
     )
     resolution_parser.add_argument("session_id")

@@ -371,12 +371,19 @@ def test_cloud_session_list_and_show_report_what_the_agent_api_exposes(agent, ca
     assert remote["total_count"] == local["total_count"] == 1
 
     local, remote = _both(capsys, database, "show", _SESSION)
-    for section in ("usage", "provider_operation", "terminal_failure", "pending_action"):
+    for section in (
+        "usage",
+        "provider_operation",
+        "model_stage",
+        "terminal_failure",
+        "pending_action",
+    ):
         assert remote[section] == local[section], section
     assert remote["activity"] == {**local["activity"], "model_calls_with_usage": None}
     assert remote["transcript"]["message_count"] == local["transcript"]["message_count"]
     assert remote["events"]["event_count"] == local["events"]["event_count"]
-    assert remote["session"] == {**local["session"], "run_epoch": None}
+    assert remote["session"] == local["session"]
+    assert type(remote["session"]["run_epoch"]) is int
     assert remote["budget"] is None
     assert remote["timing"] == local["timing"]
     assert remote["timing"]["model_calls"] == 2

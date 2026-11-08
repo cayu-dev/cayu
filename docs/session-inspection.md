@@ -475,9 +475,9 @@ cayu session list --task TASK_ID
 cayu session list --overview
 cayu session list --overview --table --application bug-hunter
 
-# Content-free operational summary, including runtime name/version, usage,
-# pending-action counts, session timing, the worker's event-loop lag, and who holds
-# the running session.
+# Content-free operational summary, including runtime name/version, run epoch, usage,
+# pending-action counts, the active model call and provider operation, session timing,
+# the worker's event-loop lag, and who holds the running session.
 cayu session show SESSION_ID
 
 # Running or interrupting sessions whose owner is gone, with that owner and its lease.
@@ -490,8 +490,9 @@ cayu session workflow SESSION_ID --table
 # tool rounds and model step preparation, with the database time inside each phase.
 cayu session runtime-timing SESSION_ID --application bug-hunter --table
 
-# Submit one explicit disposition through the authenticated server. The full
-# Authorization value is read from CAYU_API_AUTHORIZATION by default.
+# Submit one explicit disposition through the authenticated server. STAGE_ID is
+# `model_stage.stage_id` and RUN_EPOCH is `session.run_epoch` in `cayu session show`.
+# The full Authorization value is read from CAYU_API_AUTHORIZATION by default.
 export CAYU_API_AUTHORIZATION='Bearer ...'
 cayu session resolve-provider-operation SESSION_ID \
   --stage-id STAGE_ID --run-epoch RUN_EPOCH \
@@ -523,6 +524,33 @@ cayu session transcript SESSION_ID --interaction-id INTERACTION_ID
 cayu session output SESSION_ID
 cayu session output SESSION_ID --interaction-id INTERACTION_ID --table
 ```
+
+### Model work in `session show`
+
+A run can stop inside a model call: a worker that died mid-call, a background provider
+operation still running at the provider, or an answer the provider gave that the session
+hasn't published yet. `cayu session show` reports that work by identity and state only,
+never a request body, stream delta, provider recovery metadata or credential:
+
+- `session.run_epoch`: the run the session is on, which a fenced decision such as
+  `resolve-provider-operation --run-epoch` names.
+- `model_stage`: the active model-completion stage, or `null` when there is none.
+  `stage_id`; `purpose` (`assistant-turn`, `context-compaction` or
+  `auxiliary-inference`); `state` (`in_flight` with no answer recorded, or `completed`
+  with an answer recorded but not yet published); `dispatched` (the request reached the
+  provider); `background` (a background provider operation owns it); `model_step_id`,
+  `model_attempt_id` and `dispatch_ordinal`; `provider_name` and `requested_model`;
+  `source_run_epoch`; `reservation_count` (budget reservations it holds); and
+  `prepared_at`/`completed_at`.
+- `provider_operation`: the latest model attempt's dispatch mode and, for background
+  operations, its operation id, stream protocol, cancellation and accounting state,
+  recovery reason, the resolutions it accepts, and the latest accepted
+  `resolve-provider-operation` decision (`resolution_action`, `resolution_id`), described
+  below.
+
+The session state API (`GET /api/sessions/{id}/state`) returns the same `model_stage`,
+with `model_step_id` and `model_attempt_id` as `null`; its `execution.run_epoch` is the
+session's run epoch.
 
 ### Runner commands of a tool call
 
@@ -1060,7 +1088,10 @@ wakes it; the CLI waits up to 90 seconds while it starts. The Agent's Cayu API i
 The commands print the same rows as for a local store, with what the Agent's public API
 withholds left out:
 
-- `list` and `show` report `run_epoch` as `null`; `list` also reports `last_activity_at`
+- `list` reports `run_epoch` as `null` (`show` reads it from the Agent's session state),
+  and `show` reports `model_stage.model_step_id` and `model_stage.model_attempt_id` as
+  `null`, private ids the Agent's API keeps private. An Agent whose Cayu predates
+  `model_stage` reports it as `null`. `list` also reports `last_activity_at`
   as `null`, and `total_count` as `null` with `--since` or `--until`, because an Agent on
   an older Cayu ignores the window and the CLI filters its rows itself. `show` reports record byte sizes, queue counts, `operation` and `budget` as
   `null`.

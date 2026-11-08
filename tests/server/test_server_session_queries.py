@@ -541,7 +541,9 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
         "last_activity_at",
         "interruption_cascade",
         "provider_operation",
+        "model_stage",
     }
+    assert body["model_stage"] is None
 
 
 def test_server_session_state_exposes_provider_reconnect_in_progress() -> None:

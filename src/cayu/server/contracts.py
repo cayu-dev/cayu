@@ -3073,6 +3073,26 @@ class ApiProviderOperationInspection(ApiBaseModel):
     reservation_count: StrictInt = Field(ge=0, le=32)
 
 
+class ApiActiveModelStage(ApiBaseModel):
+    """The model call the session's run is making, or made and hasn't published."""
+
+    stage_id: str = Field(max_length=256)
+    purpose: Literal["assistant-turn", "context-compaction", "auxiliary-inference"]
+    state: Literal["in_flight", "completed"]
+    dispatched: StrictBool
+    background: StrictBool
+    # Private runtime identities: the API reports them as null, as it does for calls.
+    model_step_id: None = None
+    model_attempt_id: None = None
+    dispatch_ordinal: StrictInt = Field(ge=0)
+    provider_name: str | None = Field(default=None, max_length=256)
+    requested_model: str | None = Field(default=None, max_length=256)
+    source_run_epoch: StrictInt = Field(ge=0)
+    reservation_count: StrictInt = Field(ge=0)
+    prepared_at: str
+    completed_at: str | None = None
+
+
 class SessionStateResponse(ApiBaseModel):
     session_id: str
     status: Literal["pending", "running", "interrupting", "completed", "failed", "interrupted"]
@@ -3080,6 +3100,7 @@ class SessionStateResponse(ApiBaseModel):
     last_activity_at: str
     interruption_cascade: Literal["none", "pending", "failed"]
     provider_operation: ApiProviderOperationInspection
+    model_stage: ApiActiveModelStage | None = None
     execution: SessionExecutionState
     execution_snapshots: list[ExecutionSnapshotInspection] = Field(
         default_factory=list, max_length=25

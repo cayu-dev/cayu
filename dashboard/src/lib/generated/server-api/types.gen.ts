@@ -455,6 +455,70 @@ export type AggregateUsageSummary = {
 };
 
 /**
+ * ApiActiveModelStage
+ *
+ * The model call the session's run is making, or made and hasn't published.
+ */
+export type ApiActiveModelStage = {
+    /**
+     * Background
+     */
+    background: boolean;
+    /**
+     * Completed At
+     */
+    completed_at?: string | null;
+    /**
+     * Dispatch Ordinal
+     */
+    dispatch_ordinal: number;
+    /**
+     * Dispatched
+     */
+    dispatched: boolean;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id?: null;
+    /**
+     * Model Step Id
+     */
+    model_step_id?: null;
+    /**
+     * Prepared At
+     */
+    prepared_at: string;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Purpose
+     */
+    purpose: 'assistant-turn' | 'context-compaction' | 'auxiliary-inference';
+    /**
+     * Requested Model
+     */
+    requested_model?: string | null;
+    /**
+     * Reservation Count
+     */
+    reservation_count: number;
+    /**
+     * Source Run Epoch
+     */
+    source_run_epoch: number;
+    /**
+     * Stage Id
+     */
+    stage_id: string;
+    /**
+     * State
+     */
+    state: 'in_flight' | 'completed';
+};
+
+/**
  * ApiAgentSummary
  */
 export type ApiAgentSummary = {
@@ -21730,6 +21794,7 @@ export type SessionStateResponse = {
      * Last Activity At
      */
     last_activity_at: string;
+    model_stage?: ApiActiveModelStage | null;
     provider_operation: ApiProviderOperationInspection;
     /**
      * Session Id

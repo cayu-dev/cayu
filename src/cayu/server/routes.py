@@ -147,6 +147,7 @@ from cayu.runtime._event_projection import (
     public_event_linkage_id,
     public_event_sequence,
 )
+from cayu.runtime._model_stage_inspection import ActiveModelStageInspection, inspect_model_stage
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
 from cayu.runtime.human_attention import (
     AttentionKind,
@@ -1083,6 +1084,14 @@ class _SessionFollowEventSourceResponse(EventSourceResponse):
 
 def _session_follow_heartbeat() -> ServerSentEvent:
     return ServerSentEvent(comment=SSE_SESSION_FOLLOW_HEARTBEAT_COMMENT)
+
+
+def _public_model_stage(stage: ActiveModelStageInspection | None) -> dict[str, Any] | None:
+    """The state API's active model stage: model step and attempt ids stay private."""
+
+    if stage is None:
+        return None
+    return {**stage.model_dump(mode="json"), "model_step_id": None, "model_attempt_id": None}
 
 
 def _session_state_etag(body: Mapping[str, Any]) -> str:
@@ -8601,6 +8610,7 @@ def create_router(
             raise HTTPException(status_code=404, detail="Session not found")
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
         provider_operation = await inspect_provider_operation(session_store, session_id)
+        model_stage = await inspect_model_stage(session_store, session_id)
         execution = await cayu_app.inspect_session_execution(session_id)
         from cayu.environments.snapshot_lifecycle import inspect_execution_snapshots
 
@@ -8612,6 +8622,7 @@ def create_router(
             "last_activity_at": state.last_activity_at.isoformat(),
             "interruption_cascade": interruption_cascade,
             "provider_operation": provider_operation.model_dump(mode="json"),
+            "model_stage": _public_model_stage(model_stage),
             "execution": execution.model_dump(mode="json"),
             "execution_snapshots": [item.model_dump(mode="json") for item in execution_snapshots],
         }

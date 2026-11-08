@@ -194,7 +194,7 @@ class AgentSessionReader:
                 "created_at": _iso(detail.get("created_at")),
                 "updated_at": _iso(state.get("updated_at", detail.get("updated_at"))),
                 "last_activity_at": _iso(state.get("last_activity_at")),
-                "run_epoch": None,
+                "run_epoch": _mapping(state.get("execution")).get("run_epoch"),
                 "labels": shown_labels,
                 "label_count": len(labels),
                 "labels_truncated": len(labels) > len(shown_labels),
@@ -224,6 +224,8 @@ class AgentSessionReader:
             "queue": {"queued": None, "delivered": None, "outstanding": None},
             "operation": {"accepted_event_count": None, "state": None},
             "provider_operation": state.get("provider_operation"),
+            # None from an Agent whose Cayu predates it, as from a run with no model call.
+            "model_stage": state.get("model_stage"),
             "event_loop_lag": await self.event_loop_lag(session_id),
             "terminal_failure": {
                 "state": status if status in {"failed", "interrupted"} else "none"

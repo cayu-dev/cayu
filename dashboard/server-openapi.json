@@ -792,6 +792,117 @@
         "title": "AggregateUsageSummary",
         "type": "object"
       },
+      "ApiActiveModelStage": {
+        "additionalProperties": false,
+        "description": "The model call the session's run is making, or made and hasn't published.",
+        "properties": {
+          "background": {
+            "title": "Background",
+            "type": "boolean"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "dispatch_ordinal": {
+            "minimum": 0.0,
+            "title": "Dispatch Ordinal",
+            "type": "integer"
+          },
+          "dispatched": {
+            "title": "Dispatched",
+            "type": "boolean"
+          },
+          "model_attempt_id": {
+            "title": "Model Attempt Id",
+            "type": "null"
+          },
+          "model_step_id": {
+            "title": "Model Step Id",
+            "type": "null"
+          },
+          "prepared_at": {
+            "title": "Prepared At",
+            "type": "string"
+          },
+          "provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name"
+          },
+          "purpose": {
+            "enum": [
+              "assistant-turn",
+              "context-compaction",
+              "auxiliary-inference"
+            ],
+            "title": "Purpose",
+            "type": "string"
+          },
+          "requested_model": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Model"
+          },
+          "reservation_count": {
+            "minimum": 0.0,
+            "title": "Reservation Count",
+            "type": "integer"
+          },
+          "source_run_epoch": {
+            "minimum": 0.0,
+            "title": "Source Run Epoch",
+            "type": "integer"
+          },
+          "stage_id": {
+            "maxLength": 256,
+            "title": "Stage Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "in_flight",
+              "completed"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage_id",
+          "purpose",
+          "state",
+          "dispatched",
+          "background",
+          "dispatch_ordinal",
+          "source_run_epoch",
+          "reservation_count",
+          "prepared_at"
+        ],
+        "title": "ApiActiveModelStage",
+        "type": "object"
+      },
       "ApiAgentSummary": {
         "additionalProperties": false,
         "properties": {
@@ -43714,6 +43825,16 @@
           "last_activity_at": {
             "title": "Last Activity At",
             "type": "string"
+          },
+          "model_stage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiActiveModelStage"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "provider_operation": {
             "$ref": "#/components/schemas/ApiProviderOperationInspection"

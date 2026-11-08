@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from cayu.budgets.pricing import PriceBook
 from cayu.budgets.usage import AggregateUsageMetrics
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._model_stage_inspection import inspect_model_stage
 from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.sessions._call_inspection import (
     InspectionWindow,
@@ -366,6 +367,7 @@ class StoreSessionReader:
             raise ValueError(f"Session not found: {session_id}") from exc
         identity = summary.session
         provider_operation = await inspect_provider_operation(self.store, session_id)
+        model_stage = await inspect_model_stage(self.store, session_id)
         return {
             "session": {
                 "id": identity.id,
@@ -423,6 +425,7 @@ class StoreSessionReader:
                 "state": "present" if summary.operation_event_count else "none",
             },
             "provider_operation": provider_operation.model_dump(mode="json"),
+            "model_stage": None if model_stage is None else model_stage.model_dump(mode="json"),
             "event_loop_lag": await read_event_loop_lag(self.store, session_id),
             "terminal_failure": {"state": summary.terminal_failure_state},
             "budget": summary.budget.model_dump(mode="json"),
