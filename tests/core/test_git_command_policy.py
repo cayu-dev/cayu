@@ -213,6 +213,85 @@ def test_git_command_policy_allows_only_documented_local_workflow_matrix(
     assert result.reason is None
 
 
+@pytest.mark.parametrize("subcommand", ["log", "diff"])
+@pytest.mark.parametrize(
+    ("value", "decision"),
+    [
+        ("1", "allow"),
+        ("01", "allow"),
+        ("", "deny"),
+        ("+1", "deny"),
+        ("-1", "deny"),
+        (" 1", "deny"),
+        ("1_0", "deny"),
+        ("\uff11", "deny"),
+        ("0" * 4301 + "1", "deny"),
+    ],
+)
+def test_git_command_policy_numeric_option_syntax(
+    subcommand: str,
+    value: str,
+    decision: str,
+) -> None:
+    if subcommand == "log":
+        argv = (*_SAFE_INSPECTION_PREFIX, "log", "--oneline", f"--max-count={value}")
+    else:
+        argv = (
+            *_SAFE_INDEX_PREFIX,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"--unified={value}",
+        )
+
+    result = _evaluate(_policy(), _request(*argv))
+
+    assert result.decision == decision
+    assert result.reason == (
+        "Git option is not allowed for this subcommand." if decision == "deny" else None
+    )
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "value", "decision"),
+    [
+        ("log", "0", "deny"),
+        ("log", "1000", "allow"),
+        ("log", "1001", "deny"),
+        ("log", "00010", "allow"),
+        ("log", "0001001", "deny"),
+        ("diff", "0", "allow"),
+        ("diff", "20", "allow"),
+        ("diff", "21", "deny"),
+        ("diff", "003", "allow"),
+        ("diff", "020", "allow"),
+        ("diff", "00021", "deny"),
+    ],
+)
+def test_git_command_policy_numeric_option_bounds(
+    subcommand: str,
+    value: str,
+    decision: str,
+) -> None:
+    if subcommand == "log":
+        argv = (*_SAFE_INSPECTION_PREFIX, "log", "--oneline", f"--max-count={value}")
+    else:
+        argv = (
+            *_SAFE_INDEX_PREFIX,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"--unified={value}",
+        )
+
+    result = _evaluate(_policy(), _request(*argv))
+
+    assert result.decision == decision
+    assert result.reason == (
+        "Git option is not allowed for this subcommand." if decision == "deny" else None
+    )
+
+
 @pytest.mark.parametrize(
     "args",
     [

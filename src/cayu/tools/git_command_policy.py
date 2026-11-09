@@ -282,7 +282,7 @@ def _evaluate_log(args: tuple[str, ...]) -> CommandPolicyResult:
             continue
         if item.startswith("--max-count="):
             count = item.removeprefix("--max-count=")
-            if not count.isdigit() or not 1 <= int(count) <= _MAX_LOG_COUNT:
+            if not _is_bounded_decimal(count, minimum=1, maximum=_MAX_LOG_COUNT):
                 return _deny("Git option is not allowed for this subcommand.")
             continue
         if item.startswith("-") or not _is_revision(item):
@@ -319,7 +319,7 @@ def _evaluate_diff(args: tuple[str, ...]) -> CommandPolicyResult:
             continue
         if item.startswith("--unified="):
             lines = item.removeprefix("--unified=")
-            if lines.isdigit() and 0 <= int(lines) <= 20:
+            if _is_bounded_decimal(lines, minimum=0, maximum=20):
                 continue
         if item.startswith("-") or not _is_revision(item):
             return _deny("Git option is not allowed for this subcommand.")
@@ -415,6 +415,16 @@ def _is_object_spec(value: str) -> bool:
         return _is_revision(value)
     revision, path = value.split(":", 1)
     return _is_revision(revision) and _is_safe_path(path)
+
+
+def _is_bounded_decimal(value: str, *, minimum: int, maximum: int) -> bool:
+    if not value or not value.isascii() or not value.isdigit():
+        return False
+    try:
+        number = int(value)
+    except ValueError:
+        return False
+    return minimum <= number <= maximum
 
 
 def _is_revision(value: str) -> bool:
