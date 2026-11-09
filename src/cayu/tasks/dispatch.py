@@ -1557,47 +1557,62 @@ class TaskStoreDispatcher(Dispatcher):
                         return await self._reclaimed_dispatch_handle(task, envelope)
                     await execution_settlement.attempt()
                     return handle
+
                 # The session is already being run by another worker — requeue rather than
                 # fail, so it runs once that session frees up (per-session serialization).
                 # The same rule applies while terminal hooks or trailing cleanup retain the
                 # prior invocation's profile fence. After a worker crash, recover stale
                 # session ownership so the requeued dispatch can proceed.
-                recovery = await self._recover_stalled_session(
-                    durable_runtime,
-                    request,
-                )
-                if recovery.permanent_rejection is not None:
-                    return await self._reject_claimed_dispatch(
+                async def recover_and_requeue(failure: Exception = exc) -> DispatchHandle | None:
+                    recovery = await self._recover_stalled_session(
                         durable_runtime,
+                        request,
+                    )
+                    if recovery.permanent_rejection is not None:
+                        return await self._reject_claimed_dispatch(
+                            durable_runtime,
+                            task=task,
+                            worker_id=worker_id,
+                            lease_authority=lease_authority,
+                            error=recovery.permanent_rejection,
+                            envelope=envelope,
+                        )
+                    released = await self._release_claimed_dispatch_after_failure(
                         task=task,
                         worker_id=worker_id,
                         lease_authority=lease_authority,
-                        error=recovery.permanent_rejection,
-                        envelope=envelope,
+                        failure=failure,
                     )
-                released = await self._release_claimed_dispatch_after_failure(
-                    task=task,
-                    worker_id=worker_id,
-                    lease_authority=lease_authority,
-                    failure=exc,
-                )
-                if not released:
+                    if not released:
+                        return self._handle(
+                            request,
+                            DispatchStatus.SUBMITTED,
+                            queue_task_id=task.id,
+                            envelope=envelope,
+                            reclaimed=True,
+                            recovered_session=recovery.recovered,
+                        )
                     return self._handle(
                         request,
                         DispatchStatus.SUBMITTED,
                         queue_task_id=task.id,
                         envelope=envelope,
-                        reclaimed=True,
+                        requeued=True,
                         recovered_session=recovery.recovered,
                     )
-                return self._handle(
-                    request,
-                    DispatchStatus.SUBMITTED,
-                    queue_task_id=task.id,
-                    envelope=envelope,
-                    requeued=True,
-                    recovered_session=recovery.recovered,
-                )
+
+                try:
+                    return await self._await_with_task_lease(
+                        recover_and_requeue(),
+                        heartbeat,
+                        task=task,
+                        worker_id=worker_id,
+                        dispatcher=self,
+                        lease_authority=lease_authority,
+                        execution_not_admitted=True,
+                    )
+                except TaskClaimLost:
+                    return await self._reclaimed_dispatch_handle(task, envelope)
             except (
                 ExecutionProfileMismatchError,
                 _QueuedDispatchAuthorityRejected,
@@ -1868,6 +1883,13 @@ class TaskStoreDispatcher(Dispatcher):
                     worker_id,
                     lease_authority,
                 )
+            except TaskTerminalizationConflict:
+                # This helper is reached only after non-admission is proven.
+                # An operator cancellation has no handler left to drain.
+                await self._settle_dispatch_cancellation_after_quiescence(
+                    task.id, worker_id, claim_generation=lease_authority.claim_generation
+                )
+                return False
             except TaskClaimLost:
                 logger.warning(
                     "dispatch task %s lost its lease while preserving a retryable failure",
@@ -2468,6 +2490,7 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str | None = None,
         dispatcher: TaskStoreDispatcher | None = None,
         lease_authority: _DispatchLeaseAuthority | None = None,
+        execution_not_admitted: bool = False,
     ) -> Any:
         """Supervise one dispatch operation through task-authority settlement."""
 
@@ -2517,9 +2540,17 @@ class TaskStoreDispatcher(Dispatcher):
                     "Dispatch task heartbeat stopped without proving task authority."
                 )
 
-        if dispatcher is None or task is None or worker_id is None or lease_authority is None:
-            # This entrance is retained only for direct internal supervision without a
-            # durable queue task.  The production dispatcher always supplies authority.
+        if (
+            dispatcher is None
+            or task is None
+            or worker_id is None
+            or lease_authority is None
+            or execution_not_admitted
+        ):
+            # Non-admission proves queue work has not started. Worker shutdown
+            # or heartbeat failure must not create a durable cancellation.
+            # Let exact claim release reconcile operator cancellation or loss.
+            # Direct supervision without a durable task also joins here.
             operation_outcome = await await_shielded_task_outcome(
                 operation_task,
                 cancellation=owner_cancellation,
