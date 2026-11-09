@@ -1876,6 +1876,21 @@ class SyncBinding(WorkspaceBinding):
         )
         if workspace is None:
             raise ValueError("SyncBinding requires a source workspace.")
+        if (
+            self.source_conflict_policy == "require_revision"
+            and self.preserve_git_modes
+            and self.delete_missing
+            and self.sync_back != "never"
+            and (
+                not isinstance(workspace, WorkspaceGitModeMutator)
+                or type(workspace).delete_if_revision_with_git_mode
+                is WorkspaceGitModeMutator.delete_if_revision_with_git_mode
+            )
+        ):
+            raise TypeError(
+                "SyncBinding mode-preserving deletion requires a source that implements "
+                "delete_if_revision_with_git_mode."
+            )
         if "sync_binding" in request_metadata:
             raise ValueError("SyncBinding metadata key 'sync_binding' is reserved.")
         context = SyncBindingContext(
@@ -2810,10 +2825,26 @@ class SyncBinding(WorkspaceBinding):
                         else:
                             expected = revision_map[path]
                             try:
-                                await source.delete_if_revision(
-                                    path,
-                                    expected_revision=expected.revision,
-                                )
+                                if self.preserve_git_modes:
+                                    if not isinstance(source, WorkspaceGitModeMutator):
+                                        raise RuntimeError(
+                                            "SyncBinding Git-mode copy-back requires a mode-aware "
+                                            "source."
+                                        )
+                                    if expected.git_mode is None:
+                                        raise RuntimeError(
+                                            f"SyncBinding source omitted Git mode authority: {path}"
+                                        )
+                                    await source.delete_if_revision_with_git_mode(
+                                        path,
+                                        expected_revision=expected.revision,
+                                        expected_git_mode=expected.git_mode,
+                                    )
+                                else:
+                                    await source.delete_if_revision(
+                                        path,
+                                        expected_revision=expected.revision,
+                                    )
                             except FileNotFoundError:
                                 if not allow_idempotent_replay:
                                     raise

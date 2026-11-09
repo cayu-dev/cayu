@@ -473,6 +473,25 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
             expected_revision,
         )
 
+    async def delete_if_revision_with_git_mode(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+        expected_git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        expected_revision = _validate_revision(expected_revision)
+        expected_mode = _git_mode_bits(expected_git_mode)
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        return await asyncio.to_thread(
+            _delete_file_if_revision,
+            self.root,
+            relative_path,
+            expected_revision,
+            expected_mode,
+        )
+
     async def require_absent(self, path: str) -> None:
         relative_path = _validate_workspace_relative_path(path)
         self._require_path_allowed(relative_path)
@@ -798,12 +817,18 @@ def _delete_file_if_revision(
     root: Path,
     relative_path: str,
     expected_revision: str,
+    expected_git_mode: int | None = None,
 ) -> WorkspaceMutationResult:
     with (
         workspace_source_lock(root, exclusive=False),
         workspace_path_lock(root, relative_path),
     ):
-        before = delete_regular_if_revision(root, relative_path, expected_revision)
+        before = delete_regular_if_revision(
+            root,
+            relative_path,
+            expected_revision,
+            expected_git_mode=expected_git_mode,
+        )
         return mutation_result_from_identities("delete", before=before, after=None)
 
 

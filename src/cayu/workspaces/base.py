@@ -903,6 +903,16 @@ class WorkspaceGitModeMutator(ABC):
     ) -> WorkspaceMutationResult:
         """Conditionally replace bytes and mode against both prior authorities."""
 
+    async def delete_if_revision_with_git_mode(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+        expected_git_mode: WorkspaceGitMode,
+    ) -> WorkspaceMutationResult:
+        """Delete a file only when both its revision and Git mode match."""
+        raise NotImplementedError("Workspace does not support Git-mode conditional deletion.")
+
 
 class RunnerBoundWorkspace(Workspace):
     """Workspace whose operations target one declared runner-owned resource.

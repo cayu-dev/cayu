@@ -749,12 +749,21 @@ def delete_regular_if_revision(
     root: Path,
     relative_path: str,
     expected_revision: str,
+    *,
+    expected_git_mode: int | None = None,
 ) -> tuple[str, str, int]:
     try:
         with _open_parent(root, relative_path) as (parent_fd, name):
-            before, _mode = _identity_at(parent_fd, name)
+            before, mode = _identity_at(parent_fd, name)
             if before[0] != expected_revision:
                 raise WorkspaceRevisionMismatchError(expected_revision, before[0])
+            if expected_git_mode is not None and bool(mode & 0o111) != bool(
+                expected_git_mode & 0o111
+            ):
+                raise WorkspaceGitModeMismatchError(
+                    "100755" if expected_git_mode & 0o111 else "100644",
+                    "100755" if mode & 0o111 else "100644",
+                )
             os.unlink(name, dir_fd=parent_fd)
             return before
     except _LocalGuardPathError as exc:

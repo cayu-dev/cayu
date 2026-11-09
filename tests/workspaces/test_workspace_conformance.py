@@ -862,6 +862,52 @@ def test_local_workspace_git_mode_replace_rejects_mode_only_cas_drift(tmp_path: 
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
+@pytest.mark.parametrize("git_mode", ["100644", "100755"])
+@pytest.mark.parametrize("drift", ["none", "mode", "bytes"])
+def test_local_workspace_git_mode_delete_checks_both_authorities(
+    tmp_path: Path, git_mode: str, drift: str
+) -> None:
+    path = tmp_path / "script.sh"
+    content = b"#!/bin/sh\n"
+    path.write_bytes(content)
+    mode = 0o755 if git_mode == "100755" else 0o644
+    path.chmod(mode)
+    workspace = LocalWorkspace(tmp_path)
+    baseline = asyncio.run(workspace.read_bytes("script.sh"))
+    assert baseline.revision is not None
+    assert baseline.git_mode is not None
+    if drift == "mode":
+        path.chmod(mode ^ 0o111)
+    elif drift == "bytes":
+        path.write_bytes(b"changed\n")
+
+    async def delete():
+        return await workspace.delete_if_revision_with_git_mode(
+            "script.sh",
+            expected_revision=baseline.revision,
+            expected_git_mode=baseline.git_mode,
+        )
+
+    if drift == "none":
+        result = asyncio.run(delete())
+        assert result.operation == "delete"
+        assert result.before_revision == baseline.revision
+        assert result.before_sha256 == baseline.sha256
+        assert result.before_bytes == len(content)
+        assert not path.exists()
+    else:
+        error = (
+            workspaces_module.WorkspaceGitModeMismatchError
+            if drift == "mode"
+            else workspaces_module.WorkspaceRevisionMismatchError
+        )
+        with pytest.raises(error):
+            asyncio.run(delete())
+        assert path.read_bytes() == (content if drift == "mode" else b"changed\n")
+        assert stat.S_IMODE(path.stat().st_mode) == (mode ^ 0o111 if drift == "mode" else mode)
+
+
 def test_conditional_mutations_serialize_filesystem_case_aliases(tmp_path: Path) -> None:
     workspace = LocalWorkspace(tmp_path)
     asyncio.run(workspace.write_bytes("Case.txt", b"base"))
