@@ -1521,7 +1521,7 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             except TaskClaimLost:
                 return await self._reclaimed_dispatch_handle(task, envelope)
-            except (SessionRunFenced, SessionStatusConflict):
+            except (SessionRunFenced, SessionStatusConflict) as exc:
                 # The exception alone is not proof that this invocation never
                 # entered. Authenticate the exact queued operation before
                 # acknowledging its execution and relinquishing the claim.
@@ -1575,17 +1575,13 @@ class TaskStoreDispatcher(Dispatcher):
                         error=recovery.permanent_rejection,
                         envelope=envelope,
                     )
-                try:
-                    await self._release_claimed_task(
-                        task.id,
-                        worker_id,
-                        lease_authority,
-                    )
-                except TaskClaimLost:
-                    logger.warning(
-                        "dispatch %s lost its lease before conflict requeue",
-                        request.dispatch_id,
-                    )
+                released = await self._release_claimed_dispatch_after_failure(
+                    task=task,
+                    worker_id=worker_id,
+                    lease_authority=lease_authority,
+                    failure=exc,
+                )
+                if not released:
                     return self._handle(
                         request,
                         DispatchStatus.SUBMITTED,
@@ -1653,18 +1649,17 @@ class TaskStoreDispatcher(Dispatcher):
                             envelope=envelope,
                         )
                     if is_durable_subagent_worker_incompatible(exc):
-                        try:
-                            await self._release_claimed_task(
-                                task.id,
-                                worker_id,
-                                lease_authority,
-                            )
-                        except TaskClaimLost:
-                            logger.warning(
-                                "dispatch %s lost its lease while requeueing an "
-                                "incompatible prepared-subagent worker",
-                                request.dispatch_id,
-                            )
+                        released = await self._release_claimed_dispatch_after_failure(
+                            task=task,
+                            worker_id=worker_id,
+                            lease_authority=lease_authority,
+                            failure=exc,
+                            release_failure_message=(
+                                "Prepared-subagent worker incompatibility and task "
+                                "release both failed."
+                            ),
+                        )
+                        if not released:
                             return self._handle(
                                 request,
                                 DispatchStatus.SUBMITTED,
@@ -1672,14 +1667,6 @@ class TaskStoreDispatcher(Dispatcher):
                                 envelope=envelope,
                                 reclaimed=True,
                             )
-                        except asyncio.CancelledError as cancellation:
-                            raise cancellation from exc
-                        except Exception as release_error:
-                            raise ExceptionGroup(
-                                "Prepared-subagent worker incompatibility and task "
-                                "release both failed.",
-                                [exc, release_error],
-                            ) from None
                         return self._handle(
                             request,
                             DispatchStatus.SUBMITTED,
@@ -1861,27 +1848,41 @@ class TaskStoreDispatcher(Dispatcher):
         worker_id: str,
         lease_authority: _DispatchLeaseAuthority,
         failure: Exception,
-    ) -> None:
-        """Make pre-admission work reclaimable without hiding a release failure."""
+        release_failure_message: str = (
+            "Queued dispatch pre-admission failure and task release both failed."
+        ),
+    ) -> bool:
+        """Make pre-admission work reclaimable without hiding a release failure.
 
-        try:
-            await self._release_claimed_task(
-                task.id,
-                worker_id,
-                lease_authority,
-            )
-        except TaskClaimLost:
-            logger.warning(
-                "dispatch task %s lost its lease while preserving a retryable failure",
-                task.id,
-            )
-        except asyncio.CancelledError as cancellation:
-            raise cancellation from failure
-        except Exception as release_error:
-            raise ExceptionGroup(
-                "Queued dispatch pre-admission failure and task release both failed.",
-                [failure, release_error],
-            ) from None
+        A release is idempotent for this claim generation, so retry once after an
+        operational failure.  Returning ``False`` records that ownership was lost;
+        callers that are requeueing can then return a reclaimed handle instead of
+        claiming that this worker released the task.
+        """
+
+        release_error: Exception | None = None
+        for _ in range(2):
+            try:
+                await self._release_claimed_task(
+                    task.id,
+                    worker_id,
+                    lease_authority,
+                )
+            except TaskClaimLost:
+                logger.warning(
+                    "dispatch task %s lost its lease while preserving a retryable failure",
+                    task.id,
+                )
+                return False
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from failure
+            except Exception as exc:
+                release_error = exc
+                continue
+            return True
+
+        assert release_error is not None
+        raise ExceptionGroup(release_failure_message, [failure, release_error]) from None
 
     async def _release_claimed_task(
         self,
