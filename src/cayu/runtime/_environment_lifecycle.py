@@ -221,6 +221,7 @@ from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._exception_detail import exception_detail, exception_detail_suffix
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
+    _authenticated_invocation_context,
     _release_invocation_command_with_cleanup_authority,
 )
 from cayu.runtime._retained_environment_end import (
@@ -4358,13 +4359,53 @@ class EnvironmentLifecycle:
                 != marker["binding_generation_id"]
                 or retained.execution_profile is None
                 or retained.execution_profile.fingerprint != execution_profile.fingerprint
-                or not retained.cleanup_ready_for_retry
             ):
                 raise SessionRunFenced("Completion cleanup has a different retained owner.")
-            # The original owner can settle without reconnecting. Await its
-            # existing owned task; never interpret marker absence alone as proof
-            # or rebuild an already-finalized binding from the old marker.
-            await self._settle_retained_environment_cleanups()
+            # A dispatched cleanup may already have captured the old context,
+            # even before it claims the owner. Let it quiesce before transferring
+            # authority, and retry only if it left this exact owner retained.
+            while (
+                settlement := retained.cleanup_settlement_task
+            ) is not None and not settlement.done():
+                outcome = await asyncio.shield(settlement)
+                if outcome.error is not None and (
+                    binding_finalize_fatal_signal(outcome.error) is not None
+                ):
+                    raise outcome.error
+                if self._active_environment_setups.get(session.id) is retained:
+                    await self._validate_completion_recovery(
+                        completion_recovery, session=session, invocation_context=invocation_context
+                    )
+            current_owner = self._active_environment_setups.get(session.id)
+            if current_owner is not None and (
+                current_owner is not retained or not retained.cleanup_ready_for_retry
+            ):
+                raise SessionRunFenced("Completion cleanup has a different retained owner.")
+            if current_owner is retained:
+                # Recovery owns a newer epoch, but the exact retained binding still
+                # owns disposal. Authenticate that handle under the recovery context
+                # before any retry checkpoints its session generation.
+                retained.invocation_context = _authenticated_invocation_context(
+                    active_profile=invocation_context.active_profile,
+                    binding=invocation_context.binding,
+                    validated_profile=execution_profile,
+                    registered_agent=registered_agent,
+                    registered_provider=invocation_context.registered_provider,
+                    registered_environment=retained.registered_environment,
+                    runtime_hooks=invocation_context.runtime_hooks,
+                    loop_policies=invocation_context.loop_policies,
+                    request_loop_policies=invocation_context.request_loop_policies,
+                    budget_policy=invocation_context.budget_policy,
+                    tool_capability_ceiling=invocation_context.tool_capability_ceiling,
+                    targeted_tool_grants=invocation_context.targeted_tool_grants,
+                    recovery_claim_id=invocation_context.recovery_claim_id,
+                    work_attempt=invocation_context.work_attempt,
+                )
+                retained.execution_profile = execution_profile
+                # The original owner can settle without reconnecting. Await its
+                # existing owned task; never interpret marker absence alone as proof
+                # or rebuild an already-finalized binding from the old marker.
+                await self._settle_retained_environment_cleanups()
             settlement = retained.cleanup_settlement_task
             if settlement is None:
                 raise RuntimeError("Retained completion cleanup remains pending.") from (
