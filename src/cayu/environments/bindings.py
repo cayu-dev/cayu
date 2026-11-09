@@ -5526,6 +5526,7 @@ async def _observe_git_workspace_revision(
         untracked = staged in {"?", "!"} and working_tree == staged
         ignored = staged == "!" and working_tree == "!"
         content_digest: str | None = None
+        worktree_mode: str | None = None
         present: bool | None = None
         should_read_worktree = status_record is not None and (
             untracked
@@ -5581,6 +5582,7 @@ async def _observe_git_workspace_revision(
                     total_paths=len(observed_paths),
                 )
             content_digest = hashlib.sha256(read.content).hexdigest()
+            worktree_mode = read.git_mode
             present = True
         elif status_record is not None and not should_read_worktree:
             present = False
@@ -5599,6 +5601,7 @@ async def _observe_git_workspace_revision(
                 content_sha256=content_digest,
                 index_object_id=index_object_id,
                 index_mode=mode,
+                worktree_mode=worktree_mode,
                 renamed_from=renamed_from,
                 present=present,
                 tracked=not untracked,
