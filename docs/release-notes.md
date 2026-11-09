@@ -1,5 +1,97 @@
 # Release notes
 
+## v0.18.0
+
+Upgrade: Stop all workers, dispatchers, and servers that open the database, take a
+backup, and run `cayu storage migrate --acknowledge-breaking 142
+--acknowledge-breaking 143 --acknowledge-breaking 144` before restarting with this
+version. Storage revision and compatibility floor advance from 139 to 144; older
+binaries must not reopen migrated stores. Server contract advances from 89 to 90;
+upgrade servers, generated HTTP clients, and custom dashboards together. Manifest
+schema remains 17. Redeploy Cloud Agents with this runtime to enable the new
+session-inspection, recovery, and knowledge-pagination capabilities.
+
+### Breaking changes
+
+- Storage revision 142 adds durable task claim generations; revision 143 records
+  recoverable completed-turn decisions; revision 144 stores invocation receipt
+  ledgers separately from checkpoint rows. Acknowledge all three when upgrading
+  from v0.17.0. Rollback requires restoring the pre-upgrade backup. Revisions 140
+  and 141 are additive and are applied by the same migration.
+- PostgreSQL revision 142 validates the task-generation constraint while holding
+  an exclusive table lock; allow maintenance time proportional to the task table.
+  PostgreSQL migration also requires backup evidence or an explicit backup waiver.
+- Server contract 90 adds evaluation reviewer identity and the
+  `awaiting_approval` execution outcome. Update clients and result consumers to
+  handle trials that stop awaiting approval without scoring an unfinished answer.
+
+### Deprecations
+
+- Fencing a claimed task mutation with only `lease_expires_at` is deprecated.
+  Custom workers calling task stores directly should pass the claim's
+  `claim_generation`; runtime workers and dispatchers already do so.
+
+### Changes
+
+- Inspect session execution ownership, lost owners, run epochs, active model
+  stages, provider operations, and session/task timing from the CLI. Read remote
+  runtime timing, environment phases, event-loop lag, sandbox usage, and Cloud
+  Agent request and infrastructure diagnostics. Runner events link to their
+  sandbox command records without exposing private execution evidence.
+- Cancel, resume, and replay tasks from the CLI, and scrub recognized credentials
+  from stored task errors with `cayu task scrub-error`. Task listings include
+  error codes. Usage inspection shows estimated costs by default.
+- Inspect and settle inbox items by session, page inbox decisions and pending
+  knowledge with sealed cursors, and read knowledge text previews alongside
+  titles. Archive kept knowledge with a reason and read archived entries through
+  authorized review scopes. Repeated Drop requests replay their recorded result
+  while preserving access checks and reviewer privacy.
+- Configure explicit sandbox reuse across compatible application agents and
+  trusted brokered sessions. Copy back changed files, batch file and search
+  operations, compress archive uploads, and forward line reads and text edits.
+  Docker coding workspaces can run setup commands, and multiprocess workers
+  support workspace copying.
+- Manage Cloud organizations and connections, call connected services from an
+  application, export and import Agent data, redeploy services, and sign in to
+  other installations. Inspect platform revisions, rollout history, runtime
+  records, release holds, and paged Compass findings and passes. Cloud commands
+  preserve server refusal reasons and show progress while waiting for sleeping
+  Agents; individual commands require corresponding Cloud server capabilities.
+- Let a trusted evaluation target approve a bounded number of its trial's pending
+  tool calls. Corpus data cannot grant approval authority, and the reviewer cannot
+  approve production sessions. Trials stopped awaiting approval retain their
+  evidence and are not scored as completed answers.
+- Reduce checkpoint decoding and rewriting, move receipt ledgers out of hot
+  checkpoint rows, batch tool-result publication, pipeline PostgreSQL reads, and
+  bound activity-page reads. Reuse provider clients across rounds and send
+  incremental input over persistent Responses WebSocket connections.
+
+### Fixes
+
+- Finish completed turns after crashes or cancellation from durable completion
+  decisions, settling their tasks and sessions without rerunning completed work.
+  Recover abandoned sessions and orphaned model work without requiring the
+  original environment, including recorded answers and background operations.
+- Fence task writes by durable claim generation, retain renewal through handler
+  disposition, deliver cancellation to running handlers, and reconcile late
+  heartbeat acknowledgements without releasing a successor's claim.
+- Preserve durable stages when parallel rounds are interrupted, settle setup and
+  checkpoint-read failures, and allow new input after interrupted pauses.
+  Failed-session recovery items can be dismissed without a registered environment.
+- Stop run-limited commands only after confirmed runner cleanup. Fence repeated
+  MicroVM owner claims behind command shutdown and preserve running commands
+  during handoff. Serialize retained cleanup and preserve cleanup ownership across
+  cancellation and publication failures.
+- Preserve targeted authority on synthesized failures, clear stale grants at
+  queued interaction handoff, restore active tool markers, and map recall anchors
+  correctly through projected model history.
+- Redact complete credentials and response-header bytes in durable diagnostics,
+  preserve non-ASCII headers and HEAD/bodyless response semantics, and recheck
+  review permissions before replaying observations.
+- Keep branches usable after rejected conditional writes, support file-to-directory
+  publication, and deduplicate shared-ancestor conflicts. Reject repeated cursors
+  instead of silently returning incomplete decision history.
+
 ## v0.17.0
 
 Upgrade: Stop older workers and servers, back up the database, and run
