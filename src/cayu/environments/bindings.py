@@ -36,6 +36,7 @@ from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
+    require_durable_nonblank,
 )
 from cayu.environments._phase_timing import observe_environment_phase
 from cayu.environments._sync_staging import (
@@ -3102,7 +3103,7 @@ class SyncBinding(WorkspaceBinding):
             if type(raw) is not list or len(raw) > self.max_files:
                 raise ValueError(f"SyncBinding recovery {field_name} must be a bounded list.")
             parsed = tuple(
-                require_durable_clean_nonblank(
+                require_durable_nonblank(
                     item,
                     f"SyncBinding recovery {field_name} path",
                 )
@@ -3123,7 +3124,7 @@ class SyncBinding(WorkspaceBinding):
         for raw_revision in raw_revisions:
             if type(raw_revision) is not dict:
                 raise ValueError("SyncBinding recovery source revision must be an object.")
-            path = require_durable_clean_nonblank(
+            path = require_durable_nonblank(
                 raw_revision.get("path"),
                 "SyncBinding recovery source path",
             )
