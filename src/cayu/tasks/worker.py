@@ -3656,46 +3656,49 @@ async def _quiesce_task_retry_handler_before_terminalization(
         raise RuntimeError("Task retry handler quiescence requires an owning task.")
     owner_cancellation: asyncio.CancelledError | None = None
     lease_maintenance_failure: BaseException | None = None
-    interrupt_at: float | None = None
+    interrupt_handle: asyncio.TimerHandle | None = None
     if cancellation is not None and not handler_task.done():
         cancellation.signal.request()
         if cancellation.interrupt_after_s is not None:
-            interrupt_at = monotonic() + cancellation.interrupt_after_s
-    while not handler_task.done():
-        try:
-            timeout = interval
-            if interrupt_at is not None:
-                remaining = interrupt_at - monotonic()
-                if remaining <= 0:
-                    # Cancel once, as the handler time limit does. A handler
-                    # that resists keeps the claim until it returns.
-                    interrupt_at = None
-                    if cancellation is not None and cancellation.may_interrupt():
-                        handler_task.cancel()
-                    continue
-                timeout = min(interval, remaining)
-            completed, _pending = await asyncio.wait((handler_task,), timeout=timeout)
-            if handler_task in completed:
-                break
-            renewed = await task_store.heartbeat(
-                task_id,
-                worker_id,
-                claim_generation=lease_authority.claim_generation,
-                extend_seconds=lease_seconds,
+
+            def interrupt_handler() -> None:
+                # Cancel once, as the handler time limit does. A handler
+                # that resists keeps the claim until it returns.
+                if not handler_task.done() and cancellation.may_interrupt():
+                    handler_task.cancel()
+
+            # A stalled renewal must not delay the handler's grace deadline.
+            interrupt_handle = asyncio.get_running_loop().call_later(
+                cancellation.interrupt_after_s, interrupt_handler
             )
-            lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
-        except asyncio.CancelledError as exc:
-            if owner_task.cancelling() <= cancellation_baseline:
+    try:
+        while not handler_task.done():
+            try:
+                completed, _pending = await asyncio.wait((handler_task,), timeout=interval)
+                if handler_task in completed:
+                    break
+                renewed = await task_store.heartbeat(
+                    task_id,
+                    worker_id,
+                    claim_generation=lease_authority.claim_generation,
+                    extend_seconds=lease_seconds,
+                )
+                lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
+            except asyncio.CancelledError as exc:
+                if owner_task.cancelling() <= cancellation_baseline:
+                    if lease_maintenance_failure is None:
+                        lease_maintenance_failure = exc
+                elif owner_cancellation is None:
+                    owner_cancellation = exc
+            except Exception as exc:
                 if lease_maintenance_failure is None:
                     lease_maintenance_failure = exc
-            elif owner_cancellation is None:
-                owner_cancellation = exc
-        except Exception as exc:
-            if lease_maintenance_failure is None:
-                lease_maintenance_failure = exc
-        except BaseException:
-            # The durable cancellation request keeps replacement disabled.
-            raise
+            except BaseException:
+                # The durable cancellation request keeps replacement disabled.
+                raise
+    finally:
+        if interrupt_handle is not None:
+            interrupt_handle.cancel()
     report: TaskRetryAttemptReport | None = None
     try:
         outcome = handler_task.result()
