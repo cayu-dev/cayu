@@ -5223,12 +5223,27 @@ async def _heartbeat_until(
             )
         ):
             return _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
-        if enforce_retry_deadline and await task_store.task_retry_deadline_elapsed(
-            task_id,
-            worker_id,
-            claim_generation=lease_authority.claim_generation,
-        ):
-            return _TaskHeartbeatOutcome.ELAPSED
+        if enforce_retry_deadline:
+            retry_deadline_inspection = asyncio.create_task(
+                task_store.task_retry_deadline_elapsed(
+                    task_id,
+                    worker_id,
+                    claim_generation=lease_authority.claim_generation,
+                )
+            )
+            try:
+                completed, _pending = await asyncio.wait(
+                    {retry_deadline_inspection},
+                    timeout=max(0.0, current_deadline() - monotonic()),
+                )
+            except asyncio.CancelledError:
+                _retain_abandoned_task_lease_operation(retry_deadline_inspection)
+                raise
+            if retry_deadline_inspection not in completed:
+                _retain_abandoned_task_lease_operation(retry_deadline_inspection)
+                raise expired_lease()
+            if retry_deadline_inspection.result():
+                return _TaskHeartbeatOutcome.ELAPSED
         return None
 
     async def reconcile_heartbeat_failure(
