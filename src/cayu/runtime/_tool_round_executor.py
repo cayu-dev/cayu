@@ -1990,17 +1990,25 @@ class ToolRoundRun:
             raise
         except SessionInterruptedByRequest as exc:
             round_owner.finish_dispatch()
-            interruption_events = [event async for event in round_owner.publish_before_interrupt()]
-            stream = self.close_after_interrupt(
-                exc,
-                messages=messages,
-                tool_calls=tool_calls,
-                tool_outcomes=tool_outcomes,
-                tool_round_identity=tool_round_identity,
-            )
-            async with aclosing(stream) as owned_stream:
-                async for event in owned_stream:
+            interruption_events = []
+            try:
+                async for event in round_owner.publish_before_interrupt():
                     interruption_events.append(event)
+                stream = self.close_after_interrupt(
+                    exc,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_outcomes=tool_outcomes,
+                    tool_round_identity=tool_round_identity,
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        interruption_events.append(event)
+            except Exception as closure_error:
+                _raise_after_interrupted_round_closure_failure(
+                    exc,
+                    closure_error=closure_error,
+                )
             for event in interruption_events:
                 yield event
             raise
@@ -2892,7 +2900,7 @@ def _cancellation_failure_cause(
 
 
 def _raise_after_interrupted_round_closure_failure(
-    interrupt: asyncio.CancelledError | BaseExceptionGroup,
+    interrupt: SessionInterruptedByRequest | asyncio.CancelledError | BaseExceptionGroup,
     *,
     closure_error: BaseException,
     restore_cancellation_requests: int = 0,
