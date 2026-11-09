@@ -62,6 +62,15 @@ global no-pager option and the fact that `core.fsmonitor` may name a hook
 command. ([Git CLI](https://git-scm.com/docs/git),
 [Git config](https://git-scm.com/docs/git-config))
 
+Commands that can write or refresh the index (`add`, `status`, and `diff`)
+also require the exact global override `-c core.hooksPath=/dev/null`. Index
+writes can invoke the `post-index-change` hook even for inspection commands;
+disabling fsmonitor alone does not suppress that hook. For example:
+
+```text
+/usr/bin/git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null status --short
+```
+
 The parser accepts only Git's separate-operand forms of `-C <path>` and
 `-c <name=value>`. Attached spellings such as `-Cpath` and `-cname=value` are
 rejected because the supported Git CLI does not recognize them. `-C` may
@@ -91,7 +100,7 @@ Arguments not listed here are denied.
 | `cat-file` | Exactly one of `-e`, `-t`, `-s`, or `-p`, followed by one bounded object expression. Options that apply filters are denied. |
 | `diff` | Both `--no-ext-diff` and `--no-textconv`; optional `--cached`, `--staged`, `--stat`, `--name-only`, `--name-status`, `--patch`, `--exit-code`, `--quiet`, or `--unified=N` for `0 <= N <= 20`; at most two bounded revisions; optional safe paths after `--`. |
 | `add` | Exactly `add -- <path>...` with at least one explicit safe path. Broad `-A`, `--all`, `-u`, interactive/patch modes, pathspec files, stdin pathspecs, and implicit staging are denied. Explicit deleted paths are supported. |
-| `commit` | The commit-only global overrides below, then exactly one `-m` or `--message` value plus `--no-verify` and `--no-gpg-sign`. No path arguments or other commit options. |
+| `commit` | The commit global overrides below, then exactly one `-m` or `--message` value plus `--no-verify` and `--no-gpg-sign`. No path arguments or other commit options. |
 
 The diff flags are not cosmetic. Upstream Git documents that
 `--no-ext-diff` prevents external diff drivers and `--no-textconv` prevents
@@ -184,9 +193,9 @@ This policy authorizes argv; it does not make Git or a repository trustworthy.
   [Git add](https://git-scm.com/docs/git-add))
 - Supported commands still read repository objects, refs, index data,
   attributes, and selected local configuration. `--no-ext-diff`,
-  `--no-textconv`, no-pager, the fsmonitor override, and the commit hook/signing
-  controls close the executable-dispatch paths covered by the matrix; they do
-  not make arbitrary repository bytes benign.
+  `--no-textconv`, no-pager, the fsmonitor override, the index-writing hook
+  suppression, and the commit hook/signing controls close the executable-dispatch
+  paths covered by the matrix; they do not make arbitrary repository bytes benign.
 - A path can change after policy evaluation. Runner root containment and OS
   isolation remain the enforcement boundary for filesystem races and symlinks.
 - Denying Git transport operations is local authorization, not network-egress

@@ -205,6 +205,9 @@ def _evaluate_subcommand(
     if invocation.subcommand == "commit":
         return _evaluate_commit(invocation, max_commit_message_bytes)
     required_configs = {_FS_MONITOR_DISABLED}
+    # Even inspection commands can write the index and invoke post-index-change.
+    if invocation.subcommand in {"add", "diff", "status"}:
+        required_configs.add("core.hooksPath=/dev/null")
     if invocation.subcommand in {"log", "show"}:
         required_configs.add(_LOG_SIGNATURE_DISABLED)
     if invocation.configs != frozenset(required_configs):

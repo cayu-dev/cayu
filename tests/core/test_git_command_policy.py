@@ -29,6 +29,7 @@ from cayu.tools import GitCommandPolicy as ToolsGitCommandPolicy
 from cayu.tools.base import ToolContext
 
 _SAFE_PREFIX = ("git", "--no-pager", "-c", "core.fsmonitor=false")
+_SAFE_INDEX_PREFIX = (*_SAFE_PREFIX, "-c", "core.hooksPath=/dev/null")
 _SAFE_INSPECTION_PREFIX = (
     *_SAFE_PREFIX,
     "-c",
@@ -130,7 +131,7 @@ def test_git_command_policy_rejects_invalid_host_configuration(
 def test_git_command_policy_allows_documented_status_shape() -> None:
     result = _evaluate(
         _policy(),
-        _request(*_SAFE_PREFIX, "status", "--short", "--branch"),
+        _request(*_SAFE_INDEX_PREFIX, "status", "--short", "--branch"),
     )
 
     assert result.decision is CommandPolicyDecision.ALLOW
@@ -140,8 +141,8 @@ def test_git_command_policy_allows_documented_status_shape() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        (*_SAFE_PREFIX, "status", "--short", "--", "nested/file.py"),
-        (*_SAFE_PREFIX, "status", "--", "-leading-dash"),
+        (*_SAFE_INDEX_PREFIX, "status", "--short", "--", "nested/file.py"),
+        (*_SAFE_INDEX_PREFIX, "status", "--", "-leading-dash"),
         (*_SAFE_PREFIX, "ls-files"),
         (*_SAFE_PREFIX, "ls-files", "--cached", "--modified", "--deleted"),
         (*_SAFE_PREFIX, "ls-files", "--others", "--exclude-standard", "--", "src"),
@@ -179,9 +180,9 @@ def test_git_command_policy_allows_documented_status_shape() -> None:
         ),
         (*_SAFE_PREFIX, "cat-file", "-t", "HEAD"),
         (*_SAFE_PREFIX, "cat-file", "-p", "HEAD:src/app.py"),
-        (*_SAFE_PREFIX, "diff", "--no-ext-diff", "--no-textconv"),
+        (*_SAFE_INDEX_PREFIX, "diff", "--no-ext-diff", "--no-textconv"),
         (
-            *_SAFE_PREFIX,
+            *_SAFE_INDEX_PREFIX,
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -190,9 +191,9 @@ def test_git_command_policy_allows_documented_status_shape() -> None:
             "--",
             "src/app.py",
         ),
-        (*_SAFE_PREFIX, "add", "--", "file.txt"),
-        (*_SAFE_PREFIX, "add", "--", "nested/file.py", "name with spaces.txt"),
-        (*_SAFE_PREFIX, "add", "--", "-leading-dash"),
+        (*_SAFE_INDEX_PREFIX, "add", "--", "file.txt"),
+        (*_SAFE_INDEX_PREFIX, "add", "--", "nested/file.py", "name with spaces.txt"),
+        (*_SAFE_INDEX_PREFIX, "add", "--", "-leading-dash"),
         (
             *_SAFE_COMMIT_PREFIX,
             "commit",
@@ -212,6 +213,23 @@ def test_git_command_policy_allows_only_documented_local_workflow_matrix(
     assert result.reason is None
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("add", "--", "file.txt"),
+        ("status", "--short"),
+        ("diff", "--no-ext-diff", "--no-textconv"),
+    ],
+)
+def test_git_command_policy_requires_hook_suppression_for_index_writers(
+    args: tuple[str, ...],
+) -> None:
+    result = _evaluate(_policy(), _request(*_SAFE_PREFIX, *args))
+
+    assert result.decision is CommandPolicyDecision.DENY
+    assert result.reason == "Git global option is not allowed."
+
+
 def test_git_command_policy_preserves_general_process_denial() -> None:
     result = _evaluate(_policy(), _request("/usr/bin/git", "status"))
 
@@ -228,7 +246,7 @@ def test_git_command_policy_preserves_general_process_approval_requirement() -> 
         allowed_repositories={"/workspace/repo"},
     )
 
-    result = _evaluate(policy, _request(*_SAFE_PREFIX, "status"))
+    result = _evaluate(policy, _request(*_SAFE_INDEX_PREFIX, "status"))
 
     assert result.decision is CommandPolicyDecision.REQUIRE_COMMAND_APPROVAL
     assert result.reason == "Executable requires command approval by the process policy."
@@ -271,7 +289,7 @@ def test_git_command_policy_denies_shell_even_when_general_policy_allows_it() ->
         ("git", "--no-pager", "--bare", "status"),
         ("git", "--no-pager", "--config-env=x=y", "status"),
         ("git", "--no-pager", "-C"),
-        ("git", "-C/workspace/repo", *_SAFE_PREFIX[1:], "status"),
+        ("git", "-C/workspace/repo", *_SAFE_INDEX_PREFIX[1:], "status"),
         ("git", "--no-pager", "-ccore.fsmonitor=false", "status"),
         (*_SAFE_PREFIX, "--", "status"),
     ],
@@ -295,7 +313,7 @@ def test_git_command_policy_rejects_unsupported_or_incomplete_global_options(
         (*_SAFE_PREFIX, "push"),
         (*_SAFE_PREFIX, "credential", "fill"),
         (*_SAFE_PREFIX, "reset", "--hard"),
-        (*_SAFE_PREFIX, "status", "--ignored"),
+        (*_SAFE_INDEX_PREFIX, "status", "--ignored"),
     ],
 )
 def test_git_command_policy_rejects_unsupported_subcommands_and_options(
@@ -373,7 +391,7 @@ def test_git_command_policy_denies_remote_credential_destructive_and_helper_comm
     ],
 )
 def test_git_command_policy_rejects_unsafe_or_ambiguous_paths(path: str) -> None:
-    result = _evaluate(_policy(), _request(*_SAFE_PREFIX, "add", "--", path))
+    result = _evaluate(_policy(), _request(*_SAFE_INDEX_PREFIX, "add", "--", path))
 
     assert result.decision is CommandPolicyDecision.DENY
     assert result.reason == "Git path is not allowed by the Git policy."
@@ -381,12 +399,12 @@ def test_git_command_policy_rejects_unsafe_or_ambiguous_paths(path: str) -> None
 
 def test_git_command_policy_empty_path_is_rejected_by_process_command_shape() -> None:
     with pytest.raises(ValueError, match="argv entries must be non-empty"):
-        _request(*_SAFE_PREFIX, "add", "--", "")
+        _request(*_SAFE_INDEX_PREFIX, "add", "--", "")
 
 
 def test_git_command_policy_nul_path_is_rejected_by_command_boundary() -> None:
     with pytest.raises(ValueError, match="NUL"):
-        _request(*_SAFE_PREFIX, "add", "--", "nul\0path")
+        _request(*_SAFE_INDEX_PREFIX, "add", "--", "nul\0path")
 
 
 def test_command_request_validation_hides_secret_bearing_command_input() -> None:
@@ -486,7 +504,7 @@ def test_command_request_validation_preserves_safe_error_structure() -> None:
 def test_git_command_policy_bounds_number_of_explicit_paths() -> None:
     result = _evaluate(
         _policy(),
-        _request(*_SAFE_PREFIX, "add", "--", *(f"file-{index}" for index in range(257))),
+        _request(*_SAFE_INDEX_PREFIX, "add", "--", *(f"file-{index}" for index in range(257))),
     )
 
     assert result.decision is CommandPolicyDecision.DENY
@@ -496,18 +514,18 @@ def test_git_command_policy_bounds_number_of_explicit_paths() -> None:
 @pytest.mark.parametrize(
     "argv",
     [
-        (*_SAFE_PREFIX, "add"),
-        (*_SAFE_PREFIX, "add", "file.py"),
-        (*_SAFE_PREFIX, "add", "--all"),
-        (*_SAFE_PREFIX, "add", "-A"),
-        (*_SAFE_PREFIX, "add", "--update"),
-        (*_SAFE_PREFIX, "add", "--pathspec-from-file=paths"),
-        (*_SAFE_PREFIX, "add", "--pathspec-file-nul"),
-        (*_SAFE_PREFIX, "diff", "--no-ext-diff"),
-        (*_SAFE_PREFIX, "diff", "--no-textconv"),
-        (*_SAFE_PREFIX, "diff", "--ext-diff", "--no-textconv"),
-        (*_SAFE_PREFIX, "diff", "--no-ext-diff", "--textconv"),
-        (*_SAFE_PREFIX, "status", "--ignored"),
+        (*_SAFE_INDEX_PREFIX, "add"),
+        (*_SAFE_INDEX_PREFIX, "add", "file.py"),
+        (*_SAFE_INDEX_PREFIX, "add", "--all"),
+        (*_SAFE_INDEX_PREFIX, "add", "-A"),
+        (*_SAFE_INDEX_PREFIX, "add", "--update"),
+        (*_SAFE_INDEX_PREFIX, "add", "--pathspec-from-file=paths"),
+        (*_SAFE_INDEX_PREFIX, "add", "--pathspec-file-nul"),
+        (*_SAFE_INDEX_PREFIX, "diff", "--no-ext-diff"),
+        (*_SAFE_INDEX_PREFIX, "diff", "--no-textconv"),
+        (*_SAFE_INDEX_PREFIX, "diff", "--ext-diff", "--no-textconv"),
+        (*_SAFE_INDEX_PREFIX, "diff", "--no-ext-diff", "--textconv"),
+        (*_SAFE_INDEX_PREFIX, "status", "--ignored"),
         (*_SAFE_INSPECTION_PREFIX, "log", "--oneline", "--max-count=1001"),
         (*_SAFE_INSPECTION_PREFIX, "log", "--oneline", "-p"),
         (*_SAFE_INSPECTION_PREFIX, "show", "HEAD"),
@@ -645,6 +663,7 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
             "editor",
             "fsmonitor",
             "hook",
+            "index-hook",
             "pager",
             "remote",
             "signing",
@@ -652,9 +671,10 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
         )
     }
     scripts = {name: _marker_script(tmp_path, name, marker) for name, marker in markers.items()}
-    hook = repository / ".git" / "hooks" / "post-commit"
-    hook.write_text(scripts["hook"].read_text(encoding="utf-8"), encoding="utf-8")
-    hook.chmod(0o755)
+    for name, hook_name in (("hook", "post-commit"), ("index-hook", "post-index-change")):
+        hook = repository / ".git" / "hooks" / hook_name
+        hook.write_text(scripts[name].read_text(encoding="utf-8"), encoding="utf-8")
+        hook.chmod(0o755)
     _git(git, repository, "config", "alias.sneaky", f"!{scripts['alias']}")
     _git(
         git,
@@ -679,6 +699,7 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
     (repository / "new.txt").write_text("new content\n", encoding="utf-8")
 
     safe = (git, "--no-pager", "-c", "core.fsmonitor=false")
+    safe_index = (*safe, "-c", "core.hooksPath=/dev/null")
     safe_inspection = (*safe, "-c", "log.showSignature=false")
     safe_commit = (
         *safe,
@@ -689,22 +710,22 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
     )
     commands = [
         (*safe, "rev-parse", "--show-toplevel"),
-        (*safe, "status", "--porcelain=v1"),
+        (*safe_index, "status", "--porcelain=v1"),
         (*safe, "ls-files", "--cached"),
         (
-            *safe,
+            *safe_index,
             "diff",
             "--no-ext-diff",
             "--no-textconv",
             "--",
             "tracked.txt",
         ),
-        (*safe, "add", "--", ":(glob)*.filtered"),
+        (*safe_index, "add", "--", ":(glob)*.filtered"),
         (*safe, "sneaky"),
         (*safe, "credential", "fill"),
-        (*safe, "add", "--", "new.txt", "deleted.txt"),
+        (*safe_index, "add", "--", "new.txt", "deleted.txt"),
         (
-            *safe,
+            *safe_index,
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -722,7 +743,7 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
             "-m",
             "add new file",
         ),
-        (*safe, "status", "--short"),
+        (*safe_index, "status", "--short"),
         (*safe_inspection, "log", "--oneline", "--max-count=2", "HEAD"),
         (
             *safe_inspection,
@@ -865,7 +886,7 @@ def test_git_command_policy_completes_local_workflow_and_blocks_seeded_bypasses(
     denial_tool = ExecCommandTool(policy=policy)
     denial_ctx = ToolContext(session_id="git_denial_state_proof", runner=runner)
     denied_commands = [
-        (*safe, "add", "--", ":(glob)*.filtered"),
+        (*safe_index, "add", "--", ":(glob)*.filtered"),
         (*safe, "sneaky"),
         (*safe, "credential", "fill"),
         (*safe, "push", "origin", "main"),
@@ -924,7 +945,7 @@ async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
 @pytest.mark.parametrize(
     ("argv", "decision"),
     [
-        ((*_SAFE_PREFIX[:1], "-C", "nested", *_SAFE_PREFIX[1:], "status"), "allow"),
+        ((*_SAFE_PREFIX[:1], "-C", "nested", *_SAFE_INDEX_PREFIX[1:], "status"), "allow"),
         (
             (
                 *_SAFE_PREFIX[:1],
@@ -932,13 +953,13 @@ async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
                 "nested",
                 "-C",
                 "child",
-                *_SAFE_PREFIX[1:],
+                *_SAFE_INDEX_PREFIX[1:],
                 "status",
             ),
             "allow",
         ),
-        ((*_SAFE_PREFIX[:1], "-C", "../escape", *_SAFE_PREFIX[1:], "status"), "deny"),
-        ((*_SAFE_PREFIX[:1], "-C", "nested/../other", *_SAFE_PREFIX[1:], "status"), "deny"),
+        ((*_SAFE_PREFIX[:1], "-C", "../escape", *_SAFE_INDEX_PREFIX[1:], "status"), "deny"),
+        ((*_SAFE_PREFIX[:1], "-C", "nested/../other", *_SAFE_INDEX_PREFIX[1:], "status"), "deny"),
     ],
 )
 def test_git_command_policy_processes_repeated_c_structurally(
@@ -956,7 +977,7 @@ def test_git_command_policy_processes_repeated_c_structurally(
     "argv",
     [
         ("git", "--no-pager", "-ccore.fsmonitor=false", "status"),
-        ("git", "-C/workspace/repo/nested", *_SAFE_PREFIX[1:], "status"),
+        ("git", "-C/workspace/repo/nested", *_SAFE_INDEX_PREFIX[1:], "status"),
         (*_SAFE_PREFIX, "--", "status"),
     ],
 )
@@ -980,7 +1001,7 @@ def test_git_command_policy_requires_signature_suppression_for_object_inspection
 
 
 def test_git_command_policy_uses_canonical_cwd_not_requested_spelling() -> None:
-    request = _request(*_SAFE_PREFIX, "status").model_copy(
+    request = _request(*_SAFE_INDEX_PREFIX, "status").model_copy(
         update={"cwd": "../../outside", "canonical_cwd": "/workspace/repo"}
     )
 
@@ -1007,7 +1028,7 @@ def test_git_command_policy_tightens_general_environment_and_stdin_controls(
 ) -> None:
     result = _evaluate(
         _policy(),
-        _request(*_SAFE_PREFIX, "status", env=env, stdin=stdin),
+        _request(*_SAFE_INDEX_PREFIX, "status", env=env, stdin=stdin),
     )
 
     assert result.decision is CommandPolicyDecision.DENY
@@ -1051,7 +1072,7 @@ def test_git_command_policy_rejects_git_helper_config_and_proxy_environment(
 
     result = _evaluate(
         policy,
-        _request(*_SAFE_PREFIX, "status", env={name: secret}),
+        _request(*_SAFE_INDEX_PREFIX, "status", env={name: secret}),
     )
 
     assert result.decision is CommandPolicyDecision.DENY
