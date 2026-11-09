@@ -1601,6 +1601,28 @@ def test_build_openai_payload_omits_inert_hosted_search_for_zero_candidates() ->
     assert "parallel_tool_calls" not in payload
 
 
+@pytest.mark.parametrize("name_fields", [{}, {"name": []}, {"name": {}}])
+def test_build_openai_payload_rejects_malformed_hosted_direct_tool_names(
+    name_fields: dict[str, Any],
+) -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Use the direct tool surface.")],
+        tools=[
+            search_tools_spec(),
+            call_tool_spec(),
+            {**name_fields, "description": "Bad name.", "input_schema": {"type": "object"}},
+        ],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
+            generation_id=f"sha256:{'d' * 64}",
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"Tool name must be a string\."):
+        build_openai_payload(request)
+
+
 def test_hosted_tool_search_projection_requires_branch_generation_identity() -> None:
     with pytest.raises(ValidationError, match="branch-local generation identity"):
         ToolDiscoveryProjectionRequest(
@@ -1631,7 +1653,10 @@ def test_hosted_tool_search_projection_requires_exact_replay_loaded_candidates()
         )
 
 
-def test_build_openai_payload_accepts_later_calls_to_a_retained_hosted_tool() -> None:
+@pytest.mark.parametrize("promote_to_direct", [False, True])
+def test_build_openai_payload_accepts_later_calls_to_a_retained_hosted_tool(
+    promote_to_direct: bool,
+) -> None:
     schema = {"type": "object", "properties": {}}
     candidate = {
         "name": "remember_knowledge",
@@ -1695,12 +1720,12 @@ def test_build_openai_payload_accepts_later_calls_to_a_retained_hosted_tool() ->
             Message.text("user", "Use it again."),
             later_call,
         ],
-        tools=[search_tools_spec(), call_tool_spec()],
+        tools=[search_tools_spec(), call_tool_spec(), *([candidate] if promote_to_direct else [])],
         tool_discovery_projection=ToolDiscoveryProjectionRequest(
             protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
             generation_id=f"sha256:{'d' * 64}",
-            candidate_tools=(candidate,),
-            loaded_tools=(candidate,),
+            candidate_tools=() if promote_to_direct else (candidate,),
+            loaded_tools=() if promote_to_direct else (candidate,),
         ),
     )
 
@@ -2078,7 +2103,10 @@ def test_build_openai_payload_rejects_orphan_hosted_search_replay() -> None:
         build_openai_payload(request)
 
 
-def test_build_openai_payload_rejects_altered_hosted_search_replay() -> None:
+@pytest.mark.parametrize("promote_to_direct", [False, True])
+def test_build_openai_payload_rejects_altered_hosted_search_replay(
+    promote_to_direct: bool,
+) -> None:
     schema = {"type": "object", "properties": {}}
     candidate = {
         "name": "remember_knowledge",
@@ -2122,11 +2150,11 @@ def test_build_openai_payload_rejects_altered_hosted_search_replay() -> None:
     request = ModelRequest(
         model="gpt-test",
         messages=[Message.text("user", "Save this lesson."), assistant],
-        tools=[search_tools_spec(), call_tool_spec()],
+        tools=[search_tools_spec(), call_tool_spec(), *([candidate] if promote_to_direct else [])],
         tool_discovery_projection=ToolDiscoveryProjectionRequest(
             protocol=OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL,
             generation_id=f"sha256:{'d' * 64}",
-            candidate_tools=(candidate,),
+            candidate_tools=() if promote_to_direct else (candidate,),
         ),
     )
 

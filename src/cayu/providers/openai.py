@@ -1958,6 +1958,7 @@ def build_openai_payload(
     _validate_tool_search_replay(
         request.messages,
         request.tool_discovery_projection,
+        direct_tools=request.tools,
     )
     direct_tool_names = {name for tool in request.tools if type(name := tool.get("name")) is str}
     if request.targeted_tool_projection is not None and any(
@@ -7031,6 +7032,8 @@ def _validate_targeted_tool_projection_marker(
 def _validate_tool_search_replay(
     messages: list[Message],
     projection: ToolDiscoveryProjectionRequest | None,
+    *,
+    direct_tools: Iterable[Mapping[str, Any]],
 ) -> None:
     """Require exact provider call evidence and one matching result per native search."""
 
@@ -7039,6 +7042,9 @@ def _validate_tool_search_replay(
     if projection.protocol == OPENAI_HOSTED_TOOL_SEARCH_PROTOCOL:
         candidates_by_name = {
             cast("str", tool["name"]): tool for tool in projection.candidate_tools
+        }
+        direct_tools_by_name = {
+            name: tool for tool in direct_tools if type(name := tool.get("name")) is str
         }
         replay_loaded_by_name: dict[str, dict[str, Any]] = {}
         for message in messages:
@@ -7085,7 +7091,12 @@ def _validate_tool_search_replay(
                 )
                 for loaded_tool in loaded_tools:
                     name = cast("str", loaded_tool["name"])
-                    if candidates_by_name.get(name) != loaded_tool:
+                    # Exposure promotion withdraws a deferred candidate, not its
+                    # history. Require the same exact definition on either surface.
+                    if (
+                        candidates_by_name.get(name) != loaded_tool
+                        and direct_tools_by_name.get(name) != loaded_tool
+                    ):
                         raise OpenAIProtocolError(
                             "Hosted Tool Search replay loaded a function outside the current "
                             "candidate projection.",
