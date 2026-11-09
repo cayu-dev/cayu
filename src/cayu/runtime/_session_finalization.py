@@ -3035,7 +3035,8 @@ class SessionFinalization:
                 ),
                 execution_profile,
             )
-            yield await self._event_writer.emit(model_error)
+            persisted_model_error = await self._event_writer.persist_exact_replay(model_error)
+            yield (await self._event_writer.fan_out_persisted([persisted_model_error]))[0]
 
         if task_id is not None:
             task = await self.fail_task(
@@ -3085,69 +3086,96 @@ class SessionFinalization:
             resolution_id,
             "interaction_failed",
         )
-        interaction_failed_records = await self.session_store.query_events(
-            EventQuery(session_id=session.id, event_id=interaction_failed_id, limit=2)
-        )
-        transitioned_session = await self.session_store.load(session.id)
-        if transitioned_session is None:
-            raise KeyError(f"Session not found: {session.id}")
-        if interaction_failed_records:
-            if len(interaction_failed_records) != 1:
+
+        async def load_committed_interaction_failure() -> Session | None:
+            records = await self.session_store.query_events(
+                EventQuery(session_id=session.id, event_id=interaction_failed_id, limit=2)
+            )
+            if not records:
+                return None
+            if len(records) != 1:
                 raise ProviderOperationEvidenceError(
                     "Provider-operation failure has duplicate interaction evidence."
                 )
             validate_provider_operation_resolution_outcome_event(
-                interaction_failed_records[0].event,
+                records[0].event,
                 resolution_event=resolution_event,
                 outcome="interaction_failed",
                 expected_execution_profile_fingerprint=execution_profile.fingerprint,
             )
-            if transitioned_session.status is not SessionStatus.FAILED:
+            committed_session = await self.session_store.load(session.id)
+            if committed_session is None:
+                raise KeyError(f"Session not found: {session.id}")
+            if committed_session.status is not SessionStatus.FAILED:
                 raise ProviderOperationEvidenceError(
                     "Provider-operation interaction failure conflicts with session status."
                 )
-        else:
-            interaction_id = await self.activate_latest_open_interaction(session.id)
-            if interaction_id is None:
-                raise RuntimeError("Provider-operation failure has no open durable interaction.")
-            observed_at = await self.failure_interaction_observed_at(
-                transitioned_session,
-                observed_at=resolution_event.timestamp,
-            )
-            # Failure does not dispatch new work. Preserve the actual released
-            # epoch instead of treating a reconstructed context as a live owner.
-            stored_profile = active_invocation_execution_profile_from_checkpoint(
-                await self.session_store.load_checkpoint(session.id)
-            )
-            released_authority = (
-                stored_profile is not None
-                and stored_profile.profile == execution_profile
-                and stored_profile.interaction_id == resolution_event.interaction_id
-                and active_invocation_execution_profile_is_released(
-                    stored_profile,
-                    session_id=session.id,
-                    run_epoch=transitioned_session.run_epoch,
+            return committed_session
+
+        transitioned_session = await load_committed_interaction_failure()
+        if transitioned_session is None:
+            transitioned_session = await self.session_store.load(session.id)
+            if transitioned_session is None:
+                raise KeyError(f"Session not found: {session.id}")
+            try:
+                interaction_id = await self.activate_latest_open_interaction(session.id)
+                if interaction_id is None:
+                    raise RuntimeError(
+                        "Provider-operation failure has no open durable interaction."
+                    )
+                observed_at = await self.failure_interaction_observed_at(
+                    transitioned_session,
+                    observed_at=resolution_event.timestamp,
                 )
-            )
-            (
-                transitioned_session,
-                interaction_failed_event,
-                _,
-            ) = await self.publish_sibling_interaction_transition(
-                session=transitioned_session,
-                invocation_context=None if released_authority else invocation_context,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                to_status=SessionStatus.FAILED,
-                from_statuses={SessionStatus.INTERRUPTED},
-                observed_at=observed_at,
-                event_id=interaction_failed_id,
-                execution_profile=execution_profile,
-                allow_released_invocation_authority=released_authority,
-            )
-            if interaction_failed_event is not None:
-                yield interaction_failed_event
+                # Failure does not dispatch new work. Preserve the actual released
+                # epoch instead of treating a reconstructed context as a live owner.
+                stored_profile = active_invocation_execution_profile_from_checkpoint(
+                    await self.session_store.load_checkpoint(session.id)
+                )
+                released_authority = (
+                    stored_profile is not None
+                    and stored_profile.profile == execution_profile
+                    and stored_profile.interaction_id == resolution_event.interaction_id
+                    and active_invocation_execution_profile_is_released(
+                        stored_profile,
+                        session_id=session.id,
+                        run_epoch=transitioned_session.run_epoch,
+                    )
+                )
+                (
+                    transitioned_session,
+                    interaction_failed_event,
+                    _,
+                ) = await self.publish_sibling_interaction_transition(
+                    session=transitioned_session,
+                    invocation_context=None if released_authority else invocation_context,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    to_status=SessionStatus.FAILED,
+                    from_statuses={SessionStatus.INTERRUPTED},
+                    observed_at=observed_at,
+                    event_id=interaction_failed_id,
+                    execution_profile=execution_profile,
+                    allow_released_invocation_authority=released_authority,
+                )
+            except Exception:
+                # A peer may have committed after our absence read, including
+                # before activation or while publishing the transition.
+                committed_session = await load_committed_interaction_failure()
+                if committed_session is None:
+                    raise
+                transitioned_session = committed_session
+            else:
+                if interaction_failed_event is not None:
+                    yield interaction_failed_event
+                else:
+                    committed_session = await load_committed_interaction_failure()
+                    if committed_session is None:
+                        raise ProviderOperationEvidenceError(
+                            "Provider-operation failure has no durable interaction outcome."
+                        )
+                    transitioned_session = committed_session
 
         session_failed_id = provider_operation_resolution_outcome_event_id(
             resolution_id,
