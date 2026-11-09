@@ -200,8 +200,15 @@ class RecoveryAdmission:
                     active_profile=current_profile,
                 )
         cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
+        stream_quiescent = stream is None
         if stream is not None:
-            cleanup_steps.append(("nested stream close", stream.aclose))
+
+            async def close_stream() -> None:
+                nonlocal stream_quiescent
+                await stream.aclose()
+                stream_quiescent = True
+
+            cleanup_steps.append(("nested stream close", close_stream))
         if authoritative_failure is not None:
             cleanup_steps.append(
                 (
@@ -235,16 +242,25 @@ class RecoveryAdmission:
                 )
             )
         if release_run_fence:
-            cleanup_steps.append(
-                (
-                    "run fence release",
-                    lambda: self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                        session_id=session_id,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    ),
+
+            async def release_quiescent_fence() -> None:
+                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                    session_id=session_id,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
                 )
-            )
+
+            async def release_after_stream() -> None:
+                if not stream_quiescent and invocation_context is not None:
+                    self._recovery_ownership.defer_cleanup_until_quiescent(
+                        invocation_context=invocation_context,
+                        operation="retained continuation run fence release",
+                        cleanup=release_quiescent_fence,
+                    )
+                    return
+                await release_quiescent_fence()
+
+            cleanup_steps.append(("run fence release", release_after_stream))
         await self._recovery_ownership.run_cleanup_steps(
             authoritative_failure=authoritative_failure,
             steps=tuple(cleanup_steps),

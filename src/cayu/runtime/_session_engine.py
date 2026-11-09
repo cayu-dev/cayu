@@ -6646,6 +6646,7 @@ class SessionEngine:
             )
 
         owed_completion: AsyncGenerator[Event, None] | None = None
+        local_pause_ledger: RunLedger | None = None
 
         if run_ledger is not None:
             # A restart never repeats environment finalization; recovery finishes it instead.
@@ -8985,15 +8986,27 @@ class SessionEngine:
                 async for event in completion_stream:
                     yield event
         except ToolApprovalRequired as exc:
-            async with contextlib.aclosing(
-                self._session_outcomes.pause_for_tool_approval(
-                    outcome_context(),
-                    exc=exc,
-                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            outcome_stream = self._session_outcomes.pause_for_tool_approval(
+                outcome_context(),
+                exc=exc,
+                materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            )
+            if run_ledger is None:
+                local_pause_ledger = RunLedger(
+                    session_id=outcome_state.session.id,
+                    run_epoch=invocation_context.binding.run_epoch,
+                    invocation_context=invocation_context,
                 )
-            ) as outcome_stream:
-                async for event in outcome_stream:
-                    yield event
+                local_pause_ledger.local_release.append(
+                    lambda: _clear_session_interaction_settlement(outcome_state.session.id)
+                )
+                run_ledger = local_pause_ledger
+            run_ledger.decided(lambda: drain_event_stream(outcome_stream))
+            # Settlement owns this generator after a consumer closes at a yield.
+            # Do not aclose it while a retained publisher may still be running.
+            async for event in outcome_stream:
+                yield event
+            run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
         except SessionWakeScheduled as exc:
             async with contextlib.aclosing(
                 self._session_outcomes.pause_for_wake(
@@ -9650,95 +9663,99 @@ class SessionEngine:
                 run_ledger.settlement_finishes_remainder(finalizer_failure)
             )
             release_run_fence_on_exit = release_run_fence_on_exit and not settlement_owed
-            if finalizer_failure is not None and (
-                isinstance(finalizer_failure, asyncio.CancelledError)
-                or workspace_observation_pending_cancellation_requests(finalizer_failure)
-            ):
+            try:
+                if finalizer_failure is not None and (
+                    isinstance(finalizer_failure, asyncio.CancelledError)
+                    or workspace_observation_pending_cancellation_requests(finalizer_failure)
+                ):
 
-                async def discard_interrupt_signal() -> None:
-                    self._session_control.discard_interrupt_signal(outcome_state.session.id)
+                    async def discard_interrupt_signal() -> None:
+                        self._session_control.discard_interrupt_signal(outcome_state.session.id)
 
-                finalizer_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
-                    (
-                        "Session interrupt-signal cleanup",
-                        discard_interrupt_signal,
-                    ),
-                ]
-                if not settlement_owed:
-                    finalizer_steps.insert(
-                        0,
+                    finalizer_steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
                         (
-                            "Session environment setup abort",
-                            lambda: self._environment_lifecycle.abort_environment_setup(
+                            "Session interrupt-signal cleanup",
+                            discard_interrupt_signal,
+                        ),
+                    ]
+                    if not settlement_owed:
+                        finalizer_steps.insert(
+                            0,
+                            (
+                                "Session environment setup abort",
+                                lambda: self._environment_lifecycle.abort_environment_setup(
+                                    session_id=outcome_state.session.id,
+                                    original_error=finalizer_failure,
+                                    execution_profile=execution_profile,
+                                    invocation_context=invocation_context,
+                                ),
+                            ),
+                        )
+                    if release_run_fence_on_exit:
+                        finalizer_steps.append(
+                            (
+                                "Session environment run-fence release",
+                                lambda: (
+                                    self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                                        session_id=outcome_state.session.id,
+                                        execution_profile=execution_profile,
+                                        invocation_context=invocation_context,
+                                    )
+                                ),
+                            )
+                        )
+                    propagated_finalizer_failure = await self._interruption_cleanup.settle_session_finalizer_preserving_interruption_failure(
+                        authoritative_failure=finalizer_failure,
+                        steps=tuple(finalizer_steps),
+                    )
+                    if release_run_fence_on_exit:
+                        # The owned child receives a copied context. Retire the
+                        # caller's corresponding token after that child settles.
+                        _deactivate_session_run_fence(outcome_state.session.id)
+                    try:
+                        if current_task is not None:
+                            self._session_control.unregister_active_task(
+                                outcome_state.session.id,
+                                current_task,
+                            )
+                    finally:
+                        if not settlement_owed:
+                            _clear_session_interaction_settlement(outcome_state.session.id)
+                            _deactivate_session_interaction(outcome_state.session.id)
+                    if propagated_finalizer_failure is not finalizer_failure:
+                        raise propagated_finalizer_failure from None
+                else:
+                    try:
+                        if not settlement_owed:
+                            await self._environment_lifecycle.abort_environment_setup(
                                 session_id=outcome_state.session.id,
                                 original_error=finalizer_failure,
                                 execution_profile=execution_profile,
                                 invocation_context=invocation_context,
-                            ),
-                        ),
-                    )
-                if release_run_fence_on_exit:
-                    finalizer_steps.append(
-                        (
-                            "Session environment run-fence release",
-                            lambda: (
-                                self._environment_lifecycle.release_run_fence_after_environment_cleanup(
+                            )
+                    finally:
+                        self._session_control.discard_interrupt_signal(outcome_state.session.id)
+                        try:
+                            if release_run_fence_on_exit:
+                                await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
                                     session_id=outcome_state.session.id,
                                     execution_profile=execution_profile,
                                     invocation_context=invocation_context,
                                 )
-                            ),
-                        )
-                    )
-                propagated_finalizer_failure = await self._interruption_cleanup.settle_session_finalizer_preserving_interruption_failure(
-                    authoritative_failure=finalizer_failure,
-                    steps=tuple(finalizer_steps),
-                )
-                if release_run_fence_on_exit:
-                    # The owned child receives a copied context. Retire the
-                    # caller's corresponding token after that child settles.
-                    _deactivate_session_run_fence(outcome_state.session.id)
-                try:
-                    if current_task is not None:
-                        self._session_control.unregister_active_task(
-                            outcome_state.session.id,
-                            current_task,
-                        )
-                finally:
-                    if not settlement_owed:
-                        _clear_session_interaction_settlement(outcome_state.session.id)
-                        _deactivate_session_interaction(outcome_state.session.id)
-                if propagated_finalizer_failure is not finalizer_failure:
-                    raise propagated_finalizer_failure from None
-            else:
-                try:
-                    if not settlement_owed:
-                        await self._environment_lifecycle.abort_environment_setup(
-                            session_id=outcome_state.session.id,
-                            original_error=finalizer_failure,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
-                        )
-                finally:
-                    self._session_control.discard_interrupt_signal(outcome_state.session.id)
-                    try:
-                        if release_run_fence_on_exit:
-                            await self._environment_lifecycle.release_run_fence_after_environment_cleanup(
-                                session_id=outcome_state.session.id,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                            )
-                    finally:
-                        try:
-                            if current_task is not None:
-                                self._session_control.unregister_active_task(
-                                    outcome_state.session.id,
-                                    current_task,
-                                )
                         finally:
-                            if not settlement_owed:
-                                _clear_session_interaction_settlement(outcome_state.session.id)
-                                _deactivate_session_interaction(outcome_state.session.id)
+                            try:
+                                if current_task is not None:
+                                    self._session_control.unregister_active_task(
+                                        outcome_state.session.id,
+                                        current_task,
+                                    )
+                            finally:
+                                if not settlement_owed:
+                                    _clear_session_interaction_settlement(outcome_state.session.id)
+                                    _deactivate_session_interaction(outcome_state.session.id)
+            finally:
+                if local_pause_ledger is not None:
+                    await self._run_settlement.finish(local_pause_ledger, finalizer_failure)
 
     async def _stop_session_for_model_step_limit(
         self,

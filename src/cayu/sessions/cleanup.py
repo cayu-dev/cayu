@@ -325,6 +325,7 @@ class RecoveryCleanupSupervisor:
         self._active_tasks: set[asyncio.Task[BaseException | None]] = set()
         self._retained_tasks: dict[asyncio.Task[BaseException | None], _RetainedCleanup] = {}
         self._continuation_tasks: set[asyncio.Task[None]] = set()
+        self._quiescence_waiters: set[asyncio.Task[None]] = set()
         self._timed_out_steps = 0
         self._completed_after_timeout = 0
         self._failed_after_timeout = 0
@@ -469,10 +470,13 @@ class RecoveryCleanupSupervisor:
                 exclude=current,
             ):
                 pass
+            self._quiescence_waiters.discard(current)
             await self._run_background_continuation((RecoveryCleanupStep(operation, cleanup),))
 
         context = copy_context()
         task = asyncio.create_task(finish(), context=context, name=operation)
+        self._quiescence_waiters.add(task)
+        task.add_done_callback(self._quiescence_waiters.discard)
         self._continuation_tasks.add(task)
         self._observe_task(task, operation, context)
         self._task_observations[task] = self._task_observations[task].model_copy(
@@ -512,6 +516,7 @@ class RecoveryCleanupSupervisor:
                 | self._retained_tasks.keys()
                 | self._continuation_tasks
                 if task is not exclude
+                and (exclude is None or task not in self._quiescence_waiters)
                 and (
                     owner is None
                     or (

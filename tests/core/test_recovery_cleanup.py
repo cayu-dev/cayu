@@ -1285,3 +1285,22 @@ def test_nested_cleanup_owner_reactivation_uses_exact_innermost_run():
         with parent.activate():
             assert _current_recovery_cleanup_identity() == ("parent", "one", 1)
         assert _current_recovery_cleanup_identity() == ("child", "two", 2)
+
+
+def test_multiple_quiescent_releases_do_not_wait_on_each_other() -> None:
+    async def scenario() -> None:
+        supervisor = RecoveryCleanupSupervisor()
+        owner = supervisor.session_snapshot(
+            session_id="session", session_instance_id="instance", run_epoch=1
+        ).owner
+        released = []
+
+        async def release() -> None:
+            released.append(True)
+
+        supervisor.defer_until_session_quiescent(owner, operation="first release", cleanup=release)
+        supervisor.defer_until_session_quiescent(owner, operation="second release", cleanup=release)
+        assert await supervisor.drain(timeout_s=1)
+        assert released == [True, True]
+
+    asyncio.run(scenario())
