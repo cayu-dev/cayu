@@ -1149,7 +1149,7 @@ class GitRepositoryBinding(WorkspaceBinding):
                 output_limit_bytes=self.output_limit_bytes,
             )
             try:
-                await executor.run("clone", self.repo_url, ".")
+                await executor.run("clone", "--origin", self.remote_name, self.repo_url, ".")
             except BaseException:
                 # A clone that dies mid-transfer — an ordinary failure OR a cancellation/interrupt —
                 # leaves partial artifacts that are non-empty AND not a valid work tree, so every
