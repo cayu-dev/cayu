@@ -1226,6 +1226,80 @@ def test_cayu_app_recover_tool_round_cancellation_after_claim_commit_preserves_c
     asyncio.run(scenario())
 
 
+def test_cayu_app_recover_tool_round_cancellation_during_presence_claim_releases_claim() -> None:
+    """Cancellation while claiming execution presence must not strand the recovery claim."""
+
+    class BlockingPresenceClaimStore(FailingTerminalToolEventStore):
+        invocation_lifecycle_command_version = 1
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.block_presence_claims = False
+            self.presence_claim_started = asyncio.Event()
+            self.allow_presence_claim = asyncio.Event()
+
+        async def _claim_session_execution(self, session_id, **arguments):
+            if self.block_presence_claims:
+                self.presence_claim_started.set()
+                await self.allow_presence_claim.wait()
+            return await super()._claim_session_execution(session_id, **arguments)
+
+    session_id = "sess_tool_round_manual_presence_claim_cancelled"
+    store = BlockingPresenceClaimStore()
+    app, store, tool, checkpoint = _crashed_tool_round_app(
+        session_id, store=store, tool=PureRecordingTool()
+    )
+    request = ToolRoundRecoveryRequest(
+        session_id=session_id,
+        round_id=checkpoint["pending_tool_round"]["tool_round_id"],
+        tool_call_id="call_1",
+        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+        message="side effect verified externally",
+    )
+
+    async def scenario() -> None:
+        releases_before_recovery = store.release_calls
+        store.block_presence_claims = True
+        recovery_task = asyncio.create_task(collect_tool_round_recovery_events(app, request))
+        await asyncio.wait_for(store.presence_claim_started.wait(), timeout=5)
+        # The durable recovery claim is committed before presence is claimed.
+        claimed_checkpoint = await store.load_checkpoint(session_id)
+        assert claimed_checkpoint is not None
+        assert "incomplete_session_recovery_claim" in claimed_checkpoint
+        claimed_session = await store.load(session_id)
+        assert claimed_session is not None
+        assert claimed_session.status is SessionStatus.RUNNING
+
+        recovery_task.cancel("cancel manual recovery during presence claim")
+        with pytest.raises(asyncio.CancelledError) as cancellation:
+            await recovery_task
+        assert cancellation.value.args == ("cancel manual recovery during presence claim",)
+        assert recovery_task.cancelled() is True
+        store.block_presence_claims = False
+
+        after = await store.load_checkpoint(session_id)
+        assert after is not None
+        assert "incomplete_session_recovery_claim" not in after
+        assert after["pending_tool_round"]["tool_round_id"] == request.round_id
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.INTERRUPTED
+        events = await store.load_events(session_id)
+        assert events[-1].type == EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["abandoned"] is True
+        assert store.release_calls - releases_before_recovery == 1
+        assert app._session_control.has_active_tasks(session_id) is False
+        assert invocation_scope._current_session_run_epoch(session_id) is None
+
+        # The claim was released rather than left to expire, so a retry in the
+        # same process proceeds immediately.
+        recovered = await collect_tool_round_recovery_events(app, request)
+        assert recovered[-1].type == EventType.SESSION_COMPLETED
+        assert tool.calls == [{}]
+
+    asyncio.run(scenario())
+
+
 def test_cayu_app_recover_tool_round_reconstruction_failure_releases_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

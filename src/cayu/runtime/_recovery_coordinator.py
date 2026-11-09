@@ -7619,7 +7619,15 @@ class RecoveryCoordinator:
         # The durable transition ran in a shielded child task. Bind its epoch to
         # the caller that will perform recovery writes and eventual cleanup.
         run_fence = _activate_owned_session_run_fence(claimed_session)
-        await self._session_control.execution_presence.ensure(claimed_session)
+        # Like a cancellation retained by the shielded transition, one delivered
+        # while claiming presence arrives after the durable claim committed.
+        # Keep it until the claim authority exists so the abandoned session is
+        # finalized and the claim released, instead of left to expire.
+        claim_cancellation = outcome.cancellation
+        try:
+            await self._session_control.execution_presence.ensure(claimed_session)
+        except asyncio.CancelledError as presence_cancellation:
+            claim_cancellation = claim_cancellation or presence_cancellation
         authority = _IncompleteRecoveryClaimAuthority(
             session_id=claimed_session.id,
             claim_id=claim_id,
@@ -7688,7 +7696,7 @@ class RecoveryCoordinator:
             )
         except _IncompleteRecoveryClaimLost as lease_failure:
             authoritative_failure = _authoritative_expired_recovery_claim_failure(
-                outcome.cancellation,
+                claim_cancellation,
                 lease_failure,
             )
             await self._recovery_ownership.cleanup_claim(
@@ -7698,11 +7706,11 @@ class RecoveryCoordinator:
                 invocation_context=invocation_context,
                 claim_has_not_dispatched_work=True,
             )
-            if outcome.cancellation is not None:
-                outcome.cancellation.add_note(
+            if claim_cancellation is not None:
+                claim_cancellation.add_note(
                     "The manual recovery claim acknowledgement also consumed its complete lease."
                 )
-                raise outcome.cancellation from exception_cause(outcome.cancellation)
+                raise claim_cancellation from exception_cause(claim_cancellation)
             raise
         if after_admission is not None:
             try:
@@ -7736,11 +7744,11 @@ class RecoveryCoordinator:
                     ),
                 )
                 raise
-        if outcome.cancellation is None:
+        if claim_cancellation is None:
             return claim
 
         await self._recovery_ownership.run_cleanup_steps(
-            authoritative_failure=outcome.cancellation,
+            authoritative_failure=claim_cancellation,
             steps=(
                 (
                     "abandoned manual recovery finalization",
@@ -7756,7 +7764,7 @@ class RecoveryCoordinator:
                     "manual recovery claim cleanup",
                     lambda: self._recovery_ownership.cleanup_claim(
                         authority=authority,
-                        authoritative_failure=outcome.cancellation,
+                        authoritative_failure=claim_cancellation,
                         execution_profile=execution_profile_snapshot.profile,
                         invocation_context=invocation_context,
                         claim_has_not_dispatched_work=True,
@@ -7764,7 +7772,7 @@ class RecoveryCoordinator:
                 ),
             ),
         )
-        raise outcome.cancellation
+        raise claim_cancellation
 
     async def recover_tool_round(
         self,
