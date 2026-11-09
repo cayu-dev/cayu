@@ -167,7 +167,10 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("eval", "baseline"): "agent",
     ("api-keys", "create"): "organization",
     ("api-keys", "revoke"): "organization",
-    **{("connections", action): "organization" for action in ("add", "agents", "rotate", "remove")},
+    **{
+        ("connections", action): "organization"
+        for action in ("add", "agents", "authorize", "rotate", "remove")
+    },
     ("connections", "bind"): "agent",
     ("connections", "unbind"): "agent",
 }
@@ -848,9 +851,10 @@ def _run_cloud(arguments: argparse.Namespace) -> int:
         return _cloud_failure(
             exc, render=None if render is None else arguments._cloud_render_failure
         )
-    if render is not None:
-        text = render(result)
-        # A command that printed its output as it went (`service logs --follow`) renders none.
+    # A renderer answers None for a result it has no text for, which prints the JSON envelope.
+    text = None if render is None else render(result)
+    if text is not None:
+        # A command that printed its output as it went (`service logs --follow`) renders "".
         if text:
             print(text)
         return 0

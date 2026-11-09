@@ -46,7 +46,7 @@ cayu cloud service status --application my-agent
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
-- `connectors` and `connections list|show|add|agents|rotate|remove|bound|bind|unbind` for the
+- `connectors` and `connections list|show|add|authorize|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
   `admin runtime-record show|forget-migration` to read
@@ -1015,7 +1015,7 @@ are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollb
 `service destroy|pause|redeploy|restart|resume|sleep|wake`, `env set|unset`,
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
 `compass findings accept|dismiss`, `eval run|baseline`, `eval runs cancel`,
-`api-keys create|revoke` and `connections add|agents|rotate|remove|bind|unbind`. Commands that
+`api-keys create|revoke` and `connections add|authorize|agents|rotate|remove|bind|unbind`. Commands that
 only read say nothing.
 
 Each Agent also remembers where it deploys. The first successful `cayu cloud deploy` of an Agent
@@ -2057,6 +2057,24 @@ developer names the Agents a new connection is for with `--agent`, and an admin 
 makes it available to every Agent. Only an admin changes which Agents may use one (`agents`),
 rotates its credential or removes it, and Cloud refuses removing one while any Agent is bound to
 it. Members see only the connections the Agents they work with use.
+
+A connector that signs in, such as Slack where the install has its Slack app, takes no
+credential: an admin adds it, and the command prints the link where the connection is approved.
+
+```console
+cayu cloud connections add slack --name eng-slack --scope chat:write --scope channels:read
+cayu cloud connections authorize eng-slack
+```
+
+Open the link in a browser where you're signed in to the Cayu Cloud portal as the same person, in
+the same Organization, that started it (the admin who ran the command), and approve it; the
+portal then finishes connecting it. Anyone else's portal refuses it (`sign_in_not_yours`). The connection is `pending`
+until then, and `error` if the sign-in fails, with the reason in `error` (for example
+`access_denied` or `state_expired`). A link works once, within 10 minutes: `authorize` prints a
+new one, to finish a pending connection, retry one in error or reconnect a ready one. `--json`
+prints the JSON envelope instead, with the link as the result's `authorization_url`. A connection
+that signed in shows the account it connected, for Slack the workspace, as `account` (`id` and
+`name`) in `list` and `show`.
 
 ## The install's system Agents
 

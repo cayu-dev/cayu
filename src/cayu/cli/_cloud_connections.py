@@ -9,11 +9,16 @@ Credentials are read from files, never from the command line: `--key-file PATH` 
 `--credential FIELD=@PATH` for a field kept in a file (a private key) and `--credential
 FIELD=VALUE` only for a field that isn't secret (`account`, `user`). No answer ever holds a
 credential.
+
+A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
+its sign-in again with `connections authorize`, and Cloud answers the link where the person
+approves it, which these commands print.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -73,19 +78,33 @@ def add_connections_parsers(
 
     add = actions.add_parser(
         "add",
-        help="Add a connection with its credential.",
+        help="Add a connection with its credential, or one that signs in.",
         description=(
             "Add a connection to CONNECTOR under --name. A developer names the Agents that may "
-            "use it with --agent; an admin who names none makes it available to every Agent."
+            "use it with --agent; an admin who names none makes it available to every Agent. "
+            "A connector that signs in (slack) takes no credential and only an admin adds it: "
+            "the command prints the link where you approve it."
         ),
     )
     add.add_argument("connector", help="The connector, from `cayu cloud connectors`.")
     add.add_argument("--name", required=True, help="The connection's name, such as team-anthropic.")
-    _add_credential_arguments(add)
+    _add_credential_arguments(add, required=False)
     add.add_argument(
         "--scope", action="append", help="A scope it may hold; repeat. None: all it can hold."
     )
     add.add_argument("--agent", action="append", help="An Agent that may use it; repeat for each.")
+    _add_sign_in_output(add)
+
+    authorize = actions.add_parser(
+        "authorize",
+        help="Start a connection's sign-in again (admins).",
+        description=(
+            "Start the sign-in of a connection that signs in again: to finish a pending one, "
+            "retry one in error, or reconnect a ready one. Prints a new link where you approve it."
+        ),
+    )
+    authorize.add_argument("name")
+    _add_sign_in_output(authorize)
 
     agents = actions.add_parser(
         "agents",
@@ -142,14 +161,49 @@ def add_connections_parsers(
     unbind.add_argument("--application", required=True, help="The Agent.")
 
 
-def _add_credential_arguments(parser: argparse.ArgumentParser) -> None:
-    given = parser.add_mutually_exclusive_group(required=True)
+def _add_credential_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
+    given = parser.add_mutually_exclusive_group(required=required)
     given.add_argument("--key-file", type=Path, help="A file holding the API key.")
     given.add_argument(
         "--credential",
         action="append",
         metavar="FIELD=@PATH|FIELD=VALUE",
         help="One credential field; @PATH reads it from a file. Repeat for each field.",
+    )
+
+
+def _add_sign_in_output(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the JSON envelope, with the link as the result's authorization_url.",
+    )
+    parser.set_defaults(_cloud_render=render_sign_in)
+
+
+def render_sign_in(outcome: Mapping[str, Any]) -> str | None:
+    """A started sign-in as text: the link to open. Any other result has no text form."""
+
+    result = outcome["result"]
+    url = result.get("authorization_url")
+    if not isinstance(url, str):
+        return None
+    opening = (
+        f"{result['name']} keeps working until you sign in again. To reconnect it"
+        if result.get("status") == "ready"
+        else f"{result['name']} is waiting for its sign-in. To connect it"
+    )
+    return "\n".join(
+        (
+            f"{opening}, open this link in a browser where you're signed in to the Cayu Cloud "
+            "portal as the same person, in the same Organization, that started it, and approve "
+            "it there:",
+            "",
+            f"  {url}",
+            "",
+            "The link works once, within 10 minutes. For a new one: "
+            f"cayu cloud connections authorize {result['name']}",
+        )
     )
 
 
@@ -171,11 +225,10 @@ def connections_command(
     if action == "list":
         result = client.request("GET", _CONNECTIONS)
     elif action == "add":
-        payload: dict[str, object] = {
-            "connector": arguments.connector,
-            "name": arguments.name,
-            "credential": _credential(arguments),
-        }
+        payload: dict[str, object] = {"connector": arguments.connector, "name": arguments.name}
+        # None given: a connector that signs in, which Cloud answers with where to approve it.
+        if arguments.key_file is not None or arguments.credential is not None:
+            payload["credential"] = _credential(arguments)
         if arguments.scope is not None:
             payload["scopes"] = arguments.scope
         if agents is not None:
@@ -187,6 +240,8 @@ def connections_command(
         path = f"{_CONNECTIONS}/{quote(arguments.name, safe='')}"
         if action == "show":
             result = client.request("GET", path)
+        elif action == "authorize":
+            result = client.request("POST", f"{path}/authorize")
         elif action == "agents":
             result = client.request(
                 "PUT", f"{path}/agents", payload={"agents": None if arguments.all else agents}

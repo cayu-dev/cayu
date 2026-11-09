@@ -252,3 +252,129 @@ def test_a_refused_removal_reports_clouds_reason(cloud, capsys: pytest.CaptureFi
     assert code != 0
     assert output["error"]["code"] == "connection_bound"
     assert "support-desk" in output["error"]["message"]
+
+
+_SIGN_IN = {
+    "name": "eng-slack",
+    "connector": "slack",
+    "status": "pending",
+    "account": None,
+    "error": None,
+    "authorization_url": "https://slack.com/oauth/v2/authorize?state=abc",
+}
+
+
+def test_add_without_a_credential_prints_where_to_approve_it(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
+
+    code = main(
+        ["cloud", "connections", "add", "slack", "--name", "eng-slack", "--scope", "chat:write"]
+    )
+
+    assert code == 0
+    assert json.loads(fake.requests[-1].content) == {
+        "connector": "slack",
+        "name": "eng-slack",
+        "scopes": ["chat:write"],
+    }
+    printed = capsys.readouterr().out
+    assert "  https://slack.com/oauth/v2/authorize?state=abc\n" in printed
+    assert "signed in to the Cayu Cloud portal as the same person" in " ".join(printed.split())
+    assert "cayu cloud connections authorize eng-slack" in printed
+
+
+def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
+
+    code, output = _run(["connections", "add", "slack", "--name", "eng-slack", "--json"], capsys)
+
+    assert code == 0
+    assert output["operation"] == "connections.add"
+    assert output["result"] == _SIGN_IN
+
+
+def test_authorize_prints_a_new_link(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+                200, json={**_SIGN_IN, "authorization_url": "https://slack.com/new"}
+            )
+        }
+    )
+
+    assert main(["cloud", "connections", "authorize", "eng-slack"]) == 0
+    assert fake.requests[-1].content == b""
+    assert "  https://slack.com/new\n" in capsys.readouterr().out
+
+    code, output = _run(["connections", "authorize", "eng-slack", "--json"], capsys)
+    assert code == 0
+    assert output["operation"] == "connections.authorize"
+    assert output["result"]["authorization_url"] == "https://slack.com/new"
+
+
+def test_a_refused_sign_in_reports_clouds_reason(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    cloud(
+        {
+            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+                403,
+                json={
+                    "detail": {
+                        "code": "admin_required",
+                        "message": "Only an organization admin can do this.",
+                    }
+                },
+            )
+        }
+    )
+
+    code, output = _run(["connections", "authorize", "eng-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "admin_required"
+
+
+def test_show_carries_the_account_status_and_why_it_failed(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    failed = {**_SIGN_IN, "status": "error", "error": "access_denied"}
+    failed.pop("authorization_url")
+    ready = {**failed, "name": "team-slack", "status": "ready", "error": None}
+    ready["account"] = {"id": "T0123", "name": "Halden"}
+    cloud(
+        {
+            ("GET", "/v1/connections/eng-slack"): httpx.Response(200, json=failed),
+            ("GET", "/v1/connections"): httpx.Response(200, json={"items": [failed, ready]}),
+        }
+    )
+
+    code, output = _run(["connections", "show", "eng-slack"], capsys)
+    assert code == 0
+    assert (output["result"]["status"], output["result"]["error"]) == ("error", "access_denied")
+
+    code, output = _run(["connections", "list"], capsys)
+    assert code == 0
+    assert [item["account"] for item in output["result"]["items"]] == [
+        None,
+        {"id": "T0123", "name": "Halden"},
+    ]
+
+
+def test_reconnecting_a_ready_connection_says_it_keeps_working(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+                200, json={**_SIGN_IN, "status": "ready"}
+            )
+        }
+    )
+
+    assert main(["cloud", "connections", "authorize", "eng-slack"]) == 0
+    printed = capsys.readouterr().out
+    assert printed.startswith("eng-slack keeps working until you sign in again. To reconnect it,")
+    assert "waiting for its sign-in" not in printed
