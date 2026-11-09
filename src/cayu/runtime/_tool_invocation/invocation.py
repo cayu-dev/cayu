@@ -1794,6 +1794,7 @@ class ToolInvocation:
                 )
                 interrupted_payload = {
                     **interrupted_event.payload,
+                    "idempotency_key": idempotency_key,
                     **approved_marker,
                     **projection.payload_fields(),
                     tool_argument_publication.ARGUMENTS_EXACT_FIELD: (
@@ -1803,6 +1804,10 @@ class ToolInvocation:
                         )
                     ),
                 }
+                if approval_id is not None:
+                    interrupted_payload["approval_id"] = approval_id
+                if input_id is not None:
+                    interrupted_payload["input_id"] = input_id
                 if projection.state == "finalized":
                     interrupted_payload.update(
                         {
