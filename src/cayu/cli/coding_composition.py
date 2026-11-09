@@ -7038,6 +7038,8 @@ def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
     )
     # The coding build_app body below constructs these through operations.coding.
     for unused_import in (
+        "from collections.abc import Iterable\n\n",
+        "from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose\n",
         "from cayu.artifacts import ArtifactStore\n",
         "from cayu.storage import KnowledgeStore\n",
         "from cayu.model_policy import configured_model_policy\n",

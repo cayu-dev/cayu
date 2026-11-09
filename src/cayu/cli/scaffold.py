@@ -1314,6 +1314,9 @@ def build_service(
         session_store=stores.session_store,
         task_store=stores.task_store,
         knowledge_store=stores.knowledge_store,
+        # The app closes the stores opened here when the service shuts down;
+        # stores injected into build_service() stay with their caller.
+        owned_resources=() if stores.configured is None else (stores.configured,),
     )
     selected_product_access = (
         product_access
@@ -2502,6 +2505,10 @@ store, which `build_service()` opens with the other stores in
 `configuration/storage.py`. Never authorize from request tenant fields, Cayu
 IDs, labels, metadata, model output, or tool input, and never return raw runtime
 records to customers.
+
+`build_service()` hands the stores it opens to the app through
+`build_app(owned_resources=...)`, so they close when the service shuts down.
+Stores you inject into `build_service()` or `build_app()` stay yours to close.
 
 The product operation store is Cayu's `SQLiteProductOperationStore` locally and
 `PostgresProductOperationStore` when `CAYU_DATABASE_URL` selects PostgreSQL. Its

@@ -43,8 +43,11 @@ in their owning packages, then connect them through the explicit registration
 seams imported here.
 """
 
+from collections.abc import Iterable
+
 from cayu.artifacts import ArtifactStore
 from cayu import CayuApp
+from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose
 from cayu.storage import KnowledgeStore
 from cayu.providers import ModelProvider
 from cayu.sessions import SessionStore
@@ -69,12 +72,16 @@ def build_app(
     session_store: SessionStore | None = None,
     task_store: TaskStore | None = None,
     knowledge_store: KnowledgeStore | None = None,
+    owned_resources: Iterable[SupportsAsyncClose | SupportsAsyncAclose] = (),
     artifact_store: ArtifactStore | None = None,
 ) -> CayuApp:
     """Construct a fresh process-scoped application graph.
 
-    Injected stores and providers are public hermetic-test seams. Importing this
-    module never constructs the application or connects to an external service.
+    Injected stores and providers are public hermetic-test seams, and they stay
+    with their caller. A caller that opened resources for this app, as
+    build_service() does with its stores, hands them over in ``owned_resources``
+    and the app closes them once aclose() settles. Importing this module never
+    constructs the application or connects to an external service.
     """
 
     if not __ARTIFACTS_ENABLED__ and artifact_store is not None:
@@ -99,9 +106,12 @@ def build_app(
         model_policy=configured_model_policy(
             None if stores.configured is None else stores.configured.model_policy_store
         ),
-        # The app closes the stores built here once aclose() settles; injected
-        # stores stay with their caller.
-        owned_resources=() if stores.configured is None else (stores.configured,),
+        # The app closes the stores built here, and whatever the caller handed
+        # over, once aclose() settles; other injected stores stay with their caller.
+        owned_resources=(
+            *owned_resources,
+            *(() if stores.configured is None else (stores.configured,)),
+        ),
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)

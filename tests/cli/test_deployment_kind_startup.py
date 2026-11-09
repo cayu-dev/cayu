@@ -105,21 +105,12 @@ def test_mismatching_factory_reports_actual_shutdown_outcome(
     monkeypatch.setitem(sys.modules, "deployment_test_state", state)
     for relative, content in project_files("service", preset="service").items():
         if relative == "app.py":
-            generated_owner = (
-                "        owned_resources=() if stores.configured is None "
-                "else (stores.configured,),\n"
-            )
+            generated_owner = "            *owned_resources,\n"
             assert content.count(generated_owner) == 1
             content = content.replace(
                 "    app = CayuApp(\n",
                 "    from deployment_test_state import owned\n    app = CayuApp(\n",
-            ).replace(
-                generated_owner,
-                "        owned_resources=(\n"
-                "            owned,\n"
-                "            *(() if stores.configured is None else (stores.configured,)),\n"
-                "        ),\n",
-            )
+            ).replace(generated_owner, "            owned,\n" + generated_owner)
         if relative.endswith("service.py"):
             content = content.replace(
                 "    project_context: ProjectControlPlaneContext | None = None,\n", ""
