@@ -2198,6 +2198,11 @@ async def _await_task_handler(
                     )
                 ),
             ):
+                # Entry acknowledgements and access admission can exhaust the event.
+                # A scheduled timeout cannot prevent the callback's initial effects.
+                if event_dispatch_deadline is not None and monotonic() >= event_dispatch_deadline:
+                    assert event_deadline is not None
+                    raise ExecutionDeadlineExceeded(event_deadline, "handler")
                 result = await handler(app, handler_view, worker_id)
         return result
 
