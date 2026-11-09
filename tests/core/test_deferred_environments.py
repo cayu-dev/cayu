@@ -40,6 +40,10 @@ from cayu.environments.deferred import (
     DeferredMaterialization,
     EnvironmentMaterializationError,
 )
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    register_environment_factory_cleanup_retry,
+)
 from cayu.evals import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 from cayu.runners import ExecCommand, LocalRunner
@@ -1520,3 +1524,118 @@ def test_a_refused_runner_whose_close_fails_is_never_reused_and_still_closed(dir
 
     assert [runner.is_closed for runner in runners] == [True, True]
     assert runners[0].close_attempts == 2
+
+
+@pytest.mark.parametrize("interruption", ["cancelled", "failed", "probe_cancelled"])
+@pytest.mark.parametrize("retry", ["finalize", "wrapper_close"])
+def test_failed_admission_keeps_probe_settlement_before_close(dirs, interruption, retry) -> None:
+    async def run():
+        runner = _FlakyCloseRunner(dirs[1], close_failures=0)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        settled = False
+        events = []
+
+        async def observe(kind, metadata, bound):
+            events.append(kind)
+
+        async def settle():
+            nonlocal settled
+            started.set()
+            await release.wait()
+            if interruption == "failed":
+                raise RuntimeError("probe settlement failed")
+            if interruption == "probe_cancelled":
+                raise asyncio.CancelledError("probe timed out")
+            settled = True
+
+        async def retry_settlement():
+            nonlocal settled
+            settled = True
+
+        settlement = asyncio.create_task(settle())
+        register_environment_factory_cleanup_retry(
+            settlement, lambda: asyncio.create_task(retry_settlement())
+        )
+
+        async def materialize(mode):
+            return runner, None
+
+        async def admit(runner):
+            error = ConnectionError("probe acknowledgement lost")
+            attach_environment_factory_cleanup_settlement_task(error, settlement)
+            raise error
+
+        state = DeferredMaterialization(materialize, default_cwd=str(dirs[1]))
+        state.attach_admission(admit)
+        state.attach_observer(observe)
+        bound = await _placeholder_bind(state, dirs[0])
+        first = asyncio.create_task(state.materialize())
+        try:
+            await started.wait()
+            await asyncio.sleep(0)
+            assert not first.done()
+            assert runner.close_attempts == 0
+            if interruption == "cancelled":
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+                assert not settlement.cancelled()
+            else:
+                release.set()
+                with pytest.raises(EnvironmentMaterializationError):
+                    await first
+            assert events == ["started", "failed"]
+            assert runner.close_attempts == 0
+            assert state.materialized_runner is None
+            release.set()
+            if retry == "finalize":
+                await state.binding.finalize(bound, outcome="interrupted")
+            else:
+                await state.runner.close()
+            assert settled
+            assert runner.is_closed
+            assert runner.close_attempts == 1
+        finally:
+            release.set()
+            await asyncio.gather(first, settlement, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_terminal_probe_without_retry_does_not_block_runner_close(dirs, cancelled) -> None:
+    async def run():
+        runner = _FlakyCloseRunner(dirs[1], close_failures=0)
+        events = []
+
+        async def observe(kind, metadata, bound):
+            events.append(kind)
+
+        async def settle():
+            if cancelled:
+                raise asyncio.CancelledError()
+            raise RuntimeError("probe failed")
+
+        settlement = asyncio.create_task(settle())
+
+        async def materialize(mode):
+            return runner, None
+
+        async def admit(runner):
+            error = ConnectionError("admission refused")
+            attach_environment_factory_cleanup_settlement_task(error, settlement)
+            raise error
+
+        state = DeferredMaterialization(materialize, default_cwd=str(dirs[1]))
+        state.attach_admission(admit)
+        state.attach_observer(observe)
+        with pytest.raises(EnvironmentMaterializationError):
+            await state.materialize()
+        assert events == ["started", "failed"]
+        assert runner.is_closed
+        assert runner.close_attempts == 1
+        await state.runner.close()
+        assert runner.close_attempts == 1
+
+    asyncio.run(run())

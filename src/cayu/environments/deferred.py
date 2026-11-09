@@ -22,6 +22,13 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 from cayu._validation import require_clean_nonblank
 from cayu.environments._phase_timing import EnvironmentPhaseTimer
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    combine_environment_factory_cleanup_settlement_tasks,
+    environment_factory_cleanup_retry_available,
+    environment_factory_cleanup_settlement_tasks,
+    retry_environment_factory_cleanup_settlement_task,
+)
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, Runner
 from cayu.runners._exit_cleanup import close_runners_at_exit
 from cayu.runners.base import (
@@ -127,6 +134,12 @@ class _Materialized:
 
 
 @dataclass(slots=True)
+class _PendingClose:
+    runner: Runner
+    settlement: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
 class _BindRequest:
     workspace: Workspace | None
     session_id: str
@@ -172,7 +185,7 @@ class DeferredMaterialization:
         self._created_started = 0.0
         # Runners that must never be used again but whose close has not yet
         # succeeded; finalization and the wrapper's close retry them.
-        self._pending_close: list[Runner] = []
+        self._pending_close: list[_PendingClose] = []
         self._bind_request: _BindRequest | None = None
         self._observer: MaterializationObserver | None = None
         self._admission: MaterializationAdmission | None = None
@@ -289,10 +302,20 @@ class DeferredMaterialization:
                         except EnvironmentMaterializationError:
                             raise
                         except Exception as refusal:
-                            raise EnvironmentMaterializationError(
+                            error = EnvironmentMaterializationError(
                                 "The deferred environment was refused by execution admission.",
                                 reason="admission_refused",
-                            ) from refusal
+                            )
+                            settlement = combine_environment_factory_cleanup_settlement_tasks(
+                                environment_factory_cleanup_settlement_tasks(refusal),
+                                task_name="cayu-deferred-admission-probe-settlement",
+                                failure_message="Deferred admission evidence probes failed to settle.",
+                            )
+                            if settlement is not None:
+                                attach_environment_factory_cleanup_settlement_task(
+                                    error, settlement
+                                )
+                            raise error from refusal
                     created = _Materialized(runner=runner, binding=binding, bound=None)
                     self._created = created
                     self._created_started = started
@@ -328,9 +351,24 @@ class DeferredMaterialization:
                 if runner is not None and self._state is None:
                     # Never reuse it, but keep it until its close succeeds.
                     self._created = None
-                    self._pending_close.append(runner)
-                    with suppress(Exception):
+                    self._pending_close.append(
+                        _PendingClose(
+                            runner,
+                            combine_environment_factory_cleanup_settlement_tasks(
+                                environment_factory_cleanup_settlement_tasks(error),
+                                task_name="cayu-deferred-admission-probe-settlement",
+                                failure_message="Deferred admission evidence probes failed to settle.",
+                            ),
+                        )
+                    )
+                    try:
                         await self._close_pending()
+                    except asyncio.CancelledError as cancellation:
+                        # The cleanup owner remains pending, but the attempt
+                        # still needs its terminal notification before exit.
+                        error = cancellation
+                    except Exception:
+                        pass
                 reason = (
                     error.reason
                     if isinstance(error, EnvironmentMaterializationError)
@@ -378,7 +416,7 @@ class DeferredMaterialization:
                         f"Deferred environment materialization failed: {type(error).__name__}.",
                         reason=reason,
                     ) from error
-                raise
+                raise error
             await self._notify(
                 "completed",
                 {"mode": mode, "elapsed_ms": int((time.monotonic() - started) * 1000)},
@@ -390,14 +428,32 @@ class DeferredMaterialization:
         """Close every retired runner; one whose close fails stays pending."""
 
         failure: BaseException | None = None
-        for runner in tuple(self._pending_close):
+        for pending in tuple(self._pending_close):
             try:
-                await runner.close()
+                # Failed admission can leave probes owning this allocation.
+                # Retain their prerequisite across cancellation and cleanup retries.
+                if pending.settlement is not None:
+                    pending.settlement = retry_environment_factory_cleanup_settlement_task(
+                        pending.settlement
+                    )
+                    # Isolate a dependency's cancellation from the caller.
+                    # A terminal task without a retry owner is quiescent even
+                    # when it failed; it must not prevent allocation closure.
+                    await asyncio.wait((pending.settlement,))
+                    if environment_factory_cleanup_retry_available(pending.settlement):
+                        if pending.settlement.cancelled():
+                            raise RuntimeError(
+                                "Deferred admission evidence probes were cancelled before settling."
+                            )
+                        pending.settlement.result()
+                    elif not pending.settlement.cancelled():
+                        pending.settlement.exception()
+                await pending.runner.close()
             except BaseException as error:
                 failure = failure or error
                 continue
-            if runner in self._pending_close:
-                self._pending_close.remove(runner)
+            if pending in self._pending_close:
+                self._pending_close.remove(pending)
         if failure is not None:
             raise failure
 
@@ -722,7 +778,7 @@ class DeferredWorkspaceBinding(WorkspaceBinding):
                 # open materialization record ends as failed. It moves to the
                 # pending list first, so a failed close keeps it owned.
                 self._deferred._created = None
-                self._deferred._pending_close.append(created.runner)
+                self._deferred._pending_close.append(_PendingClose(created.runner))
                 try:
                     await self._deferred._notify(
                         "failed",
