@@ -3151,7 +3151,8 @@
           "ShutdownBudget",
           "ShutdownStepSpec",
           "SupportsAsyncAclose",
-          "SupportsAsyncClose"
+          "SupportsAsyncClose",
+          "close_on_failure"
         ],
         "cayu.runtime.checks": [
           "DiagnosticSeverity",

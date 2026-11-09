@@ -35,11 +35,11 @@ def test_serve_declared_kind_is_verified_from_the_returned_service(
                 content = content.replace(
                     "    project_context: ProjectControlPlaneContext | None = None,\n", ""
                 )
-                content = content.replace("        project_context=project_context,\n", "")
+                content = content.replace("            project_context=project_context,\n", "")
             if declared is not None:
                 content = content.replace(
-                    "        agent_name=",
-                    f"        deployment_kind={declared!r},\n        agent_name=",
+                    "            agent_name=",
+                    f"            deployment_kind={declared!r},\n            agent_name=",
                     1,
                 )
         path = tmp_path / relative
@@ -105,16 +105,16 @@ def test_mismatching_factory_reports_actual_shutdown_outcome(
     monkeypatch.setitem(sys.modules, "deployment_test_state", state)
     for relative, content in project_files("service", preset="service").items():
         if relative == "app.py":
-            generated_owner = "            *owned_resources,\n"
+            generated_owner = "                *owned_resources,\n"
             assert content.count(generated_owner) == 1
             content = content.replace(
-                "    app = CayuApp(\n",
-                "    from deployment_test_state import owned\n    app = CayuApp(\n",
-            ).replace(generated_owner, "            owned,\n" + generated_owner)
+                "        app = CayuApp(\n",
+                "        from deployment_test_state import owned\n\n        app = CayuApp(\n",
+            ).replace(generated_owner, "                owned,\n" + generated_owner)
         if relative.endswith("service.py"):
             content = content.replace(
                 "    project_context: ProjectControlPlaneContext | None = None,\n", ""
-            ).replace("        project_context=project_context,\n", "")
+            ).replace("            project_context=project_context,\n", "")
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)

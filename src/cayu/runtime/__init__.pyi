@@ -39,6 +39,7 @@ from cayu.runtime.application_lifecycle import ShutdownBudget as ShutdownBudget
 from cayu.runtime.application_lifecycle import ShutdownStepSpec as ShutdownStepSpec
 from cayu.runtime.application_lifecycle import SupportsAsyncAclose as SupportsAsyncAclose
 from cayu.runtime.application_lifecycle import SupportsAsyncClose as SupportsAsyncClose
+from cayu.runtime.application_lifecycle import close_on_failure as close_on_failure
 from cayu.runtime.checks import AVAILABLE_CHECK_TAGS as AVAILABLE_CHECK_TAGS
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES as BUILTIN_DIAGNOSTIC_CODES
 from cayu.runtime.checks import CHECK_REPORT_SCHEMA_VERSION as CHECK_REPORT_SCHEMA_VERSION
@@ -567,6 +568,7 @@ __all__ = [
     "build_local_execution_attempt_authority",
     "check_manifest",
     "classify_retryable_error",
+    "close_on_failure",
     "copy_mcp_manifest_policy",
     "first_reached_limit",
     "inspect_provider_operation",

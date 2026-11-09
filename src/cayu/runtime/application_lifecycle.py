@@ -13,7 +13,9 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from functools import wraps
@@ -78,6 +80,70 @@ def _async_closer(resource: object) -> Callable[[], Awaitable[None]]:
         if callable(close) and inspect.iscoroutinefunction(close):
             return close
     raise TypeError("owned_resources must provide an async close() or aclose() method.")
+
+
+@contextmanager
+def close_on_failure(
+    *resources: SupportsAsyncClose | SupportsAsyncAclose | None,
+) -> Iterator[None]:
+    """Close resources opened for something under construction if building it raises.
+
+    A synchronous factory, such as a project's ``build_app()``, opens stores and
+    hands them to the application it builds. If a later step raises, no
+    application exists to close them, so this closes them instead, in reverse
+    order, and re-raises. ``None`` entries are skipped, and each resource closes
+    once. When a close fails too, the build error and the close errors are
+    raised together in a ``BaseExceptionGroup``.
+
+    With no event loop running in this thread, the closes run under
+    ``asyncio.run()``. Inside a running loop, which cannot be blocked on, they run
+    on a fresh loop in a worker thread, and this waits for them.
+    """
+
+    owned = tuple(
+        {id(resource): resource for resource in resources if resource is not None}.values()
+    )
+    # Checked before the body runs, so a resource that cannot close fails fast.
+    closers = [_async_closer(resource) for resource in owned]
+    try:
+        yield
+    except BaseException as primary:
+        failures = _close_now(tuple(reversed(closers)))
+        if failures:
+            raise BaseExceptionGroup(
+                "Construction failed and closing its resources failed", [primary, *failures]
+            ) from None
+        raise
+
+
+def _close_now(closers: Sequence[Callable[[], Awaitable[None]]]) -> list[BaseException]:
+    async def close_all() -> list[BaseException]:
+        errors: list[BaseException] = []
+        for close in closers:
+            try:
+                await close()
+            except BaseException as error:
+                # Keep closing the rest, even after a cancelled close.
+                errors.append(error)
+        return errors
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        running = False
+    else:
+        running = True
+
+    def run_closes() -> list[BaseException]:
+        return asyncio.run(close_all())
+
+    try:
+        if not running:
+            return run_closes()
+        with ThreadPoolExecutor(1, thread_name_prefix="cayu-close-on-failure") as worker:
+            return worker.submit(run_closes).result()
+    except BaseException as error:
+        return [error]
 
 
 class ShutdownBudget:

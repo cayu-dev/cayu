@@ -1872,11 +1872,11 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
             "    access_policy: ResourceAccessPolicy | None = None,\n) -> CayuApp:",
         )
         .replace(
-            "        enable_logging=runtime.enable_logging,\n",
-            "        enable_logging=runtime.enable_logging,\n"
-            "        resource_access_policy=(\n"
-            "            access_policy if access_policy is not None else build_access_policy()\n"
-            "        ),\n",
+            "            enable_logging=runtime.enable_logging,\n",
+            "            enable_logging=runtime.enable_logging,\n"
+            "            resource_access_policy=(\n"
+            "                access_policy if access_policy is not None else build_access_policy()\n"
+            "            ),\n",
         )
     )
     return {

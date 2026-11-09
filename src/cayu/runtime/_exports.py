@@ -413,6 +413,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "check_manifest": ("cayu.runtime.checks", "check_manifest"),
     "classify_retryable_error": ("cayu.runtime.retry_policy", "classify_retryable_error"),
+    "close_on_failure": ("cayu.runtime.application_lifecycle", "close_on_failure"),
     "copy_mcp_manifest_policy": ("cayu.runtime.mcp_manifest_policy", "copy_mcp_manifest_policy"),
     "first_reached_limit": ("cayu.runtime.stop_policy", "first_reached_limit"),
     "inspect_provider_operation": (
@@ -469,6 +470,7 @@ PUBLIC_NAMES = [
     "ShutdownStepSpec",
     "SupportsAsyncAclose",
     "SupportsAsyncClose",
+    "close_on_failure",
     "APP_MANIFEST_SCHEMA_VERSION",
     "AVAILABLE_CHECK_TAGS",
     "AgentManifest",

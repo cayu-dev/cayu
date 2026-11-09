@@ -47,7 +47,7 @@ from collections.abc import Iterable
 
 from cayu.artifacts import ArtifactStore
 from cayu import CayuApp
-from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose
+from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose, close_on_failure
 from cayu.storage import KnowledgeStore
 from cayu.providers import ModelProvider
 from cayu.sessions import SessionStore
@@ -80,8 +80,10 @@ def build_app(
     Injected stores and providers are public hermetic-test seams, and they stay
     with their caller. A caller that opened resources for this app, as
     build_service() does with its stores, hands them over in ``owned_resources``
-    and the app closes them once aclose() settles. Importing this module never
-    constructs the application or connects to an external service.
+    and the app closes them once aclose() settles. The handover happens only when
+    build_app() returns: if it raises, it closes the stores it opened itself, and
+    resources passed in ``owned_resources`` stay with the caller. Importing this
+    module never constructs the application or connects to an external service.
     """
 
     if not __ARTIFACTS_ENABLED__ and artifact_store is not None:
@@ -93,39 +95,45 @@ def build_app(
         knowledge_store=knowledge_store,
         knowledge_scope=knowledge_scope,
     )
-    runtime = build_runtime_options()
-    app = CayuApp(
-        config=runtime.config,
-        session_store=stores.session_store,
-        task_store=stores.task_store,
-        knowledge_store=stores.knowledge_store,
-        knowledge_access_scope=knowledge_scope,
-        knowledge_review_namespace=runtime.knowledge_review_namespace,
-        request_footprint=runtime.request_footprint,
-        enable_logging=runtime.enable_logging,
-        model_policy=configured_model_policy(
-            None if stores.configured is None else stores.configured.model_policy_store
-        ),
-        # The app closes the stores built here, and whatever the caller handed
-        # over, once aclose() settles; other injected stores stay with their caller.
-        owned_resources=(
-            *owned_resources,
-            *(() if stores.configured is None else (stores.configured,)),
-        ),
-    )
-    selected_provider = provider if provider is not None else configured_provider()
-    app.register_provider(selected_provider, default=True)
-    environment = build_local_environment(
-        artifact_store=artifact_store,
-        knowledge_store=stores.knowledge_store,
-        knowledge_scope=knowledge_scope,
-    )
-__ENVIRONMENT_REGISTRATION__    register_agents(
-        app,
-        provider_override=provider,
-        context_policy=build_context_policy(),
-    )
-    return app
+    # If a step below raises, the stores opened above close before the error
+    # propagates, since no app exists yet to close them.
+    with close_on_failure(stores.configured):
+        runtime = build_runtime_options()
+        app = CayuApp(
+            config=runtime.config,
+            session_store=stores.session_store,
+            task_store=stores.task_store,
+            knowledge_store=stores.knowledge_store,
+            knowledge_access_scope=knowledge_scope,
+            knowledge_review_namespace=runtime.knowledge_review_namespace,
+            request_footprint=runtime.request_footprint,
+            enable_logging=runtime.enable_logging,
+            model_policy=configured_model_policy(
+                None
+                if stores.configured is None
+                else stores.configured.model_policy_store
+            ),
+            # The app closes the stores built here, and whatever the caller
+            # handed over, once aclose() settles; other injected stores stay
+            # with their caller.
+            owned_resources=(
+                *owned_resources,
+                *(() if stores.configured is None else (stores.configured,)),
+            ),
+        )
+        selected_provider = provider if provider is not None else configured_provider()
+        app.register_provider(selected_provider, default=True)
+        environment = build_local_environment(
+            artifact_store=artifact_store,
+            knowledge_store=stores.knowledge_store,
+            knowledge_scope=knowledge_scope,
+        )
+__ENVIRONMENT_REGISTRATION__        register_agents(
+            app,
+            provider_override=provider,
+            context_policy=build_context_policy(),
+        )
+        return app
 '''
 
 _CONFIGURATION_INIT_PY = '''"""Validated application configuration and adapter construction."""
@@ -1939,25 +1947,25 @@ def convention_files(
                 else "from environments.local import build_local_environment"
             ),
             "__ENVIRONMENT_REGISTRATION__": (
-                "    sandbox = build_sandbox_factory(\n"
-                "        artifact_store=None if environment is None else environment.artifact_store,\n"
-                "        knowledge_store=stores.knowledge_store,\n"
-                "        knowledge_scope=knowledge_scope,\n"
-                "    )\n"
-                "    if sandbox is None:\n"
-                "        app.register_environment(\n"
-                "            build_unsandboxed_environment(environment), default=True\n"
+                "        sandbox = build_sandbox_factory(\n"
+                "            artifact_store=None if environment is None else environment.artifact_store,\n"
+                "            knowledge_store=stores.knowledge_store,\n"
+                "            knowledge_scope=knowledge_scope,\n"
                 "        )\n"
-                "    else:\n"
-                "        app.register_environment_factory(\n"
-                "            sandbox_environment_spec(),\n"
-                "            sandbox,\n"
-                "            artifact_store=sandbox.configured_artifact_store,\n"
-                "            default=True,\n"
-                "        )\n"
+                "        if sandbox is None:\n"
+                "            app.register_environment(\n"
+                "                build_unsandboxed_environment(environment), default=True\n"
+                "            )\n"
+                "        else:\n"
+                "            app.register_environment_factory(\n"
+                "                sandbox_environment_spec(),\n"
+                "                sandbox,\n"
+                "                artifact_store=sandbox.configured_artifact_store,\n"
+                "                default=True,\n"
+                "            )\n"
                 if agent_sandbox
-                else "    if environment is not None:\n"
-                "        app.register_environment(environment, default=True)\n"
+                else "        if environment is not None:\n"
+                "            app.register_environment(environment, default=True)\n"
             ),
         }
         return render(template, replacements)

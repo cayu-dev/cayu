@@ -1290,10 +1290,10 @@ def long_running_project_files(
                     "    payments: PaymentService | None = None,\n) -> CayuApp:",
                 ),
                 (
-                    "        context_policy=build_context_policy(),\n    )",
-                    "        context_policy=build_context_policy(),\n"
-                    "        payments=payments if payments is not None else LocalPaymentService(),\n"
-                    "    )",
+                    "            context_policy=build_context_policy(),\n        )",
+                    "            context_policy=build_context_policy(),\n"
+                    "            payments=payments if payments is not None else LocalPaymentService(),\n"
+                    "        )",
                 ),
             ),
         ),

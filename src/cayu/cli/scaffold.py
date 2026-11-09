@@ -1162,6 +1162,7 @@ import re
 from fastapi import HTTPException, Request
 
 from cayu.providers import ModelProvider
+from cayu.runtime import close_on_failure
 from cayu.sessions import SessionStore
 from cayu.tasks import TaskStore
 from cayu.server import (
@@ -1309,45 +1310,48 @@ def build_service(
         product_store=product_store,
         product_operations=True,
     )
-    app = build_app(
-        provider=provider,
-        session_store=stores.session_store,
-        task_store=stores.task_store,
-        knowledge_store=stores.knowledge_store,
-        # The app closes the stores opened here when the service shuts down;
-        # stores injected into build_service() stay with their caller.
-        owned_resources=() if stores.configured is None else (stores.configured,),
-    )
-    selected_product_access = (
-        product_access
-        if product_access is not None
-        else (
-            DevelopmentProductAccess(dependency=_development_product_auth)
-            if mode is ServiceMode.DEVELOPMENT
-            else _production_product_access()
+    # Until the service exists, nothing else closes the stores opened above, so
+    # they close here if build_app() or create_agent_service() raises.
+    with close_on_failure(stores.configured):
+        app = build_app(
+            provider=provider,
+            session_store=stores.session_store,
+            task_store=stores.task_store,
+            knowledge_store=stores.knowledge_store,
+            # The app closes the stores opened here when the service shuts
+            # down; stores injected into build_service() stay with their caller.
+            owned_resources=() if stores.configured is None else (stores.configured,),
         )
-    )
-    selected_operator_access = (
-        operator_access
-        if operator_access is not None
-        else (
-            OpenAccess()
-            if mode is ServiceMode.DEVELOPMENT
-            else _production_operator_access()
+        selected_product_access = (
+            product_access
+            if product_access is not None
+            else (
+                DevelopmentProductAccess(dependency=_development_product_auth)
+                if mode is ServiceMode.DEVELOPMENT
+                else _production_product_access()
+            )
         )
-    )
-    return create_agent_service(
-        app,
-        agent_name="__AGENT_NAME__",
-        mode=mode,
-        project_context=project_context,
-        product_access=selected_product_access,
-        operator_access=selected_operator_access,
-        product_store=stores.product_store,
-        # Choose a cap for the slowest expected job, including provider/tool waits.
-        # Set None only when deliberately allowing unbounded execution.
-        execution_timeout_s=600,
-    )
+        selected_operator_access = (
+            operator_access
+            if operator_access is not None
+            else (
+                OpenAccess()
+                if mode is ServiceMode.DEVELOPMENT
+                else _production_operator_access()
+            )
+        )
+        return create_agent_service(
+            app,
+            agent_name="__AGENT_NAME__",
+            mode=mode,
+            project_context=project_context,
+            product_access=selected_product_access,
+            operator_access=selected_operator_access,
+            product_store=stores.product_store,
+            # Choose a cap for the slowest expected job, including provider/tool waits.
+            # Set None only when deliberately allowing unbounded execution.
+            execution_timeout_s=600,
+        )
 '''
 
 _SERVICE_SECURITY_TEST_PY = """from __future__ import annotations
@@ -2508,7 +2512,9 @@ records to customers.
 
 `build_service()` hands the stores it opens to the app through
 `build_app(owned_resources=...)`, so they close when the service shuts down.
-Stores you inject into `build_service()` or `build_app()` stay yours to close.
+If `build_app()` or `create_agent_service()` raises first, `close_on_failure()`
+closes them before the error propagates. Stores you inject into
+`build_service()` or `build_app()` stay yours to close.
 
 The product operation store is Cayu's `SQLiteProductOperationStore` locally and
 `PostgresProductOperationStore` when `CAYU_DATABASE_URL` selects PostgreSQL. Its

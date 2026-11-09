@@ -716,6 +716,15 @@ them open and call `aclose()` again. Do not wrap the app in `async with` blocks 
 that close unconditionally on exit, such as `ApplicationStores`; hand them to the
 app through `owned_resources` instead.
 
+A synchronous factory that opens resources for an app it is still building has
+no app to close them if a later step raises. Wrap those steps in
+`cayu.runtime.close_on_failure(*resources)`: when the block raises, it closes
+the resources in reverse order and re-raises, and a close that fails too is
+raised together with the build error in a `BaseExceptionGroup`. Inside a
+running event loop the closes run on their own loop in a worker thread. The
+generated `build_app()` and `build_service()` factories use it for the stores
+they open.
+
 Knowledge tools and collaboration stores can be shared by several applications,
 so shutdown is scoped to the app. `drain_knowledge_publications()` refuses this
 app's new publications and waits for the ones it started; the registered tool

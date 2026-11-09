@@ -260,7 +260,7 @@ from cayu.artifacts import ArtifactStore, LocalArtifactStore
 from cayu.budgets import BudgetLedger, BudgetPolicy
 from cayu.coding_products import CodingGitBaselineAuthority
 from cayu.environments import Environment, EnvironmentSpec
-from cayu.runtime import ExecutionProfileBehaviorIdentity
+from cayu.runtime import ExecutionProfileBehaviorIdentity, close_on_failure
 from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeStatus,
@@ -1318,131 +1318,134 @@ def build_coding_app(
         task_store=task_store,
         knowledge_store=knowledge_store,
     )
-    selected_session_store = stores.session_store
-    selected_task_store = stores.task_store
-    selected_knowledge_store = stores.knowledge_store
-    selected_scope = None
-    if selected_knowledge_store is not None:
-        if scope is None:
-            raise RuntimeError(
-                "coding knowledge_store injection requires the knowledge capability"
+    # If a step below raises, the stores opened above close before the error
+    # propagates, since no app exists yet to close them.
+    with close_on_failure(stores.configured):
+        selected_session_store = stores.session_store
+        selected_task_store = stores.task_store
+        selected_knowledge_store = stores.knowledge_store
+        selected_scope = None
+        if selected_knowledge_store is not None:
+            if scope is None:
+                raise RuntimeError(
+                    "coding knowledge_store injection requires the knowledge capability"
+                )
+            bound_scope = selected_knowledge_store.bound_access_scope()
+            selected_scope = _require_coding_knowledge_scope(
+                scope if bound_scope is None else bound_scope
             )
-        bound_scope = selected_knowledge_store.bound_access_scope()
-        selected_scope = _require_coding_knowledge_scope(
-            scope if bound_scope is None else bound_scope
-        )
-    selected_artifact_store = artifact_store
-    if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
-        selected_artifact_store = LocalArtifactStore(
-            _STATE_ROOT / "artifacts", store_id="coding-artifacts"
-        )
-    environment_identity = _coding_environment_identity(
-        root=root,
-        artifact_store=selected_artifact_store,
-        knowledge_store=selected_knowledge_store,
-        scope=selected_scope,
-        generated_stores=(
-            artifact_store is None
-            and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
-        ),
-        store_profile=stores.store_profile,
-    )
-
-    runtime = build_runtime_options()
-    app = CayuApp(
-        config=runtime.config,
-        enable_logging=runtime.enable_logging,
-        session_store=selected_session_store,
-        task_store=selected_task_store,
-        knowledge_store=selected_knowledge_store,
-        knowledge_access_scope=selected_scope,
-        knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
-        budget_policy=budget_policy,
-        budget_ledger=budget_ledger,
-        # The app closes the stores built here once aclose() settles; injected
-        # stores stay with their caller.
-        owned_resources=() if stores.configured is None else (stores.configured,),
-    )
-    selected_provider = provider if provider is not None else configured_provider()
-    app.register_provider(selected_provider, default=True)
-    app.register_environment(
-        Environment(
-            EnvironmentSpec(
-                name="coding",
-                execution_profile_identity=environment_identity,
-            ),
-            workspace=LocalWorkspace(
-                root,
-                workspace_id="coding-workspace",
-                excluded_directory_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES,
-            ),
-            runner=LocalRunner(root, inherit_env=False),
+        selected_artifact_store = artifact_store
+        if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
+            selected_artifact_store = LocalArtifactStore(
+                _STATE_ROOT / "artifacts", store_id="coding-artifacts"
+            )
+        environment_identity = _coding_environment_identity(
+            root=root,
             artifact_store=selected_artifact_store,
             knowledge_store=selected_knowledge_store,
+            scope=selected_scope,
+            generated_stores=(
+                artifact_store is None
+                and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
+            ),
+            store_profile=stores.store_profile,
+        )
+
+        runtime = build_runtime_options()
+        app = CayuApp(
+            config=runtime.config,
+            enable_logging=runtime.enable_logging,
+            session_store=selected_session_store,
+            task_store=selected_task_store,
+            knowledge_store=selected_knowledge_store,
             knowledge_access_scope=selected_scope,
-        ),
-        default=True,
-    )
-    tools = [
-        ListFilesTool(),
-        SearchTextTool(
-            exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
-            protected_entry_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES,
-        ),
-        ReadFileTool(),
-        ApplyPatchTool(),
-        WriteFileTool(),
-        EditFileTool(),
-        DeleteFileTool(),
-        GitChangesTool(),
-    ]
-    if __CODING_ARTIFACTS_ENABLED__:
-        tools.append(ListArtifactsTool())
-    if _KNOWLEDGE_ENABLED:
-        tools.extend(
-            (
-                ListKnowledgeTool(),
-                SearchKnowledgeTool(),
-                ReadKnowledgeTool(),
-                RememberKnowledgeTool(),
-            )
+            knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
+            budget_policy=budget_policy,
+            budget_ledger=budget_ledger,
+            # The app closes the stores built here once aclose() settles;
+            # injected stores stay with their caller.
+            owned_resources=() if stores.configured is None else (stores.configured,),
         )
-    if __CODING_DELEGATION_ENABLED__:
-        app.register_environment(_reviewer_environment())
-        background_registry = BackgroundSubagentTaskRegistry()
-        tools.extend(
-            (
-                SubagentTool(
-                    app,
-                    agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
-                    background_registry=background_registry,
-                    execution_profile_identity=_subagent_tool_identity(
-                        reviewer_agent,
-                        reviewer_execution_profile_identity,
-                        generated_session_store=stores.generated_session_store,
-                    ),
+        selected_provider = provider if provider is not None else configured_provider()
+        app.register_provider(selected_provider, default=True)
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(
+                    name="coding",
+                    execution_profile_identity=environment_identity,
                 ),
-                SubagentResultTool(
-                    app.session_store,
-                    background_registry=background_registry,
-                    default_timeout_s=30,
-                    execution_profile_identity=_subagent_result_tool_identity(
-                        generated_session_store=stores.generated_session_store,
-                    ),
+                workspace=LocalWorkspace(
+                    root,
+                    workspace_id="coding-workspace",
+                    excluded_directory_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES,
                 ),
-            )
+                runner=LocalRunner(root, inherit_env=False),
+                artifact_store=selected_artifact_store,
+                knowledge_store=selected_knowledge_store,
+                knowledge_access_scope=selected_scope,
+            ),
+            default=True,
         )
-    if __CODING_HUMAN_INPUT_ENABLED__:
-        tools.append(UserInputTool())
-    register_coding_agents(
-        app,
-        primary_agent=primary_agent,
-        reviewer_agent=reviewer_agent,
-        tools=require_coding_tool_inventory(tuple(tools), docker=False),
-        tool_policy=require_coding_tool_policy(_primary_tool_policy()),
-        provider_override=provider,
-    )
-    return app
+        tools = [
+            ListFilesTool(),
+            SearchTextTool(
+                exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
+                protected_entry_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES,
+            ),
+            ReadFileTool(),
+            ApplyPatchTool(),
+            WriteFileTool(),
+            EditFileTool(),
+            DeleteFileTool(),
+            GitChangesTool(),
+        ]
+        if __CODING_ARTIFACTS_ENABLED__:
+            tools.append(ListArtifactsTool())
+        if _KNOWLEDGE_ENABLED:
+            tools.extend(
+                (
+                    ListKnowledgeTool(),
+                    SearchKnowledgeTool(),
+                    ReadKnowledgeTool(),
+                    RememberKnowledgeTool(),
+                )
+            )
+        if __CODING_DELEGATION_ENABLED__:
+            app.register_environment(_reviewer_environment())
+            background_registry = BackgroundSubagentTaskRegistry()
+            tools.extend(
+                (
+                    SubagentTool(
+                        app,
+                        agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
+                        background_registry=background_registry,
+                        execution_profile_identity=_subagent_tool_identity(
+                            reviewer_agent,
+                            reviewer_execution_profile_identity,
+                            generated_session_store=stores.generated_session_store,
+                        ),
+                    ),
+                    SubagentResultTool(
+                        app.session_store,
+                        background_registry=background_registry,
+                        default_timeout_s=30,
+                        execution_profile_identity=_subagent_result_tool_identity(
+                            generated_session_store=stores.generated_session_store,
+                        ),
+                    ),
+                )
+            )
+        if __CODING_HUMAN_INPUT_ENABLED__:
+            tools.append(UserInputTool())
+        register_coding_agents(
+            app,
+            primary_agent=primary_agent,
+            reviewer_agent=reviewer_agent,
+            tools=require_coding_tool_inventory(tuple(tools), docker=False),
+            tool_policy=require_coding_tool_policy(_primary_tool_policy()),
+            provider_override=provider,
+        )
+        return app
 '''
 
 
@@ -2548,15 +2551,18 @@ def build_coding_product_application(
         budget_policy=budget_policy,
         budget_ledger=budget_ledger,
     )
-    return CodingProductApplication(
-        composition.app,
-        source_workspace=composition.source_workspace,
-        artifact_store=composition.artifact_store,
-        toolchain_profile=composition.toolchain_profile,
-        image_fingerprint=composition.image_fingerprint,
-        agent_name=AGENT.name,
-        project_root=composition.project_root,
-    )
+    # The app owns the stores the composition opened. If the front door refuses
+    # it, close the app so they don't leak.
+    with close_on_failure(composition.app):
+        return CodingProductApplication(
+            composition.app,
+            source_workspace=composition.source_workspace,
+            artifact_store=composition.artifact_store,
+            toolchain_profile=composition.toolchain_profile,
+            image_fingerprint=composition.image_fingerprint,
+            agent_name=AGENT.name,
+            project_root=composition.project_root,
+        )
 '''
 
 
@@ -4063,190 +4069,193 @@ def build_coding_composition(
         task_store=task_store,
         knowledge_store=knowledge_store,
     )
-    selected_session_store = stores.session_store
-    selected_task_store = stores.task_store
-    selected_knowledge_store = stores.knowledge_store
-    selected_scope = None
-    if selected_knowledge_store is not None:
-        if scope is None:
+    # If a step below raises, the stores opened above close before the error
+    # propagates, since no app exists yet to close them.
+    with close_on_failure(stores.configured):
+        selected_session_store = stores.session_store
+        selected_task_store = stores.task_store
+        selected_knowledge_store = stores.knowledge_store
+        selected_scope = None
+        if selected_knowledge_store is not None:
+            if scope is None:
+                raise RuntimeError(
+                    "coding knowledge_store injection requires the knowledge capability"
+                )
+            bound_scope = selected_knowledge_store.bound_access_scope()
+            selected_scope = _require_coding_knowledge_scope(
+                scope if bound_scope is None else bound_scope
+            )
+        selected_artifact_store = artifact_store
+        if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
+            selected_artifact_store = LocalArtifactStore(
+                _STATE_ROOT / "artifacts", store_id="coding-artifacts"
+            )
+        store_identity = _coding_environment_identity(
+            root=root,
+            artifact_store=selected_artifact_store,
+            knowledge_store=selected_knowledge_store,
+            scope=selected_scope,
+            generated_stores=(
+                artifact_store is None
+                and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
+            ),
+            store_profile=stores.store_profile,
+        )
+        checks = named_checks_from_toolchain(
+            toolchain_profile,
+            identities=_CHECK_IDENTITIES,
+            identity_prefix="__PROJECT_NAME__.docker_check",
+        )
+        check_names = tuple(check.name for check in checks)
+        command_selectors = tuple(
+            authority.selector
+            for authority in toolchain_profile.structured_command_authorities
+        )
+        if not command_selectors:
             raise RuntimeError(
-                "coding knowledge_store injection requires the knowledge capability"
+                "Toolchain profile exposes no structured command authorities"
             )
-        bound_scope = selected_knowledge_store.bound_access_scope()
-        selected_scope = _require_coding_knowledge_scope(
-            scope if bound_scope is None else bound_scope
+        check_tool = RunCheckTool(
+            checks=checks,
+            command_policy=ExactNamedCheckCommandPolicy(
+                checks,
+                workspace_path=toolchain_profile.workspace_path,
+                execution_profile_identity=_CHECK_COMMAND_POLICY_IDENTITY,
+            ),
+            toolchain_profile=toolchain_profile,
         )
-    selected_artifact_store = artifact_store
-    if __CODING_ARTIFACTS_ENABLED__ and selected_artifact_store is None:
-        selected_artifact_store = LocalArtifactStore(
-            _STATE_ROOT / "artifacts", store_id="coding-artifacts"
-        )
-    store_identity = _coding_environment_identity(
-        root=root,
-        artifact_store=selected_artifact_store,
-        knowledge_store=selected_knowledge_store,
-        scope=selected_scope,
-        generated_stores=(
-            artifact_store is None
-            and (not _KNOWLEDGE_ENABLED or stores.generated_knowledge_store)
-        ),
-        store_profile=stores.store_profile,
-    )
-    checks = named_checks_from_toolchain(
-        toolchain_profile,
-        identities=_CHECK_IDENTITIES,
-        identity_prefix="__PROJECT_NAME__.docker_check",
-    )
-    check_names = tuple(check.name for check in checks)
-    command_selectors = tuple(
-        authority.selector
-        for authority in toolchain_profile.structured_command_authorities
-    )
-    if not command_selectors:
-        raise RuntimeError(
-            "Toolchain profile exposes no structured command authorities"
-        )
-    check_tool = RunCheckTool(
-        checks=checks,
-        command_policy=ExactNamedCheckCommandPolicy(
-            checks,
-            workspace_path=toolchain_profile.workspace_path,
-            execution_profile_identity=_CHECK_COMMAND_POLICY_IDENTITY,
-        ),
-        toolchain_profile=toolchain_profile,
-    )
-    command_tool = RunCommandTool(toolchain_profile=toolchain_profile)
+        command_tool = RunCommandTool(toolchain_profile=toolchain_profile)
 
-    runtime = build_runtime_options()
-    app = CayuApp(
-        config=runtime.config,
-        enable_logging=runtime.enable_logging,
-        session_store=selected_session_store,
-        task_store=selected_task_store,
-        knowledge_store=selected_knowledge_store,
-        knowledge_access_scope=selected_scope,
-        knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
-        budget_policy=budget_policy,
-        budget_ledger=budget_ledger,
-        # The app closes the stores built here once aclose() settles; injected
-        # stores stay with their caller.
-        owned_resources=() if stores.configured is None else (stores.configured,),
-    )
-    selected_provider = provider if provider is not None else configured_provider()
-    app.register_provider(selected_provider, default=True)
-    register_coding_environment(
-        app,
-        name="coding",
-        backend=backend,
-        source_workspace=source_workspace,
-        artifact_store=selected_artifact_store,
-        # Knowledge tools get their store and scope from the environment.
-        knowledge_store=selected_knowledge_store,
-        knowledge_access_scope=selected_scope,
-        default=True,
-        execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
-        metadata={
-            "binding_profile_identity": _DOCKER_BINDING_IDENTITY.model_dump(
-                mode="json"
-            ),
-            "store_profile_identity": (
-                None
-                if store_identity is None
-                else store_identity.model_dump(mode="json")
-            ),
-        },
-    )
-    tools = [
-        ListFilesTool(),
-        SearchTextTool(
-            exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
-            protected_entry_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
-        ),
-        ReadFileTool(),
-        ApplyPatchTool(),
-        WriteFileTool(),
-        EditFileTool(),
-        DeleteFileTool(),
-        GitChangesTool(),
-        check_tool,
-        command_tool,
-    ]
-    if __CODING_ARTIFACTS_ENABLED__:
-        tools.append(ListArtifactsTool())
-    if _KNOWLEDGE_ENABLED:
-        tools.extend(
-            (
-                ListKnowledgeTool(),
-                SearchKnowledgeTool(),
-                ReadKnowledgeTool(),
-                RememberKnowledgeTool(),
-            )
+        runtime = build_runtime_options()
+        app = CayuApp(
+            config=runtime.config,
+            enable_logging=runtime.enable_logging,
+            session_store=selected_session_store,
+            task_store=selected_task_store,
+            knowledge_store=selected_knowledge_store,
+            knowledge_access_scope=selected_scope,
+            knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
+            budget_policy=budget_policy,
+            budget_ledger=budget_ledger,
+            # The app closes the stores built here once aclose() settles;
+            # injected stores stay with their caller.
+            owned_resources=() if stores.configured is None else (stores.configured,),
         )
-    if __CODING_DELEGATION_ENABLED__:
-        app.register_environment(_reviewer_environment())
-        background_registry = BackgroundSubagentTaskRegistry()
-        tools.extend(
-            (
-                SubagentTool(
-                    app,
-                    agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
-                    background_registry=background_registry,
-                    execution_profile_identity=_subagent_tool_identity(
-                        reviewer_agent,
-                        reviewer_execution_profile_identity,
-                        generated_session_store=stores.generated_session_store,
+        selected_provider = provider if provider is not None else configured_provider()
+        app.register_provider(selected_provider, default=True)
+        register_coding_environment(
+            app,
+            name="coding",
+            backend=backend,
+            source_workspace=source_workspace,
+            artifact_store=selected_artifact_store,
+            # Knowledge tools get their store and scope from the environment.
+            knowledge_store=selected_knowledge_store,
+            knowledge_access_scope=selected_scope,
+            default=True,
+            execution_profile_identity=_CODING_ENVIRONMENT_IDENTITY,
+            metadata={
+                "binding_profile_identity": _DOCKER_BINDING_IDENTITY.model_dump(
+                    mode="json"
+                ),
+                "store_profile_identity": (
+                    None
+                    if store_identity is None
+                    else store_identity.model_dump(mode="json")
+                ),
+            },
+        )
+        tools = [
+            ListFilesTool(),
+            SearchTextTool(
+                exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES,
+                protected_entry_names=_SOURCE_EXCLUDED_DIRECTORY_NAMES,
+            ),
+            ReadFileTool(),
+            ApplyPatchTool(),
+            WriteFileTool(),
+            EditFileTool(),
+            DeleteFileTool(),
+            GitChangesTool(),
+            check_tool,
+            command_tool,
+        ]
+        if __CODING_ARTIFACTS_ENABLED__:
+            tools.append(ListArtifactsTool())
+        if _KNOWLEDGE_ENABLED:
+            tools.extend(
+                (
+                    ListKnowledgeTool(),
+                    SearchKnowledgeTool(),
+                    ReadKnowledgeTool(),
+                    RememberKnowledgeTool(),
+                )
+            )
+        if __CODING_DELEGATION_ENABLED__:
+            app.register_environment(_reviewer_environment())
+            background_registry = BackgroundSubagentTaskRegistry()
+            tools.extend(
+                (
+                    SubagentTool(
+                        app,
+                        agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
+                        background_registry=background_registry,
+                        execution_profile_identity=_subagent_tool_identity(
+                            reviewer_agent,
+                            reviewer_execution_profile_identity,
+                            generated_session_store=stores.generated_session_store,
+                        ),
+                    ),
+                    SubagentResultTool(
+                        app.session_store,
+                        background_registry=background_registry,
+                        default_timeout_s=30,
+                        execution_profile_identity=_subagent_result_tool_identity(
+                            generated_session_store=stores.generated_session_store,
+                        ),
+                    ),
+                )
+            )
+        if __CODING_HUMAN_INPUT_ENABLED__:
+            tools.append(UserInputTool())
+        register_coding_agents(
+            app,
+            primary_agent=primary_agent,
+            reviewer_agent=reviewer_agent,
+            tools=require_coding_tool_inventory(tuple(tools), docker=True),
+            tool_policy=require_coding_tool_policy(
+                StructuredCommandToolPolicy(
+                    toolchain_profile=toolchain_profile,
+                    base_policy=_primary_tool_policy(
+                        check_names=check_names,
+                        command_selectors=command_selectors,
                     ),
                 ),
-                SubagentResultTool(
-                    app.session_store,
-                    background_registry=background_registry,
-                    default_timeout_s=30,
-                    execution_profile_identity=_subagent_result_tool_identity(
-                        generated_session_store=stores.generated_session_store,
-                    ),
-                ),
-            )
-        )
-    if __CODING_HUMAN_INPUT_ENABLED__:
-        tools.append(UserInputTool())
-    register_coding_agents(
-        app,
-        primary_agent=primary_agent,
-        reviewer_agent=reviewer_agent,
-        tools=require_coding_tool_inventory(tuple(tools), docker=True),
-        tool_policy=require_coding_tool_policy(
-            StructuredCommandToolPolicy(
-                toolchain_profile=toolchain_profile,
-                base_policy=_primary_tool_policy(
-                    check_names=check_names,
-                    command_selectors=command_selectors,
-                ),
             ),
-        ),
-        # The backend sets the evidence its sandboxes can prove: live on Docker,
-        # broker-reported guarantees on Cayu Cloud. Both are trusted-code only.
-        execution_requirements=backend.execution_requirements(
-            real_secret_visibility="non_possession",
-            guest_privilege="contained",
-            host_filesystem="isolated",
-            cancellation="confirmed",
-            cleanup="confirmed",
-        ),
-        provider_override=provider,
-    )
-    return CodingComposition(
-        app=app,
-        source_workspace=source_workspace,
-        artifact_store=selected_artifact_store,
-        toolchain_profile=toolchain_profile,
-        backend=backend,
-        project_root=root,
-        image_fingerprint=(
-            receipt.image_identity.fingerprint
-            if backend.name == DOCKER_CODING_BACKEND
-            else None
-        ),
-    )
+            # The backend sets the evidence its sandboxes can prove: live on Docker,
+            # broker-reported guarantees on Cayu Cloud. Both are trusted-code only.
+            execution_requirements=backend.execution_requirements(
+                real_secret_visibility="non_possession",
+                guest_privilege="contained",
+                host_filesystem="isolated",
+                cancellation="confirmed",
+                cleanup="confirmed",
+            ),
+            provider_override=provider,
+        )
+        return CodingComposition(
+            app=app,
+            source_workspace=source_workspace,
+            artifact_store=selected_artifact_store,
+            toolchain_profile=toolchain_profile,
+            backend=backend,
+            project_root=root,
+            image_fingerprint=(
+                receipt.image_identity.fingerprint
+                if backend.name == DOCKER_CODING_BACKEND
+                else None
+            ),
+        )
 
 
 def register_workspace_environment(
@@ -7039,7 +7048,7 @@ def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
     # The coding build_app body below constructs these through operations.coding.
     for unused_import in (
         "from collections.abc import Iterable\n\n",
-        "from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose\n",
+        "from cayu.runtime import SupportsAsyncAclose, SupportsAsyncClose, close_on_failure\n",
         "from cayu.artifacts import ArtifactStore\n",
         "from cayu.storage import KnowledgeStore\n",
         "from cayu.model_policy import configured_model_policy\n",
@@ -7051,7 +7060,7 @@ def _coding_app_source(source: str, *, app_build: str = _APP_BUILD) -> str:
     ):
         source = source.replace(unused_import, "", 1)
     start = source.index("def build_app(")
-    end_marker = "\n    return app\n"
+    end_marker = "\n        return app\n"
     end = source.index(end_marker, start) + len(end_marker)
     return source[:start] + app_build + source[end:]
 
@@ -7147,6 +7156,11 @@ def _docker_composition_source(source: str) -> str:
 
 def _docker_coding_app_source(source: str) -> str:
     rendered = _coding_app_source(source, app_build=_DOCKER_APP_BUILD)
+    rendered = rendered.replace(
+        "from cayu.providers import ModelProvider\n",
+        "from cayu.providers import ModelProvider\nfrom cayu.runtime import close_on_failure\n",
+        1,
+    )
     rendered = rendered.replace(
         "from operations.coding import build_coding_app\n",
         (
