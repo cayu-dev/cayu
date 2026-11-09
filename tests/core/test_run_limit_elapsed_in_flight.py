@@ -87,8 +87,9 @@ class VirtualClockLoop(asyncio.SelectorEventLoop):
         return future
 
     async def shutdown_default_executor(self, timeout: float | None = None) -> None:
-        # A virtual timeout would expire at once; joining takes real time.
-        await super().shutdown_default_executor(None)
+        # A virtual timeout would expire at once; joining takes real time. Leave
+        # the timeout out: no timeout is the default on 3.12+, and 3.11 takes none.
+        await super().shutdown_default_executor()
 
 
 _WALL_CLOCK_ORIGIN = datetime(2030, 1, 1, tzinfo=UTC)
