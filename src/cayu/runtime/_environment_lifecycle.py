@@ -4219,6 +4219,7 @@ class EnvironmentLifecycle:
         run_epoch: int,
     ) -> None:
         """Remove exact live reconnect authority only after confirmed disposal."""
+        generation = uuid4().hex
 
         def retire(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
             if session.instance_id != session_instance_id or session.run_epoch != run_epoch:
@@ -4262,6 +4263,11 @@ class EnvironmentLifecycle:
                 or receipt.reconnect_metadata != reconnect
             ):
                 raise RuntimeError("Allocation disposal conflicts with its receipt.")
+            copied.setdefault(_ALLOCATION_GENERATIONS_KEY, {})[environment_name] = {
+                "session_instance_id": session_instance_id,
+                "reconnect_metadata": reconnect,
+                "successor_generation": generation,
+            }
             # Keep the identity this allocation's bindings recorded. Once the
             # identity record and receipt are gone, the reconnect metadata may
             # not carry it, for example when a wrapping factory nests it.

@@ -3766,7 +3766,12 @@ def test_disposal_retirement_preserves_successor_authority(stale: bool) -> None:
                 session_instance_id=session.instance_id,
                 run_epoch=session.run_epoch,
             )
-            # Lost commit acknowledgement can be retried without restoring live authority.
+            retired_checkpoint = await store.load_checkpoint(session.id)
+            generation = environment_lifecycle_module._retired_allocation_generation(
+                retired_checkpoint, session=session, environment_name="coding"
+            )
+            assert generation is not None
+            # Lost commit acknowledgement must preserve the successor generation too.
             await lifecycle._retire_disposed_allocation(
                 session.id,
                 "coding",
@@ -3775,6 +3780,13 @@ def test_disposal_retirement_preserves_successor_authority(stale: bool) -> None:
                 run_epoch=session.run_epoch,
             )
             assert await store.load_checkpoint(session.id) == {
+                environment_lifecycle_module._ALLOCATION_GENERATIONS_KEY: {
+                    "coding": {
+                        "session_instance_id": session.instance_id,
+                        "reconnect_metadata": expected["reconnect_metadata"],
+                        "successor_generation": generation,
+                    },
+                },
                 environment_lifecycle_module._RETIRED_ALLOCATION_DISPOSAL_KEY: {"coding": expected},
                 ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY: {"other": {"id": "keep"}},
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY: {"other": session.id},
