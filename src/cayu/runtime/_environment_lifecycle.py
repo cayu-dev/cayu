@@ -9909,28 +9909,34 @@ async def _settle_environment_factory_release(
     once every owner and ``on_quiescent`` succeed, the cleanup is settled.
     """
 
-    pending = [release_task]
+    pending = [(release_task, False)]
     seen: set[asyncio.Task[None]] = set()
+    active: set[asyncio.Task[None]] = set()
     failures: list[BaseException] = []
     cancellation: asyncio.CancelledError | None = None
     while pending:
-        task = pending.pop()
+        task, exiting = pending.pop()
+        if exiting:
+            active.remove(task)
+            continue
         if task in seen:
             continue
         seen.add(task)
+        active.add(task)
+        pending.append((task, True))
         outcome = await await_shielded_task_outcome(task)
         error = outcome.error
         cancellation = cancellation or outcome.cancellation
         if error is None:
             continue
         nested, unresolved = _environment_factory_cleanup_handoffs(error)
-        unseen = tuple(task for task in nested if task not in seen)
-        if len(unseen) != len(nested):
-            # A terminal task that delegates back to itself or an earlier
-            # owner supplies no new proof of quiescence. Preserve its
+        if any(task in active for task in nested):
+            # Only a handoff to an ancestor in the active chain is cyclic;
+            # completed shared dependencies need not be settled again.
+            # A cyclic owner supplies no new proof of quiescence. Preserve its
             # original failure so lifecycle capacity remains fenced.
             failures.append(_environment_factory_cleanup_failure(error))
-        pending.extend(unseen)
+        pending.extend((task, False) for task in nested if task not in seen)
         failures.extend(_environment_factory_cleanup_failure(failure) for failure in unresolved)
     if failures:
         failure: BaseException = (
