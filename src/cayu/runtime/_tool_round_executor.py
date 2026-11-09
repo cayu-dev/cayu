@@ -3141,6 +3141,18 @@ async def _await_mcp_manifest_operation(
             cancellation,
             operation=operation,
         ) from cancellation
+    except Exception as error:
+        # Storage cleanup may replace the caller's cancellation with an error.
+        if current_task is None or current_task.cancelling() <= cancellation_requests:
+            raise
+        cancellation = consume_pending_task_cancellation(
+            preserve_requests=cancellation_requests,
+        )
+        if cancellation is None:
+            raise RuntimeError(
+                "MCP manifest caller cancellation could not be recovered."
+            ) from error
+        raise cancellation from error
     if current_task is not None and current_task.cancelling() > cancellation_requests:
         cancellation = consume_pending_task_cancellation(
             preserve_requests=cancellation_requests,
