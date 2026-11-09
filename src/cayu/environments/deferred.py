@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 from cayu._validation import require_clean_nonblank
+from cayu.environments._cleanup_handoff import (
+    KEPT_TEARDOWN_TIMEOUT_S,
+    KeptTeardownStillRunning,
+    keep_cleanup_owners,
+)
 from cayu.environments._phase_timing import EnvironmentPhaseTimer
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
 from cayu.environments.factory import (
@@ -362,12 +367,13 @@ class DeferredMaterialization:
                         )
                     )
                     try:
-                        await self._close_pending()
+                        await self._close_pending(retiring=runner)
                     except asyncio.CancelledError as cancellation:
                         # The cleanup owner remains pending, but the attempt
                         # still needs its terminal notification before exit.
                         error = cancellation
                     except Exception:
+                        # A failed close stays pending with its teardown owner.
                         pass
                 reason = (
                     error.reason
@@ -424,11 +430,19 @@ class DeferredMaterialization:
             )
             return runner
 
-    async def _close_pending(self) -> None:
-        """Close every retired runner; one whose close fails stays pending."""
+    async def _close_pending(self, *, retiring: Runner | None = None) -> None:
+        """Close every retired runner; one whose close fails stays pending.
+
+        Closing only what is ``retiring`` under the materialization lock never
+        touches an earlier runner; a later close retries that one. All waits
+        for handed-off teardown share one bound.
+        """
 
         failure: BaseException | None = None
+        deadline = asyncio.get_running_loop().time() + KEPT_TEARDOWN_TIMEOUT_S
         for pending in tuple(self._pending_close):
+            if retiring is not None and pending.runner is not retiring:
+                continue
             try:
                 # Failed admission can leave probes owning this allocation.
                 # Retain their prerequisite across cancellation and cleanup retries.
@@ -439,7 +453,19 @@ class DeferredMaterialization:
                     # Isolate a dependency's cancellation from the caller.
                     # A terminal task without a retry owner is quiescent even
                     # when it failed; it must not prevent allocation closure.
-                    await asyncio.wait((pending.settlement,))
+                    done, _ = await asyncio.wait(
+                        (pending.settlement,),
+                        timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                    )
+                    if not done:
+                        timeout = KeptTeardownStillRunning(
+                            "A retired deferred runner's earlier teardown is still running; "
+                            "its close is retried later."
+                        )
+                        attach_environment_factory_cleanup_settlement_task(
+                            timeout, pending.settlement
+                        )
+                        raise timeout
                     if environment_factory_cleanup_retry_available(pending.settlement):
                         if pending.settlement.cancelled():
                             raise RuntimeError(
@@ -450,6 +476,24 @@ class DeferredMaterialization:
                         pending.settlement.exception()
                 await pending.runner.close()
             except BaseException as error:
+                # A close that hands its teardown to a successor leaves it as
+                # this runner's prerequisite: the next close waits for it. A
+                # terminal settlement without a retry is already quiescent.
+                owners = (
+                    []
+                    if pending.settlement is None
+                    or (
+                        pending.settlement.done()
+                        and not environment_factory_cleanup_retry_available(pending.settlement)
+                    )
+                    else [pending.settlement]
+                )
+                keep_cleanup_owners(error, into=owners)
+                pending.settlement = combine_environment_factory_cleanup_settlement_tasks(
+                    owners,
+                    task_name="cayu-deferred-runner-close-settlement",
+                    failure_message="A retired deferred runner's teardown failed to settle.",
+                )
                 failure = failure or error
                 continue
             if pending in self._pending_close:

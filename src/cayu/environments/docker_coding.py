@@ -33,6 +33,7 @@ from cayu._validation import (
 )
 from cayu.artifacts.base import ArtifactStore
 from cayu.credentials import CredentialMode
+from cayu.environments._cleanup_handoff import keep_cleanup_owners
 from cayu.environments._ephemeral_git import (
     GIT_ENV_REMOVE,
     EphemeralGitBaseline,
@@ -3327,9 +3328,11 @@ class _DockerWarmSpareBackend:
         try:
             # Same admission probes a cold start runs, on this exact container.
             await _run_toolchain_admission_probes(runner, self._factory.toolchain_profile)
-        except BaseException:
-            with suppress(Exception):
+        except BaseException as error:
+            try:
                 await runner.close()
+            except Exception as close_error:
+                keep_cleanup_owners(close_error, into=error)
             raise
         return _DockerWarmSpare(runner=runner, requirements_key=_requirements_key(requirements))
 

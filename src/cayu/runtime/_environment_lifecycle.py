@@ -60,6 +60,7 @@ from cayu.egress.transitions import (
     _discard_egress_authority_allocation_parking_reservation,
     _reserve_egress_authority_allocation_parking,
 )
+from cayu.environments._cleanup_handoff import KeptTeardowns, keep_cleanup_owners
 from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
 from cayu.environments._phase_timing import EnvironmentPhaseTimer
 from cayu.environments.admission import (
@@ -822,6 +823,7 @@ class EnvironmentLifecycle:
         self._active_environment_setups: dict[str, _ActiveEnvironmentSetup] = {}
         self._pending_environment_owner_admissions: set[str] = set()
         self._deferred_factory_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+        self._leftover_teardown = KeptTeardowns()
         self._deferred_factory_cleanup_profiles: dict[str, ExecutionProfileIdentity] = {}
         self._deferred_run_fence_release_events: dict[_RunFenceReleaseKey, asyncio.Event] = {}
         self._deferred_run_fence_release_tasks: dict[_RunFenceReleaseKey, asyncio.Task[None]] = {}
@@ -2058,17 +2060,15 @@ class EnvironmentLifecycle:
             execution_requirements=effective_execution_requirements(session, registered_agent),
         )
         try:
+            await self._leftover_teardown.await_settled((session.id, name))
             released = await environment_operation_boundary.await_environment_operation(
                 lambda: factory.release_deferred_materialization(request),
                 operation_name="Deferred environment crash cleanup",
                 redactor=self._secret_redactor,
             )
-        except Exception:
-            # Best effort: the leftover holds no output to publish. It is never
-            # adopted: the next materialization in use mode removes it before
-            # creating a fresh resource, and finalization of a run that never
-            # materializes disposes it. A daemon outage must not make recovery
-            # fail on every retry.
+        except Exception as error:
+            # Best effort; a handed-off teardown stays with the leftover for the next attempt.
+            keep_cleanup_owners(error, into=self._leftover_teardown.bucket((session.id, name)))
             logger.warning(
                 "Deferred environment crash cleanup failed; it is retried at the next "
                 "materialization or finalization.",
@@ -3310,6 +3310,7 @@ class EnvironmentLifecycle:
         allocation_checkpoint_may_be_committed = False
         effective_operation = operation
         try:
+            await self._leftover_teardown.await_settled((session.id, environment_name))
             await _report_environment_lifecycle(
                 progress_reporter,
                 EnvironmentLifecyclePhase.OWNERSHIP_ADMISSION,
@@ -4195,7 +4196,7 @@ class EnvironmentLifecycle:
         session_id = None if metadata is None else metadata.get("session_id")
         if type(session_id) is not str:
             raise RuntimeError("Binding finalization lost its session identity.")
-
+        await self._leftover_teardown.await_settled((session_id, registered_environment.spec.name))
         pending_disposal: dict[str, Any] | None = None
         disposal_context: InvocationContext | None = None
 
@@ -9580,6 +9581,7 @@ async def _release_unclaimed_factory_result(
         state = {"release_dispatched": False}
 
         async def run_fallback_release() -> None:
+            kept: list[asyncio.Task[None]] = []
             await settle_before_release()
             state["release_dispatched"] = True
             runner = result.environment.runner
@@ -9591,7 +9593,7 @@ async def _release_unclaimed_factory_result(
                         redactor=resolved_redactor,
                     )
                 except Exception as cleanup_error:
-                    cleanup_errors.append(("runner", cleanup_error))
+                    cleanup_errors.append(("runner", keep_cleanup_owners(cleanup_error, into=kept)))
 
             binding = result.environment.binding
             close = getattr(binding, "close", None)
@@ -9609,7 +9611,12 @@ async def _release_unclaimed_factory_result(
                         redactor=resolved_redactor,
                     )
                 except Exception as cleanup_error:
-                    cleanup_errors.append(("binding", cleanup_error))
+                    cleanup_errors.append(
+                        ("binding", keep_cleanup_owners(cleanup_error, into=kept))
+                    )
+            if kept:  # Settle after every handed-off teardown; keep each one's own retry.
+                await asyncio.wait(kept)
+                keep_cleanup_owners(kept, into=original_error)
             if not cleanup_errors and on_quiescent is not None:
                 on_quiescent()
 
@@ -9647,23 +9654,15 @@ async def _release_unclaimed_factory_result(
             timeout_handoff_task=(fallback_task if pre_release_owner else None),
         )
     except BaseException as cleanup_error:
-        if pre_release_owner:
-            attach_environment_factory_cleanup_settlement_task(
-                original_error,
-                fallback_task,
+        attach_environment_factory_cleanup_settlement_task(
+            original_error,
+            (
+                None
+                if pre_release_owner
+                else environment_factory_cleanup_settlement_task(cleanup_error)
             )
-        elif (
-            settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
-        ) is not None:
-            attach_environment_factory_cleanup_settlement_task(
-                original_error,
-                settlement_task,
-            )
-        else:
-            attach_environment_factory_cleanup_settlement_task(
-                original_error,
-                fallback_task,
-            )
+            or fallback_task,
+        )
         diagnostic = exception_diagnostic(
             cleanup_error,
             empty_message="environment factory fallback release failed",
@@ -9799,8 +9798,7 @@ async def _await_bounded_environment_factory_release(
             "Environment release failed after caller cancellation.",
             [cancellation, error],
         )
-        settlement = environment_factory_cleanup_settlement_task(error)
-        if settlement is not None:
+        if (settlement := environment_factory_cleanup_settlement_task(error)) is not None:
             attach_environment_factory_cleanup_settlement_task(failure, settlement)
         raise failure from None
     return cancellation

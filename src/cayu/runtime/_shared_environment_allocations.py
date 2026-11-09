@@ -55,6 +55,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from cayu.environments._cleanup_handoff import keep_cleanup_owners
 from cayu.environments._finalization_disposal import finalization_disposal_checkpoint
 from cayu.environments.base import Environment
 from cayu.environments.bindings import (
@@ -202,6 +203,8 @@ class _SharedAllocation:
     # released its state, and the factory disposed of the resources.
     binding_released: bool = False
     resources_discarded: bool = False
+    # Teardown a failed release or discard handed off; every retry waits for it.
+    cleanup_successors: list[asyncio.Task[None]] = field(default_factory=list)
     # The durable record of a workflow-owned allocation, and the attempts of
     # this process that may act on it; None for a process-local allocation.
     record: SharedAllocationRecord | None = None
@@ -1677,6 +1680,14 @@ class SharedEnvironmentAllocations:
         self._closing.discard(entry)
 
     async def _release(self, entry: _SharedAllocation, outcome: str) -> None:
+        await _await_cleanup_successors(entry)
+        try:
+            await self._release_once(entry, outcome)
+        except BaseException as error:
+            keep_cleanup_owners(error, into=entry.cleanup_successors)
+            raise
+
+    async def _release_once(self, entry: _SharedAllocation, outcome: str) -> None:
         if entry.record is not None and not await self._still_holds(entry):
             # A newer attempt of the run took the allocation over in another
             # process; finalizing it here would dispose of that attempt's work.
@@ -1920,6 +1931,7 @@ class SharedEnvironmentAllocations:
                 # Another attempt took it over: it isn't this process's to discard.
                 self._forget(entry)
                 return True
+        await _await_cleanup_successors(entry)
         if not entry.binding_released and entry.bound is not None and binding is not None:
             try:
                 if not binding.abandon(entry.bound):
@@ -1933,6 +1945,7 @@ class SharedEnvironmentAllocations:
                         entry.bound, outcome=entry.release_outcome or "interrupted"
                     )
             except Exception as error:
+                keep_cleanup_owners(error, into=entry.cleanup_successors)
                 _LOGGER.warning(
                     "Releasing the binding state of environment %r's shared allocation "
                     "failed (%s); it is kept for a retry.",
@@ -1945,6 +1958,7 @@ class SharedEnvironmentAllocations:
             try:
                 await _discard_resources(entry.result)
             except Exception as error:
+                keep_cleanup_owners(error, into=entry.cleanup_successors)
                 _LOGGER.warning(
                     "Discarding the shared allocation of environment %r failed (%s).",
                     name,
@@ -2552,6 +2566,19 @@ async def _positively_disposed(
         return await factory.is_allocation_disposed(request) is True
     except Exception:
         return False
+
+
+async def _await_cleanup_successors(entry: _SharedAllocation) -> None:
+    """Wait for the teardown an earlier failed release or discard of ``entry`` handed off."""
+
+    if not entry.cleanup_successors:
+        return
+    await asyncio.wait(entry.cleanup_successors)
+    for task in entry.cleanup_successors:
+        # The failure that handed it off was already reported; mark it retrieved.
+        if not task.cancelled():
+            task.exception()
+    entry.cleanup_successors.clear()
 
 
 async def _discard_resources(result: EnvironmentFactoryResult) -> bool:

@@ -108,6 +108,7 @@ from cayu.egress.transitions import (
     _runtime_egress_authority_adoption_result,
     egress_authority_owner_fingerprint,
 )
+from cayu.environments._cleanup_handoff import keep_cleanup_owners
 from cayu.environments._setup_commands import validate_setup_command_timeout
 from cayu.environments.admission import (
     _REQUIRED_LIVE_OBSERVATIONS,
@@ -1661,7 +1662,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                         outcome="interrupted" if reconnect_identity is not None else None
                     )
                 except asyncio.CancelledError as cancellation:
-                    rollback_cancellation = cancellation
+                    rollback_cancellation = keep_cleanup_owners(
+                        cancellation, into=factory_settlement_tasks
+                    )
                 except BaseException as cleanup_error:
                     if not managed_runner.closed:
                         factory_settlement_tasks.append(
@@ -1672,6 +1675,8 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                                 ),
                             )
                         )
+                    else:
+                        keep_cleanup_owners(cleanup_error, into=factory_settlement_tasks)
                     cleanup_errors.append(("managed runner", cleanup_error))
             else:
                 revocation_complete = False
@@ -1703,14 +1708,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                         ):
                             rollback_cancellation = asyncio.CancelledError()
                     except asyncio.CancelledError as cancellation:
-                        rollback_cancellation = cancellation
+                        rollback_cancellation = keep_cleanup_owners(
+                            cancellation, into=factory_settlement_tasks
+                        )
                     except BaseException as cleanup_error:
-                        if (
-                            cleanup_settlement_task := environment_factory_cleanup_settlement_task(
-                                cleanup_error
-                            )
-                        ) is not None:
-                            factory_settlement_tasks.append(cleanup_settlement_task)
+                        keep_cleanup_owners(cleanup_error, into=factory_settlement_tasks)
                         cleanup_errors.append(("runner", cleanup_error))
                 if binding is not None and revocation_complete:
                     try:
@@ -1721,14 +1723,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                         ):
                             rollback_cancellation = asyncio.CancelledError()
                     except asyncio.CancelledError as cancellation:
-                        rollback_cancellation = cancellation
+                        rollback_cancellation = keep_cleanup_owners(
+                            cancellation, into=factory_settlement_tasks
+                        )
                     except BaseException as cleanup_error:
-                        if (
-                            cleanup_settlement_task := environment_factory_cleanup_settlement_task(
-                                cleanup_error
-                            )
-                        ) is not None:
-                            factory_settlement_tasks.append(cleanup_settlement_task)
+                        keep_cleanup_owners(cleanup_error, into=factory_settlement_tasks)
                         cleanup_errors.append(("binding", cleanup_error))
             if ca_dir is not None:
                 with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -2035,6 +2034,19 @@ async def _await_cleanup(awaitable: Awaitable[None]) -> bool:
     return await _await_cleanup_task(asyncio.create_task(_run()))
 
 
+def _surviving_cancellation(
+    cancellation: asyncio.CancelledError | None,
+    phase_cancellation: asyncio.CancelledError | None,
+) -> asyncio.CancelledError | None:
+    """Keep the first cancellation, carrying any owners a later phase's one held."""
+
+    if cancellation is None:
+        return phase_cancellation
+    if phase_cancellation is not None:
+        keep_cleanup_owners(phase_cancellation, into=cancellation)
+    return cancellation
+
+
 def _split_cleanup_cancellation(
     error: BaseExceptionGroup,
 ) -> tuple[asyncio.CancelledError | None, Exception | None]:
@@ -2057,16 +2069,18 @@ def _split_cleanup_cancellation(
             raise error
         ordinary_failures.append(candidate)
     if not ordinary_failures:
+        if cancellation is not None:
+            keep_cleanup_owners(error, into=cancellation)
         return cancellation, None
-    if len(ordinary_failures) == 1:
-        return cancellation, ordinary_failures[0]
-    return (
-        cancellation,
-        ExceptionGroup(
-            "Virtual-egress cleanup had concurrent failures.",
-            ordinary_failures,
-        ),
+    failure = (
+        ordinary_failures[0]
+        if len(ordinary_failures) == 1
+        else ExceptionGroup("Virtual-egress cleanup had concurrent failures.", ordinary_failures)
     )
+    # Owners attached to the group itself, or to a cancellation, ride on what
+    # is kept from it.
+    keep_cleanup_owners(error, into=failure)
+    return cancellation, failure
 
 
 def _contains_timeout(error: BaseException) -> bool:
@@ -4247,7 +4261,7 @@ class _EgressManagedRunner(Runner):
                 errors.append((phase, failure))
                 return
             phase_cancellation, timeout_error = _split_cleanup_cancellation(failure)
-            cancellation = cancellation or phase_cancellation
+            cancellation = _surviving_cancellation(cancellation, phase_cancellation)
             if (
                 phase_cancellation is not None
                 and isinstance(timeout_error, TimeoutError)
@@ -4309,7 +4323,7 @@ class _EgressManagedRunner(Runner):
                 record_timeout("runner", timeout_failure)
             else:
                 phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
-                cancellation = cancellation or phase_cancellation
+                cancellation = _surviving_cancellation(cancellation, phase_cancellation)
                 if cleanup_error is not None:
                     errors.append(("runner", cleanup_error))
         except Exception as exc:
@@ -4339,7 +4353,7 @@ class _EgressManagedRunner(Runner):
                     record_timeout("binding", timeout_failure)
                 else:
                     phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
-                    cancellation = cancellation or phase_cancellation
+                    cancellation = _surviving_cancellation(cancellation, phase_cancellation)
                     if cleanup_error is not None:
                         errors.append(("binding", cleanup_error))
             except Exception as exc:
@@ -4365,7 +4379,7 @@ class _EgressManagedRunner(Runner):
                     record_timeout("audit", timeout_failure)
                 else:
                     phase_cancellation, cleanup_error = _split_cleanup_cancellation(exc)
-                    cancellation = cancellation or phase_cancellation
+                    cancellation = _surviving_cancellation(cancellation, phase_cancellation)
                     if cleanup_error is not None:
                         errors.append(("audit", cleanup_error))
             except Exception as exc:

@@ -28,6 +28,8 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
 from uuid import uuid4
 
+from cayu.environments._cleanup_handoff import keep_cleanup_owners
+
 if TYPE_CHECKING:
     from cayu.environments.admission import ExecutionRequirements
 
@@ -209,6 +211,8 @@ class WarmSparePool(Generic[SpareT]):
         self._spares: list[SpareT] = []
         self._unsatisfiable: dict[str, float] = {}
         self._refill_task: asyncio.Task[None] | None = None
+        # Teardown a failed creation or discard handed off; releasing waits for it.
+        self._handed_off_teardown: list[asyncio.Task[None]] = []
         self._backoff_s = 0.0
         self._next_attempt_at = 0.0
         self._next_reap_at = 0.0
@@ -275,7 +279,8 @@ class WarmSparePool(Generic[SpareT]):
     async def _discard(self, spare: SpareT) -> None:
         try:
             await self._backend.discard_spare(spare)
-        except Exception:
+        except Exception as error:
+            keep_cleanup_owners(error, into=self._handed_off_teardown)
             logger.warning("Discarding a warm spare failed.", exc_info=True)
 
     async def take(self, name: str, requirements: ExecutionRequirements) -> SpareT | None:
@@ -381,7 +386,8 @@ class WarmSparePool(Generic[SpareT]):
         while not self._closed and not self._idle_released and len(self._spares) < self._size:
             try:
                 spare = await self._backend.create_spare(self._spare_name())
-            except Exception:
+            except Exception as error:
+                keep_cleanup_owners(error, into=self._handed_off_teardown)
                 logger.warning("Warm spare creation failed; backing off.", exc_info=True)
                 self._back_off()
                 return
@@ -410,6 +416,18 @@ class WarmSparePool(Generic[SpareT]):
         spares, self._spares = self._spares, []
         for spare in spares:
             await self._discard(spare)
+        teardown = tuple(self._handed_off_teardown)
+        if teardown:
+            # Kept until settled, so a cancelled release keeps waiting next time.
+            await asyncio.wait(teardown)
+            for task in teardown:
+                # Its failure was already logged where it was handed off.
+                if not task.cancelled():
+                    task.exception()
+            settled = set(teardown)
+            self._handed_off_teardown = [
+                task for task in self._handed_off_teardown if task not in settled
+            ]
 
     async def release_idle(self) -> None:
         """Remove every idle spare; the next ``take`` refills the pool."""
