@@ -2436,8 +2436,8 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   kind only, so `--cursor` and `--kind` can't be combined with `--agent`,
   `--rule`, `--dimension`, `--min-score` or `--tool`, nor `--cursor` with
   `--summary`; with those filters `--limit N` keeps the N strongest that match,
-  with no cursor. Cloud's paged findings carry no `score`, so the SCORE column
-  shows `-` for them. Without `--limit`, `--cursor` or `--kind` the command
+  with no cursor. A Cloud release from before paged findings carried their
+  `score` leaves the SCORE column `-` for them. Without `--limit`, `--cursor` or `--kind` the command
   reads the Agent's findings as before. A cursor Cloud doesn't recognize is
   refused with `invalid_cursor`, and a Cloud release from before paging answers
   `compass_paging_unavailable` to `--cursor` and `--kind` (a plain `--limit`
@@ -2447,8 +2447,10 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   the findings it proposed and left waiting, and the mission it made ready or
   why it made none. `--limit N` lists N (20 by default), `--cursor` goes on
   from an earlier listing's `next_cursor`, and `--all` follows the cursors to
-  the oldest pass. `--json` prints the JSON envelope. Cloud answers no `total`
-  for passes. A Cloud release from before paging answers
+  the oldest pass. The table ends with how many it shows of Cloud's `total`
+  ("20 of 57 passes."), which `--json` prints as `total`; a Cloud release from
+  before it counted passes sends none, and `total` is null. `--json` prints the
+  JSON envelope. A Cloud release from before paging answers
   `compass_paging_unavailable`.
 - **Dismissing findings in bulk.** `findings dismiss AGENT --rule RULE --note
   TEXT` dismisses every proposed finding of the rule, narrowed by the same

@@ -1115,6 +1115,8 @@ def test_findings_list_pages_by_status_and_kind_and_prints_the_next_cursor(
     assert main(["cloud", "compass", "findings", "list", "cayu-scout", *options]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert [line.split()[0] for line in lines[1:3]] == ["f-1", "f-2"]
+    # The SCORE column shows the score each paged finding carries.
+    assert [line.split()[3] for line in lines[1:3]] == ["9", "4"]
     assert lines[-2:] == [
         "2 of 3 findings.",
         "More findings follow: pass --cursor c-2 with the same options.",
@@ -1288,7 +1290,47 @@ def test_passes_list_pages_through_every_pass(cloud, capsys: pytest.CaptureFixtu
     result = output["result"]
     assert (len(result["items"]), result["next_cursor"]) == (105, None)
     assert result["application_id"] == "cayu-scout"
+    # This Cloud doesn't count passes.
+    assert result["total"] is None
     assert len(fake.requests) == 3
+
+
+def test_passes_list_prints_the_total_cloud_counts(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paged = f"{_PAGES}/passes?agent=cayu-scout"
+    cloud(
+        {
+            ("GET", f"{paged}&limit=2"): [
+                httpx.Response(200, json={"passes": _passes(2), "next_cursor": "p-2", "total": 3})
+            ],
+            ("GET", f"{paged}&limit=100&cursor=p-2"): [
+                httpx.Response(200, json={"passes": _passes(1), "next_cursor": None, "total": 3})
+            ],
+            ("GET", f"{paged}&limit=20"): [
+                httpx.Response(200, json={"passes": _passes(1), "next_cursor": None, "total": -1})
+            ],
+        }
+    )
+
+    assert main(["cloud", "compass", "passes", "list", "cayu-scout", "--limit", "2"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-3:] == ["", "2 of 3 passes.", "More passes follow: pass --cursor p-2, or --all."]
+
+    assert (
+        main(["cloud", "compass", "passes", "list", "cayu-scout", "--cursor", "p-2", "--all"]) == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2:] == ["", "1 of 3 passes."]
+
+    code, output = _run(
+        ["passes", "list", "cayu-scout", "--cursor", "p-2", "--all", "--json"], capsys
+    )
+    assert (code, output["result"]["total"]) == (0, 3)
+
+    # A total no count can be is refused.
+    code, output = _run(["passes", "list", "cayu-scout", "--json"], capsys)
+    assert (code, output["error"]["category"]) == (2, "api_response_invalid")
 
 
 def test_passes_list_takes_a_limit_or_all_but_not_both(

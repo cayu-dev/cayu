@@ -3,8 +3,9 @@
 `compass show` gives an Agent's recent passes; this lists all of them, newest first, from
 Cloud's paged listing (`GET /v1/compass/passes`). `--limit N` lists N of them (20 by
 default), `--cursor` goes on after an earlier listing and `--all` lists every one after it.
-The answer's `next_cursor` goes on after the last pass listed. It prints a table by
-default; `--json` prints the JSON envelope the other `cayu cloud` commands print.
+The answer's `next_cursor` goes on after the last pass listed, and `total` counts every pass
+(None from a Cloud that doesn't count them). It prints a table by default; `--json` prints the
+JSON envelope the other `cayu cloud` commands print.
 """
 
 from __future__ import annotations
@@ -49,12 +50,14 @@ def list_passes(
     client: CloudApiClient, application: str, arguments: argparse.Namespace
 ) -> dict[str, Any]:
     """The Agent's passes after ``--cursor``, newest first: ``--limit`` of them, or every
-    one with ``--all``, with the ``next_cursor`` after the last one listed."""
+    one with ``--all``, with the ``next_cursor`` after the last one listed and the ``total``
+    Cloud counts (None from a Cloud that doesn't)."""
 
     if arguments.all and arguments.limit is not None:
         raise ValueError("--all lists every pass; leave out --limit.")
     limit = None if arguments.all else (arguments.limit or DEFAULT_LIMIT)
     items: list[dict[str, Any]] = []
+    total: int | None = None
     cursor: str | None = arguments.cursor
     # Every cursor a page started from: a page that answers one of them again would loop.
     seen: set[str] = set() if cursor is None else {cursor}
@@ -75,9 +78,16 @@ def list_passes(
             )
         records = answer.get("passes")
         following = answer.get("next_cursor")
-        if not isinstance(records, list) or not (following is None or isinstance(following, str)):
+        # A Cloud from before it counted passes answers no `total`.
+        counted = answer.get("total")
+        if (
+            not isinstance(records, list)
+            or not (following is None or isinstance(following, str))
+            or not (counted is None or (type(counted) is int and counted >= 0))
+        ):
             raise CloudApiError("api_response_invalid", "Compass's page of passes is invalid.")
         items.extend(item for item in records if isinstance(item, dict))
+        total = counted
         cursor = following or None
         if cursor is not None and cursor in seen:
             raise CloudApiError(
@@ -88,7 +98,12 @@ def list_passes(
         seen.add(cursor)
     return {
         "operation": "compass.passes.list",
-        "result": {"application_id": application, "items": items, "next_cursor": cursor},
+        "result": {
+            "application_id": application,
+            "items": items,
+            "total": total,
+            "next_cursor": cursor,
+        },
     }
 
 
@@ -98,9 +113,15 @@ def render_passes(output: Mapping[str, Any]) -> str:
     if not items:
         return f"No passes for {_cell(result['application_id'])}."
     lines = _passes_table(items)
+    total = result.get("total")
+    if type(total) is int:
+        shown = f"{len(items)} of {total}" if total != len(items) else str(total)
+        lines.extend(["", f"{shown} passes."])
     if result.get("next_cursor") is not None:
         cursor = _cell(result["next_cursor"], limit=_CURSOR_LIMIT)
-        lines.extend(["", f"More passes follow: pass --cursor {cursor}, or --all."])
+        if type(total) is not int:
+            lines.append("")
+        lines.append(f"More passes follow: pass --cursor {cursor}, or --all.")
     return "\n".join(lines)
 
 
