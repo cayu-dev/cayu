@@ -4424,7 +4424,11 @@ class EnvironmentLifecycle:
 
             await self._session_store.transform_checkpoint(session_id, retain_completion)
 
-        token = finalization_disposal_checkpoint.set(checkpoint_disposal)
+        token = (
+            finalization_disposal_checkpoint.set(checkpoint_disposal)
+            if registered_environment.factory_backed
+            else None
+        )
         try:
             snapshot = await _finalize_binding_after_mutation_quiescence(
                 registered_environment,
@@ -4444,7 +4448,8 @@ class EnvironmentLifecycle:
                 )
             return snapshot
         finally:
-            finalization_disposal_checkpoint.reset(token)
+            if token is not None:
+                finalization_disposal_checkpoint.reset(token)
 
     async def recover_completion_disposal(
         self,
