@@ -3287,9 +3287,15 @@ class SyncBinding(WorkspaceBinding):
             state = self._states.get(state_key)
             if state is None or state.phase != "finalizing":
                 raise RuntimeError("SyncBinding copy-back lost its ownership state.")
+            # Deleted source files must not become target-only baseline content
+            # if they are recreated before a partially applied copy-back is retried.
+            deleted_paths = set(state.source_paths) - set(source_paths)
             self._states[state_key] = replace(
                 state,
                 source_paths=source_paths,
+                target_baseline_paths=tuple(
+                    path for path in state.target_baseline_paths if path not in deleted_paths
+                ),
                 source_revisions=source_revisions,
             )
 
