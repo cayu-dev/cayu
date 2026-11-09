@@ -106,6 +106,22 @@ _ALLOWED_HANDLERS: dict[str, dict[tuple[str, str], int]] = {
     },
 }
 
+# Calls that settle a session as an operator interruption.
+_INTERRUPTION_SETTLEMENTS = frozenset(
+    {
+        "handle_session_interrupted",
+        "handle_session_interrupted_preserving_failure",
+        "interrupt_recovery",
+    }
+)
+# The rules that decide whether a grouped exit is the caller's cancellation, which
+# abandons the run unless an interrupt was requested. Session exits ask
+# ``runtime._run_exit.grouped_caller_cancellation``; recovery keeps its own wider
+# abandonment signal.
+_GROUPED_CANCELLATION_RULES = frozenset(
+    {"grouped_caller_cancellation", "_recovery_abandonment_signal"}
+)
+
 # Entrances that admit an invocation. Between the admission call and their
 # settlement scope only these yields may appear (an admission the store refused
 # can replay an earlier profile decision; nothing was admitted).
@@ -209,3 +225,86 @@ def test_no_yield_between_admission_and_settlement_scope() -> None:
         assert len(yields) == allowed_yields, (
             f"{name} yields at lines {yields} after admission, before its settlement scope."
         )
+
+
+def _called_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _unclassified_group_handlers(tree: ast.AST) -> list[str]:
+    """Handlers that can catch a group and interrupt before asking the rule.
+
+    That is ``except BaseExceptionGroup``, ``except BaseException``, a bare
+    ``except`` or ``except*``. The rule must be called in the handler's own body,
+    not a nested function, before its first interruption call. The check is
+    syntactic: it sees order, not the branch the rule's answer takes.
+    """
+
+    unclassified: list[str] = []
+    for name, function in _functions(tree):
+        for node in _own_nodes(function):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            if node.type is not None and not set(_handler_type_names(node.type)) & {
+                "BaseExceptionGroup",
+                "BaseException",
+            }:
+                continue
+            calls = [call for call in _own_nodes(node) if isinstance(call, ast.Call)]
+            interruptions = [
+                call.lineno for call in calls if _called_name(call) in _INTERRUPTION_SETTLEMENTS
+            ]
+            rules = [
+                call.lineno for call in calls if _called_name(call) in _GROUPED_CANCELLATION_RULES
+            ]
+            if interruptions and (not rules or min(rules) >= min(interruptions)):
+                unclassified.append(f"{name} (line {node.lineno})")
+    return unclassified
+
+
+@pytest.mark.parametrize("relative", sorted(_ALLOWED_HANDLERS))
+def test_grouped_exits_classify_cancellation_before_interrupting(relative: str) -> None:
+    """A grouped exit settles as an operator interruption only after the one rule.
+
+    A grouped cancellation without an interrupt request settles like the plain
+    cancellation it carries; a handler that interrupts first would route it
+    differently.
+    """
+
+    unclassified = _unclassified_group_handlers(ast.parse((_ROOT / relative).read_text()))
+    assert not unclassified, (
+        f"Handlers in {relative} that can catch a group interrupt the session before "
+        f"asking grouped_caller_cancellation: {unclassified}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "def f():\n    try:\n        pass\n    except* BaseException as e:\n"
+            "        interrupt_recovery()\n        grouped_caller_cancellation(e)\n",
+            ["f (line 4)"],
+        ),
+        (
+            "def g():\n    try:\n        pass\n    except BaseExceptionGroup as e:\n"
+            "        def h():\n            grouped_caller_cancellation(e)\n"
+            "        interrupt_recovery()\n",
+            ["g (line 4)"],
+        ),
+        (
+            "def k():\n    try:\n        pass\n    except:\n"
+            "        grouped_caller_cancellation(None)\n        interrupt_recovery()\n",
+            [],
+        ),
+    ],
+    ids=["rule-after-interruption", "rule-in-nested-function", "rule-first"],
+)
+def test_grouped_exit_ratchet_sees_order_handlers_and_nesting(
+    source: str, expected: list[str]
+) -> None:
+    assert _unclassified_group_handlers(ast.parse(source)) == expected

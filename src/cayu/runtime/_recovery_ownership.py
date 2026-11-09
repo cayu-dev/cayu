@@ -32,6 +32,7 @@ from cayu._validation import (
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.runtime._committed_save import save_reconciling_cancellation
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
 )
@@ -43,6 +44,7 @@ from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
     RebindInvocationCommand,
     _release_invocation_command_with_cleanup_authority,
+    _replay_invocation_lifecycle_command,
     prepare_rebind_invocation_command,
 )
 from cayu.runtime._recovery_claims import (
@@ -447,6 +449,35 @@ class RecoveryOwnership:
             supervisor=self._recovery_cleanup_supervisor,
         )
 
+    async def interrupt_requested_for_exit(
+        self,
+        failure: BaseException,
+        read: Callable[[], Awaitable[bool]],
+        *,
+        cancellation_baseline: int = 0,
+    ) -> bool:
+        """Read whether an interrupt was requested while ``failure`` exits a run.
+
+        The read is cleanup of ``failure``: a redelivered cancellation cannot
+        interrupt it. If it fails, ``failure`` itself propagates, caused by the
+        read failure, so the caller's cancellation is never replaced by it.
+        """
+
+        requested: list[bool] = []
+
+        async def classify() -> None:
+            requested.append(await read())
+
+        failures = await self.run_cleanup_steps(
+            authoritative_failure=failure,
+            steps=(("cancelled exit interruption classification", classify),),
+            cancellation_baseline=cancellation_baseline,
+        )
+        if failures or not requested:
+            # A failed step is already in ``failure``'s cause chain.
+            raise failure
+        return requested[0]
+
     async def fence_or_rebind_active_invocation(
         self,
         session_id: str,
@@ -455,6 +486,7 @@ class RecoveryOwnership:
         checkpoint_transform: CheckpointTransform,
         target_status: SessionStatus | None = None,
         profile_adoption: PendingProfileAdoption | None = None,
+        own_task: bool = False,
     ) -> Session:
         """Advance one recovery epoch through the typed invocation seam.
 
@@ -462,7 +494,9 @@ class RecoveryOwnership:
         protocol.  Its durable CAS rejects a stale preflight.  A session with
         no such authority remains an intentional pre-invocation recovery case.
         A ``profile_adoption`` admits the paused invocation again under its
-        adopted profile instead of rebinding the recorded one.
+        adopted profile instead of rebinding the recorded one. ``own_task``
+        says this call is the whole body of its own child task, so a command
+        cancelled after it may have committed is re-read before it fails.
         """
 
         session = await self._session_store.load(session_id)
@@ -510,7 +544,15 @@ class RecoveryOwnership:
                 checkpoint_transform=checkpoint_transform,
                 target_status=target_status,
             )
-        result = await self._session_store.apply_invocation_lifecycle_command(command)
+        store = self._session_store
+        result = await (
+            save_reconciling_cancellation(
+                lambda: store.apply_invocation_lifecycle_command(command),
+                reconcile=lambda: _replay_invocation_lifecycle_command(store, command),
+            )
+            if own_task
+            else store.apply_invocation_lifecycle_command(command)
+        )
         if type(result) is not InvocationMutationResult:
             raise RuntimeError("Invocation rebind returned an incompatible result.")
         return result.session
@@ -757,6 +799,7 @@ class RecoveryOwnership:
                 session.id,
                 statuses={SessionStatus.INTERRUPTING},
                 checkpoint_transform=claim_interruption,
+                own_task=True,
             )
         )
         outcome = await await_shielded_task_outcome(claim_task)

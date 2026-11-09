@@ -507,6 +507,7 @@ class RecoveryAdmission:
                 target_status=SessionStatus.RUNNING,
                 checkpoint_transform=reject_active_incomplete_recovery,
                 profile_adoption=profile_adoption,
+                own_task=True,
             )
         )
         cancellation: asyncio.CancelledError | None = None

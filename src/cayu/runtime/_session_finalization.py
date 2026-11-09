@@ -331,8 +331,8 @@ from cayu.sessions.store import SessionStore
 from cayu.sessions.transcript_queries import (
     TranscriptQuery,
 )
-from cayu.tasks._terminalization import _terminalize_claimed_task
-from cayu.tasks.records import Task
+from cayu.tasks._terminalization import _terminalize_claimed_task_or_requested_cancellation
+from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalKind,
@@ -1142,6 +1142,10 @@ def _task_event(
     registered_agent: runtime_records.RegisteredAgentState,
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Event:
+    if event_type is EventType.TASK_FAILED and task.status is TaskStatus.CANCELLED:
+        # The failure was settled through the task's own durable cancellation
+        # request, which wins terminalization.
+        event_type = EventType.TASK_CANCELLED
     return task_lifecycle_event(
         event_type=event_type,
         task=task,
@@ -3428,7 +3432,9 @@ class SessionFinalization:
             if deadline_failure is not None:
                 return deadline_failure
         if task_worker_id is not None:
-            return await _terminalize_claimed_task(
+            # A cancellation its own worker durably requested wins: the task is
+            # then settled through that request and returned cancelled.
+            return await _terminalize_claimed_task_or_requested_cancellation(
                 self.task_store,
                 runtime_task_failure_terminalization_request(
                     task_id=task_id,

@@ -7,11 +7,15 @@ from collections.abc import Awaitable
 from datetime import datetime
 from typing import TypeVar
 
-from cayu.tasks._cancellation import _task_cancellation_terminalization_request
+from cayu.tasks._cancellation import (
+    _task_cancellation_idempotency_key,
+    _task_cancellation_terminalization_request,
+)
 from cayu.tasks.records import (
     _TERMINAL_TASK_STATUSES,
     Task,
     TaskClaimLost,
+    TaskStatus,
 )
 from cayu.tasks.retry import (
     TaskRetrySettlementRequest,
@@ -396,30 +400,95 @@ async def _terminalize_claimed_task_or_detect_peer_winner(
 
     request, _request_sha256 = prepare_task_terminalization(request)
     try:
-        await _terminalize_claimed_task(task_store, request)
+        _, settled_by_request = await _settle_claim_or_requested_cancellation(task_store, request)
     except TaskTerminalizationConflict:
         if not task_store.supports_idempotent_terminalization:
             raise
-        receipt = await task_store.load_task_terminalization_receipt(
-            request.task_id,
-            request.idempotency_key,
-        )
-        if receipt is not None:
+        if (
+            await task_store.load_task_terminalization_receipt(
+                request.task_id, request.idempotency_key
+            )
+            is not None
+        ):
             raise
         task = await task_store.load_task(request.task_id)
-        if task is not None:
-            cancellation = _task_cancellation_terminalization_request(
-                task,
-                worker_id=request.worker_id,
-                claim_generation=request.claim_generation,
-            )
-            if cancellation is not None:
-                await _terminalize_claimed_task(task_store, cancellation)
-                return True
         if task is not None and task.status in _TERMINAL_TASK_STATUSES:
             return True
         raise
-    return False
+    return settled_by_request
+
+
+async def _terminalize_claimed_task_or_requested_cancellation(
+    task_store: TaskStore,
+    request: TaskTerminalizationRequest,
+) -> Task:
+    """Terminalize the claim, or settle the cancellation its own owner requested.
+
+    A durable cancellation request of the same worker and claim wins
+    terminalization. When ``request`` conflicts with it, the task is settled
+    through that request instead and the cancelled task is returned. Every other
+    conflict propagates, and a request of another worker or claim generation
+    raises ``TaskClaimLost``.
+    """
+
+    task, _ = await _settle_claim_or_requested_cancellation(task_store, request)
+    return task
+
+
+async def _settle_claim_or_requested_cancellation(
+    task_store: TaskStore,
+    request: TaskTerminalizationRequest,
+) -> tuple[Task, bool]:
+    """The terminal task, and whether the owner's cancellation request settled it.
+
+    The cancellation is fenced by the failing request: its worker, its handoff,
+    and its claim generation, or without one its lease when it carries one.
+    Once settled, a repeat of the same request returns the task that request's
+    receipt cancelled.
+    """
+
+    try:
+        return await _terminalize_claimed_task(task_store, request), False
+    except TaskTerminalizationConflict:
+        if not task_store.supports_idempotent_terminalization or request.worker_id is None:
+            raise
+        if (
+            await task_store.load_task_terminalization_receipt(
+                request.task_id, request.idempotency_key
+            )
+            is not None
+        ):
+            raise
+        task = await task_store.load_task(request.task_id)
+        if task is None:
+            raise
+        if task.status is TaskStatus.CANCELLED:
+            receipt = await task_store.load_task_terminalization_receipt(
+                task.id, _task_cancellation_idempotency_key(task.id, request.worker_id)
+            )
+            if (
+                receipt is None
+                or receipt.kind is not TaskTerminalKind.CANCELLED
+                or receipt.worker_id != request.worker_id
+            ):
+                raise
+            return task, True
+        if task.interrupted_handoff_id != request.handoff_id or (
+            # A generation-fenced request's lease is ignored: its claim's
+            # heartbeat keeps renewing it.
+            request.claim_generation is None
+            and request.lease_expires_at is not None
+            and task.lease_expires_at != request.lease_expires_at
+        ):
+            raise
+        cancellation = _task_cancellation_terminalization_request(
+            task,
+            worker_id=request.worker_id,
+            claim_generation=request.claim_generation,
+        )
+        if cancellation is None:
+            raise
+        return await _terminalize_claimed_task(task_store, cancellation), True
 
 
 def _task_terminalization_error_is_acknowledgement_ambiguous(exc: Exception) -> bool:

@@ -140,6 +140,14 @@ def iter_exception_tree(error: BaseException) -> Iterator[BaseException]:
                 pending.extend(reversed(children))
 
 
+def exception_tree_leaves(error: BaseException) -> tuple[BaseException, ...]:
+    """The non-group exceptions of one exception tree, in tree order."""
+
+    return tuple(
+        node for node in iter_exception_tree(error) if not isinstance(node, BaseExceptionGroup)
+    )
+
+
 def failure_control_cause(
     errors: list[BaseException],
     signal: BaseException,

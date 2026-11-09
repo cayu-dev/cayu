@@ -18,6 +18,7 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._committed_save import save_reconciling_cancellation
 from cayu.runtime._durable_tool_round import _environment_name as _environment_name
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_completion_contracts import (
@@ -258,7 +259,9 @@ class AssistantModelPublication:
                     )
                     raise replay_error from first_error
 
-        commit_task = asyncio.create_task(commit_and_fan_out())
+        commit_task = asyncio.create_task(
+            save_reconciling_cancellation(commit_and_fan_out, reconcile=commit_and_fan_out_once)
+        )
         outcome = await await_shielded_task_outcome(commit_task)
         cancellation = outcome.cancellation
         error = outcome.error

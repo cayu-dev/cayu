@@ -54,6 +54,20 @@ from cayu.tasks.terminalization import (
 )
 
 
+def _task_cancellation_idempotency_key(task_id: str, worker_id: str) -> str:
+    """The terminalization key of a worker's durable cancellation request for a task."""
+
+    identity = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-cancellation.v1",
+            "task_id": task_id,
+            "worker_id": worker_id,
+        },
+        "task_cancellation",
+    )
+    return f"task-cancellation:v1:{sha256(identity).hexdigest()}"
+
+
 def _task_cancellation_requested_task(
     task: Task,
     *,
@@ -102,15 +116,7 @@ def _task_cancellation_requested_task(
         if error is None
         else copy_durable_json_object(error, "error")
     )
-    identity = canonical_durable_json_bytes(
-        {
-            "schema": "cayu.task-cancellation.v1",
-            "task_id": task.id,
-            "worker_id": task.worker_id,
-        },
-        "task_cancellation",
-    )
-    cancellation_idempotency_key = f"task-cancellation:v1:{sha256(identity).hexdigest()}"
+    cancellation_idempotency_key = _task_cancellation_idempotency_key(task.id, task.worker_id)
     requested_at = normalize_utc_datetime(updated_at, "updated_at")
     requested_event = _task_cancellation_requested_event(
         task,

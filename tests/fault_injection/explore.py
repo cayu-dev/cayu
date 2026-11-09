@@ -333,6 +333,42 @@ class CaseResult:
     events: list[str]
     reached: bool
     violations: list[Violation]
+    # How the live process left the session; see ``_settlement``.
+    settlement: tuple[str, ...] = ()
+
+
+_TERMINAL_SESSION_EVENTS = frozenset(
+    {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED, EventType.SESSION_INTERRUPTED}
+)
+
+
+async def _settlement(world: World) -> tuple[str, ...]:
+    """The session's status and the kind of its last terminal event.
+
+    An interrupted session is either abandoned (no interrupt was requested, so
+    recovery continues it) or interrupted by a request; the two carry different
+    terminal payloads.
+    """
+
+    session = await world.store.load(SESSION_ID)
+    if session is None:
+        return ("absent",)
+    terminal = next(
+        (
+            event
+            for event in reversed(await world.store.load_events(SESSION_ID))
+            if event.type in _TERMINAL_SESSION_EVENTS
+        ),
+        None,
+    )
+    if terminal is None:
+        return (str(session.status),)
+    kind = (
+        "abandoned"
+        if terminal.payload.get("abandoned") is True
+        else str(terminal.payload.get("interruption_type"))
+    )
+    return (str(session.status), str(terminal.type), kind, str(terminal.payload.get("reason")))
 
 
 async def _drive(
@@ -564,6 +600,7 @@ async def run_case(scenario: Scenario, fault: FaultKind | None, point: str | Non
     events: list[Event] = []
     outcome = "not started"
     violations: list[Violation] = []
+    settlement: tuple[str, ...] = ()
 
     def record(stage: str, found: list[tuple[str, str]]) -> None:
         violations.extend(
@@ -642,6 +679,7 @@ async def run_case(scenario: Scenario, fault: FaultKind | None, point: str | Non
             for _ in range(3):
                 await asyncio.sleep(0)
             await check(Stage.LIVE)
+            settlement = await bounded(Stage.LIVE, _settlement(world), _CHECK_TIMEOUT_S) or ()
             finished, failure = await _close(
                 app,
                 injected_group=fault is FaultKind.GROUPED_CANCEL and injector.fired is not None,
@@ -704,6 +742,7 @@ async def run_case(scenario: Scenario, fault: FaultKind | None, point: str | Non
         events=[str(event.type) for event in events],
         reached=injector.fired is not None,
         violations=violations,
+        settlement=settlement,
     )
 
 

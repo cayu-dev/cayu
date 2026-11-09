@@ -58,6 +58,7 @@ from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
 )
 from cayu.runtime._resume_configuration import invocation_configuration
+from cayu.runtime._run_exit import grouped_caller_cancellation
 from cayu.runtime._run_settlement import (
     OutcomeStage,
     RunLedger,
@@ -2277,6 +2278,41 @@ class SessionEngine:
             interaction_started = True
             messages: list[Message] | None = None
             prompt_contribution_manifest: PromptContributionManifest | None = None
+
+            async def abandon_cancelled_setup(cancellation: BaseException) -> None:
+                async def settle_pre_run_deadline_task() -> None:
+                    await self._session_tasks.fail_task_for_execution_deadline(
+                        task_id=request.task_id,
+                        task_worker_id=request.task_worker_id,
+                        task_lease_expires_at=request.task_lease_expires_at,
+                        task_handoff_id=None,
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+
+                await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=cancellation,
+                    steps=(
+                        (
+                            "cancelled pre-run session finalization",
+                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
+                                session.id,
+                                propagate_interaction_publication_rejection=True,
+                                registered_agent=registered_agent,
+                                registered_environment=registered_environment,
+                                execution_profile=execution_profile,
+                                invocation_context=invocation_context,
+                                active_run=active_factory_run,
+                            ),
+                        ),
+                        (
+                            "cancelled pre-run task deadline finalization",
+                            settle_pre_run_deadline_task,
+                        ),
+                    ),
+                )
+
             try:
                 await self._session_control.execution_presence.ensure(
                     session, task_id=request.task_id
@@ -2498,7 +2534,9 @@ class SessionEngine:
                     return
                 release_before_run = False
             except asyncio.CancelledError as cancellation:
-                if await self._session_control.interrupt_requested(session.id):
+                if await self._recovery_ownership.interrupt_requested_for_exit(
+                    cancellation, lambda: self._session_control.interrupt_requested(session.id)
+                ):
                     if interaction_started:
                         await self.session_store.materialize_deferred_interaction_input(session.id)
                     async for event in self._session_finalization.handle_session_interrupted(
@@ -2511,39 +2549,7 @@ class SessionEngine:
                     ):
                         yield event
                     return
-
-                async def settle_pre_run_deadline_task() -> None:
-                    await self._session_tasks.fail_task_for_execution_deadline(
-                        task_id=request.task_id,
-                        task_worker_id=request.task_worker_id,
-                        task_lease_expires_at=request.task_lease_expires_at,
-                        task_handoff_id=None,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                    )
-
-                await self._recovery_ownership.run_cleanup_steps(
-                    authoritative_failure=cancellation,
-                    steps=(
-                        (
-                            "cancelled pre-run session finalization",
-                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                                session.id,
-                                propagate_interaction_publication_rejection=True,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                execution_profile=execution_profile,
-                                invocation_context=invocation_context,
-                                active_run=active_factory_run,
-                            ),
-                        ),
-                        (
-                            "cancelled pre-run task deadline finalization",
-                            settle_pre_run_deadline_task,
-                        ),
-                    ),
-                )
+                await abandon_cancelled_setup(cancellation)
                 raise
             except TerminalEventPublicationUncertain:
                 raise
@@ -2648,6 +2654,16 @@ class SessionEngine:
                     yield event
                 return
             except BaseExceptionGroup as exc:
+                baseline = ledger.cancellation_baseline
+                if grouped_caller_cancellation(
+                    exc, cancellation_baseline=baseline
+                ) is not None and not await self._recovery_ownership.interrupt_requested_for_exit(
+                    exc,
+                    lambda: self._session_control.interrupt_requested(session.id),
+                    cancellation_baseline=baseline,
+                ):
+                    await abandon_cancelled_setup(exc)
+                    raise
                 if binding_finalize_explicit_cancellation(exc) is not None:
 
                     async def prepare_interruption() -> None:
@@ -6746,6 +6762,91 @@ class SessionEngine:
             ):
                 yield event
 
+        async def finalize_abandoned_run(deadline_expired: bool, **evidence: Any) -> Event | None:
+            if deadline_expired and invocation_context.work_attempt is not None:
+                if self.task_store is None:
+                    raise RuntimeError("Governed deadline stop requires its task store.")
+                await record_work_attempt_execution_stop(
+                    self.task_store,
+                    admission=invocation_context.work_attempt.admission,
+                    reason="elapsed_limit",
+                    redactor=self._secret_redactor,
+                )
+            terminal_event = await self._session_finalization.finalize_abandoned_session_run(
+                RecoveryAbandonedSessionRequest(
+                    session=outcome_state.session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    run_started_at=run_started_at,
+                    turn_usage_tracker=turn_usage_tracker,
+                    active_run=active_run,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                    **evidence,
+                )
+            )
+            if deadline_expired and invocation_context.work_attempt is None:
+                outcome_state.task_finished = (
+                    await self._session_tasks.fail_task_for_execution_deadline(
+                        task_id=task_id,
+                        task_worker_id=task_worker_id,
+                        task_handoff_id=task_handoff_id,
+                        session=outcome_state.session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                    )
+                ) or outcome_state.task_finished
+            return terminal_event
+
+        async def abandon_cancelled_run(
+            cancellation: BaseException,
+            *,
+            interaction_transition_failures: tuple[dict[str, Any], ...] = (),
+            **evidence: Any,
+        ) -> tuple[tuple[str, BaseException], ...]:
+            """Abandon a run its caller cancelled, plainly or grouped with cleanup failures."""
+            terminal_event: Event | None = None
+            deadline_expired = expired_execution_deadline() is not None
+
+            async def close_cancelled_tool_round() -> None:
+                if not close_new_pending_round_on_interrupt:
+                    return
+                async for (
+                    _
+                ) in self._interruption_cleanup.close_durable_pending_tool_round_after_interrupt(
+                    session=outcome_state.session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    execution_profile=execution_profile,
+                    invocation_context=invocation_context,
+                ):
+                    pass
+
+            async def finalize_cancelled_session() -> None:
+                nonlocal terminal_event
+                terminal_event = await finalize_abandoned_run(
+                    deadline_expired,
+                    interaction_transition_failures=interaction_transition_failures,
+                    **evidence,
+                )
+
+            steps = (
+                ("cancelled tool-round finalization", close_cancelled_tool_round),
+                ("cancelled session finalization", finalize_cancelled_session),
+            )
+            if interaction_transition_failures and isinstance(cancellation, asyncio.CancelledError):
+                failures = await _run_interaction_transition_cancellation_cleanup_steps(
+                    cancellation, steps=steps, supervisor=self._recovery_cleanup_supervisor
+                )
+            else:
+                failures = await self._recovery_ownership.run_cleanup_steps(
+                    authoritative_failure=cancellation, steps=steps
+                )
+            if terminal_event is not None:
+                _mark_session_invocation_terminal_event(terminal_event)
+            return failures
+
         try:
             work_attempt = invocation_context.work_attempt
             if work_attempt is not None:
@@ -9368,93 +9469,15 @@ class SessionEngine:
                 # remains authoritative and completes its typed outcome.
                 raise
 
-            async def close_cancelled_tool_round() -> None:
-                if not close_new_pending_round_on_interrupt:
-                    return
-                async for (
-                    _
-                ) in self._interruption_cleanup.close_durable_pending_tool_round_after_interrupt(
-                    session=outcome_state.session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                ):
-                    pass
-
             # Exception targets are cleared when their handler exits. Retained
             # cleanup needs only the safe deadline evidence, not the exception.
-            native_admission_deadline = provider_cancellation_admission_deadline(cancellation)
-            cancellation_terminal_event: Event | None = None
-            deadline_expired = expired_execution_deadline() is not None
-
-            async def finalize_cancelled_session() -> None:
-                nonlocal cancellation_terminal_event
-                if deadline_expired and invocation_context.work_attempt is not None:
-                    if self.task_store is None:
-                        raise RuntimeError("Governed deadline stop requires its task store.")
-                    await record_work_attempt_execution_stop(
-                        self.task_store,
-                        admission=invocation_context.work_attempt.admission,
-                        reason="elapsed_limit",
-                        redactor=self._secret_redactor,
-                    )
-                cancellation_terminal_event = (
-                    await self._session_finalization.finalize_abandoned_session_run(
-                        RecoveryAbandonedSessionRequest(
-                            session=outcome_state.session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            environment_name=environment_name,
-                            run_started_at=run_started_at,
-                            turn_usage_tracker=turn_usage_tracker,
-                            active_run=active_run,
-                            interaction_transition_failures=tuple(interaction_transition_failures),
-                            interaction_transition=interaction_transition,
-                            provider_cancellation_failures=(provider_cancellation_diagnostics),
-                            native_admission_deadline=native_admission_deadline,
-                            execution_profile=execution_profile,
-                            invocation_context=invocation_context,
-                        )
-                    )
-                )
-                if deadline_expired and invocation_context.work_attempt is None:
-                    outcome_state.task_finished = (
-                        await self._session_tasks.fail_task_for_execution_deadline(
-                            task_id=task_id,
-                            task_worker_id=task_worker_id,
-                            task_handoff_id=task_handoff_id,
-                            session=outcome_state.session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
-                    ) or outcome_state.task_finished
-
-            cancellation_cleanup_steps = (
-                (
-                    "cancelled tool-round finalization",
-                    close_cancelled_tool_round,
-                ),
-                (
-                    "cancelled session finalization",
-                    finalize_cancelled_session,
-                ),
+            cancellation_cleanup_failures = await abandon_cancelled_run(
+                cancellation,
+                interaction_transition_failures=tuple(interaction_transition_failures),
+                interaction_transition=interaction_transition,
+                provider_cancellation_failures=provider_cancellation_diagnostics,
+                native_admission_deadline=provider_cancellation_admission_deadline(cancellation),
             )
-            if interaction_transition_failures:
-                cancellation_cleanup_failures = (
-                    await _run_interaction_transition_cancellation_cleanup_steps(
-                        cancellation,
-                        steps=cancellation_cleanup_steps,
-                        supervisor=self._recovery_cleanup_supervisor,
-                    )
-                )
-            else:
-                cancellation_cleanup_failures = await self._recovery_ownership.run_cleanup_steps(
-                    authoritative_failure=cancellation,
-                    steps=cancellation_cleanup_steps,
-                )
-            if cancellation_terminal_event is not None:
-                _mark_session_invocation_terminal_event(cancellation_terminal_event)
             if provider_cancellation_authenticated and cancellation_cleanup_failures:
                 _mark_provider_cancellation_finalization_failure(cancellation)
             raise
@@ -9501,40 +9524,7 @@ class SessionEngine:
                 raise
 
             async def finalize_closed_session() -> None:
-                deadline_expired = expired_execution_deadline() is not None
-                if deadline_expired and invocation_context.work_attempt is not None:
-                    if self.task_store is None:
-                        raise RuntimeError("Governed deadline stop requires its task store.")
-                    await record_work_attempt_execution_stop(
-                        self.task_store,
-                        admission=invocation_context.work_attempt.admission,
-                        reason="elapsed_limit",
-                        redactor=self._secret_redactor,
-                    )
-                await self._session_finalization.finalize_abandoned_session_run(
-                    RecoveryAbandonedSessionRequest(
-                        session=outcome_state.session,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        environment_name=environment_name,
-                        run_started_at=run_started_at,
-                        turn_usage_tracker=turn_usage_tracker,
-                        active_run=active_run,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    )
-                )
-                if deadline_expired and invocation_context.work_attempt is None:
-                    outcome_state.task_finished = (
-                        await self._session_tasks.fail_task_for_execution_deadline(
-                            task_id=task_id,
-                            task_worker_id=task_worker_id,
-                            task_handoff_id=task_handoff_id,
-                            session=outcome_state.session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                        )
-                    ) or outcome_state.task_finished
+                await finalize_abandoned_run(expired_execution_deadline() is not None)
 
             try:
                 await self._recovery_ownership.run_cleanup_steps(
@@ -9618,6 +9608,16 @@ class SessionEngine:
                 # This worker has positive evidence that its durable mutation
                 # authority was lost. Do not attempt a terminal write under a
                 # stale run epoch.
+                raise
+            baseline = 0 if run_ledger is None else run_ledger.cancellation_baseline
+            if grouped_caller_cancellation(
+                failure, cancellation_baseline=baseline
+            ) is not None and not await self._recovery_ownership.interrupt_requested_for_exit(
+                failure,
+                lambda: self._session_control.interrupt_requested(outcome_state.session.id),
+                cancellation_baseline=baseline,
+            ):
+                await abandon_cancelled_run(failure)
                 raise
 
             async def prepare_group_interruption() -> list[Event]:

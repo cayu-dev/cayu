@@ -13,7 +13,7 @@ import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 
-from cayu._exception_groups import iter_exception_tree
+from cayu._exception_groups import exception_tree_leaves, iter_exception_tree
 
 _CONTROL_FLOW_TYPES = (asyncio.CancelledError, GeneratorExit)
 
@@ -58,6 +58,9 @@ class RunExit:
 
     supervisory: tuple[BaseException, ...] = ()
     """Untouched process-level leaves, in tree order."""
+
+    leaves: tuple[BaseException, ...] = ()
+    """A cancelled exit's non-group exceptions, in tree order."""
 
 
 def delivered_cancellation(
@@ -113,9 +116,7 @@ def classify_run_exit(
         return RunExit(RunExitKind.RETURNED, None)
     if _carries_run_fence_loss(error):
         return RunExit(RunExitKind.FENCED, error)
-    leaves = tuple(
-        node for node in iter_exception_tree(error) if not isinstance(node, BaseExceptionGroup)
-    )
+    leaves = exception_tree_leaves(error)
     supervisory = tuple(
         leaf
         for leaf in leaves
@@ -130,7 +131,36 @@ def classify_run_exit(
             supervisory=supervisory,
         )
     if cancellation is not None:
-        return RunExit(RunExitKind.CANCELLED, error, cancellation=cancellation)
+        return RunExit(RunExitKind.CANCELLED, error, cancellation=cancellation, leaves=leaves)
     if any(isinstance(leaf, GeneratorExit) for leaf in leaves):
         return RunExit(RunExitKind.ABANDONED, error)
     return RunExit(RunExitKind.FAILED, error)
+
+
+def grouped_caller_cancellation(
+    error: BaseException,
+    *,
+    cancellation_baseline: int = 0,
+) -> asyncio.CancelledError | None:
+    """Return the caller's cancellation when a group settles exactly as it.
+
+    Cleanup that receives the caller's cancellation and fails too raises the
+    delivered ``CancelledError`` grouped with ordinary failures. That is still
+    the caller cancelling the run: like a plain cancellation, it abandons the
+    run, which recovery continues, unless an interrupt was requested. Every
+    session exit handler asks this one rule. A group with ``GeneratorExit``,
+    process control or fence loss, without an ordinary failure, or whose
+    cancellation was not delivered settles as before.
+    """
+
+    if not isinstance(error, BaseExceptionGroup):
+        return None
+    run_exit = classify_run_exit(error, cancellation_baseline=cancellation_baseline)
+    if run_exit.kind is not RunExitKind.CANCELLED:
+        return None
+    leaves = run_exit.leaves
+    if any(isinstance(leaf, GeneratorExit) for leaf in leaves) or not any(
+        isinstance(leaf, Exception) for leaf in leaves
+    ):
+        return None
+    return run_exit.cancellation

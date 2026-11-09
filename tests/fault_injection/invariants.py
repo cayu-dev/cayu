@@ -172,10 +172,14 @@ async def task_violations(
             continue
         session_completed = session.status is SessionStatus.COMPLETED
         task_completed = task.status is TaskStatus.COMPLETED
-        if session_completed and task.status is TaskStatus.CANCELLED:
+        if (
+            session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+            and task.status is TaskStatus.CANCELLED
+        ):
             # A task reaches CANCELLED only through a durable cancellation request,
             # which wins task terminalization over its session's committed
-            # completion: the session stays completed and the task cancelled.
+            # completion or failure: the session keeps its outcome and the task
+            # is cancelled.
             continue
         if session_completed != task_completed and (
             task.status in TERMINAL_TASK_STATUSES or session.status in TERMINAL_SESSION_STATUSES

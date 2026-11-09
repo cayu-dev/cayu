@@ -116,6 +116,7 @@ from cayu.sessions.requests import (
 )
 from cayu.sessions.store import SessionStore
 from cayu.tasks._terminalization import _terminalize_claimed_task
+from cayu.tasks.cancellation import _task_cancellation_requested
 from cayu.tasks.creation import (
     _task_invocation_for_attachment,
     _task_session_instance_for_attachment,
@@ -275,7 +276,15 @@ class SessionTaskLifecycle:
             raise TaskClaimLost(
                 "Committed runtime task failure has conflicting task failure evidence."
             ) from None
-        if task.status is TaskStatus.RUNNING:
+        # A cancellation request wins terminalization, as over a committed
+        # completion: a cancelled task, or one its worker's durable request still
+        # owns, is left as it is, and the session finishes as its committed
+        # failure. Once cancelled, a task records no longer whose request or
+        # which path cancelled it, so any cancelled task is accepted.
+        cancelled_by_request = task.status is TaskStatus.CANCELLED or (
+            task.status is TaskStatus.RUNNING and _task_cancellation_requested(task)
+        )
+        if task.status is TaskStatus.RUNNING and not cancelled_by_request:
             await before_mutation()
             if original_worker_id is None:
                 task = await self.task_store.fail_task(
@@ -336,7 +345,7 @@ class SessionTaskLifecycle:
                     task = current
                     if task is None or task.status is not TaskStatus.FAILED:
                         raise
-        if task.status is not TaskStatus.FAILED:
+        if task.status is not TaskStatus.FAILED and not cancelled_by_request:
             raise TaskClaimLost(
                 "Committed runtime task failure conflicts with the task terminal outcome."
             ) from None
@@ -347,6 +356,7 @@ class SessionTaskLifecycle:
             task_worker_id=original_worker_id,
             task_lease_expires_at=original_lease_expires_at,
             task_handoff_id=original_handoff_id,
+            cancelled_by_request=cancelled_by_request,
         )
         if not replayed:
             raise TaskClaimLost(
@@ -770,8 +780,17 @@ class SessionTaskLifecycle:
         task_worker_id: str | None,
         task_lease_expires_at: datetime | None = None,
         task_handoff_id: str | None,
+        cancelled_by_request: bool = False,
     ) -> tuple[bool, tuple[Event, ...]]:
-        """Converge a receipt-backed generic task failure without redispatching work."""
+        """Converge a receipt-backed generic task failure without redispatching work.
+
+        A cancelled task, or with ``cancelled_by_request`` one still left to a
+        durable cancellation request, is consistent with a committed failure: a
+        cancellation request wins terminalization. The committed decision's
+        failure evidence then stands in for the task's, the task is neither
+        failed nor checked against the failure receipt, and no task event is
+        published until the task is terminal.
+        """
 
         if task_id is None:
             return False, ()
@@ -814,7 +833,7 @@ class SessionTaskLifecycle:
                 ) from None
             if terminal_decision.outcome is InvocationTerminalOutcome.INTERRUPTED:
                 return False, ()
-            if task.status is TaskStatus.RUNNING:
+            if task.status is TaskStatus.RUNNING and not cancelled_by_request:
                 await self.require_linked_continuation_task_authority(
                     task_id=task.id,
                     task_worker_id=task_worker_id,
@@ -833,8 +852,27 @@ class SessionTaskLifecycle:
                     session=session,
                     error=terminal_decision.task_error_payload,
                 )
+            # Failing it may have settled the task through its worker's
+            # cancellation request instead, now or on an earlier attempt.
+            cancelled_by_request = cancelled_by_request or (
+                terminal_decision.outcome is InvocationTerminalOutcome.FAILED
+                and task.status is TaskStatus.CANCELLED
+            )
+        evidence = task
+        if cancelled_by_request:
+            if terminal_decision is None or terminal_decision.task_error_payload is None:
+                raise TaskClaimLost(
+                    "A task cancelled by its request needs the committed failure's evidence."
+                ) from None
+            evidence = task.model_copy(
+                update={
+                    "status": TaskStatus.FAILED,
+                    "error": terminal_decision.task_error_payload,
+                },
+                deep=True,
+            )
         identity = runtime_task_failure_identity_from_task(
-            task,
+            evidence,
             session_id=session.id,
             session_instance_id=session.instance_id,
         )
@@ -851,7 +889,7 @@ class SessionTaskLifecycle:
             != runtime_task_failure_event_id(identity, "interaction_failed")
             or terminal_decision.terminal_event_id
             != runtime_task_failure_event_id(identity, "session_failed")
-            or terminal_decision.task_error_payload != task.error
+            or terminal_decision.task_error_payload != evidence.error
         ):
             raise TaskClaimLost(
                 "Failure terminal decision conflicts with durable task evidence."
@@ -873,20 +911,21 @@ class SessionTaskLifecycle:
                 raise TaskClaimLost(
                     "Terminal task failure belongs to a stale session run epoch."
                 ) from None
-        await self.require_linked_continuation_task_authority(
-            task_id=task.id,
-            task_worker_id=task_worker_id,
-            task_lease_expires_at=task_lease_expires_at,
-            task_handoff_id=task_handoff_id,
-            session_id=session.id,
-            session_instance_id=session.instance_id,
-            expected_runtime_task_terminalization_request_sha256=(
-                None
-                if terminal_decision is None
-                else terminal_decision.task_terminalization_request_sha256
-            ),
-        )
-        failure_payload = runtime_task_failure_session_payload(task)
+        if not cancelled_by_request:
+            await self.require_linked_continuation_task_authority(
+                task_id=task.id,
+                task_worker_id=task_worker_id,
+                task_lease_expires_at=task_lease_expires_at,
+                task_handoff_id=task_handoff_id,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                expected_runtime_task_terminalization_request_sha256=(
+                    None
+                    if terminal_decision is None
+                    else terminal_decision.task_terminalization_request_sha256
+                ),
+            )
+        failure_payload = runtime_task_failure_session_payload(evidence)
         if failure_payload is None:
             raise TaskClaimLost(
                 "Terminal task failure lost its durable session failure payload."
@@ -895,7 +934,7 @@ class SessionTaskLifecycle:
             raise TaskClaimLost(
                 "Terminal task failure has conflicting durable session evidence."
             ) from None
-        turn_completed_payload = runtime_task_failure_turn_payload(task)
+        turn_completed_payload = runtime_task_failure_turn_payload(evidence)
         if turn_completed_payload is None:
             raise TaskClaimLost(
                 "Terminal task failure lost its durable turn completion payload."
@@ -1062,34 +1101,40 @@ class SessionTaskLifecycle:
                 _deactivate_session_interaction(session.id)
             return True, tuple(replay_events)
 
-        task_failed_template = _task_event(
-            event_type=EventType.TASK_FAILED,
-            task=task,
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-        )
-        task_failed = event_with_runtime_generated_id(
-            event_with_execution_profile_authority(
-                event_with_runtime_payload_authority(
-                    task_failed_template.model_copy(
-                        update={
-                            "id": runtime_task_failure_event_id(identity, "task_failed"),
-                            "interaction_id": identity.interaction_id,
-                            "timestamp": identity.observed_at,
-                            "payload": {
-                                **task_failed_template.payload,
-                                "runtime_task_failure_id": identity.failure_id,
-                            },
-                        }
-                    ),
-                    "runtime_task_failure_id",
-                ),
-                execution_profile,
+        # A task still left to its cancellation request gets no event here, as a
+        # completion recovery publishes none for a task it did not decide; its
+        # event id then never names a nonterminal task.
+        if task.status is not TaskStatus.RUNNING:
+            task_failed_template = _task_event(
+                event_type=EventType.TASK_FAILED,
+                task=task,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
             )
-        )
-        persisted_task_failed = await self._event_writer.persist_exact_replay(task_failed)
-        replay_events.extend(await self._event_writer.fan_out_persisted([persisted_task_failed]))
+            task_failed = event_with_runtime_generated_id(
+                event_with_execution_profile_authority(
+                    event_with_runtime_payload_authority(
+                        task_failed_template.model_copy(
+                            update={
+                                "id": runtime_task_failure_event_id(identity, "task_failed"),
+                                "interaction_id": identity.interaction_id,
+                                "timestamp": identity.observed_at,
+                                "payload": {
+                                    **task_failed_template.payload,
+                                    "runtime_task_failure_id": identity.failure_id,
+                                },
+                            }
+                        ),
+                        "runtime_task_failure_id",
+                    ),
+                    execution_profile,
+                )
+            )
+            persisted_task_failed = await self._event_writer.persist_exact_replay(task_failed)
+            replay_events.extend(
+                await self._event_writer.fan_out_persisted([persisted_task_failed])
+            )
 
         if terminal_decision is not None:
             interaction_id = await self._session_finalization.activate_latest_open_interaction(
@@ -1114,6 +1159,7 @@ class SessionTaskLifecycle:
                         task_worker_id=task_worker_id,
                         task_lease_expires_at=task_lease_expires_at,
                         task_handoff_id=task_handoff_id,
+                        cancelled_by_request=cancelled_by_request,
                     )
                     return replayed, (*replay_events, *terminal_events)
             if interaction_id != identity.interaction_id:

@@ -71,10 +71,11 @@ reruns the scenario in a fresh event loop for each point and fault:
   acknowledgement was lost to cancellation. That claim awaits lease expiry;
   the second worker must settle every task in recovery.
 - `task-outcome-disagrees-with-session`: a task completes exactly when its
-  linked session completes. One pairing is deliberate and accepted: a completed
-  session whose task is cancelled. A task reaches cancelled only through a
-  durable cancellation request, and that request wins task terminalization even
-  after the session committed its completion; the session stays completed.
+  linked session completes. Two pairings are deliberate and accepted: a
+  completed or a failed session whose task is cancelled. A task reaches cancelled only through a durable
+  cancellation request, and that request wins task terminalization even after
+  the session committed its completion or its failure; the session keeps its
+  outcome.
 - `task-group-execution-obligation-unsettled`: every execution a quiescent task
   group recorded is settled once its member is terminal.
 - `shutdown-or-recovery-hangs`: the phase, shutdown and recovery all finish,
@@ -111,7 +112,12 @@ trace must be reached again; a scenario whose trace changes between runs fails.
 | `task` | a worker claims a task and runs its session through a tool round | 101/246; 32/79; 20/20 |
 | `task-group` | the same task as the member of a quiescent task group | 101/249; 32/80; 20/20 |
 
-`grouped-cancel` uses the same points as `cancel`.
+`grouped-cancel` uses the same points as `cancel`. Without an interrupt request
+a grouped cancellation settles like the plain cancellation it carries: the run
+is abandoned, for recovery to continue. `test_grouped_cancellation.py` checks
+that at one point of each exit handler (run setup, the run body, a tool round, a
+resume, an approval continuation and a task-backed run), comparing the
+settlement each case records with that of `cancel` at the same point.
 
 ## Pull-request sample and run time
 
@@ -153,9 +159,6 @@ points unless the fault says otherwise.
 
 | Finding | Faults, scenarios | Points | Invariant broken | Where |
 |---|---|---|---|---|
-| `task-session-grouped-recovery` | grouped-cancel: task, task-group | 68 | session running, owner lost, even after recovery | a task-backed run's model steps and tool round; recovery then fails with `TaskClaimLost` because the task was already settled |
-| `approval-grouped-continuation` | grouped-cancel: approval | 1 | session running without owner | right after the approval continuation commits `transition_status_and_checkpoint` |
-| `grouped-model-stage` | grouped-cancel: run, tool-round, resume, approval | 12 | cannot continue after recovery ("no authoritative open interaction") | right after `complete_model_completion_stage` commits in `_assistant_model_publication` |
 | `group-crash-conflict` | crash: task-group | 50 | task running forever: the next worker's continuation raises `TaskGroupConflict: Prior group execution is still unsettled` | a crash anywhere in the member's run |
 | `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled; recovery completes the member but nothing proves its callback returned | a crash after the member's live terminalization, before `_settle_task_group_execution` |
 
