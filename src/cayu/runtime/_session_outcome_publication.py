@@ -225,6 +225,7 @@ class SessionOutcomeContext:
     task_lease_expires_at: datetime | None
     task_handoff_id: str | None
     request_loop_policies: tuple[LoopPolicy, ...]
+    on_failure_decided: Callable[[], None] | None = None
 
 
 class SessionOutcomePublication:
@@ -1500,6 +1501,8 @@ class SessionOutcomePublication:
                     accounting_pending,
                     group_message=("Session failure and model-completion budget recovery fence."),
                 )
+            if context.on_failure_decided is not None:
+                context.on_failure_decided()
             if interaction_failed_event is not None:
                 yield interaction_failed_event
         if payload is None:
@@ -1600,6 +1603,8 @@ class SessionOutcomePublication:
                     accounting_pending,
                     group_message=("Session failure and model-completion budget recovery fence."),
                 )
+            if context.on_failure_decided is not None:
+                context.on_failure_decided()
             if interaction_failed_event is not None:
                 yield interaction_failed_event
             for event in failure_turn_events:

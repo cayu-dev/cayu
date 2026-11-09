@@ -6364,6 +6364,15 @@ class SessionEngine:
         run_ledger: RunLedger | None = None,
     ) -> AsyncGenerator[Event, None]:
         outcome_state = SessionOutcomeState(session=session)
+        failure_outcome_stream: AsyncGenerator[Event, None] | None = None
+
+        def retain_failure_outcome() -> None:
+            if run_ledger is None:
+                return
+            if failure_outcome_stream is None:
+                raise RuntimeError("Failure outcome stream was not initialized.")
+            retained_stream = failure_outcome_stream
+            run_ledger.decided(lambda: drain_event_stream(retained_stream))
 
         def outcome_context() -> SessionOutcomeContext:
             return SessionOutcomeContext(
@@ -6381,6 +6390,7 @@ class SessionEngine:
                 task_lease_expires_at=task_lease_expires_at,
                 task_handoff_id=task_handoff_id,
                 request_loop_policies=request_loop_policies,
+                on_failure_decided=retain_failure_outcome,
             )
 
         if type(invocation_context) is not InvocationContext:
@@ -9537,15 +9547,24 @@ class SessionEngine:
                 raise
             if run_ledger is not None:
                 run_ledger.failure_owned_by_body = True
-            async with contextlib.aclosing(
-                self._session_outcomes.fail(
-                    outcome_context(),
-                    exc=exc,
-                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
-                )
-            ) as outcome_stream:
-                async for event in outcome_stream:
-                    yield event
+            failure_outcome_stream = self._session_outcomes.fail(
+                outcome_context(),
+                exc=exc,
+                materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            )
+            if run_ledger is None:
+                async with contextlib.aclosing(failure_outcome_stream) as outcome_stream:
+                    async for event in outcome_stream:
+                        yield event
+            else:
+                try:
+                    async for event in failure_outcome_stream:
+                        yield event
+                    if run_ledger.stage is OutcomeStage.DECIDED:
+                        run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+                finally:
+                    if run_ledger.remainder is None:
+                        await failure_outcome_stream.aclose()
         except BaseExceptionGroup as failure:
             if preserve_failure_until_initial_provider_dispatch and (
                 not initial_provider_dispatch_started
