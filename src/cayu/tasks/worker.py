@@ -2270,16 +2270,20 @@ async def _await_task_handler(
         handler_task.add_done_callback(
             lambda _: callback_done.done() or callback_done.set_result(None)
         )
+        # Retry disposition can finish while the fence is still writing. Count
+        # the watcher separately so shutdown retains its store until it settles.
         _retain_handler_time_limit_watcher(
             asyncio.create_task(
-                _fence_handler_that_outlives_its_time_limit(
-                    app,
-                    task_store,
-                    task,
-                    worker_id,
-                    callback_done,
-                    time_limit,
-                    lease_authority=lease_authority,
+                app._run_worker_step(
+                    lambda: _fence_handler_that_outlives_its_time_limit(
+                        app,
+                        task_store,
+                        task,
+                        worker_id,
+                        callback_done,
+                        time_limit,
+                        lease_authority=lease_authority,
+                    )
                 )
             )
         )
