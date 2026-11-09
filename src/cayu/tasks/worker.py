@@ -3695,6 +3695,8 @@ async def _quiesce_task_retry_handler_before_terminalization(
                     extend_seconds=lease_seconds,
                 )
                 lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
+                # A successful renewal recovers the transient maintenance failure.
+                lease_maintenance_failure = None
             except asyncio.CancelledError as exc:
                 if owner_task.cancelling() <= cancellation_baseline:
                     if lease_maintenance_failure is None:
