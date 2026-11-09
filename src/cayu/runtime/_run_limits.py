@@ -4358,6 +4358,27 @@ class RunLimitController:
                 await heartbeat_task
             async with lifecycle.reservation_transition_lock:
                 await self.renew_reservations(reservations)
+        except asyncio.CancelledError as authoritative_exc:
+            if next_item_task is not None:
+                if not next_item_task.done():
+                    next_item_task.cancel()
+                try:
+                    await next_item_task
+                except asyncio.CancelledError as cancellation:
+                    # Remote cancellation resolves in the child task. Preserve its
+                    # accounting handoff on the caller's authoritative cancellation.
+                    for name in (
+                        "provider_operation_accounting_pending",
+                        "provider_operation_cancellation_claim",
+                    ):
+                        if name in cancellation.__dict__:
+                            authoritative_exc.__dict__[name] = cancellation.__dict__[name]
+                except StopAsyncIteration:
+                    pass
+                except Exception as provider_failure:
+                    raise authoritative_exc from provider_failure
+                next_item_task = None
+            raise
         finally:
             if next_item_task is not None and not next_item_task.done():
                 next_item_task.cancel()

@@ -1798,6 +1798,100 @@ def test_controller_reconciles_operation_reservations_with_priced_actuals():
     assert next(iter(ledger._records.values())).billing_identity is None
 
 
+@pytest.mark.parametrize(
+    "handoff_name",
+    ["provider_operation_accounting_pending", "provider_operation_cancellation_claim"],
+)
+def test_model_heartbeat_preserves_child_cancellation_accounting_handoff(handoff_name: str):
+    store = InMemorySessionStore()
+    controller = _controller(store, ledger=InMemoryBudgetLedger(reservation_ttl_seconds=30))
+    handoff = True if handoff_name == "provider_operation_accounting_pending" else object()
+
+    async def scenario() -> None:
+        session_id = "sess_model_caller_cancel_accounting"
+        await _running_session(store, session_id)
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("2"),),
+            session_id=session_id,
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+        )
+        stream_started = asyncio.Event()
+
+        async def model_events() -> AsyncIterator[tuple[Event | None, None]]:
+            stream_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                exc.__dict__[handoff_name] = handoff
+                raise
+            yield None, None
+
+        async def consume() -> None:
+            async for _ in controller.model_step_events_with_heartbeat(
+                model_events(),
+                reservations=list(setup.reservations),
+                lifecycle=run_limits_module.BudgetModelStepLifecycle(),
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        await stream_started.wait()
+        task.cancel("caller cancelled")
+        with pytest.raises(asyncio.CancelledError, match="caller cancelled") as raised:
+            await task
+        assert raised.value.__dict__[handoff_name] is handoff
+        assert task.cancelling() == 1
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
+def test_model_heartbeat_keeps_caller_cancellation_when_child_has_failed():
+    store = InMemorySessionStore()
+    controller = _controller(store, ledger=InMemoryBudgetLedger(reservation_ttl_seconds=30))
+
+    async def scenario() -> None:
+        session_id = "sess_model_caller_cancel_accounting"
+        await _running_session(store, session_id)
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("2"),),
+            session_id=session_id,
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+        )
+
+        async def model_events() -> AsyncIterator[tuple[Event | None, None]]:
+            task.cancel("caller cancelled")
+            raise ConnectionError("provider failed")
+            yield None, None
+
+        async def consume() -> None:
+            async for _ in controller.model_step_events_with_heartbeat(
+                model_events(),
+                reservations=list(setup.reservations),
+                lifecycle=run_limits_module.BudgetModelStepLifecycle(),
+            ):
+                pass
+
+        task = asyncio.create_task(consume())
+        with pytest.raises(asyncio.CancelledError, match="caller cancelled") as raised:
+            await task
+        assert isinstance(raised.value.__cause__, ConnectionError)
+        assert task.cancelling() == 1
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+
 def test_controller_arbitrates_operation_heartbeat_lease_loss():
     store = InMemorySessionStore()
     ledger = _LoseLeaseOnSecondHeartbeat()
