@@ -22,10 +22,11 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._invocation_lifecycle import ReleaseInvocationCommand
 from cayu.sessions._invocation_terminal_decision import (
-    build_completed_invocation_terminal_decision,
+    InvocationTerminalOutcome,
+    build_owed_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions._paired_writes import completed_decision_install_mutation
+from cayu.sessions._paired_writes import owed_decision_install_mutation
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import (
     INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
@@ -250,7 +251,8 @@ def test_session_store_conformance_completed_decision_store_rules(
             )
 
             # Another decision for the same completion event is refused.
-            conflicting = build_completed_invocation_terminal_decision(
+            conflicting = build_owed_invocation_terminal_decision(
+                outcome=InvocationTerminalOutcome.COMPLETED,
                 session_id=decision.session_id,
                 session_instance_id=decision.session_instance_id,
                 run_epoch=decision.run_epoch,
@@ -269,7 +271,7 @@ def test_session_store_conformance_completed_decision_store_rules(
                         update={
                             "transition": install.transition.model_copy(
                                 update={
-                                    "checkpoint_mutation": completed_decision_install_mutation(
+                                    "checkpoint_mutation": owed_decision_install_mutation(
                                         conflicting
                                     )
                                 }
@@ -279,7 +281,7 @@ def test_session_store_conformance_completed_decision_store_rules(
                 )
 
             # The session cannot leave COMPLETED while its completion is owed.
-            with pytest.raises(SessionRunFenced, match="keeps its status"):
+            with pytest.raises(SessionRunFenced, match="keeps its terminal status"):
                 await store.transition_status(
                     _SESSION_ID,
                     from_statuses={SessionStatus.COMPLETED},
@@ -289,7 +291,7 @@ def test_session_store_conformance_completed_decision_store_rules(
             # Nor release its fence before SESSION_COMPLETED is durable.
             active = active_invocation_execution_profile_from_checkpoint(checkpoint)
             assert active is not None
-            with pytest.raises(SessionRunFenced, match="held until its completed outcome"):
+            with pytest.raises(SessionRunFenced, match="held until its terminal outcome"):
                 await runtime_checkpoint_session_store(store).apply_invocation_lifecycle_command(
                     _release_invocation_command_with_cleanup_authority(
                         ReleaseInvocationCommand(

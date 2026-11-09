@@ -224,19 +224,27 @@ class InteractionTransitionSpec(BaseModel):
             raise ValueError(
                 "A running interaction completion requires a queue-conditional checkpoint mutation."
             )
-        if self.checkpoint_mutation is not None and (
-            self.event.type != EventType.INTERACTION_COMPLETED
-            or not self.only_if_no_queued_messages
+        if self.checkpoint_mutation is not None and self.to_status in (
+            paired_writes.OWED_OUTCOME_STATUSES
         ):
-            raise ValueError(
-                "checkpoint_mutation is valid only for a queue-conditional interaction completion."
-            )
-        if self.checkpoint_mutation is not None and self.to_status is SessionStatus.COMPLETED:
-            # The completed decision is installed only if the session completes.
-            paired_writes.completed_decision_from_install_mutation(
-                self.checkpoint_mutation, event=self.event
+            # A terminal outcome's decision is installed only if the session
+            # reaches that outcome's status; a completion only if no message is queued.
+            if self.to_status is SessionStatus.COMPLETED and not self.only_if_no_queued_messages:
+                raise ValueError(
+                    "A completed decision rides only on a queue-conditional completion."
+                )
+            paired_writes.owed_decision_from_install_mutation(
+                self.checkpoint_mutation, event=self.event, to_status=self.to_status
             )
         elif self.checkpoint_mutation is not None:
+            if (
+                self.event.type != EventType.INTERACTION_COMPLETED
+                or not self.only_if_no_queued_messages
+            ):
+                raise ValueError(
+                    "A completion-finalization mutation is valid only for a queue-conditional "
+                    "interaction completion."
+                )
             completion_finalization._validate_completion_finalization_mutation_shape(
                 self.checkpoint_mutation
             )

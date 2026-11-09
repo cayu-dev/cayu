@@ -17,17 +17,17 @@ from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalOutcome,
     _decision_digest,
     _decision_id,
-    build_completed_invocation_terminal_decision,
     build_invocation_terminal_decision,
-    completed_decision_event_id,
+    build_owed_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_event_id,
+    owed_decision_event_id,
 )
 from cayu.sessions._paired_writes import (
-    checkpoint_settling_completed_decision,
-    completed_decision_install_mutation,
-    require_completed_decision_authority,
-    unsettled_completed_decision,
+    checkpoint_settling_owed_decision,
+    owed_decision_install_mutation,
+    require_owed_decision_authority,
+    unsettled_owed_decision,
 )
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
@@ -105,7 +105,9 @@ def _completed(**overrides: Any) -> InvocationTerminalDecision:
         "task_result_payload": {"session_id": "s"},
     }
     arguments.update(overrides)
-    return build_completed_invocation_terminal_decision(**arguments)
+    return build_owed_invocation_terminal_decision(
+        outcome=InvocationTerminalOutcome.COMPLETED, **arguments
+    )
 
 
 @pytest.mark.parametrize(
@@ -160,11 +162,11 @@ def test_completed_decision_round_trips_as_version_two(task_id: str | None) -> N
         )
         == decision
     )
-    assert completed_decision_event_id(decision, "task_completed") == (
+    assert owed_decision_event_id(decision, "task_completed") == (
         f"{decision.decision_id}:task_completed"
     )
-    with pytest.raises(ValueError, match="Only completed decisions"):
-        completed_decision_event_id(_failed(), "task_completed")
+    with pytest.raises(ValueError, match="Only version-2 decisions"):
+        owed_decision_event_id(_failed(), "task_completed")
 
 
 def test_completed_decision_adopts_a_queued_run_operation_event_id() -> None:
@@ -259,7 +261,7 @@ def _interaction_completed(**updates: Any) -> Event:
 
 
 def test_completion_transition_installs_only_its_own_completed_decision() -> None:
-    mutation = completed_decision_install_mutation(_completed())
+    mutation = owed_decision_install_mutation(_completed())
     spec = InteractionTransitionSpec(
         event=_interaction_completed(),
         from_statuses=(SessionStatus.RUNNING,),
@@ -282,7 +284,7 @@ def test_completion_transition_installs_only_its_own_completed_decision() -> Non
                 only_if_no_queued_messages=conditional,
                 checkpoint_mutation=mutation,
             )
-    with pytest.raises(ValueError, match="only install its completed decision"):
+    with pytest.raises(ValueError, match="only install its own decision"):
         InteractionTransitionSpec(
             event=_interaction_completed(),
             from_statuses=(SessionStatus.RUNNING,),
@@ -299,8 +301,8 @@ def test_completion_transition_installs_only_its_own_completed_decision() -> Non
                 ]
             },
         )
-    with pytest.raises(ValueError, match="Only a completed decision"):
-        completed_decision_install_mutation(_failed())
+    with pytest.raises(ValueError, match="Only a version-2 decision"):
+        owed_decision_install_mutation(_failed())
 
 
 def test_release_settles_a_completed_decision_only_after_its_terminal_event() -> None:
@@ -315,16 +317,14 @@ def test_release_settles_a_completed_decision_only_after_its_terminal_event() ->
         session_completed.model_copy(update={"id": "another-terminal-event"}),
         session_completed.model_copy(update={"type": EventType.SESSION_FAILED}),
     ):
-        with pytest.raises(SessionRunFenced, match="held until its completed outcome"):
-            checkpoint_settling_completed_decision(checkpoint, terminal_event=terminal_event)
-    assert (
-        checkpoint_settling_completed_decision(checkpoint, terminal_event=session_completed) == {}
-    )
+        with pytest.raises(SessionRunFenced, match="held until its terminal outcome"):
+            checkpoint_settling_owed_decision(checkpoint, terminal_event=terminal_event)
+    assert checkpoint_settling_owed_decision(checkpoint, terminal_event=session_completed) == {}
     interrupted = {
         INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY: _interrupted().model_dump(mode="json")
     }
-    assert checkpoint_settling_completed_decision(interrupted, terminal_event=None) is interrupted
-    assert unsettled_completed_decision(interrupted) is None
+    assert checkpoint_settling_owed_decision(interrupted, terminal_event=None) is interrupted
+    assert unsettled_owed_decision(interrupted) is None
 
 
 @pytest.mark.parametrize("run_epoch", [2, 3], ids=["owner", "another-epoch"])
@@ -338,9 +338,9 @@ def test_store_installs_only_the_completing_invocations_decision(run_epoch: int)
     )
 
     def install() -> None:
-        require_completed_decision_authority(
+        require_owed_decision_authority(
             to_status=SessionStatus.COMPLETED,
-            checkpoint_mutation=completed_decision_install_mutation(_completed()),
+            checkpoint_mutation=owed_decision_install_mutation(_completed()),
             event=_interaction_completed(),
             session=session,
             checkpoint=None,
@@ -350,5 +350,5 @@ def test_store_installs_only_the_completing_invocations_decision(run_epoch: int)
     if run_epoch == _IDENTITY["run_epoch"]:
         install()
     else:
-        with pytest.raises(SessionRunFenced, match="belong to the invocation it completes"):
+        with pytest.raises(SessionRunFenced, match="belong to the invocation it ends"):
             install()

@@ -325,8 +325,18 @@ checkpoint writers cannot create, replace, or delete this decision. Only the
 typed invocation terminal-decision and interaction-transition boundaries may
 install or settle it.
 
-A completed run records what it still owes as a version-2 terminal decision,
-installed with its version-5 completion receipt.
+A completed, failed or interrupted run records what it still owes as a
+version-2 terminal decision, installed with its version-5 transition receipt in
+the same transaction as its terminal status. The decision freezes the
+TURN_COMPLETED and session event (and a completion's task result) with their
+event IDs; the run publishes them from it, recovery publishes the same events
+from it after a crash, and the fence release settles it only once the session
+event is durable. A session cannot leave its decided status while its decision
+is unsettled. The TURN_COMPLETED and session event carry the time the
+interaction ended, which the decision freezes so that a replay is exact. Events
+saved after the transition and before the session event, such as environment
+finalization events, can therefore carry later timestamps; the event sequence,
+not the timestamp, orders a session's events.
 `SessionStore.list_sessions_with_unsettled_invocation_terminal_decision(query)`
 lists, like `list_sessions_with_pending_interruption_cascade`, only the
 sessions whose checkpoint still holds `invocation_terminal_decision`, so
@@ -336,8 +346,10 @@ that does not implement it raises `NotImplementedError`. Storage revision 143
 adds that index and is breaking, because older binaries reject both records:
 stop every process that opens the database and run `cayu storage migrate` before
 starting the new binaries. Acknowledge each pending breaking revision: 143 for
-this index and 144 for the separate receipt ledger, using
-`--acknowledge-breaking REVISION` for each. Older binaries must not open a migrated database; they
+this index, 144 for the separate receipt ledger and 145 for failed and
+interrupted decisions, using `--acknowledge-breaking REVISION` for each.
+Revision 145 changes no schema; it is breaking because older binaries reject a
+failed or interrupted version-2 decision and its receipt. Older binaries must not open a migrated database; they
 refuse it as too new. On PostgreSQL the index is built `CONCURRENTLY`.
 
 Custom `SessionStore` implementations must accept the optional

@@ -94,12 +94,17 @@ def _checkpoint_readers(monkeypatch):
     )
 
 
+async def _no_owed_outcome(session, decision) -> None:
+    raise AssertionError("No outcome is owed in these scenarios.")
+
+
 def _settlement(world: _World) -> RunSettlement:
     return RunSettlement(
         session_store=world,
         session_finalization=world,
         environment_lifecycle=world,
         recovery_ownership=world,
+        finish_owed_outcome=_no_owed_outcome,
     )
 
 

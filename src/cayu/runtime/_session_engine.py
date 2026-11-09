@@ -52,6 +52,7 @@ from cayu.runtime._model_completion_contracts import (
 )
 from cayu.runtime._model_completion_recovery import ModelCompletionRecovery
 from cayu.runtime._model_policy import PolicySelection
+from cayu.runtime._outcome_decision_settlement import completed_outcome
 from cayu.runtime._pending_tool_round_recovery import PendingToolRoundRecovery
 from cayu.runtime._policy_wire import decode as decode_policy_evidence
 from cayu.runtime._recovery_ownership import (
@@ -683,6 +684,7 @@ class SessionEngine(BeforeStopPolicies):
             session_finalization=session_finalization,
             environment_lifecycle=environment_lifecycle,
             recovery_ownership=recovery_ownership,
+            finish_owed_outcome=terminal_finalization.finish_owed_outcome,
             recovery_owns_failure=lambda error, ledger: (
                 session_finalization.interaction_publication_refused(
                     ledger.session_id, ledger.invocation_context.binding.interaction_id
@@ -3143,7 +3145,11 @@ class SessionEngine(BeforeStopPolicies):
                 from_statuses={SessionStatus.RUNNING},
                 checkpoint_mutation=checkpoint_mutation,
                 tool_completion_result=tool_completion_result,
-                completed_decision_context=completion if checkpoint_mutation is None else None,
+                owed_outcome=(
+                    None
+                    if completion is None or checkpoint_mutation is not None
+                    else completed_outcome(completion, tool_completion_result)
+                ),
             )
             return transitioned, event, completed, completion_marker if completed else None
         except (SessionRunFenced, SessionStatusConflict):
@@ -5985,15 +5991,38 @@ class SessionEngine(BeforeStopPolicies):
         run_ledger: RunLedger | None = None,
     ) -> AsyncGenerator[Event, None]:
         outcome_state = SessionOutcomeState(session=session)
-        failure_outcome_stream: AsyncGenerator[Event, None] | None = None
+        decided_outcome: AsyncGenerator[Event, None] | None = None
+        local_outcome_ledger: RunLedger | None = None
 
-        def retain_failure_outcome() -> None:
-            if run_ledger is None:
+        def retain_decided_outcome() -> None:
+            # A committed failure or pause (an approval pause from its start)
+            # owes the rest of its publication: after any exit, settlement
+            # finishes it.
+            nonlocal run_ledger, local_outcome_ledger
+            if decided_outcome is None:
                 return
-            if failure_outcome_stream is None:
-                raise RuntimeError("Failure outcome stream was not initialized.")
-            retained_stream = failure_outcome_stream
-            run_ledger.decided(lambda: drain_event_stream(retained_stream))
+            if run_ledger is None:
+                local_outcome_ledger = RunLedger(
+                    session_id=outcome_state.session.id,
+                    run_epoch=invocation_context.binding.run_epoch,
+                    invocation_context=invocation_context,
+                )
+                local_outcome_ledger.local_release.append(
+                    lambda: _clear_session_interaction_settlement(outcome_state.session.id)
+                )
+                run_ledger = local_outcome_ledger
+            retained = decided_outcome
+            run_ledger.decided(lambda: drain_event_stream(retained))
+
+        def decided_outcome_published() -> None:
+            if run_ledger is not None and run_ledger.stage is OutcomeStage.DECIDED:
+                run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+
+        async def close_undecided_outcome(stream: AsyncGenerator[Event, None]) -> None:
+            # Settlement owns a decided publication after a consumer closes at a
+            # yield; do not close it while that retained publisher may still run.
+            if run_ledger is None or run_ledger.remainder is None:
+                await stream.aclose()
 
         def outcome_context() -> SessionOutcomeContext:
             return SessionOutcomeContext(
@@ -6011,7 +6040,7 @@ class SessionEngine(BeforeStopPolicies):
                 task_lease_expires_at=task_lease_expires_at,
                 task_handoff_id=task_handoff_id,
                 request_loop_policies=request_loop_policies,
-                on_failure_decided=retain_failure_outcome,
+                on_outcome_decided=retain_decided_outcome,
             )
 
         if type(invocation_context) is not InvocationContext:
@@ -6267,7 +6296,6 @@ class SessionEngine(BeforeStopPolicies):
             )
 
         owed_completion: AsyncGenerator[Event, None] | None = None
-        local_pause_ledger: RunLedger | None = None
 
         if run_ledger is not None:
             # A restart never repeats environment finalization; recovery finishes it instead.
@@ -6471,14 +6499,19 @@ class SessionEngine(BeforeStopPolicies):
                     # The native park already accepted the entire turn, including
                     # stop policies. Finish its interrupted publication/cleanup;
                     # do not reevaluate policies or dispatch another model step.
-                    async for event in self._session_outcomes.publish_stop_interruption(
+                    decided_outcome = self._session_outcomes.publish_stop_interruption(
                         outcome_context(),
                         BeforeStopDecision(
                             action=BeforeStopAction.INTERRUPT,
                             reason="Explicit continuation wait reached a whole-turn boundary.",
                         ),
-                    ):
-                        yield event
+                    )
+                    try:
+                        async for event in decided_outcome:
+                            yield event
+                        decided_outcome_published()
+                    finally:
+                        await close_undecided_outcome(decided_outcome)
                     return
             effective_deadline(
                 current_execution_deadline(), outcome_state.session.execution_deadline
@@ -8467,10 +8500,15 @@ class SessionEngine(BeforeStopPolicies):
                             del continuation_transform
                             continue
                         if before_stop_decision.action == BeforeStopAction.INTERRUPT:
-                            async for event in self._session_outcomes.publish_stop_interruption(
+                            decided_outcome = self._session_outcomes.publish_stop_interruption(
                                 outcome_context(), before_stop_decision
-                            ):
-                                yield event
+                            )
+                            try:
+                                async for event in decided_outcome:
+                                    yield event
+                                decided_outcome_published()
+                            finally:
+                                await close_undecided_outcome(decided_outcome)
                             return
                         if before_stop_decision.action == BeforeStopAction.FAIL:
                             raise RuntimeError(
@@ -8692,57 +8730,56 @@ class SessionEngine(BeforeStopPolicies):
                 async for event in completion_stream:
                     yield event
         except ToolApprovalRequired as exc:
-            outcome_stream = self._session_outcomes.pause_for_tool_approval(
+            decided_outcome = self._session_outcomes.pause_for_tool_approval(
                 outcome_context(),
                 exc=exc,
                 materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
             )
-            if run_ledger is None:
-                local_pause_ledger = RunLedger(
-                    session_id=outcome_state.session.id,
-                    run_epoch=invocation_context.binding.run_epoch,
-                    invocation_context=invocation_context,
-                )
-                local_pause_ledger.local_release.append(
-                    lambda: _clear_session_interaction_settlement(outcome_state.session.id)
-                )
-                run_ledger = local_pause_ledger
-            run_ledger.decided(lambda: drain_event_stream(outcome_stream))
-            # Settlement owns this generator after a consumer closes at a yield.
-            # Do not aclose it while a retained publisher may still be running.
-            async for event in outcome_stream:
-                yield event
-            run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+            # An approval pause has always been settled by its own publication,
+            # even when the run ends before its transition commits.
+            retain_decided_outcome()
+            try:
+                async for event in decided_outcome:
+                    yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
         except SessionWakeScheduled as exc:
-            async with contextlib.aclosing(
-                self._session_outcomes.pause_for_wake(
-                    outcome_context(),
-                    exc=exc,
-                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
-                )
-            ) as outcome_stream:
-                async for event in outcome_stream:
+            decided_outcome = self._session_outcomes.pause_for_wake(
+                outcome_context(),
+                exc=exc,
+                materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            )
+            try:
+                async for event in decided_outcome:
                     yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
         except UserInputRequired as exc:
-            async with contextlib.aclosing(
-                self._session_outcomes.pause_for_user_input(
-                    outcome_context(),
-                    exc=exc,
-                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
-                )
-            ) as outcome_stream:
-                async for event in outcome_stream:
+            decided_outcome = self._session_outcomes.pause_for_user_input(
+                outcome_context(),
+                exc=exc,
+                materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            )
+            try:
+                async for event in decided_outcome:
                     yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
         except ForegroundChildActionRequired as exc:
-            async with contextlib.aclosing(
-                self._session_outcomes.pause_for_foreground_child(
-                    outcome_context(),
-                    exc=exc,
-                    materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
-                )
-            ) as outcome_stream:
-                async for event in outcome_stream:
+            decided_outcome = self._session_outcomes.pause_for_foreground_child(
+                outcome_context(),
+                exc=exc,
+                materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
+            )
+            try:
+                async for event in decided_outcome:
                     yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
         except ToolEffectReconciliationRequired as unresolved:
             authoritative_failure = (
                 unresolved.failures
@@ -9158,24 +9195,17 @@ class SessionEngine(BeforeStopPolicies):
                 raise
             if run_ledger is not None:
                 run_ledger.failure_owned_by_body = True
-            failure_outcome_stream = self._session_outcomes.fail(
+            decided_outcome = self._session_outcomes.fail(
                 outcome_context(),
                 exc=exc,
                 materialize_deferred_messages_after_failure=materialize_deferred_messages_after_failure,
             )
-            if run_ledger is None:
-                async with contextlib.aclosing(failure_outcome_stream) as outcome_stream:
-                    async for event in outcome_stream:
-                        yield event
-            else:
-                try:
-                    async for event in failure_outcome_stream:
-                        yield event
-                    if run_ledger.stage is OutcomeStage.DECIDED:
-                        run_ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
-                finally:
-                    if run_ledger.remainder is None:
-                        await failure_outcome_stream.aclose()
+            try:
+                async for event in decided_outcome:
+                    yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
         except BaseExceptionGroup as failure:
             if preserve_failure_until_initial_provider_dispatch and (
                 not initial_provider_dispatch_started
@@ -9359,8 +9389,8 @@ class SessionEngine(BeforeStopPolicies):
                                     _clear_session_interaction_settlement(outcome_state.session.id)
                                     _deactivate_session_interaction(outcome_state.session.id)
             finally:
-                if local_pause_ledger is not None:
-                    await self._run_settlement.finish(local_pause_ledger, finalizer_failure)
+                if local_outcome_ledger is not None:
+                    await self._run_settlement.finish(local_outcome_ledger, finalizer_failure)
 
     async def _clear_pending_tool_round_if_matches(
         self,

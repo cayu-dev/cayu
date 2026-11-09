@@ -32,11 +32,13 @@ from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
 )
 from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalDecision,
+    InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions._paired_writes import unsettled_completed_decision
+from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions.records import SessionStatus
 
 if TYPE_CHECKING:
@@ -173,10 +175,12 @@ class RunSettlement:
         session_finalization: SessionFinalization,
         environment_lifecycle: EnvironmentLifecycle,
         recovery_ownership: RecoveryOwnership,
+        finish_owed_outcome: Callable[[Session, InvocationTerminalDecision], Awaitable[None]],
         recovery_owns_failure: Callable[[BaseException, RunLedger], bool] = lambda error, ledger: (
             False
         ),
     ) -> None:
+        self._finish_owed_outcome = finish_owed_outcome
         self._recovery_owns_failure = recovery_owns_failure
         self._session_store = session_store
         self._session_finalization = session_finalization
@@ -271,7 +275,7 @@ class RunSettlement:
 
         if run_exit.kind in _UNSETTLED_EXITS or ledger.stage >= OutcomeStage.FENCE_RELEASED:
             return
-        # A committed completion is finished from its decision whoever handled the error.
+        # A committed outcome is finished from its decision whoever handled the error.
         owed = await self._owed_settlement(ledger)
         if owed is not _Owed.COMPLETION and ledger.stage < OutcomeStage.DECIDED:
             if run_exit.error is not None and self._recovery_owns_failure(run_exit.error, ledger):
@@ -292,17 +296,21 @@ class RunSettlement:
         try:
             if owed is _Owed.DECISION:
                 await self._decide_abandoned(ledger)
-            # A completion that committed before the body recorded it publishes
+            # An outcome that committed before the body recorded it publishes
             # what its decision owes before the release.
-            if owed is _Owed.COMPLETION and await self._publish_owed_completion(ledger):
+            if owed is _Owed.COMPLETION and await self._publish_owed_outcome(ledger):
                 ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
             if ledger.remainder is not None:
                 published = await ledger.remainder()
-                if published is False and run_exit.kind is RunExitKind.CANCELLED:
-                    # A cancellation inside the publication ended it. Its decision
-                    # still holds every event it owes, so a fresh publication
-                    # finishes it; each step replays what is already durable.
-                    published = await self._publish_owed_completion(ledger)
+                if published is False:
+                    # A cancellation or failure inside the publication ended it.
+                    # Its decision still holds every event it owes, so a fresh
+                    # publication finishes it; each step replays what is durable.
+                    # A completion is restarted only after a cancellation, so a
+                    # failing process never runs environment finalization twice.
+                    published = await self._publish_owed_outcome(
+                        ledger, restart_completion=run_exit.kind is RunExitKind.CANCELLED
+                    )
                 if published is not False:
                     ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
         finally:
@@ -349,13 +357,15 @@ class RunSettlement:
             return _Owed.NOTHING
         if ledger.stage >= OutcomeStage.DECIDED:
             return _Owed.RELEASE
-        completed = unsettled_completed_decision(checkpoint)
+        owed = owed_decision_of_status(checkpoint, session.status)
         if (
-            ledger.completion is not None
-            and session.status is SessionStatus.COMPLETED
-            and completed is not None
+            owed is not None
+            and (
+                ledger.completion is not None
+                or owed.outcome is not InvocationTerminalOutcome.COMPLETED
+            )
             and invocation_terminal_decision_matches_active_profile(
-                completed,
+                owed,
                 session_id=session.id,
                 session_instance_id=session.instance_id,
                 run_epoch=session.run_epoch,
@@ -378,19 +388,23 @@ class RunSettlement:
             return _Owed.RECOVERY
         return _Owed.DECISION
 
-    async def _publish_owed_completion(self, ledger: RunLedger) -> bool:
-        """Publish a completion from its decision while the session is still completed."""
+    async def _publish_owed_outcome(
+        self, ledger: RunLedger, *, restart_completion: bool = True
+    ) -> bool:
+        """Publish an outcome from its decision while the session keeps its status."""
 
         session = await self._session_store.load(ledger.session_id)
-        if (
-            ledger.completion is None
-            or session is None
-            or session.status is not SessionStatus.COMPLETED
-            or unsettled_completed_decision(
-                await self._session_store.load_checkpoint(ledger.session_id)
-            )
-            is None
-        ):
+        if session is None:
+            return False
+        owed = owed_decision_of_status(
+            await self._session_store.load_checkpoint(ledger.session_id), session.status
+        )
+        if owed is None:
+            return False
+        if owed.outcome is not InvocationTerminalOutcome.COMPLETED:
+            await self._finish_owed_outcome(session, owed)
+            return True
+        if ledger.completion is None or not restart_completion:
             return False
         publication = ledger.completion(session)
         return publication is not None and await drain_event_stream(publication)

@@ -101,7 +101,7 @@ def test_task_worker_finishes_a_completion_without_the_sweep(backend: str, monke
         return []
 
     # Only the next worker's expired-owner scan can find the completed session.
-    monkeypatch.setattr(IncompleteSessionRecovery, "recover_committed_completions", no_sweep)
+    monkeypatch.setattr(IncompleteSessionRecovery, "recover_committed_outcomes", no_sweep)
 
     result = explore.run_point(explore.SCENARIOS["task"], FaultKind.CRASH, _TERMINALIZE)
 

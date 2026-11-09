@@ -847,6 +847,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         PRIMARY KEY (session_id, record_sha256)
     )""",
     ),
+    # Failed and interrupted terminal decisions; no schema change.
+    145: (),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

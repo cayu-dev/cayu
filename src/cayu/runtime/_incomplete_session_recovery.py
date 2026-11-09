@@ -247,6 +247,7 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._model_stage import ModelCompletionStage
+from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -670,7 +671,7 @@ class IncompleteSessionRecovery:
         self._effective_retry_policy = effective_retry_policy
         self._engine = engine
         self._session_tasks = session_tasks
-        self._committed_completion_listing_unsupported = False
+        self._committed_outcome_listing_unsupported = False
         self._environment_lifecycle = environment_lifecycle
         self._event_writer = event_writer
         self._execution_profile_continuation = execution_profile_continuation
@@ -1318,63 +1319,67 @@ class IncompleteSessionRecovery:
         except _RecoveryPreflightMutationRequired:
             return None
 
-    async def recover_committed_completions(
+    async def recover_committed_outcomes(
         self,
         *,
         inactive_for_seconds: int,
     ) -> list[IncompleteSessionRecoveryResult]:
-        """Finish completed sessions whose completed decision is still unsettled.
+        """Finish terminal sessions whose terminal decision is still unsettled.
 
         The sweep over running and interrupting sessions never sees them: their
-        COMPLETED transition committed, but the process stopped before their
-        task, terminal events or fence release caught up.
+        completed, failed or interrupted transition committed, but the process
+        stopped before their task, terminal events or fence release caught up.
         """
 
-        request = IncompleteSessionsRecoveryRequest(
-            statuses={SessionStatus.COMPLETED},
-            inactive_for_seconds=inactive_for_seconds,
-            reason="committed_completion_recovered",
-        )
         results: list[IncompleteSessionRecoveryResult] = []
-        cursor: str | None = None
-        while True:
-            try:
-                list_owed = (
-                    self._session_store.list_sessions_with_unsettled_invocation_terminal_decision
-                )
-                page = await list_owed(
-                    SessionQuery(
-                        status=SessionStatus.COMPLETED,
-                        inactive_for_seconds=inactive_for_seconds,
-                        order_by=SessionOrder.CREATED_AT_ASC,
-                        limit=1000,
-                        cursor=cursor,
+        for status in (SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED):
+            request = IncompleteSessionsRecoveryRequest(
+                statuses={status},
+                inactive_for_seconds=inactive_for_seconds,
+                reason="committed_outcome_recovered",
+            )
+            cursor: str | None = None
+            while True:
+                try:
+                    list_owed = self._session_store.list_sessions_with_unsettled_invocation_terminal_decision
+                    page = await list_owed(
+                        SessionQuery(
+                            status=status,
+                            inactive_for_seconds=inactive_for_seconds,
+                            order_by=SessionOrder.CREATED_AT_ASC,
+                            limit=1000,
+                            cursor=cursor,
+                        )
                     )
-                )
-            except NotImplementedError:
-                if not self._committed_completion_listing_unsupported:
-                    self._committed_completion_listing_unsupported = True
-                    logger.warning(
-                        "This SessionStore cannot list unsettled terminal decisions, so the "
-                        "sweep does not finish completed turns whose process stopped early; "
-                        "implement list_sessions_with_unsettled_invocation_terminal_decision."
+                except NotImplementedError:
+                    if not self._committed_outcome_listing_unsupported:
+                        self._committed_outcome_listing_unsupported = True
+                        logger.warning(
+                            "This SessionStore cannot list unsettled terminal decisions, so the "
+                            "sweep does not finish terminal turns whose process stopped early; "
+                            "implement list_sessions_with_unsettled_invocation_terminal_decision."
+                        )
+                    return results
+                for session in page.sessions:
+                    checkpoint = await self._session_store.load_checkpoint(session.id)
+                    if owed_decision_of_status(checkpoint, status) is None:
+                        # An election that precedes its transition has its own owner.
+                        continue
+                    results.append(
+                        await self._recover_incomplete_session_fault_isolated(
+                            session=session,
+                            request=request,
+                            before_recovery=None,
+                            before_mutation=None,
+                            after_recovery=None,
+                            reconcile_result=None,
+                            recover_abandoned_model=None,
+                        )
                     )
-                return results
-            for session in page.sessions:
-                results.append(
-                    await self._recover_incomplete_session_fault_isolated(
-                        session=session,
-                        request=request,
-                        before_recovery=None,
-                        before_mutation=None,
-                        after_recovery=None,
-                        reconcile_result=None,
-                        recover_abandoned_model=None,
-                    )
-                )
-            if page.next_cursor is None or page.next_cursor == cursor:
-                return results
-            cursor = page.next_cursor
+                if page.next_cursor is None or page.next_cursor == cursor:
+                    break
+                cursor = page.next_cursor
+        return results
 
     async def _recover_incomplete_session_fault_isolated(
         self,

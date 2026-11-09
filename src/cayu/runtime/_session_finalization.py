@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
+from typing import Any, NoReturn, TypeVar
 from uuid import uuid4
 
 from pydantic import (
@@ -122,10 +122,6 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
-from cayu.runtime._completed_decision_settlement import (
-    completed_decision_install,
-    task_lifecycle_event,
-)
 from cayu.runtime._continuation_task_failure import (
     load_direct_task_failure_replay,
     provider_operation_task_failure_payload,
@@ -172,6 +168,11 @@ from cayu.runtime._model_step_executor import (
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
     ModelStepLimitEvaluationRequest,
+)
+from cayu.runtime._outcome_decision_settlement import (
+    OwedOutcome,
+    owed_decision_install,
+    task_lifecycle_event,
 )
 from cayu.runtime._recovery_claims import (
     _IncompleteRecoveryClaimLost,
@@ -293,6 +294,7 @@ from cayu.sessions._model_completion_publication import (
 )
 from cayu.sessions._model_stage import SessionModelCompletionStageConflict
 from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
+from cayu.sessions._paired_writes import OUTCOME_SESSION_STATUS
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_LIMIT_REACHED,
     _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
@@ -341,9 +343,6 @@ from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
 )
-
-if TYPE_CHECKING:
-    from cayu.runtime._session_outcome_publication import SessionOutcomeContext
 
 _INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS = 3
 
@@ -2094,7 +2093,7 @@ class SessionFinalization:
         terminal_decision: InvocationTerminalDecision | None = None,
         tool_completion_result: ToolCompletionResult | None = None,
         abandoned_provider_operation_stage_id: str | None = None,
-        completed_decision_context: SessionOutcomeContext | None = None,
+        owed_outcome: OwedOutcome | None = None,
     ) -> tuple[Session, Event | None, bool]:
         """Publish the interaction's transition, settling any active model stage.
 
@@ -2326,10 +2325,11 @@ class SessionFinalization:
             return transitioned, None, True
 
         pending_action_kind: str | None = None
+        outcome_checkpoint: dict[str, Any] | None = None
         if to_status is not SessionStatus.COMPLETED and terminal_decision is None:
-            checkpoint = await self.session_store.load_checkpoint(session.id)
+            outcome_checkpoint = await self.session_store.load_checkpoint(session.id)
             pending_action_kind = _pending_interaction_action_kind(
-                checkpoint, run_epoch=session.run_epoch
+                outcome_checkpoint, run_epoch=session.run_epoch
             )
             if (
                 pending_action_kind is None
@@ -2450,19 +2450,22 @@ class SessionFinalization:
                 )
             return transitioned, None, True
 
+        if to_status is SessionStatus.COMPLETED:
+            outcome_checkpoint = completion_checkpoint
         if (
-            completed_decision_context is not None
-            and to_status is SessionStatus.COMPLETED
-            # A recovered continuation keeps its claim's own completion path.
+            owed_outcome is not None
+            and OUTCOME_SESSION_STATUS[owed_outcome.outcome] is to_status
+            # A recovered continuation keeps its claim's own terminal path.
             and expected_recovery_claim_id is None
+            # An outcome another owner already elected keeps its own decision.
+            and invocation_terminal_decision_from_checkpoint(outcome_checkpoint) is None
         ):
-            # What this completion still owes is installed with it, if it completes.
-            checkpoint_mutation = await completed_decision_install(
-                checkpoint=completion_checkpoint,
+            # What this outcome still owes is installed with it, if it commits.
+            checkpoint_mutation = await owed_decision_install(
+                checkpoint=outcome_checkpoint,
                 session_finalization=self,
-                context=completed_decision_context,
-                interaction_completed=event,
-                tool_completion_result=tool_completion_result,
+                owed=owed_outcome,
+                interaction_event=event,
             )
         replay_event = copy_event(event)
         from cayu.runtime._session_steering import SessionSteeringBoundaryReached
@@ -2866,6 +2869,7 @@ class SessionFinalization:
         terminal_event: Event | None = None,
         terminal_decision: InvocationTerminalDecision | None = None,
         allow_released_invocation_authority: bool = False,
+        owed_outcome: OwedOutcome | None = None,
     ) -> tuple[Session, Event | None, bool]:
         """Publish from a caller not enclosed by ``_run_session`` cleanup."""
 
@@ -2892,6 +2896,7 @@ class SessionFinalization:
                 expected_recovery_claim_id=expected_recovery_claim_id,
                 terminal_event=terminal_event,
                 terminal_decision=terminal_decision,
+                owed_outcome=owed_outcome,
             )
         except asyncio.CancelledError as cancellation:
             await self._reconcile_sibling_interaction_transition_cancellation(
@@ -3246,6 +3251,11 @@ class SessionFinalization:
                 yield terminal_event
         finally:
             _deactivate_session_interaction(session.id)
+
+    def publication_safe_event(self, event: Event) -> Event:
+        """Return ``event`` as its publication would store it, secrets redacted."""
+
+        return self._event_writer.prepare_candidate(event)
 
     async def prepare_turn_completed_event(
         self,

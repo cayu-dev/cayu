@@ -601,6 +601,10 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(revision=143, kind=RevisionKind.BREAKING, compatible_from=143),
     # Checkpoint ledger references require the separate receipt ledger table.
     Revision(revision=144, kind=RevisionKind.BREAKING, compatible_from=144),
+    # A failed or interrupted run also records what it still owes as a version-2
+    # terminal decision, installed with its transition receipt. Older binaries
+    # reject both records, so they must not open it. No schema change.
+    Revision(revision=145, kind=RevisionKind.BREAKING, compatible_from=145),
 )
 
 #: The revision an empty database is initialized to.

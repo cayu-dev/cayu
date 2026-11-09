@@ -2996,7 +2996,7 @@ class InMemorySessionStore(
                 )
             if to_status is SessionStatus.RUNNING:
                 self._require_external_wait_admission_unlocked(session)
-            paired_writes.require_owed_completion_kept(
+            paired_writes.require_owed_outcome_kept(
                 session.status, to_status, self._checkpoints.get(session_id)
             )
 
@@ -3172,7 +3172,7 @@ class InMemorySessionStore(
                 )
             if to_status is SessionStatus.RUNNING:
                 self._require_external_wait_admission_unlocked(session)
-            paired_writes.require_owed_completion_kept(
+            paired_writes.require_owed_outcome_kept(
                 session.status, to_status, self._checkpoints.get(session_id)
             )
             if expected_latest_interaction_event_id is not None:
@@ -3696,7 +3696,7 @@ class InMemorySessionStore(
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {target_status}"
                 )
-            paired_writes.require_completed_decision_authority(
+            paired_writes.require_owed_decision_authority(
                 to_status=target_status,
                 checkpoint_mutation=checkpoint_mutation_request,
                 event=copied_event,
@@ -4279,11 +4279,11 @@ class InMemorySessionStore(
                     run_epochs=frozenset({copied.expected_run_epoch}),
                     active_profile=copied.expected_active_profile,
                 )
-                if (owed := paired_writes.unsettled_completed_decision(checkpoint)) is not None:
+                if (owed := paired_writes.unsettled_owed_decision(checkpoint)) is not None:
                     published = self._event_records_by_id.get(
                         (copied.session_id, owed.terminal_event_id)
                     )
-                    checkpoint = paired_writes.checkpoint_settling_completed_decision(
+                    checkpoint = paired_writes.checkpoint_settling_owed_decision(
                         checkpoint, terminal_event=None if published is None else published.event
                     )
                 session = session.model_copy(update={"run_epoch": copied.expected_run_epoch + 1})

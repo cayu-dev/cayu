@@ -4434,9 +4434,11 @@ async def _completion_owes_task(app: CayuApp, session: Session, task_id: str) ->
 
     if session.status is not SessionStatus.COMPLETED:
         return False
-    from cayu.sessions._paired_writes import unsettled_completed_decision
+    from cayu.sessions._paired_writes import owed_decision_of_status
 
-    owed = unsettled_completed_decision(await app.session_store.load_checkpoint(session.id))
+    owed = owed_decision_of_status(
+        await app.session_store.load_checkpoint(session.id), SessionStatus.COMPLETED
+    )
     return owed is not None and owed.task_id == task_id
 
 

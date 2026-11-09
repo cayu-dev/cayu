@@ -8,10 +8,11 @@ recovery once the owner is gone, finishes the pair from durable state alone.
 The intent stays in the session checkpoint until it settles, which is what
 recovery lists.
 
-A completed interaction is such a pair. Its invocation terminal decision is
-installed by the COMPLETED transition, as a set-if-absent checkpoint mutation
-that every store applies only when the session actually completes. The fence
-release settles it, and only once its SESSION_COMPLETED event is durable.
+Every terminal interaction outcome is such a pair. A version-2 invocation
+terminal decision is installed by the outcome's own transition (COMPLETED,
+FAILED or INTERRUPTED), as a set-if-absent checkpoint mutation that every store
+applies only when the session reaches that status. The fence release settles
+it, and only once the outcome's session event is durable.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._invocation_terminal_decision import (
+    _OWED_DECISION_SCHEMA_VERSION,
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
     invocation_terminal_decision_from_checkpoint,
@@ -38,12 +40,25 @@ from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.checkpoints import INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY
 from cayu.sessions.records import Session, SessionStatus
 
+# The session status each owed outcome's transition commits, and its session event.
+OUTCOME_SESSION_STATUS: dict[InvocationTerminalOutcome, SessionStatus] = {
+    InvocationTerminalOutcome.COMPLETED: SessionStatus.COMPLETED,
+    InvocationTerminalOutcome.FAILED: SessionStatus.FAILED,
+    InvocationTerminalOutcome.INTERRUPTED: SessionStatus.INTERRUPTED,
+}
+OUTCOME_SESSION_EVENT: dict[InvocationTerminalOutcome, EventType] = {
+    InvocationTerminalOutcome.COMPLETED: EventType.SESSION_COMPLETED,
+    InvocationTerminalOutcome.FAILED: EventType.SESSION_FAILED,
+    InvocationTerminalOutcome.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
+OWED_OUTCOME_STATUSES = frozenset(OUTCOME_SESSION_STATUS.values())
 
-def completed_decision_install_mutation(decision: InvocationTerminalDecision) -> dict[str, Any]:
-    """Return the checkpoint mutation that installs a completed decision with its transition."""
 
-    if decision.outcome is not InvocationTerminalOutcome.COMPLETED:
-        raise ValueError("Only a completed decision rides on the completion transition.")
+def owed_decision_install_mutation(decision: InvocationTerminalDecision) -> dict[str, Any]:
+    """Return the checkpoint mutation that installs a decision with its transition."""
+
+    if decision.schema_version != _OWED_DECISION_SCHEMA_VERSION:
+        raise ValueError("Only a version-2 decision rides on its terminal transition.")
     return RuntimePublicationMutation(
         operations=(
             RuntimePublicationCheckpointOperation(
@@ -56,12 +71,22 @@ def completed_decision_install_mutation(decision: InvocationTerminalDecision) ->
     ).model_dump(mode="json")
 
 
-def completed_decision_from_install_mutation(
+def is_owed_decision_install_mutation(mutation: dict[str, Any]) -> bool:
+    """Whether a transition's checkpoint mutation installs a terminal decision."""
+
+    operations = RuntimePublicationMutation.model_validate(mutation).operations
+    return any(
+        operation.key == INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY for operation in operations
+    )
+
+
+def owed_decision_from_install_mutation(
     mutation: dict[str, Any],
     *,
     event: Event,
+    to_status: SessionStatus,
 ) -> InvocationTerminalDecision:
-    """Authenticate a completion transition's mutation as the decision for its own event."""
+    """Authenticate a terminal transition's mutation as the decision for its own event."""
 
     operations = RuntimePublicationMutation.model_validate(mutation).operations
     if (
@@ -70,80 +95,89 @@ def completed_decision_from_install_mutation(
         or operations[0].action != "set"
         or operations[0].expected_value_digest is not None
     ):
-        raise ValueError("A completion transition may only install its completed decision.")
+        raise ValueError("A terminal transition may only install its own decision.")
     decision = InvocationTerminalDecision.model_validate(operations[0].value)
     if (
-        decision.outcome is not InvocationTerminalOutcome.COMPLETED
+        decision.schema_version != _OWED_DECISION_SCHEMA_VERSION
+        or OUTCOME_SESSION_STATUS[decision.outcome] is not to_status
         or decision.interaction_event_id != event.id
         or decision.interaction_id != event.interaction_id
         or decision.session_id != event.session_id
         or decision.observed_at != event.timestamp
     ):
-        raise ValueError("A completed decision belongs to another interaction completion.")
+        raise ValueError("A terminal decision belongs to another interaction outcome.")
     return decision
 
 
-def unsettled_completed_decision(
+def unsettled_owed_decision(
     checkpoint: dict[str, Any] | None,
 ) -> InvocationTerminalDecision | None:
-    """Return the completed decision whose owed writes are not all durable yet."""
+    """Return the version-2 decision whose owed writes are not all durable yet."""
 
     decision = invocation_terminal_decision_from_checkpoint(checkpoint)
-    if decision is None or decision.outcome is not InvocationTerminalOutcome.COMPLETED:
+    if decision is None or decision.schema_version != _OWED_DECISION_SCHEMA_VERSION:
         return None
     return decision
 
 
-def checkpoint_settling_completed_decision(
+def owed_decision_of_status(
+    checkpoint: dict[str, Any] | None,
+    status: SessionStatus,
+) -> InvocationTerminalDecision | None:
+    """Return the unsettled decision a session in ``status`` still owes, if any."""
+
+    decision = unsettled_owed_decision(checkpoint)
+    if decision is None or OUTCOME_SESSION_STATUS[decision.outcome] is not status:
+        return None
+    return decision
+
+
+def checkpoint_settling_owed_decision(
     checkpoint: dict[str, Any] | None,
     *,
     terminal_event: Event | None,
 ) -> dict[str, Any] | None:
-    """Settle an owed completion in the fence release, refusing until it is published.
+    """Settle an owed outcome in the fence release, refusing until it is published.
 
     ``terminal_event`` is the durable event the store found under the decision's
-    terminal event ID, if any. A release with no completed decision is unchanged.
+    terminal event ID, if any. A release with no owed decision is unchanged.
     """
 
-    decision = unsettled_completed_decision(checkpoint)
+    decision = unsettled_owed_decision(checkpoint)
     if decision is None:
         return checkpoint
     if (
         terminal_event is None
-        or terminal_event.type is not EventType.SESSION_COMPLETED
+        or terminal_event.type is not OUTCOME_SESSION_EVENT[decision.outcome]
         or terminal_event.id != decision.terminal_event_id
         or terminal_event.session_id != decision.session_id
     ):
-        raise SessionRunFenced("The run fence is held until its completed outcome is published.")
-    # The release receipt is the settled completion's acknowledgement-loss evidence,
+        raise SessionRunFenced("The run fence is held until its terminal outcome is published.")
+    # The release receipt is the settled outcome's acknowledgement-loss evidence,
     # so nothing of the decision is retained for the next admission.
     settled = copy_durable_json_object(checkpoint, "checkpoint")
     settled.pop(INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY)
     return settled
 
 
-def require_owed_completion_kept(
+def require_owed_outcome_kept(
     status: SessionStatus,
     to_status: SessionStatus,
     checkpoint: dict[str, Any] | None,
 ) -> None:
-    """Refuse moving a completed session off COMPLETED while its completion is owed.
+    """Refuse moving a session off its decided status while that outcome is owed.
 
-    Only the completion's own publication, or recovery, may finish it; a later
-    failure must not leave a decision that no release or sweep can settle.
+    Only the outcome's own publication, or recovery, may finish it; a later
+    transition must not leave a decision that no release or sweep can settle.
     """
 
-    if (
-        status is SessionStatus.COMPLETED
-        and to_status is not SessionStatus.COMPLETED
-        and unsettled_completed_decision(checkpoint) is not None
-    ):
+    if to_status is not status and owed_decision_of_status(checkpoint, status) is not None:
         raise SessionRunFenced(
-            "A completed session keeps its status until its completion is published."
+            "A session keeps its terminal status until its terminal outcome is published."
         )
 
 
-def require_completed_decision_authority(
+def require_owed_decision_authority(
     *,
     to_status: SessionStatus,
     checkpoint_mutation: dict[str, Any] | None,
@@ -152,11 +186,17 @@ def require_completed_decision_authority(
     checkpoint: dict[str, Any] | None,
     active_profile: ActiveInvocationExecutionProfile | None,
 ) -> None:
-    """Install only a decision that names the exact invocation the transition completes."""
+    """Install only a decision that names the exact invocation the transition ends."""
 
-    if to_status is not SessionStatus.COMPLETED or checkpoint_mutation is None:
+    if (
+        to_status not in OWED_OUTCOME_STATUSES
+        or checkpoint_mutation is None
+        or not is_owed_decision_install_mutation(checkpoint_mutation)
+    ):
         return
-    decision = completed_decision_from_install_mutation(checkpoint_mutation, event=event)
+    decision = owed_decision_from_install_mutation(
+        checkpoint_mutation, event=event, to_status=to_status
+    )
     profile = (
         active_invocation_execution_profile_from_checkpoint(checkpoint)
         if active_profile is None
@@ -170,4 +210,4 @@ def require_completed_decision_authority(
         interaction_id=profile.interaction_id,
         execution_profile_fingerprint=profile.profile.fingerprint,
     ):
-        raise SessionRunFenced("A completed decision must belong to the invocation it completes.")
+        raise SessionRunFenced("A terminal decision must belong to the invocation it ends.")

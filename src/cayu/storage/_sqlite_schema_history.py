@@ -768,6 +768,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
         ledger_json TEXT NOT NULL,
         PRIMARY KEY (session_id, record_sha256)
     );""",
+    # Failed and interrupted terminal decisions; no schema change.
+    145: "",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

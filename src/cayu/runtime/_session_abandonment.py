@@ -1255,7 +1255,7 @@ class SessionAbandonment:
                         await self.abandon_retained(inactive_for_seconds=inactive_for_seconds)
                     )
                 results.extend(
-                    await self._incomplete_recovery.recover_committed_completions(
+                    await self._incomplete_recovery.recover_committed_outcomes(
                         inactive_for_seconds=inactive_for_seconds
                     )
                 )
@@ -1280,8 +1280,9 @@ class SessionAbandonment:
         fails as abandoned instead (``abandon_orphaned_without_environment``). Any
         other session is left alone and not reported. It then finishes abandonments
         that failed a session but stopped before its terminal evidence
-        (``_finish_unfinished_abandonments``). One session's failure is reported, not
-        raised, so it can't hold up the rest.
+        (``_finish_unfinished_abandonments``), and terminal turns whose run stopped
+        before it published what their decision owes (``recover_committed_outcomes``).
+        One session's failure is reported, not raised, so it can't hold up the rest.
         """
 
         if type(inactive_for_seconds) is not int or inactive_for_seconds < 0:
@@ -1309,6 +1310,11 @@ class SessionAbandonment:
                     break
                 cursor = page.next_cursor
         results.extend(await self._finish_unfinished_abandonments(inactive_for_seconds))
+        results.extend(
+            await self._incomplete_recovery.recover_committed_outcomes(
+                inactive_for_seconds=inactive_for_seconds
+            )
+        )
         return results
 
     async def _finish_unfinished_abandonments(

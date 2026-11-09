@@ -98,7 +98,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
     invocation_terminal_decision_matches_recovery_profile,
 )
-from cayu.sessions._paired_writes import unsettled_completed_decision
+from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventQuery
@@ -390,8 +390,8 @@ class SessionTaskLifecycle:
         this step never makes the session look active to that claim.
         """
 
-        decision = unsettled_completed_decision(checkpoint)
-        if decision is None or session.status is not SessionStatus.COMPLETED:
+        decision = owed_decision_of_status(checkpoint, SessionStatus.COMPLETED)
+        if decision is None:
             return None
         active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
         if active_profile is None or not invocation_terminal_decision_matches_recovery_profile(

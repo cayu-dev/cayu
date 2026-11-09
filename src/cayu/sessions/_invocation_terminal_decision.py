@@ -28,9 +28,10 @@ from cayu.sessions.checkpoints import (
 
 _DECISION_RECORD_TYPE = "cayu.invocation-terminal-decision"
 _DECISION_SCHEMA_VERSION = 1
-# A COMPLETED decision is the only version-2 record, so every failed or
-# interrupted record keeps its version-1 bytes, identity and digest.
-_COMPLETED_DECISION_SCHEMA_VERSION = 2
+# A version-2 record is installed by the terminal transition itself and keeps
+# what that outcome still owes. Version-1 records elect a failed or interrupted
+# winner before its transition and keep their bytes, identity and digest.
+_OWED_DECISION_SCHEMA_VERSION = 2
 
 
 class InvocationTerminalOutcome(StrEnum):
@@ -82,6 +83,14 @@ class InvocationTerminalDecision(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    terminal_payload_authority: tuple[str, ...] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    terminal_nested_payload_authority: tuple[tuple[str, ...], ...] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     record_digest: str
 
     @field_validator(
@@ -119,6 +128,30 @@ class InvocationTerminalDecision(BaseModel):
             raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
         return value
 
+    @field_validator("terminal_payload_authority")
+    @classmethod
+    def validate_payload_authority(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is not None and (
+            not value
+            or list(value) != sorted(set(value))
+            or any(not field.isidentifier() for field in value)
+        ):
+            raise ValueError("terminal_payload_authority must list sorted payload field names.")
+        return value
+
+    @field_validator("terminal_nested_payload_authority")
+    @classmethod
+    def validate_nested_payload_authority(
+        cls, value: tuple[tuple[str, ...], ...] | None
+    ) -> tuple[tuple[str, ...], ...] | None:
+        if value is not None and (
+            not value
+            or list(value) != sorted(set(value))
+            or any(not path or any(not segment for segment in path) for path in value)
+        ):
+            raise ValueError("terminal_nested_payload_authority must list sorted payload paths.")
+        return value
+
     @field_validator("observed_at")
     @classmethod
     def normalize_observed_at(cls, value: datetime) -> datetime:
@@ -135,14 +168,16 @@ class InvocationTerminalDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_outcome_fields(self) -> InvocationTerminalDecision:
-        if (self.outcome is InvocationTerminalOutcome.COMPLETED) != (
-            self.schema_version == _COMPLETED_DECISION_SCHEMA_VERSION
-        ):
-            raise ValueError("Only completed decisions use schema version 2.")
+        if self.schema_version == _OWED_DECISION_SCHEMA_VERSION:
+            return self._validate_owed_fields()
         if self.outcome is InvocationTerminalOutcome.COMPLETED:
-            return self._validate_completed_fields()
-        if self.task_result_payload is not None:
-            raise ValueError("Only completed decisions carry a task result.")
+            raise ValueError("Completed decisions use schema version 2.")
+        if (
+            self.task_result_payload is not None
+            or self.terminal_payload_authority is not None
+            or self.terminal_nested_payload_authority is not None
+        ):
+            raise ValueError("Only version-2 decisions carry owed publication fields.")
         failure_fields = (
             self.task_id,
             self.runtime_task_failure_id,
@@ -222,7 +257,8 @@ class InvocationTerminalDecision(BaseModel):
             )
         return self._validate_identity()
 
-    def _validate_completed_fields(self) -> InvocationTerminalDecision:
+    def _validate_owed_fields(self) -> InvocationTerminalDecision:
+        completed = self.outcome is InvocationTerminalOutcome.COMPLETED
         if (
             self.interaction_event_id is None
             or self.predecessor_interaction_event_id is not None
@@ -233,8 +269,9 @@ class InvocationTerminalDecision(BaseModel):
             or self.task_error_payload is not None
             or self.turn_completed_payload is None
             or (self.task_id is None) != (self.task_result_payload is None)
+            or (not completed and self.task_id is not None)
         ):
-            raise ValueError("Completed decisions require only completion authority.")
+            raise ValueError("Version-2 decisions require only the authority of their outcome.")
         expected_terminal_event_id = invocation_terminal_event_id(
             outcome=self.outcome,
             session_id=self.session_id,
@@ -279,14 +316,17 @@ def _decision_id(payload: Mapping[str, Any]) -> str:
     return f"invocation-terminal-decision:v{version}:{_decision_digest(payload)}"
 
 
-def completed_decision_event_id(
+def owed_decision_event_id(
     decision: InvocationTerminalDecision,
     event_kind: Literal["task_completed", "turn_completed"],
 ) -> str:
-    """Return the exact ID of one event a completed decision still owes."""
+    """Return the exact ID of one event a version-2 decision still owes."""
 
-    if decision.outcome is not InvocationTerminalOutcome.COMPLETED:
-        raise ValueError("Only completed decisions own completion event IDs.")
+    if decision.schema_version != _OWED_DECISION_SCHEMA_VERSION or (
+        event_kind == "task_completed"
+        and decision.outcome is not InvocationTerminalOutcome.COMPLETED
+    ):
+        raise ValueError("Only version-2 decisions own their outcome's event IDs.")
     return f"{decision.decision_id}:{event_kind}"
 
 
@@ -428,8 +468,9 @@ def build_invocation_terminal_decision(
     return _sealed_decision(payload)
 
 
-def build_completed_invocation_terminal_decision(
+def build_owed_invocation_terminal_decision(
     *,
+    outcome: InvocationTerminalOutcome,
     session_id: str,
     session_instance_id: str,
     run_epoch: int,
@@ -443,13 +484,15 @@ def build_completed_invocation_terminal_decision(
     turn_completed_payload: dict[str, Any],
     task_id: str | None = None,
     task_result_payload: dict[str, Any] | None = None,
+    terminal_payload_authority: tuple[str, ...] | None = None,
+    terminal_nested_payload_authority: tuple[tuple[str, ...], ...] | None = None,
 ) -> InvocationTerminalDecision:
-    """Build the version-2 record of what a committed completion still owes."""
+    """Build the version-2 record of what a committed terminal outcome still owes."""
 
     payload: dict[str, Any] = {
         "record_type": _DECISION_RECORD_TYPE,
-        "schema_version": _COMPLETED_DECISION_SCHEMA_VERSION,
-        "outcome": InvocationTerminalOutcome.COMPLETED.value,
+        "schema_version": _OWED_DECISION_SCHEMA_VERSION,
+        "outcome": outcome.value,
         "session_id": session_id,
         "session_instance_id": session_instance_id,
         "run_epoch": run_epoch,
@@ -474,6 +517,12 @@ def build_completed_invocation_terminal_decision(
         payload["task_result_payload"] = copy_durable_json_object(
             task_result_payload, "task_result_payload"
         )
+    if terminal_payload_authority:
+        payload["terminal_payload_authority"] = sorted(set(terminal_payload_authority))
+    if terminal_nested_payload_authority:
+        payload["terminal_nested_payload_authority"] = [
+            list(path) for path in sorted(set(terminal_nested_payload_authority))
+        ]
     return _sealed_decision(payload)
 
 

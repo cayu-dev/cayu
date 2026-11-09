@@ -48,8 +48,10 @@ class SessionAbandonmentEntrances:
         sweep then also revisits interrupted sessions whose tasks finished
         later, and abandoned sessions whose cleanup did not finish. Every sweep
         finishes a ``close_session`` that stopped before closing the children,
-        and every completed turn whose process stopped before it completed its
-        task, published its terminal events or released its session.
+        and every completed, failed or paused turn whose process stopped before
+        it completed its task, published its terminal events or released its
+        session. Until then such a session refuses to run, resume or settle a
+        pending approval or input.
         """
 
         return tuple(
@@ -86,8 +88,10 @@ class SessionAbandonmentEntrances:
         environment binding stays recorded.
 
         A session with a live owner, an unfinished task, or activity within the
-        window is left alone, as is one without attested ownership and tasks. The
-        server runs this on a schedule (``ServerLifecycleConfig``); call it yourself
+        window is left alone, as is one without attested ownership and tasks. It
+        also finishes every completed, failed or paused turn whose process stopped
+        before it published its terminal events or released its session, as
+        :meth:`recover_abandoned_sessions` does. The server runs this on a schedule (``ServerLifecycleConfig``); call it yourself
         when you run Cayu without the server. Results list only the sessions it
         acted on.
         """

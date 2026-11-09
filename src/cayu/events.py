@@ -896,6 +896,22 @@ def event_nested_payload_authority_is_runtime_generated(
     )
 
 
+def runtime_payload_authority_paths(
+    event: Event,
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """Return the payload fields and nested paths a runtime producer attested.
+
+    A durable record that rebuilds this event later re-attests exactly these, so
+    the rebuilt event carries the same provenance as the one first published.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    fields = sorted({field_name for field_name, _ in event._runtime_payload_authority})
+    paths = sorted({path for path, _ in event._runtime_nested_payload_authority})
+    return tuple(fields), tuple(paths)
+
+
 def event_with_durable_sequence(event: Event, sequence: int) -> Event:
     """Copy an event and attach its private durable sequence for live projection."""
 

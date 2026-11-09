@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -57,12 +57,6 @@ from cayu.providers.base import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
-from cayu.runtime._completed_decision_settlement import (
-    completed_task_event,
-    completed_terminal_event,
-    completed_turn_event,
-    completion_terminal_payload,
-)
 from cayu.runtime._continuation_task_failure import (
     RuntimeTaskFailureIdentity,
     RuntimeTaskFailureTerminalizationPending,
@@ -101,6 +95,13 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
+)
+from cayu.runtime._outcome_decision_settlement import (
+    completed_task_event,
+    completion_terminal_payload,
+    owed_terminal_event,
+    owed_turn_event,
+    prepared_outcome,
 )
 from cayu.runtime._provider_operation_start_owner import is_ambiguous_provider_operation_start_error
 from cayu.runtime._run_limits import (
@@ -168,7 +169,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
-from cayu.sessions._paired_writes import unsettled_completed_decision
+from cayu.sessions._paired_writes import unsettled_owed_decision
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
@@ -201,8 +202,8 @@ class SessionOutcomeState:
     task_started: bool = False
     task_start_attempted: bool = False
     task_finished: bool = False
-    completed_decision: InvocationTerminalDecision | None = None
-    """The decision this invocation's completion transition carried."""
+    outcome_decision: InvocationTerminalDecision | None = None
+    """The decision this invocation's terminal transition carried."""
     completion_publication_started: bool = False
     completion_finalization_started: bool = False
 
@@ -225,7 +226,8 @@ class SessionOutcomeContext:
     task_lease_expires_at: datetime | None
     task_handoff_id: str | None
     request_loop_policies: tuple[LoopPolicy, ...]
-    on_failure_decided: Callable[[], None] | None = None
+    on_outcome_decided: Callable[[], None] | None = None
+    """Called once a failure or pause transition commits, before its first yield."""
 
 
 class SessionOutcomePublication:
@@ -449,7 +451,7 @@ class SessionOutcomePublication:
                 expected_marker=completion_marker,
             )
         # The completion transition fixed the identity of every event it still owes.
-        owed = state.completed_decision
+        owed = state.outcome_decision
         # A restarted publication replays whatever the first one made durable.
         replay = state.completion_publication_started
         state.completion_publication_started = True
@@ -513,7 +515,7 @@ class SessionOutcomePublication:
             active_run=active_run,
             invocation_context=invocation_context,
             prepared_turn_completed=(
-                None if owed is None else completed_turn_event(owed, state.session)
+                None if owed is None else owed_turn_event(owed, state.session)
             ),
             exact_replay=replay,
         ):
@@ -521,7 +523,7 @@ class SessionOutcomePublication:
         if prefinalized_completion is not None:
             terminal_event = prefinalized_completion.event
         elif owed is not None:
-            terminal_event = completed_terminal_event(owed, state.session)
+            terminal_event = owed_terminal_event(owed, state.session)
         else:
             terminal_event = Event(
                 type=EventType.SESSION_COMPLETED,
@@ -549,60 +551,101 @@ class SessionOutcomePublication:
         self,
         context: SessionOutcomeContext,
         decision: BeforeStopDecision,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         state = context.state
-        registered_agent = context.registered_agent
-        registered_environment = context.registered_environment
-        execution_profile = context.execution_profile
-        invocation_context = context.invocation_context
-        environment_name = context.environment_name
-        run_started_at = context.run_started_at
-        turn_usage_tracker = context.turn_usage_tracker
-        active_run = context.active_run
-
-        (
-            state.session,
-            interrupted,
-            _,
-        ) = await self._session_finalization.publish_interaction_transition(
-            session=state.session,
-            invocation_context=invocation_context,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=execution_profile,
+        terminal_event = Event(
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=state.session.id,
+            agent_name=context.registered_agent.spec.name,
+            environment_name=context.environment_name,
+            payload={
+                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                "reason": decision.reason,
+                "policy_metadata": copy_json_value(decision.metadata, "policy_metadata"),
+            },
         )
-        if interrupted is not None:
-            yield interrupted
+        async with contextlib.aclosing(
+            self._publish_interrupted_outcome(context, terminal_event, enclosed=True)
+        ) as outcome_events:
+            async for event in outcome_events:
+                yield event
+
+    async def _publish_interrupted_outcome(
+        self,
+        context: SessionOutcomeContext,
+        terminal_event: Event,
+        *,
+        enclosed: bool = False,
+    ) -> AsyncGenerator[Event, None]:
+        """Commit an interruption with the decision of what it owes, then publish that.
+
+        ``enclosed`` publishes from inside the run's own cleanup; every pause is
+        published from its sibling handlers instead.
+        """
+
+        state = context.state
+        if enclosed:
+            (
+                state.session,
+                interaction_event,
+                _,
+            ) = await self._session_finalization.publish_interaction_transition(
+                session=state.session,
+                invocation_context=context.invocation_context,
+                agent_name=context.registered_agent.spec.name,
+                environment_name=context.environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+                execution_profile=context.execution_profile,
+                owed_outcome=await prepared_outcome(
+                    context, terminal_event, self._session_finalization
+                ),
+            )
+        else:
+            (
+                state.session,
+                interaction_event,
+                _,
+            ) = await self._session_finalization.publish_sibling_interaction_transition(
+                session=state.session,
+                invocation_context=context.invocation_context,
+                registered_agent=context.registered_agent,
+                registered_environment=context.registered_environment,
+                environment_name=context.environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+                execution_profile=context.execution_profile,
+                owed_outcome=await prepared_outcome(
+                    context, terminal_event, self._session_finalization
+                ),
+            )
+        decision = _decided_by(state, interaction_event)
+        if context.on_outcome_decided is not None:
+            context.on_outcome_decided()
+        if interaction_event is not None:
+            yield interaction_event
         for event in await self._session_finalization.emit_turn_completed_once(
             session=state.session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
+            registered_agent=context.registered_agent,
+            environment_name=context.environment_name,
             status=SessionStatus.INTERRUPTED,
-            run_started_at=run_started_at,
-            usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            invocation_context=invocation_context,
+            run_started_at=context.run_started_at,
+            usage_tracker=context.turn_usage_tracker,
+            active_run=context.active_run,
+            invocation_context=context.invocation_context,
+            prepared_turn_completed=(
+                None if decision is None else owed_turn_event(decision, state.session)
+            ),
         ):
             yield event
         async for event in self._terminal_event_publication.emit(
-            event=Event(
-                type=EventType.SESSION_INTERRUPTED,
-                session_id=state.session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                    "reason": decision.reason,
-                    "policy_metadata": copy_json_value(decision.metadata, "policy_metadata"),
-                },
+            event=(
+                terminal_event if decision is None else owed_terminal_event(decision, state.session)
             ),
             phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
             session=state.session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
+            registered_agent=context.registered_agent,
+            registered_environment=context.registered_environment,
+            execution_profile=context.execution_profile,
+            invocation_context=context.invocation_context,
         ):
             yield event
 
@@ -665,69 +708,33 @@ class SessionOutcomePublication:
     ) -> AsyncGenerator[Event, None]:
         state = context.state
         registered_agent = context.registered_agent
-        registered_environment = context.registered_environment
-        execution_profile = context.execution_profile
-        invocation_context = context.invocation_context
         environment_name = context.environment_name
-        run_started_at = context.run_started_at
-        turn_usage_tracker = context.turn_usage_tracker
-        active_run = context.active_run
 
         await materialize_deferred_messages_after_failure()
-        (
-            state.session,
-            interaction_paused_event,
-            _,
-        ) = await self._session_finalization.publish_sibling_interaction_transition(
-            session=state.session,
-            invocation_context=invocation_context,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=execution_profile,
-        )
-        if interaction_paused_event is not None:
-            yield interaction_paused_event
-        for event in await self._session_finalization.emit_turn_completed_once(
-            session=state.session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            status=SessionStatus.INTERRUPTED,
-            run_started_at=run_started_at,
-            usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            invocation_context=invocation_context,
-        ):
-            yield event
-        async for event in self._terminal_event_publication.emit(
-            event=approval_support.event_with_pending_approval_authority(
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=state.session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                        "model_step_id": exc.approval.model_step_id,
-                        "model_attempt_id": exc.approval.model_attempt_id,
-                        "tool_round_id": exc.approval.tool_round_id,
-                        **approval_support.bounded_pending_approval_event_payload(
-                            exc.approval,
-                            redactor=self._secret_redactor,
-                        ),
-                    },
-                ),
-                exc.approval,
+        terminal_event = approval_support.event_with_pending_approval_authority(
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=state.session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                    "model_step_id": exc.approval.model_step_id,
+                    "model_attempt_id": exc.approval.model_attempt_id,
+                    "tool_round_id": exc.approval.tool_round_id,
+                    **approval_support.bounded_pending_approval_event_payload(
+                        exc.approval,
+                        redactor=self._secret_redactor,
+                    ),
+                },
             ),
-            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-            session=state.session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-        ):
-            yield event
+            exc.approval,
+        )
+        async with contextlib.aclosing(
+            self._publish_interrupted_outcome(context, terminal_event)
+        ) as outcome_events:
+            async for event in outcome_events:
+                yield event
 
     async def pause_for_user_input(
         self,
@@ -737,66 +744,30 @@ class SessionOutcomePublication:
     ) -> AsyncGenerator[Event, None]:
         state = context.state
         registered_agent = context.registered_agent
-        registered_environment = context.registered_environment
-        execution_profile = context.execution_profile
-        invocation_context = context.invocation_context
         environment_name = context.environment_name
-        run_started_at = context.run_started_at
-        turn_usage_tracker = context.turn_usage_tracker
-        active_run = context.active_run
 
         await materialize_deferred_messages_after_failure()
-        (
-            state.session,
-            interaction_paused_event,
-            _,
-        ) = await self._session_finalization.publish_sibling_interaction_transition(
-            session=state.session,
-            invocation_context=invocation_context,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=execution_profile,
-        )
-        if interaction_paused_event is not None:
-            yield interaction_paused_event
-        for event in await self._session_finalization.emit_turn_completed_once(
-            session=state.session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            status=SessionStatus.INTERRUPTED,
-            run_started_at=run_started_at,
-            usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            invocation_context=invocation_context,
-        ):
-            yield event
-        async for event in self._terminal_event_publication.emit(
-            event=event_with_pending_user_input_authority(
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=state.session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                        "model_step_id": exc.pending.model_step_id,
-                        "model_attempt_id": exc.pending.model_attempt_id,
-                        "tool_round_id": exc.pending.tool_round_id,
-                        **pending_user_input_interruption_payload(exc.pending),
-                    },
-                ),
-                exc.pending,
+        terminal_event = event_with_pending_user_input_authority(
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=state.session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                    "model_step_id": exc.pending.model_step_id,
+                    "model_attempt_id": exc.pending.model_attempt_id,
+                    "tool_round_id": exc.pending.tool_round_id,
+                    **pending_user_input_interruption_payload(exc.pending),
+                },
             ),
-            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-            session=state.session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-        ):
-            yield event
+            exc.pending,
+        )
+        async with contextlib.aclosing(
+            self._publish_interrupted_outcome(context, terminal_event)
+        ) as outcome_events:
+            async for event in outcome_events:
+                yield event
 
     async def pause_for_wake(
         self,
@@ -809,75 +780,44 @@ class SessionOutcomePublication:
         state = context.state
         registered_agent = context.registered_agent
         environment_name = context.environment_name
-        invocation_context = context.invocation_context
         wake = exc.wake
         pending = wake.continuation
 
         await materialize_deferred_messages_after_failure()
-        (
-            state.session,
-            interaction_paused_event,
-            _,
-        ) = await self._session_finalization.publish_sibling_interaction_transition(
-            session=state.session,
-            invocation_context=invocation_context,
-            registered_agent=registered_agent,
-            registered_environment=context.registered_environment,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=context.execution_profile,
-        )
-        if interaction_paused_event is not None:
-            yield interaction_paused_event
-        for event in await self._session_finalization.emit_turn_completed_once(
-            session=state.session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            status=SessionStatus.INTERRUPTED,
-            run_started_at=context.run_started_at,
-            usage_tracker=context.turn_usage_tracker,
-            active_run=context.active_run,
-            invocation_context=invocation_context,
-        ):
-            yield event
-        async for event in self._terminal_event_publication.emit(
-            event=event_with_runtime_payload_authority(
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=state.session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": WAKE_SCHEDULED_INTERRUPTION_TYPE,
-                        "model_step_id": pending.model_step_id,
-                        "model_attempt_id": pending.model_attempt_id,
-                        "tool_round_id": pending.tool_round_id,
-                        "wake_id": wake.wake_id,
-                        "tool_call_id": pending.tool_call_id,
-                        "source_run_epoch": pending.source_run_epoch,
-                        "pause_digest": pending_session_wake_digest(wake),
-                        "execution_profile_fingerprint": pending.execution_profile_fingerprint,
-                        "wake": public_pending_wake_payload(wake),
-                        # The round this wake resumes, as recovery evidence for its
-                        # continuation; it is not a request for anyone's input.
-                        "continuation": public_pending_user_input_event_payload(pending),
-                    },
-                ),
-                "model_step_id",
-                "model_attempt_id",
-                "tool_round_id",
-                "wake_id",
-                "tool_call_id",
-                "execution_profile_fingerprint",
+        terminal_event = event_with_runtime_payload_authority(
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=state.session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    "interruption_type": WAKE_SCHEDULED_INTERRUPTION_TYPE,
+                    "model_step_id": pending.model_step_id,
+                    "model_attempt_id": pending.model_attempt_id,
+                    "tool_round_id": pending.tool_round_id,
+                    "wake_id": wake.wake_id,
+                    "tool_call_id": pending.tool_call_id,
+                    "source_run_epoch": pending.source_run_epoch,
+                    "pause_digest": pending_session_wake_digest(wake),
+                    "execution_profile_fingerprint": pending.execution_profile_fingerprint,
+                    "wake": public_pending_wake_payload(wake),
+                    # The round this wake resumes, as recovery evidence for its
+                    # continuation; it is not a request for anyone's input.
+                    "continuation": public_pending_user_input_event_payload(pending),
+                },
             ),
-            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-            session=state.session,
-            registered_agent=registered_agent,
-            registered_environment=context.registered_environment,
-            execution_profile=context.execution_profile,
-            invocation_context=invocation_context,
-        ):
-            yield event
+            "model_step_id",
+            "model_attempt_id",
+            "tool_round_id",
+            "wake_id",
+            "tool_call_id",
+            "execution_profile_fingerprint",
+        )
+        async with contextlib.aclosing(
+            self._publish_interrupted_outcome(context, terminal_event)
+        ) as outcome_events:
+            async for event in outcome_events:
+                yield event
 
     async def pause_for_foreground_child(
         self,
@@ -887,64 +827,28 @@ class SessionOutcomePublication:
     ) -> AsyncGenerator[Event, None]:
         state = context.state
         registered_agent = context.registered_agent
-        registered_environment = context.registered_environment
-        execution_profile = context.execution_profile
-        invocation_context = context.invocation_context
         environment_name = context.environment_name
-        run_started_at = context.run_started_at
-        turn_usage_tracker = context.turn_usage_tracker
-        active_run = context.active_run
         request_loop_policies = context.request_loop_policies
 
         self._foreground_gate_policy_owner.retain_wait(
             state.session, exc.wait, request_loop_policies
         )
         await materialize_deferred_messages_after_failure()
-        (
-            state.session,
-            interaction_paused_event,
-            _,
-        ) = await self._session_finalization.publish_sibling_interaction_transition(
-            session=state.session,
-            invocation_context=invocation_context,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-            execution_profile=execution_profile,
-        )
-        if interaction_paused_event is not None:
-            yield interaction_paused_event
-        for event in await self._session_finalization.emit_turn_completed_once(
-            session=state.session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            status=SessionStatus.INTERRUPTED,
-            run_started_at=run_started_at,
-            usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            invocation_context=invocation_context,
-        ):
-            yield event
-        async for event in self._terminal_event_publication.emit(
-            event=event_with_foreground_child_wait_authority(
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=state.session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=exc.interruption_evidence(),
-                ),
-                exc.wait,
+        terminal_event = event_with_foreground_child_wait_authority(
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=state.session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=exc.interruption_evidence(),
             ),
-            phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-            session=state.session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-        ):
-            yield event
+            exc.wait,
+        )
+        async with contextlib.aclosing(
+            self._publish_interrupted_outcome(context, terminal_event)
+        ) as outcome_events:
+            async for event in outcome_events:
+                yield event
 
     async def _stream_deadline_settles_as_failure(
         self,
@@ -1001,11 +905,11 @@ class SessionOutcomePublication:
         task_worker_id = context.task_worker_id
         task_handoff_id = context.task_handoff_id
 
-        owed = state.completed_decision and unsettled_completed_decision(
+        owed = state.outcome_decision and unsettled_owed_decision(
             await self.session_store.load_checkpoint(state.session.id)
         )
-        if owed is not None and owed == state.completed_decision:
-            # The completion committed: its decision finishes it, never a failure.
+        if owed is not None and owed == state.outcome_decision:
+            # The outcome committed: its decision finishes it, never a failure.
             raise exc
         if (
             isinstance(exc, ExecutionDeadlineExceeded)
@@ -1470,6 +1374,25 @@ class SessionOutcomePublication:
                 task_failure_error,
                 group_message=("Session failure and linked task terminalization failure."),
             )
+        if payload is None:
+            payload = build_session_failure_payload()
+        if task_failure_error is not None:
+            payload.update(
+                task_update_error_payload(
+                    task_failure_error,
+                    redactor=self._secret_redactor,
+                )
+            )
+        if isinstance(exc, ExecutionDeadlineExceeded):
+            payload["execution_deadline"] = exc.diagnostics
+        session_failed_event = Event(
+            type=EventType.SESSION_FAILED,
+            session_id=state.session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=payload,
+        )
+        failure_decision: InvocationTerminalDecision | None = None
         if failure_terminal_decision is None:
             try:
                 (
@@ -1494,6 +1417,14 @@ class SessionOutcomePublication:
                     ),
                     execution_profile=execution_profile,
                     model_completion_failure=exc,
+                    # A linked task's failure keeps the event identities its task carries.
+                    owed_outcome=(
+                        await prepared_outcome(
+                            context, session_failed_event, self._session_finalization
+                        )
+                        if runtime_failure_identity is None
+                        else None
+                    ),
                 )
             except ModelCompletionBudgetSettlementPending as accounting_pending:
                 _raise_primary_with_secondary_failure(
@@ -1501,19 +1432,11 @@ class SessionOutcomePublication:
                     accounting_pending,
                     group_message=("Session failure and model-completion budget recovery fence."),
                 )
-            if context.on_failure_decided is not None:
-                context.on_failure_decided()
+            failure_decision = _decided_by(state, interaction_failed_event)
+            if context.on_outcome_decided is not None:
+                context.on_outcome_decided()
             if interaction_failed_event is not None:
                 yield interaction_failed_event
-        if payload is None:
-            payload = build_session_failure_payload()
-        if task_failure_error is not None:
-            payload.update(
-                task_update_error_payload(
-                    task_failure_error,
-                    redactor=self._secret_redactor,
-                )
-            )
         failure_turn_events = await self._session_finalization.emit_turn_completed_once(
             session=state.session,
             registered_agent=registered_agent,
@@ -1523,22 +1446,19 @@ class SessionOutcomePublication:
             usage_tracker=turn_usage_tracker,
             active_run=active_run,
             invocation_context=invocation_context,
-            prepared_turn_completed=prepared_failure_turn_completed,
+            prepared_turn_completed=(
+                prepared_failure_turn_completed
+                if failure_decision is None
+                else owed_turn_event(failure_decision, state.session)
+            ),
             settle_interaction=failure_terminal_decision is None,
         )
         if failure_terminal_decision is None:
             for event in failure_turn_events:
                 yield event
-        if isinstance(exc, ExecutionDeadlineExceeded):
-            payload["execution_deadline"] = exc.diagnostics
-        session_failed_event = Event(
-            type=EventType.SESSION_FAILED,
-            session_id=state.session.id,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=payload,
-        )
-        if runtime_failure_identity is not None:
+        if failure_decision is not None:
+            session_failed_event = owed_terminal_event(failure_decision, state.session)
+        elif runtime_failure_identity is not None:
             session_failed_event = event_with_runtime_generated_id(
                 event_with_execution_profile_authority(
                     event_with_runtime_payload_authority(
@@ -1603,8 +1523,8 @@ class SessionOutcomePublication:
                     accounting_pending,
                     group_message=("Session failure and model-completion budget recovery fence."),
                 )
-            if context.on_failure_decided is not None:
-                context.on_failure_decided()
+            if context.on_outcome_decided is not None:
+                context.on_outcome_decided()
             if interaction_failed_event is not None:
                 yield interaction_failed_event
             for event in failure_turn_events:
@@ -1745,3 +1665,19 @@ class SessionOutcomePublication:
                 expected_statuses={SessionStatus.RUNNING},
                 expected_run_epoch=session.run_epoch,
             )
+
+
+def _decided_by(
+    state: SessionOutcomeState,
+    interaction_event: Event | None,
+) -> InvocationTerminalDecision | None:
+    """The decision the transition that published ``interaction_event`` installed."""
+
+    decision = state.outcome_decision
+    if (
+        interaction_event is None
+        or decision is None
+        or decision.interaction_event_id != interaction_event.id
+    ):
+        return None
+    return decision

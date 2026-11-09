@@ -239,10 +239,11 @@ from cayu.sessions._operation_records import (
     _reject_reserved_runtime_publication_key,
 )
 from cayu.sessions._paired_writes import (
-    checkpoint_settling_completed_decision,
-    require_completed_decision_authority,
-    require_owed_completion_kept,
-    unsettled_completed_decision,
+    OWED_OUTCOME_STATUSES,
+    checkpoint_settling_owed_decision,
+    require_owed_decision_authority,
+    require_owed_outcome_kept,
+    unsettled_owed_decision,
 )
 from cayu.sessions._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
@@ -436,7 +437,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 144
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 145
 _T = TypeVar("_T")
 
 
@@ -3369,15 +3370,12 @@ class SQLiteSessionStore(
                     _check_closure_lineage_owner(owner, (session_id,))
                 updated_at = self._ownership_clock()
                 expected_run_epoch = _current_session_run_epoch(session_id)
-                admission_source = (
-                    self._load_unlocked(session_id) if to_status is SessionStatus.RUNNING else None
-                )
-                if to_status is not SessionStatus.COMPLETED:
-                    current = self._load_unlocked(session_id)
-                    if current is not None and current.status is SessionStatus.COMPLETED:
-                        require_owed_completion_kept(
-                            current.status, to_status, self._load_checkpoint_unlocked(session_id)
-                        )
+                current = self._load_unlocked(session_id)
+                admission_source = current if to_status is SessionStatus.RUNNING else None
+                if current is not None and current.status in OWED_OUTCOME_STATUSES:
+                    require_owed_outcome_kept(
+                        current.status, to_status, self._load_checkpoint_unlocked(session_id)
+                    )
                 placeholders = ", ".join("?" for _ in allowed_statuses)
                 params: list[object] = [
                     str(to_status),
@@ -3517,8 +3515,8 @@ class SQLiteSessionStore(
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {to_status}"
                     )
-                if loaded.status is SessionStatus.COMPLETED:
-                    require_owed_completion_kept(
+                if loaded.status in OWED_OUTCOME_STATUSES:
+                    require_owed_outcome_kept(
                         loaded.status, to_status, self._load_checkpoint_unlocked(session_id)
                     )
                 if to_status is SessionStatus.RUNNING:
@@ -4711,7 +4709,7 @@ class SQLiteSessionStore(
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {target_status}"
                     )
-                require_completed_decision_authority(
+                require_owed_decision_authority(
                     to_status=target_status,
                     checkpoint_mutation=checkpoint_mutation_request,
                     event=copied_event,
@@ -5335,12 +5333,12 @@ class SQLiteSessionStore(
                     run_epochs=frozenset({copied.expected_run_epoch}),
                     active_profile=copied.expected_active_profile,
                 )
-                if (owed := unsettled_completed_decision(checkpoint)) is not None:
+                if (owed := unsettled_owed_decision(checkpoint)) is not None:
                     published = connection.execute(
                         "SELECT * FROM cayu_events WHERE session_id = ? AND event_id = ?",
                         (copied.session_id, owed.terminal_event_id),
                     ).fetchone()
-                    checkpoint = checkpoint_settling_completed_decision(
+                    checkpoint = checkpoint_settling_owed_decision(
                         checkpoint,
                         terminal_event=(
                             None if published is None else sqlite_records.event_from_row(published)
