@@ -8023,6 +8023,25 @@ class RecoveryCoordinator:
                 )
                 recovery_handoff_quiescent = True
 
+            async def cleanup_quiescent_claim() -> None:
+                await self._recovery_ownership.cleanup_claim(
+                    authority=claim.require_authority(),
+                    authoritative_failure=authoritative_failure,
+                    execution_profile=execution_profile_snapshot.profile,
+                    invocation_context=invocation_context,
+                    recovery_work_quiescent=True,
+                )
+
+            async def release_recovery_claim() -> None:
+                if not (recovery_worker_quiescent and recovery_handoff_quiescent):
+                    self._recovery_ownership.defer_cleanup_until_quiescent(
+                        invocation_context=invocation_context,
+                        operation="manual recovery retained claim release",
+                        cleanup=cleanup_quiescent_claim,
+                    )
+                    return
+                await cleanup_quiescent_claim()
+
             try:
                 done, _pending = await asyncio.wait(
                     {recovery_task, heartbeat_task, interruption_watch_task},
@@ -8075,15 +8094,7 @@ class RecoveryCoordinator:
                             ("manual tool-round recovery heartbeat stop", stop_claim_heartbeat),
                             (
                                 "manual tool-round recovery claim release",
-                                lambda: self._recovery_ownership.cleanup_claim(
-                                    authority=claim.require_authority(),
-                                    authoritative_failure=authoritative_failure,
-                                    execution_profile=execution_profile_snapshot.profile,
-                                    invocation_context=invocation_context,
-                                    recovery_work_quiescent=(
-                                        recovery_worker_quiescent and recovery_handoff_quiescent
-                                    ),
-                                ),
+                                release_recovery_claim,
                             ),
                         ),
                     )

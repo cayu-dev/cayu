@@ -445,6 +445,41 @@ class RecoveryCleanupSupervisor:
             ),
         )
 
+    def defer_until_session_quiescent(
+        self,
+        owner: RecoveryCleanupOwner,
+        *,
+        operation: str,
+        cleanup: RecoveryCleanup,
+    ) -> None:
+        """Retain a release until all other cleanup for its exact owner stops."""
+        if owner.supervisor_id != self._supervisor_id:
+            raise ValueError("Cleanup owner belongs to a different supervisor.")
+        if not self._has_task_capacity():
+            raise RecoveryCleanupCapacityExceeded(
+                operation=operation, max_supervised_tasks=self._policy.max_supervised_tasks
+            )
+
+        async def finish() -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            while not await self._drain(
+                timeout_s=self._policy.overall_timeout_seconds,
+                owner=owner,
+                exclude=current,
+            ):
+                pass
+            await self._run_background_continuation((RecoveryCleanupStep(operation, cleanup),))
+
+        context = copy_context()
+        task = asyncio.create_task(finish(), context=context, name=operation)
+        self._continuation_tasks.add(task)
+        self._observe_task(task, operation, context)
+        self._task_observations[task] = self._task_observations[task].model_copy(
+            update={"owner": owner}
+        )
+        task.add_done_callback(self._harvest_continuation)
+
     async def drain_session(self, owner: RecoveryCleanupOwner, *, timeout_s: float) -> bool:
         """Wait only for this observation owner; stale process identities fail closed."""
         if type(owner) is not RecoveryCleanupOwner or owner.supervisor_id != self._supervisor_id:
@@ -454,7 +489,13 @@ class RecoveryCleanupSupervisor:
     async def drain(self, *, timeout_s: float) -> bool:
         return await self._drain(timeout_s=timeout_s, owner=None)
 
-    async def _drain(self, *, timeout_s: float, owner: RecoveryCleanupOwner | None) -> bool:
+    async def _drain(
+        self,
+        *,
+        timeout_s: float,
+        owner: RecoveryCleanupOwner | None,
+        exclude: asyncio.Task | None = None,
+    ) -> bool:
         """Wait boundedly for supervised work without cancelling retained owners."""
 
         timeout_s = _require_positive_finite_seconds(
@@ -470,9 +511,13 @@ class RecoveryCleanupSupervisor:
                 for task in self._active_tasks
                 | self._retained_tasks.keys()
                 | self._continuation_tasks
-                if owner is None
-                or (
-                    task in self._task_observations and self._task_observations[task].owner == owner
+                if task is not exclude
+                and (
+                    owner is None
+                    or (
+                        task in self._task_observations
+                        and self._task_observations[task].owner == owner
+                    )
                 )
             )
             if not pending:

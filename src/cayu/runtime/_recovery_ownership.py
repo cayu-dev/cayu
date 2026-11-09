@@ -416,6 +416,23 @@ class RecoveryOwnership:
         """Share the current store-time lease policy with live finalization."""
         return _INCOMPLETE_RECOVERY_CLAIM_LEASE
 
+    def defer_cleanup_until_quiescent(
+        self,
+        *,
+        invocation_context: InvocationContext,
+        operation: str,
+        cleanup: Callable[[], Awaitable[None]],
+    ) -> None:
+        binding = invocation_context.binding
+        owner = self._recovery_cleanup_supervisor.session_snapshot(
+            session_id=binding.session_id,
+            session_instance_id=binding.session_instance_id,
+            run_epoch=binding.run_epoch,
+        ).owner
+        self._recovery_cleanup_supervisor.defer_until_session_quiescent(
+            owner, operation=operation, cleanup=cleanup
+        )
+
     async def run_cleanup_steps(
         self,
         *,
