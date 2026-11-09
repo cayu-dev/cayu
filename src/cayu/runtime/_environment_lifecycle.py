@@ -7751,6 +7751,12 @@ class EnvironmentLifecycle:
                     persist_cancellation = persistence.cancellation
                     setup_owner.cleanup_release_safe = True
                     setup_owner.pending_finalize_failure_event = None
+                    if binding._completion_requires_successful_finalization(bound_workspace):
+                        # The target may hold the only copy of successful tool
+                        # mutations. Keep its exact owner for a later bounded retry
+                        # after the failure evidence is durable.
+                        setup_owner.cleanup_requires_finalize_retry = True
+                        setup_owner.cleanup_settlement_deferred = True
                     fanout_outcome = await await_shielded_task_outcome(
                         asyncio.create_task(self._event_writer.fan_out_persisted([failure_event])),
                         cancellation=persist_cancellation,
