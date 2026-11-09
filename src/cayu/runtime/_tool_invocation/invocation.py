@@ -1864,6 +1864,14 @@ class ToolInvocation:
                         attach_runner_cancellation_failure(candidate, failure)
                 set_exception_cause(interrupt, failure)
 
+        dispatch_started = False
+
+        def observe_tool_invocation() -> None:
+            nonlocal dispatch_started
+            dispatch_started = True
+            if tool_invocation_observer is not None:
+                tool_invocation_observer(tool_call.id)
+
         dispatch = ToolInvocationDispatch(
             call=invocation_call,
             context=tool_context,
@@ -1874,19 +1882,17 @@ class ToolInvocation:
             tool_timeout_seconds=self._tool_timeout_seconds,
             run_time_left=run_time_left,
             strict_common_budget_admission=self._strict_common_budget_admission,
-            on_invoke=(
-                None
-                if tool_invocation_observer is None
-                else lambda: tool_invocation_observer(tool_call.id)
-            ),
+            on_invoke=observe_tool_invocation,
             runner_events=runner_events,
             settle_workspace=(
                 close_workspace_mutation_window if workspace_window_id is not None else None
             ),
         )
+        dispatch_completed = False
         try:
             with knowledge_lookup_scope(observe_knowledge_lookup):
                 execution_outcome = await dispatch.run()
+            dispatch_completed = True
         except tool_execution.ToolDispatchAdmissionRefusal as refused:
             refusal = refused.refusal
             if dispatch.effect is not None:
@@ -2000,6 +2006,16 @@ class ToolInvocation:
             if workspace_mutation_owner is not None:
                 workspace_mutation_owner.seal_and_transfer_pending()
             raise
+        finally:
+            # Only pre-dispatch failures prove that no writer is still active.
+            # Interrupted tools may have transferred pending mutations to a fence.
+            # Successful calls keep the window open through terminal capture.
+            if (
+                not dispatch_started
+                and not dispatch_completed
+                and workspace_attribution_window is not None
+            ):
+                workspace_attribution_window.close(discard_history=True)
 
         result_event: Event | None = None
         try:
