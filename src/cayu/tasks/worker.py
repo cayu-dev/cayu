@@ -1124,6 +1124,12 @@ async def run_task_worker(
             if owns_maintenance:
                 meaningful_activity = await maintain_expired_claims() or meaningful_activity
                 rescan_released_handoffs()
+                if slot_should_stop():
+                    return DurableWorkerStep(
+                        handled=handled_this_step,
+                        stop=True,
+                        activity=meaningful_activity,
+                    )
             if (
                 until_idle is not None
                 and owns_maintenance
