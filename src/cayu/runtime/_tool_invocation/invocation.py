@@ -1882,8 +1882,6 @@ class ToolInvocation:
         try:
             with knowledge_lookup_scope(observe_knowledge_lookup):
                 execution_outcome = await dispatch.run()
-            for auxiliary_event in dispatch.events:
-                yield auxiliary_event, None
         except tool_execution.ToolDispatchAdmissionRefusal as refused:
             refusal = refused.refusal
             if dispatch.effect is not None:
@@ -2231,8 +2229,8 @@ class ToolInvocation:
                     # telemetry so a later telemetry failure cannot erase the
                     # authoritative tool outcome from the public stream. Receipt
                     # events remain ordered immediately before that terminal.
-                    for runner_event in runner_events:
-                        yield runner_event, None
+                    for diagnostic_event in (*dispatch.events, *runner_events):
+                        yield diagnostic_event, None
                     for workspace_event in workspace_events:
                         yield workspace_event, None
                     yield published_terminal_event, published_terminal_outcome
@@ -2341,8 +2339,8 @@ class ToolInvocation:
                     if event[1] is None:
                         continue
                     terminal_recorded = True
-                    for runner_event in runner_events:
-                        yield runner_event, None
+                    for diagnostic_event in (*dispatch.events, *runner_events):
+                        yield diagnostic_event, None
                     for workspace_event in workspace_events:
                         yield workspace_event, None
                     for proxy_event in proxy_events:
@@ -2351,8 +2349,8 @@ class ToolInvocation:
                         yield terminal_event
                     terminal_events.clear()
                 if not terminal_recorded:
-                    for runner_event in runner_events:
-                        yield runner_event, None
+                    for diagnostic_event in (*dispatch.events, *runner_events):
+                        yield diagnostic_event, None
                     for workspace_event in workspace_events:
                         yield workspace_event, None
                     for proxy_event in proxy_events:
@@ -2448,8 +2446,8 @@ class ToolInvocation:
                     if event[1] is None:
                         continue
                     terminal_recorded = True
-                    for runner_event in runner_events:
-                        yield runner_event, None
+                    for diagnostic_event in (*dispatch.events, *runner_events):
+                        yield diagnostic_event, None
                     for workspace_event in workspace_events:
                         yield workspace_event, None
                     for proxy_event in proxy_events:
@@ -2462,13 +2460,18 @@ class ToolInvocation:
                 # the invocation's secret scope. Uncertainty replaces the tool
                 # terminal, not delivery of its preceding runner/proxy evidence.
                 if not terminal_recorded:
-                    for diagnostics in (runner_events, workspace_events, proxy_events):
+                    for diagnostics in (
+                        dispatch.events,
+                        runner_events,
+                        workspace_events,
+                        proxy_events,
+                    ):
                         for diagnostic_event in diagnostics:
                             yield diagnostic_event, None
                 raise
             if not terminal_recorded:
-                for runner_event in runner_events:
-                    yield runner_event, None
+                for diagnostic_event in (*dispatch.events, *runner_events):
+                    yield diagnostic_event, None
                 for workspace_event in workspace_events:
                     yield workspace_event, None
                 for proxy_event in proxy_events:
