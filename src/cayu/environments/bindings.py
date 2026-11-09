@@ -3415,6 +3415,7 @@ def _reject_same_or_indeterminate_target(
 
     Fails closed: when either workspace cannot report a stable ``resource_key`` the identity is
     indeterminate, so the bind is refused rather than risk ``_clear_workspace`` wiping the source.
+    Local filesystem roots must also be disjoint, including LocalRunner-backed workspace views.
     """
     if source is target or source.id == target.id:
         raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
@@ -3422,6 +3423,16 @@ def _reject_same_or_indeterminate_target(
     target_key = _validated_workspace_resource_key(target)
     if source_key == target_key:
         raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
+    if (
+        len(source_key) == len(target_key) == 2
+        and source_key[0] == target_key[0] == "local"
+        and isinstance(source_key[1], str)
+        and isinstance(target_key[1], str)
+    ):
+        source_root = Path(source_key[1])
+        target_root = Path(target_key[1])
+        if source_root.is_relative_to(target_root) or target_root.is_relative_to(source_root):
+            raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
     return source_key, target_key
 
 

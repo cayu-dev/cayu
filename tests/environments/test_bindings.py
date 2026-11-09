@@ -1479,6 +1479,40 @@ def test_sync_binding_rejects_target_with_same_local_root(tmp_path) -> None:
         asyncio.run(run())
 
 
+@pytest.mark.parametrize("source_type", [LocalWorkspace, RunnerWorkspace])
+@pytest.mark.parametrize("target_type", [LocalWorkspace, RunnerWorkspace])
+@pytest.mark.parametrize("target_contains_source", [False, True])
+def test_sync_binding_rejects_overlapping_local_roots(
+    tmp_path, source_type, target_type, target_contains_source
+) -> None:
+    outer = tmp_path / "workspace"
+    inner = outer / "nested"
+    inner.mkdir(parents=True)
+    source_root, target_root = (inner, outer) if target_contains_source else (outer, inner)
+    source_file = source_root / "important.txt"
+    source_file.write_bytes(b"durable source")
+    target_file = target_root / "stale.txt"
+    target_file.write_bytes(b"untouched target")
+
+    def workspace(workspace_type, root, workspace_id):  # type: ignore[no-untyped-def]
+        if workspace_type is RunnerWorkspace:
+            return RunnerWorkspace(LocalRunner(root), workspace_id=workspace_id)
+        return LocalWorkspace(root, workspace_id=workspace_id)
+
+    source = workspace(source_type, source_root, "source")
+    target = workspace(target_type, target_root, "target")
+
+    with pytest.raises(ValueError, match="different"):
+        asyncio.run(
+            SyncBinding(target_workspace=target).bind(
+                source, None, session_id="sess_overlapping_roots"
+            )
+        )
+
+    assert source_file.read_bytes() == b"durable source"
+    assert target_file.read_bytes() == b"untouched target"
+
+
 def test_sync_binding_rejects_target_subclass_with_same_local_root(tmp_path) -> None:
     class CustomLocalWorkspace(LocalWorkspace):
         pass
