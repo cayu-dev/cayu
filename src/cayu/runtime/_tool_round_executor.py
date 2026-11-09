@@ -1463,17 +1463,53 @@ class ToolRoundRun:
             tool_round_identity=tool_round_identity,
             tool_calls=tool_calls,
         )
-        (
-            source_pending_round,
-            tool_calls,
-            targeted_resolution_events,
-        ) = await executor.invocation.admission.resolve_targeted_calls(
-            session=session,
-            registered_agent=self._registered_agent,
-            registered_environment=self._registered_environment,
-            pending_round=source_pending_round,
-            invocation_context=self._invocation_context,
-        )
+        try:
+            (
+                source_pending_round,
+                tool_calls,
+                targeted_resolution_events,
+            ) = await executor.invocation.admission.resolve_targeted_calls(
+                session=session,
+                registered_agent=self._registered_agent,
+                registered_environment=self._registered_environment,
+                pending_round=source_pending_round,
+                invocation_context=self._invocation_context,
+            )
+        except (RuntimeError, ValueError):
+            # A remote worker may commit interruption while a targeted grant
+            # use is being bound; the bind's running-session fence then raises
+            # SessionStatusConflict. Reclassify only when durable status
+            # positively proves interruption; otherwise preserve the
+            # resolution error. Cancellation stays outside this handler: it
+            # can arrive after resolution committed its resolved round, which
+            # the engine's interruption path closes from durable state.
+            try:
+                await executor._session_control.raise_if_interrupted(session.id)
+            except SessionInterruptedByRequest as exc:
+                # Close the calls the durable round holds, which are the
+                # resolved ones if resolution committed before it failed.
+                _checkpoint, durable_round = await pending_round_reader.load_pending_tool_round(
+                    executor._session_store,
+                    session.id,
+                    redactor=executor._secret_redactor,
+                    runtime_session=session,
+                )
+                stream = self.close_after_interrupt(
+                    exc,
+                    messages=messages,
+                    tool_calls=(
+                        tool_calls
+                        if durable_round is None
+                        else tool_round_recovery.pending_round_tool_calls(durable_round)
+                    ),
+                    tool_outcomes=tool_outcomes,
+                    tool_round_identity=tool_round_identity,
+                )
+                async with aclosing(stream) as owned_stream:
+                    async for event in owned_stream:
+                        yield event
+                raise
+            raise
         for targeted_resolution_event in targeted_resolution_events:
             yield targeted_resolution_event
         tool_exposure = source_pending_round.tool_exposure
