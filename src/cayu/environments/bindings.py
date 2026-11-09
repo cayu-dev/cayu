@@ -2408,6 +2408,14 @@ class SyncBinding(WorkspaceBinding):
                     bytes_completed=0,
                     bytes_total=self.max_total_bytes,
                 )
+                # Bulk writes can fail after publishing only some paths. Retain
+                # every possible create so a retry can remove it if the target
+                # reverts it; workspace deletion is safe for missing paths.
+                self._update_conflict_state(
+                    state_key,
+                    source_paths=tuple(sorted(set(state.source_paths).union(copy_back_paths))),
+                    source_revisions=state.source_revisions,
+                )
                 copied_bytes = await _copy_paths(
                     source=bound.workspace,
                     target=source_workspace,
@@ -2422,10 +2430,17 @@ class SyncBinding(WorkspaceBinding):
                     observed=await _observe_sync_transfer_sizes(bound.workspace, copy_back_paths),
                 )
                 for path in deleted_paths:
-                    await _await_sync_mutation(
-                        lambda path=path: source_workspace.delete(path),
-                        operation=f"SyncBinding source delete for {path!r}",
-                    )
+                    try:
+                        await _await_sync_mutation(
+                            lambda path=path: source_workspace.delete(path),
+                            operation=f"SyncBinding source delete for {path!r}",
+                        )
+                    except IsADirectoryError:
+                        # The baseline may include a speculative create that
+                        # never replaced a source directory, or a path whose
+                        # target is now a directory. Copy-back owns files only;
+                        # there is no file at this path left to remove.
+                        continue
                 source_revisions = state.source_revisions
                 await _report_sync_lifecycle(
                     EnvironmentLifecyclePhase.COPY_BACK_PUBLICATION,
