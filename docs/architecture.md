@@ -292,7 +292,9 @@ CayuApp
 ```
 
 `SessionEngine` owns execution, queued-message delivery and model/tool loop
-decisions. `SessionRecovery` owns
+decisions. Its before-stop policies and model-step limit stop, and the pure
+helpers its run, resume and turn loop read, live in `runtime/_session_run/`.
+`SessionRecovery` owns
 startup recovery, abandoned-run recovery, and public resume orchestration above
 the engine. Resume prepares and validates its inputs before recovery, retains its
 budget snapshot, then enters execution after recovery settles.

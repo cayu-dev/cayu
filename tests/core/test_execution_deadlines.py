@@ -1433,7 +1433,7 @@ def test_worker_default_does_not_tighten_subagents_or_workflow_anchors(bounded):
 @pytest.mark.parametrize("late_cancellation", [False, True])
 def test_setup_interruption_cleanup_preserves_deadline_stream_cancellation(late_cancellation):
     from cayu.deadlines import _TIMERS, deadline_stream
-    from cayu.runtime._session_engine import _settle_setup_interruption
+    from cayu.runtime._session_run.run_failures import _settle_setup_interruption
 
     async def scenario():
         boundary = ExecutionDeadline.after(60)
@@ -1622,7 +1622,7 @@ def test_deadline_stream_cleanup_error_keeps_primary_failure_catchable(external_
 @pytest.mark.parametrize("fatal", [False, True])
 def test_setup_interruption_preserves_concurrent_cancellation_and_cleanup_failure(fatal):
     from cayu._exception_groups import iter_exception_tree
-    from cayu.runtime._session_engine import _settle_setup_interruption
+    from cayu.runtime._session_run.run_failures import _settle_setup_interruption
 
     async def scenario():
         caller = asyncio.current_task()

@@ -76,7 +76,6 @@ from cayu.providers.retry_policy import RetryPolicy
 from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity, recorded_release_identity
 from cayu.runtime import _provider_disposition_recovery as provider_disposition_module
 from cayu.runtime import _provider_operation_cancellation_owner as cancellation_owner
-from cayu.runtime import _session_engine as session_engine_module
 from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._model_completion_contracts import (
@@ -86,6 +85,9 @@ from cayu.runtime._model_completion_contracts import (
 from cayu.runtime._model_errors import _BillingIdentityResolutionCancelled
 from cayu.runtime._provider_operation_recovery_owner import (
     _ProviderRecoveryRequiredPublicationFailureEvidence,
+)
+from cayu.runtime._session_run.checkpoint_replacement import (
+    _replace_checkpoint_preserving_runtime_state,
 )
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.execution_profiles import (
@@ -1705,7 +1707,7 @@ async def stage_provider_resolution_process_loss(
     assert pending is not None
     await store.transform_checkpoint(
         session_id,
-        session_engine_module._replace_checkpoint_preserving_runtime_state(
+        _replace_checkpoint_preserving_runtime_state(
             {
                 "provider_operation_pending_resolution_disposition": {"record_type": "stale"},
                 "provider_operation_fallback_dispatch_ordinals": {"stale": 99},

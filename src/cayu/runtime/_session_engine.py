@@ -9,10 +9,10 @@ import logging
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from cayu.releases import release_event_fields
@@ -68,7 +68,6 @@ from cayu.runtime._run_settlement import (
 )
 from cayu.runtime._session_finalization import (
     _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
-    _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
     SessionFinalization,
     _close_async_iterator,
     _collect_through_event_type,
@@ -98,7 +97,6 @@ from cayu.runtime._session_tool_discovery import (
     _require_tool_discovery_view,
     _tool_discovery_operation_initializer,
 )
-from cayu.runtime._shared_allocation_records import SHARED_ALLOCATIONS_CHECKPOINT_KEY
 from cayu.runtime._task_execution_admission import (
     require_ordinary_session_execution,
     verifier_aware_task_execution_outcome,
@@ -142,7 +140,6 @@ from cayu._validation import (
 )
 from cayu.approvals.tools import (
     ResolutionActor,
-    ResolutionActorSource,
     resolution_actor_payload,
 )
 from cayu.approvals.user_input import (
@@ -169,7 +166,6 @@ from cayu.budgets.billing import (
 from cayu.budgets.run_limits import RunLimits, copy_run_limits, has_run_limits
 from cayu.budgets.usage import (
     SessionUsageSummary,
-    is_conversational_model_completion_payload,
 )
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.peer_content import PeerContentAppendRequest, PeerContentReceipt
@@ -237,7 +233,6 @@ from cayu.events import (
 )
 from cayu.exceptions import (
     TerminalEventPublicationUncertain,
-    _is_runtime_interaction_lifecycle_publication_rejection,
 )
 from cayu.execution_profiles import (
     ExecutionProfileAdoptionIntent,
@@ -288,8 +283,6 @@ from cayu.runtime._diagnostics import (
     task_update_error_payload,
 )
 from cayu.runtime._durable_subagents import (
-    DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
-    DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
     durable_subagent_authority_rejected,
     durable_subagent_request_sha256,
     durable_subagent_submission_from_checkpoint,
@@ -323,8 +316,6 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._loop_policy_continuations import (
     before_stop_continuation_checkpoint_transform,
-    before_stop_continuation_indices,
-    before_stop_policy_key,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_completion_contracts import (
@@ -372,6 +363,38 @@ from cayu.runtime._session_control import (
     SessionInterruptedByRequest,
     clear_current_task_cancellation,
 )
+from cayu.runtime._session_run.before_stop import BeforeStopPolicies
+from cayu.runtime._session_run.checkpoint_replacement import (
+    _replace_checkpoint_preserving_runtime_state,
+)
+from cayu.runtime._session_run.fork_profile import (
+    _FORK_INITIAL_PROFILE_POLICY_ID,
+    _fork_initial_profile_actor,
+    _require_exact_fork_initial_invocation_profile,
+)
+from cayu.runtime._session_run.profile_replay import (
+    _active_transition_matches_profile_decision,
+)
+from cayu.runtime._session_run.queued_messages import (
+    _QueuedCompletionResult,
+)
+from cayu.runtime._session_run.resume_preparation import (
+    _require_expected_resume_run_epoch,
+    _ResumePreparation,
+)
+from cayu.runtime._session_run.run_failures import (
+    _consume_authenticated_interaction_transition_run_fence,
+    _failure_carries_interaction_publication_rejection,
+    _recovery_owns_run_failure,
+    _settle_setup_interruption,
+)
+from cayu.runtime._session_run.turn_helpers import (
+    _knowledge_access_scope,
+    _knowledge_store,
+    _model_step_completion_published,
+    _session_trace_event_fields,
+    _user_tool_call_count,
+)
 from cayu.runtime._structured_output_tool_round import (
     _has_structured_output_tool_call,
     _redact_structured_output_validation,
@@ -413,21 +436,13 @@ from cayu.runtime.execution_profiles import (
 )
 from cayu.runtime.loop_policies import (
     BeforeStopAction,
-    BeforeStopContext,
     BeforeStopDecision,
     LoopPolicy,
-    copy_before_stop_decision,
     validate_loop_policies,
 )
 from cayu.runtime.model_steps import (
     AssistantStepResult,
-    StepClassification,
-    classify_assistant_step,
     completion_requests_follow_up,
-)
-from cayu.runtime.provider_operations import (
-    _PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY,
-    _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
 )
 from cayu.runtime.stop_policy import StopDecision, StopLimit
 from cayu.runtime.tool_completion import (
@@ -441,7 +456,6 @@ from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
 )
 from cayu.sessions._checkpoint_publication import (
-    INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     _initial_transcript_pending_interaction_id,
 )
 from cayu.sessions._execution_profile_checkpoint import (
@@ -490,26 +504,12 @@ from cayu.sessions._invocation_scope import (
 )
 from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._terminal_evidence import (
-    _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
-    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _checkpoint_with_session_run_operation,
 )
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.checkpoints import (
-    ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-    CHECKPOINT_SCHEMA_VERSION_KEY,
-    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
-    CURRENT_CHECKPOINT_SCHEMA_VERSION,
-    INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-    INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-    SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-)
 from cayu.sessions.cleanup import RecoveryCleanupSupervisor
 from cayu.sessions.creation_claims import bind_runtime_session_create_claim
 from cayu.sessions.event_queries import EventOrder, EventQuery
-from cayu.sessions.forks import (
-    session_fork_profile_relationship,
-)
 from cayu.sessions.messaging import (
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -526,7 +526,6 @@ from cayu.sessions.records import (
     copy_session_runtime_identity,
 )
 from cayu.sessions.recovery import (
-    _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.requests import (
@@ -534,7 +533,6 @@ from cayu.sessions.requests import (
     ResumeRequest,
     RunRequest,
     _authenticated_session_instance_id_for_run_request,
-    _fork_initial_invocation_request_sha256,
     _runtime_resume_transport_metadata,
     run_request_with_runtime_session_instance_authority,
     runtime_prepared_session_authority,
@@ -588,38 +586,6 @@ from cayu.workspaces.observation_recovery import (
 logger = logging.getLogger(__name__)
 
 
-async def _settle_setup_interruption(operation: Callable[[], Awaitable[None]]) -> None:
-    """Join fresh interruption work without normalizing its caller's requests."""
-    cleanup = asyncio.create_task(
-        capture_awaitable_outcome(operation), name="cayu-setup-interruption-cleanup"
-    )
-    cancellation: asyncio.CancelledError | None = None
-    while not cleanup.done():
-        try:
-            await asyncio.wait((cleanup,))
-        except asyncio.CancelledError as exc:
-            cancellation = cancellation or exc
-    failure = cleanup.result().error
-    if cancellation is not None:
-        if failure is not None and not isinstance(failure, (Exception, asyncio.CancelledError)):
-            raise BaseExceptionGroup(
-                "Setup interruption failure and caller cancellation.", [failure, cancellation]
-            )
-        raise cancellation from failure
-    if failure is not None:
-        raise failure
-
-
-@dataclass(frozen=True, slots=True)
-class _QueuedCompletionResult:
-    outcome: Literal["continue", "complete", "stopped"]
-    session: Session
-    events: list[Event]
-    invocation_context: InvocationContext | None
-    completion_finalization_marker: dict[str, Any] | None = None
-    continuation: AsyncGenerator[Event, None] | None = None
-
-
 _OperationResultT = TypeVar("_OperationResultT")
 
 
@@ -628,368 +594,7 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 
 
-def _consume_authenticated_interaction_transition_run_fence(
-    error: BaseException,
-) -> bool:
-    """Consume current transition fence markers without discarding evidence.
-
-    A sibling transition boundary removes the marker from caller cancellation,
-    but the exact store failure in its cause remains independently marked.  The
-    enclosing run owner must recognize that authenticated child marker before
-    deciding whether stale-epoch cleanup is legal.
-    """
-
-    authenticated = False
-    for candidate in iter_exception_tree(error):
-        if not _is_interaction_transition_run_fence(candidate):
-            continue
-        authenticated = True
-        pop_exception_state(
-            candidate,
-            _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
-        )
-    return authenticated
-
-
-_FORK_INITIAL_PROFILE_POLICY_ID = "cayu:fork-initial-invocation:v1"
-
-
-def _fork_initial_profile_actor() -> ResolutionActor:
-    return ResolutionActor(
-        subject="cayu:fork-initial-invocation",
-        source=ResolutionActorSource.SYSTEM,
-    )
-
-
-def _require_expected_resume_run_epoch(session: Session, request: ResumeRequest) -> None:
-    expected = request.expected_run_epoch
-    if expected is not None and session.run_epoch != expected:
-        raise SessionRunFenced(
-            f"Resume expected run epoch {expected}, but the session is at {session.run_epoch}."
-        )
-
-
-def _require_exact_fork_initial_invocation_profile(
-    session: Session,
-    request: ResumeRequest,
-    *,
-    queued_dispatch_id: str | None,
-) -> ExecutionProfileIdentity | None:
-    """Authenticate the dispatch-only first invocation frozen with an exact fork."""
-
-    relationship = session_fork_profile_relationship(session)
-    if (
-        session.run_epoch != 0
-        or relationship is None
-        or relationship.initial_invocation_request_sha256 is None
-    ):
-        return None
-    if queued_dispatch_id is None:
-        raise SessionRunFenced(
-            "Session fork first invocation must enter through its exact durable dispatch."
-        )
-    queued_dispatch_id = require_clean_nonblank(
-        queued_dispatch_id,
-        "queued_dispatch_id",
-    )
-    if relationship.initial_dispatch_id != queued_dispatch_id:
-        raise SessionRunFenced(
-            "Session fork first invocation dispatch identity does not match the exact fork."
-        )
-    if relationship.initial_invocation_request_sha256 != (
-        _fork_initial_invocation_request_sha256(request)
-    ):
-        raise SessionRunFenced(
-            "Session fork first invocation does not match the exact request frozen "
-            "before child publication."
-        )
-    if relationship.initial_invocation_profile is None:  # pragma: no cover - model invariant
-        raise RuntimeError("Session fork first invocation lost its execution profile.")
-    return relationship.initial_invocation_profile
-
-
-def _session_trace_event_fields(
-    session: Session,
-    request_metadata: dict[str, Any],
-) -> dict[str, Any]:
-    # Surface the parent linkage and any inbound W3C trace context on the session
-    # start event so an OpenTelemetryEventSink can parent the root span. Additive:
-    # other sinks ignore these keys.
-    fields: dict[str, Any] = {}
-    if session.parent_session_id:
-        fields["parent_session_id"] = session.parent_session_id
-    traceparent = request_metadata.get("traceparent")
-    if isinstance(traceparent, str) and traceparent:
-        fields["traceparent"] = traceparent
-        tracestate = request_metadata.get("tracestate")
-        if isinstance(tracestate, str) and tracestate:
-            fields["tracestate"] = tracestate
-    return fields
-
-
-def _loop_policy_supports_before_stop(policy: LoopPolicy) -> bool:
-    policy_method = type(policy).before_stop
-    default_method = LoopPolicy.before_stop
-    return policy_method is not default_method
-
-
-@dataclass(frozen=True)
-class _BeforeStopPolicySelection:
-    decision: BeforeStopDecision
-    policy_key: str
-
-
-def _before_stop_policy_event(
-    *,
-    event_type: str,
-    policy_name: str,
-    scope: str,
-    session: Session,
-    registered_agent: runtime_records.RegisteredAgentState,
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-    step: int,
-    classification: StepClassification,
-    payload: dict[str, Any],
-) -> Event:
-    event_payload = {
-        "policy": policy_name,
-        "scope": scope,
-        "step": step,
-        "classification": classification.payload(),
-        **copy_json_value(payload, "payload"),
-    }
-    return Event(
-        type=event_type,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=_environment_name(registered_environment),
-        payload=event_payload,
-    )
-
-
-def _replace_checkpoint_preserving_runtime_state(
-    checkpoint: dict[str, Any],
-):
-    replacement = copy_durable_record(checkpoint, "checkpoint")
-
-    def transform(_session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-        updated = copy_durable_record(replacement, "checkpoint")
-        updated[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION
-        for key, field_name in (
-            ("workspace_checkpoints", "workspace_checkpoints"),
-            (
-                ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
-                "active_invocation_execution_profile",
-            ),
-            (
-                INVOCATION_LIFECYCLE_RECEIPT_CHECKPOINT_KEY,
-                "invocation_lifecycle_receipt",
-            ),
-            (
-                INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-                "invocation_terminal_decision",
-            ),
-            (
-                SETTLED_INVOCATION_TERMINAL_DECISION_CHECKPOINT_KEY,
-                "settled_invocation_terminal_decision",
-            ),
-            (
-                INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
-                "initial_transcript_pending",
-            ),
-            (_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, "pending_session_interrupt"),
-            (_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, "pending_interruption_cascade"),
-            (_session_operation_state._SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
-            (_SESSION_RUN_OPERATION_CHECKPOINT_KEY, "session_run_operation"),
-            (
-                _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
-                "queued_dispatch_terminal_receipts",
-            ),
-            (
-                _prompt_transition._PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY,
-                "prompt_anatomy_transition_intents",
-            ),
-            (
-                _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
-                "incomplete_session_recovery_claim",
-            ),
-            (
-                DURABLE_SUBAGENT_SUBMISSION_SEEDS_CHECKPOINT_KEY,
-                "durable_subagent_submission_seeds",
-            ),
-            (
-                DURABLE_SUBAGENT_SUBMISSIONS_CHECKPOINT_KEY,
-                "durable_subagent_submissions",
-            ),
-            (
-                _PROVIDER_OPERATION_FALLBACK_ORDINALS_CHECKPOINT_KEY,
-                "provider_operation_fallback_dispatch_ordinals",
-            ),
-            (
-                _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
-                "provider_operation_pending_resolution_disposition",
-            ),
-            (
-                COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
-                "completion_result_event_publications",
-            ),
-            (
-                "recovery_plan_execution",
-                "recovery_plan_execution",
-            ),
-            # An agent session's shared allocations, which its subagents and a
-            # resumed run in another process change while this run works.
-            (SHARED_ALLOCATIONS_CHECKPOINT_KEY, "shared_environment_allocations"),
-        ):
-            updated.pop(key, None)
-            if current is not None and key in current:
-                updated[key] = copy_json_value(current[key], field_name)
-        return updated
-
-    return transform
-
-
-def _knowledge_store(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.knowledge_store
-
-
-def _knowledge_access_scope(
-    registered_environment: runtime_records.RegisteredEnvironment | None,
-) -> Any:
-    if registered_environment is None:
-        return None
-    return registered_environment.environment.knowledge_access_scope
-
-
-def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> int:
-    return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
-
-
-def _model_step_completion_published(
-    item: tuple[Event | None, ModelStepFlowOutcome | None],
-) -> bool:
-    # Automatic context compaction publishes its own model.completed earlier in
-    # the step; only the conversational completion ends the bounded model call.
-    event, _ = item
-    return (
-        event is not None
-        and event.type is EventType.MODEL_COMPLETED
-        and is_conversational_model_completion_payload(event.payload)
-    )
-
-
-def _recovery_owns_run_failure(
-    error: BaseException,
-    *,
-    session_id: str,
-    runtime_authority: object,
-) -> bool:
-    """Whether a run body deliberately left its invocation open for recovery.
-
-    Uncertain terminal evidence, an unsettled durable child submission, or a
-    lifecycle publication the runtime refused (also when it is only the cause
-    of the exit, as after a refused abandonment) leave the session RUNNING. A
-    refusal counts only with this runtime's provenance: extension code can
-    construct the public exception, and must not keep a session open with it.
-    """
-
-    interaction_id = _current_session_interaction_id(session_id)
-    pending = [error]
-    visited: set[int] = set()
-    while pending:
-        candidate = pending.pop()
-        if id(candidate) in visited:
-            continue
-        visited.add(id(candidate))
-        if isinstance(
-            candidate, TerminalEventPublicationUncertain
-        ) or _is_runtime_interaction_lifecycle_publication_rejection(
-            candidate,
-            session_id=session_id,
-            interaction_id=interaction_id,
-            runtime_authority=runtime_authority,
-        ):
-            return True
-        pending.extend(iter_exception_tree(candidate))
-        cause = exception_cause(candidate)
-        if cause is not None:
-            pending.append(cause)
-    return is_durable_subagent_submission_unsettled(error, parent_session_id=session_id)
-
-
-def _failure_carries_interaction_publication_rejection(
-    failure: Exception,
-    *,
-    session_id: str,
-    interaction_id: str | None,
-    runtime_authority: object,
-) -> bool:
-    cause = exception_cause(failure)
-    return cause is not None and any(
-        _is_runtime_interaction_lifecycle_publication_rejection(
-            candidate,
-            session_id=session_id,
-            interaction_id=interaction_id,
-            runtime_authority=runtime_authority,
-        )
-        for candidate in iter_exception_tree(cause)
-    )
-
-
-def _active_transition_matches_profile_decision(
-    *,
-    transition: EgressAuthorityTransitionRecord | None,
-    session: Session,
-    decision: ExecutionProfileDecision,
-) -> bool:
-    """Verify the complete durable activation tuple for profile admission."""
-
-    return bool(
-        transition is not None
-        and transition.state is EgressAuthorityTransitionState.ACTIVE
-        and transition.session_id == session.id
-        and transition.environment_name == session.environment_name
-        and transition.expected_authority == decision.expected_profile.egress_authority
-        and transition.target_authority == decision.candidate_profile.egress_authority
-        and transition.receipt is not None
-    )
-
-
-@dataclass(frozen=True)
-class _ResumePreparation:
-    """Validated continuation input retained across abandoned-owner recovery."""
-
-    request: ResumeRequest
-    task_id: str | None
-    start_event_payload_extra: dict[str, Any]
-    start_task_on_enter: bool
-    adoption_request_fingerprint: str | None
-    source_execution_profile: ExecutionProfileIdentity | None
-    required_execution_profile: ExecutionProfileIdentity | None
-    required_session_instance_fingerprint: str | None
-    required_task_session_instance_id: str | None
-    run_operation_id: str | None
-    terminal_event_id: str | None
-    queue_task_id: str | None
-    queued_dispatch_id: str | None
-    required_foreground_wait: ForegroundChildWait | None
-    required_foreground_terminal: ForegroundChildTerminal | None
-    required_foreground_continuation: ForegroundParentContinuation | None
-    foreground_before_mutation: Callable[[], Awaitable[None]] | None
-    continuation_handoff: _ResumeAdmissionHandoff | None
-    participant_context: CollaborationAccessContext | None
-    execution_to_wait: _ExternalExecutionToWait | None
-    budget_policy: BudgetPolicy | None
-    loaded_session: Session
-    recovery_required: bool
-    recovered_run_epoch: int | None = None
-
-
-class SessionEngine:
+class SessionEngine(BeforeStopPolicies):
     """Own durable session operations and one run's end-to-end orchestration."""
 
     def __init__(
@@ -9757,54 +9362,6 @@ class SessionEngine:
                 if local_pause_ledger is not None:
                     await self._run_settlement.finish(local_pause_ledger, finalizer_failure)
 
-    async def _stop_session_for_model_step_limit(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        environment_name: str | None,
-        messages: list[Message],
-        step: int,
-        max_steps: int | None,
-        run_started_at: float,
-        turn_usage_tracker: SessionUsageTracker,
-        active_run: ActiveSessionRun[SessionUsageTracker] | None,
-        execution_profile: ExecutionProfileIdentity | None,
-        invocation_context: InvocationContext | None = None,
-    ) -> AsyncGenerator[Event, None]:
-        if max_steps is None:
-            raise RuntimeError("An unlimited invocation cannot exhaust model steps.")
-        usage_summary = await self._run_limit_controller.session_usage_summary(session.id)
-        decision = StopDecision(
-            limit=StopLimit.MODEL_STEPS,
-            maximum=max_steps,
-            actual=step,
-            message=(
-                "Run limit reached: the configured model-step allowance was "
-                f"exhausted ({step} >= {max_steps})."
-            ),
-        )
-        async for event in self._session_finalization.stop_session_for_limit_reached(
-            session=session,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            environment_name=environment_name,
-            decision=decision,
-            usage_summary=usage_summary,
-            cost_summary=None,
-            messages=messages,
-            tool_calls=[],
-            completed_tool_outcomes=[],
-            run_started_at=run_started_at,
-            turn_usage_tracker=turn_usage_tracker,
-            active_run=active_run,
-            execution_profile=execution_profile,
-            invocation_context=invocation_context,
-            reconcile_transition_cancellation=False,
-        ):
-            yield event
-
     async def _clear_pending_tool_round_if_matches(
         self,
         session_id: str,
@@ -9832,164 +9389,3 @@ class SessionEngine:
         if loaded is None:
             raise KeyError(f"Session not found: {session_id}") from None
         return loaded
-
-    async def _run_before_stop_policies(
-        self,
-        *,
-        session: Session,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
-        step_result: AssistantStepResult,
-        step: int,
-        max_steps: int | None,
-        request_metadata: dict[str, Any],
-        request_loop_policies: tuple[LoopPolicy, ...],
-        invocation_context: InvocationContext | None = None,
-    ) -> AsyncGenerator[tuple[Event, _BeforeStopPolicySelection | None], None]:
-        if invocation_context is not None and (
-            invocation_context.binding.session_id != session.id
-            or registered_agent is not invocation_context.registered_agent
-            or registered_environment is not invocation_context.registered_environment
-            or len(invocation_context.request_loop_policies) != len(request_loop_policies)
-            or any(
-                frozen is not supplied
-                for frozen, supplied in zip(
-                    invocation_context.request_loop_policies,
-                    request_loop_policies,
-                    strict=True,
-                )
-            )
-        ):
-            raise RuntimeError("Loop policy substituted frozen invocation authority.")
-        classification = classify_assistant_step(step_result)
-        policy_groups = (
-            (
-                "app",
-                self._loop_policies
-                if invocation_context is None
-                else invocation_context.loop_policies,
-            ),
-            ("agent", registered_agent.loop_policies),
-            (
-                "request",
-                validate_loop_policies(
-                    request_loop_policies
-                    if invocation_context is None
-                    else invocation_context.request_loop_policies,
-                    field_name="request_loop_policies",
-                ),
-            ),
-        )
-        snapshot = None
-        checkpoint = None
-        for scope, policies in policy_groups:
-            for position, policy in enumerate(policies):
-                if not _loop_policy_supports_before_stop(policy):
-                    continue
-                if snapshot is None:
-                    snapshot = await self.session_store.load_transcript_snapshot(session.id)
-                    checkpoint = await self.session_store.load_checkpoint(session.id)
-                policy_key = before_stop_policy_key(policy, scope=scope, position=position)
-                policy_name = require_clean_nonblank(policy.name, "loop_policy.name")
-                yield (
-                    await self._event_writer.emit(
-                        _before_stop_policy_event(
-                            event_type="custom.loop.before_stop.started",
-                            policy_name=policy_name,
-                            scope=scope,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            step=step,
-                            classification=classification,
-                            payload={},
-                        )
-                    ),
-                    None,
-                )
-                context = BeforeStopContext(
-                    session=session,
-                    step_result=step_result,
-                    classification=classification,
-                    step=step,
-                    max_steps=max_steps,
-                    metadata=request_metadata,
-                    messages=[record.message for record in snapshot.records],
-                    continuation_message_indices=before_stop_continuation_indices(
-                        checkpoint,
-                        snapshot=snapshot,
-                        session_id=session.id,
-                        policy_key=policy_key,
-                    ),
-                )
-                try:
-                    decision = copy_before_stop_decision(await policy.before_stop(context))
-                except Exception as exc:
-                    diagnostic = exception_diagnostic(
-                        exc,
-                        empty_message="loop policy failed",
-                        nonportable_message=("Loop policy failed with a non-portable diagnostic."),
-                        redactor=self._secret_redactor,
-                    )
-                    yield (
-                        await self._event_writer.emit(
-                            _before_stop_policy_event(
-                                event_type="custom.loop.before_stop.failed",
-                                policy_name=policy_name,
-                                scope=scope,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                step=step,
-                                classification=classification,
-                                payload=diagnostic.payload_fields(),
-                            )
-                        ),
-                        None,
-                    )
-                    raise
-                yield (
-                    await self._event_writer.emit(
-                        _before_stop_policy_event(
-                            event_type="custom.loop.before_stop.completed",
-                            policy_name=policy_name,
-                            scope=scope,
-                            session=session,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            step=step,
-                            classification=classification,
-                            payload={
-                                "action": decision.action.value,
-                                "reason": decision.reason,
-                                "metadata": copy_json_value(decision.metadata, "metadata"),
-                            },
-                        )
-                    ),
-                    None,
-                )
-                if decision.action != BeforeStopAction.COMPLETE:
-                    yield (
-                        await self._event_writer.emit(
-                            _before_stop_policy_event(
-                                event_type="custom.loop.before_stop.selected",
-                                policy_name=policy_name,
-                                scope=scope,
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                step=step,
-                                classification=classification,
-                                payload={
-                                    "action": decision.action.value,
-                                    "reason": decision.reason,
-                                    "metadata": copy_json_value(
-                                        decision.metadata,
-                                        "metadata",
-                                    ),
-                                },
-                            )
-                        ),
-                        _BeforeStopPolicySelection(decision=decision, policy_key=policy_key),
-                    )
-                    return

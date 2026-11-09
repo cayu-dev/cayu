@@ -215,7 +215,9 @@ def test_checkpoint_timeout_retains_environment_until_write_settles(tmp_path):
 
 
 def test_checkpoint_authority_is_not_imported_from_old_schema_or_generic_writes():
-    from cayu.runtime._session_engine import _replace_checkpoint_preserving_runtime_state
+    from cayu.runtime._session_run.checkpoint_replacement import (
+        _replace_checkpoint_preserving_runtime_state,
+    )
     from cayu.sessions.checkpoints import decode_runtime_checkpoint, runtime_checkpoint_writer_view
 
     old = {"schema_version": 7, "workspace_checkpoints": {"forged": {}}}

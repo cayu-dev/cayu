@@ -481,7 +481,6 @@ from cayu.runtime._session_control import (
 from cayu.runtime._session_engine import (
     SessionEngine,
     _environment_name,
-    _replace_checkpoint_preserving_runtime_state,
 )
 from cayu.runtime._session_execution_presence import process_owner_id
 from cayu.runtime._session_finalization import SessionFinalization
@@ -493,6 +492,9 @@ from cayu.runtime._session_outcome_publication import SessionOutcomePublication
 from cayu.runtime._session_preparation import SessionPreparation
 from cayu.runtime._session_recovery import SessionRecovery
 from cayu.runtime._session_request_boundary import _validate_resume_request, _validate_run_request
+from cayu.runtime._session_run.checkpoint_replacement import (
+    _replace_checkpoint_preserving_runtime_state,
+)
 from cayu.runtime._session_task_lifecycle import SessionTaskLifecycle
 from cayu.runtime._task_execution_admission import verifier_aware_task_execution_outcome
 from cayu.runtime._task_store_operation_boundary import (

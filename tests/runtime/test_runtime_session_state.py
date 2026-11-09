@@ -15,7 +15,6 @@ from tests.core._run_lineage_support import assert_root_run_lineage
 from tests.runtime.runtime_provider_support import FakeProvider
 from tests.runtime.runtime_session_support import collect_events, collect_fork_events
 
-import cayu.runtime._session_engine as session_engine_module
 import cayu.sessions._model_completion_publication as model_completion_publication_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
@@ -23,6 +22,9 @@ from cayu.context.base import project_runtime_managed_context_checkpoint
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers.base import ModelStreamEvent
+from cayu.runtime._session_run.checkpoint_replacement import (
+    _replace_checkpoint_preserving_runtime_state,
+)
 from cayu.sessions._checkpoint_preservation import _reserve_completion_result_event_publication
 from cayu.sessions._model_failover import ModelTarget
 from cayu.sessions.checkpoints import (
@@ -152,7 +154,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         }
         await store.transform_checkpoint(
             session_id,
-            session_engine_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
+            _replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         preserved = await store.load_checkpoint(session_id)
         await app._session_finalization.clear_pending_session_interrupt(session_id)
@@ -174,7 +176,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         )
         await store.transform_checkpoint(
             session_id,
-            session_engine_module._replace_checkpoint_preserving_runtime_state(stale_replacement),
+            _replace_checkpoint_preserving_runtime_state(stale_replacement),
         )
         return preserved, await store.load_checkpoint(session_id)
 
