@@ -1,20 +1,4 @@
-"""Calls to an application's connections: the outside systems it reaches through named slots.
-
-An application names what it needs by slot (``warehouse``, ``crm``) and never holds the
-credential behind it when a host serves the slot for it. A ``ConnectionClient`` sends one HTTP
-request through a slot and answers the connector's response:
-
-* ``CloudConnectionBroker`` sends it to Cayu Cloud's connection broker, which attaches the
-  Organization's credential bound to the slot (``docs/adr/0003-connections-runtime-contract.md``).
-  ``from_environment`` configures it from ``CAYU_CONNECTIONS_URL`` and the Agent's own
-  ``CAYU_CONNECTIONS_TOKEN``, both of which only Cayu Cloud sets.
-* ``LocalConnections`` sends it straight to each slot's own host with headers the application
-  gives, for a laptop or a test.
-
-The connector's status is the answer's, whatever it is; ``ConnectionCallError`` is raised only
-when the request couldn't be sent: the slot is unbound, the host refused to send it, or the
-connector couldn't be reached.
-"""
+"""The connection clients: Cayu Cloud's broker and local slots (see ``cayu.connections``)."""
 
 from __future__ import annotations
 
@@ -24,6 +8,8 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from urllib.parse import unquote
 
@@ -35,6 +21,8 @@ TOKEN_ENVIRONMENT = "CAYU_CONNECTIONS_TOKEN"
 DEFAULT_TIMEOUT_SECONDS = 70.0
 #: The largest body one call carries, as Cayu Cloud's broker limits it.
 MAX_BODY_BYTES = 5 * 1024 * 1024
+#: The longest wait a ``Retry-After`` is read as; a longer one is clamped to it.
+MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
 _ENCODED_SEPARATOR = re.compile(r"%(2f|5c)", re.IGNORECASE)
 _HOP_HEADERS = frozenset(
     {
@@ -67,12 +55,24 @@ class ConnectionResponse:
 
 
 class ConnectionCallError(Exception):
-    """The request wasn't sent through the slot; ``code`` names why, when the host said."""
+    """The request wasn't sent through the slot; ``code`` names why, when the host said.
 
-    def __init__(self, message: str, *, code: str | None = None, status: int | None = None):
+    ``retry_after`` is how many seconds the host asked the caller to wait before trying again
+    (its ``Retry-After``), when it said.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status: int | None = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.retry_after = retry_after
 
 
 class ConnectionClient(Protocol):
@@ -187,6 +187,7 @@ class CloudConnectionBroker:
                 else f"The broker answered {response.status_code}.",
                 code=code if isinstance(code, str) else None,
                 status=response.status_code,
+                retry_after=retry_after_seconds(response.headers.get("retry-after")),
             )
         try:
             answer = response.json()
@@ -276,6 +277,24 @@ class LocalConnections:
             headers=tuple((name.lower(), value) for name, value in response.headers.multi_items()),
             body=response.content,
         )
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    """A ``Retry-After`` value in seconds from now: delay seconds or an HTTP date; None when
+    absent or unreadable."""
+
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.isascii() and value.isdigit():
+        return float(min(int(value), MAX_RETRY_AFTER_SECONDS))
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return min(max(0.0, (when - datetime.now(UTC)).total_seconds()), MAX_RETRY_AFTER_SECONDS)
 
 
 def _checked(path: str, headers: Mapping[str, str] | None, body: bytes) -> dict[str, str]:

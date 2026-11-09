@@ -132,6 +132,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Database storage and migrations ADR](adr/0001-database-storage-and-migrations.md)
 - [Execution snapshots: Docker CRIU and AWS DMTCP proofs](adr/0002-execution-snapshot-substrate.md)
 - [Connections in the Runtime ADR](adr/0003-connections-runtime-contract.md)
+- [Connector toolkits: Slack and Snowflake](connector-toolkits.md)
 - [AWS MicroVM checkpoint syscall support request](evidence/aws-lambda-microvm-kcmp-support-request.md)
 - [AWS credentials](aws-credentials.md)
 - [Glossary](glossary.md)

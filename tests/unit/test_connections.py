@@ -6,16 +6,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 import httpx
 import pytest
 
 from cayu.connections import (
     MAX_BODY_BYTES,
+    MAX_RETRY_AFTER_SECONDS,
     CloudConnectionBroker,
     ConnectionCallError,
     LocalConnections,
     LocalSlot,
+    retry_after_seconds,
 )
 
 BROKER = "https://api.example.test/v1/agent-connections"
@@ -91,6 +95,33 @@ def test_a_broker_refusal_names_its_code() -> None:
         asyncio.run(client.request("crm", "GET", "/v1/records"))
     assert (caught.value.code, caught.value.status) == ("connection_unbound", 404)
     assert str(caught.value) == "The slot crm isn't bound."
+
+
+def test_a_broker_refusal_carries_its_retry_after() -> None:
+    def refused(retry_after: str | None) -> ConnectionCallError:
+        def broker(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={} if retry_after is None else {"Retry-After": retry_after},
+                json={"detail": {"code": "too_many_calls", "message": "Too many calls."}},
+            )
+
+        client = CloudConnectionBroker(
+            url=BROKER, token="cayu_conn_x", transport=httpx.MockTransport(broker)
+        )
+        with pytest.raises(ConnectionCallError) as caught:
+            asyncio.run(client.request("crm", "GET", "/v1"))
+        return caught.value
+
+    error = refused("2")
+    assert (error.code, error.status, error.retry_after) == ("too_many_calls", 429, 2.0)
+    assert refused(None).retry_after is None
+    assert refused("soon").retry_after is None
+    assert refused("999999999").retry_after == MAX_RETRY_AFTER_SECONDS
+    assert retry_after_seconds("\u00b2") is None
+    assert retry_after_seconds("  ") is None
+    later = format_datetime(datetime.now(UTC) + timedelta(seconds=90), usegmt=True)
+    assert 80 < (refused(later).retry_after or 0) <= 90
 
 
 def test_local_connections_send_straight_to_the_slots_host() -> None:

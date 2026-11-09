@@ -6,7 +6,7 @@ whether a release breaks anything. The maintainers adopted it on 2026-10-15.
 The PyPI `Development Status` classifier is `4 - Beta`.
 
 Cayu exports a lot: 19 names from the root `cayu` package and about 3,800 names
-across the 29 public packages in
+across the 32 public packages in
 [public-api-packages.json](public-api-packages.json). This policy does not
 promise all of that. It promises a small core, gives durable and wire formats
 version rules, and labels the rest as provisional or experimental.

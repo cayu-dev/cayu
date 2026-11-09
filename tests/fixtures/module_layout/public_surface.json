@@ -796,6 +796,67 @@
         "SessionExportAction"
       ]
     },
+    "cayu.connections": {
+      "defined_in": {
+        "cayu.connections.client": [
+          "CloudConnectionBroker",
+          "ConnectionCallError",
+          "ConnectionClient",
+          "ConnectionResponse",
+          "LocalConnections",
+          "LocalSlot",
+          "retry_after_seconds"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "DEFAULT_TIMEOUT_SECONDS",
+        "MAX_BODY_BYTES",
+        "MAX_RETRY_AFTER_SECONDS",
+        "Query",
+        "TOKEN_ENVIRONMENT",
+        "URL_ENVIRONMENT"
+      ]
+    },
+    "cayu.connectors.slack": {
+      "defined_in": {
+        "cayu.connectors.slack.toolkit": [
+          "approval_policy",
+          "review_fields",
+          "tools"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "DEFAULT_PAGE_SIZE",
+        "DEFAULT_SLOT",
+        "MAX_MESSAGE_CHARACTERS",
+        "MAX_PAGE_SIZE"
+      ]
+    },
+    "cayu.connectors.snowflake": {
+      "defined_in": {
+        "cayu.connectors.snowflake.sql": [
+          "StatementShapeError",
+          "is_read_statement"
+        ],
+        "cayu.connectors.snowflake.toolkit": [
+          "approval_policy",
+          "review_fields",
+          "tools"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "DEFAULT_MAX_ROWS",
+        "DEFAULT_SLOT",
+        "DEFAULT_TIMEOUT_SECONDS",
+        "DEFAULT_WRITE_SLOT",
+        "MAX_ROWS",
+        "MAX_STATEMENT_CHARACTERS",
+        "READ_KEYWORDS"
+      ]
+    },
     "cayu.context": {
       "defined_in": {
         "cayu.context.base": [
@@ -5461,6 +5522,14 @@
       "identities": {},
       "present": [
         "DEFAULT_MAX_STEPS"
+      ]
+    },
+    "cayu.connectors": {
+      "defined_in": {},
+      "identities": {},
+      "present": [
+        "slack",
+        "snowflake"
       ]
     },
     "cayu.context.structured_output": {

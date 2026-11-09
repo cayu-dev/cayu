@@ -9,8 +9,12 @@
 ## Built so far
 
 `cayu.connections` has `ConnectionClient`, `CloudConnectionBroker` and `LocalConnections`, and
-`cayu cloud connectors|connections` manages connections. Slot declarations, the manifest
-document, `ToolContext.connections`, MCP through a slot and model slots are still proposals.
+`cayu cloud connectors|connections` manages connections. `cayu.connectors.slack` and
+`cayu.connectors.snowflake` are the first connector toolkits: ready tools on a slot, an approval
+policy for their write tools and an argument-review preset ([connector toolkits](../connector-toolkits.md)).
+They take their client as an argument until `ToolContext.connections` exists. Slot declarations,
+the manifest document, `ToolContext.connections`, MCP through a slot and model slots are still
+proposals.
 
 ## Decision summary
 
@@ -80,10 +84,11 @@ has it today).
   and it's the main structural choice to review. Until then, tools construct a client
   themselves.
 - **Errors.** `ConnectionCallError`, raised only when the request wasn't sent, with the
-  broker's `code` and HTTP `status`: `agent_credential_invalid`, `connection_unbound`,
-  `connection_unavailable`, `connection_not_ready`, `connector_not_brokered`,
-  `path_not_allowed`, `path_invalid`, `method_not_allowed`, `headers_invalid`,
-  `body_too_large`, `request_too_large`, `upstream_failed`, `upstream_response_too_large`. The
+  broker's `code`, HTTP `status` and `retry_after` (seconds, from the broker's `Retry-After`):
+  `agent_credential_invalid`, `connection_unbound`, `connection_unavailable`,
+  `connection_not_ready`, `connector_not_brokered`, `credential_invalid`, `scope_not_allowed`,
+  `path_not_allowed`, `path_invalid`, `method_not_allowed`, `headers_invalid`, `body_too_large`,
+  `request_too_large`, `too_many_calls`, `upstream_failed`, `upstream_response_too_large`. The
   client refuses `path_invalid`, `headers_invalid` and `body_too_large` itself, before sending.
   The connector's own status is the answer's, whatever it is. A bound connection that fails
   never falls back to another credential.
@@ -129,5 +134,5 @@ Cloud's owners decide.
    Environment carry it as it does `vault`?
 2. Is a slot-naming header on Gateway requests acceptable, or should the Gateway resolve the
    Agent's only model slot without one?
-3. Which connector toolkits ship first? Cloud's F500 slice needs Slack and Snowflake. Snowflake
-   through its SQL REST API keeps to the broker; a driver needs egress F500 doesn't allow.
+3. Which connector toolkits come after Slack and Snowflake? Snowflake goes through its SQL REST
+   API, which keeps to the broker; a driver would need egress the broker doesn't give.
