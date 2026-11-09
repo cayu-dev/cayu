@@ -132,6 +132,7 @@ from cayu.runtime._session_control import (
     ActiveSessionRun,
     SessionControl,
     SessionInterruptedByRequest,
+    _close_async_iterator,
     clear_current_task_cancellation,
 )
 from cayu.runtime._tool_invocation.admission import (
@@ -1542,14 +1543,16 @@ class ToolRoundRun:
                         yield event
                 raise
 
-        async for event in self._check_dispatch_limits(
+        stream = self._check_dispatch_limits(
             pending_tool_calls=len(tool_calls),
             messages=messages,
             tool_calls=tool_calls,
             completed_tool_outcomes=tool_outcomes,
             tool_round_identity=tool_round_identity,
-        ):
-            yield event
+        )
+        async with aclosing(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
         if self.stopped_for_limit or self.closed_for_finish:
             return
 
@@ -2029,10 +2032,14 @@ class ToolRoundRun:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome] | None = None,
         tool_round_identity: ToolRoundIdentity,
         publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncGenerator[Event, None]:
         if evaluation.decision is not None and publish_staged_terminals is not None:
-            async for event in publish_staged_terminals():
-                yield event
+            stream = publish_staged_terminals()
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await _close_async_iterator(stream)
         request = ToolRoundLimitRequest(
             evaluation=evaluation,
             session=self._session,
@@ -2051,8 +2058,12 @@ class ToolRoundRun:
             execution_profile=self._execution_profile,
             invocation_context=self._invocation_context,
         )
-        async for event in self._executor._apply_limit_evaluation(request):
-            yield event
+        stream = self._executor._apply_limit_evaluation(request)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_async_iterator(stream)
 
     async def _check_dispatch_limits(
         self,
@@ -2077,15 +2088,17 @@ class ToolRoundRun:
                 model_attempt_id=tool_round_identity.model_attempt_id,
             ),
         )
-        async for event in self._apply_limit_evaluation(
+        stream = self._apply_limit_evaluation(
             limit_evaluation,
             messages=messages,
             tool_calls=tool_calls,
             completed_tool_outcomes=completed_tool_outcomes,
             tool_round_identity=tool_round_identity,
             publish_staged_terminals=publish_staged_terminals,
-        ):
-            yield event
+        )
+        async with aclosing(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event
         if limit_evaluation.decision is not None:
             self.stopped_for_limit = True
             return
@@ -2093,9 +2106,13 @@ class ToolRoundRun:
         if cutoff is None:
             return
         if publish_staged_terminals is not None:
-            async for event in publish_staged_terminals():
-                yield event
-        async for event in self._executor._close_round_at_finish_cutoff(
+            stream = publish_staged_terminals()
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await _close_async_iterator(stream)
+        stream = self._executor._close_round_at_finish_cutoff(
             ToolRoundFinishCutoffRequest(
                 decision=cutoff,
                 session=self._session,
@@ -2108,8 +2125,12 @@ class ToolRoundRun:
                 execution_profile=self._execution_profile,
                 projection_cursor=self.projection_cursor,
             )
-        ):
-            yield event
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await _close_async_iterator(stream)
         self.closed_for_finish = True
 
     async def close_after_interrupt(
@@ -2250,15 +2271,17 @@ class ToolRoundRun:
             # Nothing runs between one call's end and the next call's start, so
             # this one check also serves as the previous call's closing check.
             await self._executor._session_control.raise_if_interrupted(self._session.id)
-            async for event in self._check_dispatch_limits(
+            stream = self._check_dispatch_limits(
                 pending_tool_calls=1,
                 messages=messages,
                 tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
                 tool_round_identity=tool_round_identity,
                 publish_staged_terminals=publish_staged_terminals,
-            ):
-                yield event, None
+            )
+            async with aclosing(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield event, None
             if self.stopped_for_limit or self.closed_for_finish:
                 return
             stream = self._executor.invocation.execute(
@@ -2326,15 +2349,17 @@ class ToolRoundRun:
         publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
     ) -> AsyncGenerator[tuple[Event, runtime_records.ToolCallOutcome | None], None]:
         if check_dispatch_limits:
-            async for event in self._check_dispatch_limits(
+            stream = self._check_dispatch_limits(
                 pending_tool_calls=len(tool_calls),
                 messages=messages,
                 tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
                 tool_round_identity=tool_round_identity,
                 publish_staged_terminals=publish_staged_terminals,
-            ):
-                yield event, None
+            )
+            async with aclosing(stream) as owned_stream:
+                async for event in owned_stream:
+                    yield event, None
             if self.stopped_for_limit or self.closed_for_finish:
                 return
         semaphore = asyncio.Semaphore(self._executor._max_parallel_tool_calls)
@@ -2561,15 +2586,17 @@ class ToolRoundRun:
         if not out_of_time:
             return
         # Never dispatched: the limit stop or finishing closure skips them.
-        async for event in self._check_dispatch_limits(
+        stream = self._check_dispatch_limits(
             pending_tool_calls=len(out_of_time),
             messages=messages,
             tool_calls=round_tool_calls,
             completed_tool_outcomes=tool_outcomes,
             tool_round_identity=tool_round_identity,
             publish_staged_terminals=publish_staged_terminals,
-        ):
-            yield event, None
+        )
+        async with aclosing(stream) as owned_stream:
+            async for event in owned_stream:
+                yield event, None
         if not (self.stopped_for_limit or self.closed_for_finish):
             raise RuntimeError("Parallel tool calls ran out of time without a limit decision.")
 

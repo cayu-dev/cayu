@@ -1599,3 +1599,86 @@ def test_outer_close_finishes_nested_tool_stream_before_return(monkeypatch, stop
         raise AssertionError("Expected tool event was not published.")
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("path", ["dispatch", "sequential", "parallel", "parallel_timeout"])
+@pytest.mark.parametrize("boundary", ["limit", "staged_limit", "finish", "staged_finish"])
+def test_limit_forwarding_joins_nested_stream_cleanup(monkeypatch, path, boundary):
+    app, store, _ = _app_with_completed_session("sess_owned_limit_close")
+
+    async def scenario():
+        session = await rebind_test_invocation(store, "sess_owned_limit_close")
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        closing = asyncio.Event()
+        release = asyncio.Event()
+        closed = []
+        event = Event(type=EventType.SESSION_LIMIT_REACHED, session_id=session.id)
+
+        async def publication(*args, **kwargs):
+            try:
+                yield event
+            finally:
+                closing.set()
+                await release.wait()
+                closed.append(boundary)
+
+        async def evaluate_limits(**kwargs):
+            return SimpleNamespace(decision=object() if "limit" in boundary else None)
+
+        async def no_events(request):
+            if False:
+                yield
+
+        monkeypatch.setattr(
+            runner,
+            "_limit_gate",
+            SimpleNamespace(
+                evaluate_limits=evaluate_limits,
+                tool_cutoff_decision=lambda: object(),
+                tool_seconds_left=lambda: 0,
+            ),
+        )
+        monkeypatch.setattr(
+            runner._executor,
+            "_apply_limit_evaluation",
+            publication if boundary == "limit" else no_events,
+        )
+        monkeypatch.setattr(runner._executor, "_close_round_at_finish_cutoff", publication)
+        calls = [_tool_call()]
+        arguments = dict(
+            messages=[],
+            tool_calls=calls,
+            tool_round_identity=_tool_round_identity(),
+            publish_staged_terminals=publication if boundary.startswith("staged") else None,
+        )
+        if path == "dispatch":
+            stream = runner._check_dispatch_limits(
+                **arguments, pending_tool_calls=1, completed_tool_outcomes=[]
+            )
+        else:
+            arguments.update(
+                round_tool_calls=calls,
+                tool_outcomes=[],
+                policy_results_by_id={},
+                policy_evidence_by_id={},
+                tool_exposure=None,
+                model_step=None,
+            )
+            if path == "sequential":
+                stream = runner._run_tool_calls_sequential(**arguments)
+            else:
+                stream = runner._run_tool_calls_parallel(
+                    **arguments, check_dispatch_limits=path == "parallel"
+                )
+        item = await anext(stream)
+        assert (item if path == "dispatch" else item[0]) is event
+        close_task = asyncio.create_task(stream.aclose())
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            assert not close_task.done()
+        finally:
+            release.set()
+            await asyncio.wait_for(close_task, timeout=5)
+        assert closed == [boundary]
+
+    asyncio.run(scenario())
