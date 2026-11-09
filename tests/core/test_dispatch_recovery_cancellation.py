@@ -47,10 +47,16 @@ async def _cancellation_during_recovery(monkeypatch, interruption):
     busy_entered = asyncio.Event()
     release_busy = asyncio.Event()
     stream = h.provider.stream
+    heartbeat = tasks.heartbeat
+    replacement_renewed = asyncio.Event()
 
     async def busy_stream(request):
         busy_entered.set()
         await release_busy.wait()
+        if interruption == "heartbeat" and len(h.provider.requests) == 2:
+            # Make the replacement renew before it can finish, so a leaked
+            # failure injector cannot hide behind a fast provider response.
+            await asyncio.wait_for(replacement_renewed.wait(), 5)
         async for event in stream(request):
             yield event
 
@@ -108,6 +114,16 @@ async def _cancellation_during_recovery(monkeypatch, interruption):
         if current.lease_expires_at is not None:
             now[0] = current.lease_expires_at + timedelta(seconds=1)
             await tasks.reclaim_expired()
+
+        async def healthy_heartbeat(task_id, worker_id, **kwargs):
+            renewed = await heartbeat(task_id, worker_id, **kwargs)
+            if worker_id == "replacement":
+                replacement_renewed.set()
+            return renewed
+
+        # The fault belongs to the exited owner. Replacement polling must use
+        # the real store renewal, including when execution crosses a heartbeat.
+        monkeypatch.setattr(tasks, "heartbeat", healthy_heartbeat)
         restarted = TaskStoreDispatcher(tasks)
         for _ in range(3):
             await restarted.process_next(h.app, worker_id="replacement")
@@ -120,6 +136,8 @@ async def _cancellation_during_recovery(monkeypatch, interruption):
         else:
             assert current.status is TaskStatus.COMPLETED
             assert len(h.provider.requests) == 3
+            if interruption == "heartbeat":
+                assert replacement_renewed.is_set()
     finally:
         release_recovery.set()
         release_busy.set()

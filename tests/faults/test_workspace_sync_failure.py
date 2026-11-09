@@ -634,10 +634,26 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
             path.name: path.read_text(encoding="utf-8") for path in target_root.iterdir()
         } == target_before_rebind
 
-        # A normal later run—not a private lifecycle call—delivers the bounded
-        # cleanup retry. It reuses the stable pending event identity before the
-        # new bind is admitted.
+        # Admission only polls retained cleanup for a bounded interval; a later
+        # run cannot assume that filesystem work or evidence publication fits
+        # within that interval. Drain through the public API, holding the retry
+        # at publication to prove ownership lasts until the evidence is durable.
         store.fail_finalize_evidence = False
+        store.block_finalize_evidence = True
+        async with asyncio.timeout(30):
+            drain = asyncio.create_task(app.drain_environment_cleanups(timeout_s=20))
+            try:
+                await store.finalize_evidence_append_started.wait()
+                assert not drain.done()
+                assert_sync_resources_owned(source, target, generation=generation, expected=True)
+                with pytest.raises(ValueError, match="already bound by an active session"):
+                    await binding.bind(source, None, session_id="blocked-during-publication")
+            finally:
+                store.allow_finalize_evidence_append.set()
+                # The original run still lacks terminal invocation evidence, so
+                # the aggregate drain may report other unresolved work. The
+                # binding and durable-event assertions below check this retry.
+                await drain
         events = [
             event
             async for event in app.run(
