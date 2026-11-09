@@ -99,6 +99,9 @@ def build_app(
         model_policy=configured_model_policy(
             None if stores.configured is None else stores.configured.model_policy_store
         ),
+        # The app closes the stores built here once aclose() settles; injected
+        # stores stay with their caller.
+        owned_resources=() if stores.configured is None else (stores.configured,),
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)

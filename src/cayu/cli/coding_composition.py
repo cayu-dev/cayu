@@ -342,6 +342,14 @@ _PRIMARY_TOOL_POLICY_IDENTITY = ExecutionProfileBehaviorIdentity(
     behavior_version="2",
     implementation_version="1-__CODING_PROFILE__",
 )
+# The tool-free reviewer runs in its own environment, so it never shares or
+# re-binds the primary agent's coding workspace.
+_REVIEWER_ENVIRONMENT_NAME = "coding-reviewer"
+_REVIEWER_ENVIRONMENT_IDENTITY = ExecutionProfileBehaviorIdentity(
+    name="cayu.generated.coding.reviewer_environment",
+    behavior_version="1",
+    implementation_version="1-__CODING_PROFILE__",
+)
 
 
 def _coding_environment_identity(
@@ -383,6 +391,8 @@ def _subagent_tool_identity(
             reviewer_identity.model_dump_json(),
             _REVIEWER_ALIAS,
             SubagentExecutionMode.BACKGROUND.value,
+            f"environment_name={_REVIEWER_ENVIRONMENT_NAME}",
+            _REVIEWER_ENVIRONMENT_IDENTITY.model_dump_json(),
             f"max_steps={REVIEWER_MAX_STEPS}",
             "result_max_chars=4000",
             f"max_tool_calls={REVIEWER_MAX_TOOL_CALLS}",
@@ -557,6 +567,12 @@ def _safe_git_probe_argv(
         "--no-pager",
         "-c",
         "core.fsmonitor=false",
+        # Repository config must not hide an executable-bit change or admit a
+        # path that differs from a tracked one only by case.
+        "-c",
+        "core.filemode=true",
+        "-c",
+        "core.ignorecase=false",
         "-c",
         f"core.excludesFile={os.devnull}",
         "-c",
@@ -1075,7 +1091,9 @@ def observe_clean_coding_product_git_baseline(root: Path) -> CodingGitBaselineAu
     )
     if status or unstaged or staged:
         raise RuntimeError(
-            "a new coding-product run requires a clean committed Git source baseline"
+            "a new coding-product run requires a clean committed Git source baseline; "
+            "Git is checked with core.filemode=true and core.ignorecase=false, "
+            "whatever the repository config says"
         )
     ignored = _run_dependency_probe(
         _safe_git_probe_argv(
@@ -1240,6 +1258,37 @@ def _require_coding_knowledge_scope(
     return scope
 
 
+def _reviewer_environment() -> Environment:
+    """The reviewer's own environment: no workspace, runner, binding or stores.
+
+    The reviewer has no tools and reviews only the task text it is given, so it
+    needs nothing from the primary's environment. Giving it its own keeps a
+    background review from re-binding the workspace the primary already holds.
+    """
+
+    return Environment(
+        EnvironmentSpec(
+            name=_REVIEWER_ENVIRONMENT_NAME,
+            execution_profile_identity=_REVIEWER_ENVIRONMENT_IDENTITY,
+        )
+    )
+
+
+def _reviewer_subagent_spec(reviewer_agent: AgentSpec) -> SubagentSpec:
+    return SubagentSpec(
+        agent_name=reviewer_agent.name,
+        description="Review a bounded change and return concrete findings.",
+        mode=SubagentExecutionMode.BACKGROUND,
+        environment_name=_REVIEWER_ENVIRONMENT_NAME,
+        max_steps=REVIEWER_MAX_STEPS,
+        result_max_chars=4_000,
+        limits=RunLimits(
+            max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
+            max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
+        ),
+    )
+
+
 def build_coding_app(
     *,
     primary_agent: AgentSpec,
@@ -1310,6 +1359,9 @@ def build_coding_app(
         knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
         budget_policy=budget_policy,
         budget_ledger=budget_ledger,
+        # The app closes the stores built here once aclose() settles; injected
+        # stores stay with their caller.
+        owned_resources=() if stores.configured is None else (stores.configured,),
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -1356,24 +1408,13 @@ def build_coding_app(
             )
         )
     if __CODING_DELEGATION_ENABLED__:
+        app.register_environment(_reviewer_environment())
         background_registry = BackgroundSubagentTaskRegistry()
         tools.extend(
             (
                 SubagentTool(
                     app,
-                    agents={
-                        _REVIEWER_ALIAS: SubagentSpec(
-                            agent_name=reviewer_agent.name,
-                            description="Review a bounded change and return concrete findings.",
-                            mode=SubagentExecutionMode.BACKGROUND,
-                            max_steps=REVIEWER_MAX_STEPS,
-                            result_max_chars=4_000,
-                            limits=RunLimits(
-                                max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                                max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                            ),
-                        )
-                    },
+                    agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
                     background_registry=background_registry,
                     execution_profile_identity=_subagent_tool_identity(
                         reviewer_agent,
@@ -1830,6 +1871,13 @@ filesystem root. Both `git` and `rg` must be on `PATH`. Repository-control
 `.git` directories and runtime-private `.cayu` directories are excluded from
 generic workspace file and search tools. __CODING_STATE_STORAGE__
 
+Cayu's Git checks override the repository's `core.filemode` and `core.ignorecase`
+settings, so repository config can't hide an executable-bit change or a path that
+differs from a tracked one only by case. On a filesystem that can't keep
+executable bits (WSL `/mnt/c`, exFAT or some SMB mounts, where Git sets
+`core.filemode=false`), every file then looks changed and a coding-product run
+reports a dirty baseline. Use a checkout on a native filesystem.
+
 `LocalWorkspace` and `LocalRunner` are trusted-host development adapters, not a
 sandbox. This composition requires the POSIX descriptor-relative filesystem
 primitives used by secure `LocalWorkspace` path operations and rejects an
@@ -1844,7 +1892,9 @@ When delegation is selected, completed reviewer sessions and their results are d
 after application reconstruction. Background reviewer execution itself belongs
 to the current process: let it reach a terminal state before restarting, or
 replace it with durable dispatch and a task-store worker when in-flight
-cross-process recovery is required.
+cross-process recovery is required. The reviewer has no tools and runs in its
+own `coding-reviewer` environment, with no workspace or runner, so a background
+review never shares or re-binds the primary agent's workspace.
 
 The generated application identities are manual version assertions, not source
 hashes. When editing authorization or reconstructed behavior, advance the paired
@@ -1859,7 +1909,9 @@ identity in the same change:
   runner, artifact, knowledge, or store wiring require advancing the identity returned by
   `_coding_environment_identity()`;
 - changes to reviewer behavior require advancing
-  `REVIEWER_EXECUTION_PROFILE_IDENTITY`; and
+  `REVIEWER_EXECUTION_PROFILE_IDENTITY`;
+- changes to the reviewer's own environment, `_reviewer_environment()`, require
+  advancing `_REVIEWER_ENVIRONMENT_IDENTITY`; and
 - changes to delegation limits or aliases must also update the material in
   `_subagent_tool_identity()`.
 
@@ -1907,8 +1959,10 @@ Treat the generated execution-profile identities as part of each editable
 behavior's contract. Advance `_PRIMARY_TOOL_POLICY_IDENTITY` with deny-pattern or
 primary-policy changes, `_SUBAGENT_RESULT_TOOL_IDENTITY` with result-tool changes,
 the identity returned by `_coding_environment_identity()` with protected-directory,
-environment, or store wiring changes, and `REVIEWER_EXECUTION_PROFILE_IDENTITY` with reviewer
-behavior changes. Keep delegation aliases and limits represented in
+environment, or store wiring changes, `REVIEWER_EXECUTION_PROFILE_IDENTITY` with reviewer
+behavior changes, and `_REVIEWER_ENVIRONMENT_IDENTITY` with reviewer environment
+changes. Keep the reviewer in its own environment; it must not inherit the
+primary's workspace. Keep delegation aliases and limits represented in
 `_subagent_tool_identity()`. An unchanged identity asserts unchanged behavior
 across process reconstruction; changing it intentionally makes stale durable
 continuations fail closed.
@@ -4074,6 +4128,9 @@ def build_coding_composition(
         knowledge_review_namespace="default" if _KNOWLEDGE_ENABLED else None,
         budget_policy=budget_policy,
         budget_ledger=budget_ledger,
+        # The app closes the stores built here once aclose() settles; injected
+        # stores stay with their caller.
+        owned_resources=() if stores.configured is None else (stores.configured,),
     )
     selected_provider = provider if provider is not None else configured_provider()
     app.register_provider(selected_provider, default=True)
@@ -4126,24 +4183,13 @@ def build_coding_composition(
             )
         )
     if __CODING_DELEGATION_ENABLED__:
+        app.register_environment(_reviewer_environment())
         background_registry = BackgroundSubagentTaskRegistry()
         tools.extend(
             (
                 SubagentTool(
                     app,
-                    agents={
-                        _REVIEWER_ALIAS: SubagentSpec(
-                            agent_name=reviewer_agent.name,
-                            description="Review a bounded change and return concrete findings.",
-                            mode=SubagentExecutionMode.BACKGROUND,
-                            max_steps=REVIEWER_MAX_STEPS,
-                            result_max_chars=4_000,
-                            limits=RunLimits(
-                                max_tool_calls=REVIEWER_MAX_TOOL_CALLS,
-                                max_elapsed_seconds=REVIEWER_MAX_ELAPSED_SECONDS,
-                            ),
-                        )
-                    },
+                    agents={_REVIEWER_ALIAS: _reviewer_subagent_spec(reviewer_agent)},
                     background_registry=background_registry,
                     execution_profile_identity=_subagent_tool_identity(
                         reviewer_agent,
@@ -4630,6 +4676,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -4677,7 +4724,7 @@ from cayu.runners import (
     RunnerExecutionAdmissionObserver,
 )
 from cayu import EventType, Message, RunRequest, ToolContext
-from cayu.sessions import InMemorySessionStore
+from cayu.sessions import InMemorySessionStore, SessionQuery
 from cayu.tasks import InMemoryTaskStore
 from cayu.artifacts import LocalArtifactStore
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -5130,7 +5177,11 @@ def test_more_workspaces_register_on_the_same_backend(
     )
 
     registrations = composition_state.app._environment_registry.registrations
-    assert set(registrations) == {"coding", "slot-1"}
+    assert set(registrations) == {
+        "coding",
+        composition._REVIEWER_ENVIRONMENT_NAME,
+        "slot-1",
+    }
     slot = registrations["slot-1"]
     assert isinstance(slot.factory, DockerCodingEnvironmentFactory)
     assert slot.factory.source_workspace.root == clone.resolve()
@@ -5203,6 +5254,17 @@ def test_docker_diagnostics_fail_before_provider_request(
 def test_coding_product_rejects_a_dirty_source_baseline(tmp_path: Path) -> None:
     source = _repository(tmp_path / "dirty-source")
     (source / "dirty.txt").write_text("not admitted\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="clean committed Git source baseline"):
+        composition.observe_clean_coding_product_git_baseline(source)
+
+
+def test_baseline_sees_a_mode_change_despite_repository_filemode_false(
+    tmp_path: Path,
+) -> None:
+    source = _repository(tmp_path / "mode-source")
+    subprocess.run(["git", "config", "core.filemode", "false"], cwd=source, check=True)
+    (source / "example.py").chmod(0o755)
 
     with pytest.raises(RuntimeError, match="clean committed Git source baseline"):
         composition.observe_clean_coding_product_git_baseline(source)
@@ -5688,6 +5750,102 @@ def test_knowledge_tool_finds_an_entry_in_the_registered_coding_environment(
     assert created_runners
 
 
+class _ReviewerProvider(ModelProvider):
+    name = "generated-docker-reviewer-smoke"
+
+    @property
+    def execution_profile_identity(self):
+        return composition.ExecutionProfileBehaviorIdentity(
+            name="generated.docker.reviewer_smoke",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.primary_step = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if not request.tools:
+            yield ModelStreamEvent.text_delta("Reviewer found no blocking issue.")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        calls = (
+            ("read_file", {"path": "example.py"}),
+            (
+                "subagent",
+                {"agent": "reviewer", "task": "Review example.py for blocking issues."},
+            ),
+            ("subagent_result", {"all": True, "wait": True}),
+        )
+        if self.primary_step < len(calls):
+            name, arguments = calls[self.primary_step]
+            call_id = f"review_call_{self.primary_step}"
+            self.primary_step += 1
+            yield ModelStreamEvent.tool_call(id=call_id, name=name, arguments=arguments)
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("Review complete.")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+def test_background_reviewer_runs_beside_the_bound_primary_and_close_releases_stores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reviewer gets its own environment; aclose() closes the stores build_app opened."""
+
+    _admit_test_image(monkeypatch)
+    monkeypatch.delenv("CAYU_DATABASE_URL", raising=False)
+    monkeypatch.setattr(composition, "_STATE_ROOT", tmp_path / "state")
+    source = _repository(tmp_path / "source")
+    target = tmp_path / "target"
+    target.mkdir()
+    created_runners: list[_LocalDockerRunner] = []
+    _install_fake_docker_factory(monkeypatch, target=target, created_runners=created_runners)
+    provider = _ReviewerProvider()
+
+    async def scenario():
+        app = build_app(provider=provider, workspace_root=source)
+        events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="__AGENT_NAME__",
+                    session_id="generated-docker-review",
+                    messages=[Message.text("user", "Review the example.")],
+                )
+            )
+        )
+        children = (
+            await app.session_store.list_sessions(
+                SessionQuery(parent_session_id="generated-docker-review")
+            )
+        ).sessions
+        outcome = await app.aclose()
+        return app, events, children, outcome
+
+    app, events, children, outcome = asyncio.run(scenario())
+
+    assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+    results = {
+        event.tool_name: event.payload["result"]
+        for event in events
+        if event.type is EventType.TOOL_CALL_COMPLETED
+    }
+    reviewed = results["subagent_result"]["structured"]
+    assert reviewed["retrieval_status"] == "ready"
+    assert [child["status"] for child in reviewed["children"]] == ["completed"]
+    assert reviewed["children"][0]["result_text"] == "Reviewer found no blocking issue."
+    assert [child.environment_name for child in children] == [
+        composition._REVIEWER_ENVIRONMENT_NAME
+    ]
+    # Only the primary allocated a coding sandbox and bound the source workspace.
+    assert len(created_runners) == 1
+    assert outcome.settled, outcome.summary()
+    assert outcome.owned_resources == "released"
+    with pytest.raises(sqlite3.ProgrammingError):
+        app.session_store._connection.execute("SELECT 1")
+
+
 @pytest.mark.parametrize("custom_profile", [False, True])
 def test_public_coding_product_path_reaches_patch_ready_and_recovers(
     tmp_path: Path,
@@ -5924,6 +6082,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sqlite3
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -6155,6 +6314,7 @@ async def _run_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.sleep(0.01)
     else:
         pytest.fail("background reviewer did not become terminal before reconstruction")
+    assert children[0].environment_name == composition._REVIEWER_ENVIRONMENT_NAME
 
     reconstructed_provider = _CompositionProvider()
     reconstructed_provider.primary_step = provider.primary_step
@@ -6248,6 +6408,14 @@ async def _run_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         KnowledgeListQuery(statuses=[KnowledgeStatus.PENDING])
     )
     assert len(pending.entries) == 1
+    await knowledge_store.close()
+    # Each app owns the stores build_app opened for it and closes them.
+    for built in (app, reconstructed):
+        outcome = await built.aclose()
+        assert outcome.settled, outcome.summary()
+        assert outcome.owned_resources == "released"
+        with pytest.raises(sqlite3.ProgrammingError):
+            built.session_store._connection.execute("SELECT 1")
 
 
 def test_coding_composition_smoke(
@@ -6895,11 +7063,6 @@ def _docker_composition_source(source: str) -> str:
             "from dataclasses import dataclass\n"
             "from typing import Literal\n"
         ),
-        1,
-    )
-    source = source.replace(
-        "from cayu.environments import Environment, EnvironmentSpec\n",
-        "",
         1,
     )
     source = source.replace(
