@@ -7356,6 +7356,8 @@ class RecoveryCoordinator:
                     and terminal_event.payload.get("interruption_type")
                     == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
                 ):
+                    if outcome.cancellation is not None:
+                        raise outcome.cancellation from claim_error
                     return _ManualRecoveryInterruptionReplay(event=copy_event(terminal_event))
 
         if claim_error is not None:
