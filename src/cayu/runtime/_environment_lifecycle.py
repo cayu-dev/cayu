@@ -5322,6 +5322,22 @@ class EnvironmentLifecycle:
         if refused_allocation_fingerprint is not None:
             retired_marker["allocation_fingerprint"] = refused_allocation_fingerprint
 
+        authority_keys = (
+            ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
+        )
+
+        def authority_retired(checkpoint: dict[str, Any]) -> bool:
+            for key in authority_keys:
+                values = checkpoint.get(key, {})
+                if type(values) is not dict:
+                    raise ValueError(f"{key} checkpoint state must be an object.")
+                if environment_name in values:
+                    return False
+            return True
+
         def retire(
             current_session: Session,
             checkpoint: dict[str, Any] | None,
@@ -5338,11 +5354,11 @@ class EnvironmentLifecycle:
             elif type(retired) is not dict:
                 raise ValueError("Retired allocation disposal state must be an object.")
             existing = retired.get(environment_name)
-            if existing == retired_marker:
+            if existing == retired_marker and authority_retired(copied):
                 # The exact transform committed and only its acknowledgement was lost.
                 return copied
-            if existing is not None:
-                raise RuntimeError("Rejected allocation retirement conflicts with its tombstone.")
+            # A predecessor's tombstone may remain after a new CREATE, even when
+            # the factory reuses reconnect metadata. Validate the live authority.
             reconnect, owner = _factory_reconnect_state_from_checkpoint(
                 copied,
                 environment_name=environment_name,
@@ -5366,12 +5382,7 @@ class EnvironmentLifecycle:
                 )
             retired[environment_name] = retired_marker
             copied[_RETIRED_ALLOCATION_DISPOSAL_KEY] = retired
-            for key in (
-                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
-            ):
+            for key in authority_keys:
                 values = copied.get(key, {})
                 if type(values) is not dict:
                     raise ValueError(f"{key} checkpoint state must be an object.")
@@ -5385,7 +5396,11 @@ class EnvironmentLifecycle:
             if checkpoint is None:
                 return False
             retired = checkpoint.get(_RETIRED_ALLOCATION_DISPOSAL_KEY)
-            return type(retired) is dict and retired.get(environment_name) == retired_marker
+            return (
+                type(retired) is dict
+                and retired.get(environment_name) == retired_marker
+                and authority_retired(checkpoint)
+            )
 
         try:
             await self._session_store.transform_checkpoint(session.id, retire)
