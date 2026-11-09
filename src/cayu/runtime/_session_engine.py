@@ -7544,6 +7544,9 @@ class SessionEngine:
                     tool_completion_result=tool_completion_result,
                     completion=outcome_context(),
                 )
+                # Recovery settled the issuing interaction before runner construction.
+                # Its targeted grants cannot follow session completion or queued input.
+                targeted_tool_grants = None
                 owe_completion(session_completed)
                 if interaction_completed_event is not None:
                     yield interaction_completed_event
