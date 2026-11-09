@@ -7313,6 +7313,7 @@ class EnvironmentLifecycle:
                                     ),
                                     "final_git_receipt": _final_git_receipt_payload(
                                         final_snapshot,
+                                        registered_environment=registered_environment,
                                         binding=binding,
                                         destination_workspace_id=base_payload.get(
                                             "source_workspace_id"
@@ -8971,9 +8972,17 @@ def _final_git_receipt_payload(
     workload_workspace_id: object,
     expected_destination_workspace_id: str | None,
     expected_workload_workspace_id: str | None,
+    registered_environment: runtime_records.RegisteredEnvironment | None = None,
 ) -> dict[str, object] | None:
     """Publish digest-bound final Git evidence from the Docker sync boundary."""
 
+    if (
+        invocation_secrets.registered_environment_secret_resolution_scope(registered_environment)
+        != "static"
+    ):
+        # Git evidence includes arbitrary workspace text and shares the terminal
+        # snapshot quarantine after invocation-local secret scopes are discarded.
+        return None
     if (
         type(binding) is not DockerCodingWorkspaceBinding
         or snapshot is None
