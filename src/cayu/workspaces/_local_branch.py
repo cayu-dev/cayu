@@ -4310,11 +4310,27 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             )
             self._validate_proposed(relative, proposed_overlay, proposed_tombstones)
             try:
-                if relative in proposed_overlay:
-                    write_regular(self._overlay_root, relative, content)
-                else:
-                    delete_regular(self._overlay_root, relative)
-                    _prune_empty_overlay_ancestors(self._overlay_root, relative)
+                for attempt in range(2):
+                    try:
+                        if relative in proposed_overlay:
+                            write_regular(self._overlay_root, relative, content)
+                        else:
+                            delete_regular(self._overlay_root, relative)
+                            _prune_empty_overlay_ancestors(self._overlay_root, relative)
+                        break
+                    except IsADirectoryError:
+                        if attempt:
+                            raise
+                        # Only a guarded mutation may remove orphan directories.
+                        # Scan their physical spellings so filesystem aliases
+                        # and baseline-normalizing writes take the same path.
+                        files, directories = _scan_private_tree(
+                            self._overlay_root,
+                            self._limits,
+                            max_total_bytes=self._limits.max_overlay_bytes,
+                            total_limit_detail_code="overlay_byte_limit_exceeded",
+                        )
+                        _prune_empty_overlay_directories(self._overlay_root, directories, files)
             except BaseException as primary:
                 if isinstance(primary, _LocalGuardStagingCleanupError):
                     fencing_error = self._fence_private_staging_failure_unlocked(primary)
@@ -6464,6 +6480,32 @@ class LocalWorkspaceBranch(WorkspaceBranch):
 def _identity_for_bytes(content: bytes, *, mode: int = 0o666) -> _FileIdentity:
     digest = hashlib.sha256(content).hexdigest()
     return _FileIdentity(sha256=digest, bytes=len(content), mode=mode)
+
+
+def _prune_empty_overlay_directories(
+    root: Path,
+    directories: frozenset[str],
+    files: dict[str, _FileIdentity],
+) -> None:
+    file_ancestors = {
+        "/".join(parts[:index])
+        for path in files
+        for parts in (path.split("/")[:-1],)
+        for index in range(1, len(parts) + 1)
+    }
+    for directory in sorted(
+        directories - file_ancestors,
+        key=lambda value: (value.count("/"), value),
+        reverse=True,
+    ):
+        try:
+            delete_empty_directory(root, directory)
+        except FileNotFoundError:
+            continue
+        except BaseException as error:
+            raise WorkspaceBranchFencedError(
+                "Durable branch overlay directories changed during reconstruction."
+            ) from error
 
 
 def _prune_empty_overlay_ancestors(root: Path, path: str) -> None:
