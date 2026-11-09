@@ -2439,7 +2439,7 @@ class ModelStepExecutor:
                 provider_result = (
                     None
                     if has_peer_content(count_request)
-                    else await provider.count_input_tokens(count_request)
+                    else await _count_provider_input_tokens(provider, count_request)
                 )
             finally:
                 reset_provider_error_workload_redactor(redactor_token)
@@ -5256,7 +5256,7 @@ class ModelStepRun:
                 return None
             redactor_token = bind_provider_error_workload_redactor(self._executor._secret_redactor)
             try:
-                result = await self._request_provider.count_input_tokens(request)
+                result = await _count_provider_input_tokens(self._request_provider, request)
             finally:
                 reset_provider_error_workload_redactor(redactor_token)
             return None if result is None else result.input_tokens
@@ -6337,6 +6337,21 @@ def _same_file_attachment_ref(left: FileAttachment, right: FileAttachment) -> bo
     from cayu.artifacts.attachments import same_file_attachment_reference
 
     return same_file_attachment_reference(left, right)
+
+
+async def _count_provider_input_tokens(
+    provider: ModelProvider,
+    request: ModelRequest,
+) -> InputTokenCountResult | None:
+    try:
+        return await provider.count_input_tokens(request)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
+        # A cancelled counter dependency is an optional-counter failure, not
+        # a request to cancel the model run. Do not expose provider diagnostics.
+        raise RuntimeError("Provider input token counter was cancelled.") from None
 
 
 def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:
