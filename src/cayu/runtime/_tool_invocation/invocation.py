@@ -2203,6 +2203,12 @@ class ToolInvocation:
                         cancellation=post_tool_cancellation,
                         restore_cancellation_requests=post_tool_cancellation_requests_consumed,
                     )
+                    if projection_cancellation is not None:
+                        post_tool_cancellation_requests_consumed += projection_requests
+                        observed_cancellation = await consume_post_tool_cancellation(
+                            projection_cancellation
+                        )
+                        post_tool_cancellation = post_tool_cancellation or observed_cancellation
                     result_event = _restore_targeted_tool_invocation_event_authority(
                         result_event,
                         effective_tool_call,
@@ -2278,9 +2284,7 @@ class ToolInvocation:
             if projection_cancellation is not None:
                 _raise_restored_post_tool_cancellation(
                     post_tool_cancellation or projection_cancellation,
-                    restore_cancellation_requests=(
-                        post_tool_cancellation_requests_consumed + projection_requests
-                    ),
+                    restore_cancellation_requests=post_tool_cancellation_requests_consumed,
                 )
             current_task = asyncio.current_task()
             tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
