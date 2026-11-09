@@ -4079,13 +4079,25 @@ class SessionFinalization:
             decision=decision,
             tool_round_identity=tool_round_identity,
         )
+        source_checkpoint, publication_round = await pending_round_reader.load_pending_tool_round(
+            self.session_store,
+            session.id,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        legacy_publication_scope = (
+            publication_round is not None
+            and publication_round.assistant_message_state == "quarantined"
+            and publication_round.assistant_publication is None
+        )
         # A gating call a person approved with changes is told so even when a
         # run limit skips it, before redaction like any other result content.
         edited_call_id = (
             pending_approval_to_clear.tool_call_id
             if approval_support.approved_arguments_for_call(
                 pending_approval_reader.approval_resolution_intent_from_checkpoint(
-                    await self.session_store.load_checkpoint(session.id),
+                    source_checkpoint,
                     redactor=self._secret_redactor,
                 ),
                 pending_approval_to_clear.tool_call_id,
@@ -4115,19 +4127,22 @@ class SessionFinalization:
             registered_agent=registered_agent,
             tool_calls=tool_calls,
         )
-        for skipped_outcome in skipped_outcomes:
+        # Recovered calls can have durable results without a sealed publication scope.
+        # Legacy checkpoints do not prove which invocation secrets those calls resolved.
+        for outcome in [*completed_tool_outcomes, *skipped_outcomes]:
             await self.session_store.transform_checkpoint(
                 session.id,
-                lambda _current_session, current_checkpoint, call_id=skipped_outcome.call.id: (
+                lambda _current_session, current_checkpoint, call_id=outcome.call.id: (
                     tool_round_recovery.checkpoint_with_assistant_publication_snapshot(
                         current_checkpoint,
                         tool_round_identity=tool_round_identity,
                         tool_call_id=call_id,
                         redactor=base_round_redactor,
-                        unsafe_output=False,
+                        unsafe_output=legacy_publication_scope and call_id in completed_ids,
                     )
                 ),
             )
+        for skipped_outcome in skipped_outcomes:
             yield await self._event_writer.emit(
                 _limit_reached_tool_call_event(
                     session=session,
