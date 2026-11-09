@@ -3380,7 +3380,6 @@ class EnvironmentLifecycle:
             phase: EnvironmentLifecyclePhase,
             operation_name: str,
         ) -> EnvironmentFactoryResult:
-            nonlocal result
             await _report_environment_lifecycle(
                 progress_reporter,
                 phase,
@@ -3394,22 +3393,28 @@ class EnvironmentLifecycle:
                 from cayu.resource_access import require_dispatch
 
                 await require_dispatch()
+
+            async def resolve_factory() -> EnvironmentFactoryResult:
+                nonlocal result
+                resolved = await operation_factory()
+                if type(resolved) is not EnvironmentFactoryResult:
+                    raise TypeError(
+                        "Environment factory resolution must return EnvironmentFactoryResult."
+                    )
+                # Transfer the exact returned owner before the operation boundary
+                # can restore caller cancellation or progress publication can fail.
+                result = resolved
+                return resolved
+
             resolved = await _await_with_environment_lifecycle_reporter(
                 progress_reporter,
                 lambda: environment_operation_boundary.await_environment_operation(
-                    operation_factory,
+                    resolve_factory,
                     operation_name=operation_name,
                     redactor=self._secret_redactor,
                 ),
                 phase_timer=phase_timer,
             )
-            if type(resolved) is not EnvironmentFactoryResult:
-                raise TypeError(
-                    "Environment factory resolution must return EnvironmentFactoryResult."
-                )
-            # Transfer the exact returned owner before any progress publication
-            # can fail on a lifecycle or phase deadline.
-            result = resolved
             await _report_environment_lifecycle(
                 progress_reporter,
                 phase,
