@@ -1,4 +1,4 @@
-"""`cayu cloud sandboxes list|show` over Cloud's sandbox broker reads."""
+"""`cayu cloud sandboxes list|show|archives` over Cloud's sandbox broker reads."""
 
 from __future__ import annotations
 
@@ -158,7 +158,7 @@ def test_cloud_help_lists_sandboxes(capsys: pytest.CaptureFixture[str]) -> None:
         main(["cloud", "sandboxes", "--help"])
     assert raised.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
-    for command in ("list", "show"):
+    for command in ("list", "show", "archives"):
         assert command in help_text
 
 
@@ -529,3 +529,186 @@ def test_show_says_an_older_cloud_reports_no_activity(
 
     assert code == 0
     assert "  Activity: not reported; this Cayu Cloud needs cayu-tech/cayu-cloud#" in out
+
+
+_ARCHIVES = f"{_SANDBOXES}/copy-archives"
+_REUSE = {"seconds": 21600, "max_archives": 8, "max_bytes": 1073741824}
+
+
+def _archive(archive_id: str, **changes: object) -> dict[str, Any]:
+    return {
+        "id": archive_id,
+        "sha256": "5f3a" + "0" * 60,
+        "bytes": 9437696,
+        "status": "ready",
+        "created_at": "2026-11-08T17:02:11+00:00",
+        "stored_at": "2026-11-08T17:02:12+00:00",
+        "last_used_at": "2026-11-08T18:40:03+00:00",
+        "retained_until": "2026-11-09T00:40:03+00:00",
+        # A field the command doesn't show, as a later Cloud might add.
+        "extra": "x",
+        **changes,
+    }
+
+
+def _archives(*items: dict[str, Any], next_cursor: str | None = None, reuse=_REUSE):
+    return httpx.Response(
+        200, json={"items": list(items), "next_cursor": next_cursor, "reuse": reuse}
+    )
+
+
+def test_archives_lists_what_the_agent_keeps(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    storing = _archive("a" * 32, status="storing", stored_at=None, bytes=2048)
+    fake = cloud({("GET", f"{_ARCHIVES}?limit=50"): _archives(storing, _archive("b" * 32))})
+
+    code, out = _run(["archives", "--json"], capsys)
+
+    assert code == 0
+    envelope = json.loads(out)
+    assert envelope["operation"] == "sandboxes.archives"
+    result = envelope["result"]
+    assert result["reuse"] == _REUSE
+    assert result["next_cursor"] is None
+    assert [(item["id"], item["status"]) for item in result["items"]] == [
+        ("a" * 32, "storing"),
+        ("b" * 32, "ready"),
+    ]
+    assert set(result["items"][0]) == {
+        "id",
+        "sha256",
+        "bytes",
+        "status",
+        "created_at",
+        "stored_at",
+        "last_used_at",
+        "retained_until",
+    }
+    assert all(request.method == "GET" for request in fake.requests)
+
+    code, out = _run(["archives"], capsys)
+
+    assert code == 0
+    lines = out.splitlines()
+    assert lines[0] == (
+        "Reuse: each archive is kept 6h after its last use, at most 8 per Agent, each up to 1.1 GB."
+    )
+    assert lines[1].split() == [
+        "ARCHIVE",
+        "STATUS",
+        "SIZE",
+        "SHA256",
+        "KEPT",
+        "LAST",
+        "USED",
+        "LAPSES",
+    ]
+    (ready,) = [line for line in lines if line.startswith("b" * 32)]
+    assert ready.split() == [
+        "b" * 32,
+        "ready",
+        "9.4",
+        "MB",
+        "5f3a00000000",
+        "2026-11-08",
+        "17:02Z",
+        "2026-11-08",
+        "18:40Z",
+        "2026-11-09",
+        "00:40Z",
+    ]
+
+
+def test_archives_pages_from_a_cursor_up_to_the_limit(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("GET", f"{_ARCHIVES}?limit=100&cursor=c0"): _archives(
+                *[_archive(f"{index:032x}") for index in range(100)], next_cursor="c1"
+            ),
+            ("GET", f"{_ARCHIVES}?limit=20&cursor=c1"): _archives(
+                *[_archive(f"{index:032x}") for index in range(100, 120)], next_cursor="c2"
+            ),
+        }
+    )
+
+    code, out = _run(["archives", "--limit", "120", "--cursor", "c0", "--json"], capsys)
+
+    assert code == 0
+    result = json.loads(out)["result"]
+    assert len(result["items"]) == 120 and result["next_cursor"] == "c2"
+    assert len(fake.requests) == 3
+
+    code, out = _run(["archives", "--limit", "120", "--cursor", "c0"], capsys)
+    assert out.splitlines()[-1] == "More: pass --cursor c2 for the next page."
+
+
+def test_archives_says_when_none_are_kept(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    cloud({("GET", f"{_ARCHIVES}?limit=50"): _archives(reuse=None)})
+
+    code, out = _run(["archives"], capsys)
+
+    assert code == 0
+    assert out.splitlines() == [
+        "Reuse: this Cayu Cloud keeps no copy-in archives.",
+        "No copy-in archives kept for cayu-scout.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (404, "cayu-tech/cayu-cloud#970"),
+        (403, "an API key with the read scope"),
+        (503, "runs no sandbox broker"),
+    ],
+)
+def test_archives_says_what_a_refusal_means(
+    cloud, capsys: pytest.CaptureFixture[str], status: int, message: str
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_ARCHIVES}?limit=50"): httpx.Response(
+                status, json={"error": {"code": "x", "message": "x", "detail": {}}}
+            ),
+        }
+    )
+
+    code, out = _run(["archives", "--json"], capsys)
+
+    assert code != 0
+    assert message in out
+
+
+def test_archives_checks_its_cursor(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["cloud", "sandboxes", "archives", "--application", "a", "--cursor", ""])
+
+    assert code != 0
+    assert "--cursor: is not a cursor from an earlier page" in capsys.readouterr().out
+
+
+def test_archives_refuses_pages_that_repeat_a_cursor(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("GET", f"{_ARCHIVES}?limit=50"): _archives(next_cursor="c1"),
+            ("GET", f"{_ARCHIVES}?limit=50&cursor=c1"): _archives(next_cursor="c1"),
+        }
+    )
+
+    code, out = _run(["archives", "--json"], capsys)
+
+    assert code != 0
+    assert "repeat a cursor" in out
+    assert len(fake.requests) == 3
+
+
+def test_archives_prints_a_long_cursor_whole(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    cursor = "c" * 300
+    cloud({("GET", f"{_ARCHIVES}?limit=1"): _archives(_archive("a" * 32), next_cursor=cursor)})
+
+    code, out = _run(["archives", "--limit", "1"], capsys)
+
+    assert code == 0
+    assert out.splitlines()[-1] == f"More: pass --cursor {cursor} for the next page."

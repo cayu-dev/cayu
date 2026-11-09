@@ -38,7 +38,7 @@ cayu cloud service status --application my-agent
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
-- `sandboxes list|show` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
+- `sandboxes list|show|archives` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
 - `activity status` to [read how Cloud reads an Agent's activity](#clouds-activity-reader);
 - `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings` for
   [Compass](#compass);
@@ -2219,6 +2219,7 @@ cayu cloud sandboxes list --application my-agent --session ses_41  # one session
 cayu cloud sandboxes list --application my-agent --task task_7 --since 2h
 cayu cloud sandboxes list --application my-agent --label mission=m-17 --label role=builder
 cayu cloud sandboxes show --application my-agent sbx_7f2c...      # with its events
+cayu cloud sandboxes archives --application my-agent             # copy-in archives kept
 ```
 
 `list` starts with the Agent's capacity now (how many places are held under
@@ -2249,6 +2250,19 @@ would ignore the filters, so `list` refuses them there
 (`sandbox_filters_unsupported`) instead of listing every sandbox; without
 filters it lists as before and reports no activity. The commands need a Cayu Cloud with cayu-tech/cayu-cloud#679; an older
 one refuses the login on these routes.
+
+`archives` lists the copy-in archives Cloud keeps for the Agent. Once a staged
+copy in is extracted, Cloud keeps its archive for a while, and the Agent's next
+copy in of the same archive (same size and SHA-256) into any of its sandboxes
+starts from it without an upload (the copy says `reused`). The command shows
+each kept archive's id, status (`ready`, or `storing` while the broker writes
+it), size, SHA-256, when it was kept, its last use and when it lapses, and the
+install's setting (how long after the last use, how many per Agent, how big).
+It never shows where an archive is stored, and it changes nothing: Cloud lets
+archives lapse on its own, and nothing gives one up on request. It reads up to
+`--limit` (default 50), newest first; `--cursor` starts from an earlier list's
+`next_cursor`. It needs a Cayu Cloud with cayu-tech/cayu-cloud#970; an older
+one answers `sandbox_archives_unsupported`.
 
 Cloud also logs every create it refuses for a full limit, with the limit, how
 many held a place and when the soonest lease runs out (`sandbox_quota_refused`

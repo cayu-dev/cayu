@@ -1,5 +1,5 @@
-"""`cayu cloud sandboxes list|show --application NAME`: an Agent's brokered sandboxes in Cayu
-Cloud, who created each, and what holds its places.
+"""`cayu cloud sandboxes list|show|archives --application NAME`: an Agent's brokered sandboxes
+in Cayu Cloud, who created each, what holds its places, and the archives kept for its copies.
 
 The commands read Cloud's sandbox broker routes (`GET /v1/applications/{id}/sandboxes`, one
 sandbox, its events and the capacity; contract `cayu.cloud.sandbox` v1) with the `cayu cloud
@@ -19,6 +19,11 @@ cayu-tech/cayu-cloud#766 would ignore the filters, so the command refuses to lis
 there). Both commands also show what each sandbox did (`activity`: its commands, failed ones
 and their run time, and its file transfers in and out), and `list` the same summed over every
 sandbox that matches, which Cloud adds up; an older Cloud reports none.
+
+`archives` lists the copy-in archives Cloud keeps for the Agent so its next staged copy in of
+the same tree starts without an upload (`GET .../sandboxes/copy-archives`, from
+cayu-tech/cayu-cloud#970): each one's digest, size, status, last use and when it lapses. It
+pages with `--limit` and `--cursor`, and never shows where an archive is stored.
 
 These commands print a table by default; `--json` prints the JSON envelope the other `cayu
 cloud` commands print, with `schema_version` in its result.
@@ -56,6 +61,19 @@ _LABEL_KEY = re.compile(r"[a-z0-9_.-]{1,63}")
 _LABEL_VALUE_LIMIT = 200
 _LABEL_FILTER_LIMIT = 10
 _PROVENANCE = ("release_id", "session_id", "task_id")
+# The Cloud change that lists the copy-in archives an Agent keeps.
+_ARCHIVES_CLOUD = "cayu-tech/cayu-cloud#970"
+_CURSOR_LIMIT = 1024
+_ARCHIVE_FIELDS = (
+    "id",
+    "sha256",
+    "bytes",
+    "status",
+    "created_at",
+    "stored_at",
+    "last_used_at",
+    "retained_until",
+)
 _SANDBOX_FIELDS = (
     "id",
     "status",
@@ -94,6 +112,12 @@ def _sandbox_id(value: str) -> str:
 def _filter_id(value: str) -> str:
     if not value or len(value) > _ID_LIMIT or not value.isprintable():
         raise argparse.ArgumentTypeError(f"must be 1 to {_ID_LIMIT} printable characters")
+    return value
+
+
+def _cursor(value: str) -> str:
+    if not value or len(value) > _CURSOR_LIMIT or not value.isprintable():
+        raise argparse.ArgumentTypeError("is not a cursor from an earlier page")
     return value
 
 
@@ -158,7 +182,30 @@ def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
         description="Show one sandbox, what it did, and its audit events, oldest first.",
     )
     showing.add_argument("sandbox_id", metavar="SANDBOX_ID", type=_sandbox_id)
-    for parser, render in ((listing, render_sandboxes), (showing, render_sandbox)):
+    archives = actions.add_parser(
+        "archives",
+        description=(
+            "List the copy-in archives Cayu Cloud keeps for the Agent, newest first: a staged "
+            "copy in of the same archive into any of its sandboxes starts from one without an "
+            "upload. Read only; Cloud lets them lapse on its own."
+        ),
+    )
+    archives.add_argument(
+        "--limit",
+        type=_limit,
+        default=DEFAULT_LIMIT,
+        help=f"How many to list, newest first (default {DEFAULT_LIMIT}, at most {MAX_LIMIT}).",
+    )
+    archives.add_argument(
+        "--cursor",
+        type=_cursor,
+        help="Start after the archives an earlier list showed (its next_cursor).",
+    )
+    for parser, render in (
+        (listing, render_sandboxes),
+        (showing, render_sandbox),
+        (archives, render_archives),
+    ):
         parser.add_argument("--application", required=True)
         add_output_argument(parser, render, failure=render_failure)
 
@@ -167,6 +214,8 @@ def sandboxes_command(
     arguments: argparse.Namespace, *, client: CloudApiClient, application_id: str
 ) -> dict[str, Any]:
     base = f"/v1/applications/{quote(application_id, safe='')}"
+    if arguments.sandboxes_command == "archives":
+        return _archives(arguments, client=client, base=base, application_id=application_id)
     selected = _selected_release(client, base)
     if arguments.sandboxes_command == "show":
         path = f"{base}/sandboxes/{quote(arguments.sandbox_id, safe='')}"
@@ -233,6 +282,71 @@ def sandboxes_command(
             "next_cursor": cursor,
             # Only a Cloud that applies the filters adds the activity up.
             "totals": _totals(client, base, matching) if applied else None,
+        },
+    }
+
+
+def _archives(
+    arguments: argparse.Namespace, *, client: CloudApiClient, base: str, application_id: str
+) -> dict[str, Any]:
+    """The archives the Agent keeps, a page of Cloud's at a time up to ``--limit``."""
+
+    items: list[Mapping[str, Any]] = []
+    cursor: str | None = arguments.cursor
+    # Every cursor a page started from: a page that answers one of them again would loop.
+    seen: set[str] = set() if cursor is None else {cursor}
+    reuse: Any = None
+    while True:
+        query = {"limit": str(min(_PAGE_LIMIT, arguments.limit - len(items)))}
+        if cursor is not None:
+            query["cursor"] = cursor
+        try:
+            page = client.request("GET", f"{base}/sandboxes/copy-archives", query=query)
+        except CloudApiError as exc:
+            # A Cloud before the route reads "copy-archives" as a sandbox id it doesn't have;
+            # the Agent itself was just found.
+            if exc.status_code == 404:
+                raise CloudApiError(
+                    "sandbox_archives_unsupported",
+                    "This Cayu Cloud doesn't list the copy-in archives it keeps; it needs "
+                    f"{_ARCHIVES_CLOUD}.",
+                    status_code=404,
+                    code=exc.code,
+                    request=exc.request,
+                ) from None
+            raise _sandbox_error(exc) from None
+        found = page.get("items")
+        if not isinstance(found, list):
+            raise CloudApiError("api_response_invalid", "The copy-in archive list is invalid.")
+        items.extend(item for item in found if isinstance(item, Mapping))
+        reuse = page.get("reuse")
+        next_cursor = page.get("next_cursor")
+        cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+        if cursor is not None and cursor in seen:
+            raise CloudApiError(
+                "api_response_invalid", "The pages of copy-in archives repeat a cursor."
+            )
+        if cursor is None or len(items) >= arguments.limit:
+            break
+        seen.add(cursor)
+    return {
+        "operation": "sandboxes.archives",
+        "result": {
+            "schema_version": SCHEMA_VERSION,
+            "application_id": application_id,
+            "reuse": (
+                {
+                    name: _number(reuse.get(name))
+                    for name in ("seconds", "max_archives", "max_bytes")
+                }
+                if isinstance(reuse, Mapping)
+                else None
+            ),
+            "items": [
+                {name: item.get(name) for name in _ARCHIVE_FIELDS}
+                for item in items[: arguments.limit]
+            ],
+            "next_cursor": cursor,
         },
     }
 
@@ -515,6 +629,51 @@ def render_sandbox(result: Mapping[str, Any]) -> str:
     ]
     lines += ["", *_table(("AT", "EVENT", "ACTOR", "DETAIL"), rows)]
     return "\n".join(lines)
+
+
+def render_archives(result: Mapping[str, Any]) -> str:
+    listed = result["result"]
+    reuse = listed.get("reuse")
+    if reuse is None:
+        lines = ["Reuse: this Cayu Cloud keeps no copy-in archives."]
+    else:
+        lines = [
+            f"Reuse: each archive is kept {_duration(reuse['seconds'])} after its last use, "
+            f"at most {_count(reuse['max_archives'])} per Agent, each up to "
+            f"{_bytes(reuse['max_bytes'])}."
+        ]
+    items = listed["items"]
+    if not items:
+        lines.append(f"No copy-in archives kept for {_cell(listed['application_id'])}.")
+    else:
+        rows = [
+            (
+                _cell(item["id"], limit=32),
+                _cell(item["status"]),
+                _bytes(item["bytes"]),
+                _cell(item["sha256"])[:12],
+                _when(item["created_at"]),
+                _when(item["last_used_at"]),
+                _when(item["retained_until"]),
+            )
+            for item in items
+        ]
+        lines += _table(
+            ("ARCHIVE", "STATUS", "SIZE", "SHA256", "KEPT", "LAST USED", "LAPSES"), rows
+        )
+    if listed.get("next_cursor") is not None:
+        cursor = _cell(listed["next_cursor"], limit=_CURSOR_LIMIT)
+        lines.append(f"More: pass --cursor {cursor} for the next page.")
+    return "\n".join(lines)
+
+
+def _duration(value: object) -> str:
+    if type(value) is not int:
+        return "?"
+    for unit, seconds in (("h", 3600), ("m", 60)):
+        if value >= seconds and value % seconds == 0:
+            return f"{value // seconds}{unit}"
+    return f"{value}s"
 
 
 def _capacity_line(capacity: Mapping[str, Any] | None) -> str:
