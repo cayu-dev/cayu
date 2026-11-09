@@ -613,3 +613,70 @@ def test_legacy_custom_task_store_keeps_ordinary_cleanup_admission():
         await app.aclose()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_shutdown_preserves_restartable_post_terminal_cleanup(backend, tmp_path):
+    import threading
+
+    async def scenario():
+        store = (
+            InMemoryTaskStore() if backend == "memory" else SQLiteTaskStore(tmp_path / "tasks.db")
+        )
+        app = CayuApp(task_store=store, enable_logging=False)
+        created = await store.create_task(TaskCreate(type="job", restartable=True))
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        callback_cancelled = []
+
+        def external_cleanup():
+            started.set()
+            release.wait()
+            finished.set()
+
+        async def handler(_app, task, worker_id):
+            await complete_managed_task(store, task, worker_id, {"ok": True})
+            try:
+                await asyncio.to_thread(external_cleanup)
+            except asyncio.CancelledError:
+                callback_cancelled.append(True)
+                raise
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="owner",
+                max_tasks=1,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            # Allow the one-second heartbeat to observe durable completion.
+            await asyncio.sleep(1.2)
+            worker.cancel("shutdown")
+            done, _ = await asyncio.wait({worker}, timeout=0.2)
+            assert not done and not callback_cancelled
+            worker.cancel("repeated shutdown")
+            done, _ = await asyncio.wait({worker}, timeout=0.2)
+            assert not done and not callback_cancelled
+            assert not finished.is_set()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(worker, 5)
+            assert finished.is_set()
+            current = await store.load_task(created.id)
+            assert current.status is TaskStatus.COMPLETED
+            assert current.result == {"ok": True}
+            assert current.restart_count == 0
+        finally:
+            release.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            await asyncio.to_thread(finished.wait, 5)
+            await app.aclose()
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(scenario())

@@ -2362,6 +2362,9 @@ async def _await_task_handler(
                 quiescence.report,
             )
         if heartbeat_result is _TaskHeartbeatOutcome.TERMINAL:
+            # Durable completion does not imply handler cleanup is finished.
+            # Keep owner cancellation from interrupting the still-running handler.
+            await asyncio.wait((handler_task,))
             return await handler_task
         final_heartbeat_result = await heartbeat_task
         if final_heartbeat_result is _TaskHeartbeatOutcome.ELAPSED:
@@ -2714,7 +2717,15 @@ async def _restart_task_handler_after_shutdown(
     async def cleanup() -> None:
         # Lease renewal continues until cancellation cleanup has fully joined.
         # A handler suppressing cancellation retains ownership until it returns.
-        handler_task.cancel()
+        # A terminal heartbeat rules out a restart, but cleanup may still be live.
+        terminal_heartbeat = (
+            heartbeat_task.done()
+            and not heartbeat_task.cancelled()
+            and heartbeat_task.exception() is None
+            and heartbeat_task.result() is _TaskHeartbeatOutcome.TERMINAL
+        )
+        if not terminal_heartbeat:
+            handler_task.cancel()
         handler_failure: BaseException | None = None
         try:
             await handler_task
