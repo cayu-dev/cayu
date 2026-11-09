@@ -5951,11 +5951,16 @@ class EnvironmentLifecycle:
                             fatal_signal or binding_finalize_cancellation(exc)
                         )
                     raise
-                if (
-                    retry_error is not None
-                    and binding_finalize_explicit_cancellation(retry_error) is not None
-                ):
-                    raise propagated_error from retry_error
+                if retry_error is not None:
+                    # The bind error itself was ordinary, so its failure is now
+                    # recorded. A control signal raised by the binding-owned
+                    # cleanup retry still belongs to the caller and must not be
+                    # downgraded to an ordinary binding failure.
+                    retry_fatal_signal = binding_finalize_fatal_signal(retry_error)
+                    if retry_fatal_signal is not None:
+                        raise propagated_error from retry_fatal_signal
+                    if binding_finalize_explicit_cancellation(retry_error) is not None:
+                        raise propagated_error from retry_error
                 return EnvironmentBindingResult(
                     registered_environment=registered_environment,
                     events=events,
