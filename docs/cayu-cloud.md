@@ -132,7 +132,7 @@ that lock pins is the one the release runs. `deployment status` returns it as
 `cayu_runtime` (`version`, `source` and `lock_digest`). Releases admitted before Cloud
 recorded it, or whose lock pins no single `cayu` version, show "not recorded".
 
-`deployment status|logs|timeline|wait|source` take a release id (`dep_...`) on its own: the
+`deployment status|logs|timeline|wait|source|sbom` take a release id (`dep_...`) on its own: the
 CLI asks Cloud which Agent the release belongs to, so `--application` is optional for them. A
 Cloud from before that lookup still finds a release an Agent currently selects, and asks
 for `--application` for any other release. `promote`, `discard`, `retry` and `rollback`
@@ -210,6 +210,40 @@ Cloud refuses with an error `code`:
 
 A Cayu Cloud from before this download answers with category
 `source_download_unsupported`.
+
+## Downloading a release's SBOM
+
+When SBOM admission refuses a release, `deployment wait`, `deployment logs` and `deployment
+timeline` name the vulnerable packages, but Cloud keeps at most 50 of them. `deployment sbom
+RELEASE` saves the whole CycloneDX SBOM that Cloud scanned, exactly as the release's image
+build wrote it, to a new file: `--output FILE`, or `RELEASE.cdx.json` in the current directory
+without it. It never replaces an existing file (`output_exists`). Like `deployment status`, it
+takes a `dep_...` id without `--application`.
+
+```console
+$ cayu cloud deployment sbom dep_8k2m --output sbom.cdx.json
+Wrote the SBOM of release dep_8k2m to /work/sbom.cdx.json (48213 bytes, 212 components, CycloneDX 1.5).
+Verified digest sha256:4be1...
+$ jq -r '.components[] | "\(.name) \(.version)"' sbom.cdx.json | grep -i pypdf
+pypdf 6.21.2
+```
+
+Cloud sends the SBOM's SHA-256 with it. The CLI writes nothing when the download doesn't
+match it (`sbom_digest_mismatch`) or isn't a CycloneDX JSON document (`sbom_invalid`).
+`--json` prints the usual envelope, whose `result` has `output`, `format` (`CycloneDX`),
+`spec_version`, `components` (how many it lists), `digest` and `bytes`.
+
+Cloud refuses with an error `code`:
+
+- `release_sbom_not_found` when the release's image was never built (it stopped before
+  `image_built`), so there is no SBOM; the error's `status` is the release's status;
+- `release_sbom_removed` when the release was destroyed, which removes its build evidence;
+- `release_not_found` for a release the Agent doesn't have;
+- `agent_not_yours` or `key_scope_required` when the login or API key may not see the Agent
+  (an API key needs `read`); and
+- `release_sboms_unavailable` when Cloud can't read SBOMs right now; run it again later.
+
+A Cayu Cloud from before this download answers with category `sbom_download_unsupported`.
 
 ## Initialize an Agent project
 

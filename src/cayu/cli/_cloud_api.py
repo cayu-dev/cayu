@@ -101,9 +101,9 @@ CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_ex
 # conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
 # a schedule run's (`cayu cloud schedule run`), a settings change's (`cayu cloud
 # settings`), an environment change's (`cayu cloud env set|unset` with several names), a
-# source download's (`cayu cloud deployment source`) and an inbox decision's (`cayu inbox`),
-# whose structured fields (such as a refused settle's `item`) that command reads from
-# `CloudApiError.body`.
+# source or SBOM download's (`cayu cloud deployment source|sbom`) and an inbox decision's
+# (`cayu inbox`), whose structured fields (such as a refused settle's `item`) that command
+# reads from `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
         *_INBOX_REFUSALS,
@@ -170,6 +170,10 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "settings_revision_conflict"),
         (409, "source_not_uploaded"),
         (410, "source_bundle_expired"),
+        # `cayu cloud deployment sbom`: why Cloud has no SBOM to send.
+        (404, "release_sbom_not_found"),
+        (410, "release_sbom_removed"),
+        (503, "release_sboms_unavailable"),
         (422, "environment_change_invalid"),
         (422, "invalid_setting"),
         (422, "invalid_settings"),

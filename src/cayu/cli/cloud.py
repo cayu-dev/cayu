@@ -78,6 +78,7 @@ from cayu.cli._cloud_project import (
     resolve_project,
     schedule_input_json,
 )
+from cayu.cli._cloud_release_sbom import SbomDownloadError, download_release_sbom, render_sbom
 from cayu.cli._cloud_release_source import (
     SourceDownloadError,
     download_release_source,
@@ -123,7 +124,7 @@ _DEPLOYMENT_IN_PROGRESS = {
 _DEPLOYMENT_READY = {"smoke_tested", "promoted"}
 _DEPLOYMENT_STATUSES = _DEPLOYMENT_FAILURES | _DEPLOYMENT_IN_PROGRESS | _DEPLOYMENT_READY
 # `deployment` reads that find the release's Agent from a `dep_...` id without --application.
-_RELEASE_ID_ACTIONS = frozenset({"logs", "source", "status", "timeline", "wait"})
+_RELEASE_ID_ACTIONS = frozenset({"logs", "sbom", "source", "status", "timeline", "wait"})
 _SERVICE_FAILURES = {"degraded", "failed", "stopped"}
 _SERVICE_IN_PROGRESS = {"deleting", "deploying", "sleeping", "starting", "stopping"}
 _SERVICE_READY = {"running"}
@@ -886,6 +887,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             _CloudReleaseSupersededError,
             _CloudRetrySubmissionError,
             _CloudSessionChoiceNotAppliedError,
+            SbomDownloadError,
         ),
     ):
         error.update(exc.details)
@@ -1227,6 +1229,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "its digest, and extract it into a new or empty directory, or with --archive keep "
             "the .tar.gz itself."
         ),
+        "sbom": (
+            "Download the CycloneDX SBOM one release's image build recorded (the file SBOM "
+            "admission scanned, with every package), verify its digest, and save it to a new "
+            "file."
+        ),
     }
     for action, description in deployment_descriptions.items():
         operation = deployment_commands.add_parser(action, description=description)
@@ -1259,6 +1266,15 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
                 help="Write the verified .tar.gz to --output instead of extracting it.",
             )
             _add_release_output_argument(operation, render_source)
+        if action == "sbom":
+            operation.add_argument(
+                "--output",
+                type=Path,
+                default=None,
+                metavar="FILE",
+                help="The new file to write (default RELEASE.cdx.json in this directory).",
+            )
+            _add_release_output_argument(operation, render_sbom)
         if action == "logs":
             operation.add_argument("--diagnostic-offset", type=_diagnostic_offset, default=None)
             operation.add_argument("--diagnostic-limit", type=_diagnostic_limit, default=None)
@@ -4200,6 +4216,16 @@ def _deployment(
                 deployment_id=arguments.deployment_id,
                 output=arguments.output,
                 archive=arguments.archive,
+            ),
+        }
+    if arguments.deployment_command == "sbom":
+        return {
+            "operation": "deployment.sbom",
+            "result": download_release_sbom(
+                client,
+                application_id=application_id,
+                deployment_id=arguments.deployment_id,
+                output=arguments.output,
             ),
         }
     base = f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}"

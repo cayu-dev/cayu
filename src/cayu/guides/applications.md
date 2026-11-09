@@ -576,7 +576,11 @@ Retrieve deployment-scoped evidence without platform credentials:
 ```console
 cayu cloud deployment timeline DEPLOYMENT_ID --application AGENT_SLUG
 cayu cloud deployment logs DEPLOYMENT_ID --application AGENT_SLUG
+cayu cloud deployment sbom DEPLOYMENT_ID --output sbom.cdx.json
 ```
+
+When SBOM admission refuses a release, the timeline and logs name at most 50
+vulnerable packages; `deployment sbom` saves the whole CycloneDX SBOM Cloud scanned.
 
 For servers supporting diagnostic pagination, use `--diagnostic-offset` with the
 returned `next_diagnostic_offset` and optionally `--diagnostic-limit 20`. If evidence

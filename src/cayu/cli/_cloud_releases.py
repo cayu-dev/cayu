@@ -12,8 +12,8 @@ says "not recorded" for those missing fields. A Release Cloud refused to publish
 published", with Cloud's reason and its hint for getting past it.
 
 `release_application_id` finds the Agent of a Release from its id alone (`GET
-/v1/deployments/{id}`), so `deployment status|logs|timeline|wait|source` take a `dep_...` id
-without `--application`. A Cloud without that route still finds the Release an Agent currently selects;
+/v1/deployments/{id}`), so `deployment status|logs|timeline|wait|source|sbom` take a `dep_...`
+id without `--application`. A Cloud without that route still finds the Release an Agent currently selects;
 for any other Release it asks for `--application`.
 
 These commands print a table by default; `--json` prints the JSON envelope the other `cayu
