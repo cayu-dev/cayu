@@ -41,11 +41,6 @@ FINDINGS: dict[str, Finding] = {
         "Grouped cancellation right after a model completion stage commits leaves a "
         "session that cannot continue after recovery",
     ),
-    "task-claim-cancel": Finding(
-        "#3390",
-        "Cancelling the worker while the execution-start mark is in flight leaves the "
-        "claim with its pending entry settlement until the next worker recovers it",
-    ),
     "group-crash-conflict": Finding(
         "#3390 (related #3245)",
         "After a worker dies mid-run its unsettled group execution makes the "
@@ -59,8 +54,9 @@ FINDINGS: dict[str, Finding] = {
     ),
     "group-crash-after-complete": Finding(
         "#3390",
-        "A crash after the member completed, before its execution is settled, leaves "
-        "the group obligation unsettled forever",
+        "A crash after the member's live terminalization, before its worker acknowledges "
+        "the execution, leaves the group obligation unsettled: nothing durable proves the "
+        "callback returned",
     ),
 }
 
@@ -159,46 +155,6 @@ KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         ),
     ),
     _known(
-        "task-claim-cancel",
-        "task",
-        FaultKind.CANCEL,
-        ((Invariant.TASK_UNSETTLED, Stage.LIVE), (Invariant.TASK_UNSETTLED, Stage.AFTER_SHUTDOWN)),
-        (
-            "store.mark_claimed_task_execution_started:enter#0",
-            "store.mark_claimed_task_execution_started:exit#0",
-        ),
-    ),
-    _known(
-        "task-claim-cancel",
-        "task",
-        FaultKind.GROUPED_CANCEL,
-        ((Invariant.TASK_UNSETTLED, Stage.LIVE), (Invariant.TASK_UNSETTLED, Stage.AFTER_SHUTDOWN)),
-        (
-            "store.mark_claimed_task_execution_started:enter#0",
-            "store.mark_claimed_task_execution_started:exit#0",
-        ),
-    ),
-    _known(
-        "task-claim-cancel",
-        "task-group",
-        FaultKind.CANCEL,
-        ((Invariant.TASK_UNSETTLED, Stage.LIVE), (Invariant.TASK_UNSETTLED, Stage.AFTER_SHUTDOWN)),
-        (
-            "store.mark_claimed_task_execution_started:enter#0",
-            "store.mark_claimed_task_execution_started:exit#0",
-        ),
-    ),
-    _known(
-        "task-claim-cancel",
-        "task-group",
-        FaultKind.GROUPED_CANCEL,
-        ((Invariant.TASK_UNSETTLED, Stage.LIVE), (Invariant.TASK_UNSETTLED, Stage.AFTER_SHUTDOWN)),
-        (
-            "store.mark_claimed_task_execution_started:enter#0",
-            "store.mark_claimed_task_execution_started:exit#0",
-        ),
-    ),
-    _known(
         "group-crash-conflict",
         "task-group",
         FaultKind.CRASH,
@@ -265,9 +221,6 @@ KNOWN_FAILURES: tuple[KnownFailure, ...] = (
         FaultKind.CRASH,
         ((Invariant.TASK_GROUP_OBLIGATION, Stage.RECOVERED),),
         (
-            "store.claim_persisted_event_side_effect:enter#3",
-            "store.mark_persisted_event_side_effect_delivered:enter#16",
-            "store.terminalize_task:enter#0",
             "store.append_event_and_claim_side_effect:enter#13",
             "store.mark_persisted_event_side_effect_delivered:enter#17",
             "store.append_event_and_claim_side_effect:enter#14",

@@ -257,6 +257,23 @@ def _ensure_recovered_attached_task_authority(
     _validate_ordinary_task_terminalization_against_cancellation(task, request)
 
 
+def recovered_completion_execution(
+    prior: Task, status: TaskStatus
+) -> tuple[str, str, datetime] | None:
+    """The dead owner's group execution an attached-task recovery settles with it.
+
+    A worker acknowledges its execution only after its callback returns. When
+    recovery completes the task of an expired, generation-fenced owner, the
+    attached session's durable completion is the proof that the work finished,
+    so the recovery settles that exact claim's execution in the same
+    transaction. A recovered failure proves no such thing and leaves it owed.
+    """
+
+    if prior.worker_id is None or prior.started_at is None or status is not TaskStatus.COMPLETED:
+        return None
+    return prior.id, prior.worker_id, prior.started_at
+
+
 def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:
     """Fence a task mutation to the exact continuation generation.
 

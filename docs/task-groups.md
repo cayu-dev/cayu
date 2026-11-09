@@ -288,15 +288,29 @@ normal task disposition (or failed entry before dispatch),
 retry only acknowledgement, never the handler. When cancellation or another
 failure is primary, the handle is attached to its exception cause chain instead
 of replacing the original signal. Process loss without durable acknowledgement
-keeps the barrier fenced; it does not infer callback settlement.
+keeps the barrier fenced; it does not infer callback settlement from elapsed
+time alone.
 The long-running dispatcher propagates errors carrying this retry owner rather
 than logging and discarding it; the caller retains and retries the same handle.
 
-Expiry can settle an undispatched, sessionless claim. It cannot settle dispatched
-work, a detached process, or an unknown external outcome. Independent local
-execution receipts remain part of the barrier even after a task becomes terminal.
-Missing positive proof retains the fence; this API does not kill arbitrary
-processes or infer quiescence from elapsed time.
+Only these settle an execution:
+
+- The worker's own acknowledgement after its callback returns, or after proven
+  nondispatch. Completing or failing a task does not settle it on the worker's
+  behalf.
+- Recovering a session-attached task as completed after its worker's lease
+  expired settles that worker's execution in the same transaction. Recovery
+  requires the exact expired claim generation and moves the task out of it, and
+  the session's durable completion proves the work finished. Recovering it as
+  failed proves nothing about the callback and leaves the execution owed.
+- Owner-lost cancellation reconciliation settles an expired owner's execution as
+  it cancels the task.
+- Expiry alone can settle an undispatched, sessionless claim.
+
+Nothing else settles dispatched work, a detached process, or an unknown external
+outcome. Independent local execution receipts remain part of the barrier even
+after a task becomes terminal. Missing positive proof retains the fence; this API
+does not kill arbitrary processes or infer quiescence from elapsed time.
 
 On successful group outcome and positive quiescence, the existing finalizer task
 becomes eligible once. A failed group still drains its losers, but marks its

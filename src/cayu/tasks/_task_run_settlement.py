@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.runtime._run_exit import RunExitKind, classify_run_exit
-from cayu.tasks._execution_settlement import has_task_execution_settlement_pending
+from cayu.tasks._execution_settlement import pending_task_execution_settlements
+from cayu.tasks.cancellation import (
+    _task_cancellation_requested,
+    _task_retry_cancellation_requested,
+)
 from cayu.tasks.records import TaskClaimLost, TaskStatus
 
 if TYPE_CHECKING:
@@ -99,40 +103,61 @@ async def release_unstarted_claims(
     *,
     claims: list[UnstartedClaim],
 ) -> None:
-    """Return claims this worker holds but never started to the queue.
+    """Return claims this worker holds but never dispatched to the queue.
 
-    Between ``claim_task`` and the execution-start mark no handler owns a
-    claim, so any exit there, including one that arrives with the claim's own
-    acknowledgement, would strand it with the exited worker until its lease
-    expires. Durable state decides: only a claim this worker still holds, not
-    started, is released, shielded from the caller's cancellation. ``claims``
+    Between ``claim_task`` and the acknowledged execution-start mark no handler
+    owns a claim, so any exit there, including one that arrives with the
+    claim's own acknowledgement, would strand it with the exited worker until
+    its lease expires. Durable state decides: only a claim this worker still
+    holds is released, shielded from the caller's cancellation. ``claims``
     names the claims this worker's claim calls returned, each released only
     under the claim generation it was acknowledged for: renewals keep the
     generation, and a newer claim under the same worker id carries its own.
     Unacknowledged claims are left to lease expiry because their authority
     cannot be recovered by worker id. A process-level stop is left to lease
-    expiry, and a claim whose execution entry is still pending stays with that
-    entry's settlement owner.
+    expiry.
+
+    A cancellation while the execution-start mark is in flight leaves that
+    entry's settlement pending. The entry raised, so no handler was dispatched:
+    its own settlement joins the mark and acknowledges any group execution it
+    opened before the claim, start marker included, is released. An entry that
+    failed on its own keeps its claim with the pending settlement, which its
+    caller retries, and any other pending settlement belongs to a dispatched
+    handler and keeps the claim.
     """
 
     from cayu.runtime._recovery_ownership import _run_recovery_cleanup_steps
 
-    if classify_run_exit(
-        failure
-    ).kind is RunExitKind.PROCESS_CONTROL or has_task_execution_settlement_pending(failure):
-        # A pending execution-entry settlement still owns the claim: its retry
-        # proves nondispatch before anyone relinquishes it.
+    if classify_run_exit(failure).kind is RunExitKind.PROCESS_CONTROL:
+        return
+    pending = pending_task_execution_settlements(failure)
+    if pending and (
+        not all(settlement.undispatched_entry for settlement in pending)
+        or not any(
+            isinstance(error, asyncio.CancelledError) for error in iter_exception_tree(failure)
+        )
+    ):
         return
 
     async def release() -> None:
+        entered: dict[str, Task] = {}
+        for settlement in pending:
+            recorded = await settlement.settle_undispatched_entry()
+            entered[recorded.id] = recorded
         for candidate in claims:
             current = await task_store.load_task(candidate.task_id)
+            # Only the start marker of an undispatched entry may be released.
+            entry = entered.get(candidate.task_id)
+            undispatched_start = None if entry is None else entry.started_at
             if (
                 current is None
                 or current.status is not TaskStatus.CLAIMED
-                or current.started_at is not None
+                or current.started_at not in {None, undispatched_start}
                 or current.worker_id != worker_id
                 or current.claim_generation != candidate.claim_generation
+                # A requested cancellation keeps the claim with its drain.
+                or _task_cancellation_requested(current)
+                or _task_retry_cancellation_requested(current)
             ):
                 continue
             try:

@@ -120,6 +120,7 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    recovered_completion_execution,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -2918,7 +2919,12 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             "Attached-task recovery lost its exact durable authority."
                         )
                     terminal_task = pg_support.task_from_row(terminal_row)
-                    await self._record_task_transition(cur, task, terminal_task)
+                    await self._record_task_transition(
+                        cur,
+                        task,
+                        terminal_task,
+                        settled_execution=recovered_completion_execution(task, terminal_status),
+                    )
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
                         "(task_id, idempotency_key, request_sha256, worker_id, "

@@ -131,6 +131,7 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    recovered_completion_execution,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -5338,7 +5339,11 @@ class SQLiteTaskStore(TaskStore):
                     error=request.error,
                     worker_id=None,
                 )
-                self._record_task_transition_unlocked(task, terminal_task)
+                self._record_task_transition_unlocked(
+                    task,
+                    terminal_task,
+                    settled_execution=recovered_completion_execution(task, terminal_status),
+                )
                 self._connection.execute(
                     "INSERT INTO cayu_task_terminalization_receipts "
                     "(task_id, idempotency_key, request_sha256, worker_id, "

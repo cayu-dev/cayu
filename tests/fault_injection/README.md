@@ -156,9 +156,8 @@ points unless the fault says otherwise.
 | `task-session-grouped-recovery` | grouped-cancel: task, task-group | 68 | session running, owner lost, even after recovery | a task-backed run's model steps and tool round; recovery then fails with `TaskClaimLost` because the task was already settled |
 | `approval-grouped-continuation` | grouped-cancel: approval | 1 | session running without owner | right after the approval continuation commits `transition_status_and_checkpoint` |
 | `grouped-model-stage` | grouped-cancel: run, tool-round, resume, approval | 12 | cannot continue after recovery ("no authoritative open interaction") | right after `complete_model_completion_stage` commits in `_assistant_model_publication` |
-| `task-claim-cancel` | cancel, grouped-cancel: task, task-group | 8 | task claimed by the exited worker until the next worker recovers it | while `mark_claimed_task_execution_started` is in flight; the claim waits for its pending execution-entry settlement |
 | `group-crash-conflict` | crash: task-group | 50 | task running forever: the next worker's continuation raises `TaskGroupConflict: Prior group execution is still unsettled` | a crash anywhere in the member's run |
-| `group-crash-after-complete` | crash: task-group | 14 | group execution obligation never settled; recovery completes the member but not its group acknowledgement | a crash after the member completed, before `_settle_task_group_execution` |
+| `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled; recovery completes the member but nothing proves its callback returned | a crash after the member's live terminalization, before `_settle_task_group_execution` |
 
 Each finding names its tracking issue in `known_failures.py`; findings with no
 issue of their own share one tracking issue there.

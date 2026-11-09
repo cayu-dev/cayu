@@ -70,6 +70,7 @@ class TaskExecutionSettlement:
         self._operation: asyncio.Task[TaskStoreOperationOutcome[None]] | None = None
         self._entry_claim: Task | None = None
         self._entry_operation: asyncio.Task[TaskStoreOperationOutcome[Task]] | None = None
+        self._entry_failed = False
         self._return_verification: Callable[[], Awaitable[bool]] | None = None
 
     async def enter(self, claim: Task, nondispatch_result: Any = None) -> Task:
@@ -114,10 +115,30 @@ class TaskExecutionSettlement:
             assert outcome.result is not None
         except BaseException:
             self._pending = True
+            self._entry_failed = True
             raise
         self._entry_operation = None
         self._entry_claim = None
         return outcome.result
+
+    @property
+    def undispatched_entry(self) -> bool:
+        """Execution entry raised, so its caller never dispatched the handler."""
+        return self._entry_failed
+
+    async def settle_undispatched_entry(self) -> Task:
+        """Finish an entry whose caller never dispatched; return the claim it recorded.
+
+        Joins the start publication, acknowledges any group execution it opened
+        as proven nondispatch, and returns the exact claim with its start marker,
+        if one committed. Raises :class:`TaskExecutionSettlementPending` while
+        the acknowledgement is still unknown.
+        """
+        if not self._entry_failed:
+            raise RuntimeError("Only a failed execution entry is proven undispatched.")
+        await self.retry()
+        assert self._authority is not None
+        return copy_task(self._authority)
 
     def _require_entry(self, value: object, *, readback: bool) -> Task:
         claim = self._entry_claim
@@ -323,4 +344,13 @@ def _failure_chain(error: BaseException | None) -> list[BaseException]:
 
 def has_task_execution_settlement_pending(error: BaseException) -> bool:
     """An outer loop must not discard a retry owner carried by another failure."""
-    return any(isinstance(item, TaskExecutionSettlementPending) for item in _failure_chain(error))
+    return bool(pending_task_execution_settlements(error))
+
+
+def pending_task_execution_settlements(error: BaseException) -> list[TaskExecutionSettlement]:
+    """The retry owners a failure carries, each once."""
+    settlements: dict[int, TaskExecutionSettlement] = {}
+    for item in _failure_chain(error):
+        if isinstance(item, TaskExecutionSettlementPending):
+            settlements.setdefault(id(item.settlement), item.settlement)
+    return list(settlements.values())

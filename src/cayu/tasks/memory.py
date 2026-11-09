@@ -122,6 +122,7 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    recovered_completion_execution,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -3524,6 +3525,7 @@ class InMemoryTaskStore(TaskStore):
                 error=request.error,
                 worker_id=None,
                 now=committed_at,
+                settled_execution=recovered_completion_execution(task, terminal_status),
             )
             self._terminalization_receipts[receipt_key] = TaskTerminalizationReceipt(
                 task_id=request.task_id,
@@ -5182,6 +5184,7 @@ class InMemoryTaskStore(TaskStore):
         handoff_id: str | None = None,
         accepted_decision_id: str | None = None,
         now: datetime | None = None,
+        settled_execution: tuple[str, str, datetime] | None = None,
     ) -> Task:
         updated, retry_settlement = self._prepare_finished_task(
             task_id,
@@ -5194,7 +5197,7 @@ class InMemoryTaskStore(TaskStore):
             accepted_decision_id=accepted_decision_id,
             now=self._ownership_clock() if now is None else now,
         )
-        self._store_task(updated)
+        self._store_task(updated, settled_execution=settled_execution)
         if retry_settlement is not None:
             self._retry_settlements[(updated.id, retry_settlement.idempotency_key)] = (
                 retry_settlement

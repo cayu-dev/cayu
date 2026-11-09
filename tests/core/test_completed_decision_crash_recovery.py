@@ -2,9 +2,11 @@
 
 The fault-injection scenarios run here over the in-memory and SQLite stores: the
 process dies right before the attached task is terminalized, or right before the
-completed run releases its fence. (A task-group member's group acknowledgement
-is not finished by recovery yet; its known failure stays in the harness.) A fresh app's recovery must then complete the
-task, publish the terminal events once and leave the session able to run again.
+completed run releases its fence. A fresh app's recovery must then complete the
+task (settling a task-group member's execution with it), publish the terminal
+events once and leave the session able to run again. A crash after a member's
+live terminalization still leaves its group execution owed; that is recorded in
+the fault-injection known failures.
 """
 
 from __future__ import annotations
@@ -82,6 +84,7 @@ def backend(request: pytest.FixtureRequest, tmp_path, monkeypatch) -> str:
         ("resume", _RELEASE),
         ("approval", _RELEASE),
         ("task", _TERMINALIZE),
+        ("task-group", _TERMINALIZE),
     ],
 )
 def test_recovery_finishes_a_completion_cut_short_by_a_crash(

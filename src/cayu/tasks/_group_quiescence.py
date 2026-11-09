@@ -530,8 +530,9 @@ def plan_group_graph_transition(
                 and task.lease_expires_at <= now
                 and identity not in unsettled_effects
             ):
-                # Require nonexecution or a positive execution-owner handoff,
-                # plus the independent effect ledger. Expiry alone is not proof.
+                # Require nonexecution or a settled execution (callback return,
+                # a recovered completion, or owner-lost cancellation), plus the
+                # independent effect ledger. Expiry alone is not proof.
                 if task.retry_series is not None:
                     cancellation = _cancelled_task_retry_settlement(
                         task,
