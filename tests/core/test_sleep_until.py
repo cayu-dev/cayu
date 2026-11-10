@@ -12,6 +12,7 @@ from uuid import uuid4
 import pytest
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
+from cayu.approvals.review import HumanReviewDisclosure, HumanReviewField, HumanReviewPolicy
 from cayu.approvals.user_input import PendingUserInput, UserInputResponse
 from cayu.budgets.run_limits import RunLimits
 from cayu.evals.testing import ScriptedModelProvider
@@ -91,12 +92,22 @@ class _StableScriptedProvider(ScriptedModelProvider):
         )
 
 
-def _app(session_store, task_store, clock, *, calls=None, arguments=None, tools=None) -> CayuApp:
+def _app(
+    session_store,
+    task_store,
+    clock,
+    *,
+    calls=None,
+    arguments=None,
+    tools=None,
+    human_review_policy=None,
+) -> CayuApp:
     app = CayuApp(
         session_store=session_store,
         task_store=task_store,
         enable_logging=False,
         clock=clock,
+        human_review_policy=human_review_policy,
     )
     app.register_provider(
         _StableScriptedProvider(
@@ -231,6 +242,38 @@ def test_wake_waits_for_its_deadline_and_cannot_be_answered_by_a_person() -> Non
         outcome = await deliver_session_wake(app, session_id="s_gate", wake_id=pending["input_id"])
         assert outcome is SessionWakeOutcome.CONTINUED
         await _assert_woke_once(sessions, "s_gate", deadline=_START + timedelta(seconds=30))
+
+    asyncio.run(scenario())
+
+
+class _AllowEveryReview(HumanReviewPolicy):
+    version = "sleep-until-review-v1"
+    binding_key = b"sleep-until-test-binding-key-32-bytes"
+
+    def authorize(self, context, *, session_id, session_metadata, action):
+        return True
+
+    def project(self, context, source):
+        return HumanReviewDisclosure(
+            status="permitted", fields=(HumanReviewField(label="Proposal", text="Allowed"),)
+        )
+
+
+def test_wake_continues_a_session_when_human_review_is_configured() -> None:
+    async def scenario() -> None:
+        clock = _Clock()
+        sessions, tasks = InMemorySessionStore(), InMemoryTaskStore(clock=clock)
+        calls: list[ModelRequest] = []
+        app = _app(sessions, tasks, clock, calls=calls, human_review_policy=_AllowEveryReview())
+        pending = await _sleeping(app, sessions, "s_reviewed")
+        clock.advance(30)
+
+        assert await _work(app) == 1
+
+        await _assert_woke_once(sessions, "s_reviewed", deadline=_START + timedelta(seconds=30))
+        assert len(calls) == 2
+        task = await tasks.load_task(pending["wake"]["task_id"])
+        assert task.status is TaskStatus.COMPLETED
 
     asyncio.run(scenario())
 
@@ -2105,8 +2148,9 @@ def test_a_subagent_that_asks_after_the_wake_continues_the_parent_once(
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize("reviewed", [False, True])
 def test_a_woken_sibling_left_without_a_result_needs_manual_recovery_not_retries(
-    backend, tmp_path, request
+    backend, tmp_path, request, reviewed
 ) -> None:
     from tests.core._execution_profile_fixtures import rebind_test_invocation
 
@@ -2155,7 +2199,13 @@ def test_a_woken_sibling_left_without_a_result_needs_manual_recovery_not_retries
         sessions, tasks = _stores(backend, tmp_path, request, clock)
         session_id = f"s_stuck_{backend}"
         charge = Charge()
-        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False, clock=clock)
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            enable_logging=False,
+            clock=clock,
+            human_review_policy=_AllowEveryReview() if reviewed else None,
+        )
         app.register_provider(_StableScriptedProvider(response_factory=respond), default=True)
         app.register_agent(
             AgentSpec(name="sleeper", model="scripted-model"), tools=[SleepUntilTool(), charge]
@@ -2211,21 +2261,48 @@ def test_a_woken_sibling_left_without_a_result_needs_manual_recovery_not_retries
             timer = session_wake_tool_result(
                 PendingUserInput.model_validate(checkpoint["pending_user_input"])
             )
-            async for _ in app.recover_user_input(
-                UserInputRecoveryRequest(
-                    session_id=session_id,
-                    input_id=wake_id,
-                    answer=timer,
-                    resolved_by=ResolutionActor(
-                        subject=SESSION_WAKE_ACTOR_SUBJECT, source=ResolutionActorSource.SYSTEM
-                    ),
-                    tool_call_id="call_charge",
-                    outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                    message="charged once",
+            reference = None
+            if reviewed:
+                from cayu.approvals.review import HumanReviewContext
+
+                view = await app.inspect_human_review(
+                    session_id, context=HumanReviewContext(recipient="operator", purpose="recovery")
                 )
-            ):
+                reference = view.reference
+            recovery_request = UserInputRecoveryRequest(
+                review_reference=reference,
+                session_id=session_id,
+                input_id=wake_id,
+                answer=timer,
+                resolved_by=ResolutionActor(
+                    subject=SESSION_WAKE_ACTOR_SUBJECT, source=ResolutionActorSource.SYSTEM
+                ),
+                tool_call_id="call_charge",
+                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                message="charged once",
+            )
+            if reviewed:
+                from cayu.approvals.review import HumanReviewDenied
+                from cayu.sessions._checkpoint_mutations import SessionRuntimePublicationConflict
+
+                with pytest.raises(HumanReviewDenied):
+                    async for _ in app.recover_user_input(
+                        recovery_request.model_copy(update={"review_reference": None})
+                    ):
+                        pass
+                with pytest.raises(SessionRuntimePublicationConflict):
+                    async for _ in app.recover_user_input(
+                        recovery_request.model_copy(update={"answer": "different timer answer"})
+                    ):
+                        pass
+                assert len(await sessions.load_events(session_id)) == settled_events
+            async for _ in app.recover_user_input(recovery_request):
                 pass
             assert (await sessions.load(session_id)).status is SessionStatus.COMPLETED
+            closed_events = len(await sessions.load_events(session_id))
+            async for _ in app.recover_user_input(recovery_request):
+                pass
+            assert len(await sessions.load_events(session_id)) == closed_events
             assert charge.runs == 1
         finally:
             await app.aclose()

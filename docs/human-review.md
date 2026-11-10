@@ -42,7 +42,10 @@ policy errors do not echo their private inputs.
 
 Pass `view.reference` as `review_reference` on `UserInputResponse` or
 `ToolApprovalRequest`, using the view's exact session/action/round/call identities.
-With a configured policy, normal resolution requires a reference. The runtime
+With a configured policy, normal resolution requires a reference. A due
+`sleep_until` wake is not a person's answer: its wake task continues the session
+without one, and no person can answer a sleep (see
+[task scheduling](task-scheduling.md)). The runtime
 checks separate decision permission before continuation, then compares the view
 inside the existing atomic claim. The opaque HMAC binds the complete pending
 execution content, session incarnation, policy version, recipient/purpose and
@@ -66,6 +69,9 @@ and preserve the accepted answer's original reference as `answer_review_referenc
 The latter participates only in the original answer identity, along with its
 answer, metadata and other existing fields; it grants no recovery permission.
 Existing answer metadata and `resolved_by` must still match the accepted answer.
+For a `sleep_until` wake, leave `answer_review_reference` unset: the durable
+wake identifies an original timer answer with no human reference. Supply the
+fresh `review_reference` to authorize recovery of the sibling tool outcome.
 The current recovery recipient must independently have `decide` permission.
 Accepted answer/approval retries match their durable request digests inside the
 atomic claim and recheck decision permission instead of reapproving changed

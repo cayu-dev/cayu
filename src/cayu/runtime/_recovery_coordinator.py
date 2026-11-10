@@ -1391,10 +1391,11 @@ class RecoveryCoordinator:
             raise RuntimeError("Session has no pending user input.")
         if pending.input_id != response.input_id:
             raise ValueError(f"User input id does not match pending input: {response.input_id}")
+        delivers_wake = wake_delivery or _replays_wake_delivery(foreground_gate, pending)
         _require_wake_authority(
             pending,
             response,
-            wake_delivery=wake_delivery or _replays_wake_delivery(foreground_gate, pending),
+            wake_delivery=delivers_wake,
             claimed=candidate_intent is not None,
             now=self._clock(),
         )
@@ -1508,13 +1509,16 @@ class RecoveryCoordinator:
                     denying=True,
                     accepted_request=False,
                 )
-            self._require_human_review_decision(
-                getattr(response, "review_reference", None),
-                current_session,
-                current_checkpoint,
-                denying=False,
-                accepted_request=current_intent is not None,
-            )
+            # A due timer, not a person, answers a sleep; its authority was
+            # proven above and no human decision exists to review.
+            if not delivers_wake:
+                self._require_human_review_decision(
+                    getattr(response, "review_reference", None),
+                    current_session,
+                    current_checkpoint,
+                    denying=False,
+                    accepted_request=current_intent is not None,
+                )
             claimed_checkpoint, claimed_intent = checkpoint_with_user_input_resolution_intent(
                 current_checkpoint,
                 pending=pending,
@@ -1650,7 +1654,6 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
 
-        answer_request_digest = user_input_answer_request_digest(request)
         resolution_request_digest = user_input_resolution_request_digest(request)
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
         close_receipt = await self._session_store.load_runtime_publication_receipt(
@@ -1724,6 +1727,9 @@ class RecoveryCoordinator:
         await self._user_input_evidence.require_exact_user_input_open_receipt(
             session=loaded_session,
             pending=pending,
+        )
+        answer_request_digest = user_input_answer_request_digest(
+            _user_input_recovery_answer_request(request, pending)
         )
         if candidate_intent is not None and (
             candidate_intent.answer_request_digest != answer_request_digest
@@ -6213,7 +6219,9 @@ class RecoveryCoordinator:
             or invocation_context.budget_policy is not budget_policy
         ):
             raise RuntimeError("User-input manual recovery lost frozen invocation authority.")
-        answer_request_digest = user_input_answer_request_digest(request)
+        answer_request_digest = user_input_answer_request_digest(
+            _user_input_recovery_answer_request(request, pending)
+        )
         resolution_request_digest = user_input_resolution_request_digest(request)
         if closure_request_digest != resolution_request_digest:
             raise RuntimeError(
@@ -6570,7 +6578,9 @@ class RecoveryCoordinator:
         try:
             from cayu.runtime._foreground_gate_continuation import gate_input_response_from_recovery
 
-            response = gate_input_response_from_recovery(request)
+            response = gate_input_response_from_recovery(
+                _user_input_recovery_answer_request(request, pending)
+            )
             raw_continuation = self.continue_user_input_resolution(
                 response=response,
                 participant_context=participant_context,
@@ -9583,6 +9593,18 @@ class RecoveryCoordinator:
             ):
                 emitted.append(published)
         return emitted
+
+
+def _user_input_recovery_answer_request(
+    request: UserInputRecoveryRequest, pending: PendingUserInput
+) -> UserInputRecoveryRequest:
+    """Keep a timer's accepted answer separate from new recovery authorization."""
+
+    if pending.wake is not None and request.answer_review_reference is None:
+        # A durable wake was answered by its timer without a human review reference.
+        # The original request still authorizes recovery and binds its replay digest.
+        return request.model_copy(update={"review_reference": None})
+    return request
 
 
 def _resumed_pause_type(pending: PendingUserInput) -> str:
