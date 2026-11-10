@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from itertools import islice
 from uuid import uuid4
 
+from cayu._event_schema import event_payload_policy
 from cayu.budgets.base import BudgetStore
 from cayu.events import (
     Event,
@@ -656,6 +657,21 @@ class RuntimeEventWriter:
                 redactor=self._secret_redactor,
                 public_authority_alias_codec=self._public_authority_alias_codec,
             )
+            delivery = _EventSinkDelivery(
+                event=public_event,
+                event_sequence=claim.event_sequence,
+                private_session_id=claim.session_id,
+                private_event_id=claim.event_id,
+                private_interaction_id=private_event.interaction_id,
+                private_tool_call_id=_private_payload_string(private_event, "tool_call_id"),
+                private_parent_session_id=_private_payload_string(
+                    private_event, "parent_session_id"
+                ),
+                private_model_attempt_id=_private_payload_string(private_event, "model_attempt_id"),
+                private_auxiliary_tool_call_id=_private_payload_string(
+                    private_event, "auxiliary_inference", "tool_call_id"
+                ),
+            )
         except Exception as exc:
             try:
                 await self._mark_claim_failed(
@@ -669,33 +685,7 @@ class RuntimeEventWriter:
                     f"{_exception_summary(bookkeeping_exc, redactor=self._secret_redactor)}",
                 )
             raise
-        sink_failures = await self._emit_to_sinks(
-            _EventSinkDelivery(
-                event=public_event,
-                event_sequence=claim.event_sequence,
-                private_session_id=claim.session_id,
-                private_event_id=claim.event_id,
-                private_interaction_id=private_event.interaction_id,
-                private_tool_call_id=_private_payload_string(
-                    private_event.payload,
-                    "tool_call_id",
-                ),
-                private_parent_session_id=_private_payload_string(
-                    private_event.payload,
-                    "parent_session_id",
-                ),
-                private_model_attempt_id=_private_payload_string(
-                    private_event.payload, "model_attempt_id"
-                ),
-                private_auxiliary_tool_call_id=(
-                    _private_payload_string(
-                        private_event.payload["auxiliary_inference"], "tool_call_id"
-                    )
-                    if type(private_event.payload.get("auxiliary_inference")) is dict
-                    else None
-                ),
-            )
-        )
+        sink_failures = await self._emit_to_sinks(delivery)
         delivered_event = event_with_durable_sequence(private_event, claim.event_sequence)
         if sink_failures:
             failure_summary = _failure_summary(
@@ -1032,9 +1022,21 @@ def _object_type_name(value: object) -> str:
     return portable_persisted_event_side_effect_error(name)
 
 
-def _private_payload_string(payload: dict[str, object], key: str) -> str | None:
-    value = payload.get(key)
-    return value if type(value) is str and value else None
+def _private_payload_string(event: Event, *path: str) -> str | None:
+    """Extract nonblank correlation only from schema-owned authority fields."""
+
+    policy = event_payload_policy(event.type)
+    if not (
+        (len(path) == 1 and path[0] in policy.authority_keys)
+        or path in policy.nested_authority_paths
+    ):
+        return None
+    value: object = event.payload
+    for key in path:
+        if type(value) is not dict:
+            return None
+        value = value.get(key)
+    return value if type(value) is str and value.strip() else None
 
 
 def _add_exception_note(exc: BaseException, note: str) -> None:

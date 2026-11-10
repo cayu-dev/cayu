@@ -2072,3 +2072,63 @@ def test_recovery_summary_escapes_control_characters(caplog):
     message = caplog.records[0].message
     assert not any(character in message for character in "\n\r\t\x1b")
     assert r"recovery\nWARNING:forged\r\t\x1b" in message
+
+
+@pytest.mark.parametrize(
+    ("event_type", "path"),
+    [
+        (EventType.TOOL_CALL_STARTED, ("tool_call_id",)),
+        (EventType.SESSION_STARTED, ("parent_session_id",)),
+        (EventType.MODEL_STARTED, ("model_attempt_id",)),
+        (
+            EventType.MODEL_AUXILIARY_ATTEMPT_STARTED,
+            ("auxiliary_inference", "tool_call_id"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("value", [" correlation ", " ", "\t", "\n", "", None, 1])
+def test_private_sink_correlation_requires_owned_nonblank_text(event_type, path, value):
+    payload = {path[-1]: value}
+    for key in reversed(path[:-1]):
+        payload = {key: payload}
+    event = Event(type=event_type, session_id="writer-correlation", payload=payload)
+    expected = value if isinstance(value, str) and value.strip() else None
+    assert event_writer_module._private_payload_string(event, *path) == expected
+    custom = Event(type="custom.observation", session_id=event.session_id, payload=payload)
+    assert event_writer_module._private_payload_string(custom, *path) is None
+    assert event.payload == custom.payload == payload
+
+
+def test_sink_delivery_construction_failure_is_recorded_and_recoverable(monkeypatch) -> None:
+    async def scenario() -> None:
+        store = await _session_store("writer-delivery-construction")
+        sink = _RecordingSink()
+        writer = RuntimeEventWriter(
+            session_store=store, budget_store=InMemoryBudgetStore(), event_sinks=[sink]
+        )
+        event = Event(type="custom.observation", session_id="writer-delivery-construction")
+
+        def fail_delivery(**kwargs):
+            raise ValueError("delivery construction failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(event_writer_module, "_EventSinkDelivery", fail_delivery)
+            patch.setattr(event_writer_module, "_PERSISTED_SIDE_EFFECT_RETRY_DELAY_SECONDS", 0)
+            with pytest.raises(ValueError, match="delivery construction failed"):
+                await writer.emit(event)
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id=event.session_id, event_id=event.id
+        )
+        assert delivery is not None
+        assert delivery.status is PersistedEventSideEffectStatus.FAILED
+        assert delivery.last_error == "ValueError: delivery construction failed"
+        assert sink.events == []
+        assert len(await writer.recover_persisted_side_effects()) == 1
+        delivery = await store.get_persisted_event_side_effect_delivery(
+            session_id=event.session_id, event_id=event.id
+        )
+        assert delivery is not None
+        assert delivery.status is PersistedEventSideEffectStatus.DELIVERED
+        assert len(sink.events) == 1
+
+    asyncio.run(scenario())
