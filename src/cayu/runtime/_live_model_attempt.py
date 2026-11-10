@@ -382,6 +382,7 @@ class LiveModelAttempt:
         memory_evidence_reference: MemoryEvidenceReference | None,
         child_session_notification_binding: ChildSessionNotificationStageBinding | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
+        bound_retry_decision: Callable[[RetryDecision], RetryDecision],
         retry_elapsed_s: Callable[[], float] | None = None,
         request_controls: dict[str, Any] | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
@@ -1398,6 +1399,7 @@ class LiveModelAttempt:
                         ),
                         elapsed_s=None if retry_elapsed_s is None else retry_elapsed_s(),
                     )
+                    stream_retry_decision = bound_retry_decision(stream_retry_decision)
 
                     if provider_operation_state is not None:
                         if completion_dispatch is None:  # pragma: no cover - checked at start

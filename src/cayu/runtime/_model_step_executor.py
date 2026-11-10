@@ -323,6 +323,7 @@ from cayu.runtime.provider_operations import (
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
+    RetryDisposition,
     RetrySuppression,
     retry_decision,
     retry_diagnostic_payload,
@@ -1796,6 +1797,25 @@ class ModelStepExecutor:
         def retry_elapsed_s() -> float:
             return max(0.0, asyncio.get_running_loop().time() - retry_window_started_at)
 
+        def bound_retry_decision(decision: RetryDecision) -> RetryDecision:
+            # Both raised failures and stream errors must publish the shared
+            # attempt cap before advertising another same-provider retry.
+            if decision.retry and selected_dispatch is not None:
+                progress = ModelFailoverProgress.model_validate(
+                    selected_dispatch.stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"]
+                )
+                if progress.attempts_used == progress.plan.max_total_attempts:
+                    return decision.model_copy(
+                        update={
+                            "retry": False,
+                            "disposition": RetryDisposition.CONFIGURED_ATTEMPT_EXHAUSTION,
+                            "delay_seconds": 0.0,
+                            "next_attempt": None,
+                            "effective_max_attempts": decision.attempt,
+                        }
+                    )
+            return decision
+
         prior_retry_failure: ModelAttemptFailed | None = None
         prompt_contribution_manifest = (
             await self._load_prompt_contribution_manifest(session.id)
@@ -2020,6 +2040,7 @@ class ModelStepExecutor:
                     max_attempts=retry_policy.max_attempts,
                     retry_policy=retry_policy,
                     retry_elapsed_s=retry_elapsed_s,
+                    bound_retry_decision=bound_retry_decision,
                     model_attempt_identity=model_attempt_identity,
                     transcript_cursor_before_request=transcript_cursor_before_request,
                     record_model_completion=record_model_completion,
@@ -2139,6 +2160,7 @@ class ModelStepExecutor:
                     raise RuntimeError(
                         "Model attempt retained a retry decision for different attempt authority."
                     ) from exc
+                decision = bound_retry_decision(decision)
                 if not exc.emitted_error_event:
                     error_event = event_with_execution_profile_authority(
                         Event(
@@ -2175,15 +2197,7 @@ class ModelStepExecutor:
                         emitted_error,
                         None,
                     )
-                total_attempts_exhausted = False
-                if selected_dispatch is not None:
-                    selected_progress = ModelFailoverProgress.model_validate(
-                        selected_dispatch.stage.intent[MODEL_FAILOVER_CHECKPOINT_KEY]["successor"]
-                    )
-                    total_attempts_exhausted = (
-                        selected_progress.attempts_used == selected_progress.plan.max_total_attempts
-                    )
-                if not decision.retry or total_attempts_exhausted:
+                if not decision.retry:
                     if model_execution_selection is not None:
                         raise _ModelFailoverCandidateExhausted(
                             selection=model_execution_selection,
