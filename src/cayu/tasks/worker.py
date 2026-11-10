@@ -4602,9 +4602,10 @@ async def _recover_expired_interrupted_task_handoffs(
             if session is None or session.instance_id != task.session_instance_id:
                 continue
         if session.status is not SessionStatus.INTERRUPTED and not (
-            # A completed session fences the lost worker's run as an interrupted
-            # one does; its pending cancellation still decides the task.
-            session.status is SessionStatus.COMPLETED and _task_cancellation_requested(task)
+            # A completed or failed session fences the lost worker's run as an
+            # interrupted one does; its pending cancellation still decides the task.
+            session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+            and _task_cancellation_requested(task)
         ):
             continue
         from cayu.external_wait_tasks import stop_wait_left_arming
@@ -4698,7 +4699,7 @@ async def _settle_expired_owner_cancellation(
 ) -> bool:
     """Cancel an attached task whose worker's lease expired with its cancellation pending.
 
-    Its session is interrupted or completed, which fences the lost worker's run, so
+    Its session is interrupted, completed, or failed, which fences the lost worker's run, so
     nothing of it can continue; ``evidence_id`` names that session incarnation and run epoch. The
     store settles only the exact expired claim ``task`` shows; a claim that changed,
     a lease that is live again, or a settlement another worker made first is left
