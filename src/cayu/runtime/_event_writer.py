@@ -49,7 +49,7 @@ from cayu.sessions.event_delivery import (
     _copy_pending_first_event_delivery,
     portable_persisted_event_side_effect_error,
 )
-from cayu.sessions.event_queries import EventQuery
+from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.execution import note_execution_progress
 from cayu.sessions.records import EventRecord
 from cayu.sessions.store import SessionStore
@@ -136,6 +136,8 @@ class RuntimeEventWriter:
         self._prepared_event_owner = object()
         self._continue_foreground_parent = continue_foreground_parent
         self._release_identity = release_identity
+        self._recovery_after_sequence: int | None = None
+        self._recovery_sweep_watermark: int | None = None
         # At most one bounded batch of identities; no event payloads or errors.
         self._recovery_claim_timeouts: dict[tuple[str, str], float] = {}
         self.timing = RuntimeTimingRecorder(
@@ -512,6 +514,8 @@ class RuntimeEventWriter:
 
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000.")
+        after_sequence = self._recovery_after_sequence
+        watermark = self._recovery_sweep_watermark
         candidates = await self._session_store.list_persisted_event_side_effect_deliveries(
             statuses={
                 PersistedEventSideEffectStatus.PENDING,
@@ -519,8 +523,27 @@ class RuntimeEventWriter:
                 PersistedEventSideEffectStatus.LEASED,
             },
             claimable_only=True,
+            after_sequence=after_sequence,
             limit=limit,
         )
+        # Only a full page can continue a sweep and needs a fixed boundary.
+        if watermark is None and len(candidates) == limit:
+            heads = await self._session_store.query_event_heads(
+                EventQuery(order_by=EventOrder.SEQUENCE_DESC, limit=1)
+            )
+            watermark = heads[0].sequence if heads else 0
+        # Advance even past deferred or contended candidates. A fixed sweep
+        # boundary ensures continuous arrivals cannot postpone earlier retries.
+        if (
+            len(candidates) < limit
+            or watermark is None
+            or candidates[-1].event_sequence >= watermark
+        ):
+            self._recovery_after_sequence = None
+            self._recovery_sweep_watermark = None
+        else:
+            self._recovery_after_sequence = candidates[-1].event_sequence
+            self._recovery_sweep_watermark = watermark
         recovered: list[Event] = []
         summaries: dict[str, _SideEffectRecoverySummary] = {}
         now = asyncio.get_running_loop().time()
