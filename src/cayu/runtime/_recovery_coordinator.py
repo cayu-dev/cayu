@@ -4854,6 +4854,13 @@ class RecoveryCoordinator:
                     redactor=self._secret_redactor,
                     policy_owner=self._foreground_gate_policy_owner,
                 )
+            # Recovered terminals run hooks and projection against the materialized
+            # environment, including any artifact store supplied by its factory.
+            async with contextlib.aclosing(environment.reconnect()) as preparation:
+                async for event in preparation:
+                    yield event
+            if environment.error is not None:
+                raise environment.error
             native_events = await self._recover_terminal_foreground_effects_at_human_gate(
                 session=session,
                 pending=pending_approval,
@@ -4885,11 +4892,6 @@ class RecoveryCoordinator:
                         "execution; retry the exact original approval request."
                     )
                 resolution_request_digest = claimed_resolution_intent.resolution_request_digest
-            async with contextlib.aclosing(environment.reconnect()) as preparation:
-                async for event in preparation:
-                    yield event
-            if environment.error is not None:
-                raise environment.error
             if emit_resume_event:
                 yield await self._event_writer.emit(
                     approval_support.resumed_event(
@@ -9562,7 +9564,6 @@ class RecoveryCoordinator:
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
                 allow_modification=False,
-                hooks_already_completed=True,
                 terminal_event_emitter=publish,
                 redactor=_redactor_for_tool_calls(
                     self._secret_redactor, registered_agent=registered_agent, tool_calls=[tool_call]
