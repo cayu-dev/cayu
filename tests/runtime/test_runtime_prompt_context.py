@@ -7,6 +7,7 @@ import threading
 
 import pytest
 from pydantic import ValidationError
+from tests._session_provenance import fixture_session_invocation
 from tests.runtime.runtime_attachment_support import _app_with_artifact_store, _valid_png_bytes
 from tests.runtime.runtime_environment_support import RecordingEnvironmentFactory
 from tests.runtime.runtime_provider_support import FakeProvider
@@ -19,12 +20,20 @@ from cayu.applications import CayuApp
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
 from cayu.artifacts.local import LocalArtifactStore
 from cayu.configuration import CayuConfig, ToolExecutionConfig
-from cayu.context.base import strip_old_file_attachments, trim_context_messages, trim_context_turns
+from cayu.context.base import (
+    ContextRequest,
+    DefaultContextPolicy,
+    strip_old_file_attachments,
+    trim_context_messages,
+    trim_context_turns,
+)
 from cayu.environments.base import Environment, EnvironmentSpec, WorkspaceInstructionsConfig
 from cayu.events import EventType
-from cayu.messages import FilePart, Message, TextPart
+from cayu.messages import FilePart, Message, TextPart, ToolCallPart, ToolResultPart
 from cayu.providers.base import ModelStreamEvent
+from cayu.sessions.records import Session
 from cayu.sessions.requests import ResumeRequest, RunRequest
+from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.workspaces.local import LocalWorkspace
 
 
@@ -260,6 +269,221 @@ def test_strip_old_file_attachments_preserves_latest_attachment_result_only():
     strip_all = strip_old_file_attachments(messages, max_attachment_results=0)
     assert strip_all[2].content[0].artifacts == []
     assert strip_all[6].content[0].artifacts == []
+
+
+def test_default_context_policy_keeps_every_attachment_from_the_latest_tool_round():
+    def image(name: str) -> dict:
+        return file_attachment(
+            artifact_id=f"art_{name}",
+            kind="image",
+            filename=f"{name}.png",
+            content_type="image/png",
+            size_bytes=3,
+        )
+
+    def read_round(names: list[str]) -> list[Message]:
+        return [
+            Message.tool_call(
+                calls=[
+                    ToolCallPart(
+                        tool_call_id=f"call_{name}",
+                        tool_name="read_file",
+                        arguments={"artifact_id": f"art_{name}"},
+                    )
+                    for name in names
+                ]
+            ),
+            Message.tool_result(
+                results=[
+                    ToolResultPart(
+                        tool_call_id=f"call_{name}",
+                        tool_name="read_file",
+                        content=f"Attached image artifact art_{name}.",
+                        artifacts=[image(name)],
+                    )
+                    for name in names
+                ]
+            ),
+        ]
+
+    messages = [
+        Message.text("user", "compare these"),
+        *read_round(["old"]),
+        *read_round(["a", "b", "c"]),
+    ]
+    request = ContextRequest(
+        session=Session(
+            id="sess_parallel_reads",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            invocation=fixture_session_invocation("sess_parallel_reads"),
+        ),
+        agent=AgentSpec(name="assistant", model="fake-model"),
+        messages=messages,
+        step=3,
+    )
+
+    projected = asyncio.run(DefaultContextPolicy().build(request))
+
+    assert projected[2].content[0].artifacts == []
+    assert [part.artifacts for part in projected[4].content] == [
+        [image("a")],
+        [image("b")],
+        [image("c")],
+    ]
+
+
+class _ShowImageTool(Tool):
+    spec = ToolSpec(
+        name="show_image",
+        description="Attach one stored image.",
+        input_schema={
+            "type": "object",
+            "properties": {"artifact_id": {"type": "string"}, "size_bytes": {"type": "integer"}},
+        },
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(
+            content=f"Attached image {args['artifact_id']}.",
+            artifacts=[
+                file_attachment(
+                    artifact_id=args["artifact_id"],
+                    kind="image",
+                    filename="image.png",
+                    content_type="image/png",
+                    size_bytes=args["size_bytes"],
+                )
+            ],
+        )
+
+
+def test_tool_round_over_the_request_attachment_limit_still_reaches_the_model(tmp_path):
+    session_id = "sess_round_over_limit"
+    app, store = _app_with_artifact_store(
+        tmp_path,
+        config=CayuConfig(tool_execution=ToolExecutionConfig(max_file_attachments_per_request=1)),
+    )
+    images = [
+        asyncio.run(
+            store.put_bytes(
+                _valid_png_bytes(),
+                filename=f"{name}.png",
+                content_type="image/png",
+                session_id=session_id,
+            )
+        )
+        for name in ("first", "second")
+    ]
+    provider = FakeProvider(
+        [
+            [
+                *(
+                    ModelStreamEvent.tool_call(
+                        id=f"call_{index}",
+                        name="show_image",
+                        arguments={"artifact_id": image.id, "size_bytes": image.size_bytes},
+                    )
+                    for index, image in enumerate(images)
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[_ShowImageTool()])
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "show both")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    request = provider.requests[-1]
+    assert set(request.options[RESOLVED_FILE_ATTACHMENTS_OPTION]) == {images[1].id}
+    first_result, second_result = request.messages[-1].content
+    assert first_result.artifacts == []
+    assert "omitted from this provider request" in first_result.content
+    assert len(second_result.artifacts) == 1
+
+
+def test_over_limit_rounds_keep_the_newest_results_that_fit_the_configured_budget(tmp_path):
+    session_id = "sess_budget_two_over_limit"
+    png = _valid_png_bytes()
+    # Two files fit in one request and three do not, like three 15 MB files under 32 MB.
+    app, store = _app_with_artifact_store(
+        tmp_path,
+        config=CayuConfig(
+            tool_execution=ToolExecutionConfig(max_total_file_attachment_bytes=2 * len(png))
+        ),
+    )
+    images = {
+        name: asyncio.run(
+            store.put_bytes(
+                png, filename=f"{name}.png", content_type="image/png", session_id=session_id
+            )
+        )
+        for name in ("a", "b", "c")
+    }
+
+    def show(*names: str) -> list[ModelStreamEvent]:
+        return [
+            *(
+                ModelStreamEvent.tool_call(
+                    id=f"call_{name}",
+                    name="show_image",
+                    arguments={
+                        "artifact_id": images[name].id,
+                        "size_bytes": images[name].size_bytes,
+                    },
+                )
+                for name in names
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+
+    provider = FakeProvider(
+        [
+            show("a", "b"),
+            show("c"),
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_ShowImageTool()],
+        context_policy=DefaultContextPolicy(max_attachment_results=2),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "show all three")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    resolved = provider.requests[-1].options[RESOLVED_FILE_ATTACHMENTS_OPTION]
+    assert set(resolved) == {images["b"].id, images["c"].id}
 
 
 def _valid_jpeg_bytes() -> bytes:

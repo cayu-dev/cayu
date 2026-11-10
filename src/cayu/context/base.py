@@ -6757,11 +6757,22 @@ def strip_old_file_attachments(
         raise TypeError("max_attachment_results must be an integer.")
     if max_attachment_results < 0:
         raise ValueError("max_attachment_results must be non-negative.")
+    return _strip_old_file_attachments(
+        messages, max_attachment_results=max_attachment_results, whole_rounds=True
+    )
 
+
+def _strip_old_file_attachments(
+    messages: list[Message],
+    *,
+    max_attachment_results: int,
+    whole_rounds: bool,
+) -> list[Message]:
     copied_messages = [copy_message(message) for message in messages]
     validate_context_messages(copied_messages)
 
-    # Tool-result attachments: keep only the latest `max_attachment_results` positions.
+    # Tool-result attachments: keep the latest `max_attachment_results` positions, widened to
+    # whole tool rounds unless the runtime asks for the strict cutoff.
     attachment_positions: list[tuple[int, int]] = []
     for message_index, message in enumerate(copied_messages):
         if message.role != MessageRole.TOOL:
@@ -6807,8 +6818,15 @@ def strip_old_file_attachments(
         keep_positions = set(attachment_positions)
     elif max_attachment_results == 0:
         keep_positions = set()
-    else:
+    elif not whole_rounds:
         keep_positions = set(attachment_positions[-max_attachment_results:])
+    else:
+        # One tool message answers one assistant tool-call round. Never split a
+        # round: the model sees every file it asked for in that round together.
+        oldest_kept_round = attachment_positions[-max_attachment_results][0]
+        keep_positions = {
+            position for position in attachment_positions if position[0] >= oldest_kept_round
+        }
 
     projected_messages: list[Message] = []
     for message_index, message in enumerate(copied_messages):

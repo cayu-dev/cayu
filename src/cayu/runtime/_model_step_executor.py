@@ -85,6 +85,8 @@ from cayu.context.base import (
     _context_secret_redactor_scope,
     _ContextCountAuthorityError,
     _defer_billing_identity_cancellation_scope,
+    _file_attachments_in_part,
+    _strip_old_file_attachments,
     context_build_termination_checkpoint_error,
     context_input_coverage,
     copy_context_messages,
@@ -1366,6 +1368,12 @@ class ModelStepExecutor:
                     }
                 )
 
+        model_messages = _fit_tool_result_attachments(
+            model_messages,
+            max_file_attachment_bytes=self._max_file_attachment_bytes,
+            max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
+            max_file_attachments_per_request=self._max_file_attachments_per_request,
+        )
         resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
             messages=model_messages,
             session=session,
@@ -6207,11 +6215,14 @@ async def _resolved_file_attachments(
     )
     if not attachment_refs:
         return {}, set()
-    if len(attachment_refs) > max_file_attachments_per_request:
-        raise RuntimeError(
-            "File attachment count exceeds the runtime attachment limit: "
-            f"{len(attachment_refs)} > {max_file_attachments_per_request}"
-        )
+    violation = _file_attachment_limit_violation(
+        attachment_refs,
+        max_file_attachment_bytes=max_file_attachment_bytes,
+        max_total_file_attachment_bytes=max_total_file_attachment_bytes,
+        max_file_attachments_per_request=max_file_attachments_per_request,
+    )
+    if violation is not None:
+        raise RuntimeError(violation)
     artifact_store = (
         None
         if registered_environment is None
@@ -6231,16 +6242,7 @@ async def _resolved_file_attachments(
     environment_name = None if registered_environment is None else registered_environment.spec.name
     resolved: dict[str, dict[str, Any]] = {}
     unresolvable_prompt_ids: set[str] = set()
-    total_attachment_bytes = 0
     for attachment in attachment_refs:
-        if attachment.size_bytes > max_file_attachment_bytes:
-            raise RuntimeError(
-                "File attachment exceeds the runtime attachment byte limit: "
-                f"{attachment.artifact_id}"
-            )
-        total_attachment_bytes += attachment.size_bytes
-        if total_attachment_bytes > max_total_file_attachment_bytes:
-            raise RuntimeError("File attachments exceed the runtime total attachment byte limit.")
         if attachment.artifact_id in resolved or attachment.artifact_id in unresolvable_prompt_ids:
             continue
         try:
@@ -6305,6 +6307,77 @@ async def _resolved_file_attachments(
             continue
         resolved[attachment.artifact_id] = resolved_file_attachment(attachment, result)
     return resolved, unresolvable_prompt_ids
+
+
+def _fit_tool_result_attachments(
+    messages: list[Message],
+    *,
+    max_file_attachment_bytes: int,
+    max_total_file_attachment_bytes: int,
+    max_file_attachments_per_request: int,
+) -> list[Message]:
+    """Drop the oldest tool-result files until the request fits the runtime limits.
+
+    Context keeps a whole tool round's files, which can exceed what one request
+    carries, and that round stays the latest until a request succeeds. Keeping the
+    newest results that fit stops every rebuilt request from failing. The latest
+    result is always kept, so a request whose latest result or prompt files are
+    over the limits still fails closed.
+    """
+
+    limits = {
+        "max_file_attachment_bytes": max_file_attachment_bytes,
+        "max_total_file_attachment_bytes": max_total_file_attachment_bytes,
+        "max_file_attachments_per_request": max_file_attachments_per_request,
+    }
+    if _file_attachment_limit_violation(_file_attachment_refs(messages)[0], **limits) is None:
+        return messages
+    attachment_results = sum(
+        1
+        for message in messages
+        if message.role == MessageRole.TOOL
+        for part in message.content
+        if type(part) is ToolResultPart and _file_attachments_in_part(part)
+    )
+    fitted = messages
+    for kept_results in range(attachment_results - 1, 0, -1):
+        fitted = _strip_old_file_attachments(
+            messages, max_attachment_results=kept_results, whole_rounds=False
+        )
+        if _file_attachment_limit_violation(_file_attachment_refs(fitted)[0], **limits) is None:
+            break
+    if fitted is not messages:
+        logger.warning(
+            "Tool-result file attachments exceed the runtime attachment limits; the oldest "
+            "results' files are sent as omission notes."
+        )
+    return fitted
+
+
+def _file_attachment_limit_violation(
+    attachment_refs: tuple[FileAttachment, ...],
+    *,
+    max_file_attachment_bytes: int,
+    max_total_file_attachment_bytes: int,
+    max_file_attachments_per_request: int,
+) -> str | None:
+    """Return why the references exceed the runtime request limits, if they do."""
+    if len(attachment_refs) > max_file_attachments_per_request:
+        return (
+            "File attachment count exceeds the runtime attachment limit: "
+            f"{len(attachment_refs)} > {max_file_attachments_per_request}"
+        )
+    total_attachment_bytes = 0
+    for attachment in attachment_refs:
+        if attachment.size_bytes > max_file_attachment_bytes:
+            return (
+                "File attachment exceeds the runtime attachment byte limit: "
+                f"{attachment.artifact_id}"
+            )
+        total_attachment_bytes += attachment.size_bytes
+        if total_attachment_bytes > max_total_file_attachment_bytes:
+            return "File attachments exceed the runtime total attachment byte limit."
+    return None
 
 
 def _file_attachment_refs(
