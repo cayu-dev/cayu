@@ -180,6 +180,7 @@ async def _recover_with(monkeypatch, error: Exception, *, parked: bool = False):
     session = SimpleNamespace(
         id=owner.session_id,
         instance_id=owner.session_instance_id,
+        run_epoch=0,
         status=SessionStatus.INTERRUPTED if parked else SessionStatus.RUNNING,
     )
 

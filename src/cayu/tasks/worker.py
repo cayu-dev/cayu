@@ -4515,11 +4515,27 @@ async def _recover_expired_interrupted_task_handoffs(
         if type(task) is not Task or task.session_id is None or task.lease_expires_at is None:
             raise TypeError("Interrupted-task handoff recovery returned an invalid task.")
         next_after = (task.lease_expires_at, task.id)
+        # Snapshot the run before revalidating its task claim. Recovery must
+        # fence only this epoch if a replacement starts after the task read.
         session = await app.session_store.load(task.session_id)
         if (
             session is None
             or task.session_instance_id is None
             or session.instance_id != task.session_instance_id
+        ):
+            continue
+        # The page is only discovery evidence: a delayed callback may have
+        # handed this claim off while the scan was in flight.
+        current = await task_store.load_task(task.id)
+        if (
+            current is None
+            or current.status is not TaskStatus.RUNNING
+            or current.worker_id != task.worker_id
+            or current.claim_generation != task.claim_generation
+            or current.lease_expires_at != task.lease_expires_at
+            or current.session_id != task.session_id
+            or current.session_instance_id != task.session_instance_id
+            or current.status_reason != task.status_reason
         ):
             continue
         if _task_cancellation_requested(task):
@@ -4540,19 +4556,25 @@ async def _recover_expired_interrupted_task_handoffs(
             SessionStatus.INTERRUPTING,
         } or await _completion_owes_task(app, session, task.id):
             from cayu.external_wait_tasks import recover_before_handoff
+            from cayu.runtime._abandoned_session_recovery import _abandoned_execution
 
             try:
                 # A turn that died before its external wait parked is recovered by
                 # that wait, never plainly, which would leave it to rerun blind.
                 if not await recover_before_handoff(app, session.id):
-                    await app.recover_incomplete_session(
-                        IncompleteSessionRecoveryRequest(
-                            session_id=session.id,
-                            inactive_for_seconds=None,
-                            reason="expired_attached_task_owner",
-                            metadata={"recovery_scope": "attached_task"},
+                    # Task lease expiry permits fencing even while the lost
+                    # worker renews session presence. The exact-run guard is
+                    # checked again in the store's recovery reservation, so it
+                    # cannot authorize fencing a replacement's newer epoch.
+                    with _abandoned_execution(session):
+                        await app.recover_incomplete_session(
+                            IncompleteSessionRecoveryRequest(
+                                session_id=session.id,
+                                inactive_for_seconds=None,
+                                reason="expired_attached_task_owner",
+                                metadata={"recovery_scope": "attached_task"},
+                            )
                         )
-                    )
             except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
