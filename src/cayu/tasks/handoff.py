@@ -202,6 +202,11 @@ class InterruptedTaskContinuationClaimPage(BaseModel):
         ge=0,
         le=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     )
+    # Candidates whose task group refused the claim until an earlier execution of
+    # the same task settles. This is a wait, not invalid authority.
+    group_waiting_task_ids: tuple[str, ...] = Field(
+        default=(), max_length=_TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE
+    )
     replayed: StrictBool = False
     exhausted: StrictBool
 
@@ -228,7 +233,9 @@ class InterruptedTaskContinuationClaimPage(BaseModel):
 
     @model_validator(mode="after")
     def validate_page(self) -> InterruptedTaskContinuationClaimPage:
-        skipped_candidates = self.rejected_candidates + self.filtered_candidates
+        skipped_candidates = (
+            self.rejected_candidates + self.filtered_candidates + len(self.group_waiting_task_ids)
+        )
         if self.replayed:
             if (
                 self.task is None
@@ -240,7 +247,9 @@ class InterruptedTaskContinuationClaimPage(BaseModel):
                 raise ValueError("A continuation claim replay requires exact live claim evidence.")
             return self
         if skipped_candidates > self.scanned_candidates:
-            raise ValueError("Rejected and filtered candidates cannot exceed scanned_candidates.")
+            raise ValueError(
+                "Rejected, filtered and group-waiting candidates cannot exceed scanned_candidates."
+            )
         if self.scanned_candidates == 0:
             if self.next_after is not None or not self.exhausted:
                 raise ValueError("An empty continuation page must be exhausted without a cursor.")

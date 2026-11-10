@@ -132,6 +132,7 @@ from cayu.tasks._schedule_wakeup import next_schedule_wake_at, observe_schedule_
 from cayu.tasks._task_run_settlement import (
     UnstartedClaim,
     acknowledge_stopped_handler,
+    acknowledge_undispatched_continuation,
     cancellation_carried_by,
     release_unstarted_claims,
 )
@@ -840,6 +841,10 @@ async def run_task_worker(
         continuation_scan_scanned = 0
         continuation_scan_rejected = 0
         continuation_scan_filtered = 0
+        # Group-waiting continuations in the current full scan, and those already
+        # reported, so each is logged once while it keeps waiting.
+        continuation_group_waiting: set[str] = set()
+        continuation_group_waiting_reported: frozenset[str] = frozenset()
         next_interrupted_handoff_recovery_at = 0.0
         next_interrupted_continuation_scan_at = 0.0
         subscribe_to_poller = getattr(task_store, "_durable_worker_poller", None)
@@ -1008,6 +1013,7 @@ async def run_task_worker(
             nonlocal continuation_scan_scanned
             nonlocal continuation_scan_rejected
             nonlocal continuation_scan_filtered
+            nonlocal continuation_group_waiting_reported
             nonlocal next_interrupted_handoff_recovery_at
             nonlocal next_interrupted_continuation_scan_at
 
@@ -1082,6 +1088,14 @@ async def run_task_worker(
                 continuation_scan_scanned += continuation_page.scanned_candidates
                 continuation_scan_rejected += continuation_page.rejected_candidates
                 continuation_scan_filtered += continuation_page.filtered_candidates
+                for waiting_task_id in continuation_page.group_waiting_task_ids:
+                    if waiting_task_id not in continuation_group_waiting_reported:
+                        logger.info(
+                            "Interrupted-task continuation is waiting for its group's "
+                            "earlier execution to settle: task_id=%s",
+                            app.redact_json(waiting_task_id),
+                        )
+                    continuation_group_waiting.add(waiting_task_id)
                 continuation_activity = continuation_page.task is not None
                 meaningful_activity = meaningful_activity or continuation_activity
                 if continuation_page.exhausted:
@@ -1100,6 +1114,8 @@ async def run_task_worker(
                     continuation_scan_scanned = 0
                     continuation_scan_rejected = 0
                     continuation_scan_filtered = 0
+                    continuation_group_waiting_reported = frozenset(continuation_group_waiting)
+                    continuation_group_waiting.clear()
                     next_interrupted_continuation_scan_at = (
                         loop.time() + continuation_poll_interval_s
                     )
@@ -1582,6 +1598,7 @@ async def _handle_with_heartbeat(
             interrupt_on_cancel=interrupt_on_cancel,
             event_budget_check=event_budget_check,
         )
+        await acknowledge_undispatched_continuation(settlement, task, None)
         # This worker owns the settlement it created. A write that outlives one
         # observation window is slow, not failed: keep joining it for up to one
         # task lease instead of ending the worker loop. Repeated store failures
@@ -1598,6 +1615,7 @@ async def _handle_with_heartbeat(
                 await settlement.attempt()
     except BaseException as exc:
         primary = exc
+        await acknowledge_undispatched_continuation(settlement, task, exc)
         raise
     finally:
         settlement.finish(primary)
@@ -1661,7 +1679,8 @@ async def _handle_with_heartbeat_owned(
         )
     )
     # Budget reads precede execution entry. Slow or failed reads leave a
-    # provably undispatched claim that ordinary lease reclamation can retry.
+    # provably undispatched claim that ordinary lease reclamation can retry; a
+    # continuation's execution, opened at claim, is acknowledged by the caller.
     (
         task,
         claim_deadline_monotonic,
@@ -2218,6 +2237,7 @@ async def _await_task_handler(
         return result
 
     async def owned_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+        settlement.dispatching()
         try:
             result = await invoke_handler()
         except BaseException as handler_failure:

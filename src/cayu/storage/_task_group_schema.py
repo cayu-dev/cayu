@@ -72,3 +72,70 @@ POSTGRES_TASK_GROUP_QUIESCENCE_DDL = (
         PRIMARY KEY (group_id, idempotency_key)
     )""",
 )
+
+
+# Revision 146: a retained group execution obligation records the claim
+# generation that started it. The migration runs with every worker stopped, so no
+# holder will acknowledge its execution again with its own generation; the backfill
+# copies each member's current generation, which yields the same planner and
+# owner-lost decisions as the exact one. The row is the execution's claim; or
+# reclaim's fence of it at generation N+1, which an owner-lost settlement of the
+# current row still matches (a drain by the stopped claim N no longer would); or a
+# later claim at N+2 or more, which already had to settle the retained execution.
+# A deleted member's execution is settled, because deleting a group member
+# requires a quiescent group whose executions are all settled. It records the
+# initial generation, which no claim can present again.
+_DELETED_MEMBER_GENERATION = 0
+
+
+def _sqlite_execution_generation_backfill(table: str) -> str:
+    return f"""
+UPDATE {table} SET snapshot_json = json_set(
+    snapshot_json,
+    '$.quiescence.executions',
+    json((
+        SELECT json_group_array(json(item)) FROM (
+            SELECT json_set(
+                execution.value,
+                '$.claim_generation',
+                COALESCE(task.claim_generation, {_DELETED_MEMBER_GENERATION})
+            ) AS item
+            FROM json_each({table}.snapshot_json, '$.quiescence.executions') AS execution
+            LEFT JOIN cayu_tasks AS task
+                ON task.id = json_extract(execution.value, '$.task_id')
+            ORDER BY execution.key
+        )
+    ))
+)
+WHERE json_array_length(snapshot_json, '$.quiescence.executions') > 0;
+"""
+
+
+def _postgres_execution_generation_backfill(table: str) -> str:
+    return f"""UPDATE {table} AS retained SET snapshot_json = jsonb_set(
+        retained.snapshot_json,
+        '{{quiescence,executions}}',
+        (
+            SELECT jsonb_agg(
+                execution.value
+                    || jsonb_build_object(
+                        'claim_generation',
+                        COALESCE(task.claim_generation, {_DELETED_MEMBER_GENERATION})
+                    )
+                ORDER BY execution.position
+            )
+            FROM jsonb_array_elements(retained.snapshot_json -> 'quiescence' -> 'executions')
+                WITH ORDINALITY AS execution(value, position)
+            LEFT JOIN cayu_tasks AS task ON task.id = execution.value ->> 'task_id'
+        )
+    )
+    WHERE jsonb_array_length(retained.snapshot_json -> 'quiescence' -> 'executions') > 0"""
+
+
+_GENERATION_BACKFILL_TABLES = ("cayu_task_groups", "cayu_task_group_resolutions")
+SQLITE_GROUP_EXECUTION_GENERATION_BACKFILL = "".join(
+    _sqlite_execution_generation_backfill(table) for table in _GENERATION_BACKFILL_TABLES
+)
+POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL = tuple(
+    _postgres_execution_generation_backfill(table) for table in _GENERATION_BACKFILL_TABLES
+)

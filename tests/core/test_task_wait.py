@@ -9,10 +9,10 @@ import cayu._task_wait as task_wait
 from cayu._task_wait import (
     absorb_consumed_cancellation_delivery,
     await_shielded_task_outcome,
+    capture_owned_task_outcome,
     consume_pending_task_cancellation,
     restore_task_cancellation_requests,
 )
-from cayu.verification._leased_adapter_runner import capture_owned_task_outcome
 
 
 @pytest.mark.parametrize("child_fails", [False, True])

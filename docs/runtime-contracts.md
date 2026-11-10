@@ -351,6 +351,12 @@ interrupted decisions, using `--acknowledge-breaking REVISION` for each.
 Revision 145 changes no schema; it is breaking because older binaries reject a
 failed or interrupted version-2 decision and its receipt. Older binaries must not open a migrated database; they
 refuse it as too new. On PostgreSQL the index is built `CONCURRENTLY`.
+Storage revision 146 changes no schema either. A task group's retained execution
+obligations record the claim generation that started them, and the migration
+copies each member's current generation into them; acknowledge it with
+`--acknowledge-breaking 146`. It is breaking because older binaries reject the
+field and would match a later claim under the same worker name as the settled
+earlier execution.
 
 Custom `SessionStore` implementations must accept the optional
 `checkpoint_root_guard` on bounded pending-action, interruption-marker,

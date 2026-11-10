@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
@@ -216,7 +215,7 @@ def record_transition(
     prior: Task | None,
     current: Task,
     *,
-    settled_execution: tuple[str, str, datetime] | None = None,
+    settled_execution: Task | None = None,
     invocation: TaskGroupInvocationObligation | None = None,
     resolve_attention: bool = False,
 ) -> None:

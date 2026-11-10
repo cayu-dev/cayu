@@ -34,7 +34,10 @@ from cayu.runtime.work_attempt_lifecycle import (
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope, timed_postgres_connection
 from cayu.tasks import _verified_work_policy as verified_work_support
-from cayu.tasks._lifecycle import _ensure_exact_owned_active_task_lease
+from cayu.tasks._lifecycle import (
+    _ensure_exact_owned_active_task_lease,
+    work_attempt_claim_execution,
+)
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -515,7 +518,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
             current: Task,
             *,
             operation_id: str | None = None,
-            settled_execution: tuple[str, str, datetime] | None = None,
+            settled_execution: Task | None = None,
         ) -> None: ...
 
         def _task_filter_clauses(self, query: TaskQuery) -> tuple[list[str], list[object]]: ...
@@ -2011,9 +2014,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 cur,
                 task,
                 updated,
-                settled_execution=(task.id, request.worker_id, task.started_at)
-                if task.started_at is not None
-                else None,
+                settled_execution=work_attempt_claim_execution(task, request.worker_id),
             )
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_preparation_holds "
@@ -2144,9 +2145,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                 cur,
                 task,
                 updated,
-                settled_execution=(task.id, admission.claim.worker_id, task.started_at)
-                if task.started_at is not None
-                else None,
+                settled_execution=work_attempt_claim_execution(task, admission.claim.worker_id),
             )
             await cur.execute(
                 "INSERT INTO cayu_work_attempt_lifecycle_receipts "

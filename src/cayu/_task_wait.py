@@ -113,6 +113,19 @@ async def absorb_consumed_cancellation_delivery() -> None:
         consume_pending_task_cancellation()
 
 
+async def capture_owned_task_outcome(
+    factory: Callable[[], Awaitable[_ResultT]],
+) -> CapturedAwaitableOutcome[_ResultT]:
+    """Retain directly captured cancellation evidence through task completion."""
+    outcome = await capture_awaitable_outcome(factory)
+    if isinstance(outcome.error, asyncio.CancelledError):
+        consume_pending_task_cancellation(outcome.error)
+        # Before Python 3.13 a consumed request restored while this task ran stays pending
+        # and would end the task cancelled, replacing this outcome and its cause.
+        await absorb_consumed_cancellation_delivery()
+    return outcome
+
+
 def restore_task_cancellation_requests(
     count: int,
     *,

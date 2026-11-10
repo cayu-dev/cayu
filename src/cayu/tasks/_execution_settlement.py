@@ -72,6 +72,7 @@ class TaskExecutionSettlement:
         self._entry_operation: asyncio.Task[TaskStoreOperationOutcome[Task]] | None = None
         self._entry_failed = False
         self._return_verification: Callable[[], Awaitable[bool]] | None = None
+        self._dispatched = False
 
     async def enter(self, claim: Task, nondispatch_result: Any = None) -> Task:
         """Own one start publication until its exact acknowledgement is known.
@@ -120,6 +121,15 @@ class TaskExecutionSettlement:
         self._entry_operation = None
         self._entry_claim = None
         return outcome.result
+
+    def dispatching(self) -> None:
+        """Record that the owner is about to invoke the handler."""
+        self._dispatched = True
+
+    @property
+    def undispatched(self) -> bool:
+        """The owner never invoked the handler and observed no execution."""
+        return not self._dispatched and self._authority is None and self._entry_claim is None
 
     @property
     def undispatched_entry(self) -> bool:

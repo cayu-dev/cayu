@@ -13,6 +13,7 @@ from hashlib import sha256
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.tasks._cancellation import (
+    _cancellation_drain_holds,
     _task_cancellation_requested_task,
     _task_retry_cancellation_requested_task,
 )
@@ -97,19 +98,57 @@ def reconciliation_is_complete(snapshot: TaskGroupSnapshot) -> bool:
     )
 
 
-def retained_execution_settlement_matches(
-    snapshot: TaskGroupSnapshot, settled_execution: tuple[str, str, datetime]
-) -> bool:
+def claim_holds_execution(execution: TaskGroupExecutionObligation, claim: Task) -> bool:
+    """Whether ``claim`` is the task claim that started ``execution``.
+
+    The claim generation is the authority. A later claim is a different
+    execution even under the same worker name and with the task's original
+    start time. The row may also be reclaim's cancellation fence of that claim,
+    which keeps its holder and advances the generation by one. The worker name
+    and start time are evidence and must agree, never a substitute.
+
+    A later claim is never at exactly N+1 with a cancellation request: claim,
+    release, reclaim and handoff each advance the generation, so a new holder
+    is at N+2 or more. Verified-work holds release the worker without advancing
+    it, but a held row resumes through ``_fresh_resumed_execution``, which moves
+    its start time past the retained execution, and an admitted row is never
+    continued. Reclaim skips rows that already carry a cancellation request.
+    """
+    return (
+        execution.task_id == claim.id
+        and execution.worker_id is not None
+        and execution.started_at == claim.started_at
+        and _cancellation_drain_holds(
+            claim,
+            worker_id=execution.worker_id,
+            claim_generation=execution.claim_generation,
+        )
+    )
+
+
+def _observes_execution(execution: TaskGroupExecutionObligation, task: Task) -> bool:
+    """Whether a started, active member row is still ``execution``'s dispatch.
+
+    A row without a worker holds no claim, so its generation names no execution
+    (a release may or may not have advanced it). Such a row keeps its last
+    execution by dispatch marker, and an ownerless start is authenticated by its
+    invocation obligation, not by a claim.
+    """
+    if task.worker_id is None:
+        return execution.started_at == task.started_at
+    return claim_holds_execution(execution, task)
+
+
+def retained_execution_settlement_matches(snapshot: TaskGroupSnapshot, claim: Task) -> bool:
     """Authenticate acknowledgement replay without requiring deleted task rows.
 
     Only an already-settled exact execution is proof. A terminal group outcome
     by itself never authorizes a new settlement or a different execution.
     """
-    identity, worker_id, started_at = settled_execution
     execution = next(
-        (item for item in snapshot.quiescence.executions if item.task_id == identity), None
+        (item for item in snapshot.quiescence.executions if item.task_id == claim.id), None
     )
-    if execution is None or execution.worker_id != worker_id or execution.started_at != started_at:
+    if execution is None or not claim_holds_execution(execution, claim):
         raise TaskGroupConflict("Execution settlement does not match its retained group owner.")
     return execution.settled_at is not None and (
         execution.result_resolution is None or execution.result_resolution.settled_at is not None
@@ -187,11 +226,20 @@ def require_group_mutation(
         raise TaskGroupConflict("A fenced group loser cannot publish successful completion.")
     if proposed.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING} and (
         prior.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
-        or prior.worker_id != proposed.worker_id
+        or not _keeps_claim(prior, proposed)
         or prior.started_at != proposed.started_at
         or prior.session_instance_id != proposed.session_instance_id
     ):
         raise TaskGroupConflict("A fenced group loser cannot start or resume execution.")
+
+
+def _keeps_claim(prior: Task, proposed: Task) -> bool:
+    """Whether ``proposed`` keeps ``prior``'s claim, by generation, not worker name."""
+    if prior.worker_id is None:
+        return proposed.worker_id is None
+    return _cancellation_drain_holds(
+        proposed, worker_id=prior.worker_id, claim_generation=prior.claim_generation
+    )
 
 
 def observe_result_resolution(
@@ -262,7 +310,7 @@ def plan_group_graph_transition(
     prerequisites: Mapping[str, tuple[str, ...]],
     first_sequence: int,
     now: datetime,
-    settled_execution: tuple[str, str, datetime] | None = None,
+    settled_execution: Task | None = None,
     resolve_attention: bool = False,
     unsettled_effects: frozenset[str] = frozenset(),
     lineage_roots: Mapping[str, str] | None = None,
@@ -294,16 +342,13 @@ def plan_group_graph_transition(
     for identity in (*snapshot.receipt.member_task_ids, *lineage_roots):
         task = tasks[identity]
         if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING} and task.started_at is not None:
-            prior = executions.get(identity)
-            if (
-                prior is None
-                or (task.worker_id is not None and prior.worker_id != task.worker_id)
-                or prior.started_at != task.started_at
-            ):
-                if prior is not None and prior.settled_at is None:
+            prior_execution = executions.get(identity)
+            if prior_execution is None or not _observes_execution(prior_execution, task):
+                if prior_execution is not None and prior_execution.settled_at is None:
                     raise TaskGroupConflict("Prior group execution is still unsettled.")
                 executions[identity] = TaskGroupExecutionObligation(
                     task_id=identity,
+                    claim_generation=task.claim_generation,
                     worker_id=task.worker_id,
                     started_at=task.started_at,
                 )
@@ -386,17 +431,13 @@ def plan_group_graph_transition(
             )
         # A session nested inside a worker does not settle that worker's later
         # callback work. Its natural return/lifecycle receipt owns that proof.
-    if settled_execution is not None and settled_execution[0] in {
+    if settled_execution is not None and settled_execution.id in {
         *snapshot.receipt.member_task_ids,
         *lineage_roots,
     }:
-        identity, worker_id, started_at = settled_execution
+        identity = settled_execution.id
         execution = executions.get(identity)
-        if (
-            execution is None
-            or execution.worker_id != worker_id
-            or execution.started_at != started_at
-        ):
+        if execution is None or not claim_holds_execution(execution, settled_execution):
             raise TaskGroupConflict("Execution settlement does not match its group owner.")
         if (
             execution.result_resolution is not None
@@ -699,9 +740,10 @@ def _fresh_resumed_execution(
 ) -> GraphTransition:
     """A resumed, sessionless callback must not reuse an old dispatch marker.
 
-    The marker remains a durable execution identity, not lease-time authority.
-    Advance it strictly past its predecessor even if store time repeats or moves
-    backwards. No task-wide schema or unrelated task history is changed.
+    The claim generation identifies the resumed claim's execution; the marker is
+    evidence that must still agree. Advance it strictly past its predecessor
+    even if store time repeats or moves backwards. No task-wide schema or
+    unrelated task history is changed.
     """
     executions = {item.task_id: item for item in snapshot.quiescence.executions}
     changed = []

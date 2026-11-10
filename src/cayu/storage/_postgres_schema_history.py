@@ -39,6 +39,7 @@ from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
+    POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL,
     POSTGRES_TASK_GROUP_DDL,
     POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
 )
@@ -849,6 +850,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     # Failed and interrupted terminal decisions; no schema change.
     145: (),
+    # Group execution obligations carry the claim generation that started them.
+    146: POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

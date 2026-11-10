@@ -163,6 +163,10 @@ Outcome, quiescence, and finalizer lifecycle are separate:
 | `quiescent` | Positive settlement proof covers every losing obligation |
 
 An execution obligation survives terminal task publication and lease clearing.
+A worker's execution is identified by the claim generation that started it, not
+by the worker name or start time: a continuation of an interrupted session is a
+new claim, so it owns a new obligation even under the original worker name and
+start time, and the barrier keeps waiting until that callback returns.
 Existing workers retain their handlers until settlement; cancelling an asyncio
 waiter is not proof that a thread, provider, or external mutation stopped.
 Verified work uses its exact admission, release, and lifecycle receipts rather

@@ -257,9 +257,7 @@ def _ensure_recovered_attached_task_authority(
     _validate_ordinary_task_terminalization_against_cancellation(task, request)
 
 
-def recovered_completion_execution(
-    prior: Task, status: TaskStatus
-) -> tuple[str, str, datetime] | None:
+def recovered_completion_execution(prior: Task, status: TaskStatus) -> Task | None:
     """The dead owner's group execution an attached-task recovery settles with it.
 
     A worker acknowledges its execution only after its callback returns. When
@@ -269,9 +267,35 @@ def recovered_completion_execution(
     transaction. A recovered failure proves no such thing and leaves it owed.
     """
 
-    if prior.worker_id is None or prior.started_at is None or status is not TaskStatus.COMPLETED:
+    if status is not TaskStatus.COMPLETED:
         return None
-    return prior.id, prior.worker_id, prior.started_at
+    return claimed_execution(prior)
+
+
+def claimed_execution(task: Task) -> Task | None:
+    """The worker claim whose group execution a store-side settlement acknowledges.
+
+    The returned row is the identity: its claim generation, not its worker name
+    or start time, names the execution (see ``claim_holds_execution``).
+    """
+
+    if task.worker_id is None or task.started_at is None:
+        return None
+    return task
+
+
+def work_attempt_claim_execution(task: Task, worker_id: str) -> Task | None:
+    """The task claim a work-attempt settlement acknowledges the execution of.
+
+    The settlement is authorized by its work-attempt admission, whose claim
+    names the task worker. Verified work releases that worker without advancing
+    the task's claim generation, so the row still carries the generation of the
+    claim that started the execution.
+    """
+
+    if task.started_at is None:
+        return None
+    return task.model_copy(update={"worker_id": worker_id})
 
 
 def _ensure_task_handoff_authority(task: Task, handoff_id: str | None) -> None:

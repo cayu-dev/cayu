@@ -29,6 +29,8 @@ class _ClockedCursor:
         self.wall_now = self.transaction_now
         self.rows = []
         self.claimed = None
+        # The unlocked candidate selection that takes graph locks before rows.
+        self.candidate_ids = [receipt.task.id]
 
     async def __aenter__(self):
         return self
@@ -41,6 +43,15 @@ class _ClockedCursor:
         self.rows = []
         if statement.startswith("SELECT pg_advisory_xact_lock"):
             return
+        if statement.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ")):
+            return
+        if statement.startswith("SELECT task.id FROM cayu_tasks AS task"):
+            self.rows = [(task_id,) for task_id in self.candidate_ids]
+            return
+        if statement.startswith("SELECT graph_id") and "cayu_task_graph_members" in statement:
+            return  # An ungrouped task: no graph to lock or record.
+        if statement.startswith("SELECT state_json FROM cayu_task_retry_keys"):
+            return  # No retry-key state to observe for this transition.
         if statement == "SELECT clock_timestamp()":
             self.rows = [(self.wall_now,)]
             return

@@ -120,6 +120,7 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    claimed_execution,
     recovered_completion_execution,
 )
 from cayu.tasks._scheduling import (
@@ -176,6 +177,7 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphSnapshot,
 )
+from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.handoff import (
     _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     InterruptedTaskContinuationClaimPage,
@@ -282,7 +284,8 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 143
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 146
+_CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -1388,7 +1391,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         event_admission: bool = False,
         event_now: datetime | None = None,
         operation_id: str | None = None,
-        settled_execution: tuple[str, str, datetime] | None = None,
+        settled_execution: Task | None = None,
     ) -> None:
         from cayu.storage._postgres_task_graphs import record_transition
 
@@ -3409,9 +3412,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 task_id_params: list[object] = [] if task_id is None else [task_id]
                 # A parked handoff is continued only by its own bound trigger.
                 parked_sql = "" if expected is not None else _POSTGRES_UNPARKED_HANDOFF_SQL
-                await cur.execute(
-                    f"""
-                        SELECT {_TASK_RETURNING_COLUMNS}
+                candidate_sql = f"""
                         FROM cayu_tasks AS task
                         WHERE status = %s
                           AND session_id IS NOT NULL
@@ -3423,19 +3424,37 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                           {parked_sql}
                           {task_id_sql}
                           {after_sql}
-                        ORDER BY created_at ASC, id ASC
-                        FOR UPDATE OF task
-                        LIMIT %s
-                        """,
-                    [
-                        str(TaskStatus.RUNNING),
-                        *task_id_params,
-                        *after_params,
-                        scan_limit,
-                    ],
+                        """
+                candidate_params = [str(TaskStatus.RUNNING), *task_id_params, *after_params]
+                from cayu.storage._postgres_task_graphs import (
+                    TaskCandidateQuery,
+                    select_graph_scopes,
+                )
+
+                # A continuation claim records a group transition, so it owns the
+                # candidates' graphs before any task row.
+                (candidate_ids,) = await select_graph_scopes(
+                    cur,
+                    (
+                        TaskCandidateQuery(
+                            f"SELECT task.id {candidate_sql} "
+                            "ORDER BY created_at ASC, id ASC LIMIT %s",
+                            (*candidate_params, scan_limit),
+                        ),
+                    ),
+                )
+                await cur.execute(
+                    f"SELECT {_TASK_RETURNING_COLUMNS} {candidate_sql} "
+                    "AND task.id = ANY(%s) ORDER BY created_at ASC, id ASC "
+                    "FOR UPDATE OF task LIMIT %s",
+                    [*candidate_params, list(candidate_ids), scan_limit],
                 )
                 rows = await cur.fetchall()
+                # A candidate claimed concurrently between the two selections drops
+                # out of ``rows``; only the unlocked selection says the scan is done.
+                selection_exhausted = len(candidate_ids) < scan_limit
                 rejected = 0
+                group_waiting: list[str] = []
                 filtered = 0
                 result: InterruptedTaskContinuationClaimPage | None = None
                 last_observed: Task | None = None
@@ -3484,6 +3503,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     require_parked_continuation_trigger(
                         receipt, None if expected is None else expected.parked_wait
                     )
+                    # A group refusal rejects only this candidate and its writes.
+                    await cur.execute(f"SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}")
                     await cur.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
                         "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
@@ -3524,13 +3545,25 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                             "PostgreSQL continuation claim lost its locked candidate."
                         )
                     claimed = pg_support.task_from_row(claimed_row)
+                    try:
+                        # A continuation is a new claim; its group execution is its own.
+                        await self._record_task_transition(cur, observed, claimed)
+                    except TaskGroupConflict:
+                        await cur.execute(
+                            f"ROLLBACK TO SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}"
+                        )
+                        await cur.execute(f"RELEASE SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}")
+                        group_waiting.append(observed.id)
+                        continue
+                    await cur.execute(f"RELEASE SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}")
                     result = InterruptedTaskContinuationClaimPage(
                         task=claimed,
                         next_after=(observed.created_at, observed.id),
                         scanned_candidates=index + 1,
                         rejected_candidates=rejected,
                         filtered_candidates=filtered,
-                        exhausted=index == len(rows) - 1 and len(rows) < scan_limit,
+                        group_waiting_task_ids=tuple(group_waiting),
+                        exhausted=index == len(rows) - 1 and selection_exhausted,
                     )
                     break
                 if result is None:
@@ -3543,7 +3576,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         scanned_candidates=len(rows),
                         rejected_candidates=rejected,
                         filtered_candidates=filtered,
-                        exhausted=len(rows) < scan_limit,
+                        group_waiting_task_ids=tuple(group_waiting),
+                        exhausted=not rows or selection_exhausted,
                     )
             await conn.commit()
         return result
@@ -3711,9 +3745,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         cur,
                         task,
                         durable_task,
-                        settled_execution=(task.id, task.worker_id, task.started_at)
-                        if task.worker_id is not None and task.started_at is not None
-                        else None,
+                        settled_execution=claimed_execution(task),
                     )
                     await cur.execute(
                         "INSERT INTO cayu_task_terminalization_receipts "
@@ -4083,9 +4115,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         cur,
                         task,
                         durable_task,
-                        settled_execution=(task.id, task.worker_id, task.started_at)
-                        if task.worker_id is not None and task.started_at is not None
-                        else None,
+                        settled_execution=claimed_execution(task),
                     )
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "

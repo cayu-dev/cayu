@@ -13,13 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.runtime._run_exit import RunExitKind, classify_run_exit
-from cayu.tasks._execution_settlement import pending_task_execution_settlements
+from cayu.tasks._execution_settlement import (
+    TaskExecutionSettlement,
+    pending_task_execution_settlements,
+)
 from cayu.tasks.cancellation import (
     _task_cancellation_requested,
     _task_retry_cancellation_requested,
@@ -28,7 +32,6 @@ from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tasks.terminalization import TaskTerminalizationConflict
 
 if TYPE_CHECKING:
-    from cayu.tasks._execution_settlement import TaskExecutionSettlement
     from cayu.tasks.records import Task
     from cayu.tasks.store import TaskStore
 
@@ -79,6 +82,66 @@ async def acknowledge_stopped_handler(
             "Task-group execution acknowledgement also failed: "
             f"{type(acknowledgement_failure).__name__}."
         )
+
+
+async def acknowledge_undispatched_continuation(
+    settlement: TaskExecutionSettlement,
+    claim: Task,
+    failure: BaseException | None,
+) -> None:
+    """Acknowledge a continuation's execution when its handler was never dispatched.
+
+    A continuation claim opens its group execution when it is claimed, not at
+    execution entry. If the worker stops before invoking the handler, for a
+    requested cancellation, an elapsed retry deadline, a failed budget read or
+    a lost claim, nothing else proves it stopped: the proof is that it never
+    started. A fresh claim opens its execution only at entry, which owns its
+    acknowledgement. A process-level stop is left to recovery.
+    """
+
+    if claim.interrupted_handoff_id is None or not settlement.undispatched:
+        return
+    if failure is not None and classify_run_exit(failure).kind is RunExitKind.PROCESS_CONTROL:
+        return
+    settlement.observe(claim)
+    await settlement.attempt()
+
+
+@asynccontextmanager
+async def continuation_execution(store: TaskStore, claim: Task) -> AsyncIterator[None]:
+    """Own the group execution a continuation claim opened, for a claimer without a worker.
+
+    A continuation claim opens a group execution. A claimer that does its own
+    work under the claim instead of dispatching a worker handler (an operator
+    recovery plan) runs that work inside this block. When the block stops, by
+    returning or by raising, the work has stopped, so the execution is
+    acknowledged; a pending acknowledgement is carried by the block's failure,
+    or raised. Callers must propagate it, never record it as an ordinary
+    failure: the handle is the only owner of that retry. A process-level stop
+    is left to recovery.
+    """
+
+    settlement = TaskExecutionSettlement(store)
+    primary: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        primary = exc
+        if classify_run_exit(exc).kind is not RunExitKind.PROCESS_CONTROL:
+            settlement.observe(claim)
+            await settlement.attempt()
+        raise
+    else:
+        settlement.observe(claim)
+        try:
+            await settlement.attempt()
+        except BaseException as exc:
+            # A cancellation while acknowledging stays the primary exit and
+            # carries the pending retry handle.
+            primary = exc
+            raise
+    finally:
+        settlement.finish(primary)
 
 
 def cancellation_carried_by(

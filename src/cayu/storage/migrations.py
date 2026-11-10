@@ -605,6 +605,12 @@ REVISIONS: tuple[Revision, ...] = (
     # terminal decision, installed with its transition receipt. Older binaries
     # reject both records, so they must not open it. No schema change.
     Revision(revision=145, kind=RevisionKind.BREAKING, compatible_from=145),
+    # A task group's execution obligation records the claim generation that
+    # started it, and settlement matches that generation instead of the worker
+    # name. The migration copies each member's current generation into its
+    # retained obligations. Older binaries reject the field and would match a
+    # later claim under the same worker name, so they must not open it.
+    Revision(revision=146, kind=RevisionKind.BREAKING, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

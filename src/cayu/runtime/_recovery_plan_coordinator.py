@@ -6,13 +6,15 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from datetime import UTC, datetime
+from functools import partial
 from hashlib import sha256
 from time import monotonic
 from typing import Protocol, cast
 from uuid import uuid4
 
+from cayu._task_wait import capture_owned_task_outcome
 from cayu._validation import canonical_durable_json_bytes, copy_durable_json_object
 from cayu.approvals.tools import ToolApprovalRecoveryOutcome
 from cayu.collaboration.access import CollaborationAccessContext
@@ -120,6 +122,8 @@ from cayu.sessions.recovery import (
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.sessions.store import SessionStore
+from cayu.tasks._execution_settlement import has_task_execution_settlement_pending
+from cayu.tasks._task_run_settlement import continuation_execution
 from cayu.tasks.handoff import TaskInterruptedHandoffReceipt, interrupted_task_handoff_request
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
@@ -1502,7 +1506,10 @@ class RecoveryPlanCoordinator:
             ),
         )
         if handed_off:
-            await self._task_store.terminalize_task(request)
+            # The continuation this plan claimed opened a group execution; the
+            # plan's own terminalization is that execution.
+            async with continuation_execution(self._task_store, task):
+                await self._task_store.terminalize_task(request)
         else:
             await self._task_store.recover_attached_task_failure(
                 request,
@@ -1719,6 +1726,10 @@ class RecoveryPlanCoordinator:
                         return await self._leave_item_intact(request, item, decision)
                     return await self._execute_item(request, item, decision)
                 except Exception as exc:
+                    if has_task_execution_settlement_pending(exc):
+                        # The caller owns the group execution acknowledgement retry;
+                        # a failed receipt would discard its only handle.
+                        raise
                     if request.plan.request.participant_context is not None and isinstance(
                         exc, PermissionError
                     ):
@@ -1760,11 +1771,22 @@ class RecoveryPlanCoordinator:
                         error_code=type(exc).__name__,
                     )
 
-        results = await asyncio.gather(*(execute(item) for item in request.plan.items))
+        # Every item finishes before any failure is raised, so no item keeps
+        # running unobserved. Each item's exit is captured inside its own task,
+        # so a cancelled item keeps the pending acknowledgement its cancellation
+        # carries, and every one of them reaches the caller.
+        outcomes = await asyncio.gather(
+            *(capture_owned_task_outcome(partial(execute, item)) for item in request.plan.items)
+        )
+        failures = [outcome.error for outcome in outcomes if outcome.error is not None]
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Recovery plan items failed.", failures)
         return RecoveryReceipt(
             plan_id=request.plan.plan_id,
             execution_id=request.execution_id,
-            items=tuple(results),
+            items=tuple(outcome.result for outcome in outcomes if outcome.result is not None),
         )
 
     async def _leave_item_intact(
@@ -1988,6 +2010,8 @@ class RecoveryPlanCoordinator:
                         item_status = RecoveryItemExecutionStatus.FAILED
                         error_code = "incomplete_session_recovery_failed"
                 except Exception as exc:
+                    if has_task_execution_settlement_pending(exc):
+                        raise
                     item_status = RecoveryItemExecutionStatus.FAILED
                     error_code = type(exc).__name__
         finally:
@@ -2433,67 +2457,74 @@ class RecoveryPlanCoordinator:
             task_heartbeat_stop: asyncio.Event | None = None
             task_heartbeat_lost: asyncio.Event | None = None
             task_heartbeat: asyncio.Task[None] | None = None
-            if recoverable_task is not None:
-                preparation = await self._incomplete_recovery.interrupt_incomplete_session_for_manual_tool_recovery(
-                    IncompleteSessionRecoveryRequest(
-                        session_id=private_session_id,
-                        inactive_for_seconds=None,
-                        reason="operator_prepared_task_backed_tool_recovery",
-                        metadata={"plan_item_id": item.item_id},
+            # A continuation this plan claims opens a group execution; the tool-round
+            # recovery below is that execution, acknowledged once it stops.
+            async with AsyncExitStack() as continuation:
+                if recoverable_task is not None:
+                    preparation = await self._incomplete_recovery.interrupt_incomplete_session_for_manual_tool_recovery(
+                        IncompleteSessionRecoveryRequest(
+                            session_id=private_session_id,
+                            inactive_for_seconds=None,
+                            reason="operator_prepared_task_backed_tool_recovery",
+                            metadata={"plan_item_id": item.item_id},
+                        )
                     )
-                )
-                events.extend(preparation.events)
-                interrupted = await self._session_store.load(private_session_id)
-                if interrupted is None:
-                    raise KeyError(f"Session not found: {item.session_id}")
-                released = await self._prepare_recoverable_task_handoff(
-                    task=recoverable_task,
-                    session=interrupted,
-                )
-                claimed = await self._claim_plan_task_continuation(
-                    task=released,
-                    item=item,
-                    execution_id=request.execution_id,
-                )
-                task_worker_id = claimed.worker_id
-                task_handoff_id = claimed.interrupted_handoff_id
-                task_heartbeat_stop = asyncio.Event()
-                task_heartbeat_lost = asyncio.Event()
-                task_heartbeat = asyncio.create_task(
-                    self._heartbeat_plan_task_continuation(
-                        task=claimed,
-                        stop=task_heartbeat_stop,
-                        lost=task_heartbeat_lost,
+                    events.extend(preparation.events)
+                    interrupted = await self._session_store.load(private_session_id)
+                    if interrupted is None:
+                        raise KeyError(f"Session not found: {item.session_id}")
+                    released = await self._prepare_recoverable_task_handoff(
+                        task=recoverable_task,
+                        session=interrupted,
                     )
-                )
-            try:
-                async for event in self._recover_tool_round(
-                    ToolRoundRecoveryRequest(
-                        session_id=private_session_id,
-                        task_worker_id=task_worker_id,
-                        task_handoff_id=task_handoff_id,
-                        round_id=action.round_id,
-                        tool_call_id=action.tool_call_id,
-                        outcome=(
-                            ToolApprovalRecoveryOutcome.COMPLETED
-                            if decision.action is RecoveryPlanAction.TOOL_MARK_COMPLETED
-                            else ToolApprovalRecoveryOutcome.FAILED
-                        ),
-                        message=decision.message or "Operator supplied recovery disposition.",
-                        reason="operator_executed_recovery_plan",
-                        metadata={"plan_item_id": item.item_id},
+                    claimed = await self._claim_plan_task_continuation(
+                        task=released,
+                        item=item,
+                        execution_id=request.execution_id,
                     )
-                ):
-                    events.append(event)
-            finally:
-                if task_heartbeat_stop is not None:
-                    task_heartbeat_stop.set()
-                if task_heartbeat is not None:
-                    task_heartbeat.cancel()
-                    await asyncio.gather(task_heartbeat, return_exceptions=True)
-            if task_heartbeat_lost is not None and task_heartbeat_lost.is_set():
-                raise TaskClaimLost("Recovery-plan task continuation lease was lost.")
-            return (), tuple(_safe_ref("event", event.id) for event in events)
+                    assert self._task_store is not None
+                    await continuation.enter_async_context(
+                        continuation_execution(self._task_store, claimed)
+                    )
+                    task_worker_id = claimed.worker_id
+                    task_handoff_id = claimed.interrupted_handoff_id
+                    task_heartbeat_stop = asyncio.Event()
+                    task_heartbeat_lost = asyncio.Event()
+                    task_heartbeat = asyncio.create_task(
+                        self._heartbeat_plan_task_continuation(
+                            task=claimed,
+                            stop=task_heartbeat_stop,
+                            lost=task_heartbeat_lost,
+                        )
+                    )
+                try:
+                    async for event in self._recover_tool_round(
+                        ToolRoundRecoveryRequest(
+                            session_id=private_session_id,
+                            task_worker_id=task_worker_id,
+                            task_handoff_id=task_handoff_id,
+                            round_id=action.round_id,
+                            tool_call_id=action.tool_call_id,
+                            outcome=(
+                                ToolApprovalRecoveryOutcome.COMPLETED
+                                if decision.action is RecoveryPlanAction.TOOL_MARK_COMPLETED
+                                else ToolApprovalRecoveryOutcome.FAILED
+                            ),
+                            message=decision.message or "Operator supplied recovery disposition.",
+                            reason="operator_executed_recovery_plan",
+                            metadata={"plan_item_id": item.item_id},
+                        )
+                    ):
+                        events.append(event)
+                finally:
+                    if task_heartbeat_stop is not None:
+                        task_heartbeat_stop.set()
+                    if task_heartbeat is not None:
+                        task_heartbeat.cancel()
+                        await asyncio.gather(task_heartbeat, return_exceptions=True)
+                if task_heartbeat_lost is not None and task_heartbeat_lost.is_set():
+                    raise TaskClaimLost("Recovery-plan task continuation lease was lost.")
+                return (), tuple(_safe_ref("event", event.id) for event in events)
 
         raise RuntimeError(f"Unsupported recovery plan action: {decision.action}")
 

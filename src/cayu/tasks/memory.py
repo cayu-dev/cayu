@@ -122,7 +122,9 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    claimed_execution,
     recovered_completion_execution,
+    work_attempt_claim_execution,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -270,6 +272,7 @@ from cayu.tasks.creation import (
     _task_session_instance_for_attachment,
     copy_task_create,
 )
+from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.handoff import (
     _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     InterruptedTaskContinuationClaimPage,
@@ -1224,9 +1227,7 @@ class InMemoryTaskStore(TaskStore):
             )
             self._store_task(
                 updated,
-                settled_execution=(task.id, request.worker_id, task.started_at)
-                if task.started_at is not None
-                else None,
+                settled_execution=work_attempt_claim_execution(task, request.worker_id),
             )
             self._work_attempt_preparation_holds[request.hold_id] = receipt
             return receipt.model_copy(deep=True)
@@ -1282,9 +1283,7 @@ class InMemoryTaskStore(TaskStore):
             settled_admission = self._copy_work_attempt_admission(settled_admission)
             self._store_task(
                 updated,
-                settled_execution=(task.id, admission.claim.worker_id, task.started_at)
-                if task.started_at is not None
-                else None,
+                settled_execution=work_attempt_claim_execution(task, admission.claim.worker_id),
             )
             if receipt.retired_contract_binding:
                 self._remove_contracted_session_index_entry(updated)
@@ -3780,6 +3779,7 @@ class InMemoryTaskStore(TaskStore):
             page = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[:scan_limit]
             active_keys = self._live_concurrency_keys(now)
             rejected = 0
+            group_waiting: list[str] = []
             filtered = 0
             for index, task in enumerate(page):
                 if not _task_matches_claim_filter(task, query):
@@ -3812,7 +3812,13 @@ class InMemoryTaskStore(TaskStore):
                         "updated_at": now,
                     }
                 )
-                self._store_task(claimed)
+                try:
+                    self._store_task(claimed)
+                except TaskGroupConflict:
+                    # The group refuses this claim before any write; skip only
+                    # this candidate so later continuations stay claimable.
+                    group_waiting.append(task.id)
+                    continue
                 self._interrupted_continuation_claims[handoff_id_sha256] = (
                     claimed.id,
                     worker_id,
@@ -3824,6 +3830,7 @@ class InMemoryTaskStore(TaskStore):
                     scanned_candidates=index + 1,
                     rejected_candidates=rejected,
                     filtered_candidates=filtered,
+                    group_waiting_task_ids=tuple(group_waiting),
                     exhausted=index == len(page) - 1 and len(page) < scan_limit,
                 )
             return InterruptedTaskContinuationClaimPage(
@@ -3831,6 +3838,7 @@ class InMemoryTaskStore(TaskStore):
                 scanned_candidates=len(page),
                 rejected_candidates=rejected,
                 filtered_candidates=filtered,
+                group_waiting_task_ids=tuple(group_waiting),
                 exhausted=len(page) < scan_limit,
             )
 
@@ -3890,9 +3898,7 @@ class InMemoryTaskStore(TaskStore):
             )
             self._store_task(
                 result.task,
-                settled_execution=(task.id, task.worker_id, task.started_at)
-                if task.worker_id is not None and task.started_at is not None
-                else None,
+                settled_execution=claimed_execution(task),
             )
             self._terminalization_receipts[receipt_key] = result.terminalization_receipt
             return _copy_task_cancellation_reconciliation_result(result)
@@ -4108,9 +4114,7 @@ class InMemoryTaskStore(TaskStore):
             )
             self._store_task(
                 receipt.task,
-                settled_execution=(task.id, task.worker_id, task.started_at)
-                if task.worker_id is not None and task.started_at is not None
-                else None,
+                settled_execution=claimed_execution(task),
             )
             self._retry_settlements[receipt_key] = receipt
             return receipt.model_copy(deep=True)
@@ -5184,7 +5188,7 @@ class InMemoryTaskStore(TaskStore):
         handoff_id: str | None = None,
         accepted_decision_id: str | None = None,
         now: datetime | None = None,
-        settled_execution: tuple[str, str, datetime] | None = None,
+        settled_execution: Task | None = None,
     ) -> Task:
         updated, retry_settlement = self._prepare_finished_task(
             task_id,
@@ -5387,7 +5391,7 @@ class InMemoryTaskStore(TaskStore):
         task: Task,
         *,
         schedule_operation_id: str | None = None,
-        settled_execution: tuple[str, str, datetime] | None = None,
+        settled_execution: Task | None = None,
     ) -> None:
         from cayu.tasks._memory_graphs import store_graph_task
 

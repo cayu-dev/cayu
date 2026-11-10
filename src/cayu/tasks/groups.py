@@ -130,11 +130,16 @@ class TaskGroupResultResolutionObligation(BaseModel):
 
 
 class TaskGroupExecutionObligation(BaseModel):
-    """Execution evidence survives terminal task publication and lease clearing."""
+    """Execution evidence survives terminal task publication and lease clearing.
+
+    A worker's execution is identified by the claim generation that started it.
+    The worker name and start time are evidence only: a later claim may reuse both.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     task_id: GraphIdentifier
+    claim_generation: int = Field(strict=True, ge=0)
     worker_id: str | None = Field(default=None, strict=True)
     started_at: datetime
     settled_at: datetime | None = None

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu.tasks._groups import GroupPublication, require_group_replay, validate_group_cursor
@@ -157,7 +156,7 @@ async def reconcile(
     group_id: str,
     *,
     resolution: TaskGroupQuiescenceResolution | None = None,
-    settled_execution: tuple[str, str, datetime] | None = None,
+    settled_execution: Task | None = None,
     invocation: TaskGroupInvocationObligation | None = None,
 ) -> TaskGroupSnapshot:
     from cayu.storage._sqlite_task_graphs import record_transition
@@ -245,7 +244,7 @@ async def settle_execution(store: SQLiteTaskStore, task: Task) -> None:
     await reconcile(
         store,
         snapshot.receipt.group_id,
-        settled_execution=(task.id, task.worker_id, task.started_at),
+        settled_execution=task,
     )
 
 

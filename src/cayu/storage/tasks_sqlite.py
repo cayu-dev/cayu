@@ -131,7 +131,9 @@ from cayu.tasks._lifecycle import (
     _raise_task_claim_attach_error,
     _require_active_attached_task_worker,
     _require_direct_attached_task_resume,
+    claimed_execution,
     recovered_completion_execution,
+    work_attempt_claim_execution,
 )
 from cayu.tasks._scheduling import (
     admitted_schedule,
@@ -289,6 +291,7 @@ from cayu.tasks.graphs import (
     TaskGraphEvent,
     TaskGraphSnapshot,
 )
+from cayu.tasks.groups import TaskGroupConflict
 from cayu.tasks.handoff import (
     _TASK_INTERRUPTED_HANDOFF_RECOVERY_MAX_PAGE_SIZE,
     InterruptedTaskContinuationClaimPage,
@@ -404,7 +407,8 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 143
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 146
+_CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 
 
 @model_store_surface("tasks")
@@ -2111,9 +2115,7 @@ class SQLiteTaskStore(TaskStore):
                 self._record_task_transition_unlocked(
                     task,
                     updated,
-                    settled_execution=(task.id, request.worker_id, task.started_at)
-                    if task.started_at is not None
-                    else None,
+                    settled_execution=work_attempt_claim_execution(task, request.worker_id),
                 )
                 self._connection.execute(
                     "INSERT INTO cayu_work_attempt_preparation_holds "
@@ -2235,9 +2237,7 @@ class SQLiteTaskStore(TaskStore):
                 self._record_task_transition_unlocked(
                     task,
                     updated,
-                    settled_execution=(task.id, admission.claim.worker_id, task.started_at)
-                    if task.started_at is not None
-                    else None,
+                    settled_execution=work_attempt_claim_execution(task, admission.claim.worker_id),
                 )
                 self._update_work_attempt_admission_unlocked(settled_admission)
                 self._connection.execute(
@@ -3861,7 +3861,7 @@ class SQLiteTaskStore(TaskStore):
         event_admission: bool = False,
         event_now: datetime | None = None,
         operation_id: str | None = None,
-        settled_execution: tuple[str, str, datetime] | None = None,
+        settled_execution: Task | None = None,
     ) -> None:
         from cayu.storage._sqlite_task_graphs import record_transition
 
@@ -5722,6 +5722,7 @@ class SQLiteTaskStore(TaskStore):
                     ),
                 ).fetchall()
                 rejected = 0
+                group_waiting: list[str] = []
                 filtered = 0
                 last_observed: Task | None = None
                 for index, row in enumerate(rows):
@@ -5770,6 +5771,8 @@ class SQLiteTaskStore(TaskStore):
                     require_parked_continuation_trigger(
                         receipt, None if expected is None else expected.parked_wait
                     )
+                    # A group refusal rejects only this candidate and its writes.
+                    self._connection.execute(f"SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}")
                     self._connection.execute(
                         "INSERT INTO cayu_task_interrupted_continuation_claims ("
                         "handoff_id_sha256, task_id, worker_id, claimed_at, expected_sha256"
@@ -5801,12 +5804,28 @@ class SQLiteTaskStore(TaskStore):
                     if update_cursor.rowcount != 1:
                         raise RuntimeError("SQLite continuation claim lost its locked candidate.")
                     claimed = self._require_task_unlocked(observed.id)
+                    try:
+                        # A continuation is a new claim; its group execution is its own.
+                        self._record_task_transition_unlocked(observed, claimed)
+                    except TaskGroupConflict:
+                        self._connection.execute(
+                            f"ROLLBACK TO SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}"
+                        )
+                        self._connection.execute(
+                            f"RELEASE SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}"
+                        )
+                        group_waiting.append(observed.id)
+                        continue
+                    self._connection.execute(
+                        f"RELEASE SAVEPOINT {_CONTINUATION_CANDIDATE_SAVEPOINT}"
+                    )
                     result = InterruptedTaskContinuationClaimPage(
                         task=claimed,
                         next_after=(observed.created_at, observed.id),
                         scanned_candidates=index + 1,
                         rejected_candidates=rejected,
                         filtered_candidates=filtered,
+                        group_waiting_task_ids=tuple(group_waiting),
                         exhausted=index == len(rows) - 1 and len(rows) < scan_limit,
                     )
                     self._connection.commit()
@@ -5820,6 +5839,7 @@ class SQLiteTaskStore(TaskStore):
                     scanned_candidates=len(rows),
                     rejected_candidates=rejected,
                     filtered_candidates=filtered,
+                    group_waiting_task_ids=tuple(group_waiting),
                     exhausted=len(rows) < scan_limit,
                 )
                 self._connection.commit()
@@ -5959,9 +5979,7 @@ class SQLiteTaskStore(TaskStore):
                 self._record_task_transition_unlocked(
                     task,
                     durable_task,
-                    settled_execution=(task.id, task.worker_id, task.started_at)
-                    if task.worker_id is not None and task.started_at is not None
-                    else None,
+                    settled_execution=claimed_execution(task),
                 )
                 receipt = result.terminalization_receipt.model_copy(
                     update={"task": durable_task},
@@ -6289,9 +6307,7 @@ class SQLiteTaskStore(TaskStore):
                 self._record_task_transition_unlocked(
                     task,
                     settled,
-                    settled_execution=(task.id, task.worker_id, task.started_at)
-                    if task.worker_id is not None and task.started_at is not None
-                    else None,
+                    settled_execution=claimed_execution(task),
                 )
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "

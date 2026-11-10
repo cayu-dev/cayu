@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, LiteralString
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
@@ -308,7 +307,7 @@ async def record_transition(
     prior: Task | None,
     current: Task,
     *,
-    settled_execution: tuple[str, str, datetime] | None = None,
+    settled_execution: Task | None = None,
     invocation: TaskGroupInvocationObligation | None = None,
     resolve_attention: bool = False,
 ) -> None:

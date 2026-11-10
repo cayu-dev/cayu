@@ -4102,7 +4102,9 @@ async def test_group_execution_obligation_rejects_invalid_worker_identity(worker
     from cayu.tasks.groups import TaskGroupExecutionObligation
 
     with pytest.raises(ValidationError):
-        TaskGroupExecutionObligation(task_id="a", worker_id=worker_id, started_at=datetime.now(UTC))
+        TaskGroupExecutionObligation(
+            task_id="a", claim_generation=1, worker_id=worker_id, started_at=datetime.now(UTC)
+        )
 
 
 @pytest.mark.parametrize("expire", [False, True])

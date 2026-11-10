@@ -172,8 +172,11 @@ def _cancellation_drain_holds(task: Task, *, worker_id: str, claim_generation: i
 
     The row is either that claim or reclaim's fence of it: reclaiming an expired
     dispatched claim keeps its worker and lease, requests cancellation and advances
-    the generation by exactly one. Every other change of holder releases the worker
-    first, so any other generation is a later claim, possibly under the same name.
+    the generation by exactly one. A new holder claims a row whose release, reclaim
+    or handoff already advanced the generation, so it is at least two ahead, possibly
+    under the same name. Verified-work holds release the worker without advancing
+    it, so a claim after such a hold can be one ahead; a caller that must tell it
+    from the fence also compares the start time, which the resume moves.
     """
 
     if task.worker_id != worker_id:

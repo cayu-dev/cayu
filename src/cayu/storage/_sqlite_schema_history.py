@@ -29,7 +29,11 @@ from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
 from cayu.storage._sqlite_closure_schema import SQLITE_CLOSURE_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
-from cayu.storage._task_group_schema import SQLITE_TASK_GROUP_DDL, SQLITE_TASK_GROUP_QUIESCENCE_DDL
+from cayu.storage._task_group_schema import (
+    SQLITE_GROUP_EXECUTION_GENERATION_BACKFILL,
+    SQLITE_TASK_GROUP_DDL,
+    SQLITE_TASK_GROUP_QUIESCENCE_DDL,
+)
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
 
@@ -770,6 +774,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     );""",
     # Failed and interrupted terminal decisions; no schema change.
     145: "",
+    # Group execution obligations carry the claim generation that started them.
+    146: SQLITE_GROUP_EXECUTION_GENERATION_BACKFILL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

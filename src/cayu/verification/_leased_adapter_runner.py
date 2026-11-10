@@ -18,10 +18,9 @@ from cayu._exception_groups import exception_cause, iter_exception_tree, set_exc
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     ShieldedTaskOutcome,
-    absorb_consumed_cancellation_delivery,
     await_shielded_task_outcome,
     capture_awaitable_outcome,
-    consume_pending_task_cancellation,
+    capture_owned_task_outcome,
     restore_task_cancellation_requests,
 )
 
@@ -453,19 +452,6 @@ class LeasedAdapterRunner(Generic[_DrainT]):
         if failure is not None:
             raise failure from exception_cause(failure)
         return cast("_T", result)
-
-
-async def capture_owned_task_outcome(
-    factory: Callable[[], Awaitable[_T]],
-) -> CapturedAwaitableOutcome[_T]:
-    """Retain directly captured cancellation evidence through task completion."""
-    outcome = await capture_awaitable_outcome(factory)
-    if isinstance(outcome.error, asyncio.CancelledError):
-        consume_pending_task_cancellation(outcome.error)
-        # Before Python 3.13 a consumed request restored while this task ran stays pending
-        # and would end the task cancelled, replacing this outcome and its cause.
-        await absorb_consumed_cancellation_delivery()
-    return outcome
 
 
 def merge_owned_failures(

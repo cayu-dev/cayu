@@ -15,6 +15,7 @@ from cayu._exception_groups import exception_cause, iter_exception_tree
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     await_shielded_task_outcome,
+    capture_owned_task_outcome,
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
@@ -85,11 +86,7 @@ from cayu.tasks.queries import TaskAggregateFilter, TaskQuery, copy_task_query
 from cayu.tasks.records import Task, TaskClaimLost, TaskStatus, copy_task
 from cayu.tasks.work_receipts import WorkAttemptLifecycleReceipt, WorkAttemptPreparationHoldReceipt
 from cayu.verification._completion_verifier_coordinator import CompletionVerifierOwnedExecution
-from cayu.verification._leased_adapter_runner import (
-    LeasedAdapterRunner,
-    capture_owned_task_outcome,
-    merge_owned_failures,
-)
+from cayu.verification._leased_adapter_runner import LeasedAdapterRunner, merge_owned_failures
 from cayu.verification._verified_completion import verified_task_operation_id
 from cayu.verification.completion_verifiers import CompletionVerifierExecutionRequest
 

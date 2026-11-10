@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from cayu._validation import MAX_PORTABLE_JSON_INTEGER
@@ -145,7 +144,7 @@ def store_graph_task(
     task: Task,
     *,
     schedule_operation_id: str | None,
-    settled_execution: tuple[str, str, datetime] | None = None,
+    settled_execution: Task | None = None,
     invocation: TaskGroupInvocationObligation | None = None,
     resolve_attention: bool = False,
     retry_successor: Task | None = None,
