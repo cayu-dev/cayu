@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import runpy
 import subprocess
 import sys
@@ -14,6 +15,7 @@ _REPORT = runpy.run_path(str(_SCRIPT))
 build_report = _REPORT["build_report"]
 SourceInventory = _REPORT["SourceInventory"]
 check_source_size = _REPORT["check_source_size"]
+public_name_count = _REPORT["public_name_count"]
 
 
 @pytest.fixture
@@ -23,7 +25,10 @@ def repository(tmp_path):
 
     git("init", "-q")
     files = {
-        "src/cayu/_exports.py": "PUBLIC_NAMES = ['Agent']\nraise RuntimeError('never import')\n",
+        "src/cayu/_exports.py": (
+            "EXPORTS = {'Agent': ('cayu.agents', 'Agent')}\n"
+            "PUBLIC_NAMES = ['Agent']\nraise RuntimeError('never import')\n"
+        ),
         "src/cayu/sessions/base.py": "class SessionStore:\n    def load(self): pass\n",
         "src/cayu/runtime/_recovery_coordinator.py": (
             "class RecoveryCoordinator:\n    def __init__(self, store, *, clock=None): pass\n"
@@ -283,7 +288,10 @@ def test_cli_revision_selection_preserves_explicit_empty_values(repository, mode
         if mode == "inventory":
             assert json.loads(result.stdout)["revision"] == commit
         else:
-            assert f"passed at {commit} (3 files, 0 capped exceptions)" in result.stdout
+            assert (
+                f"passed at {commit} (3 files, 0 capped exceptions, 7 source lines, 1 public names)"
+                in result.stdout
+            )
 
 
 @pytest.mark.parametrize("revision", ["", "HEAD"], ids=["empty", "explicit-head"])
@@ -310,10 +318,28 @@ def test_cli_baseline_check_rejects_every_explicit_revision(repository, revision
     assert not result.stdout
 
 
-def _size_policy(root: Path, exceptions=None) -> Path:
+def _size_policy(root: Path, exceptions=None, budgets=None) -> Path:
+    """Write a policy whose total budgets match the source currently in the worktree."""
+
+    sources = sorted((root / "src/cayu").rglob("*.py"))
+    current = {
+        "source_python_lines": sum(len(path.read_text().splitlines()) for path in sources),
+        "public_names": sum(
+            public_name_count(path.read_text(), str(path))
+            for path in sources
+            if path.name == "_exports.py"
+        ),
+    }
     path = root / "size-policy.json"
     path.write_text(
-        json.dumps({"schema_version": 1, "default_max_lines": 9999, "exceptions": exceptions or {}})
+        json.dumps(
+            {
+                "schema_version": 2,
+                "default_max_lines": 9999,
+                "total_budgets": current | (budgets or {}),
+                "exceptions": exceptions or {},
+            }
+        )
     )
     return path
 
@@ -352,7 +378,7 @@ def test_source_size_guard_applies_to_new_python_and_stub_paths(repository, suff
     _commit_source_fixture(root)
 
     if lines == 9999:
-        _, files, exceptions = check_source_size(root, "HEAD", policy)
+        _, files, exceptions, _ = check_source_size(root, "HEAD", policy)
         assert (files, exceptions) == (4, 0)
     else:
         with pytest.raises(ValueError, match=rf"replacement\.{suffix}: 10,000.*9,999"):
@@ -368,7 +394,7 @@ def test_source_size_exception_allows_only_its_documented_cap(repository, lines)
     _commit_source_fixture(root)
 
     if lines <= 10001:
-        assert check_source_size(root, "HEAD", policy)[1:] == (4, 1)
+        assert check_source_size(root, "HEAD", policy)[1:3] == (4, 1)
     else:
         with pytest.raises(ValueError, match="worker.py: 10,002.*10,001"):
             check_source_size(root, "HEAD", policy)
@@ -399,16 +425,28 @@ def test_source_size_exception_does_not_follow_an_oversized_replacement(reposito
     assert "old_worker.py: remove the exception" in str(raised.value)
 
 
+_VALID_POLICY = {
+    "schema_version": 2,
+    "default_max_lines": 9999,
+    "total_budgets": {"source_python_lines": 7, "public_names": 1},
+    "exceptions": {},
+}
+
+
 @pytest.mark.parametrize(
     "invalid_policy",
     [
         [],
-        {"schema_version": True, "default_max_lines": 9999, "exceptions": {}},
-        {"schema_version": 2, "default_max_lines": 9999, "exceptions": {}},
-        {"schema_version": 1, "default_max_lines": True, "exceptions": {}},
-        {"schema_version": 1, "default_max_lines": 0, "exceptions": {}},
-        {"schema_version": 1, "default_max_lines": 9999, "exceptions": []},
-        {"schema_version": 1, "default_max_lines": 9999, "exceptions": {}, "typo": 1},
+        {**_VALID_POLICY, "schema_version": True},
+        {**_VALID_POLICY, "schema_version": 1},
+        {**_VALID_POLICY, "default_max_lines": True},
+        {**_VALID_POLICY, "default_max_lines": 0},
+        {**_VALID_POLICY, "exceptions": []},
+        {**_VALID_POLICY, "typo": 1},
+        {key: value for key, value in _VALID_POLICY.items() if key != "total_budgets"},
+        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7}},
+        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7, "public_names": True}},
+        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 0, "public_names": 1}},
     ],
 )
 def test_source_size_guard_rejects_invalid_policy(repository, invalid_policy):
@@ -442,7 +480,8 @@ def test_source_size_guard_rejects_duplicate_policy_keys(repository):
     root, _ = repository
     policy = root / "invalid-policy.json"
     policy.write_text(
-        '{"schema_version":1,"default_max_lines":9999,"exceptions":{},"exceptions":{}}'
+        '{"schema_version":2,"default_max_lines":9999,"total_budgets":{},"exceptions":{},'
+        '"exceptions":{}}'
     )
     with pytest.raises(ValueError, match="Duplicate source-size policy key"):
         check_source_size(root, "HEAD", policy)
@@ -489,7 +528,10 @@ def test_source_size_guard_uses_committed_blobs_in_shallow_repositories(reposito
         text=True,
     )
     assert before.returncode == 0, before.stderr
-    assert f"passed at {original} (3 files, 0 capped exceptions)" in before.stdout
+    assert (
+        f"passed at {original} (3 files, 0 capped exceptions, 7 source lines, 1 public names)"
+        in before.stdout
+    )
 
 
 def test_source_size_guard_rejects_source_symlinks(repository):
@@ -522,4 +564,104 @@ def test_source_size_guard_rejects_an_empty_source_population(repository):
     subprocess.run(["git", "-C", str(root), "rm", "-r", "-q", "src"], check=True)
     _commit_source_fixture(root)
     with pytest.raises(ValueError, match="no production Python or stub files"):
-        check_source_size(root, "HEAD", _size_policy(root))
+        check_source_size(
+            root,
+            "HEAD",
+            _size_policy(root, budgets={"source_python_lines": 1, "public_names": 1}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("budgets", "failure"),
+    [
+        pytest.param({"source_python_lines": 5_007, "public_names": 21}, None, id="within-margin"),
+        pytest.param(
+            {"source_python_lines": 6},
+            "source_python_lines: 7 exceeds the recorded budget of 6",
+            id="lines-over",
+        ),
+        pytest.param(
+            {"source_python_lines": 5_008},
+            "source_python_lines: 7 is more than 5,000 below the recorded budget of 5,008; "
+            "lower total_budgets.source_python_lines to 2,007",
+            id="lines-under",
+        ),
+        pytest.param(
+            {"public_names": 22},
+            "public_names: 1 is more than 20 below the recorded budget of 22; "
+            "lower total_budgets.public_names to 6",
+            id="names-under",
+        ),
+    ],
+)
+def test_total_budgets_fail_above_and_well_below_the_recorded_value(repository, budgets, failure):
+    root, _ = repository
+    policy = _size_policy(root, budgets=budgets)
+    if failure is None:
+        assert check_source_size(root, "HEAD", policy)[3] == {
+            "source_python_lines": 7,
+            "public_names": 1,
+        }
+    else:
+        with pytest.raises(ValueError, match=re.escape(failure)):
+            check_source_size(root, "HEAD", policy)
+
+
+_TOOLS_EXPORTS = (
+    "EXPORTS: dict[str, tuple[str, str]] = "
+    "{'Tool': ('cayu.tools.base', 'Tool'), 'ToolSpec': ('cayu.tools.base', 'ToolSpec')}\n"
+    "PUBLIC_NAMES = sorted(EXPORTS)\n"
+)
+
+
+def test_public_name_budget_counts_exports_of_every_package(repository):
+    root, _ = repository
+    policy = _size_policy(root)
+    (root / "src/cayu/tools").mkdir()
+    (root / "src/cayu/tools/_exports.py").write_text(_TOOLS_EXPORTS)
+    _commit_source_fixture(root)
+    with pytest.raises(ValueError, match="public_names: 3 exceeds the recorded budget of 1"):
+        check_source_size(root, "HEAD", policy)
+
+
+def test_scoreboard_reads_the_committed_tables_without_running_them(repository):
+    root, _ = repository
+    files = {
+        "src/cayu/tools/_exports.py": _TOOLS_EXPORTS,
+        "src/cayu/storage/migrations.py": (
+            "REVISIONS: tuple[Revision, ...] = (\n"
+            "    Revision(revision=1, kind=RevisionKind.BREAKING, compatible_from=1),\n"
+            "    Revision(revision=2, kind=RevisionKind.ADDITIVE, compatible_from=1),\n"
+            "    Revision(revision=3, kind=RevisionKind.BREAKING, compatible_from=3),\n"
+            ")\n"
+        ),
+        "tests/test_overhead_budgets.py": (
+            "BUDGETS: dict[str, dict[str, int]] = {\n"
+            "    'read_file whole': {'sandbox_commands': 1, 'broker_requests': 2},\n"
+            "    'session start to model request 1': {'store_calls': 36},\n"
+            "    'events before model call 1': {'events': 4},\n"
+            "}\n"
+        ),
+    }
+    for name, content in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(content)
+    _commit_source_fixture(root)
+    (root / "tests/test_overhead_budgets.py").write_text("raise RuntimeError('uncommitted')\n")
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT.with_name("scoreboard.py")), "--repo", str(root)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "commit": subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "source_python_lines": 14,
+        "test_python_lines": 6,
+        "public_names": 3,
+        "store_call_budgets": {"session start to model request 1": 36},
+        "schema_revisions": 3,
+        "breaking_schema_revisions": 2,
+    }

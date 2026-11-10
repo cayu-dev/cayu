@@ -75,9 +75,53 @@ PR. Malformed policies, duplicate keys and unexplained exceptions fail closed.
 Do not delete comments, compress formatting or move arbitrary lines merely to
 pass the check. Review complete responsibilities and their verification needs.
 
-This check covers individual production files. Test-suite organization, the
+### Total budgets
+
+The same check holds two totals to the `total_budgets` recorded in the policy
+file:
+
+| Budget | What it counts |
+| --- | --- |
+| `source_python_lines` | Physical lines in every committed `.py` file under `src/cayu/`. Stubs (`.pyi`) are not included. |
+| `public_names` | Names declared in the literal `EXPORTS` dict of every `_exports.py` under `src/cayu/`, the per-package export declarations that `docs/public-api-packages.json` lists and the public-API tests check. |
+
+Each budget is recorded a little above the current total, so that small fixes
+pass without every pull request editing, and conflicting on, the same line of
+the policy file. The check fails when a total is above its budget. A change that
+reaches the ceiling either removes as much elsewhere or raises the budget, with
+the reason in the pull request. The check also fails when a total is more than
+5,000 source lines or 20 public names below its budget. Its message names the
+value to record: the current total plus the standard headroom of 2,000 lines or
+5 names. Lower the budget in the same pull request that removed the code, so the
+reduction cannot quietly come back.
+
+This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
 own delivery evidence. The historical inventory baseline stays unchanged.
+
+## Scoreboard
+
+`scripts/scoreboard.py` prints one JSON object of structural numbers for a
+commit. Like the size report, it reads committed blobs and imports or runs
+nothing, so it can be re-run on any commit that has the files it reads:
+
+```sh
+python3 scripts/scoreboard.py                       # HEAD
+python3 scripts/scoreboard.py --revision <commit>   # any commit or ref
+```
+
+| Field | Meaning |
+| --- | --- |
+| `commit` | The measured commit. |
+| `source_python_lines` | The same count as the `source_python_lines` budget above. |
+| `test_python_lines` | Physical lines in committed `.py` files under `tests/`. |
+| `public_names` | The same count as the `public_names` budget above. |
+| `store_call_budgets` | Every `store_calls` entry in the `BUDGETS` table of `tests/test_overhead_budgets.py`, keyed by its step name. These are the recorded ceilings, which that test holds equal to the measured counts; the scoreboard reads the table and does not run the test. |
+| `schema_revisions` | Entries in `REVISIONS` in `src/cayu/storage/migrations.py`. |
+| `breaking_schema_revisions` | Those entries whose kind is `RevisionKind.BREAKING`. |
+
+Measured runtime numbers, such as per-step latency and benchmark pass rates, are
+not part of the scoreboard; see the workloads below.
 
 ## Compare revisions
 

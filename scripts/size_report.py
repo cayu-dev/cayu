@@ -33,6 +33,10 @@ _WATCHED_CALLS = frozenset(
 _PROVIDER_NAMES = frozenset(
     {"cayu.ModelProvider", "cayu.providers.ModelProvider", "cayu.providers.base.ModelProvider"}
 )
+# Room a recorded budget leaves above the total, so small fixes need no policy edit.
+_TOTAL_BUDGET_HEADROOM = {"source_python_lines": 2_000, "public_names": 5}
+# How far below its recorded budget a total may fall before the budget must be lowered.
+_TOTAL_BUDGET_MARGIN = {"source_python_lines": 5_000, "public_names": 20}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -182,6 +186,31 @@ def _literal_names(tree: ast.Module, name: str) -> list[str]:
     if len(value) != len(set(value)):
         raise ValueError(f"{name} contains duplicate names")
     return list(value)
+
+
+def _assigned_value(tree: ast.Module, name: str) -> ast.expr:
+    values = [
+        node.value
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and node.value is not None
+        and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+    ]
+    if len(values) != 1:
+        raise ValueError(f"{name} must have a single top-level assignment")
+    return values[0]
+
+
+def public_name_count(source: str, path: str) -> int:
+    """Count the names one package's ``_exports.py`` declares in its literal ``EXPORTS``."""
+
+    exports = ast.literal_eval(_assigned_value(ast.parse(source, filename=path), "EXPORTS"))
+    if not isinstance(exports, dict):
+        raise ValueError(f"{path}: EXPORTS must be a literal dict")
+    return len(exports)
 
 
 def _duration_snapshot(data: bytes) -> dict[str, int | float]:
@@ -385,7 +414,7 @@ def build_report(repo: Path, revision: str) -> dict[str, Any]:
     }
 
 
-def _source_size_limits(path: Path) -> tuple[int, dict[str, int]]:
+def _source_size_limits(path: Path) -> tuple[int, dict[str, int], dict[str, int]]:
     def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result = {}
         for key, value in pairs:
@@ -397,14 +426,17 @@ def _source_size_limits(path: Path) -> tuple[int, dict[str, int]]:
     policy = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_pairs)
     if (
         not isinstance(policy, dict)
-        or set(policy) != {"schema_version", "default_max_lines", "exceptions"}
+        or set(policy) != {"schema_version", "default_max_lines", "total_budgets", "exceptions"}
         or type(policy["schema_version"]) is not int
-        or policy["schema_version"] != 1
+        or policy["schema_version"] != 2
         or type(policy["default_max_lines"]) is not int
         or policy["default_max_lines"] < 1
+        or not isinstance(policy["total_budgets"], dict)
+        or set(policy["total_budgets"]) != set(_TOTAL_BUDGET_MARGIN)
+        or any(type(budget) is not int or budget < 1 for budget in policy["total_budgets"].values())
         or not isinstance(policy["exceptions"], dict)
     ):
-        raise ValueError("Invalid source-size policy schema or default_max_lines")
+        raise ValueError("Invalid source-size policy schema, default_max_lines or total_budgets")
     maximum = policy["default_max_lines"]
     exceptions = {}
     for name, exception in policy["exceptions"].items():
@@ -423,17 +455,50 @@ def _source_size_limits(path: Path) -> tuple[int, dict[str, int]]:
         ):
             raise ValueError(f"Invalid source-size exception: {name}")
         exceptions[name] = exception["max_lines"]
-    return maximum, exceptions
+    return maximum, exceptions, policy["total_budgets"]
 
 
-def check_source_size(repo: Path, revision: str, policy: Path) -> tuple[str, int, int]:
-    maximum, exceptions = _source_size_limits(policy)
-    commit = _resolve_commit(repo, revision)
+def source_totals(repo: Path, commit: str) -> tuple[dict[str, int], dict[str, int]]:
+    """Return per-file line counts and the budgeted totals for committed ``src/cayu``."""
+
+    sizes = {}
+    public_names = 0
     with closing(_tracked_blobs(repo, commit, source_only=True)) as blobs:
-        sizes = {path: _physical_lines(data.decode("utf-8")) for path, data in blobs}
+        for path, data in blobs:
+            source = data.decode("utf-8")
+            sizes[path] = _physical_lines(source)
+            if path.endswith("/_exports.py"):
+                public_names += public_name_count(source, path)
+    totals = {
+        "source_python_lines": sum(lines for path, lines in sizes.items() if path.endswith(".py")),
+        "public_names": public_names,
+    }
+    return sizes, totals
+
+
+def check_source_size(
+    repo: Path, revision: str, policy: Path
+) -> tuple[str, int, int, dict[str, int]]:
+    maximum, exceptions, budgets = _source_size_limits(policy)
+    commit = _resolve_commit(repo, revision)
+    sizes, totals = source_totals(repo, commit)
     if not sizes:
         raise ValueError("Source size check found no production Python or stub files")
     failures = []
+    for name, budget in budgets.items():
+        current = totals[name]
+        if current > budget:
+            failures.append(
+                f"{name}: {current:,} exceeds the recorded budget of {budget:,}; remove as "
+                f"much as this change adds, or raise total_budgets.{name} with a reason"
+            )
+        elif current < budget - _TOTAL_BUDGET_MARGIN[name]:
+            failures.append(
+                f"{name}: {current:,} is more than {_TOTAL_BUDGET_MARGIN[name]:,} below the "
+                f"recorded budget of {budget:,}; lower total_budgets.{name} to "
+                f"{current + _TOTAL_BUDGET_HEADROOM[name]:,} in this change so the reduction "
+                "is kept"
+            )
     for path, lines in sorted(sizes.items()):
         limit = exceptions.get(path, maximum)
         if lines > limit:
@@ -449,7 +514,7 @@ def check_source_size(repo: Path, revision: str, policy: Path) -> tuple[str, int
             + "\n".join(f"  {failure}" for failure in failures)
             + "\nReview ownership and any proposed exception in docs/refactoring-baseline.md."
         )
-    return commit, len(sizes), len(exceptions)
+    return commit, len(sizes), len(exceptions), totals
 
 
 def main() -> int:
@@ -471,12 +536,14 @@ def main() -> int:
     revision = "HEAD" if args.revision is None else args.revision
     try:
         if args.check_source_size:
-            commit, files, exceptions = check_source_size(
+            commit, files, exceptions, totals = check_source_size(
                 args.repo, revision, args.check_source_size
             )
             print(
                 f"Source size policy passed at {commit} "
-                f"({files} files, {exceptions} capped exceptions)"
+                f"({files} files, {exceptions} capped exceptions, "
+                f"{totals['source_python_lines']:,} source lines, "
+                f"{totals['public_names']:,} public names)"
             )
             return 0
         expected = json.loads(args.check.read_text()) if args.check else None
