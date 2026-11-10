@@ -6321,6 +6321,10 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
+                arguments={},
+            )
             recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
@@ -6352,7 +6356,11 @@ class RecoveryCoordinator:
                     },
                 ),
                 result=public_recovered_result,
-                redactor=self._secret_redactor,
+                redactor=_redactor_for_tool_calls(
+                    self._secret_redactor,
+                    registered_agent=registered_agent,
+                    tool_calls=[tool_call],
+                ),
             )
             recovery_tool_event = event_with_execution_profile_authority(
                 recovery_tool_event,
@@ -6394,10 +6402,6 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = approval_support.tool_call_request_from_pending(
-                pending_tool_call,
-                arguments={},
-            )
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
@@ -6748,6 +6752,10 @@ class RecoveryCoordinator:
                     yield event
                 return
             effect_record: ToolEffectRecord | None = None
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
+                arguments={},
+            )
             if type(request) is ToolEffectReconciliationRequest:
                 if environment.invocation_context is None:
                     raise RuntimeError(
@@ -6830,7 +6838,11 @@ class RecoveryCoordinator:
                             },
                         ),
                         result=public_recovered_result,
-                        redactor=self._secret_redactor,
+                        redactor=_redactor_for_tool_calls(
+                            self._secret_redactor,
+                            registered_agent=registered_agent,
+                            tool_calls=[tool_call],
+                        ),
                     )
                 )
                 recovery_tool_event = event_with_execution_profile_authority(
@@ -6861,10 +6873,6 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = approval_support.tool_call_request_from_pending(
-                pending_tool_call,
-                arguments={},
-            )
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
             # after_tool_call is observe-only here (v1): the threaded modification is ignored.
@@ -8339,6 +8347,10 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
+                arguments={},
+            )
             recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
@@ -8367,7 +8379,11 @@ class RecoveryCoordinator:
                     },
                 ),
                 result=public_recovered_result,
-                redactor=self._secret_redactor,
+                redactor=_redactor_for_tool_calls(
+                    self._secret_redactor,
+                    registered_agent=registered_agent,
+                    tool_calls=[tool_call],
+                ),
             )
             recovery_tool_event = event_with_execution_profile_authority(
                 recovery_tool_event,
@@ -8401,10 +8417,6 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = approval_support.tool_call_request_from_pending(
-                pending_tool_call,
-                arguments={},
-            )
             tool_event = emitted_recovery_events[-1]
             # The operator outcome is durable before hooks run. Recovery hooks are
             # observe-only so they cannot rewrite externally verified evidence.
