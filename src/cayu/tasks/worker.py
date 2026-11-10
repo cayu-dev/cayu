@@ -44,6 +44,7 @@ from cayu._exception_groups import (
 )
 from cayu._task_wait import (
     await_shielded_task_outcome,
+    capture_awaitable_outcome,
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
@@ -87,6 +88,7 @@ from cayu.runtime._durable_worker_loop import (
     worker_stop_requested,
 )
 from cayu.runtime._event_loop_lag_sessions import app_session_event_loop_lag_recorder
+from cayu.runtime._run_exit import RunExitKind, classify_run_exit
 from cayu.runtime._task_lease_authority import (
     TaskLeaseAuthority as _TaskLeaseAuthority,
 )
@@ -2454,6 +2456,7 @@ async def _await_task_handler(
                 lease_authority,
                 cancellation_baseline=cancellation_baseline,
                 owner_cancellation=owner_cancellation,
+                cancellation=cancellation,
             )
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
@@ -2487,6 +2490,7 @@ async def _await_task_handler(
                 lease_authority,
                 cancellation_baseline=cancellation_baseline,
                 owner_cancellation=owner_cancellation,
+                cancellation=cancellation,
             )
             raise AssertionError(
                 "Task retry cancellation handling returned unexpectedly."
@@ -2774,6 +2778,7 @@ async def _raise_task_retry_owner_cancellation(
     *,
     cancellation_baseline: int,
     owner_cancellation: asyncio.CancelledError,
+    cancellation: _TaskCancellationDelivery,
 ) -> None:
     """Naturally drain one retry attempt before propagating owner cancellation."""
 
@@ -2824,6 +2829,34 @@ async def _raise_task_retry_owner_cancellation(
                         "Task retry owner-cancellation drain lost its elapsed deadline receipt."
                     )
                 return
+            if heartbeat_outcome is _TaskHeartbeatOutcome.CANCELLATION_REQUESTED:
+                quiescence_outcome = await capture_awaitable_outcome(
+                    lambda: _quiesce_task_retry_handler_before_terminalization(
+                        task_store,
+                        task.id,
+                        worker_id,
+                        lease_seconds,
+                        handler_task,
+                        cancellation_baseline=0,
+                        lease_authority=lease_authority,
+                        cancellation=cancellation,
+                    )
+                )
+                quiescence_failure = quiescence_outcome.error
+                if quiescence_failure is not None:
+                    if classify_run_exit(quiescence_failure).kind in {
+                        RunExitKind.ABANDONED,
+                        RunExitKind.PROCESS_CONTROL,
+                        RunExitKind.FENCED,
+                    }:
+                        raise quiescence_failure
+                    # The fence drain retains supervision even if maintenance
+                    # failed, and settles only after positive handler quiescence.
+                    _attach_task_worker_secondary_failure(
+                        owner_cancellation,
+                        quiescence_failure,
+                        label="Task retry owner-cancellation quiescence failures",
+                    )
             if heartbeat_failure is not None or heartbeat_outcome is (
                 _TaskHeartbeatOutcome.CANCELLATION_REQUESTED
             ):
@@ -2839,6 +2872,7 @@ async def _raise_task_retry_owner_cancellation(
                     cancellation_baseline=cancellation_baseline,
                     cancellation_error={"code": "task_worker_owner_cancelled"},
                     primary_failure=heartbeat_failure or owner_cancellation,
+                    cancellation=cancellation,
                 )
                 if heartbeat_failure is not None:
                     raise heartbeat_failure
@@ -2881,6 +2915,7 @@ async def _raise_task_retry_owner_cancellation(
                 cancellation_baseline=cancellation_baseline,
                 cancellation_error={"code": "task_worker_owner_cancelled"},
                 primary_failure=heartbeat_failure or owner_cancellation,
+                cancellation=cancellation,
             )
             if handler_failure is not None:
                 _attach_task_worker_secondary_failure(
@@ -3051,6 +3086,7 @@ async def _drain_retry_task_handler_under_cancellation_fence(
     cancellation_error: dict[str, Any] | None = None,
     primary_failure: BaseException,
     owner_cancellation: asyncio.CancelledError | None = None,
+    cancellation: _TaskCancellationDelivery | None = None,
 ) -> None:
     """Fence a retry attempt before naturally draining cancellation-opaque work."""
 
@@ -3088,12 +3124,13 @@ async def _drain_retry_task_handler_under_cancellation_fence(
             if type(outcome) is TaskRetryAttemptReport:
                 report = outcome
         except asyncio.CancelledError as exc:
-            failures.append(
-                unexpected_child_cancellation_error(
-                    exc,
-                    operation="Task retry handler drain",
+            if cancellation is None or not cancellation.signal.requested:
+                failures.append(
+                    unexpected_child_cancellation_error(
+                        exc,
+                        operation="Task retry handler drain",
+                    )
                 )
-            )
         except BaseException as exc:
             failures.append(exc)
 
@@ -3712,9 +3749,13 @@ async def _quiesce_task_retry_handler_before_terminalization(
             except Exception as exc:
                 if lease_maintenance_failure is None:
                     lease_maintenance_failure = exc
-            except BaseException:
-                # The durable cancellation request keeps replacement disabled.
-                raise
+            except BaseException as exc:
+                run_exit = classify_run_exit(exc, cancellation_baseline=cancellation_baseline)
+                if run_exit.kind is not RunExitKind.FAILED:
+                    # The durable cancellation request keeps replacement disabled.
+                    raise
+                if lease_maintenance_failure is None:
+                    lease_maintenance_failure = exc
     finally:
         if interrupt_handle is not None:
             interrupt_handle.cancel()
