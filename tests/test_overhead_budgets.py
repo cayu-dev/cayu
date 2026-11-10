@@ -7,8 +7,9 @@ that adds work to a hot path fails here, and the failure lists what ran.
 
 The brokered measurements use the in-memory fake broker, whose commands run as
 real processes, and the real coding factory and binding. The session measurement
-runs a scripted provider through three model steps against an in-memory store and
-counts the store calls the Runtime makes between model and tool boundaries.
+runs a scripted provider through three model steps against the in-memory, SQLite
+and Postgres stores and counts the store calls the Runtime makes between model and
+tool boundaries. On SQLite it also counts the statements and commits they cost.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import math
 import shutil
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
@@ -37,7 +38,9 @@ from cayu.runtime import _session_control
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.sandbox_broker import BrokeredSandboxCodingEnvironmentFactory, BrokeredSandboxReuse
 from cayu.sandbox_broker import coding as coding_module
-from cayu.sessions import InMemorySessionStore
+from cayu.sessions import InMemorySessionStore, SessionStore
+from cayu.storage import SQLiteSessionStore
+from cayu.storage._phase_timing import SQLiteTimingConnection, SQLiteTimingCursor
 from cayu.tools import (
     EditFileTool,
     ExecCommandTool,
@@ -69,6 +72,9 @@ if TYPE_CHECKING:
 # target_cleans     passes that clear the target before copy-in
 # store_calls       session-store calls the Runtime awaits (not the store's own
 #                   nested calls)
+# sql_statements    statements a SQLite store executes on its connections, BEGIN
+#                   included (not the driver's implicit BEGIN or a trigger's statements)
+# sql_commits       transactions a SQLite store commits
 # events            events the session stores
 BUDGETS: dict[str, dict[str, int]] = {
     # One tool call on a bound brokered coding sandbox.
@@ -115,7 +121,9 @@ BUDGETS: dict[str, dict[str, int]] = {
         "upload_kib": 10,
         "target_cleans": 1,
     },
-    # A session of three model steps: two tool calls, then one, then a reply.
+    # A session of three model steps: two tool calls, then one, then a reply. These
+    # hold on every store (in-memory, SQLite and Postgres): the Runtime's calls must
+    # not depend on which one it runs on.
     "session start to model request 1": {"store_calls": 36},
     "model reply 1 to first tool start": {"store_calls": 21},
     "between tool calls in round 1": {"store_calls": 13},
@@ -124,6 +132,22 @@ BUDGETS: dict[str, dict[str, int]] = {
     "round 2 last tool result to model request 3": {"store_calls": 36},
     "model reply 3 to session end": {"store_calls": 35},
     "during the model calls": {"store_calls": 2},
+    # The same session on a file-backed SQLite store: the statements it sends to
+    # SQLite and the transactions it commits.
+    "session start to model request 1 on SQLite": {"sql_statements": 183, "sql_commits": 18},
+    "model reply 1 to first tool start on SQLite": {"sql_statements": 105, "sql_commits": 9},
+    "between tool calls in round 1 on SQLite": {"sql_statements": 68, "sql_commits": 6},
+    "round 1 last tool result to model request 2 on SQLite": {
+        "sql_statements": 183,
+        "sql_commits": 18,
+    },
+    "model reply 2 to first tool start on SQLite": {"sql_statements": 105, "sql_commits": 9},
+    "round 2 last tool result to model request 3 on SQLite": {
+        "sql_statements": 172,
+        "sql_commits": 15,
+    },
+    "model reply 3 to session end on SQLite": {"sql_statements": 173, "sql_commits": 14},
+    "during the model calls on SQLite": {"sql_statements": 14, "sql_commits": 2},
     # One Cloud activity page (GET /cloud/v1/activity) over an in-memory store.
     # Its runs are replies and tool calls, and denied approvals; a page costs
     # the same calls whatever the number of its runs and touches.
@@ -531,8 +555,54 @@ class _MarkedTool(Tool):
 
 
 @contextmanager
+def _record_sql(
+    store: SQLiteSessionStore, timeline: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Record each statement the store executes, and each commit, on ``timeline``.
+
+    Counted at the store's connection wrapper, on its writer and readers, rather than
+    by a SQLite statement trace, which also reports each statement a trigger runs. A
+    commit is one that ends an open transaction, by ``commit()`` or a ``with`` block.
+    """
+
+    connections = {store._connection, *(connection for _, connection in store._readers)}
+
+    def statement(method: Any, connection_of: Any) -> Any:
+        @wraps(method)
+        def call(self: Any, query: str, *args: Any) -> Any:
+            if connection_of(self) in connections:
+                timeline.append(("sql", query.split(None, 1)[0].upper()))
+            return method(self, query, *args)
+
+        return call
+
+    def commit(self: Any) -> Any:
+        if self in connections and self.in_transaction:
+            timeline.append(("commit", ""))
+        return original_commit(self)
+
+    def exit_block(self: Any, *arguments: Any) -> Any:
+        if self in connections and self.in_transaction and arguments[0] is None:
+            timeline.append(("commit", ""))
+        return original_exit(self, *arguments)
+
+    original_commit = SQLiteTimingConnection.commit
+    original_exit = SQLiteTimingConnection.__exit__
+    with monkeypatch.context() as patch:
+        for wrapper, connection_of in (
+            (SQLiteTimingConnection, lambda connection: connection),
+            (SQLiteTimingCursor, lambda cursor: cursor._connection),
+        ):
+            for name in ("execute", "executemany"):
+                patch.setattr(wrapper, name, statement(getattr(wrapper, name), connection_of))
+        patch.setattr(SQLiteTimingConnection, "commit", commit)
+        patch.setattr(SQLiteTimingConnection, "__exit__", exit_block)
+        yield
+
+
+@contextmanager
 def _record_store_calls(
-    store: InMemorySessionStore,
+    store: SessionStore,
     timeline: list[tuple[str, str]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
@@ -579,32 +649,53 @@ _SEGMENTS = (
 )
 
 
-def _store_segments(timeline: list[tuple[str, str]]) -> tuple[list[list[str]], list[str]]:
-    """Split the store calls at the marks: the spans between steps, and those in model calls."""
+_Work = list[tuple[str, str]]
 
-    spans: list[tuple[str, str, list[str]]] = []
-    calls: list[str] = []
+
+def _store_segments(timeline: _Work) -> tuple[list[_Work], _Work]:
+    """Split the store work at the marks: the spans between steps, and those in model calls."""
+
+    spans: list[tuple[str, str, _Work]] = []
+    work: _Work = []
     previous = "start"
     for kind, name in timeline:
-        if kind == "store":
-            calls.append(name)
+        if kind != "mark":
+            work.append((kind, name))
         else:
-            spans.append((previous, name, calls))
-            calls, previous = [], name
-    spans.append((previous, "end", calls))
+            spans.append((previous, name, work))
+            work, previous = [], name
+    spans.append((previous, "end", work))
     in_model = [
-        call
-        for start, end, calls in spans
+        item
+        for start, end, work in spans
         if (start, end) == (_MODEL_REQUEST, _MODEL_REPLY)
-        for call in calls
+        for item in work
     ]
-    between = [
-        calls for start, end, calls in spans if (start, end) != (_MODEL_REQUEST, _MODEL_REPLY)
-    ]
+    between = [work for start, end, work in spans if (start, end) != (_MODEL_REQUEST, _MODEL_REPLY)]
     return between, in_model
 
 
+def _session_store(backend: str, tmp_path: Path, request: pytest.FixtureRequest) -> SessionStore:
+    if backend == "memory":
+        return InMemorySessionStore()
+    if backend == "sqlite":
+        return SQLiteSessionStore(tmp_path / "sessions.sqlite")
+    from cayu.storage import PostgresSessionStore
+    from cayu.storage.migrations import SchemaMode
+
+    return PostgresSessionStore(
+        request.getfixturevalue("postgres_dsn"), schema_mode=SchemaMode.CREATE
+    )
+
+
+# Every store keeps its variant on pull requests: each is a separate implementation
+# the Runtime's calls must not drift on.
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", ("memory", "sqlite", "postgres"))
 def test_session_store_calls_per_model_step_and_tool_round_stay_within_budget(
+    backend: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timeline: list[tuple[str, str]] = []
@@ -625,22 +716,29 @@ def test_session_store_calls_per_model_step_and_tool_round_stay_within_budget(
     ]
 
     async def scenario() -> list[Any]:
-        store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(_TimedProvider(timeline, batches), default=True)
-        app.register_agent(
-            AgentSpec(name="worker", model="scripted-model"), tools=[_MarkedTool(timeline)]
-        )
-        request = RunRequest(
-            session_id="budget",
-            agent_name="worker",
-            max_steps=3,
-            messages=[Message.text("user", "take three notes")],
-        )
-        with _record_store_calls(store, timeline, monkeypatch):
-            last = [event.type async for event in app.run(request)][-1]
-        assert last == EventType.SESSION_COMPLETED
-        return await store.load_events("budget")
+        store = _session_store(backend, tmp_path, request)
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_TimedProvider(timeline, batches), default=True)
+            app.register_agent(
+                AgentSpec(name="worker", model="scripted-model"), tools=[_MarkedTool(timeline)]
+            )
+            run = RunRequest(
+                session_id="budget",
+                agent_name="worker",
+                max_steps=3,
+                messages=[Message.text("user", "take three notes")],
+            )
+            with ExitStack() as recording:
+                recording.enter_context(_record_store_calls(store, timeline, monkeypatch))
+                if backend == "sqlite":
+                    recording.enter_context(_record_sql(store, timeline, monkeypatch))
+                last = [event.type async for event in app.run(run)][-1]
+            assert last == EventType.SESSION_COMPLETED
+            return await store.load_events("budget")
+        finally:
+            if backend != "memory":
+                await store.close()
 
     # The stream's interrupt poll reloads the session once its real-time interval
     # expires; a descheduled worker would add a load, so the interval never expires here.
@@ -653,11 +751,22 @@ def test_session_store_calls_per_model_step_and_tool_round_stay_within_budget(
         *(_MODEL_REQUEST, _MODEL_REPLY),
     ]
     segments, in_model = _store_segments(timeline)
-    observed: dict[str, dict[str, int]] = {"during the model calls": {"store_calls": len(in_model)}}
-    breakdown: dict[str, Any] = {"during the model calls": dict(Counter(in_model))}
-    for name, calls in zip(_SEGMENTS, segments, strict=True):
+    observed: dict[str, dict[str, int]] = {}
+    breakdown: dict[str, Any] = {}
+    for name, work in (
+        *zip(_SEGMENTS, segments, strict=True),
+        ("during the model calls", in_model),
+    ):
+        calls = [call for kind, call in work if kind == "store"]
         observed[name] = {"store_calls": len(calls)}
         breakdown[name] = dict(Counter(calls))
+        if backend == "sqlite":
+            statements = [verb for kind, verb in work if kind == "sql"]
+            observed[f"{name} on SQLite"] = {
+                "sql_statements": len(statements),
+                "sql_commits": sum(kind == "commit" for kind, _ in work),
+            }
+            breakdown[f"{name} on SQLite"] = dict(Counter(statements))
 
     steps: list[list[str]] = [[]]
     for event in events:
