@@ -5706,6 +5706,7 @@ class EnvironmentLifecycle:
             _retain_cleanup_invocation_context(setup_owner, invocation_context)
         self._release_pending_environment_owner_admission(session.id)
         release_failed_binding_reservations: Callable[[], None] | None = None
+        returned_bound: BoundWorkspace | None = None
         try:
             await _report_environment_lifecycle(
                 progress_reporter,
@@ -5769,22 +5770,43 @@ class EnvironmentLifecycle:
                         release_failed_binding_reservations
                     )
             else:
+
+                async def bind_registered_workspace() -> BoundWorkspace:
+                    nonlocal returned_bound
+                    # Retain the exact handle before the operation boundary can
+                    # restore caller cancellation and discard its return value.
+                    returned_bound = await binding.bind(
+                        registered_environment.environment.workspace,
+                        registered_environment.environment.runner,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                    )
+                    return returned_bound
+
                 bound = await _await_with_environment_lifecycle_reporter(
                     progress_reporter,
                     lambda: environment_operation_boundary.await_environment_operation(
-                        lambda: binding.bind(
-                            registered_environment.environment.workspace,
-                            registered_environment.environment.runner,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                        ),
+                        bind_registered_workspace,
                         operation_name="Environment workspace binding",
                         redactor=self._secret_redactor,
                     ),
                     phase_timer=phase_timer,
                 )
         except BaseException as exc:
+            if returned_bound is not None:
+                bound_environment = copy_environment(registered_environment.environment)
+                bound_environment.workspace = returned_bound.workspace
+                bound_environment.runner = returned_bound.runner
+                _advance_cleanup_environment(
+                    setup_owner,
+                    replace(
+                        registered_environment,
+                        environment=bound_environment,
+                        bound_workspace=returned_bound,
+                        binding_payload=copy_json_value(base_payload, "binding_payload"),
+                    ),
+                )
             progress_failure: BaseException | None = None
             try:
                 await _finish_environment_lifecycle(
@@ -5905,8 +5927,13 @@ class EnvironmentLifecycle:
                 # and that terminal path still holds its pre-bind environment
                 # snapshot. Removing the owner here would make that stale snapshot
                 # look authoritative and release the same factory result twice.
+                # A successful static bind instead retains its exact bound owner
+                # for terminal finalization, even when cancellation hid its result.
                 setup_owner = self._active_environment_setups.get(session.id)
-                if setup_owner is not None:
+                if (
+                    setup_owner is not None
+                    and setup_owner.registered_environment.bound_workspace is None
+                ):
                     _advance_cleanup_environment(setup_owner, registered_environment)
                     setup_owner.cleanup_started = True
                     setup_owner.prebind_release_tombstone = True
