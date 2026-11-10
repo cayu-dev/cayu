@@ -6463,7 +6463,10 @@ class EnvironmentLifecycle:
                 for owner in self._active_environment_setups.values()
                 if owner.cleanup_ready_for_retry
             )
-            settling = self._retained_environment_ends.settling()
+            settling = (
+                *self._retained_environment_ends.settling(),
+                *self._leftover_teardown.settling(),
+            )
             if (
                 not retained
                 and not self._deferred_factory_cleanup_tasks
@@ -6518,6 +6521,7 @@ class EnvironmentLifecycle:
                     and not self._deferred_factory_cleanup_tasks
                     and not self._deferred_run_fence_release_tasks
                     and not self._retained_environment_ends.settling()
+                    and not self._leftover_teardown.settling()
                 )
             if (
                 not any(

@@ -83,6 +83,22 @@ class KeptTeardowns:
             del self._tasks[empty]
         return self._tasks.setdefault(key, [])
 
+    def settling(self) -> tuple[asyncio.Task[None], ...]:
+        """Harvest settled teardown and inventory unfinished owners for a drain."""
+
+        pending: list[asyncio.Task[None]] = []
+        for key, tasks in tuple(self._tasks.items()):
+            for task in tasks:
+                # Its failure was already reported where it was handed off.
+                if task.done() and not task.cancelled():
+                    task.exception()
+            tasks[:] = [task for task in tasks if not task.done()]
+            if tasks:
+                pending.extend(tasks)
+            else:
+                del self._tasks[key]
+        return tuple(pending)
+
     async def await_settled(self, key: Hashable) -> None:
         """Wait for ``key``'s kept teardown, which stays kept until it has settled.
 

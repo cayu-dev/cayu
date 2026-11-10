@@ -694,6 +694,34 @@ def test_kept_teardowns_keep_what_has_not_settled(monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+def test_kept_teardown_inventory_harvests_only_settled_owners(outcome):
+    async def scenario():
+        successor = _Successor()
+        kept = KeptTeardowns()
+        keep_cleanup_owners(successor.fail_with_handoff("teardown"), into=kept.bucket("pending"))
+
+        async def finish():
+            if outcome == "failure":
+                raise RuntimeError("teardown failed")
+
+        settled = asyncio.create_task(finish())
+        if outcome == "cancelled":
+            settled.cancel()
+        kept.bucket("settled").append(settled)
+        try:
+            await asyncio.wait((settled,))
+            assert kept.settling() == (successor.task,)
+            assert kept._tasks == {"pending": [successor.task]}
+            await successor.settle()
+            assert kept.settling() == ()
+            assert kept._tasks == {}
+        finally:
+            await successor.settle()
+
+    asyncio.run(scenario())
+
+
 def test_a_later_egress_cleanup_cancellation_hands_its_owners_to_the_first():
     async def scenario():
         successor = _Successor()
