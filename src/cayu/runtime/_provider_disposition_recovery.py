@@ -49,7 +49,6 @@ from cayu.runtime._recovery_admission import (
 )
 from cayu.runtime._recovery_ownership import (
     RecoveryOwnership,
-    _recovery_abandonment_signal,
 )
 from cayu.runtime._recovery_requests import (
     ProviderOperationFailureRequest,
@@ -800,10 +799,10 @@ class ProviderDispositionRecovery:
                 await self._recovery_admission.cleanup_entrypoint_handoff(
                     stream=None,
                     session_id=session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
-                    finalize_abandoned=False,
+                    # The pending disposition owns the invocation until the fallback
+                    # stream starts; the stream then settles its own exits.
+                    ledger=None,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=invocation_context,
@@ -878,6 +877,21 @@ class ProviderDispositionRecovery:
             raise ProviderOperationEvidenceError(
                 "Provider-operation fallback step exceeds its durable run limit."
             )
+        run_context = (
+            invocation_context
+            if invocation_context is not None
+            else reconstruct_invocation_context(
+                runtime_hooks=self._runtime_hooks,
+                loop_policies=self._loop_policies,
+                session=session,
+                execution_profile_snapshot=execution_profile_snapshot,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                budget_policy=copy_budget_policy(budget_policy),
+                request_loop_policies=(),
+            )
+        )
         session_stream = self._engine.continue_run(
             RecoverySessionRunRequest(
                 session=session,
@@ -911,23 +925,10 @@ class ProviderDispositionRecovery:
                     )
                 ),
                 preserve_failure_until_initial_provider_dispatch=True,
-                invocation_context=(
-                    invocation_context
-                    if invocation_context is not None
-                    else reconstruct_invocation_context(
-                        runtime_hooks=self._runtime_hooks,
-                        loop_policies=self._loop_policies,
-                        session=session,
-                        execution_profile_snapshot=execution_profile_snapshot,
-                        registered_agent=registered_agent,
-                        registered_provider=registered_provider,
-                        registered_environment=registered_environment,
-                        budget_policy=copy_budget_policy(budget_policy),
-                        request_loop_policies=(),
-                    )
-                ),
+                invocation_context=run_context,
             )
         )
+        ledger = self._recovery_admission.ledger(run_context)
         authoritative_failure: BaseException | None = None
         replacement_dispatch_durable = False
         limit_outcome_started = False
@@ -972,21 +973,17 @@ class ProviderDispositionRecovery:
                     raise RuntimeError(
                         "Provider-operation fallback limit has no durable terminal outcome."
                     )
-            cleanup = (
+            await (
                 self._recovery_admission.cleanup_entrypoint_handoff
                 if release_run_fence_on_cleanup
                 else self._recovery_admission.cleanup_recovery_handoff
-            )
-            await cleanup(
+            )(
                 stream=session_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=(
-                    replacement_dispatch_durable
-                    and _recovery_abandonment_signal(authoritative_failure) is not None
-                ),
+                # Until the replacement dispatch is durable the pending disposition
+                # still owns the invocation; afterwards this owner settles it.
+                ledger=ledger if replacement_dispatch_durable else None,
                 release_run_fence=release_run_fence_on_cleanup,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,

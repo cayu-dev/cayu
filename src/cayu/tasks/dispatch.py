@@ -118,6 +118,7 @@ from cayu.tasks._execution_settlement import (
     has_task_execution_settlement_pending,
 )
 from cayu.tasks._schedule_wakeup import next_schedule_wake_at
+from cayu.tasks._task_run_settlement import release_drained_claim
 from cayu.tasks._terminalization import _terminalize_claimed_task_or_detect_peer_winner
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEvent,
@@ -1339,7 +1340,7 @@ class TaskStoreDispatcher(Dispatcher):
                 envelope=envelope,
             )
         except Exception as exc:
-            await self._release_claimed_dispatch_after_failure(
+            await self._release_drained_dispatch_claim(
                 task=task,
                 worker_id=worker_id,
                 lease_authority=lease_authority,
@@ -1362,7 +1363,7 @@ class TaskStoreDispatcher(Dispatcher):
                 envelope=envelope,
             )
         except Exception as exc:
-            await self._release_claimed_dispatch_after_failure(
+            await self._release_drained_dispatch_claim(
                 task=task,
                 worker_id=worker_id,
                 lease_authority=lease_authority,
@@ -1577,7 +1578,7 @@ class TaskStoreDispatcher(Dispatcher):
                             error=recovery.permanent_rejection,
                             envelope=envelope,
                         )
-                    released = await self._release_claimed_dispatch_after_failure(
+                    released = await self._release_drained_dispatch_claim(
                         task=task,
                         worker_id=worker_id,
                         lease_authority=lease_authority,
@@ -1664,7 +1665,7 @@ class TaskStoreDispatcher(Dispatcher):
                             envelope=envelope,
                         )
                     if is_durable_subagent_worker_incompatible(exc):
-                        released = await self._release_claimed_dispatch_after_failure(
+                        released = await self._release_drained_dispatch_claim(
                             task=task,
                             worker_id=worker_id,
                             lease_authority=lease_authority,
@@ -1701,7 +1702,7 @@ class TaskStoreDispatcher(Dispatcher):
                             error=exc,
                             envelope=envelope,
                         )
-                    await self._release_claimed_dispatch_after_failure(
+                    await self._release_drained_dispatch_claim(
                         task=task,
                         worker_id=worker_id,
                         failure=exc,
@@ -1856,55 +1857,35 @@ class TaskStoreDispatcher(Dispatcher):
                 return DispatchStatus.SUBMITTED
         return DispatchStatus.SUBMITTED
 
-    async def _release_claimed_dispatch_after_failure(
+    async def _release_drained_dispatch_claim(
         self,
         *,
         task: Task,
         worker_id: str,
         lease_authority: _DispatchLeaseAuthority,
-        failure: Exception,
+        failure: Exception | None,
         release_failure_message: str = (
             "Queued dispatch pre-admission failure and task release both failed."
         ),
     ) -> bool:
-        """Make pre-admission work reclaimable without hiding a release failure.
+        """Make work with no handler left to drain reclaimable, through the claim exit table.
 
-        A release is idempotent for this claim generation, so retry once after an
-        operational failure.  Returning ``False`` records that ownership was lost;
-        callers that are requeueing can then return a reclaimed handle instead of
-        claiming that this worker released the task.
+        Returning ``False`` records that this worker no longer holds the claim;
+        callers that are requeueing then return a reclaimed handle.
         """
 
-        release_error: Exception | None = None
-        for _ in range(2):
-            try:
-                await self._release_claimed_task(
-                    task.id,
-                    worker_id,
-                    lease_authority,
-                )
-            except TaskTerminalizationConflict:
-                # This helper is reached only after non-admission is proven.
-                # An operator cancellation has no handler left to drain.
-                await self._settle_dispatch_cancellation_after_quiescence(
-                    task.id, worker_id, claim_generation=lease_authority.claim_generation
-                )
-                return False
-            except TaskClaimLost:
-                logger.warning(
-                    "dispatch task %s lost its lease while preserving a retryable failure",
-                    task.id,
-                )
-                return False
-            except asyncio.CancelledError as cancellation:
-                raise cancellation from failure
-            except Exception as exc:
-                release_error = exc
-                continue
-            return True
-
-        assert release_error is not None
-        raise ExceptionGroup(release_failure_message, [failure, release_error]) from None
+        claim_generation = lease_authority.claim_generation
+        return await release_drained_claim(
+            self._tasks,
+            task_id=task.id,
+            worker_id=worker_id,
+            claim_generation=claim_generation,
+            failure=failure,
+            settle_cancellation=lambda: self._settle_dispatch_cancellation_after_quiescence(
+                task.id, worker_id, claim_generation=claim_generation
+            ),
+            release_failure_message=release_failure_message,
+        )
 
     async def _release_claimed_task(
         self,
@@ -1961,17 +1942,13 @@ class TaskStoreDispatcher(Dispatcher):
                 if rejected is None:
                     raise AssertionError("Authenticated dispatch rejection lost its envelope.")
                 return rejected
-            try:
-                await self._release_claimed_task(
-                    task.id,
-                    worker_id,
-                    lease_authority,
-                )
-            except TaskClaimLost:
-                logger.warning(
-                    "dispatch %s lost its lease while retaining incomplete terminal evidence",
-                    request.dispatch_id,
-                )
+            # The run has stopped (or never entered): no handler is left to drain.
+            if not await self._release_drained_dispatch_claim(
+                task=task,
+                worker_id=worker_id,
+                lease_authority=lease_authority,
+                failure=None,
+            ):
                 return self._handle(
                     request,
                     DispatchStatus.SUBMITTED,

@@ -731,6 +731,12 @@ class SessionEngine(BeforeStopPolicies):
         self._execution_profile_continuation = execution_profile_continuation
         self._model_completion_recovery = model_completion_recovery
 
+    @property
+    def run_settlement(self) -> RunSettlement:
+        """The one exit owner of every admitted invocation, recovery included."""
+
+        return self._run_settlement
+
     async def _require_active_egress_profile_cutover(
         self,
         *,

@@ -273,46 +273,11 @@ class RunSettlement:
     async def settle(self, ledger: RunLedger, run_exit: RunExit) -> None:
         """Finish whatever this invocation still owes. Safe to call again."""
 
-        if run_exit.kind in _UNSETTLED_EXITS or ledger.stage >= OutcomeStage.FENCE_RELEASED:
-            return
-        # A committed outcome is finished from its decision whoever handled the error.
-        owed = await self._owed_settlement(ledger)
-        if owed is not _Owed.COMPLETION and ledger.stage < OutcomeStage.DECIDED:
-            if run_exit.error is not None and self._recovery_owns_failure(run_exit.error, ledger):
-                # The body deliberately left this invocation open for its recovery
-                # owner (uncertain terminal evidence, an unsettled durable child
-                # submission, a rejected interaction publication).
-                return
-            if ledger.failure_owned_by_body:
-                # The body's own failure handler took this invocation's outcome; if
-                # it could not finish, also because a cancellation interrupted it,
-                # its durable state is left for recovery exactly as before.
-                return
-        if owed is _Owed.NOTHING:
-            ledger.advance(OutcomeStage.FENCE_RELEASED)
-            return
-        if owed is _Owed.RECOVERY:
+        owed = await self._owed_outcome(ledger, run_exit)
+        if owed is None:
             return
         try:
-            if owed is _Owed.DECISION:
-                await self._decide_abandoned(ledger)
-            # An outcome that committed before the body recorded it publishes
-            # what its decision owes before the release.
-            if owed is _Owed.COMPLETION and await self._publish_owed_outcome(ledger):
-                ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
-            if ledger.remainder is not None:
-                published = await ledger.remainder()
-                if published is False:
-                    # A cancellation or failure inside the publication ended it.
-                    # Its decision still holds every event it owes, so a fresh
-                    # publication finishes it; each step replays what is durable.
-                    # A completion is restarted only after a cancellation, so a
-                    # failing process never runs environment finalization twice.
-                    published = await self._publish_owed_outcome(
-                        ledger, restart_completion=run_exit.kind is RunExitKind.CANCELLED
-                    )
-                if published is not False:
-                    ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+            await self._finish_outcome(ledger, run_exit, owed)
         finally:
             # Abort the environment and release the fence even if the decision
             # or its remainder failed: the release itself keeps the fence when
@@ -330,6 +295,69 @@ class RunSettlement:
                     invocation_context=context,
                 )
         ledger.advance(OutcomeStage.FENCE_RELEASED)
+
+    async def settle_outcome(self, ledger: RunLedger, error: BaseException | None) -> None:
+        """Decide and publish what one exit owes; the caller releases it.
+
+        For exit owners whose release has its own order, such as a recovery
+        handoff that releases its fence or claim only once the continuation is
+        quiescent. As in ``finish``, a normal return owes nothing beyond a
+        remainder the body recorded: the body decided its own outcome, so a
+        session it left live is never decided abandoned here.
+        """
+
+        run_exit = classify_run_exit(error, cancellation_baseline=ledger.cancellation_baseline)
+        if run_exit.kind is RunExitKind.RETURNED and ledger.remainder is None:
+            return
+        owed = await self._owed_outcome(ledger, run_exit)
+        if owed is not None:
+            await self._finish_outcome(ledger, run_exit, owed)
+
+    async def _owed_outcome(self, ledger: RunLedger, run_exit: RunExit) -> _Owed | None:
+        """What this exit still owes before its release, or None when nothing is."""
+
+        if run_exit.kind in _UNSETTLED_EXITS or ledger.stage >= OutcomeStage.FENCE_RELEASED:
+            return None
+        # A committed outcome is finished from its decision whoever handled the error.
+        owed = await self._owed_settlement(ledger)
+        if owed is not _Owed.COMPLETION and ledger.stage < OutcomeStage.DECIDED:
+            if run_exit.error is not None and self._recovery_owns_failure(run_exit.error, ledger):
+                # The body deliberately left this invocation open for its recovery
+                # owner (uncertain terminal evidence, an unsettled durable child
+                # submission, a rejected interaction publication).
+                return None
+            if ledger.failure_owned_by_body:
+                # The body's own failure handler took this invocation's outcome; if
+                # it could not finish, also because a cancellation interrupted it,
+                # its durable state is left for recovery exactly as before.
+                return None
+        if owed is _Owed.NOTHING:
+            ledger.advance(OutcomeStage.FENCE_RELEASED)
+            return None
+        if owed is _Owed.RECOVERY:
+            return None
+        return owed
+
+    async def _finish_outcome(self, ledger: RunLedger, run_exit: RunExit, owed: _Owed) -> None:
+        if owed is _Owed.DECISION:
+            await self._decide_abandoned(ledger)
+        # An outcome that committed before the body recorded it publishes
+        # what its decision owes before the release.
+        if owed is _Owed.COMPLETION and await self._publish_owed_outcome(ledger):
+            ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
+        if ledger.remainder is not None:
+            published = await ledger.remainder()
+            if published is False:
+                # A cancellation or failure inside the publication ended it.
+                # Its decision still holds every event it owes, so a fresh
+                # publication finishes it; each step replays what is durable.
+                # A completion is restarted only after a cancellation, so a
+                # failing process never runs environment finalization twice.
+                published = await self._publish_owed_outcome(
+                    ledger, restart_completion=run_exit.kind is RunExitKind.CANCELLED
+                )
+            if published is not False:
+                ledger.advance(OutcomeStage.TERMINAL_PUBLISHED)
 
     def release_local(self, ledger: RunLedger) -> None:
         """Retire this invocation's task-local state. Never awaits."""

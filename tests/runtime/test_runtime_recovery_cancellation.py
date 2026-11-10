@@ -447,6 +447,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             registered_environment=None,
             execution_profile=None,
             invocation_context=None,
+            structured_output_pending=None,
         ) -> None:
             cleanup_order.append("abandoned_finalization")
             await original_finalize(
@@ -458,6 +459,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                structured_output_pending=structured_output_pending,
             )
 
         monkeypatch.setattr(
@@ -495,17 +497,17 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_stops_continuation_before_re
             )
 
         assert provider.continuation_cancelled.is_set()
-        assert cleanup_order.count("abandoned_finalization") == 1
+        # The cancelled continuation settles its own run as interrupted; the
+        # supervisor's settlement then finds that outcome committed and only
+        # releases, so nothing is finalized as abandoned a second time.
+        assert cleanup_order.count("abandoned_finalization") == 0
         assert cleanup_order.count("environment_abort") == 1
-        assert cleanup_order.index("provider_cancelled") < cleanup_order.index(
-            "abandoned_finalization"
-        )
-        assert cleanup_order.index("abandoned_finalization") < cleanup_order.index(
-            "environment_abort"
-        )
+        assert cleanup_order.index("provider_cancelled") < cleanup_order.index("environment_abort")
         assert cleanup_order.index("environment_abort") < cleanup_order.index("run_fence_release")
         session = await store.load(session_id)
         assert session is not None and session.status == SessionStatus.INTERRUPTED
+        events = await store.load_events(session_id)
+        assert [event.type for event in events].count(EventType.SESSION_INTERRUPTED) == 1
         checkpoint = await store.load_checkpoint(session_id)
         assert_only_model_step_publication_checkpoint(checkpoint)
         assert tool.calls == [{}]
@@ -580,6 +582,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
             registered_environment=None,
             execution_profile=None,
             invocation_context=None,
+            structured_output_pending=None,
         ) -> None:
             cleanup_order.append("abandoned_finalization")
             await original_finalize(
@@ -591,6 +594,7 @@ def test_cayu_app_recover_tool_round_heartbeat_loss_cleans_up_while_consumer_is_
                 registered_environment=registered_environment,
                 execution_profile=execution_profile,
                 invocation_context=invocation_context,
+                structured_output_pending=structured_output_pending,
             )
 
         monkeypatch.setattr(

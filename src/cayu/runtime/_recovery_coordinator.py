@@ -28,7 +28,6 @@ from cayu._exception_groups import (
     _attach_exception_cause_preserving_graph,
     add_exception_note_safely,
     exception_cause,
-    iter_exception_tree,
 )
 from cayu._task_wait import (
     await_shielded_task_outcome,
@@ -1593,8 +1592,8 @@ class RecoveryCoordinator:
             effect_reconciliation=effect_reconciliation,
             foreground_gate=foreground_gate,
         )
+        ledger = self._recovery_admission.ledger(invocation_context)
         authoritative_failure: BaseException | None = None
-        abandoned = False
         try:
             if resumed_event is not None:
                 yield resumed_event
@@ -1602,16 +1601,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._recovery_admission.cleanup_entrypoint_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=abandoned,
+                ledger=ledger,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
@@ -1911,6 +1907,7 @@ class RecoveryCoordinator:
                 update={"run_epoch": session.run_epoch}
             ),
         )
+        ledger = self._recovery_admission.ledger(invocation_context)
         if expired_replay is not None:
             replay_failure: BaseException | None = None
             environment = ContinuationEnvironment(
@@ -1968,10 +1965,8 @@ class RecoveryCoordinator:
                 await self._recovery_admission.cleanup_entrypoint_handoff(
                     stream=None,
                     session_id=session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=environment.registered_environment,
                     authoritative_failure=replay_failure,
-                    finalize_abandoned=replay_failure is not None,
+                    ledger=ledger,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=environment.invocation_context,
@@ -2009,10 +2004,8 @@ class RecoveryCoordinator:
             await self._recovery_admission.cleanup_entrypoint_handoff(
                 stream=recovery_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=not inner_started,
+                ledger=None if inner_started else ledger,
                 release_run_fence=not inner_started,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
@@ -2461,8 +2454,8 @@ class RecoveryCoordinator:
             invocation_context=invocation_context,
             foreground_gate=foreground_gate,
         )
+        ledger = self._recovery_admission.ledger(invocation_context)
         authoritative_failure: BaseException | None = None
-        abandoned = False
         try:
             if profile_adoption is not None:
                 # Inside the cleanup boundary: the session is already claimed.
@@ -2474,16 +2467,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = _recovery_abandonment_signal(exc) is not None
             raise
         finally:
             await self._recovery_admission.cleanup_entrypoint_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=abandoned,
+                ledger=ledger,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
@@ -2883,6 +2873,7 @@ class RecoveryCoordinator:
                 update={"run_epoch": session.run_epoch}
             ),
         )
+        ledger = self._recovery_admission.ledger(invocation_context)
         recovery_stream = self.recover_tool_approval(
             request=request,
             participant_context=participant_context,
@@ -2914,10 +2905,8 @@ class RecoveryCoordinator:
             await self._recovery_admission.cleanup_entrypoint_handoff(
                 stream=recovery_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=not inner_started,
+                ledger=None if inner_started else ledger,
                 release_run_fence=not inner_started,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=invocation_context,
@@ -3416,13 +3405,12 @@ class RecoveryCoordinator:
             raise
         finally:
             try:
+                # The claimed recovery below owns the invocation and its settlement.
                 await self._recovery_admission.cleanup_entrypoint_handoff(
                     stream=recovery_stream,
                     session_id=loaded_session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
-                    finalize_abandoned=False,
+                    ledger=None,
                     release_run_fence=False,
                     abort_environment_setup=False,
                     execution_profile=execution_profile_snapshot.profile,
@@ -5553,15 +5541,6 @@ class RecoveryCoordinator:
             self._foreground_gate_policy_owner.release(
                 session=session, kind="approval", action_id=pending_approval.approval_id
             )
-        except GeneratorExit:
-            await self._session_finalization.finalize_abandoned_session_by_id(
-                session.id,
-                registered_agent=registered_agent,
-                registered_environment=environment.registered_environment,
-                execution_profile=execution_profile_snapshot.profile,
-                invocation_context=environment.invocation_context,
-            )
-            raise
         except ForegroundChildActionRequired as exc:
             async for event in self._pause_gate_on_child(
                 exc,
@@ -6207,10 +6186,10 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         execution_profile_snapshot: ActiveInvocationExecutionProfile,
         budget_policy: BudgetPolicy | None,
-        invocation_context: InvocationContext | None = None,
+        invocation_context: InvocationContext,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
-        if invocation_context is not None and (
+        if (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
             or invocation_context.registered_provider is not registered_provider
@@ -6242,8 +6221,8 @@ class RecoveryCoordinator:
         recovery_prepared = False
         publication = ManualRecoveryPublication(self._event_writer)
         cancellation_baseline = _task_cancellation_count()
+        ledger = self._recovery_admission.ledger(invocation_context)
         authoritative_failure: BaseException | None = None
-        abandoned = False
         environment = ContinuationEnvironment(
             lifecycle=self._environment_lifecycle,
             session=session,
@@ -6448,7 +6427,6 @@ class RecoveryCoordinator:
             recovery_prepared = True
         except (GeneratorExit, asyncio.CancelledError) as exc:
             authoritative_failure = exc
-            abandoned = True
             raise
         except Exception as exc:
             authoritative_failure = exc
@@ -6456,13 +6434,6 @@ class RecoveryCoordinator:
                 reconciliation = await publication.reconcile()
             except BaseException as reconciliation_failure:
                 authoritative_failure = reconciliation_failure
-                abandoned = (
-                    _recovery_abandonment_signal(
-                        reconciliation_failure,
-                        cancellation_baseline=cancellation_baseline,
-                    )
-                    is not None
-                )
                 raise
             if reconciliation.cancellation is not None:
                 reconciliation.cancellation.add_note(
@@ -6470,7 +6441,6 @@ class RecoveryCoordinator:
                     "reconciliation was running."
                 )
                 authoritative_failure = reconciliation.cancellation
-                abandoned = True
                 raise reconciliation.cancellation from exc
             publication.persisted = reconciliation.persisted is True
             persistence_payload = reconciliation.failure_payload(redactor=self._secret_redactor)
@@ -6499,13 +6469,6 @@ class RecoveryCoordinator:
                         yield event
                 except BaseException as interruption_failure:
                     authoritative_failure = interruption_failure
-                    abandoned = (
-                        _recovery_abandonment_signal(
-                            interruption_failure,
-                            cancellation_baseline=cancellation_baseline,
-                        )
-                        is not None
-                    )
                     raise
                 # The original failure is now represented by durable interrupted
                 # state. It must not suppress a later fence-release failure.
@@ -6538,14 +6501,14 @@ class RecoveryCoordinator:
             raise
         except BaseExceptionGroup as exc:
             authoritative_failure = exc
-            abandoned = (
+            grouped_abandonment = (
                 _recovery_abandonment_signal(
                     exc,
                     cancellation_baseline=cancellation_baseline,
                 )
                 is not None
             )
-            if publication.persisted and not abandoned:
+            if publication.persisted and not grouped_abandonment:
                 async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
@@ -6563,10 +6526,8 @@ class RecoveryCoordinator:
                 await self._recovery_admission.cleanup_recovery_handoff(
                     stream=None,
                     session_id=session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=environment.registered_environment,
                     authoritative_failure=authoritative_failure,
-                    finalize_abandoned=abandoned,
+                    ledger=ledger,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=environment.invocation_context,
@@ -6574,7 +6535,6 @@ class RecoveryCoordinator:
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
         authoritative_failure = None
-        abandoned = False
         try:
             from cayu.runtime._foreground_gate_continuation import gate_input_response_from_recovery
 
@@ -6606,22 +6566,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = (
-                _recovery_abandonment_signal(
-                    exc,
-                    cancellation_baseline=cancellation_baseline,
-                )
-                is not None
-            )
             raise
         finally:
             await self._recovery_admission.cleanup_recovery_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=environment.registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=abandoned,
+                ledger=ledger,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=environment.invocation_context,
@@ -6642,10 +6593,10 @@ class RecoveryCoordinator:
         budget_policy: BudgetPolicy | None,
         deferred_messages: list[Message],
         claimed_resolution_intent: pending_approval_reader.ApprovalResolutionIntent | None,
-        invocation_context: InvocationContext | None = None,
+        invocation_context: InvocationContext,
         participant_context: CollaborationAccessContext | None = None,
     ) -> AsyncGenerator[Event, None]:
-        if invocation_context is not None and (
+        if (
             invocation_context.binding.session_id != session.id
             or invocation_context.registered_agent is not registered_agent
             or invocation_context.registered_provider is not registered_provider
@@ -6662,8 +6613,8 @@ class RecoveryCoordinator:
         recovery_prepared = False
         publication = ManualRecoveryPublication(self._event_writer)
         cancellation_baseline = _task_cancellation_count()
+        ledger = self._recovery_admission.ledger(invocation_context)
         authoritative_failure: BaseException | None = None
-        abandoned = False
         environment = ContinuationEnvironment(
             lifecycle=self._environment_lifecycle,
             session=session,
@@ -6921,25 +6872,16 @@ class RecoveryCoordinator:
             recovery_prepared = True
         except (GeneratorExit, asyncio.CancelledError) as exc:
             authoritative_failure = exc
-            abandoned = True
             raise
         except Exception as exc:
             authoritative_failure = exc
             if type(request) is ToolEffectReconciliationRequest:
                 # Finish the claimed recovery through its existing cleanup owner.
-                abandoned = True
                 raise
             try:
                 reconciliation = await publication.reconcile()
             except BaseException as reconciliation_failure:
                 authoritative_failure = reconciliation_failure
-                abandoned = (
-                    _recovery_abandonment_signal(
-                        reconciliation_failure,
-                        cancellation_baseline=cancellation_baseline,
-                    )
-                    is not None
-                )
                 raise
             if reconciliation.cancellation is not None:
                 reconciliation.cancellation.add_note(
@@ -6947,7 +6889,6 @@ class RecoveryCoordinator:
                     "reconciliation was running."
                 )
                 authoritative_failure = reconciliation.cancellation
-                abandoned = True
                 raise reconciliation.cancellation from exc
             publication.persisted = reconciliation.persisted is True
             persistence_payload = reconciliation.failure_payload(redactor=self._secret_redactor)
@@ -6979,13 +6920,6 @@ class RecoveryCoordinator:
                         yield event
                 except BaseException as interruption_failure:
                     authoritative_failure = interruption_failure
-                    abandoned = (
-                        _recovery_abandonment_signal(
-                            interruption_failure,
-                            cancellation_baseline=cancellation_baseline,
-                        )
-                        is not None
-                    )
                     raise
                 # The original failure is now represented by durable interrupted
                 # state. It must not suppress a later fence-release failure.
@@ -6995,14 +6929,14 @@ class RecoveryCoordinator:
             raise
         except BaseExceptionGroup as exc:
             authoritative_failure = exc
-            abandoned = (
+            grouped_abandonment = (
                 _recovery_abandonment_signal(
                     exc,
                     cancellation_baseline=cancellation_baseline,
                 )
                 is not None
             )
-            if publication.persisted and not abandoned:
+            if publication.persisted and not grouped_abandonment:
                 async for event in self._session_finalization.interrupt_recovery(
                     RecoveryInterruptionRequest(
                         session=session,
@@ -7020,10 +6954,8 @@ class RecoveryCoordinator:
                 await self._recovery_admission.cleanup_recovery_handoff(
                     stream=None,
                     session_id=session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=environment.registered_environment,
                     authoritative_failure=authoritative_failure,
-                    finalize_abandoned=abandoned,
+                    ledger=ledger,
                     release_run_fence=True,
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=environment.invocation_context,
@@ -7031,7 +6963,6 @@ class RecoveryCoordinator:
 
         continuation_stream: AsyncGenerator[Event, None] | None = None
         authoritative_failure = None
-        abandoned = False
         try:
             if type(request) is ToolEffectReconciliationRequest:
                 approval_request = ToolApprovalRequest(
@@ -7091,23 +7022,13 @@ class RecoveryCoordinator:
                 yield event
         except BaseException as exc:
             authoritative_failure = exc
-            abandoned = (
-                type(request) is ToolEffectReconciliationRequest
-                or _recovery_abandonment_signal(
-                    exc,
-                    cancellation_baseline=cancellation_baseline,
-                )
-                is not None
-            )
             raise
         finally:
             await self._recovery_admission.cleanup_recovery_handoff(
                 stream=continuation_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=environment.registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=abandoned,
+                ledger=ledger,
                 release_run_fence=True,
                 execution_profile=execution_profile_snapshot.profile,
                 invocation_context=environment.invocation_context,
@@ -7996,7 +7917,11 @@ class RecoveryCoordinator:
             authoritative_failure: BaseException | None = None
             cleanup_failure: BaseException | None = None
             durable_interruption_observed = False
-            recovery_transition_fenced = False
+            # The supervisor owns the claimed invocation's exit and settles it.
+            # Fence loss is decided as for runs: the interaction-transition
+            # marker, or the durable epoch, instance or profile having moved.
+            # Any other SessionRunFenced is an ordinary failure.
+            ledger = self._recovery_admission.ledger(invocation_context)
             recovery_worker_quiescent = False
             recovery_handoff_quiescent = False
             if supervisor_runtime_task is not None:
@@ -8007,7 +7932,7 @@ class RecoveryCoordinator:
             supervisor_started.set()
 
             async def stop_recovery_worker() -> None:
-                nonlocal recovery_transition_fenced, recovery_worker_quiescent
+                nonlocal recovery_worker_quiescent
                 try:
                     if not recovery_task.done() and not recovery_task.cancelling():
                         recovery_task.cancel()
@@ -8021,17 +7946,9 @@ class RecoveryCoordinator:
                         child_failure = exception_cause(child_cancellation)
                         if child_failure is None:
                             return
-                        recovery_transition_fenced = any(
-                            isinstance(candidate, SessionRunFenced)
-                            for candidate in iter_exception_tree(child_failure)
-                        )
                         raise child_failure from None
                 child_failure = recovery_task.exception()
                 if child_failure is not None:
-                    recovery_transition_fenced = any(
-                        isinstance(candidate, SessionRunFenced)
-                        for candidate in iter_exception_tree(child_failure)
-                    )
                     raise child_failure
 
             async def settle_recovery_handoff() -> None:
@@ -8039,12 +7956,8 @@ class RecoveryCoordinator:
                 await self._recovery_admission.cleanup_recovery_handoff(
                     stream=recovery_stream,
                     session_id=claim.session.id,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
                     authoritative_failure=authoritative_failure,
-                    finalize_abandoned=(
-                        authoritative_failure is not None and not recovery_transition_fenced
-                    ),
+                    ledger=ledger,
                     release_run_fence=False,
                     execution_profile=execution_profile_snapshot.profile,
                     invocation_context=invocation_context,
@@ -8497,75 +8410,17 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-        except (GeneratorExit, asyncio.CancelledError) as abandonment:
-            await self._recovery_ownership.run_cleanup_steps(
-                authoritative_failure=abandonment,
-                steps=(
-                    (
-                        "abandoned session finalization",
-                        lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                            session.id,
-                            registered_agent=registered_agent,
-                            registered_environment=registered_environment,
-                            execution_profile=execution_profile_snapshot.profile,
-                            invocation_context=invocation_context,
-                        ),
-                    ),
-                ),
-            )
-            raise
         except Exception as exc:
             reconciliation_error: Exception | None = None
             if not recovery_persisted and recovery_event_to_reconcile is not None:
-                try:
-                    reconciliation = await reconcile_manual_recovery_persistence(
-                        self._event_writer, recovery_event_to_reconcile
-                    )
-                except BaseException as reconciliation_failure:
-                    if (
-                        _recovery_abandonment_signal(
-                            reconciliation_failure,
-                            cancellation_baseline=cancellation_baseline,
-                        )
-                        is not None
-                    ):
-                        await self._recovery_ownership.run_cleanup_steps(
-                            authoritative_failure=reconciliation_failure,
-                            steps=(
-                                (
-                                    "abandoned session finalization",
-                                    lambda: (
-                                        self._session_finalization.finalize_abandoned_session_by_id(
-                                            session.id,
-                                            registered_agent=registered_agent,
-                                            registered_environment=registered_environment,
-                                            execution_profile=execution_profile_snapshot.profile,
-                                            invocation_context=invocation_context,
-                                        )
-                                    ),
-                                ),
-                            ),
-                        )
-                    raise
+                # Every exit from here is settled by the manual-recovery supervisor.
+                reconciliation = await reconcile_manual_recovery_persistence(
+                    self._event_writer, recovery_event_to_reconcile
+                )
                 if reconciliation.cancellation is not None:
                     reconciliation.cancellation.add_note(
                         "Manual tool-round recovery append failed while persistence "
                         "reconciliation was running."
-                    )
-                    await self._recovery_ownership.run_cleanup_steps(
-                        authoritative_failure=reconciliation.cancellation,
-                        steps=(
-                            (
-                                "abandoned session finalization",
-                                lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                                    session.id,
-                                    registered_agent=registered_agent,
-                                    registered_environment=registered_environment,
-                                    execution_profile=execution_profile_snapshot.profile,
-                                    invocation_context=invocation_context,
-                                ),
-                            ),
-                        ),
                     )
                     raise reconciliation.cancellation from exc
                 recovery_persisted = reconciliation.persisted is True
@@ -8696,22 +8551,6 @@ class RecoveryCoordinator:
                     )
                 ):
                     yield event
-            if abandonment is not None:
-                await self._recovery_ownership.run_cleanup_steps(
-                    authoritative_failure=exc,
-                    steps=(
-                        (
-                            "abandoned session finalization",
-                            lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                                session.id,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                execution_profile=execution_profile_snapshot.profile,
-                                invocation_context=invocation_context,
-                            ),
-                        ),
-                    ),
-                )
             raise
 
         session_stream: AsyncGenerator[Event, None] | None = None
@@ -8751,13 +8590,9 @@ class RecoveryCoordinator:
             await self._recovery_admission.cleanup_recovery_handoff(
                 stream=session_stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                # The manual-recovery supervisor drains this worker before
-                # finalizing the session and releasing its claim. This nested
-                # continuation owns stream closure, not a second finalization.
-                finalize_abandoned=False,
+                # The manual-recovery supervisor owns and settles this exit.
+                ledger=None,
                 release_run_fence=False,
                 abort_environment_setup=False,
                 execution_profile=execution_profile_snapshot.profile,
@@ -9452,11 +9287,9 @@ class RecoveryCoordinator:
             await self._recovery_admission.cleanup_recovery_handoff(
                 stream=stream,
                 session_id=session.id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=failure,
-                # Same supervisor ownership as manual tool-round recovery.
-                finalize_abandoned=False,
+                # The manual-recovery supervisor owns and settles this exit.
+                ledger=None,
                 release_run_fence=False,
                 abort_environment_setup=False,
                 execution_profile=execution_profile_snapshot.profile,

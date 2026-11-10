@@ -4,12 +4,16 @@ A worker or dispatcher that runs a claimed task owns two things once the
 handler stops: the task's disposition and, for a quiescent task group, the
 acknowledgement that this execution stopped. These helpers classify the exit
 with :func:`cayu.runtime._run_exit.classify_run_exit` and settle both
-obligations on every path.
+obligations on every path. A claim with no handler left to drain (its
+execution was proven not admitted, or has stopped) leaves through
+:func:`release_drained_claim`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -21,11 +25,18 @@ from cayu.tasks.cancellation import (
     _task_retry_cancellation_requested,
 )
 from cayu.tasks.records import TaskClaimLost, TaskStatus
+from cayu.tasks.terminalization import TaskTerminalizationConflict
 
 if TYPE_CHECKING:
     from cayu.tasks._execution_settlement import TaskExecutionSettlement
     from cayu.tasks.records import Task
     from cayu.tasks.store import TaskStore
+
+
+logger = logging.getLogger(__name__)
+
+# One retry: a release is idempotent for its claim generation.
+_DRAINED_RELEASE_ATTEMPTS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,3 +183,46 @@ async def release_unstarted_claims(
         authoritative_failure=failure,
         steps=(("unstarted task claim release", release),),
     )
+
+
+async def release_drained_claim(
+    task_store: TaskStore,
+    *,
+    task_id: str,
+    worker_id: str,
+    claim_generation: int,
+    failure: Exception | None,
+    settle_cancellation: Callable[[], Awaitable[None]],
+    release_failure_message: str,
+) -> bool:
+    """Return a claim no handler is left to drain to the queue.
+
+    The claim's execution was proven not admitted, or has already stopped, so
+    every exit of the release settles the claim: it is released (``True``),
+    already another owner's (``False``), or cancelled by an operator meanwhile,
+    which is settled as cancelled here (``False``). A transient store failure
+    is retried, because the release is idempotent for ``claim_generation``; if
+    it still fails it is raised, together with ``failure`` when the release
+    follows one. Caller cancellation is raised, chained to ``failure``.
+    """
+
+    release_error: Exception | None = None
+    for _attempt in range(_DRAINED_RELEASE_ATTEMPTS):
+        try:
+            await task_store.release_task(task_id, worker_id, claim_generation=claim_generation)
+        except TaskTerminalizationConflict:
+            await settle_cancellation()
+            return False
+        except TaskClaimLost:
+            logger.warning("task %s lost its claim before its drained release", task_id)
+            return False
+        except asyncio.CancelledError as cancellation:
+            raise cancellation from failure
+        except Exception as error:
+            release_error = error
+            continue
+        return True
+    assert release_error is not None
+    if failure is None:
+        raise release_error
+    raise ExceptionGroup(release_failure_message, [failure, release_error]) from None

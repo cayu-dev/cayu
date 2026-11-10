@@ -456,3 +456,145 @@ def test_failing_decision_still_releases_environment_and_fence(failing):
     first = "decide" if failing == "decision" else "deferred-input"
     assert world.calls == [first, "environment", "fence"]
     assert ledger.stage is OutcomeStage.ADMITTED
+
+
+@pytest.mark.parametrize(
+    ("error", "decided"),
+    [(None, False), (OSError("continuation failed"), True), (GeneratorExit(), True)],
+    ids=["returned", "failed", "closed"],
+)
+def test_outcome_settlement_leaves_a_returned_owner_and_its_release_alone(error, decided):
+    """A recovery handoff settles the outcome and releases in its own order.
+
+    A continuation that returned decided its own outcome: even with its session
+    still live, nothing is decided for it, exactly as ``finish`` skips it.
+    """
+
+    async def scenario():
+        world = _World()
+        await _settlement(world).settle_outcome(_ledger(world), error)
+        return world
+
+    world = asyncio.run(scenario())
+    assert world.calls == (["decide"] if decided else [])
+    assert world.session.status is (SessionStatus.INTERRUPTED if decided else SessionStatus.RUNNING)
+
+
+class _HandoffWorld(_World):
+    """The durable side of a recovery handoff, and the refusals it records."""
+
+    def __init__(self, *, fail_next_load: bool = False) -> None:
+        super().__init__()
+        self.session.execution_deadline = SimpleNamespace(expired=False)
+        self.fail_next_load = fail_next_load
+        self.refused: set[str] = set()
+
+    async def load(self, session_id):
+        if self.fail_next_load:
+            self.fail_next_load = False
+            raise OSError("session read unavailable")
+        return await super().load(session_id)
+
+    def forget_refused_interaction_publications(self, session_id):
+        self.refused.discard(session_id)
+
+
+@pytest.fixture
+def handoff_admission(monkeypatch):
+    from cayu.runtime import _recovery_admission
+    from cayu.runtime._recovery_admission import RecoveryAdmission
+
+    monkeypatch.setattr(
+        _recovery_admission,
+        "active_invocation_execution_profile_from_checkpoint",
+        lambda checkpoint: checkpoint.get("active"),
+    )
+
+    def admission_for(world: _HandoffWorld) -> RecoveryAdmission:
+        settlement = RunSettlement(
+            session_store=world,
+            session_finalization=world,
+            environment_lifecycle=world,
+            recovery_ownership=world,
+            finish_owed_outcome=_no_owed_outcome,
+            # As the engine's predicate does: a refused publication leaves the exit open.
+            recovery_owns_failure=lambda error, ledger: ledger.session_id in world.refused,
+        )
+        return RecoveryAdmission(
+            clock=None,
+            environment_lifecycle=world,
+            recovery_ownership=world,
+            run_settlement=settlement,
+            session_control=None,
+            session_finalization=world,
+            session_store=world,
+            terminal_finalization=None,
+        )
+
+    return admission_for
+
+
+def test_a_failed_handoff_reload_still_closes_settles_and_releases(handoff_admission):
+    async def scenario():
+        world = _HandoffWorld(fail_next_load=True)
+        closed = []
+
+        async def continuation():
+            try:
+                yield 1
+            finally:
+                closed.append(True)
+
+        stream = continuation()
+        await anext(stream)
+        admission = handoff_admission(world)
+        failure = OSError("continuation failed")
+        ledger = admission.ledger(_ledger(world).invocation_context)
+        await admission.cleanup_entrypoint_handoff(
+            stream=stream,
+            session_id="session",
+            authoritative_failure=failure,
+            ledger=ledger,
+            release_run_fence=True,
+            invocation_context=ledger.invocation_context,
+        )
+        return world, closed, failure
+
+    world, closed, failure = asyncio.run(scenario())
+    assert closed == [True]
+    assert world.calls == ["decide", "environment", "fence"]
+    assert world.session.status is SessionStatus.INTERRUPTED
+    # The read failure is reported with the original failure, which stays authoritative.
+    assert any("context reload" in note for note in failure.__notes__)
+
+
+@pytest.mark.parametrize("refused_by", ["earlier-owner", "this-invocation"])
+def test_recovered_owner_judges_only_its_own_publication_refusals(handoff_admission, refused_by):
+    """A refusal another owner recorded never keeps this invocation open.
+
+    One this invocation recorded leaves it open for recovery, and is retired
+    with its exit either way, as a run or resume's settlement does.
+    """
+
+    async def scenario():
+        world = _HandoffWorld()
+        admission = handoff_admission(world)
+        if refused_by == "earlier-owner":
+            world.refused.add("session")
+        ledger = admission.ledger(_ledger(world).invocation_context)
+        if refused_by == "this-invocation":
+            world.refused.add("session")
+        await admission.cleanup_entrypoint_handoff(
+            stream=None,
+            session_id="session",
+            authoritative_failure=OSError("continuation failed"),
+            ledger=ledger,
+            release_run_fence=True,
+            invocation_context=ledger.invocation_context,
+        )
+        return world
+
+    world = asyncio.run(scenario())
+    decided = refused_by == "earlier-owner"
+    assert world.calls == (["decide"] if decided else []) + ["environment", "fence"]
+    assert world.refused == set()

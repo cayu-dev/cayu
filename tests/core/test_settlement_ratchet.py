@@ -1,13 +1,15 @@
 """Keep new run, recovery and task code on the single settlement path.
 
-Settlement is owned by ``runtime/_run_settlement.py`` (admitted invocations),
-``runtime/_run_exit.py`` (exit classification) and ``tasks/_task_run_settlement.py``
-(claimed tasks). A new ``except GeneratorExit`` or ``except BaseExceptionGroup``
-(or a catch-all ``except BaseException``) in the engine, recovery or task
-modules is a hand-written exit handler: it settles only the exits its author
-anticipated. The allow-lists record the
-handlers that remain today (see the settlement implementation notes for why
-each stays) and may only shrink.
+Settlement is owned by ``runtime/_run_settlement.py`` (admitted invocations,
+recovered ones included), ``runtime/_run_exit.py`` (exit classification) and
+``tasks/_task_run_settlement.py`` (claimed tasks). A new ``except GeneratorExit``
+or ``except BaseExceptionGroup`` (or a catch-all ``except BaseException``) in the
+engine, recovery or task modules is a hand-written exit handler: it settles only
+the exits its author anticipated. So is a recovery exit that finalizes an
+abandoned session itself instead of handing its ledger to the settlement, and a
+dispatcher branch that releases a claim outside the claim exit table. The
+allow-lists record the exits that remain today (see the settlement
+implementation notes for why each stays) and may only shrink.
 """
 
 from __future__ import annotations
@@ -32,13 +34,12 @@ _ALLOWED_HANDLERS: dict[str, dict[tuple[str, str], int]] = {
         ): 1,
         ("RecoveryCoordinator._interrupt_deadline_settlement", "BaseException"): 1,
         ("RecoveryCoordinator._reconcile_tool_effect_claimed", "BaseException"): 1,
-        ("RecoveryCoordinator._recover_tool_round_claimed", "BaseException"): 2,
+        ("RecoveryCoordinator._recover_tool_round_claimed", "BaseException"): 1,
         ("RecoveryCoordinator._recover_tool_round_claimed", "BaseExceptionGroup"): 1,
-        ("RecoveryCoordinator._recover_tool_round_claimed", "GeneratorExit"): 1,
         ("RecoveryCoordinator._recovery_tool_hook_events", "BaseException"): 1,
         ("RecoveryCoordinator._resolve_tool_approval_owned", "BaseException"): 1,
         ("RecoveryCoordinator._resolve_user_input_owned", "BaseException"): 1,
-        ("RecoveryCoordinator.continue_tool_approval_resolution", "GeneratorExit"): 2,
+        ("RecoveryCoordinator.continue_tool_approval_resolution", "GeneratorExit"): 1,
         ("RecoveryCoordinator.continue_user_input_resolution", "GeneratorExit"): 1,
         ("RecoveryCoordinator.recover_tool_approval", "BaseException"): 3,
         ("RecoveryCoordinator.recover_tool_approval", "BaseExceptionGroup"): 1,
@@ -51,6 +52,20 @@ _ALLOWED_HANDLERS: dict[str, dict[tuple[str, str], int]] = {
         ("RecoveryCoordinator.recover_user_input", "BaseExceptionGroup"): 1,
         ("RecoveryCoordinator.recover_user_input", "GeneratorExit"): 1,
         ("RecoveryCoordinator.recover_user_input_request", "BaseException"): 2,
+    },
+    "runtime/_provider_disposition_recovery.py": {
+        (
+            "ProviderDispositionRecovery.finish_pending_provider_operation_disposition",
+            "BaseException",
+        ): 1,
+        (
+            "ProviderDispositionRecovery.finish_pending_provider_operation_disposition",
+            "BaseExceptionGroup",
+        ): 1,
+        ("ProviderDispositionRecovery.run_pending_provider_operation_fallback", "BaseException"): 1,
+    },
+    "runtime/_recovery_admission.py": {
+        ("RecoveryAdmission.transition_recovery_session_to_running", "BaseException"): 3,
     },
     "runtime/_session_engine.py": {
         (
@@ -105,6 +120,69 @@ _ALLOWED_HANDLERS: dict[str, dict[tuple[str, str], int]] = {
         ("run_task_worker.run_slot.run_step", "BaseException"): 2,
     },
 }
+
+# Recovered invocations settle through ``RunSettlement``: the exit owner hands
+# its ledger to the recovery handoff cleanup. Finalizing an abandoned session
+# directly is left only where an admission or a recovery claim fails before its
+# ledger exists (the claim's acknowledgement was lost, or its context could not
+# be rebuilt).
+_RECOVERY_MODULES = (
+    "runtime/_provider_disposition_recovery.py",
+    "runtime/_recovery_admission.py",
+    "runtime/_recovery_coordinator.py",
+)
+_ALLOWED_DIRECT_ABANDONMENT: dict[str, dict[str, int]] = {
+    "runtime/_recovery_admission.py": {
+        "RecoveryAdmission.transition_recovery_session_to_running": 2,
+    },
+    "runtime/_recovery_coordinator.py": {
+        "RecoveryCoordinator._claim_manual_tool_round_recovery": 4,
+        "RecoveryCoordinator._claim_manual_tool_round_recovery.reconstruct_claim_invocation_context": 1,
+    },
+}
+_ABANDONMENT_FINALIZERS = frozenset(
+    {
+        "finalize_abandoned_session_by_id",
+        "finalize_abandoned_session_run",
+        "finalize_abandoned_without_registered_runtime",
+    }
+)
+_HANDOFF_CLEANUPS = frozenset({"cleanup_recovery_handoff", "cleanup_entrypoint_handoff"})
+# Handoff cleanups that pass ``ledger=None``: a nested continuation whose
+# enclosing owner (the manual-recovery supervisor or the claimed recovery)
+# settles the exit, or the provider entrance, where the pending disposition owns
+# the invocation until the fallback stream starts and settles its own exits.
+_NESTED_HANDOFFS: dict[str, dict[str, int]] = {
+    "runtime/_provider_disposition_recovery.py": {
+        "ProviderDispositionRecovery.finish_pending_provider_operation_disposition": 1,
+    },
+    "runtime/_recovery_coordinator.py": {
+        "RecoveryCoordinator._reconcile_tool_effect_claimed": 1,
+        "RecoveryCoordinator._recover_tool_round_claimed": 1,
+        "RecoveryCoordinator.recover_tool_round_request": 1,
+    },
+}
+# Handoff cleanups whose ledger is ``owner if condition else None``: ownership
+# passes between two owners at a known point. The entrance owns a manual
+# recovery until its claimed recovery stream starts and settles its own exits
+# (``inner_started``); the pending provider disposition owns a fallback until
+# its replacement dispatch is durable.
+_CONDITIONAL_HANDOFFS: dict[str, dict[str, int]] = {
+    "runtime/_provider_disposition_recovery.py": {
+        "ProviderDispositionRecovery.run_pending_provider_operation_fallback": 1,
+    },
+    "runtime/_recovery_coordinator.py": {
+        "RecoveryCoordinator.recover_tool_approval_request": 1,
+        "RecoveryCoordinator.recover_user_input_request": 1,
+    },
+}
+# Dispatcher claim releases outside ``release_drained_claim``: the release
+# primitive itself, and an unstarted claim whose lease ran out before dispatch.
+_ALLOWED_CLAIM_RELEASES: dict[str, int] = {
+    "TaskStoreDispatcher._process_next_owned.claim_next_task": 1,
+    "TaskStoreDispatcher._release_claimed_task": 1,
+}
+_CLAIM_RELEASES = frozenset({"release_task", "_release_claimed_task"})
 
 # Calls that settle a session as an operator interruption.
 _INTERRUPTION_SETTLEMENTS = frozenset(
@@ -308,3 +386,176 @@ def test_grouped_exit_ratchet_sees_order_handlers_and_nesting(
     source: str, expected: list[str]
 ) -> None:
     assert _unclassified_group_handlers(ast.parse(source)) == expected
+
+
+def _calls_by_function(tree: ast.AST, names: frozenset[str]) -> collections.Counter[str]:
+    """Calls to ``names`` per function, including those inside its lambdas."""
+
+    found: collections.Counter[str] = collections.Counter()
+    for name, function in _functions(tree):
+        pending = list(ast.iter_child_nodes(function))
+        while pending:
+            node = pending.pop()
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue
+            if isinstance(node, ast.Call) and _called_name(node) in names:
+                found[name] += 1
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def _calls_handoff_cleanup(call: ast.Call) -> bool:
+    """A handoff cleanup call, also one choosing between the two cleanups inline."""
+
+    if isinstance(call.func, ast.IfExp):
+        branches = (call.func.body, call.func.orelse)
+        return any(
+            isinstance(branch, ast.Attribute) and branch.attr in _HANDOFF_CLEANUPS
+            for branch in branches
+        )
+    return _called_name(call) in _HANDOFF_CLEANUPS
+
+
+def _is_none(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _handoff_ownership(tree: ast.AST) -> dict[str, collections.Counter[str] | list[str]]:
+    """Classify each handoff cleanup's ``ledger=`` by who settles the exit.
+
+    ``nested``: ``None``. ``conditional``: a named ledger in one arm of a
+    conditional and ``None`` in the other. Anything that is neither a plain
+    named ledger nor one of these is ``unrecognised``; a call naming no ledger
+    at all is ``unnamed``.
+    """
+
+    nested: collections.Counter[str] = collections.Counter()
+    conditional: collections.Counter[str] = collections.Counter()
+    unnamed: list[str] = []
+    unrecognised: list[str] = []
+    for name, function in _functions(tree):
+        for node in _own_nodes(function):
+            if not isinstance(node, ast.Call) or not _calls_handoff_cleanup(node):
+                continue
+            ledger = next((k.value for k in node.keywords if k.arg == "ledger"), None)
+            where = f"{name} (line {node.lineno})"
+            if ledger is None:
+                unnamed.append(where)
+            elif _is_none(ledger):
+                nested[name] += 1
+            elif isinstance(ledger, ast.IfExp) and (
+                _is_none(ledger.body) != _is_none(ledger.orelse)
+            ):
+                owner = ledger.orelse if _is_none(ledger.body) else ledger.body
+                if isinstance(owner, ast.Name):
+                    conditional[name] += 1
+                else:
+                    unrecognised.append(where)
+            elif not isinstance(ledger, ast.Name):
+                unrecognised.append(where)
+    return {
+        "nested": nested,
+        "conditional": conditional,
+        "unnamed": unnamed,
+        "unrecognised": unrecognised,
+    }
+
+
+def _beyond(found: collections.Counter[str], allowed: dict[str, int]) -> dict[str, int]:
+    return {name: count for name, count in found.items() if count > allowed.get(name, 0)}
+
+
+def _below(found: collections.Counter[str], allowed: dict[str, int]) -> dict[str, int]:
+    return {name: count for name, count in allowed.items() if found.get(name, 0) < count}
+
+
+def _assert_allow_list(found: collections.Counter[str], allowed: dict[str, int], what: str) -> None:
+    assert not _beyond(found, allowed), f"{what}: {_beyond(found, allowed)}"
+    assert not _below(found, allowed), (
+        f"{what} were removed; shrink the allow-list: {_below(found, allowed)}"
+    )
+
+
+@pytest.mark.parametrize("relative", _RECOVERY_MODULES)
+def test_recovery_exits_settle_through_run_settlement(relative: str) -> None:
+    tree = ast.parse((_ROOT / relative).read_text())
+    _assert_allow_list(
+        _calls_by_function(tree, _ABANDONMENT_FINALIZERS),
+        _ALLOWED_DIRECT_ABANDONMENT.get(relative, {}),
+        f"Recovery exits in {relative} that finalize an abandoned session themselves "
+        "(hand the exit owner's ledger to the handoff cleanup)",
+    )
+    ownership = _handoff_ownership(tree)
+    assert not ownership["unnamed"], (
+        f"Handoff cleanups in {relative} that name no exit owner: {ownership['unnamed']}"
+    )
+    assert not ownership["unrecognised"], (
+        f"Handoff cleanups in {relative} whose ledger is neither a named owner, None, nor "
+        f"'owner if condition else None': {ownership['unrecognised']}"
+    )
+    _assert_allow_list(
+        ownership["nested"],
+        _NESTED_HANDOFFS.get(relative, {}),
+        f"Handoff cleanups in {relative} that settle nothing (pass the exit owner's ledger "
+        "unless an enclosing owner settles this exit)",
+    )
+    _assert_allow_list(
+        ownership["conditional"],
+        _CONDITIONAL_HANDOFFS.get(relative, {}),
+        f"Handoff cleanups in {relative} whose ownership changes hands conditionally",
+    )
+
+
+def test_dispatcher_releases_claims_through_the_claim_exit_table() -> None:
+    tree = ast.parse((_ROOT / "tasks/dispatch.py").read_text())
+    _assert_allow_list(
+        _calls_by_function(tree, _CLAIM_RELEASES),
+        _ALLOWED_CLAIM_RELEASES,
+        "Dispatcher claim releases outside the claim exit table (release a claim no "
+        "handler is left to drain with tasks._task_run_settlement.release_drained_claim)",
+    )
+
+
+_NEW_EXITS: list[tuple[str, dict[str, object]]] = [
+    (
+        "def f():\n    run(lambda: s.finalize_abandoned_session_by_id(1))\n"
+        "    s.finalize_abandoned_session_run(2)\n"
+        "    s.finalize_abandoned_without_registered_runtime(3)\n",
+        {"direct": {"f": 3}},
+    ),
+    (
+        "async def g():\n    await a.cleanup_recovery_handoff(ledger=None)\n"
+        "    await (a.cleanup_entrypoint_handoff if c else b)(stream=None)\n",
+        {"nested": {"g": 1}, "unnamed": ["g (line 3)"]},
+    ),
+    (
+        "async def h(ledger):\n    await a.cleanup_recovery_handoff(ledger=ledger)\n"
+        "    await self._tasks.release_task(1, 2)\n",
+        {"releases": {"h": 1}},
+    ),
+    (
+        "async def k(ledger):\n"
+        "    await a.cleanup_recovery_handoff(ledger=None if started else ledger)\n"
+        "    await a.cleanup_recovery_handoff(ledger=None if started else None)\n"
+        "    await a.cleanup_recovery_handoff(ledger=make())\n",
+        {"conditional": {"k": 1}, "unrecognised": ["k (line 3)", "k (line 4)"]},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    _NEW_EXITS,
+    ids=["direct-abandonment", "handoff-without-owner", "raw-release", "conditional-ledgers"],
+)
+def test_recovery_and_dispatch_ratchets_see_new_exits(
+    source: str, expected: dict[str, object]
+) -> None:
+    tree = ast.parse(source)
+    ownership = _handoff_ownership(tree)
+    assert _calls_by_function(tree, _ABANDONMENT_FINALIZERS) == expected.get("direct", {})
+    assert _calls_by_function(tree, _CLAIM_RELEASES) == expected.get("releases", {})
+    for kind in ("nested", "conditional"):
+        assert ownership[kind] == collections.Counter(expected.get(kind, {})), kind
+    for kind in ("unnamed", "unrecognised"):
+        assert sorted(ownership[kind]) == expected.get(kind, []), kind

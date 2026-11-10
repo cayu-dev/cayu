@@ -1,4 +1,12 @@
-"""Admit a recovered invocation and retain cleanup until handoff settles."""
+"""Admit a recovered invocation and retain cleanup until handoff settles.
+
+A recovered invocation (a human-gate continuation, a manual recovery or a
+recovery handoff) is settled like a run or resume: its exit owner records a
+``RunLedger`` at admission and hands every exit to the one ``RunSettlement``,
+which decides from durable state what the invocation still owes. Only the
+release differs: the run fence or recovery claim is released once the
+continuation is quiescent.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +56,7 @@ from cayu.runtime._recovery_requests import (
 from cayu.runtime._run_limits import (
     SessionUsageTracker,
 )
+from cayu.runtime._run_settlement import RunLedger, RunSettlement
 from cayu.runtime._session_control import (
     SessionControl,
 )
@@ -148,6 +157,7 @@ class RecoveryAdmission:
         clock: Callable[[], datetime],
         environment_lifecycle: EnvironmentLifecycle,
         recovery_ownership: RecoveryOwnership,
+        run_settlement: RunSettlement,
         session_control: SessionControl[SessionUsageTracker],
         session_finalization: SessionFinalization,
         session_store: SessionStore,
@@ -156,33 +166,75 @@ class RecoveryAdmission:
         self._clock = clock
         self._environment_lifecycle = environment_lifecycle
         self._recovery_ownership = recovery_ownership
+        self._run_settlement = run_settlement
         self._session_control = session_control
         self._session_finalization = session_finalization
         self._session_store = session_store
         self.terminal_finalization = terminal_finalization
+
+    def ledger(self, invocation_context: InvocationContext) -> RunLedger:
+        """Record the exit owner of one admitted recovered invocation.
+
+        Created where the owner admits (or takes over) the invocation, in the
+        task that will run its cleanup, so a grouped cancellation is classified
+        against that task's own cancellation requests.
+
+        The decision is the run path's, but unlike a run or resume ledger this
+        one publishes no deferred interaction input before an abandonment and
+        records no structured-output intent, exactly as recovery abandonment
+        did before. A gate's deferred messages belong to its pending round
+        until the gate's close publishes them; publishing them on abandonment
+        needs the resume's per-boundary "still private while a round is open"
+        rule for each gate, which this owner does not have.
+        """
+
+        binding = invocation_context.binding
+        # A refusal recorded by an earlier owner of this session is not evidence
+        # about this invocation (as when a run or resume enters its settlement).
+        self._session_finalization.forget_refused_interaction_publications(binding.session_id)
+        return RunLedger(
+            session_id=binding.session_id,
+            run_epoch=binding.run_epoch,
+            invocation_context=invocation_context,
+        )
 
     async def cleanup_recovery_handoff(
         self,
         *,
         stream: AsyncGenerator[Event, None] | None,
         session_id: str,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
         authoritative_failure: BaseException | None,
-        finalize_abandoned: bool,
+        ledger: RunLedger | None,
         release_run_fence: bool,
         abort_environment_setup: bool = True,
         execution_profile: ExecutionProfileIdentity | None = None,
         invocation_context: InvocationContext | None = None,
     ) -> None:
-        if invocation_context is not None:
+        """Close the continuation, settle its exit and release what this owner holds.
+
+        ``ledger`` is the exit owner's: every exit is settled by ``RunSettlement``
+        from durable state, whatever its shape. A nested continuation whose
+        enclosing owner settles passes ``None``. ``invocation_context`` is the
+        owner's current context (rebound to its resolved environment).
+        """
+
+        if ledger is not None:
+            if invocation_context is not None:
+                ledger.rebind(invocation_context)
+            invocation_context = ledger.invocation_context
+        cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
+
+        async def reload_invocation_context() -> None:
             # A nested continuation can atomically consume a queued message and
             # transfer the same run epoch from interaction A to interaction B.
             # Recovery entrypoints retain their original local A context, so
             # derive cleanup authority from the durable checkpoint before any
             # owner/fence cleanup observes it.  ``with_queued_interaction``
             # authenticates the complete stable profile and collaborator set;
-            # incompatible durable state remains fail-closed below.
+            # incompatible durable state remains fail-closed below. It is a
+            # cleanup step, so a failed read still lets the rest run.
+            nonlocal invocation_context
+            assert invocation_context is not None
             current_session = await self._session_store.load(session_id)
             current_checkpoint = await self._session_store.load_checkpoint(session_id)
             current_profile = active_invocation_execution_profile_from_checkpoint(
@@ -199,7 +251,11 @@ class RecoveryAdmission:
                     current_session,
                     active_profile=current_profile,
                 )
-        cleanup_steps: list[tuple[str, RecoveryCleanup]] = []
+                if ledger is not None:
+                    ledger.rebind(invocation_context)
+
+        if invocation_context is not None:
+            cleanup_steps.append(("recovered invocation context reload", reload_invocation_context))
         stream_quiescent = stream is None
         if stream is not None:
 
@@ -216,19 +272,19 @@ class RecoveryAdmission:
                     lambda: self._preserve_expired_continuation_effects(session_id),
                 )
             )
-        if finalize_abandoned:
-            cleanup_steps.append(
-                (
-                    "abandoned session finalization",
-                    lambda: self._session_finalization.finalize_abandoned_session_by_id(
-                        session_id,
-                        registered_agent=registered_agent,
-                        registered_environment=registered_environment,
-                        execution_profile=execution_profile,
-                        invocation_context=invocation_context,
-                    ),
-                )
-            )
+        if ledger is not None:
+            settled_ledger = ledger
+
+            async def settle_recovered_invocation() -> None:
+                try:
+                    await self._run_settlement.settle_outcome(settled_ledger, authoritative_failure)
+                finally:
+                    # This invocation's refusals are retired with its exit.
+                    self._session_finalization.forget_refused_interaction_publications(
+                        settled_ledger.session_id
+                    )
+
+            cleanup_steps.append(("recovered invocation settlement", settle_recovered_invocation))
         if abort_environment_setup and authoritative_failure is not None:
             cleanup_steps.append(
                 (
@@ -291,10 +347,8 @@ class RecoveryAdmission:
         *,
         stream: AsyncGenerator[Event, None] | None,
         session_id: str,
-        registered_agent: runtime_records.RegisteredAgentState,
-        registered_environment: runtime_records.RegisteredEnvironment | None,
         authoritative_failure: BaseException | None,
-        finalize_abandoned: bool,
+        ledger: RunLedger | None,
         release_run_fence: bool,
         abort_environment_setup: bool = True,
         execution_profile: ExecutionProfileIdentity | None = None,
@@ -304,10 +358,8 @@ class RecoveryAdmission:
             await self.cleanup_recovery_handoff(
                 stream=stream,
                 session_id=session_id,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
                 authoritative_failure=authoritative_failure,
-                finalize_abandoned=finalize_abandoned,
+                ledger=ledger,
                 release_run_fence=release_run_fence,
                 abort_environment_setup=abort_environment_setup,
                 execution_profile=execution_profile,

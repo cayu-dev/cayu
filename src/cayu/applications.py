@@ -1820,6 +1820,7 @@ class CayuApp(
             clock=self._clock,
             environment_lifecycle=self._environment_lifecycle,
             recovery_ownership=self._recovery_ownership,
+            run_settlement=self._session_engine.run_settlement,
             session_control=self._session_control,
             session_finalization=self._session_finalization,
             session_store=self._runtime_session_store,
