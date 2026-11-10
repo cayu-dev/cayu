@@ -456,6 +456,16 @@ class HandlerTimeLimit:
         """True once ``timeout_s`` passed and the block was cancelled."""
         return self._cancelled.is_set()
 
+    @property
+    def cancellation_requested(self) -> bool:
+        """Whether this limit or an enclosing limit has delivered cancellation."""
+        limit: HandlerTimeLimit | None = self
+        while limit is not None:
+            if limit.cancelled:
+                return True
+            limit = limit._parent
+        return False
+
     def remaining_seconds(self) -> float | None:
         """Seconds until the soft limit passes, or ``None`` before the block starts."""
         return None if self._deadline is None else self._deadline.remaining_seconds()

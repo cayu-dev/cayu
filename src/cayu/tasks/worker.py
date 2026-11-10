@@ -55,6 +55,7 @@ from cayu.deadlines import (
     ExecutionDeadline,
     ExecutionDeadlineExceeded,
     HandlerTimeLimit,
+    current_handler_time_limit,
     default_run_deadline,
     handler_grace_seconds,
     require_handler_seconds,
@@ -2145,6 +2146,7 @@ async def _await_task_handler(
     event_dispatch_deadline: float | None,
     cancellation_grace_s: float | None = None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
+    forwarded_deadline_cancellation = False
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
     handler_view = copy_task(task)
@@ -2256,6 +2258,10 @@ async def _await_task_handler(
                 lease_authority=lease_authority,
                 lease_seconds=lease_seconds,
                 owner_cancellation=owner_cancellation,
+                deadline_cancellation_delivered=(
+                    forwarded_deadline_cancellation
+                    or (time_limit is not None and time_limit.cancelled)
+                ),
             )
             return
         await _drain_ordinary_task_handler_under_cancellation_fence(
@@ -2469,6 +2475,18 @@ async def _await_task_handler(
             ) from grouped_failure
         raise
     except asyncio.CancelledError as owner_cancellation:
+        # A nested continuation has its own supervisor task, but an enclosing
+        # handler limit cancels only this owner task. Cancel the child before
+        # the ordinary cancellation fence drains it, so the deadline reaches
+        # the resumed provider as well.
+        enclosing_limit = current_handler_time_limit()
+        if (
+            enclosing_limit is not None
+            and enclosing_limit.cancellation_requested
+            and not (time_limit is not None and time_limit.cancelled)
+        ):
+            handler_task.cancel()
+            forwarded_deadline_cancellation = True
         owner_task = asyncio.current_task()
         if owner_task is None:  # pragma: no cover - coroutine execution invariant
             raise RuntimeError(
@@ -2683,6 +2701,7 @@ async def _restart_task_handler_after_shutdown(
     lease_authority: _TaskLeaseAuthority,
     lease_seconds: int,
     owner_cancellation: asyncio.CancelledError,
+    deadline_cancellation_delivered: bool,
 ) -> None:
     heartbeat_task = _heartbeat_during_quiescence(
         task_store,
@@ -2735,7 +2754,11 @@ async def _restart_task_handler_after_shutdown(
             and heartbeat_task.exception() is None
             and heartbeat_task.result() is _TaskHeartbeatOutcome.TERMINAL
         )
-        if not terminal_heartbeat:
+        # An enclosing deadline may already have interrupted the handler.
+        # A second cancel would abort the asynchronous cleanup we must join.
+        # An internal asyncio.timeout cancellation is not a worker stop request:
+        # its context manager can consume it, so only our own delivery counts.
+        if not terminal_heartbeat and not deadline_cancellation_delivered:
             handler_task.cancel()
         handler_failure: BaseException | None = None
         try:
