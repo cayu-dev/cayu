@@ -3854,7 +3854,11 @@ def _validate_captured_path(
     path: str,
     limits: WorkspaceBranchLimits,
 ) -> None:
-    if _validate_workspace_relative_path(path) != path:
+    try:
+        normalized = _validate_workspace_relative_path(path)
+    except ValueError as error:
+        raise _UnsupportedBranch("source_contains_noncanonical_path") from error
+    if normalized != path:
         raise _UnsupportedBranch("source_contains_noncanonical_path")
     if len(path.encode("utf-8")) > limits.max_path_bytes:
         raise WorkspaceBranchResourceExhaustedError("path_byte_limit_exceeded")
