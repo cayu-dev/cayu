@@ -2450,30 +2450,58 @@ def test_scaffold_openai_refuses_plain_http_base_url_off_this_machine(tmp_path, 
             module.configured_provider()
 
 
-def test_scaffold_gateway_resolves_model_set_after_agent_import(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("model", "expected"), [(None, "bedrock/claude-sonnet-4-5"), ("example/model", "example/model")]
+)
+def test_scaffold_gateway_uses_the_primary_slot_default_unless_cayu_model_is_set(
+    tmp_path, monkeypatch, model, expected
+):
     assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "cayu-gateway"]) == 0
     project = tmp_path / "myproj"
-    monkeypatch.delenv("CAYU_MODEL", raising=False)
     monkeypatch.setenv("CAYU_PROVIDER", "cayu-gateway")
+    if model is None:
+        monkeypatch.delenv("CAYU_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("CAYU_MODEL", model)
     with project_context(project):
         module = importlib.import_module("app")
-        monkeypatch.setenv("CAYU_MODEL", "example/new-model")
         app = module.build_app(
             provider=ScriptedModelProvider([], name="cayu_gateway"),
             session_store=InMemorySessionStore(),
             task_store=InMemoryTaskStore(),
         )
-        assert app.describe().agents[0].model == "example/new-model"
+        agent = app.describe().agents[0]
+        assert (agent.model, agent.model_slot) == (expected, "primary")
+        assert [slot.declaration() for slot in app.model_slots()] == [
+            {"name": "primary", "default": expected, "label": "Primary model"}
+        ]
 
 
-@pytest.mark.parametrize("missing", ["CAYU_MODEL", "CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL"])
+def test_scaffold_runs_a_model_id_a_slot_cant_hold_without_the_slot(tmp_path, monkeypatch):
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "anthropic"]) == 0
+    monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
+    monkeypatch.setenv("CAYU_MODEL", "claude-sonnet-4@20250514")
+    with project_context(tmp_path / "myproj"):
+        module = importlib.import_module("app")
+        with pytest.warns(UserWarning, match="can't be a model slot's default"):
+            app = module.build_app(
+                provider=ScriptedModelProvider([], name="anthropic"),
+                session_store=InMemorySessionStore(),
+                task_store=InMemoryTaskStore(),
+            )
+        agent = app.describe().agents[0]
+        assert (agent.model, agent.model_slot) == ("claude-sonnet-4@20250514", None)
+        assert app.model_slots() == ()
+
+
+@pytest.mark.parametrize("missing", ["CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL"])
 def test_scaffold_gateway_fails_before_dispatch_with_incomplete_configuration(
     tmp_path, monkeypatch, missing
 ):
     assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "cayu-gateway"]) == 0
     monkeypatch.setenv("CAYU_PROVIDER", "cayu-gateway")
+    monkeypatch.delenv("CAYU_MODEL", raising=False)
     for name, value in {
-        "CAYU_MODEL": "example/model",
         "CAYU_GATEWAY_API_KEY": "test",
         "CAYU_GATEWAY_BASE_URL": "https://gateway.example/v1",
     }.items():
@@ -2481,8 +2509,8 @@ def test_scaffold_gateway_fails_before_dispatch_with_incomplete_configuration(
     monkeypatch.delenv(missing)
     with project_context(tmp_path / "myproj"):
         provider = importlib.import_module("configuration.providers").configured_provider()
-        with pytest.raises(RuntimeError, match="requires CAYU_MODEL"):
-            provider.preflight_model_target(model="example/model")
+        with pytest.raises(RuntimeError, match=f"requires .*{missing}"):
+            provider.preflight_model_target(model="bedrock/claude-sonnet-4-5")
 
 
 def test_scaffold_openrouter_builds_first_class_provider_with_explicit_model(
@@ -3424,7 +3452,7 @@ def test_a_project_without_evals_gets_no_objectives() -> None:
     assert "improvement" not in tomllib.loads(files["pyproject.toml"])["tool"]["cayu"]
 
 
-def test_scaffold_declares_the_starter_model_as_a_managed_setting(tmp_path, monkeypatch):
+def test_scaffold_declares_the_starter_model_as_a_model_slot(tmp_path, monkeypatch):
     assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "anthropic"]) == 0
     project = tmp_path / "myproj"
     monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
@@ -3437,23 +3465,27 @@ def test_scaffold_declares_the_starter_model_as_a_managed_setting(tmp_path, monk
             task_store=InMemoryTaskStore(),
         )
         agent = app.describe().agents[0]
+        assert agent.model_slot == "primary"
+        assert [slot.declaration() for slot in app.model_slots()] == [
+            {"name": "primary", "default": "claude-sonnet-4-6", "label": "Primary model"}
+        ]
         settings = {item["key"]: item for item in app.managed_settings_schema()["settings"]}
-        model = settings[f"agent.{agent.name}.model"]
-        assert model["default"] == agent.model == "claude-sonnet-4-6"
-        assert model["applies"] == "next_session"
+        assert f"agent.{agent.name}.model" not in settings
         assert "config.run.max_steps" in settings
+    registration = (project / "agents/registration.py").read_text()
+    assert "model_setting" not in registration
+    assert 'app.require_model("primary"' in registration
 
 
 @pytest.mark.parametrize(
     ("project_name", "agent_name"), [("MyProj", "MyProj"), ("longproj", "a" * 130)]
 )
-def test_scaffold_with_an_agent_name_a_key_cant_hold_builds_without_the_model_setting(
+def test_scaffold_with_any_agent_name_uses_the_primary_model_slot(
     tmp_path, monkeypatch, project_name, agent_name
 ):
     arguments = ["new", project_name, "--dir", str(tmp_path), "--provider", "anthropic"]
     assert main([*arguments, "--agent-name", agent_name]) == 0
     project = tmp_path / project_name
-    assert "model_setting" not in (project / "agents/registration.py").read_text()
     monkeypatch.setenv("CAYU_PROVIDER", "anthropic")
     with project_context(project):
         module = importlib.import_module("app")
@@ -3463,4 +3495,5 @@ def test_scaffold_with_an_agent_name_a_key_cant_hold_builds_without_the_model_se
             task_store=InMemoryTaskStore(),
         )
         assert app.describe().agents[0].name == agent_name
+        assert app.describe().agents[0].model_slot == "primary"
         assert not any(key.startswith("agent.") for key in (s.key for s in app.managed_settings()))

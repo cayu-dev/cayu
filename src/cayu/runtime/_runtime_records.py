@@ -102,6 +102,8 @@ class RegisteredAgentState:
     fork_controller_name: str | None = None
     fork_controller_base_agent: str | None = None
     fork_controller_tool_names: frozenset[str] = frozenset()
+    # The model slot whose binding chooses new sessions' model, and which Gateway requests name.
+    model_slot: str | None = None
 
     def executable_tool(self, name: str) -> RegisteredTool | None:
         """Resolve an application or runtime-owned executable without merging catalogues."""

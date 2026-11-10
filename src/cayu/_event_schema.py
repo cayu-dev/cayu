@@ -73,6 +73,7 @@ def _request_control_paths(key: str) -> frozenset[tuple[str, ...]]:
 
 
 _MANAGED_SETTINGS_PATHS = frozenset(("managed_settings", key) for key in ("revision", "values"))
+_MODEL_SLOT_PATHS = frozenset(("model_slot", key) for key in ("slot", "source"))
 
 
 _RELEASE_PATHS = frozenset(
@@ -2613,13 +2614,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=frozenset(failure_evidence_owned_paths),
     )
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name input_contract managed_settings model_policy parent_session_id "
+        "agent_name input_contract managed_settings model_policy model_slot parent_session_id "
         "prompt_contribution_manifest run_epoch "
         f"traceparent tracestate {RELEASE_EVENT_PAYLOAD_KEY}",
         owned_nested_paths=(
             _PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS
             | _MODEL_POLICY_PATHS
             | _MANAGED_SETTINGS_PATHS
+            | _MODEL_SLOT_PATHS
             | _RELEASE_PATHS
         ),
         authority_keys={"input_contract"},

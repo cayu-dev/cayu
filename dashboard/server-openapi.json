@@ -107,6 +107,17 @@
             "title": "Model",
             "type": "string"
           },
+          "model_slot": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Slot"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -7449,6 +7460,14 @@
             "title": "Fingerprint",
             "type": "string"
           },
+          "model_slots": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ModelSlotManifest"
+            },
+            "title": "Model Slots",
+            "type": "array"
+          },
           "providers": {
             "items": {
               "$ref": "#/components/schemas/ProviderManifest"
@@ -7460,8 +7479,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "17",
-            "default": "17",
+            "const": "18",
+            "default": "18",
             "title": "Schema Version",
             "type": "string"
           },
@@ -33504,6 +33523,44 @@
           "schedules"
         ],
         "title": "ModelPrice",
+        "type": "object"
+      },
+      "ModelSlotManifest": {
+        "additionalProperties": false,
+        "description": "One declared model slot: the model it uses unless Cayu Cloud binds it.",
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "default"
+        ],
+        "title": "ModelSlotManifest",
         "type": "object"
       },
       "ModelTarget": {

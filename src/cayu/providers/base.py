@@ -21,6 +21,7 @@ from cayu._validation import (
 )
 from cayu.artifacts.attachments import file_attachment_from_payload
 from cayu.budgets.billing import BillingIdentity
+from cayu.connections.models import MODEL_SLOT_PATTERN
 from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import current_execution_deadline
 from cayu.messages import (
@@ -945,6 +946,27 @@ class ModelRequest(BaseModel):
     send it (OpenAI Responses maps it to ``prompt_cache_key`` unless the caller
     set that option); other adapters ignore it.
     """
+    model_slot: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    """The agent's model slot this request serves, for attribution only.
+
+    The runtime sets it for an agent registered with ``model_slot``. ``GatewayProvider``
+    sends it in the request's ``cayu`` extension; other adapters ignore it. It never chooses
+    or admits a model.
+    """
+
+    @field_validator("model_slot")
+    @classmethod
+    def validate_model_slot(cls, value: str | None) -> str | None:
+        if value is not None and (
+            type(value) is not str or not MODEL_SLOT_PATTERN.fullmatch(value)
+        ):
+            raise ValueError(
+                "model_slot must be 1-63 lowercase letters, digits or interior hyphens."
+            )
+        return value
 
     @field_validator("cache_affinity_key")
     @classmethod
@@ -1994,4 +2016,5 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
         cache_affinity_key=request.cache_affinity_key,
+        model_slot=request.model_slot,
     )

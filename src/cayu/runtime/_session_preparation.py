@@ -17,6 +17,7 @@ from cayu.budgets.base import (
     copy_budget_policy,
 )
 from cayu.build_provenance import current_runtime_build_provenance
+from cayu.connections.models import ModelSlotResolution
 from cayu.context.structured_output import StructuredOutputSpec
 from cayu.context.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
@@ -72,6 +73,7 @@ from cayu.sessions.invocation import SessionExecutionSource
 from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import (
     RunRequest,
+    bind_runtime_model_slot,
     copy_run_request,
     run_request_authority_is_runtime_generated,
     run_request_with_task_invocation,
@@ -145,6 +147,8 @@ class _PreparedInitialRun:
     policy_evidence: bytes | None
     # The Cayu Cloud settings revision and values this session starts with.
     managed_settings_evidence: dict[str, Any] | None = None
+    # The model slot this session's model came from, and how: ``{"slot", "source"}``.
+    model_slot_evidence: dict[str, str] | None = None
 
 
 def _session_identity(
@@ -220,6 +224,8 @@ class SessionPreparation:
         policy_selection: Callable[[str], PolicySelection | None] | None = None,
         managed_model: Callable[[str], tuple[bool, str | None]] | None = None,
         managed_evidence: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
+        model_slot: Callable[[str], ModelSlotResolution | None] | None = None,
+        model_slot_name: Callable[[str], str | None] | None = None,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -253,6 +259,8 @@ class SessionPreparation:
         self._policy_selection = policy_selection
         self._managed_model = managed_model
         self._managed_evidence = managed_evidence
+        self._model_slot = model_slot
+        self._model_slot_name = model_slot_name
 
     def resolve_new_run_environment(
         self,
@@ -274,9 +282,15 @@ class SessionPreparation:
         return self._get_registered_environment(environment_name)
 
     def manages_model(self, agent_name: str) -> bool:
-        """Whether Cayu Cloud's managed settings choose this agent's model."""
+        """Whether Cayu Cloud chooses this agent's model for new sessions: through its model
+        slot, or its managed settings."""
 
-        return self._managed_model is not None and self._managed_model(agent_name)[0]
+        return self._uses_model_slot(agent_name) or (
+            self._managed_model is not None and self._managed_model(agent_name)[0]
+        )
+
+    def _uses_model_slot(self, agent_name: str) -> bool:
+        return self._model_slot_name is not None and self._model_slot_name(agent_name) is not None
 
     def _resolve_initial_model_target(
         self,
@@ -284,18 +298,20 @@ class SessionPreparation:
         registered_agent: runtime_records.RegisteredAgentState,
         *,
         select_current_policy: bool = True,
-    ) -> tuple[runtime_records.RegisteredProvider, str, bytes | None]:
+    ) -> tuple[runtime_records.RegisteredProvider, str, bytes | None, ModelSlotResolution | None]:
         prepared = runtime_prepared_session_authority(request)
         managed, managed_model = (
             (False, None)
             if self._managed_model is None or not select_current_policy
             else self._managed_model(request.agent_name)
         )
+        managed = managed or (select_current_policy and self._uses_model_slot(request.agent_name))
         # A queued policy selection belongs to the admitted child, not the
         # worker's current default. Non-policy children still undergo ordinary
         # agent/profile compatibility checks and cannot adopt policy retroactively.
-        # Likewise a child whose model Cayu Cloud manages keeps the model it was
-        # prepared with, so a later change in Cloud doesn't break its profile.
+        # Likewise a child whose model Cayu Cloud manages (its model slot or managed
+        # settings) keeps the model it was prepared with, so a later change in Cloud
+        # doesn't break its profile.
         if prepared is not None and (prepared.policy_evidence is not None or managed):
             if request.target is not None and (
                 request.target.provider_name != prepared.provider_name
@@ -306,11 +322,13 @@ class SessionPreparation:
                 self._get_registered_provider(prepared.provider_name),
                 prepared.model,
                 prepared.policy_evidence,
+                None,
             )
         if request.target is not None:
             return (
                 self._get_registered_provider(request.target.provider_name),
                 request.target.model,
+                None,
                 None,
             )
         selection = (
@@ -323,16 +341,33 @@ class SessionPreparation:
                 self._get_registered_provider(selection.target.provider_name),
                 selection.target.model,
                 selection.evidence,
+                None,
             )
-        # Then Cayu Cloud's value for new sessions, then the agent's own model.
-        model = registered_agent.spec.model if managed_model is None else managed_model
+        # Then the agent's model slot (its binding, else its default), then Cayu Cloud's
+        # managed value for new sessions, then the agent's own model. A slot whose model
+        # isn't approved refuses the session: nothing falls back to another model.
+        slot = (
+            None
+            if self._model_slot is None or not select_current_policy
+            else self._model_slot(request.agent_name)
+        )
+        if slot is not None:
+            model = slot.model
+        else:
+            model = registered_agent.spec.model if managed_model is None else managed_model
         if registered_agent.spec.provider_name is not None:
-            return self._get_registered_provider(registered_agent.spec.provider_name), model, None
+            return (
+                self._get_registered_provider(registered_agent.spec.provider_name),
+                model,
+                None,
+                slot,
+            )
         return (
             self._route_registered_provider_for_model(model=model)
             or self._get_registered_provider(),
             model,
             None,
+            slot,
         )
 
     def resolve_initial_model_target(self, request: RunRequest) -> ModelTarget:
@@ -341,7 +376,7 @@ class SessionPreparation:
         if type(request) is not RunRequest:
             raise TypeError("Initial model-target resolution requires a RunRequest.")
         registered_agent = self._get_registered_agent(request.agent_name)
-        registered_provider, model, _ = self._resolve_initial_model_target(
+        registered_provider, model, _, _ = self._resolve_initial_model_target(
             request,
             registered_agent,
         )
@@ -603,8 +638,14 @@ class SessionPreparation:
             )
             model = retained_policy_selection.target.model
             policy_evidence = retained_policy_selection.evidence
+            model_slot = None
         else:
-            registered_provider, model, policy_evidence = self._resolve_initial_model_target(
+            (
+                registered_provider,
+                model,
+                policy_evidence,
+                model_slot,
+            ) = self._resolve_initial_model_target(
                 request,
                 registered_agent,
                 select_current_policy=not allow_existing_session_id,
@@ -849,6 +890,9 @@ class SessionPreparation:
                 raise_task_store_operation_failure(admission_failure)
             if requires_completion_decision:
                 return None
+        # The session records the slot its model came from, so its requests name the slot
+        # for as long as it runs, whatever later releases declare.
+        bind_runtime_model_slot(request, None if model_slot is None else model_slot.record())
         return _PreparedInitialRun(
             request=request,
             registered_agent=registered_agent,
@@ -896,4 +940,5 @@ class SessionPreparation:
                     },
                 )
             ),
+            model_slot_evidence=None if model_slot is None else model_slot.evidence(),
         )

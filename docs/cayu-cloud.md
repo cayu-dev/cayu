@@ -48,6 +48,7 @@ cayu cloud service status --application my-agent
   [API keys](#organization-api-keys), as a signed-in admin;
 - `connectors` and `connections list|show|add|authorize|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
+- `models list` for an Agent's [model slots](#model-slots);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
   `admin runtime-record show|forget-migration` to read
   [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, as a
@@ -2075,6 +2076,33 @@ new one, to finish a pending connection, retry one in error or reconnect a ready
 prints the JSON envelope instead, with the link as the result's `authorization_url`. A connection
 that signed in shows the account it connected, for Slack the workspace, as `account` (`id` and
 `name`) in `list` and `show`.
+
+### Model slots
+
+An Agent declares the models it needs as named model slots, each with a default, and the
+Organization binds each slot to one of its approved models without a redeploy:
+
+```python
+app.require_model("primary", default="bedrock/claude-sonnet-4-5", label="Primary model")
+app.register_agent(support_spec, model_slot="primary")
+```
+
+```console
+cayu cloud models list --application support-desk
+cayu cloud connections bind primary --model bedrock/claude-opus-4-1 --application support-desk
+cayu cloud connections unbind primary --model --application support-desk
+```
+
+`models list` prints each slot's model, whether it is `bound`, uses its `default` or is
+`unbound`, whether the model is approved and whether the running Release declares the slot, then
+the approved models; `--json` prints the JSON envelope. Developers bind the slots of Agents they
+can change; Cloud refuses a model that isn't approved (`model_not_approved`). The Agent reads its
+bindings in the background and resolves its slot when a session starts, so a binding changes new
+sessions only; resumed sessions keep their model. A slot nobody bound uses its declared default.
+If the bound model is later no longer approved, new sessions are refused rather than moved to
+another model. `session.started` records the slot and where its model came from (`bound`,
+`default`, or `unread` when the bindings could not be read since the process started). See
+[ADR 0003](adr/0003-connections-runtime-contract.md#models).
 
 ## The install's system Agents
 

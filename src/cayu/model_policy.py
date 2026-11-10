@@ -1,11 +1,15 @@
 """Explicit application-default policy integration, independent of inference auth.
 
+Deprecated: removed in the next release. Declare model slots with ``CayuApp.require_model()``
+instead; Cayu Cloud binds them per Agent (``docs/adr/0003-connections-runtime-contract.md``).
+
 Construct one controller per local agent. Supply a management channel only when
 automatic adoption/reporting is desired. Start/stop through CayuApp lifecycle
 methods; the generated entrypoint and server own that lifecycle automatically.
 """
 
 import os
+import warnings
 from pathlib import Path
 
 from cayu.runtime._model_policy import ModelPolicy, ModelPolicyController, PolicyChannel
@@ -28,6 +32,12 @@ def configured_model_policy(store: ModelPolicyStore | None) -> ModelPolicy | Non
     path = os.environ.get("CAYU_MODEL_POLICY_CONFIG")
     if not path:
         return None
+    warnings.warn(
+        "CAYU_MODEL_POLICY_CONFIG is deprecated and will be removed in the next release; "
+        "declare model slots with CayuApp.require_model(), which Cayu Cloud binds.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     require(store is not None)
     assert store is not None
     with Path(path).open("rb") as stream:

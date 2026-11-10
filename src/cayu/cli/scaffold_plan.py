@@ -221,7 +221,7 @@ ADAPTERS: tuple[AdapterSpec, ...] = (
         kind="provider",
         summary="Cayu Gateway Chat Completions provider.",
         supported_presets=("agent", "service", "coding", "long-running", "b2b"),
-        environment=("CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL", "CAYU_MODEL"),
+        environment=("CAYU_GATEWAY_API_KEY", "CAYU_GATEWAY_BASE_URL"),
     ),
     AdapterSpec(
         name="openrouter",

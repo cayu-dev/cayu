@@ -146,6 +146,8 @@ class CloudRegistration(_Model):
     # The Release's cayu.managed-settings-schema/v1 document (docs/managed-settings.md).
     # A plain mapping, so that encoding keeps each setting's null default.
     settings_schema: dict[str, Any] | None = None
+    # The Release's model slots, [{"name", "default", "label"?}]; left out when it declares none.
+    model_slots: list[dict[str, Any]] | None = None
 
 
 class CloudToolUsage(_Model):
@@ -299,6 +301,7 @@ async def _build_registration(
     store_id: str | None = None,
     replaces_cursor: int | None = None,
     settings_schema: bool = True,
+    model_slots: bool = True,
 ) -> tuple[CloudRegistration, _Registered]:
     from cayu.mcp.tools import McpToolAdapter
     from cayu.runtime.manifest import describe_inventory_tools
@@ -412,6 +415,16 @@ async def _build_registration(
         # setting already refuses one that contains a secret.
         registration_value = registration_value.model_copy(
             update={"settings_schema": app.managed_settings_schema()}
+        )
+    try:
+        declared_slots = app.model_slots() if model_slots else ()
+    except ValueError:
+        # Startup refuses undeclared slots; registration never fails because of them.
+        declared_slots = ()
+    if declared_slots:
+        # Added after redaction, like the settings schema: declaring a slot refuses a secret.
+        registration_value = registration_value.model_copy(
+            update={"model_slots": [slot.declaration() for slot in declared_slots]}
         )
     registration_value = _fit_registration(registration_value)
     return registration_value, _Registered(
@@ -704,9 +717,10 @@ class CloudInventoryPublisher:
         # A replacement Cloud hasn't answered yet: the cursor replaced and the start sent, kept
         # so a retry doesn't move the start past events written in between.
         self._replacement: tuple[int, int] | None = None
-        # Cloud refuses an invalid settings schema with 422 and keeps the rest of the
-        # registration; later registrations leave the schema out.
+        # Cloud refuses an invalid settings schema or model slots with 422 and keeps the rest
+        # of the registration; later registrations leave the refused part out.
         self._settings_schema_refused = False
+        self._model_slots_refused = False
 
     def _route(self, suffix: str = "") -> str:
         return (
@@ -782,22 +796,64 @@ class CloudInventoryPublisher:
                 store_id=store_id,
                 replaces_cursor=replaces_cursor,
                 settings_schema=not self._settings_schema_refused,
+                model_slots=not self._model_slots_refused,
             )
             try:
                 answer = await self._send("PUT", self._route(), registration)
             except CloudRegistryRefused as refused:
-                if refused.status != 422 or registration.settings_schema is None:
+                if not self._leave_out_refused(refused, registration):
                     raise
-                logger.warning(
-                    "Cayu Cloud refused this Release's managed settings schema; "
-                    "registering without it, so Cloud can't manage its Agent settings."
-                )
-                self._settings_schema_refused = True
                 continue
             break
         self._registered = registered
         self._store_id = store_id
         self._cursor = self._cursor_from(answer.get("usage_cursor"))
+
+    def _leave_out_refused(
+        self, refused: CloudRegistryRefused, registration: CloudRegistration
+    ) -> bool:
+        """Leave out of later registrations what Cloud refused with 422; False when nothing
+        sent can be left out.
+
+        Cloud names the refused part's code (``detail.also`` lists the model slots' refusal
+        when it refused both). An unnamed 422 leaves out the newest optional part first; any
+        other named 422 leaves out only the settings schema.
+        """
+
+        if refused.status != 422:
+            return False
+        also = refused.detail.get("also")
+        also_codes = {
+            item.get("code")
+            for item in (also if isinstance(also, list) else [also])
+            if isinstance(item, dict)
+        }
+        slots_sent = registration.model_slots is not None
+        schema_sent = registration.settings_schema is not None
+        if refused.code == "model_slots_invalid":
+            drop_slots, drop_schema = slots_sent, False
+        elif refused.code == "settings_schema_invalid":
+            drop_slots = slots_sent and "model_slots_invalid" in also_codes
+            drop_schema = schema_sent
+        elif refused.code is None:
+            drop_slots, drop_schema = slots_sent, schema_sent and not slots_sent
+        else:
+            # Another named refusal is never about the slots; the settings schema keeps
+            # its earlier fallback.
+            drop_slots, drop_schema = False, schema_sent
+        if drop_slots:
+            logger.warning(
+                "Cayu Cloud refused this Release's model slots; registering without them, so "
+                "Cloud can't bind its models and its slots use their declared defaults."
+            )
+            self._model_slots_refused = True
+        if drop_schema:
+            logger.warning(
+                "Cayu Cloud refused this Release's managed settings schema; "
+                "registering without it, so Cloud can't manage its Agent settings."
+            )
+            self._settings_schema_refused = True
+        return drop_slots or drop_schema
 
     async def _replace_unreachable_cursor(self) -> bool:
         """Hand back a cursor past this store's newest event; return whether Cloud took it.

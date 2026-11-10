@@ -1,5 +1,10 @@
 # Model policy for new sessions
 
+Deprecated: `ModelPolicyController`, `CayuApp(model_policy=...)` and
+`CAYU_MODEL_POLICY_CONFIG` warn with a `DeprecationWarning` and are removed in the
+next release. Declare model slots with `CayuApp.require_model()` instead; Cayu
+Cloud binds them per Agent ([ADR 0003](adr/0003-connections-runtime-contract.md#models)).
+
 Model policy is explicitly enabled application configuration, not an inference
 credential feature. It changes defaults for **new sessions** only. Selection is:
 an explicit `RunRequest.target`, then the locally installed policy default, then

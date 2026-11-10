@@ -469,8 +469,9 @@ async def _invoke_worker(
     supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
     drain_watch = asyncio.create_task(watch_cloud_drain(request_drain))
     try:
-        # A no-op outside Cayu Cloud; close_project_app stops it.
+        # No-ops outside Cayu Cloud; close_project_app stops them.
         await app.start_managed_settings(role="worker")
+        await app.start_model_slots()
 
         def start_entrypoint() -> asyncio.Future[Any]:
             # The entrypoint's task copies this context when it is created.

@@ -62,6 +62,15 @@ The body also carries `settings_schema`, the Release's managed settings schema
 If Cloud refuses it with 422, the reporter logs a warning and registers again
 without it for the rest of the process's life.
 
+When the Release declares model slots (`CayuApp.require_model`), the body carries
+`model_slots`, `[{"name", "default", "label"?}]`; it is left out when there are
+none. Cloud answers 422 `model_slots_invalid` for slots it refuses, or
+`settings_schema_invalid` with the slots' refusal in `detail.also` when it refuses
+both; either way it keeps the rest, and the reporter registers again without what
+it refused for the rest of the process's life. An unnamed 422 leaves out the model
+slots first, then the settings schema. See
+[ADR 0003](adr/0003-connections-runtime-contract.md#models).
+
 Each tool is reported once by name, with every specialist that has it, its
 declared description, effect, approval and source:
 

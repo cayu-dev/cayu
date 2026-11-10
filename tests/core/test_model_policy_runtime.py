@@ -492,6 +492,9 @@ asyncio.run(main())
 """
     process = await asyncio.create_subprocess_exec(
         sys.executable,
+        # The policy reader is deprecated; this checks only what it restores.
+        "-W",
+        "ignore::DeprecationWarning",
         "-c",
         script,
         str(path),

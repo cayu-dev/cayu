@@ -34,6 +34,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
+    "MODEL_SETTING_DEPRECATED",
     "PUBLIC_SERVICE_DEVELOPMENT_MODE",
     "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
     "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
@@ -188,6 +189,11 @@ def check_manifest(
             )
         )
 
+    setting_keys = (
+        frozenset()
+        if manifest.settings is None
+        else {item.key for item in manifest.settings.settings}
+    )
     for agent in manifest.agents:
         if agent.authoring_state is AgentAuthoringState.UNFINISHED_GENERATED_TRACER_BULLET:
             diagnostics.append(
@@ -216,6 +222,28 @@ def check_manifest(
                     verification_command=(
                         "cayu inspect --json && cayu check --fail-on warning --json"
                     ),
+                )
+            )
+        if f"agent.{agent.name}.model" in setting_keys:
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="MODEL_SETTING_DEPRECATED",
+                    severity=DiagnosticSeverity.WARNING,
+                    subject=f"agent:{agent.name}",
+                    path=f"settings.agent.{agent.name}.model",
+                    message=(
+                        f"Agent '{agent.name}' chooses its model with the deprecated "
+                        "model_setting(); it is removed after the deprecation window."
+                    ),
+                    hint=(
+                        "Declare a model slot with app.require_model(SLOT, default=MODEL), "
+                        "register the agent with model_slot=SLOT, and drop model_setting() "
+                        "from its settings."
+                    ),
+                    tags=("authoring", "configuration"),
+                    parameters={"agent": agent.name},
+                    documentation_anchor="cayu guide diagnostics#model-setting-deprecated",
+                    verification_command="cayu check --fail-on warning --json",
                 )
             )
         if agent.provider_resolution == "missing":

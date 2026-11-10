@@ -162,6 +162,12 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "scope_not_allowed"),
         (422, "scope_required"),
         (422, "too_many_agents"),
+        # `cayu cloud models` and `connections bind --model`: why Cloud refused a model slot.
+        (409, "model_not_approved"),
+        (409, "models_unavailable"),
+        (422, "invalid_model"),
+        (503, "models_unavailable"),
+        (503, "models_unreadable"),
         # `cayu cloud admin runtime-record`: why Cloud refused to read or change the record.
         (404, "runtime_record_not_found"),
         (409, "database_migration_running"),

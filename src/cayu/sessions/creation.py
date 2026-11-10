@@ -11,6 +11,7 @@ from cayu._validation import (
     copy_durable_metadata,
     copy_session_metadata,
 )
+from cayu.connections.models import MODEL_SLOT_METADATA_KEY, model_slot_record
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEYS,
     TASK_EVENT_BINDING_METADATA_KEY,
@@ -54,7 +55,7 @@ from cayu.sessions.invocation import (
     session_invocation_from_task,
 )
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionIdentity
-from cayu.sessions.requests import RunRequest, copy_run_request
+from cayu.sessions.requests import RunRequest, copy_run_request, runtime_model_slot
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
     ToolCapabilityCeiling,
@@ -205,6 +206,13 @@ def session_metadata_for_creation(
     copied[RUNTIME_BUILD_PROVENANCE_METADATA_KEY] = identity.runtime_build_provenance.model_dump(
         mode="json"
     )
+    # Runtime-owned: only session preparation names the slot a new session's model came from.
+    copied.pop(MODEL_SLOT_METADATA_KEY, None)
+    model_slot = model_slot_record(
+        None if prepared_request is None else runtime_model_slot(prepared_request)
+    )
+    if model_slot is not None and model_slot["model"] == identity.model:
+        copied[MODEL_SLOT_METADATA_KEY] = model_slot
     if tool_capability_ceiling is not None:
         copied = session_metadata_with_tool_capability_ceiling(
             copied,

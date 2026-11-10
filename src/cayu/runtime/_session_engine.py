@@ -171,6 +171,7 @@ from cayu.budgets.usage import (
 from cayu.collaboration.access import CollaborationAccessContext
 from cayu.collaboration.peer_content import PeerContentAppendRequest, PeerContentReceipt
 from cayu.configuration import RunDefaults
+from cayu.connections.models import session_model_slot
 from cayu.context.base import (
     _runtime_authored_user_message_checkpoint_transform,
     validate_context_messages,
@@ -1399,6 +1400,7 @@ class SessionEngine(BeforeStopPolicies):
         session_identity = prepared.session_identity
         policy_evidence = prepared.policy_evidence
         managed_settings_evidence = prepared.managed_settings_evidence
+        model_slot_evidence = prepared.model_slot_evidence
         # ``prepared`` also retains the registered provider, whose repr may contain
         # live credentials. Keep the deliberately scoped provider local below so
         # cancellation cleanup can drop it before a traceback escapes this frame.
@@ -1751,6 +1753,13 @@ class SessionEngine(BeforeStopPolicies):
             pending_session = await self.session_store.load(session_id)
             if pending_session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            # A queued durable child was created with its slot when it was prepared.
+            child_slot = session_model_slot(pending_session)
+            model_slot_evidence = (
+                None
+                if child_slot is None
+                else {"slot": child_slot["slot"], "source": child_slot["source"]}
+            )
             pending_checkpoint = await self.session_store.load_checkpoint(session_id)
             claimed_checkpoint = validate_prepared_submission(
                 pending_session,
@@ -2467,6 +2476,7 @@ class SessionEngine(BeforeStopPolicies):
                         if managed_settings_evidence is None
                         else {"managed_settings": managed_settings_evidence}
                     ),
+                    **({} if model_slot_evidence is None else {"model_slot": model_slot_evidence}),
                     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
                         request,
                         message_start_index=(len(messages) - len(initial_source_messages)),

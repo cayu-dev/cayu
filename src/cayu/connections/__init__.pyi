@@ -13,3 +13,6 @@ from cayu.connections.client import LocalConnections as LocalConnections
 from cayu.connections.client import LocalSlot as LocalSlot
 from cayu.connections.client import Query as Query
 from cayu.connections.client import retry_after_seconds as retry_after_seconds
+from cayu.connections.models import ModelSlot as ModelSlot
+from cayu.connections.models import ModelSlots as ModelSlots
+from cayu.connections.models import ModelSlotUnavailable as ModelSlotUnavailable

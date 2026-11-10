@@ -16,6 +16,7 @@ from cayu.environments import (
     EnvironmentSpec,
 )
 from cayu.evals import ScriptedModelProvider
+from cayu.managed_settings import model_setting
 from cayu.runners import LocalRunner
 from cayu.runtime import ProjectDiagnostic, check_manifest
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
@@ -129,6 +130,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
+        "MODEL_SETTING_DEPRECATED",
         "PUBLIC_SERVICE_DEVELOPMENT_MODE",
         "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
         "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
@@ -579,6 +581,11 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     knowledgeless_codes = {
         item.code for item in check_manifest(knowledgeless.describe()).diagnostics
     }
+    legacy_model = CayuApp(enable_logging=False)
+    with pytest.warns(DeprecationWarning):
+        setting = model_setting()
+    legacy_model.register_agent(AgentSpec(name="legacy", model="model"), settings=[setting])
+    legacy_model_codes = {item.code for item in check_manifest(legacy_model.describe()).diagnostics}
     public_service_codes = {
         item.code
         for item in check_manifest(
@@ -638,6 +645,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unconstrained_codes
         | unbounded_codes
         | knowledgeless_codes
+        | legacy_model_codes
         | public_service_codes
         | nondurable_task_service_codes
         | project_control_plane_codes

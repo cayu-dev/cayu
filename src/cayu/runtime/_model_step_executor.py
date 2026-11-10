@@ -67,6 +67,7 @@ from cayu.budgets.usage import (
     is_conversational_model_completion_payload,
     usage_metrics_from_event_payload,
 )
+from cayu.connections.models import session_model_slot
 from cayu.context.base import (
     ContextBuildError,
     ContextCompactionTelemetry,
@@ -1550,6 +1551,14 @@ class ModelStepExecutor:
             ),
             options=redacted_options,
             cache_affinity_key=await self._cache_affinity.key_for(session),
+            # Only a session whose model came from its slot names it, and only for the slot's
+            # model: never a failover fallback's or a resumed session's new target.
+            model_slot=(
+                slot["slot"]
+                if (slot := session_model_slot(session)) is not None
+                and effective_model == slot["model"]
+                else None
+            ),
         )
 
     async def run_with_retries(

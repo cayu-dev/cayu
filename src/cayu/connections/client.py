@@ -129,9 +129,18 @@ class CloudConnectionBroker:
     async def slots(self) -> list[dict[str, Any]]:
         """The Agent's bound slots and each connection's state."""
 
-        answer = await self._call("GET", "")
-        items = answer.get("items")
+        items = (await self.listing()).get("items")
         return items if isinstance(items, list) else []
+
+    async def listing(self, *, release: str | None = None) -> dict[str, Any]:
+        """The broker's whole listing: the slots (``items``), and the model slots (``models``)
+        and ``approved_models`` where Cloud serves them.
+
+        ``release`` names this process's Release, so the model slots are those it declares;
+        without it Cloud lists the serving Release's.
+        """
+
+        return await self._call("GET", "", params=None if release is None else {"release": release})
 
     async def request(
         self,

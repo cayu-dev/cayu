@@ -69,6 +69,7 @@ def run_project_entrypoint(
             try:
                 # aclose() owns stopping it, within the shutdown deadline.
                 await app.start_model_policy()
+                await app.start_model_slots()
                 return await run_to_completion(app, run_request)
             finally:
                 shutdown = await app.aclose()

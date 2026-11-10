@@ -66,6 +66,7 @@ GATED_ENTRANCES = frozenset(
         "service_producer_disposition",
         "start_managed_settings",
         "start_model_policy",
+        "start_model_slots",
         "verify_completion_proposal",
     }
 )
@@ -106,6 +107,7 @@ SHUTDOWN_PARTS = frozenset(
         "flush_runtime_timing",
         "stop_managed_settings",
         "stop_model_policy",
+        "stop_model_slots",
     }
 )
 

@@ -28,6 +28,7 @@ from cayu.approvals.user_input import user_input_lifecycle_authority_from_checkp
 from cayu.approvals.wakes import require_no_pending_wake
 from cayu.budgets.base import BudgetPolicy
 from cayu.configuration import RunDefaults
+from cayu.connections.models import MODEL_SLOT_METADATA_KEY, session_model_slot
 from cayu.context.base import validate_context_messages
 from cayu.deadlines import (
     EXECUTION_DEADLINE_METADATA_KEY,
@@ -1943,6 +1944,15 @@ class SessionFork:
         )
         fork_metadata = copy_durable_metadata(request.metadata)
         fork_metadata.update(inherited_display_metadata(source_session.metadata))
+        # A fork names the source's model slot only while it keeps the source's agent and
+        # the slot's model.
+        source_slot = session_model_slot(source_session)
+        if (
+            source_slot is not None
+            and agent_name == source_session.agent_name
+            and source_slot["model"] == model
+        ):
+            fork_metadata[MODEL_SLOT_METADATA_KEY] = source_slot
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
                 fork_metadata,

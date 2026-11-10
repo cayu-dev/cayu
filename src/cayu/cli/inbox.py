@@ -401,6 +401,7 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
                 # A decision runs the agent here, so start what a server starts first;
                 # closing the app stops it.
                 await app.start_model_policy()
+                await app.start_model_slots()
             local = LocalInbox(
                 app,
                 reviewer=reviewer,

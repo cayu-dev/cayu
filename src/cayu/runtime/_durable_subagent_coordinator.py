@@ -70,6 +70,7 @@ from cayu.sessions.records import (
 from cayu.sessions.requests import (
     InterruptSessionRequest,
     RunRequest,
+    bind_runtime_model_slot,
     copy_run_request,
     run_request_with_prepared_session_authority,
     run_request_with_runtime_generated_authority,
@@ -113,6 +114,7 @@ class DurableSubagentPreparedRun:
     runtime_build_provenance: RuntimeBuildProvenance
     execution_profile: ExecutionProfileIdentity
     policy_evidence: dict[str, Any] | None = None
+    model_slot: dict[str, str] | None = None
 
 
 class DurableSubagentCoordinator:
@@ -773,6 +775,7 @@ class DurableSubagentCoordinator:
         child_runtime_build_provenance = prepared.runtime_build_provenance
         child_execution_profile = prepared.execution_profile
         child_policy_evidence = prepared.policy_evidence
+        child_model_slot = prepared.model_slot
         # Do not retain the provider-bearing preparation bundle across the durable
         # checkpoint publication below. Store failures may escape with frame locals.
         del prepared
@@ -818,6 +821,7 @@ class DurableSubagentCoordinator:
             request=request,
             child_execution_profile=child_execution_profile,
             policy_evidence=child_policy_evidence,
+            child_model_slot=child_model_slot,
         )
         require_durable_subagent_intent_matches_seed(intent, seed)
 
@@ -923,6 +927,8 @@ class DurableSubagentCoordinator:
 
         if child is None:
             request = copy_run_request(intent.request)
+            # The child is created with the slot its model came from when it was prepared.
+            bind_runtime_model_slot(request, intent.child_model_slot)
             request = run_request_with_runtime_generated_authority(
                 request,
                 "session_id",

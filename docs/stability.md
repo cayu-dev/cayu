@@ -53,7 +53,7 @@ These are the parts every application and generated project touches.
 | Execution profiles | `cayu.runtime` execution-profile identity | Existing sessions continue across a patch upgrade without an `ExecutionProfilePolicy`. Any profile change that needs application adoption ships only in a minor release and is listed under `Breaking changes`. |
 | CLI JSON output | `schema_version` in the JSON of `cayu session`, `cayu task`, `cayu knowledge`, `cayu inbox`, `cayu storage`, `cayu check`, `cayu inspect`, `cayu doctor`, `cayu providers`, `cayu diagnostics`, `cayu execution-profile`, `cayu recovery`, `cayu eval` and `cayu guide` | Within one `schema_version`, fields are only added. Removing, renaming or retyping a field bumps `schema_version` and ships only in a minor release. Table and text output is for people and is not covered. JSON without a `schema_version` (for example `cayu agent`) is provisional until it gets one. |
 | Server HTTP contract | `SERVER_CONTRACT_VERSION` in `src/cayu/_server_contract_version.py` | Bumps only in minor releases and is listed under `Breaking changes` when older clients must not use the new server. The bundled dashboard always matches. |
-| App manifest and generator schema | `APP_MANIFEST_SCHEMA_VERSION` in `cayu.runtime.manifest` | Same rule as the server contract. |
+| App manifest and generator schema | `APP_MANIFEST_SCHEMA_VERSION` in `cayu.runtime.manifest` | Same rule as the server contract. A manifest persisted under an earlier schema (in eval results, baselines or snapshots) no longer parses after a bump; record it again with the new release. Schema 18 adds `model_slots` and each agent's `model_slot`, so schema 17 manifests stop parsing. |
 | Cayu Cloud agent contract | `CLOUD_AGENT_CONTRACT_VERSIONS` in `cayu.cloud_reporting`, served at `{api}/cloud/contract` | Within a version, fields and values are only added and readers ignore those they don't know. A new version ships only in a minor release, under its own `{api}/cloud/v{N}` routes, and stopping an older one is listed under `Breaking changes`. See [the contract](runtime-contracts.md#cayu-cloud-agent-contract). |
 | Trusted proxy identity | `PROXY_IDENTITY_TOKEN_TYPE` in `cayu.server.proxy_identity`, the token's JWS `typ` | Within v1, claims are only added and servers ignore those they don't use. A change a v1 server would misread uses a new `typ`. See [the contract](runtime-contracts.md#trusted-proxy-identity). |
 
@@ -105,6 +105,13 @@ Rules for stable surfaces within 0.x:
    `Breaking changes` entry says so and explains why.
 5. **Provisional surfaces** need no window, but every breaking change still
    gets a `Breaking changes` entry.
+
+### Current deprecations
+
+| Deprecated | Replacement | Removal |
+| --- | --- | --- |
+| `cayu.managed_settings.model_setting()` (the Agent settings `model` field) | `CayuApp.require_model(slot, default=...)` and `register_agent(..., model_slot=...)` | After the standard window. Until then an agent registered with it uses a model slot named after it. |
+| `ModelPolicyController`, `CayuApp(model_policy=...)`, `CAYU_MODEL_POLICY_CONFIG` (the Gateway model policy reader) | Model slots bound in Cayu Cloud | The next release. |
 
 How breaking changes are announced:
 

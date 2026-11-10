@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from pathlib import PurePosixPath
 from typing import Any
 
 from cayu import Event, EventType
@@ -19,6 +20,9 @@ SESSION_TERMINAL_EVENTS = frozenset(
         EventType.SESSION_INTERRUPTED,
     }
 )
+
+# The examples mount the dashboard at Cayu's default dashboard path.
+_DASHBOARD_PATH = "/cayu"
 
 _READ_ONLY_POST_PATHS = frozenset(
     {
@@ -39,12 +43,22 @@ def is_superseded_browser_read_abort(
     if failure != "net::ERR_ABORTED" or mutation_id is not None:
         return False
     if method == "GET":
-        return path.startswith("/api/")
+        return path.startswith("/api/") or _is_dashboard_static_file(path)
     if method != "POST":
         return False
     return path in _READ_ONLY_POST_PATHS or (
         path.startswith("/api/sessions/") and path.endswith("/topology")
     )
+
+
+def _is_dashboard_static_file(path: str) -> bool:
+    """Return whether the dashboard mount serves this path as a file, not the app shell."""
+    if not path.startswith(f"{_DASHBOARD_PATH}/"):
+        return False
+    relative = PurePosixPath(path.removeprefix(f"{_DASHBOARD_PATH}/"))
+    if relative.parts[:1] == ("api",):
+        return False
+    return relative.suffix != ""
 
 
 def require(condition: bool, message: str) -> None:

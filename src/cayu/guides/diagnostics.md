@@ -56,6 +56,16 @@ The marker is an author assertion, not source analysis: Cayu does not scan
 Python or prose for words such as `sample`, `echo`, or `tracer bullet`, and an
 absent marker does not prove domain correctness.
 
+## model-setting-deprecated
+
+`MODEL_SETTING_DEPRECATED` means an agent still chooses its model with
+`model_setting()`, which is deprecated. Declare a model slot with
+`app.require_model(SLOT, default=MODEL)`, register the agent with
+`model_slot=SLOT`, and drop `model_setting()` from its settings. Until then the
+agent uses a model slot named after it (`_` as `-`) whose default is its own
+model, and Cayu Cloud moves the stored setting to that slot's binding. Verify
+with `cayu check --fail-on warning --json`.
+
 ## agent-provider-not-found
 
 `AGENT_PROVIDER_NOT_FOUND` means an agent's explicit provider is absent, or no

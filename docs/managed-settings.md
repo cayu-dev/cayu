@@ -58,11 +58,18 @@ the schema over its limits is refused when it is made.
 Some agent keys are applied by Cayu itself, with the agent's own value as the
 default:
 
-- `model` (`model_setting()`): the model new sessions use. A string, or an enum
-  when you pass `choices`. It applies at `next_session` (or `restart`). An agent
-  whose model the Gateway's model policy manages (`CayuApp(model_policy=...)`
-  with a binding for that agent) leaves `model` out of its schema: the policy
-  owns it, and the two are never both in charge of one model.
+- `model` (`model_setting()`, deprecated): the model new sessions use. A string,
+  or an enum when you pass `choices`. It applies at `next_session` (or
+  `restart`). Declare a model slot instead (`app.require_model(SLOT,
+  default=MODEL)` and `register_agent(..., model_slot=SLOT)`; see
+  [ADR 0003](adr/0003-connections-runtime-contract.md#models)), which Cayu
+  Cloud binds per Agent. Calling `model_setting()` warns with a
+  `DeprecationWarning`, and `cayu check` reports `MODEL_SETTING_DEPRECATED`.
+  Until the setting is removed, an agent registered with it uses a model slot
+  named after it (`_` as `-`) whose default is the agent's own model: a model
+  bound to that slot wins, otherwise the setting's value applies. An agent whose
+  model the Gateway's model policy manages (`CayuApp(model_policy=...)`, also
+  deprecated) leaves `model` out of its schema.
 - `thinking.effort` (`thinking_effort_setting()`): an enum of thinking efforts.
 - `provider_options.<name>` (`provider_option_setting(name, ...)`): one scalar
   provider option.
@@ -105,13 +112,12 @@ that can't be part of a key, is left out. Budget amounts apply at `restart`.
 
 ### Scaffolded projects
 
-`cayu new` registers the starter agent with `settings=[model_setting()]` in
-`agents/registration.py`, so a deployed Agent's model is an Agent setting whose
-default is the model in `agents/agent.py`. It leaves the setting out when the
-agent's name has an uppercase letter, which a key can't hold. The coding preset
-doesn't declare it yet. The run limits and retries come with
-every application. `configuration/settings.py` still reads `CAYU_MODEL` as a
-fallback default for one release; a value set in Cloud overrides it. Add a
+`cayu new` declares a `primary` model slot in `agents/registration.py` and
+registers the starter agent on it, so a deployed Agent's model is bound in Cayu
+Cloud and defaults to the model in `agents/agent.py`. The run limits and retries
+come with every application. `configuration/settings.py` still reads
+`CAYU_MODEL` as a fallback default until the model slots replace it; a model
+bound in Cloud overrides it. Add a
 project's own settings in `build_app` with `app.declare_settings([...])`, and
 pass `settings=` when registering further agents.
 

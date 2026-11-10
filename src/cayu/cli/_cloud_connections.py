@@ -13,6 +13,10 @@ credential.
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
 approves it, which these commands print.
+
+`cayu cloud models list` shows an Agent's model slots; `connections bind SLOT --model MODEL` binds
+one to an approved model and `connections unbind SLOT --model` unbinds it, so new sessions use
+the slot's default.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+
+from cayu.cli._cloud_settings import _table
 
 if TYPE_CHECKING:
     from cayu.cli._cloud_api import CloudApiClient
@@ -142,23 +148,59 @@ def add_connections_parsers(
     bound.add_argument("--application", required=True, help="The Agent.")
     bind = actions.add_parser(
         "bind",
-        help="Bind one of an Agent's slots to a connection.",
-        description="Bind the Agent's SLOT to CONNECTION, optionally to fewer of its scopes.",
+        help="Bind one of an Agent's slots to a connection, or its model slot to a model.",
+        description=(
+            "Bind the Agent's SLOT to CONNECTION, optionally to fewer of its scopes; or, with "
+            "--model, bind its model slot SLOT to an approved model, which new sessions use."
+        ),
     )
     bind.add_argument("slot")
-    bind.add_argument("connection")
+    bind.add_argument("connection", nargs="?")
     bind.add_argument("--application", required=True, help="The Agent.")
     bind.add_argument("--scope", action="append", help="A scope the binding uses; repeat.")
+    bind.add_argument(
+        "--model", help="Bind the model slot SLOT to this approved model instead of a connection."
+    )
     unbind = actions.add_parser(
         "unbind",
         help="Unbind one of an Agent's slots.",
         description=(
             "Unbind the Agent's SLOT: its calls through it stop at once. An admin can then "
-            "remove the connection with `cayu cloud connections remove`."
+            "remove the connection with `cayu cloud connections remove`. With --model, unbind "
+            "its model slot SLOT: new sessions use the slot's default."
         ),
     )
     unbind.add_argument("slot")
     unbind.add_argument("--application", required=True, help="The Agent.")
+    unbind.add_argument(
+        "--model", action="store_true", help="Unbind the model slot SLOT, not a connection slot."
+    )
+
+
+def add_models_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    models = commands.add_parser(
+        "models",
+        help="List an Agent's model slots.",
+        description=(
+            "Read an Agent's model slots: the models it declares by name, and the approved "
+            "model each one uses. Bind one with `cayu cloud connections bind SLOT --model MODEL`."
+        ),
+    )
+    actions = models.add_subparsers(dest="models_command", required=True)
+    listed = actions.add_parser(
+        "list",
+        help="List an Agent's model slots and approved models.",
+        description=(
+            "List the Agent's model slots: each one's model, whether it is bound or uses its "
+            "default, whether the model is approved and whether the running Release declares "
+            "the slot; then the approved models it can be bound to."
+        ),
+    )
+    listed.add_argument("--application", required=True, help="The Agent.")
+    listed.add_argument(
+        "--json", action="store_true", help="Print the JSON envelope instead of a table."
+    )
+    listed.set_defaults(_cloud_render=render_models)
 
 
 def _add_credential_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
@@ -207,6 +249,48 @@ def render_sign_in(outcome: Mapping[str, Any]) -> str | None:
     )
 
 
+def render_models(outcome: Mapping[str, Any]) -> str:
+    """An Agent's model slots as a table, then the models they can be bound to."""
+
+    result = outcome["result"]
+    lines = _table(
+        ("SLOT", "MODEL", "SOURCE", "APPROVED", "DECLARED"),
+        [
+            (
+                str(item.get("slot")),
+                item.get("model") or "-",
+                str(item.get("source")),
+                _yes_no(item.get("approved")),
+                _yes_no(item.get("declared")),
+            )
+            for item in result.get("items") or []
+        ],
+    )
+    approved = result.get("approved_models")
+    lines.append("")
+    lines.append(
+        "Approved models: " + ("unknown" if approved is None else ", ".join(approved) or "none")
+    )
+    return "\n".join(lines)
+
+
+def _yes_no(value: object) -> str:
+    return "unknown" if value is None else "yes" if value else "no"
+
+
+def models_command(
+    arguments: argparse.Namespace, *, client: CloudApiClient, application_id: str
+) -> dict[str, Any]:
+    """Run one `models` action on the Agent ``application_id``."""
+
+    result = client.request("GET", _models(application_id))
+    return {"operation": f"models.{arguments.models_command}", "result": result}
+
+
+def _models(application_id: str) -> str:
+    return f"/v1/applications/{quote(application_id, safe='')}/models"
+
+
 def connectors_command(client: CloudApiClient) -> dict[str, Any]:
     return {"operation": "connectors.list", "result": client.request("GET", "/v1/connectors")}
 
@@ -253,7 +337,8 @@ def connections_command(
         else:
             client.request("DELETE", path)
             result = {"name": arguments.name, "removed": True}
-    return {"operation": f"connections.{action}", "result": result}
+    kind = "models" if action in {"bind", "unbind"} and arguments.model else "connections"
+    return {"operation": f"{kind}.{action}", "result": result}
 
 
 def _agent_action(
@@ -261,6 +346,10 @@ def _agent_action(
 ) -> dict[str, Any]:
     if application_id is None:
         raise ValueError("An Agent's connections need its application id.")
+    if arguments.connections_command != "bound" and arguments.model:
+        return _model_slot_action(arguments, client, application_id)
+    if arguments.connections_command == "bind" and arguments.connection is None:
+        raise ValueError("Bind SLOT to a CONNECTION, or its model slot with --model MODEL.")
     slots = f"/v1/applications/{quote(application_id, safe='')}/connections"
     if arguments.connections_command == "bound":
         return client.request("GET", slots)
@@ -270,6 +359,18 @@ def _agent_action(
         if arguments.scope is not None:
             payload["scopes"] = arguments.scope
         return client.request("PUT", slot, payload=payload)
+    client.request("DELETE", slot)
+    return {"application_id": application_id, "slot": arguments.slot, "unbound": True}
+
+
+def _model_slot_action(
+    arguments: argparse.Namespace, client: CloudApiClient, application_id: str
+) -> dict[str, Any]:
+    slot = f"{_models(application_id)}/{quote(arguments.slot, safe='')}"
+    if arguments.connections_command == "bind":
+        if arguments.connection is not None or arguments.scope is not None:
+            raise ValueError("A model slot binds to --model MODEL alone: no CONNECTION or --scope.")
+        return client.request("PUT", slot, payload={"model": arguments.model})
     client.request("DELETE", slot)
     return {"application_id": application_id, "slot": arguments.slot, "unbound": True}
 

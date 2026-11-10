@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -36,6 +38,7 @@ from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.build_provenance import RuntimeBuildProvenance
 from cayu.configuration import DEFAULT_MAX_STEPS, MAX_STEPS
+from cayu.connections.models import MODEL_SLOT_METADATA_KEY
 from cayu.context.structured_output import StructuredOutputSpec, copy_structured_output_spec
 from cayu.context.thinking import ThinkingConfig
 from cayu.deadlines import (
@@ -231,6 +234,36 @@ class _RuntimePreparedSessionAuthority:
             require_clean_nonblank(getattr(self, field_name), field_name)
 
 
+_RUNTIME_MODEL_SLOT_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeModelSlot:
+    """Process-local proof that session preparation chose the slot a new session records."""
+
+    token: object
+    record: Mapping[str, str]
+
+
+def bind_runtime_model_slot(request: RunRequest, record: Mapping[str, str] | None) -> None:
+    """Record, on a prepared request, the slot its new session's model came from."""
+
+    request._runtime_model_slot = (
+        None
+        if record is None
+        else _RuntimeModelSlot(_RUNTIME_MODEL_SLOT_TOKEN, MappingProxyType(dict(record)))
+    )
+
+
+def runtime_model_slot(request: RunRequest) -> dict[str, str] | None:
+    """The slot record session preparation bound to ``request``; None for anything else."""
+
+    holder = request._runtime_model_slot
+    if type(holder) is not _RuntimeModelSlot or holder.token is not _RUNTIME_MODEL_SLOT_TOKEN:
+        return None
+    return dict(holder.record)
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeResumeTransportMetadataAuthority:
     """Positive provenance for per-attempt metadata kept outside semantic input."""
@@ -321,6 +354,9 @@ class RunRequest(BaseModel):
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
     _runtime_task_invocation: TaskInvocationSnapshot | None = PrivateAttr(default=None)
     _runtime_prepared_session_authority: object | None = PrivateAttr(default=None)
+    # The model slot this new session's model came from (``bind_runtime_model_slot``): written
+    # to the session's metadata when it is created, never taken from the caller.
+    _runtime_model_slot: object | None = PrivateAttr(default=None)
 
     @field_validator("title", mode="before")
     @classmethod
@@ -357,6 +393,7 @@ class RunRequest(BaseModel):
                     RUN_LINEAGE_METADATA_KEY,
                     EVAL_TRIAL_METADATA_KEY,
                     TASK_METADATA_KEY,
+                    MODEL_SLOT_METADATA_KEY,
                 )
                 if key in copied
             ),
@@ -384,6 +421,8 @@ class RunRequest(BaseModel):
                 authority_name = "eval-trial authority"
             elif reserved_key == TASK_METADATA_KEY:
                 authority_name = "task authority"
+            elif reserved_key == MODEL_SLOT_METADATA_KEY:
+                authority_name = "model-slot authority"
             else:
                 authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
@@ -846,6 +885,7 @@ class ForkSessionRequest(BaseModel):
             RUN_LINEAGE_METADATA_KEY: "run-lineage authority",
             EVAL_TRIAL_METADATA_KEY: "eval-trial authority",
             TASK_METADATA_KEY: "task authority",
+            MODEL_SLOT_METADATA_KEY: "model-slot authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),
@@ -1094,6 +1134,12 @@ def copy_run_request(request: RunRequest) -> RunRequest:
     object.__setattr__(copied, "__pydantic_fields_set__", copied_fields_set)
     copied._runtime_generated_authority = request._runtime_generated_authority
     copied._runtime_event_base_deadline = request._runtime_event_base_deadline
+    model_slot = request._runtime_model_slot
+    copied._runtime_model_slot = (
+        model_slot
+        if type(model_slot) is _RuntimeModelSlot and model_slot.token is _RUNTIME_MODEL_SLOT_TOKEN
+        else None
+    )
     prepared_creation = request._runtime_work_attempt_creation
     copied._runtime_work_attempt_creation = (
         prepared_creation

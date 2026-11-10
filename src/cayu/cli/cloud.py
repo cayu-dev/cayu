@@ -51,8 +51,10 @@ from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compa
 from cayu.cli._cloud_connections import (
     AGENT_ACTIONS,
     add_connections_parsers,
+    add_models_parser,
     connections_command,
     connectors_command,
+    models_command,
 )
 from cayu.cli._cloud_data import add_data_parser, data_command
 from cayu.cli._cloud_data_transfers import (
@@ -1478,6 +1480,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_api_keys_parser(commands)
 
     add_connections_parsers(commands)
+    add_models_parser(commands)
 
     add_admin_parser(commands, application=_application_slug)
 
@@ -2478,6 +2481,12 @@ def _client_command(
                 if getattr(arguments, "agent", None)
                 else None
             ),
+        )
+    if arguments.command == "models":
+        return models_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
         )
     if arguments.command == "admin":
         return admin_command(

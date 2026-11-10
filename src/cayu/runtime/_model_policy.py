@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -60,6 +61,12 @@ class ModelPolicyController:
         incarnation: tuple[str, int],
         channel: PolicyChannel | None = None,
     ):
+        warnings.warn(
+            "ModelPolicyController is deprecated and will be removed in the next release; "
+            "declare model slots with CayuApp.require_model(), which Cayu Cloud binds.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         identifier(agent_name)
         identifier(provider_name)
         self.agent_name, self.provider_name = agent_name, provider_name

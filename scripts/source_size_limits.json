@@ -2,7 +2,7 @@
   "schema_version": 2,
   "default_max_lines": 9999,
   "total_budgets": {
-    "source_python_lines": 1215000,
+    "source_python_lines": 1217040,
     "public_names": 4050
   },
   "exceptions": {

@@ -91,7 +91,7 @@ def test_schema_16_identity_is_explicitly_incompatible(normalized):
     )
     if normalized:
         document = json.dumps(_normalize_numbers(document))
-    with pytest.raises(ValidationError, match="Input should be '17'"):
+    with pytest.raises(ValidationError, match="Input should be '18'"):
         EvaluationTargetIdentity.model_validate_json(document)
 
 
@@ -127,7 +127,7 @@ def test_saved_schema_16_result_is_rejected_without_rehashing(normalized):
     encoded = json.dumps(document)
     if normalized:
         encoded = json.dumps(_normalize_numbers(encoded))
-    with pytest.raises(ValidationError, match="Input should be '17'"):
+    with pytest.raises(ValidationError, match="Input should be '18'"):
         corpus_execution_result_from_json(encoded)
 
 

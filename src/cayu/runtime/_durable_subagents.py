@@ -17,6 +17,7 @@ from cayu._validation import (
     copy_durable_metadata,
     require_durable_clean_nonblank,
 )
+from cayu.connections.models import model_slot_record
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
@@ -819,11 +820,23 @@ class DurableSubagentSubmissionIntent(_DurableSubagentAuthorityRecord):
     child_execution_profile: ExecutionProfileIdentity
     submission_sha256: str
     policy_evidence: dict[str, Any] | None = None
+    # The model slot the child's model came from, ``{"slot", "source", "model"}``; absent
+    # otherwise.
+    child_model_slot: dict[str, str] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("policy_evidence", mode="before")
     @classmethod
     def copy_policy_evidence(cls, value):
         return None if value is None else copy_durable_metadata(value, "model_policy")
+
+    @field_validator("child_model_slot")
+    @classmethod
+    def validate_child_model_slot(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is not None and model_slot_record(value) != value:
+            raise ValueError("child_model_slot must be a model slot's record.")
+        return value
 
     @field_validator("child_provider_name", "child_model", "child_runtime_name")
     @classmethod

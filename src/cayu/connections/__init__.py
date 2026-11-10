@@ -11,6 +11,10 @@ request through a slot and answers the connector's response:
 * ``LocalConnections`` sends it straight to each slot's own host with headers the application
   gives, for a laptop or a test.
 
+Model slots are the models an application declares by name (``CayuApp.require_model``), which
+the Organization binds per Agent in Cayu Cloud: ``ModelSlots`` reads the bindings from the broker
+and a new session resolves its agent's slot when it starts.
+
 The connector's status is the answer's, whatever it is; ``ConnectionCallError`` is raised only
 when the request couldn't be sent: the slot is unbound, the host refused to send it, or the
 connector couldn't be reached.

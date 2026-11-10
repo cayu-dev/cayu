@@ -64,6 +64,10 @@ export type AgentManifest = {
      */
     model: string;
     /**
+     * Model Slot
+     */
+    model_slot?: string | null;
+    /**
      * Name
      */
     name: string;
@@ -3659,6 +3663,10 @@ export type AppManifest = {
      */
     fingerprint: string;
     /**
+     * Model Slots
+     */
+    model_slots?: Array<ModelSlotManifest>;
+    /**
      * Providers
      */
     providers: Array<ProviderManifest>;
@@ -3666,7 +3674,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '17';
+    schema_version?: '18';
     settings?: ManagedSettingsManifest | null;
     stores: StoreManifest;
 };
@@ -16444,6 +16452,26 @@ export type ModelPrice = {
      * Schedules
      */
     schedules: Array<PriceSchedule>;
+};
+
+/**
+ * ModelSlotManifest
+ *
+ * One declared model slot: the model it uses unless Cayu Cloud binds it.
+ */
+export type ModelSlotManifest = {
+    /**
+     * Default
+     */
+    default: string | null;
+    /**
+     * Label
+     */
+    label?: string | null;
+    /**
+     * Name
+     */
+    name: string;
 };
 
 /**

@@ -65,6 +65,8 @@ REGISTRATION_KEYS = {
     "replaces_cursor",
     # Optional in v1: the Release's managed settings schema (docs/managed-settings.md).
     "settings_schema",
+    # Optional in v1: the Release's model slots (connections.md#models in Cayu Cloud).
+    "model_slots",
 }
 # Only the publisher knows the store and the cursor Cloud answered.
 _PUBLISHER_KEYS = {"store_id", "replaces_cursor"}
@@ -197,7 +199,8 @@ def test_registration_reports_only_active_shared_knowledge_the_app_registered():
         ):
             assert forbidden not in encoded
         body = json.loads(encoded)
-        assert set(body) == REGISTRATION_KEYS - _PUBLISHER_KEYS
+        # A Release that declares no model slots leaves them out.
+        assert set(body) == REGISTRATION_KEYS - _PUBLISHER_KEYS - {"model_slots"}
         assert body["contract"] == CLOUD_REGISTRY_CONTRACT == "cayu.agent-registry/v1"
         assert body["start_cursor"] == 7
         assert body["agents"] == ["audit", "billing"]

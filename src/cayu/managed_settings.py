@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import warnings
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -216,11 +217,22 @@ def model_setting(
 ) -> ManagedSetting:
     """Declare an agent's model; pass it to ``register_agent(settings=...)``.
 
+    Deprecated: declare a model slot with ``CayuApp.require_model()`` and name it with
+    ``register_agent(..., model_slot=...)``. An agent registered with this setting uses a model
+    slot named after it (``_`` as ``-``), declared with its own model as the default; a model
+    bound to that slot in Cloud wins over the setting's value.
+
     New sessions use the value set in Cloud; running and resumed sessions keep
     the model they started with. The default is the agent's own model. Agents
     whose model the Gateway's model policy manages leave it out of the schema.
     """
 
+    warnings.warn(
+        "model_setting() is deprecated; declare a model slot with CayuApp.require_model() and "
+        "name it with register_agent(..., model_slot=...).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if choices is None:
         return ManagedSetting(
             key="model", type="string", max_length=256, label=label, description=description

@@ -427,6 +427,7 @@ def create_server(
             # aclose() owns stopping them, within the shutdown deadline.
             await app.start_model_policy()
             await app.start_managed_settings(role="web")
+            await app.start_model_slots()
             if browser_recordings is not None:
                 browser_recordings.start()
             follow_up = await recover_startup_state()
@@ -1604,6 +1605,7 @@ def _compose_interruption_drain_lifespan(
                 # aclose() owns stopping them, within the shutdown deadline.
                 await app.start_model_policy()
                 await app.start_managed_settings(role="web")
+                await app.start_model_slots()
                 await _recover_persisted_event_side_effects_during_startup(
                     app,
                     timeout_s=side_effect_startup_timeout_s,

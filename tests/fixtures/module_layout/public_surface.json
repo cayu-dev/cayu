@@ -806,6 +806,11 @@
           "LocalConnections",
           "LocalSlot",
           "retry_after_seconds"
+        ],
+        "cayu.connections.models": [
+          "ModelSlot",
+          "ModelSlotUnavailable",
+          "ModelSlots"
         ]
       },
       "identities": {},

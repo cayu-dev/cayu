@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import warnings
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import replace
@@ -35,6 +36,7 @@ from cayu._application_environment_maintenance import (
 from cayu._application_environment_registry import ApplicationEnvironmentRegistry
 from cayu._application_human_review import HumanReviewEntrances
 from cayu._application_managed_settings import ManagedSettingsEntrances
+from cayu._application_model_slots import ModelSlotEntrances
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
 from cayu._application_session_abandonment import SessionAbandonmentEntrances
@@ -271,6 +273,7 @@ from cayu.configuration import (
     CayuConfigSource,
     copy_cayu_config,
 )
+from cayu.connections.models import ModelSlots
 from cayu.context.base import (
     ContextPolicy,
 )
@@ -694,6 +697,7 @@ from cayu.sessions.requests import (
     copy_fork_session_request,
     copy_resume_request,
     run_request_with_runtime_generated_authority,
+    runtime_model_slot,
     with_event_base_deadline,
 )
 from cayu.sessions.store import SessionStore
@@ -941,7 +945,11 @@ _PROVIDER_RECONCILIATION_BUDGET_SHARE = 0.5
 
 
 class CayuApp(
-    WorkflowEntrances, ManagedSettingsEntrances, HumanReviewEntrances, SessionAbandonmentEntrances
+    WorkflowEntrances,
+    ManagedSettingsEntrances,
+    ModelSlotEntrances,
+    HumanReviewEntrances,
+    SessionAbandonmentEntrances,
 ):
     """Application runtime for registered specialists, providers, and session state."""
 
@@ -994,9 +1002,17 @@ class CayuApp(
         release_identity: ReleaseIdentity | None = None,
         owned_resources: Iterable[SupportsAsyncClose | SupportsAsyncAclose] = (),
         managed_settings: ManagedSettings | None = None,
+        model_slots: ModelSlots | None = None,
     ) -> None:
         if model_policy is not None and type(model_policy) is not ModelPolicy:
             raise TypeError("model_policy must be ModelPolicy.")
+        if model_policy is not None:
+            warnings.warn(
+                "CayuApp(model_policy=...) is deprecated and will be removed in the next "
+                "release; declare model slots with CayuApp.require_model() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.model_policy = model_policy
         self._admission = ApplicationAdmission()
         # Caller-supplied stores and providers are never closed by the app. A
@@ -1707,6 +1723,8 @@ class CayuApp(
             policy_selection=None if model_policy is None else model_policy.selection,
             managed_model=self._managed_agent_model,
             managed_evidence=self._managed_session_evidence,
+            model_slot=self._session_model_slot,
+            model_slot_name=self._model_slot_name,
         )
 
         self._session_tasks = SessionTaskLifecycle(
@@ -2115,6 +2133,7 @@ class CayuApp(
         )
         # Reads Cloud's settings once now, for those that apply at restart.
         self._bind_managed_settings(managed_settings)
+        self._bind_model_slots(model_slots)
         # Last: an application whose construction failed never holds the handoff.
         attention.bind_handoff(self, self.human_attention_handoff)
 
@@ -5347,6 +5366,7 @@ class CayuApp(
             # Policy workers call providers in the background; stop them first. The
             # managed-settings poller is the other Cloud worker; it holds no work.
             await self.stop_managed_settings()
+            await self.stop_model_slots()
             await self.stop_model_policy()
 
         async def provider_reconciliations(budget: float) -> bool:
@@ -5969,10 +5989,12 @@ class CayuApp(
         execution_requirements: ExecutionRequirements | None = None,
         environment_name: str | NoEnvironment | None = None,
         settings: Iterable[ManagedSetting] | None = None,
+        model_slot: str | None = None,
     ) -> AgentSpec:
         spec, declared = self._agent_managed_settings(
             spec, settings, default_thinking=self._config.run.thinking
         )
+        slot, setting_slot = self._agent_model_slot(spec, model_slot, declared)
         registered = self._agent_registry.register_agent(
             spec,
             default_thinking=self._config.run.thinking,
@@ -5995,8 +6017,11 @@ class CayuApp(
             loop_policies=loop_policies,
             execution_requirements=execution_requirements,
             environment_name=environment_name,
+            model_slot=slot,
         )
         self._add_managed_settings(declared)
+        if setting_slot is not None:
+            self._add_setting_model_slot(registered.name, setting_slot)
         return registered
 
     def enroll_fork_controller(self, controller: ForkController) -> None:
@@ -8016,6 +8041,7 @@ class CayuApp(
                     if prepared.policy_evidence is None
                     else json.loads(prepared.policy_evidence)
                 ),
+                model_slot=runtime_model_slot(prepared.request),
             )
         finally:
             del prepared

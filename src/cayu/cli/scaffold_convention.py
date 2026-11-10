@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 
 from cayu.cli.scaffold_app_database import APP_DATABASE, APP_DATABASE_TABLES
@@ -14,7 +13,6 @@ from cayu.cli.scaffold_plan import (
     preset_spec,
     removed_capability_files,
 )
-from cayu.managed_settings import MAX_KEY_LENGTH
 
 # Packages every project declares; a home whose capability `--without`
 # removed is left out of the generated architecture test.
@@ -241,12 +239,12 @@ def configured_provider() -> ModelProvider:
     if choice == "cayu-gateway":
         api_key = configured_gateway_api_key()
         base_url = configured_gateway_base_url()
-        if not (configured_model_override() and api_key and base_url):
+        if not (api_key and base_url):
             return _ScaffoldPlaceholderProvider(
                 name="cayu_gateway",
                 setup_error=(
-                    "provider 'cayu-gateway' requires CAYU_MODEL, "
-                    "CAYU_GATEWAY_API_KEY, and CAYU_GATEWAY_BASE_URL"
+                    "provider 'cayu-gateway' requires CAYU_GATEWAY_API_KEY "
+                    "and CAYU_GATEWAY_BASE_URL"
                 ),
             )
         return GatewayProvider(api_key=api_key, base_url=base_url)
@@ -335,6 +333,8 @@ _DEFAULT_MODELS = {
     "openai": "gpt-5.6-luna",
     "anthropic": "claude-sonnet-4-6",
     "openai-subscription": "gpt-6-luna",
+    # The "primary" model slot's default; Cayu Cloud binds the slot to an approved model.
+    "cayu-gateway": "bedrock/claude-sonnet-4-5",
 }
 
 
@@ -360,7 +360,7 @@ def configured_model() -> str:
     if override:
         return override
     selected = configured_provider_choice()
-    if selected in {"openrouter", "cayu-gateway"}:
+    if selected == "openrouter":
         return f"{selected}-model-unconfigured"
     if selected is None:
         return "provider-model-unconfigured"
@@ -370,7 +370,6 @@ def configured_model() -> str:
 _UNCONFIGURED_MODELS = (
     "provider-model-unconfigured",
     "openrouter-model-unconfigured",
-    "cayu-gateway-model-unconfigured",
 )
 
 
@@ -393,11 +392,11 @@ def resolve_configured_agent(agent: AgentSpec) -> AgentSpec:
 
 
 def configured_model_override() -> str:
-    """Return CAYU_MODEL, a fallback default kept for one release.
+    """Return CAYU_MODEL, a fallback default kept until the model slots replace it.
 
-    The starter agent declares its model as a managed setting, so a deployed
-    Agent's model is set in Cayu Cloud's Agent settings, which override this
-    default. Locally, set the model in agents/agent.py.
+    The starter agent's model is the default of its "primary" model slot, so a
+    deployed Agent's model is bound in Cayu Cloud, which overrides this default.
+    Locally, set the model in agents/agent.py.
     """
 
     return (os.environ.get("CAYU_MODEL") or "").strip()
@@ -778,29 +777,13 @@ def _request_footprint_config() -> RequestFootprintConfig:
     )
 '''
 
-_MODEL_SETTING_IMPORT = "from cayu.managed_settings import model_setting\n"
-_MODEL_SETTING_ARGUMENT = """        # In Cayu Cloud the model is an Agent setting (agent.<name>.model) that new
-        # sessions read; the agent's own model is its default.
-        settings=[model_setting()],
-"""
-
-
-def _registration_with_model_setting(source: str, agent_name: str) -> str:
-    """Leave the model setting out for an agent whose name can't be part of a setting key."""
-
-    key = f"agent.{agent_name}.model"
-    if re.fullmatch(r"[a-z0-9_-]+", agent_name) and len(key) <= MAX_KEY_LENGTH:
-        return source
-    source = _replace_once(source, _MODEL_SETTING_IMPORT, "")
-    return _replace_once(source, _MODEL_SETTING_ARGUMENT, "")
-
-
 _AGENT_REGISTRATION_PY = '''"""Explicit agent, tool, policy, and runtime registration seam."""
 
 from cayu import AgentSpec, CayuApp
 from cayu.providers import ModelProvider
 from cayu.context import ContextPolicy
-from cayu.managed_settings import model_setting
+from cayu.connections import ModelSlot
+import warnings
 
 from agents.agent import AGENT
 from configuration import resolve_configured_agent
@@ -821,6 +804,24 @@ def _agent_for_provider_override(
     return agent.model_copy(update={"provider_name": provider.name})
 
 
+def _primary_model_slot(app: CayuApp, model: str) -> str | None:
+    """Declare the "primary" model slot, with the agent's own model as its default.
+
+    In Cayu Cloud the Organization binds the slot to one of its approved models, and new
+    sessions use it. A model id a slot can't hold (such as one with "@") runs without it.
+    """
+
+    if not ModelSlot.is_model_id(model):
+        warnings.warn(
+            f"The model {model!r} can't be a model slot's default, so the agent runs "
+            "without the 'primary' slot and Cayu Cloud can't bind its model.",
+            stacklevel=2,
+        )
+        return None
+    app.require_model("primary", default=model, label="Primary model")
+    return "primary"
+
+
 def register_agents(
     app: CayuApp,
     *,
@@ -838,15 +839,13 @@ def register_agents(
     # </cayu:generated-starter-tools>
     app.register_agent(
         _agent_for_provider_override(AGENT, provider_override),
+        model_slot=_primary_model_slot(app, resolve_configured_agent(AGENT).model),
         tools=starter_tools,
         context_policy=context_policy,
         tool_exposure_policy=build_tool_exposure_policy(
             tuple(tool.spec.name for tool in starter_tools)
         ),
         tool_policy=build_tool_policy(tuple(starter_external_tool_names)),
-        # In Cayu Cloud the model is an Agent setting (agent.<name>.model) that new
-        # sessions read; the agent's own model is its default.
-        settings=[model_setting()],
     )
     # <cayu:generated-registrations>
     # </cayu:generated-registrations>
@@ -1997,9 +1996,7 @@ def convention_files(
             "configuration/storage.py": configured(_STORAGE_PY),
             "configuration/runtime.py": configured(_RUNTIME_PY),
             "agents/agent.py": configured(_AGENT_PY),
-            "agents/registration.py": _registration_with_model_setting(
-                configured(_AGENT_REGISTRATION_PY), plan.agent_name
-            ),
+            "agents/registration.py": configured(_AGENT_REGISTRATION_PY),
             "prompts/agent.py": configured(_PROMPT_PY),
             "tools/registration.py": configured(_TOOLS_REGISTRATION_PY),
             "policies/tools.py": configured(_TOOL_POLICY_PY),

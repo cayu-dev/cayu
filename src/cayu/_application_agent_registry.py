@@ -232,6 +232,7 @@ class ApplicationAgentRegistry:
         loop_policies: Iterable[LoopPolicy] | None = None,
         execution_requirements: ExecutionRequirements | None = None,
         environment_name: str | NoEnvironment | None = None,
+        model_slot: str | None = None,
     ) -> AgentSpec:
         if type(spec) is not AgentSpec:
             raise TypeError("Agent registration requires an AgentSpec.")
@@ -563,6 +564,7 @@ class ApplicationAgentRegistry:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
             child_session_context_contributor=stored_child_session_context,
+            model_slot=model_slot,
         )
         if self._environment_registry is not None:
             # Runs before any MCP ownership is claimed or anything is published.

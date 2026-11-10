@@ -71,7 +71,7 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.runtime import _runtime_records as runtime_records
 
-APP_MANIFEST_SCHEMA_VERSION = "17"
+APP_MANIFEST_SCHEMA_VERSION = "18"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -340,6 +340,8 @@ class AgentManifest(_ManifestModel):
     # Both are omitted when the agent uses the application default.
     default_environment: str | None = Field(default=None, exclude_if=lambda value: value is None)
     runs_without_environment: bool = Field(default=False, exclude_if=lambda value: not value)
+    # The model slot whose binding chooses the agent's model for new sessions, if any.
+    model_slot: str | None = Field(default=None, exclude_if=lambda value: value is None)
     tools: tuple[ToolManifest, ...] = ()
     hosted_tools: tuple[HostedToolManifest, ...] = ()
     targeted_tool_mode: (
@@ -473,8 +475,16 @@ class ManagedSettingsManifest(_ManifestModel):
     settings: tuple[ManagedSetting, ...]
 
 
+class ModelSlotManifest(_ManifestModel):
+    """One declared model slot: the model it uses unless Cayu Cloud binds it."""
+
+    name: str
+    default: str | None
+    label: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class AppManifest(_ManifestModel):
-    schema_version: Literal["17"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["18"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     # Booted runtime evidence only; JSON manifests cannot establish this fact.
@@ -489,6 +499,9 @@ class AppManifest(_ManifestModel):
     # Absent only from manifests recorded before parts could declare settings.
     settings: ManagedSettingsManifest | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+    model_slots: tuple[ModelSlotManifest, ...] = Field(
+        default=(), exclude_if=lambda value: not value
     )
 
 
@@ -650,6 +663,10 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     # The schema is published to Cloud as assembled, so the manifest carries it
     # unnormalized. Declaration already refuses settings that contain a secret.
     structural_payload["settings"] = app.managed_settings_schema()
+    # Published to Cloud as declared too; declaring a slot refuses a secret value.
+    model_slots = [slot.declaration() for slot in app.model_slots()]
+    if model_slots:
+        structural_payload["model_slots"] = model_slots
     manifest = AppManifest.model_validate(
         {
             **normalized_payload,
@@ -824,6 +841,7 @@ def _describe_agent(
             else None
         ),
         runs_without_environment=registration.default_environment_name is NO_ENVIRONMENT,
+        model_slot=registration.model_slot,
         tools=tuple(
             _describe_tool(
                 app,

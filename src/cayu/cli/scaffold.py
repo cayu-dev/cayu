@@ -969,13 +969,13 @@ never persisted. Put OpenRouter routing controls such as `provider.order`,
 `provider.allow_fallbacks`, `provider.require_parameters`, `provider.zdr`, and
 `provider.data_collection` in `AgentSpec.provider_options["openrouter"]`.
 
-Cayu Gateway (explicit endpoint and model):
+Cayu Gateway (explicit endpoint; the model is the `primary` model slot's default,
+`bedrock/claude-sonnet-4-5`, which Cayu Cloud can bind to another approved model):
 
 ```bash
 export CAYU_PROVIDER=cayu-gateway
 export CAYU_GATEWAY_BASE_URL=https://YOUR_GATEWAY/v1
 export CAYU_GATEWAY_API_KEY=YOUR_KEY
-export CAYU_MODEL=YOUR_MODEL
 uv run --no-sync python run.py --message "YOUR REQUEST"
 ```
 
@@ -1001,11 +1001,12 @@ For production, use the OpenAI Platform API or another officially supported
 provider. Run `uv run --no-sync cayu guide providers#openai-subscription` for the local
 support boundary.
 
-Deployed to Cayu Cloud, the starter agent's model is an Agent setting
-(`agent.<name>.model`, declared in `agents/registration.py`), with run limits and
-retries next to it: change them on the Agent's Settings page and new sessions use
-them. `CAYU_MODEL` still sets the default model for one more release; set it in
-`agents/agent.py` instead. See `docs/managed-settings.md` in the Cayu repository.
+Deployed to Cayu Cloud, the starter agent's model comes from its `primary` model
+slot (declared with `app.require_model` in `agents/registration.py`): bind it with
+`cayu cloud connections bind --application AGENT primary --model MODEL` and new
+sessions use that model. Run limits and retries are Agent settings: change them on
+the Agent's Settings page. `CAYU_MODEL` still sets the default model until the model
+slots replace it; set it in `agents/agent.py` instead.
 
 `--agent` is optional while this is the only registered specialist. The checked-in
 `AGENTS.md` is the local instruction surface for coding agents.

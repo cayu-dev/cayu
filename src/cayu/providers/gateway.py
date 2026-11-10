@@ -34,6 +34,9 @@ from cayu.providers.chat_completions import (
 from cayu.providers.deadlines import ProviderStreamDeadlines
 
 _MAX_LOOKUP_BYTES = 1_048_576
+# The Gateway's request-body extension (``cayu``): cost restrictions and the model slot.
+_EXTENSION = "cayu"
+_EXTENSION_SCHEMA_VERSION = 1
 
 
 class GatewayTransport(ChatCompletionsTransport, Protocol):
@@ -126,16 +129,28 @@ class GatewayProvider(ChatCompletionsProvider):
         from cayu.providers.openai import _openai_structured_output_format
 
         output = _openai_structured_output_format(request.options)
-        if output is None:
+        if output is None and request.model_slot is None:
             return request
         options = copy_json_value(request.options, "options")
         gateway = dict(options.get(self.name, {}))
-        if "response_format" in gateway:
-            raise ValueError("Native structured output conflicts with response_format.")
-        gateway["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {k: v for k, v in output.items() if k != "type"},
-        }
+        if output is not None:
+            if "response_format" in gateway:
+                raise ValueError("Native structured output conflicts with response_format.")
+            gateway["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {k: v for k, v in output.items() if k != "type"},
+            }
+        if request.model_slot is not None:
+            # The Gateway records the slot for attribution; an unset slot is left out, since
+            # the Gateway refuses explicit nulls in its extension.
+            extension = gateway.get(_EXTENSION, {})
+            if type(extension) is not dict:
+                raise ValueError(f"The Gateway's {_EXTENSION} extension must be an object.")
+            gateway[_EXTENSION] = {
+                "schema_version": _EXTENSION_SCHEMA_VERSION,
+                **extension,
+                "model_slot": request.model_slot,
+            }
         options[self.name] = gateway
         # model_copy retains the runtime's private peer serialization observer.
         return request.model_copy(update={"options": options})
