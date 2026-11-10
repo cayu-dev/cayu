@@ -175,6 +175,7 @@ from cayu.tasks.handoff import (
 )
 from cayu.tasks.queries import TaskQuery
 from cayu.tasks.records import (
+    _HELD_TASK_STATUSES,
     _TERMINAL_TASK_STATUSES,
     Task,
     TaskClaimLost,
@@ -5341,6 +5342,15 @@ async def _heartbeat_until(
             elapsed_receipt = await _load_elapsed_task_retry_receipt(task_store, task)
             if elapsed_receipt is not None:
                 return _TaskHeartbeatOutcome.ELAPSED
+            return _TaskHeartbeatOutcome.TERMINAL
+        if (
+            task is not None
+            and task.status in _HELD_TASK_STATUSES
+            and task.claim_generation == lease_authority.claim_generation
+        ):
+            # A hold ends this claim deliberately and keeps its generation; only
+            # a later claim, after a resume, advances it. Nobody else owns the
+            # task, so the handler finishes like one that settled it.
             return _TaskHeartbeatOutcome.TERMINAL
         raise heartbeat_error
 
