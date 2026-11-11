@@ -143,7 +143,6 @@ from cayu.execution_profiles import (
     event_with_execution_profile_authority,
     event_with_execution_profile_fingerprint_authority,
 )
-from cayu.runners._exit_cleanup import release_held_runners_at_exit
 from cayu.runners.base import Runner, RunnerExecutionAdmissionObserver
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -214,6 +213,7 @@ from cayu.runtime._environment_allocation import (
 from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
+from cayu.runtime._environment_exit_ownership import EnvironmentExitOwnership
 from cayu.runtime._environment_exposure import (
     ExposureAdmissionSettlementPending,
     await_environment_exposure_settlement,
@@ -336,14 +336,6 @@ _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_BATCH_SIZE = 5000
 _ENVIRONMENT_LIFECYCLE_PROGRESS_QUERY_LIMIT = (
     len(EnvironmentLifecycleOperation) * MAX_ENVIRONMENT_PROGRESS_EVENTS
 )
-
-
-def _session_store_survives_restart(store: SessionStore) -> bool:
-    # Imported here: the application registry imports runtime modules.
-    from cayu._application_agent_registry import _session_store_survives_restart as survives
-    from cayu.runtime._checkpoint_store import public_session_store
-
-    return survives(public_session_store(store))
 
 
 def _transition_evidence_fields(
@@ -788,7 +780,7 @@ def _advance_cleanup_environment(
     owner.invocation_context = context
 
 
-class EnvironmentLifecycle:
+class EnvironmentLifecycle(EnvironmentExitOwnership):
     """Own environment factory, workspace binding, and reconnect state."""
 
     def __init__(
@@ -863,10 +855,7 @@ class EnvironmentLifecycle:
         self._final_workspace_observation_operations = BoundedInvocationOperationRegistry(
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
         )
-        self._exit_hook: Callable[[], list[Runner]] | None = None
-        self._process_local_store = False
-        if not _session_store_survives_restart(session_store):
-            self.declare_process_local_session_store()
+        super().__init__(session_store, self._active_environment_setups, self.shared_allocations)
 
     def _session_run_here(self, session_id: str) -> tuple[str, int] | None:
         """The incarnation and run epoch of the run this process executes for a session."""
@@ -876,53 +865,6 @@ class EnvironmentLifecycle:
         if context is None:
             return None
         return context.binding.session_instance_id, context.binding.run_epoch
-
-    def declare_process_local_session_store(self) -> None:
-        """Treat allocation records as ending with this process.
-
-        For a session store that does not outlive the process, no later process
-        can resume its sessions or reconnect to what they allocated. Two things
-        follow, and this enables both (idempotently):
-
-        - Factory requests, for creation and reconnect alike, carry
-          ``process_local_owner``, so a factory can tag what it creates and a
-          later process can reap it once this one is gone
-          (``reap_orphaned_docker_coding_containers`` for Docker coding).
-        - At normal interpreter exit, each factory runner still held (a session
-          whose release failed, or that never released because the app was not
-          closed) has its own close action applied synchronously; for Docker
-          coding that is ``docker rm -f`` of the exact container. Environments
-          the application registered directly are never touched.
-        """
-
-        self._process_local_store = True
-        if self._exit_hook is not None:
-            return
-        # The hook holds the owner table, not this lifecycle: an app dropped
-        # without aclose() still has its held allocations released at exit.
-        setups = self._active_environment_setups
-        # Hold the shared allocation table, not its registry, which reaches the app.
-        shared_runners = self.shared_allocations.held_runners_source()
-
-        def held_runners() -> list[Runner]:
-            runners: list[Runner] = []
-            for owner in list(setups.values()):
-                registered = owner.registered_environment
-                if not registered.factory_backed:
-                    continue
-                for environment in (
-                    registered.environment,
-                    getattr(registered.unclaimed_factory_result, "environment", None),
-                    getattr(registered.retained_factory_result, "environment", None),
-                ):
-                    runner = getattr(environment, "runner", None)
-                    if isinstance(runner, Runner):
-                        runners.append(runner)
-            runners.extend(shared_runners())
-            return runners
-
-        self._exit_hook = held_runners
-        release_held_runners_at_exit(self, held_runners)
 
     async def _emit_transition(
         self,
@@ -1999,6 +1941,10 @@ class EnvironmentLifecycle:
                 reconnect_metadata=receipt.reconnect_metadata,
             )
         if record.state is EnvironmentAllocationState.REAPED:
+            if record.reconnect_metadata is not None:
+                self._retire_preserved_factory_runners(
+                    session.id, session.instance_id, name, record.reconnect_metadata
+                )
             return
         request = EnvironmentFactoryRequest(
             session_id=session.id,
@@ -2043,6 +1989,10 @@ class EnvironmentLifecycle:
         ):
             raise RuntimeError(
                 "Factory cleanup remains pending; retry incomplete-session recovery."
+            )
+        if record.reconnect_metadata is not None:
+            self._retire_preserved_factory_runners(
+                session.id, session.instance_id, name, record.reconnect_metadata
             )
 
     async def release_deferred_materialization(
@@ -3826,6 +3776,12 @@ class EnvironmentLifecycle:
                     ),
                 ),
             )
+            if isinstance(environment.runner, Runner):
+                # The promoted runner now covers this exact allocation at exit,
+                # including when reconnect constructed a different runner.
+                self._retire_preserved_factory_runners(
+                    session.id, session.instance_id, environment_name, reconnect_metadata
+                )
         except BaseException as exc:
             progress_failure: BaseException | None = None
             try:
@@ -3875,6 +3831,17 @@ class EnvironmentLifecycle:
                                 # claim cleanup. Detach local handles without
                                 # deleting the now-durable provider resource.
                                 release_action = EnvironmentFactoryReleaseAction.PRESERVE
+                    if (
+                        self._process_local_store
+                        and release_action is EnvironmentFactoryReleaseAction.PRESERVE
+                    ):
+                        self._remember_preserved_factory_runner(
+                            session.id,
+                            session.instance_id,
+                            environment_name,
+                            result.reconnect_metadata,
+                            result.environment.runner,
+                        )
                     try:
                         release_payload = await self._release_factory_result_with_progress(
                             result,
@@ -4118,6 +4085,9 @@ class EnvironmentLifecycle:
             return copied
 
         await self._session_store.transform_checkpoint(session.id, retire)
+        self._retire_preserved_factory_runners(
+            session.id, session.instance_id, environment_name, reconnect
+        )
 
     async def _retire_disposed_allocation(
         self,
@@ -4217,6 +4187,9 @@ class EnvironmentLifecycle:
             return copied
 
         await self._session_store.transform_checkpoint(session_id, retire)
+        self._retire_preserved_factory_runners(
+            session_id, session_instance_id, environment_name, expected["reconnect_metadata"]
+        )
 
     async def _finalize_binding_with_disposal_checkpoint(
         self,
@@ -4570,6 +4543,9 @@ class EnvironmentLifecycle:
             lambda: factory.recover_finalization_disposal(request, state),
             operation_name="Environment completion disposal recovery",
             redactor=self._secret_redactor,
+        )
+        self._retire_preserved_factory_runners(
+            session.id, session.instance_id, environment_name, reconnect_metadata
         )
         if marker["outcome"] != "completed":
             assert pending_disposal is not None
