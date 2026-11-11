@@ -657,23 +657,23 @@ async def run_verified_github_delivery(
     )
     source = _replace_once(
         source,
-        "        ),\n        toolchain_profile=toolchain_profile,\n    )\n",
-        "        ),\n        toolchain_profile=toolchain_profile,\n"
-        "        max_model_output_bytes=256,\n    )\n",
+        "            ),\n            toolchain_profile=toolchain_profile,\n        )\n",
+        "            ),\n            toolchain_profile=toolchain_profile,\n"
+        "            max_model_output_bytes=256,\n        )\n",
     )
     source = _replace_once(
         source,
-        """    checks = named_checks_from_toolchain(
-        toolchain_profile,
-        identities=_CHECK_IDENTITIES,
-        identity_prefix="maintenance-app.docker_check",
-    )
+        """        checks = named_checks_from_toolchain(
+            toolchain_profile,
+            identities=_CHECK_IDENTITIES,
+            identity_prefix="maintenance-app.docker_check",
+        )
 """,
-        """    checks = maintenance_checks()
-    for check in checks:
-        authority = toolchain_profile.command_authority(check.name)
-        if authority is None or authority.command_argv() != tuple(check.command.argv):
-            raise RuntimeError("Maintenance check escapes admitted toolchain authority")
+        """        checks = maintenance_checks()
+        for check in checks:
+            authority = toolchain_profile.command_authority(check.name)
+            if authority is None or authority.command_argv() != tuple(check.command.argv):
+                raise RuntimeError("Maintenance check escapes admitted toolchain authority")
 """,
     )
     source = _replace_once(

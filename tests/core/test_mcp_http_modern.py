@@ -18,7 +18,6 @@ from cayu.mcp import (
     McpProtocolEra,
     McpProtocolError,
     McpServerSpec,
-    McpTransportLimits,
 )
 from cayu.mcp._http_protocol import (
     MCP_METHOD_HEADER,
@@ -651,9 +650,30 @@ def test_modern_http_cancellation_closes_only_the_request_stream() -> None:
     assert tools == ["search"]
 
 
-def test_modern_http_deadline_settles_only_the_timed_out_request() -> None:
+def test_modern_http_deadline_settles_only_the_timed_out_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cayu.mcp.http as mcp_http
+
     server = ModernMcpHttpServer()
-    blocked = _BlockingModernResponseStream()
+    budgets = []
+    budget_type = mcp_http._HttpCallBudget
+
+    def record_budget(*args, **kwargs):
+        budget = budget_type(*args, **kwargs)
+        budgets.append(budget)
+        return budget
+
+    class ExpiringResponseStream(_BlockingModernResponseStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            self.started.set()
+            # Expire the real call budget after response ownership begins.
+            # Discovery and follow-up calls retain their normal time budgets.
+            budgets[-1]._deadline = asyncio.get_running_loop().time()
+            yield b" "
+            await asyncio.Event().wait()
+
+    blocked = ExpiringResponseStream()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -669,19 +689,17 @@ def test_modern_http_deadline_settles_only_the_timed_out_request() -> None:
         client = HttpMcpClient(
             protocol_era=McpProtocolEra.MODERN_2026_07_28,
             transport=httpx.MockTransport(handler),
-            transport_limits=McpTransportLimits(
-                idle_timeout_s=1,
-                total_call_timeout_s=0.02,
-            ),
         )
         session = await client.connect(_server_spec())
         try:
             await session.list_tools()
-            with pytest.raises(McpCallDeadlineExceededError) as exc_info:
-                await session.call_tool("search", {})
+            with monkeypatch.context() as patcher:
+                patcher.setattr(mcp_http, "_HttpCallBudget", record_budget)
+                with pytest.raises(McpCallDeadlineExceededError) as exc_info:
+                    await session.call_tool("search", {})
             settlement = _http_settlement_task(exc_info.value)
             assert settlement is not None
-            await asyncio.wait_for(settlement, timeout=0.2)
+            await asyncio.wait_for(settlement, timeout=5)
             tools = await session.list_tools()
             return session._closed, session._http.is_closed, [tool.name for tool in tools]
         finally:

@@ -524,6 +524,8 @@ def test_daily_accounting_rejects_mutated_summary_without_diagnostics(
 
 
 def test_home_prerequisites_postgres_http(postgres_dsn):
+    from uuid import uuid4
+
     from tests.server.test_server_inbox import _app, _settle, _wait_for_status
 
     from cayu.storage import (
@@ -535,6 +537,8 @@ def test_home_prerequisites_postgres_http(postgres_dsn):
     )
     from cayu.storage.migrations import SchemaMode
 
+    proposal_id = "pg-proposal-" + uuid4().hex
+    session_id = "pg-question-" + uuid4().hex
     scope = KnowledgeAccessScope.privileged()
     sessions = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
     knowledge = PostgresKnowledgeStore(
@@ -545,28 +549,43 @@ def test_home_prerequisites_postgres_http(postgres_dsn):
         try:
             client.portal.call(
                 knowledge.create_entry,
-                KnowledgeEntry(id="pg-proposal", text="Evidence", status=KnowledgeStatus.PENDING),
+                KnowledgeEntry(id=proposal_id, text="Evidence", status=KnowledgeStatus.PENDING),
             )
-            _pause(client, runtime, "pg-question", "asker")
+            # The module shares its database. Other tests may leave pending
+            # proposals, so exercise the HTTP flow with an unrelated one present.
+            client.portal.call(
+                knowledge.create_entry,
+                KnowledgeEntry(
+                    id="unrelated-" + uuid4().hex,
+                    text="Other evidence",
+                    status=KnowledgeStatus.PENDING,
+                ),
+            )
+            _pause(client, runtime, session_id, "asker")
             absent = client.get(
                 "/api/inbox/counts", params={"q": "unmatched needle"}, headers=_as("priya")
             )
             assert absent.status_code == 200 and absent.json()["total_count"] == 0
-            for kind, request in [
+            for kind, owned_id, request in [
                 (
                     "question",
+                    session_id,
                     {"decision": "answer", "answer": "staging", "reason": "Reviewed environment."},
                 ),
-                ("knowledge", {"decision": "drop", "reason": "Reviewed source."}),
+                ("knowledge", proposal_id, {"decision": "drop", "reason": "Reviewed source."}),
             ]:
                 items = client.get(
-                    "/api/inbox", params={"kind": kind}, headers=_as("priya")
+                    "/api/inbox", params={"kind": kind, "q": owned_id}, headers=_as("priya")
                 ).json()["items"]
                 assert len(items) == 1
+                if kind == "question":
+                    assert items[0]["session_id"] == session_id
+                else:
+                    assert items[0]["knowledge"]["entry_id"] == proposal_id
                 response = _settle(client, items[0]["id"], "priya", **request)
                 assert response.status_code == 200, response.text
                 assert response.json()["item"]["settlement"]["reason"] == request["reason"]
-            _wait_for_status(client, runtime, "pg-question")
+            _wait_for_status(client, runtime, session_id)
             daily = client.get("/api/sessions/overview/counts", headers=_as("priya"))
             assert daily.status_code == 200, daily.text
             assert set(daily.json()["tokens"]) == {"input", "output", "cached"}
