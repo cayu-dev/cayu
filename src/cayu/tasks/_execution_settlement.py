@@ -229,6 +229,19 @@ class TaskExecutionSettlement:
         self.result = result
         self._pending = self._store.supports_task_group_quiescence
 
+    def retain_returned_execution(
+        self, authority: Task, verify: Callable[[], Awaitable[bool]], result: Any = None
+    ) -> None:
+        """Own exceptional-return verification before leaving supervised dispatch.
+
+        Retention is synchronous so cancellation cannot skip the obligation;
+        the disposition handler or retry owner performs the actual readback.
+        """
+        if not self._store.supports_task_group_quiescence:
+            return
+        self.observe(authority, result)
+        self._return_verification = verify
+
     async def verify_returned_execution(
         self, authority: Task, verify: Callable[[], Awaitable[bool]], result: Any = None
     ) -> None:
@@ -242,8 +255,8 @@ class TaskExecutionSettlement:
         if not self._store.supports_task_group_quiescence:
             await verify()
             return
-        self.observe(authority, result)
-        self._return_verification = verify
+        if self._authority is None:
+            self.retain_returned_execution(authority, verify, result)
         await self.attempt()
 
     async def attempt(self) -> None:

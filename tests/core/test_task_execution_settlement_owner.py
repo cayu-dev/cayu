@@ -35,7 +35,7 @@ from cayu.tasks.dispatch import (
     _queued_dispatch_task_id,
 )
 from cayu.tasks.queries import TaskQuery
-from cayu.tasks.records import TaskStatus
+from cayu.tasks.records import TaskClaimLost, TaskStatus
 from cayu.tasks.worker import run_task_worker
 from cayu.vaults.redaction import SecretRedactor
 
@@ -515,6 +515,65 @@ async def dispatch_group(app, runtime):
     )
     await create_group(app, member)
     return identity
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("fault", ["none", "readback", "settlement"])
+async def test_dispatch_claim_loss_attempts_retained_acknowledgement(
+    store, monkeypatch, grouped, fault
+):
+    repaired = False
+    reads = 0
+
+    class ClaimLostRuntime(Runtime):
+        async def dispatch_inline(self, request):
+            self.calls += 1
+            raise TaskClaimLost("Dispatch lost its task claim")
+            yield  # pragma: no cover - preserve the streaming interface
+
+        async def _queued_dispatch_settlement_state(self, envelope):
+            nonlocal reads
+            if self.calls:
+                reads += 1
+                if fault == "readback" and not repaired:
+                    raise ConnectionError("Dispatch return readback unavailable")
+            return await super()._queued_dispatch_settlement_state(envelope)
+
+    app = CayuApp(task_store=store, enable_logging=False)
+    runtime = ClaimLostRuntime()
+    dispatcher = TaskStoreDispatcher(store)
+    if grouped:
+        identity = await dispatch_group(app, runtime)
+    else:
+        submitted = await dispatcher.submit(
+            runtime,
+            DispatchRequest(session_id="session", messages=[Message.text("user", "continue")]),
+        )
+        identity = submitted.metadata["queue_task_id"]
+    calls = fail_acknowledgements(
+        monkeypatch, store, failures=3 if fault == "settlement" else 0, commit=False
+    )
+    if fault == "none":
+        handle = await dispatcher.process_next(runtime, worker_id="owner")
+        assert handle.status is DispatchStatus.SUBMITTED
+        assert handle.metadata["reclaimed"] is True
+        assert reads == 1 and len(calls) == 1
+    else:
+        with pytest.raises(TaskExecutionSettlementPending) as pending:
+            await dispatcher.process_next(runtime, worker_id="owner")
+        assert reads == (3 if fault == "readback" else 1)
+        assert len(calls) == (0 if fault == "readback" else 3)
+        if grouped:
+            execution = (await app.load_task_group("owned")).quiescence.executions[0]
+            assert execution.settled_at is None
+        repaired = True
+        assert await pending.value.settlement.retry() is DispatchStatus.SUBMITTED
+    assert runtime.calls == 1 and len(set(calls)) == 1
+    current = await store.load_task(identity)
+    assert current.status is TaskStatus.CLAIMED
+    assert calls[0] == (identity, "owner", current.started_at)
+    if grouped:
+        await assert_settled(app, identity)
 
 
 async def test_session_conflict_after_admission_retains_unsettled_execution(store):

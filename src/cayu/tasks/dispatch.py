@@ -520,6 +520,13 @@ class _QueuedDispatchAuthorityRejected(RuntimeError):
     """Permanent rejection proven by the runtime-owned dispatch boundary."""
 
 
+_REJECTED_DISPATCH_ERRORS = (
+    ExecutionProfileMismatchError,
+    _QueuedDispatchAuthorityRejected,
+    TaskCompletionDecisionRequired,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _StalledSessionRecovery:
     """Outcome of one dispatcher-owned incomplete-session recovery attempt."""
@@ -1511,11 +1518,29 @@ class TaskStoreDispatcher(Dispatcher):
                 async def dispatch_owned() -> DispatchStatus:
                     settlement_authority = copy_task(task)
                     owned_status = status
-                    async for event in durable_runtime._dispatch_queued(envelope):
-                        owned_status = _dispatch_status_after_event(
-                            event,
-                            fallback=owned_status,
+                    try:
+                        async for event in durable_runtime._dispatch_queued(envelope):
+                            owned_status = _dispatch_status_after_event(
+                                event,
+                                fallback=owned_status,
+                            )
+                    except Exception as exc:
+                        # Keep exceptional-return proof inside the supervised
+                        # operation: cancellation drains it without entering the
+                        # outer disposition handlers.
+                        verify = (
+                            verify_rejected_dispatch_return
+                            if isinstance(exc, _REJECTED_DISPATCH_ERRORS)
+                            else verify_dispatch_return
                         )
+                        execution_settlement.retain_returned_execution(
+                            settlement_authority, verify, DispatchStatus.SUBMITTED
+                        )
+                        if isinstance(exc, TaskClaimLost):
+                            # Claim loss returns a reclaimed handle without an
+                            # outer verification/disposition step.
+                            await execution_settlement.attempt()
+                        raise
                     execution_settlement.observe(settlement_authority, owned_status)
                     await execution_settlement.attempt()
                     return owned_status
@@ -1622,11 +1647,7 @@ class TaskStoreDispatcher(Dispatcher):
                     )
                 except TaskClaimLost:
                     return await self._reclaimed_dispatch_handle(task, envelope)
-            except (
-                ExecutionProfileMismatchError,
-                _QueuedDispatchAuthorityRejected,
-                TaskCompletionDecisionRequired,
-            ) as exc:
+            except _REJECTED_DISPATCH_ERRORS as exc:
                 # A permanent rejection still entered this execution: prove its
                 # non-admission and acknowledge it before relinquishing the claim.
                 await execution_settlement.verify_returned_execution(
