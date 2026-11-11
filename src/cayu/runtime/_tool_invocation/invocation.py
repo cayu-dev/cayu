@@ -2037,6 +2037,10 @@ class ToolInvocation:
                             redactor=invocation_secret_scope.redactor,
                             tool_call_id=tool_call.id,
                         )
+                    # Cancellation can hide a secondary settlement failure.
+                    # Recheck positive settlement proof before terminal capture.
+                    await close_workspace_mutation_window_after_interrupt(exc, exc)
+                    await consume_post_tool_cancellation(exc)
                     workspace_capture_payload = {
                         "workspace_mutation_capture_status": "interrupted",
                         "workspace_mutation_capture_detail_code": "receipt_publication_interrupted",
