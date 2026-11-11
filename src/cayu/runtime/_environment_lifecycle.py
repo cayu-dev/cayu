@@ -2903,18 +2903,29 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             try:
                 task.result()
             except BaseException:
+                # One authenticated cleanup owner may be retained by several
+                # sessions. Retrying it replaces the owner handle for all of
+                # those entries, not just the one that dispatched the retry.
+                shared_sessions = tuple(
+                    owned_session_id
+                    for owned_session_id, owned_task in self._deferred_factory_cleanup_tasks.items()
+                    if owned_task is task
+                )
                 replacement = retry_environment_factory_cleanup_settlement_task(task)
                 if replacement is not task:
-                    self._deferred_factory_cleanup_tasks[session_id] = replacement
-                    replacement.add_done_callback(
-                        lambda completed, owned_session_id=session_id: (
-                            self._deferred_factory_cleanup_completed(
-                                owned_session_id,
-                                completed,
+                    for owned_session_id in shared_sessions:
+                        if self._deferred_factory_cleanup_tasks.get(owned_session_id) is not task:
+                            continue
+                        self._deferred_factory_cleanup_tasks[owned_session_id] = replacement
+                        replacement.add_done_callback(
+                            lambda completed, owned_session_id=owned_session_id: (
+                                self._deferred_factory_cleanup_completed(
+                                    owned_session_id,
+                                    completed,
+                                )
                             )
                         )
-                    )
-                    attempted_sessions.add(session_id)
+                        attempted_sessions.add(owned_session_id)
 
     def _transfer_deferred_factory_cleanup(
         self,

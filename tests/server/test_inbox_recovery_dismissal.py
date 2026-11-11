@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -19,7 +20,7 @@ from tests.server.test_server_inbox import _app, _authenticate, _items, _pause, 
 
 from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest, SessionStatus, ToolEffect
 from cayu.approvals.user_input import UserInputResponse
-from cayu.server import ServerConfig, create_server
+from cayu.server import ServerConfig, ServerLifecycleConfig, create_server
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 
@@ -43,16 +44,23 @@ def recovery_inbox(request, tmp_path):
             )
         )
     )
+    # Recovery must see an expired child lease regardless of how quickly the
+    # subprocess exited. Advance both selection and storage ownership clocks.
+    recovery_now = datetime.now(UTC) + timedelta(minutes=2)
     app = _proposal_app(
-        SQLiteSessionStore(path),
+        SQLiteSessionStore(path, ownership_clock=lambda: recovery_now),
         _Proposal(ToolEffect.EXTERNAL, receipt),
         VersionedFakeProvider([]),
         lease_seconds=1.5,
+        clock=lambda: recovery_now,
     )
+    # This fixture owns recovery explicitly; the startup reconciler must not
+    # race its prepared unresolved-call state before the dismissal request.
+    lifecycle = ServerLifecycleConfig(orphaned_session_reconcile_interval_seconds=None)
     config = (
-        ServerConfig.local_development()
+        ServerConfig.local_development(lifecycle=lifecycle)
         if getattr(request, "param", None) == "open"
-        else ServerConfig.protected(_authenticate)
+        else ServerConfig.protected(_authenticate, lifecycle=lifecycle)
     )
     with TestClient(create_server(app, config=config)) as client:
 
