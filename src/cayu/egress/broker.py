@@ -1316,6 +1316,12 @@ class HttpxUpstream:
                 raise _UpstreamUnsupportedEncodingError(
                     "Upstream response content encoding is unsupported."
                 ) from exc
+            if decoder is not None and response.status_code == 206:
+                # Byte ranges refer to the encoded representation. Decoding
+                # cannot preserve their offsets, even for a complete coding.
+                raise _UpstreamUnsupportedEncodingError(
+                    "Upstream partial response content encoding is unsupported."
+                )
             content_length = response.headers.get("content-length")
             # Bodyless responses can describe a representation rather than a
             # body to be received. Actual received bytes are still bounded below.
