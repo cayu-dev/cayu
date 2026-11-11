@@ -14,6 +14,7 @@ from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
+    copy_durable_metadata,
     copy_durable_record,
 )
 from cayu._validation import (
@@ -1239,6 +1240,39 @@ def set_checkpoint_allocation_identity(
             checkpoint[key] = values
         else:
             checkpoint.pop(key, None)
+
+
+def _factory_reconnect_state_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    environment_name: str,
+) -> tuple[dict[str, Any], str | None]:
+    if checkpoint is None:
+        return {}, None
+    state = checkpoint.get(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+    if state is None:
+        metadata: dict[str, Any] = {}
+    else:
+        if type(state) is not dict:
+            raise ValueError("Environment factory reconnect checkpoint must be an object.")
+        candidate_metadata = state.get(environment_name)
+        if candidate_metadata is None:
+            metadata = {}
+        elif type(candidate_metadata) is not dict:
+            raise ValueError("Environment factory reconnect metadata must be an object.")
+        else:
+            metadata = copy_durable_metadata(candidate_metadata, "reconnect_metadata")
+    owners = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
+    if owners is None:
+        return metadata, None
+    if type(owners) is not dict:
+        raise ValueError("Environment factory allocation owners must be an object.")
+    owner = owners.get(environment_name)
+    if owner is None:
+        return metadata, None
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("Environment factory allocation owner must be a nonblank string.")
+    return metadata, owner
 
 
 def checkpoint_object_map(

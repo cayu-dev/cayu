@@ -203,6 +203,9 @@ from cayu.runtime._environment_allocation import (
     set_checkpoint_allocation_identity,
 )
 from cayu.runtime._environment_allocation import (
+    _factory_reconnect_state_from_checkpoint as _factory_reconnect_state_from_checkpoint,
+)
+from cayu.runtime._environment_allocation import (
     environment_factory_checkpoint_may_be_committed as _environment_factory_checkpoint_may_be_committed,
 )
 from cayu.runtime._environment_allocation import (
@@ -628,6 +631,9 @@ class _ActiveEnvironmentSetup:
     cleanup_settlement_started: bool = False
     cleanup_settlement_deferred: bool = False
     cleanup_requires_finalize_retry: bool = False
+    pending_disposal_retirement: Callable[[], Awaitable[WorkspaceSnapshot | None]] | None = field(
+        default=None, repr=False
+    )
     # Set once the binding proved the environment is gone for good.
     environment_end_reason: str | None = None
     pending_completion_marker_clear: dict[str, Any] | None = field(default=None, repr=False)
@@ -4114,9 +4120,17 @@ class EnvironmentLifecycle:
     ) -> None:
         """Remove exact live reconnect authority only after confirmed disposal."""
         generation = uuid4().hex
+        authority_keys = (
+            _PENDING_ALLOCATION_DISPOSAL_KEY,
+            ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
+        )
 
         def retire(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
-            if session.instance_id != session_instance_id or session.run_epoch != run_epoch:
+            if session.instance_id != session_instance_id:
                 raise SessionRunFenced("Allocation disposal lost its session generation.")
             copied = copy_durable_record(current or {}, "checkpoint")
             retired = copied.get(_RETIRED_ALLOCATION_DISPOSAL_KEY, {})
@@ -4127,9 +4141,19 @@ class EnvironmentLifecycle:
                     key: value for key, value in existing.items() if key != "allocation_fingerprint"
                 }
                 == expected
+                and all(
+                    environment_name not in copied.get(key, {})
+                    for key in (
+                        *authority_keys,
+                        ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
+                    )
+                )
             ):
-                # Read back an exact retirement whose commit acknowledgement was lost.
+                # An exact committed retirement is readback, not new authority.
+                # Markerless recovery may already have advanced the run epoch.
                 return copied
+            if session.run_epoch != run_epoch:
+                raise SessionRunFenced("Allocation disposal lost its session generation.")
             pending = copied.get(_PENDING_ALLOCATION_DISPOSAL_KEY, {})
             if pending.get(environment_name) != expected:
                 raise RuntimeError("Allocation disposal lost its exact durable marker.")
@@ -4175,14 +4199,7 @@ class EnvironmentLifecycle:
                 if allocation_fingerprint is None
                 else {**expected, "allocation_fingerprint": allocation_fingerprint}
             )
-            for key in (
-                _PENDING_ALLOCATION_DISPOSAL_KEY,
-                ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_CHECKPOINT_KEY,
-                ENVIRONMENT_FACTORY_ALLOCATION_IDENTITY_BINDING_CHECKPOINT_KEY,
-            ):
+            for key in authority_keys:
                 values = copied.get(key, {})
                 values.pop(environment_name, None)
                 if not values:
@@ -4203,6 +4220,9 @@ class EnvironmentLifecycle:
         session_id = None if metadata is None else metadata.get("session_id")
         if type(session_id) is not str:
             raise RuntimeError("Binding finalization lost its session identity.")
+        setup_owner = self._active_environment_setups.get(session_id)
+        if setup_owner is not None and setup_owner.pending_disposal_retirement is not None:
+            return await setup_owner.pending_disposal_retirement()
         await self._leftover_teardown.await_settled((session_id, registered_environment.spec.name))
         pending_disposal: dict[str, Any] | None = None
         disposal_context: InvocationContext | None = None
@@ -4328,13 +4348,33 @@ class EnvironmentLifecycle:
             )
             if pending_disposal is not None:
                 assert disposal_context is not None
-                await self._retire_disposed_allocation(
-                    session_id,
-                    registered_environment.spec.name,
-                    pending_disposal,
-                    session_instance_id=disposal_context.binding.session_instance_id,
-                    run_epoch=disposal_context.binding.run_epoch,
-                )
+
+                async def retire_disposal() -> WorkspaceSnapshot | None:
+                    # Recovery may have authenticated this exact owner under a
+                    # newer epoch while the retirement checkpoint was unavailable.
+                    context = (
+                        disposal_context if setup_owner is None else setup_owner.invocation_context
+                    )
+                    assert context is not None
+                    assert pending_disposal is not None
+                    await self._retire_disposed_allocation(
+                        session_id,
+                        registered_environment.spec.name,
+                        pending_disposal,
+                        session_instance_id=context.binding.session_instance_id,
+                        run_epoch=context.binding.run_epoch,
+                    )
+                    if setup_owner is not None:
+                        setup_owner.pending_disposal_retirement = None
+                        setup_owner.cleanup_requires_finalize_retry = False
+                    return snapshot
+
+                # Binding effects are settled and its private authority may be
+                # gone. Retain only the durable bookkeeping before awaiting it.
+                if setup_owner is not None:
+                    setup_owner.pending_disposal_retirement = retire_disposal
+                    setup_owner.cleanup_requires_finalize_retry = True
+                return await retire_disposal()
             return snapshot
         finally:
             if token is not None:
@@ -7615,8 +7655,10 @@ class EnvironmentLifecycle:
             if binding is None or bound_workspace is None:
                 self._active_environment_setups.pop(session_id, None)
                 return
-            if setup_owner.environment_end_reason is not None and release_is_retained(
-                setup_owner, claimed=True
+            if (
+                setup_owner.pending_disposal_retirement is None
+                and setup_owner.environment_end_reason is not None
+                and release_is_retained(setup_owner, claimed=True)
             ):
                 # No retry can succeed and nothing can still change the bound
                 # copy: retire the owner instead of retrying its cleanup.
@@ -7633,6 +7675,7 @@ class EnvironmentLifecycle:
                 if (
                     setup_owner.cleanup_release_safe
                     and setup_owner.pending_completion_marker_clear is None
+                    and setup_owner.pending_disposal_retirement is None
                 ):
                     try:
                         released = _abandon_binding_after_mutation_quiescence(
@@ -7931,13 +7974,17 @@ class EnvironmentLifecycle:
         abandon_error: BaseException | None = None
         released = True
         try:
-            # No lifecycle owner survives this abort path. Finalize success
-            # makes this a no-op; failure leaves retry state that must now be
-            # released by the exact bound generation.
-            release_outcome = _abandon_binding_after_mutation_quiescence(
-                registered_environment,
-                binding,
-                bound_workspace,
+            # Finalize success makes abandonment a no-op. A retirement
+            # checkpoint failure must keep its owner until bookkeeping settles;
+            # other failures release the exact bound generation here.
+            release_outcome = (
+                False
+                if setup_owner.pending_disposal_retirement is not None
+                else _abandon_binding_after_mutation_quiescence(
+                    registered_environment,
+                    binding,
+                    bound_workspace,
+                )
             )
             if release_outcome is _BINDING_ABANDON_BLOCKED_BY_MUTATION_FENCE:
                 setup_owner.cleanup_settlement_started = False
@@ -9309,39 +9356,6 @@ def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:
     if event_type == EventType.SESSION_INTERRUPTED:
         return "interrupted"
     return str(event_type)
-
-
-def _factory_reconnect_state_from_checkpoint(
-    checkpoint: dict[str, Any] | None,
-    *,
-    environment_name: str,
-) -> tuple[dict[str, Any], str | None]:
-    if checkpoint is None:
-        return {}, None
-    state = checkpoint.get(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
-    if state is None:
-        metadata: dict[str, Any] = {}
-    else:
-        if type(state) is not dict:
-            raise ValueError("Environment factory reconnect checkpoint must be an object.")
-        candidate_metadata = state.get(environment_name)
-        if candidate_metadata is None:
-            metadata = {}
-        elif type(candidate_metadata) is not dict:
-            raise ValueError("Environment factory reconnect metadata must be an object.")
-        else:
-            metadata = copy_durable_metadata(candidate_metadata, "reconnect_metadata")
-    owners = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
-    if owners is None:
-        return metadata, None
-    if type(owners) is not dict:
-        raise ValueError("Environment factory allocation owners must be an object.")
-    owner = owners.get(environment_name)
-    if owner is None:
-        return metadata, None
-    if not isinstance(owner, str) or not owner:
-        raise ValueError("Environment factory allocation owner must be a nonblank string.")
-    return metadata, owner
 
 
 def _environment_name(
