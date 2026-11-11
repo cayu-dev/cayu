@@ -8,6 +8,7 @@ accepts any auth dependency, not only Basic auth.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -17,8 +18,9 @@ from typing import Any, cast
 
 import pytest
 
+from cayu.cli import _cloud_deploy_check as cloud_deploy_check
 from cayu.cli import cloud as cloud_cli
-from cayu.cli import scaffold
+from cayu.cli import main, scaffold
 from cayu.cli._cloud_deploy_check import check_serve_can_start, run_cloud_deploy_check
 from cayu.cli._serve_readiness import GENERATED_AUTH_MODULE
 from cayu.cli.scaffold import project_files
@@ -35,10 +37,12 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]
     monkeypatch.delenv("CAYU_OPERATOR_PASSWORD", raising=False)
     monkeypatch.setenv("CAYU_CLOUD_EVIDENCE_DIR", str(tmp_path / "evidence"))
     monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "cloud-config.json"))
-    for name in ("serve_check_auth", "cayu.server.environment_auth"):
+    project_modules = ("serve_check_auth", "deploy_check_app", "missing_deploy_auth")
+    for name in (*project_modules, "cayu.server.environment_auth"):
         sys.modules.pop(name, None)
     yield
-    sys.modules.pop("serve_check_auth", None)
+    for name in project_modules:
+        sys.modules.pop(name, None)
 
 
 def _project(
@@ -266,6 +270,448 @@ def _write_manifest(project: Path, command: str = _SERVE) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _checkable_project(root: Path) -> Path:
+    project = _project(root, dependencies='["cayu[server]>=0.16.3"]', lock_extras=("server",))
+    (project / "deploy_check_app.py").write_text(
+        "from cayu import AgentSpec, CayuApp\n"
+        "from cayu.evals import ScriptedModelProvider\n"
+        "def build_app():\n"
+        "    app = CayuApp(enable_logging=False)\n"
+        "    app.register_provider(ScriptedModelProvider([]), default=True)\n"
+        "    app.register_agent(AgentSpec(name='agent', model='scripted-model'))\n"
+        "    return app\n",
+        encoding="utf-8",
+    )
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace("app:build_app", "deploy_check_app:build_app"),
+        encoding="utf-8",
+    )
+    return project
+
+
+@pytest.mark.parametrize("absolute_source", [True, False])
+def test_check_deploy_agrees_with_init_and_deploy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    absolute_source: bool,
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    if absolute_source:
+        with (project / "pyproject.toml").open("a") as stream:
+            stream.write(
+                "\n[tool.uv.sources]\n"
+                f"cayu = {{ path = {json.dumps(str(tmp_path / 'cayu'))}, editable = true }}\n"
+            )
+    monkeypatch.chdir(project)
+
+    code, initialized = _cloud(["init", ".", "--force"], capsys)
+    assert code == 0
+    init_check = initialized["result"]["deploy_check"]
+    assert init_check["status"] == ("failed" if absolute_source else "passed")
+
+    check_code = main(["check", "--deploy", "--fail-on", "warning", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert check_code == (1 if absolute_source else 0), report
+    assert "error" not in report
+    assert [
+        {key: diagnostic[key] for key in expected}
+        for diagnostic, expected in zip(
+            report["diagnostics"], init_check.get("blocking", []), strict=True
+        )
+    ] == init_check.get("blocking", [])
+
+    def no_cloud(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the rejected deploy must not contact Cloud")
+
+    deployed: dict[str, object] = {}
+
+    def deploy(arguments: object, **kwargs: object) -> dict[str, object]:
+        deployed.update(kwargs)
+        return {"operation": "deploy", "result": {}}
+
+    monkeypatch.setattr(
+        cloud_cli, "_cloud_client", no_cloud if absolute_source else lambda *a, **kw: object()
+    )
+    monkeypatch.setattr(cloud_cli, "_deploy", deploy)
+    code, payload = _cloud(["deploy", "."], capsys)
+    if absolute_source:
+        assert code == 2
+        assert payload["error"]["category"] == "deploy_check_failed"
+        assert payload["error"]["deploy_check"] == init_check
+        assert deployed == {}
+    else:
+        assert code == 0
+        assert deployed["deploy_check"] == init_check
+
+
+@pytest.mark.parametrize(
+    "case,expected_code",
+    [
+        ("extra", "SERVE_SERVER_EXTRA_MISSING"),
+        ("lock", "SERVE_LOCK_MISSING_SERVER_EXTRA"),
+        ("auth", "SERVE_AUTH_MISSING"),
+        ("override", "SERVE_AUTH_TARGET_UNRESOLVABLE"),
+        ("reload", "SERVE_RELOAD_MODE"),
+        ("dev", "SERVE_DEV_MODE"),
+        ("arguments", "SERVE_COMMAND_INVALID"),
+    ],
+)
+def test_check_deploy_includes_sibling_serve_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    expected_code: str,
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    pyproject = project / "pyproject.toml"
+    if case == "extra":
+        pyproject.write_text(pyproject.read_text().replace("cayu[server]", "cayu"))
+    elif case == "lock":
+        lock = project / "uv.lock"
+        lock.write_text(lock.read_text().replace('extra = ["server"]', "extra = []"))
+    elif case == "auth":
+        pyproject.write_text(pyproject.read_text().replace(f'auth = "{_TARGET}"', ""))
+    elif case == "override":
+        (project / "missing_deploy_auth.py").write_text("authenticate = None\n")
+    command = _SERVE + {
+        "override": " --auth missing_deploy_auth:authenticate",
+        "reload": " --reload",
+        "dev": " --dev",
+        "arguments": " --unknown-option",
+    }.get(case, "")
+    _write_manifest(project, command)
+    monkeypatch.chdir(project)
+
+    def no_cloud(*args: object, **kwargs: object) -> object:
+        raise AssertionError("invalid deployment must not contact Cloud")
+
+    monkeypatch.setattr(cloud_cli, "_cloud_client", no_cloud)
+    code, payload = _cloud(["deploy", "."], capsys)
+    assert code == 2
+    blocking = payload["error"]["deploy_check"]["blocking"]
+    assert [finding["code"] for finding in blocking] == [expected_code]
+    assert main(["check", "--deploy", "--json"]) == 1
+    diagnostics = json.loads(capsys.readouterr().out)["diagnostics"]
+    assert [
+        {key: item[key] for key in expected}
+        for item, expected in zip(diagnostics, blocking, strict=True)
+    ] == blocking
+
+
+@pytest.mark.parametrize("scope", ["ordinary", "tag", "other-web", "worker", "absent"])
+def test_serve_deploy_findings_respect_check_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    scope: str,
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    _write_manifest(project, "uvicorn custom:app" if scope == "other-web" else _SERVE)
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace(f'auth = "{_TARGET}"', ""))
+    manifest = project / "cayu-cloud.toml"
+    if scope == "worker":
+        manifest.write_text(
+            manifest.read_text().replace("[web]", "[worker]").replace("port = 8000", "")
+        )
+    elif scope == "absent":
+        manifest.unlink()
+    monkeypatch.chdir(project)
+    arguments = ["check", "--json"]
+    if scope != "ordinary":
+        arguments.append("--deploy")
+    if scope == "tag":
+        arguments.extend(["--tag", "security"])
+    code = main(arguments)
+    report = json.loads(capsys.readouterr().out)
+    assert "error" not in report
+    assert all(not item["code"].startswith("SERVE_") for item in report["diagnostics"])
+    if scope != "ordinary":
+        assert code == 0
+
+
+def test_check_deploy_preserves_scaffold_import_safety_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "agent"
+    project.mkdir()
+    _write_scaffold(project, preset="agent")
+    app = project / "app.py"
+    app.write_text(
+        'from pathlib import Path\nPath("unsafe-auth-import.txt").touch()\n'
+        + app.read_text().replace("from __future__ import annotations", "")
+    )
+    _write_manifest(project, _SERVE + " --auth app:build_app")
+    monkeypatch.chdir(project)
+    sys.modules.pop("app", None)
+
+    assert main(["check", "--deploy", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert "SCAFFOLD_IMPORT_SIDE_EFFECT" in [item["code"] for item in report["diagnostics"]]
+    assert not (project / "unsafe-auth-import.txt").exists()
+
+
+def test_check_deploy_uses_the_web_command_auth_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace(_TARGET, "unused_auth:authenticate"))
+    _write_manifest(project, _SERVE + f" --auth {_TARGET}")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--deploy", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+
+
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_check_deploy_checks_custom_auth_source_before_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: bool,
+    unsafe: bool,
+) -> None:
+    project = tmp_path / "agent"
+    project.mkdir()
+    _write_scaffold(project, preset="agent")
+    package = project / "auth_extension"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "unsafe_auth.py").write_text(
+        ('from pathlib import Path\nPath("unsafe-auth-import.txt").touch()\n' if unsafe else "")
+        + "def authenticate(request):\n    return None\n"
+    )
+    command = _SERVE
+    if override:
+        command += " --auth auth_extension.unsafe_auth:authenticate"
+    else:
+        pyproject = project / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text().replace(_TARGET, "auth_extension.unsafe_auth:authenticate")
+        )
+    _write_manifest(project, command)
+    monkeypatch.chdir(project)
+    sys.modules.pop("auth_extension", None)
+    sys.modules.pop("auth_extension.unsafe_auth", None)
+    resolved: list[str] = []
+    load_target = cloud_deploy_check.load_target
+
+    def observe_load(target: str, **kwargs: Any) -> Any:
+        resolved.append(target)
+        return load_target(target, **kwargs)
+
+    monkeypatch.setattr(cloud_deploy_check, "load_target", observe_load)
+
+    assert main(["check", "--deploy", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert not (project / "unsafe-auth-import.txt").exists()
+    assert (
+        "SCAFFOLD_IMPORT_SIDE_EFFECT" in [item["code"] for item in report["diagnostics"]]
+    ) is unsafe
+    assert resolved == ([] if unsafe else ["auth_extension.unsafe_auth:authenticate"])
+
+
+@pytest.mark.parametrize("problem", ["manifest", "auth-unavailable"])
+def test_check_deploy_does_not_claim_success_when_preflight_cannot_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    problem: str,
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    _write_manifest(project, _SERVE + " --auth absent_cloud_dependency:authenticate")
+    if problem == "manifest":
+        (project / "cayu-cloud.toml").write_text("[malformed")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--deploy", "--json"]) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "PROJECT_CHECK_FAILED"
+    assert (
+        "Invalid Cayu Cloud TOML" if problem == "manifest" else "module was not found"
+    ) in error["message"]
+
+
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("unsafe", [False, True])
+@pytest.mark.parametrize(
+    "parent,payload_file,missing",
+    [
+        ("auth_extension", "auth_extension/__init__.py", "missing"),
+        ("auth_extension", "auth_extension/__init__.py", "missing.deep"),
+        ("auth_extension.nested", "auth_extension/__init__.py", "missing"),
+        ("auth_extension.nested", "auth_extension/nested/__init__.py", "missing"),
+        ("auth_extension.namespace.deep", "auth_extension/namespace/deep/__init__.py", "missing"),
+        ("auth_extension.shadow", "auth_extension/shadow.py", "missing"),
+    ],
+)
+def test_check_deploy_scans_parents_of_missing_auth_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    override: bool,
+    unsafe: bool,
+    parent: str,
+    payload_file: str,
+    missing: str,
+) -> None:
+    project = tmp_path / "agent"
+    project.mkdir()
+    _write_scaffold(project, preset="agent")
+    directory = project
+    for part in parent.split("."):
+        if part == "shadow":
+            break
+        directory /= part
+        directory.mkdir()
+        if part != "namespace":
+            (directory / "__init__.py").touch()
+    (project / payload_file).write_text(
+        'from pathlib import Path\nPath("unsafe-parent-import.txt").touch()\n'
+        if unsafe
+        else "SAFE_VALUE = 1\n"
+    )
+    target = f"{parent}.{missing}:authenticate"
+    command = _SERVE
+    if override:
+        command += f" --auth {target}"
+    else:
+        pyproject = project / "pyproject.toml"
+        pyproject.write_text(pyproject.read_text().replace(_TARGET, target))
+    _write_manifest(project, command)
+    monkeypatch.chdir(project)
+
+    code = main(["check", "--deploy", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert not (project / "unsafe-parent-import.txt").exists()
+    assert code == 1, report
+    findings = report["diagnostics"]
+    if unsafe:
+        assert any(
+            item["code"] == "SCAFFOLD_IMPORT_SIDE_EFFECT"
+            and item["path"].startswith(f"{payload_file}:")
+            for item in findings
+        )
+        assert not any(item["code"] == "SERVE_AUTH_TARGET_UNRESOLVABLE" for item in findings)
+    else:
+        assert any(item["code"] == "SERVE_AUTH_TARGET_UNRESOLVABLE" for item in findings)
+        assert not any(item["code"] == "SCAFFOLD_IMPORT_SIDE_EFFECT" for item in findings)
+
+
+@pytest.mark.parametrize("state", ["absent", "valid-link", "dangling-link"])
+def test_check_deploy_distinguishes_absent_and_unreadable_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+) -> None:
+    project = _checkable_project(tmp_path / "agent")
+    if state != "absent":
+        _write_manifest(project)
+        manifest = project / "cayu-cloud.toml"
+        configuration = project / "config"
+        configuration.mkdir()
+        target = configuration / "production.toml"
+        manifest.rename(target)
+        manifest.symlink_to(Path("config/production.toml"))
+        if state == "dangling-link":
+            target.unlink()
+    monkeypatch.chdir(project)
+
+    code = main(["check", "--deploy", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    if state == "dangling-link":
+        assert code == 2, report
+        assert report["error"]["code"] == "PROJECT_CHECK_FAILED"
+        assert "Could not read Cayu Cloud manifest" in report["error"]["message"]
+    else:
+        assert code == 0, report
+        assert report["diagnostics"] == []
+
+
+@pytest.mark.parametrize(
+    "entrance",
+    ["auth-override", "explicit", "doctor", "auth-config", "factory-config", "service-config"],
+)
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_source_gate_preserves_raw_and_configured_target_identity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    entrance: str,
+    unsafe: bool,
+) -> None:
+    assert main(["new", "smoke-agent", "--dir", str(tmp_path), "--preset", "agent"]) == 0
+    capsys.readouterr()
+    project = tmp_path / "smoke-agent"
+    configured = entrance.endswith("-config")
+    selected = "target_extension" if configured else " target_extension"
+    for name in ("target_extension", " target_extension"):
+        package = project / name
+        package.mkdir()
+        (package / "__init__.py").write_text(
+            'from pathlib import Path\nPath("unexpected-parent-import.txt").touch()\n'
+            if (name == selected) == unsafe
+            else "SAFE_VALUE = 1\n"
+        )
+    raw_target = " target_extension.missing:authenticate "
+    pyproject = project / "pyproject.toml"
+    command = ["check", "--json"]
+    if entrance == "auth-override":
+        _write_manifest(project, _SERVE + f" --auth {json.dumps(raw_target)}")
+        command.append("--deploy")
+    elif entrance == "auth-config":
+        pyproject.write_text(pyproject.read_text().replace(_TARGET, raw_target))
+        _write_manifest(project)
+        command.append("--deploy")
+    elif entrance in {"factory-config", "service-config"}:
+        setting = (
+            f"factory = {json.dumps(raw_target)}"
+            if entrance == "factory-config"
+            else f'factory = "app:build_app"\nservice_factory = {json.dumps(raw_target)}'
+        )
+        pyproject.write_text(pyproject.read_text().replace('factory = "app:build_app"', setting))
+    elif entrance == "explicit":
+        command.append(raw_target)
+    else:
+        command = ["doctor", raw_target, "--bundle", str(tmp_path / "support.zip"), "--json"]
+    # Separate processes retain Python's real unusual-name import semantics,
+    # without a preceding test's sys.modules cache substituting another project.
+    result = subprocess.run(
+        [sys.executable, "-m", "cayu", *command],
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    report = json.loads(result.stdout)
+    assert not (project / "unexpected-parent-import.txt").exists()
+    if entrance == "doctor":
+        assert result.returncode == 2, report
+        with zipfile.ZipFile(tmp_path / "support.zip") as archive:
+            bundle = json.loads(archive.read("report.json"))
+        reasons = {item.get("reason_code") for item in bundle["collectors"]}
+        assert ("source_validation_failed" in reasons) is unsafe
+    else:
+        blockers = [
+            item
+            for item in report.get("diagnostics", [])
+            if item["code"] == "SCAFFOLD_IMPORT_SIDE_EFFECT"
+        ]
+        assert bool(blockers) is unsafe, report
+        if unsafe:
+            assert result.returncode == 1
+            assert all(item["path"].startswith(f"{selected}/__init__.py:") for item in blockers)
+        else:
+            assert result.returncode == (1 if entrance == "auth-config" else 2), report
 
 
 def test_deploy_refuses_a_web_process_that_cannot_start_before_any_cloud_request(

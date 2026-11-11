@@ -1948,6 +1948,15 @@ service access that is still a placeholder or a `uv.lock` to refresh after init 
 the `server` extra, or can't run, the result includes `deploy_check` and a `warnings`
 entry describing what to fix before deploying.
 
+After initialization, `cayu check --deploy --fail-on warning --json` also reads the
+project's `cayu-cloud.toml` and includes the same `SERVE_*` findings for its
+`cayu serve` web command. Ordinary `cayu check`, worker-only manifests, and other
+web commands do not run this serve preflight. Tag filters still apply. If the
+manifest cannot be read, or auth cannot be checked and no blocking finding is
+available, the standalone command returns an invocation error instead of claiming
+success. If scaffold source checks block
+imports, their findings take precedence and custom auth is not imported.
+
 ## Agent environment variables
 
 Cloud-managed variables belong to the long-lived Agent, not to one immutable release.

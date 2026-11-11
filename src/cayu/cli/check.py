@@ -94,6 +94,13 @@ def _run_check(args: argparse.Namespace) -> int:
     try:
         project = resolve_project(args.target, command="cayu check")
         report = check_project(project, tags=requested_tags, deploy_only=args.deploy)
+        if (
+            args.deploy
+            and (not requested_tags or "deploy" in requested_tags)
+            # Auth resolution can import project code; preserve the source-safety stop.
+            and not import_blocking_findings(report.diagnostics)
+        ):
+            report = _with_diagnostics(report, _cloud_serve_findings(project.root))
     except Exception as exc:
         message = (
             str(exc)
@@ -103,6 +110,33 @@ def _run_check(args: argparse.Namespace) -> int:
         _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
     return _render_report(args, report)
+
+
+def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
+    """Check the same local web command and upload inputs as Cloud init/deploy.
+
+    Keep this at the CLI entrance: Cloud's service check itself calls
+    ``check_project``, and Doctor/non-deploy checks do not check a Cloud manifest.
+    """
+
+    from cayu.cli._cloud_api import CloudApiError
+    from cayu.cli._cloud_deploy_check import check_serve_can_start
+    from cayu.cli._cloud_project import CloudProjectManifest
+    from cayu.cli._serve_readiness import is_cayu_serve_command
+
+    path = root / "cayu-cloud.toml"
+    if not path.exists() and not path.is_symlink():
+        return ()
+    try:
+        manifest = CloudProjectManifest.load(path)
+    except CloudApiError as exc:
+        raise ProjectError(str(exc)) from exc
+    if manifest.web is None or not is_cayu_serve_command(manifest.web.command):
+        return ()
+    findings, reason = check_serve_can_start(root, manifest.web.command, check_auth_source=True)
+    if reason is not None and not findings:
+        raise ProjectError(reason)
+    return findings
 
 
 def check_project(
@@ -235,13 +269,19 @@ def build_project_check_report(
         tags=tags,
         deploy_only=deploy_only,
     )
-    if not scaffold_diagnostics:
+    return _with_diagnostics(report, scaffold_diagnostics)
+
+
+def _with_diagnostics(
+    report: ProjectCheckReport, diagnostics: tuple[ProjectDiagnostic, ...]
+) -> ProjectCheckReport:
+    if not diagnostics:
         return report
     return report.model_copy(
         update={
             "diagnostics": tuple(
                 sorted(
-                    (*report.diagnostics, *scaffold_diagnostics),
+                    (*report.diagnostics, *diagnostics),
                     key=lambda item: (item.severity.value, item.code, item.path),
                 )
             )

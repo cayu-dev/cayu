@@ -1709,23 +1709,30 @@ def _configured_entry_targets(root: Path) -> tuple[str, ...]:
     if not isinstance(config, dict):
         return ()
     return tuple(
-        value for key in ("factory", "service_factory") if isinstance(value := config.get(key), str)
+        value.strip()
+        for key in ("factory", "service_factory")
+        if isinstance(value := config.get(key), str)
     )
 
 
 def _entry_module_paths(root: Path, targets: tuple[str, ...]) -> set[Path]:
-    """Resolve ``module:attribute`` targets to local module files without importing them."""
+    """Resolve entries or their executable ancestors without importing them."""
 
     paths: set[Path] = set()
     for target in targets:
-        module = target.strip().partition(":")[0]
+        module = target.partition(":")[0]
         if not module or module.startswith("."):
             continue
-        _local, path = _project_local_import_module_path(
-            root, importing_path=root, module=module, level=0
-        )
-        if path is not None and path.suffix == ".py" and path.is_relative_to(root):
-            paths.add(path)
+        while module:
+            _local, path = _project_local_import_module_path(
+                root, importing_path=root, module=module, level=0
+            )
+            if path is not None and path.suffix == ".py" and path.is_relative_to(root):
+                paths.add(path)
+                break
+            # A missing child still imports existing parents first. Retain the
+            # nearest Python source; the declaration graph also walks its parents.
+            module = module.rpartition(".")[0]
     return paths
 
 

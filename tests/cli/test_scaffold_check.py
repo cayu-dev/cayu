@@ -1618,3 +1618,52 @@ def test_cli_check_folds_an_application_load_failure_into_the_source_report(
         "SCAFFOLD_APPLICATION_LOAD_FAILED",
         "SCAFFOLD_PLAN_DRIFT",
     ]
+
+
+@pytest.mark.parametrize("entrance", ["explicit", "factory", "service_factory", "doctor"])
+def test_cli_source_gate_scans_parents_of_missing_factory_modules(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    entrance: str,
+) -> None:
+    assert main(["new", "project", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "project"
+    marker = tmp_path / "factory-parent-imported.txt"
+    package = project / "factory_extension"
+    package.mkdir()
+    (package / "__init__.py").write_text(_payload(marker), encoding="utf-8")
+    target = "factory_extension.missing:build_app"
+    command = ["check", "--json"]
+    if entrance == "explicit":
+        command.append(target)
+    elif entrance == "doctor":
+        command = ["doctor", target, "--bundle", str(tmp_path / "support.zip"), "--json"]
+    else:
+        pyproject = project / "pyproject.toml"
+        replacement = (
+            f'factory = "{target}"'
+            if entrance == "factory"
+            else f'factory = "app:build_app"\nservice_factory = "{target}"'
+        )
+        pyproject.write_text(
+            pyproject.read_text().replace('factory = "app:build_app"', replacement),
+            encoding="utf-8",
+        )
+    monkeypatch.chdir(project)
+
+    code = main(command)
+    report = json.loads(capsys.readouterr().out)
+    assert not marker.exists()
+    if entrance == "doctor":
+        assert code == 2
+        assert report["outcome"] == "boot_failed"
+    else:
+        assert code == 1, report
+        assert report["manifest_fingerprint"] == "unavailable"
+        assert any(
+            item["code"] == "SCAFFOLD_IMPORT_SIDE_EFFECT"
+            and item["path"].startswith("factory_extension/__init__.py:")
+            for item in report["diagnostics"]
+        )

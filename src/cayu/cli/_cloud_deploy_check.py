@@ -39,6 +39,7 @@ from cayu.cli.project import (
     project_context,
     resolve_project,
 )
+from cayu.cli.scaffold_check import check_declared_scaffold_source, import_blocking_findings
 from cayu.cli.serve import (
     ServeError,
     parse_serve_arguments,
@@ -182,7 +183,7 @@ def _run_public_service_check(root: Path) -> CloudDeployCheck:
 
 
 def check_serve_can_start(
-    root: Path, web_command: str = "cayu serve"
+    root: Path, web_command: str = "cayu serve", *, check_auth_source: bool = False
 ) -> tuple[tuple[ProjectDiagnostic, ...], str | None]:
     """Find what would stop `web_command`, a `cayu serve` command, starting on Cayu Cloud.
 
@@ -195,6 +196,8 @@ def check_serve_can_start(
     accepted without importing them, because their credentials come from Cayu
     Cloud rather than this shell. A cayu path source must be among the files the
     deploy uploads.
+    ``check_auth_source`` preserves standalone check's source-safety gate for
+    custom auth targets, including packages outside its factory source graph.
     """
 
     pyproject = root / "pyproject.toml"
@@ -322,6 +325,12 @@ def check_serve_can_start(
         if unavailable is not None:
             findings.append(_environment_auth_unavailable(document, unavailable, path=path))
     elif not _is_generated_auth_module(root, target):
+        if check_auth_source:
+            blocked = import_blocking_findings(
+                check_declared_scaffold_source(root, entry_targets=(target,))
+            )
+            if blocked:
+                return (*findings, *blocked), None
         finding, reason = _resolve_auth_target(root, target, path=path)
         if finding is not None:
             findings.append(finding)

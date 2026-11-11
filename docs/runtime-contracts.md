@@ -575,7 +575,7 @@ instead of changing the identifier.
 Cayu labels, metadata, `AuthContext.tenant`, model/tool values, and raw runtime
 identifiers are never authorization inputs.
 
-`cayu check --deploy` evaluates only this declarative service manifest and
+For public-service posture, `cayu check --deploy` evaluates this declarative service manifest and
 emits stable findings for development mode, unsafe product access, open
 operator access, non-durable product identity state, and missing,
 development-only, read-only, or unverified runtime session/task stores. Its
@@ -583,6 +583,8 @@ machine-readable evidence marks the generated assembled-ASGI security suite as
 separately required and host-owned behavior outside the contract as unverified.
 Arbitrary ASGI source is not scanned, mirrored into `AppManifest`, or silently
 certified.
+For a local Cloud project's `cayu serve` web command, the command also reports
+the [Cloud serve preflight findings](cayu-cloud.md#local-deploy-check).
 
 `cayu worker <name>` is a process-role adapter over this same factory contract.
 It discovers the nearest configured project, enters its import context, and
