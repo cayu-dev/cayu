@@ -89,6 +89,7 @@ from cayu.runtime._durable_worker_loop import (
     worker_stop_requested,
 )
 from cayu.runtime._event_loop_lag_sessions import app_session_event_loop_lag_recorder
+from cayu.runtime._process_workers import require_single_process_worker
 from cayu.runtime._run_exit import RunExitKind, classify_run_exit
 from cayu.runtime._task_lease_authority import (
     TaskLeaseAuthority as _TaskLeaseAuthority,
@@ -607,7 +608,10 @@ async def run_task_worker(
       validator. ``None`` (the default) settles nothing, unless ``cayu worker
       --reconcile-abandoned-after-seconds`` set it for the process. Don't set
       it when several workers or processes claim the same tasks: a slow worker
-      may still be running a task whose lease expired.
+      may still be running a task whose lease expired. Cayu-supervised groups
+      reject this mode before task-store access unless their metadata declares
+      one process; use ``cayu worker --processes 1``. Outside Cayu supervision,
+      ensuring there is no competing process remains the caller's responsibility.
     - ``restart_abandoned=True`` makes that declared single worker requeue a
       task created with ``restartable=True`` instead of cancelling it, through
       ``restart_abandoned_task``: the task returns to ``pending`` with
@@ -723,6 +727,8 @@ async def run_task_worker(
         max_abandoned_restarts,
         reconcile_abandoned_after_s=reconcile_abandoned_after_s,
     )
+    if reconcile_abandoned_after_s is not None:
+        require_single_process_worker("reconcile_abandoned_after_s")
     if type(recover_interrupted_handoffs) is not bool:
         raise TypeError("recover_interrupted_handoffs must be a bool.")
     validate_worker_interval(

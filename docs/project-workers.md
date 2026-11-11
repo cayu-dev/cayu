@@ -193,6 +193,16 @@ own worker ID (as in the example above), so a restarted worker doesn't share
 the dead one's ID. Otherwise settle fenced tasks yourself once you know the old
 process exited; see [when a worker dies mid-task](triggering-runs.md#when-a-worker-dies-mid-task).
 
+An entrypoint that passes `reconcile_abandoned_after_s` in Python must also
+configure one process: run `cayu worker NAME --processes 1`, or set `NAME = 1`
+under `[tool.cayu.worker_processes]`. This applies both to cancellation and to
+`restart_abandoned=True`. `run_task_worker` and `run_task_worker_until_idle`
+refuse this recovery mode before accessing the task store when their supervisor
+reports multiple processes or incomplete/invalid process metadata. The error
+explains how to select one process; it does not silently change the process
+count. Outside Cayu supervision the option remains your declaration that no
+other process or deployment claims the same tasks.
+
 A cancelled task that runs an agent session usually needs neither. Its session
 fences the old worker's run, so once the dead worker's lease expires, the next
 worker that recovers interrupted handoffs (long-running or `--until-idle`; every

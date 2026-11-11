@@ -226,6 +226,28 @@ def process_worker_count() -> int:
     return int(value)
 
 
+def require_single_process_worker(operation: str) -> None:
+    """Refuse sole-worker operations in an ambiguous or multi-process group.
+
+    Without supervisor metadata, the caller owns the standalone declaration.
+    Unlike the reporting helper above, malformed metadata is never proof of a
+    single process. A child's local ``--processes 1`` does not erase its peers.
+    """
+
+    count = os.environ.get(WORKER_COUNT_ENVIRONMENT)
+    index = os.environ.get("CAYU_WORKER_INDEX")
+    if count is None and index is None and "CAYU_SUPERVISOR_PID" not in os.environ:
+        return
+    if count is not None and count.strip() == "1" and (index is None or index == "0"):
+        return
+    raise ValueError(
+        f"{operation} requires a single worker process. Run cayu worker with --processes 1 "
+        "or set this worker to 1 in [tool.cayu.worker_processes]. "
+        "Supervisor metadata must declare CAYU_WORKER_COUNT=1 and, when present, "
+        "CAYU_WORKER_INDEX=0; do not override metadata in a multi-process worker."
+    )
+
+
 def process_worker_environment(index: int, count: int) -> dict[str, str]:
     """This process's environment for child ``index`` of ``count``.
 

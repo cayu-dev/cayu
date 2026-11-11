@@ -59,6 +59,12 @@ await run_task_worker(
 the same for a project worker. Restart is refused without the single-worker
 declaration. Don't use this when several workers claim the
 same tasks: a slow worker can still be running a task whose lease expired.
+When the entrypoint sets these options in code, run it with
+`cayu worker NAME --processes 1` or set `NAME = 1` under
+`[tool.cayu.worker_processes]`. The task worker refuses single-worker recovery
+before accessing the task store if its supervisor reports several processes
+or invalid process metadata. Outside Cayu supervision, you remain responsible
+for ensuring that no other deployment claims the same tasks.
 With several workers, settle fenced tasks yourself once you know which workers
 are live, for example from your platform's record of stopped containers:
 
