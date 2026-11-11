@@ -13,6 +13,7 @@ from tests.connector_broker_support import (
     FakeBroker,
     Refusal,
     Sent,
+    assert_within_budgets,
     context,
     policy_request,
 )
@@ -20,6 +21,7 @@ from tests.connector_broker_support import (
 from cayu.approvals import ToolArgumentReview
 from cayu.connections import LocalConnections, LocalSlot
 from cayu.connectors import slack
+from cayu.connectors._common import MAX_TERMINAL_PAYLOAD_BYTES
 from cayu.tools import (
     AlwaysRequireApprovalToolPolicy,
     StaticToolPolicy,
@@ -59,7 +61,7 @@ def test_the_toolkit_has_read_tools_and_write_tools_only_when_asked() -> None:
         "slack_read_thread": ToolEffect.NONE,
         "slack_lookup_user": ToolEffect.NONE,
     }
-    assert all(tool.spec.max_terminal_payload_bytes == 64 * 1024 for tool in tools)
+    assert all(tool.spec.max_terminal_payload_bytes == MAX_TERMINAL_PAYLOAD_BYTES for tool in tools)
     schemas = {
         tool.name: tool.schema["properties"]["channel"]["description"]
         for tool in tools
@@ -184,7 +186,7 @@ def test_a_page_of_200_long_channels_fits_without_losing_a_channel() -> None:
     assert result.structured is not None
     channels = result.structured["channels"]
     assert all("topic" not in item and "purpose" not in item for item in channels)
-    assert len(json.dumps(result.model_dump(mode="json")).encode()) <= 60 * 1024
+    assert_within_budgets(result)
     # The page answered ends where the next page's cursor starts.
     assert int(broker.sent[-1].query["limit"]) == len(channels) > 100
     assert result.structured["next_cursor"] == f"after-{len(channels)}"
@@ -201,12 +203,17 @@ def test_a_page_that_never_fits_is_asked_for_again_smaller_from_the_same_cursor(
     assert again.query["cursor"] == "c1"
     assert int(again.query["limit"]) == len(channels) < 200
     assert result.structured["next_cursor"] == f"after-{len(channels)}"
-    assert len(json.dumps(result.model_dump(mode="json")).encode()) <= 60 * 1024
+    assert_within_budgets(result)
 
 
 def test_a_page_whose_topics_dont_fit_keeps_them_shorter() -> None:
     channels = [
-        {"id": f"C{index}", "name": f"c{index}", "topic": {"value": "t" * 250}}
+        {
+            "id": f"C{index}",
+            "name": f"c{index}",
+            "topic": {"value": "t" * 250},
+            "purpose": {"value": "p" * 250},
+        }
         for index in range(120)
     ]
     broker = FakeBroker(lambda _: _ok(channels=channels))
@@ -214,6 +221,7 @@ def test_a_page_whose_topics_dont_fit_keeps_them_shorter() -> None:
     assert result.structured is not None
     assert len(result.structured["channels"]) == 120
     assert {len(item["topic"]) for item in result.structured["channels"]} == {80}
+    assert {len(item["purpose"]) for item in result.structured["channels"]} == {80}
     assert len(broker.sent) == 1
 
 
@@ -260,7 +268,7 @@ def test_a_page_too_large_for_the_answer_is_shortened_further_to_fit() -> None:
     assert result.structured is not None
     assert len(result.structured["messages"]) == 50
     assert all(len(message["text"]) < 4_000 for message in result.structured["messages"])
-    assert len(json.dumps(result.model_dump(mode="json")).encode()) <= 60 * 1024
+    assert_within_budgets(result)
 
 
 def test_read_thread_reads_replies() -> None:

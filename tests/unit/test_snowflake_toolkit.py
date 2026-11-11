@@ -15,6 +15,7 @@ from tests.connector_broker_support import (
     FakeBroker,
     Refusal,
     Sent,
+    assert_within_budgets,
     context,
     policy_request,
 )
@@ -489,7 +490,7 @@ def test_a_gzipped_partition_is_read_and_an_unreadable_one_is_reported() -> None
 
 
 def test_columns_too_wide_to_answer_are_an_error_naming_the_handle() -> None:
-    columns = [{"name": f"{index:03d}_" + "a" * 196, "type": "text"} for index in range(200)]
+    columns = [{"name": f"{index:03d}_" + "a" * 196, "type": "text"} for index in range(400)]
     answer = _result_set([])
     answer["resultSetMetaData"]["rowType"] = columns
     broker = FakeBroker(lambda _: Answer(body=answer))
@@ -500,7 +501,7 @@ def test_columns_too_wide_to_answer_are_an_error_naming_the_handle() -> None:
     assert result.structured["error"] == "result_too_wide"
     assert result.structured["statement_handle"] == HANDLE
     assert "fewer columns" in result.structured["advice"]
-    assert len(json.dumps(result.model_dump(mode="json")).encode()) <= 60 * 1024
+    assert_within_budgets(result)
 
 
 def test_an_answer_too_large_keeps_the_rows_that_fit() -> None:
@@ -513,7 +514,7 @@ def test_an_answer_too_large_keeps_the_rows_that_fit() -> None:
     assert 0 < result.structured["returned_rows"] < 200
     assert result.structured["rows"] == rows[: result.structured["returned_rows"]]
     assert result.structured["truncated"] is True
-    assert len(json.dumps(result.model_dump(mode="json")).encode()) <= 60 * 1024
+    assert_within_budgets(result)
 
 
 @pytest.mark.parametrize(

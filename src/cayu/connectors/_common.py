@@ -25,10 +25,14 @@ from cayu.tools.policy import (
     ToolPolicyResult,
 )
 
-#: The terminal payload each toolkit tool declares: the runtime's smallest enforced bound.
-MAX_TERMINAL_PAYLOAD_BYTES = 64 * 1024
-#: The largest serialized result a tool returns, leaving the runtime its own room.
+#: The largest answer the model reads: a result's ``content``, in UTF-8 bytes.
 ANSWER_BUDGET_BYTES = 60 * 1024
+#: The terminal payload each toolkit tool declares. A result carries its answer twice, as the
+#: model's ``content`` (escaped once more inside the payload's JSON) and as ``structured``, so
+#: the bound holds a full answer twice with room for its escaping.
+MAX_TERMINAL_PAYLOAD_BYTES = 160 * 1024
+#: The largest serialized result a tool returns, leaving the runtime its own room.
+_RESULT_BUDGET_BYTES = MAX_TERMINAL_PAYLOAD_BYTES - 4 * 1024
 #: The longest argument an approval reason quotes.
 _REASON_ARGUMENT_CHARACTERS = 80
 
@@ -85,8 +89,11 @@ def invalid_arguments(message: str) -> ToolResult:
     return invalid_tool_arguments_result(ValueError(message))
 
 
-def call_error_result(error: ConnectionCallError, slot: str) -> ToolResult:
-    """A call the client or broker refused, as a tool error naming its code and what to do."""
+def call_error_result(
+    error: ConnectionCallError, slot: str, advice: Mapping[str, str] | None = None
+) -> ToolResult:
+    """A call the client or broker refused, as a tool error naming its code and what to do;
+    ``advice`` gives a toolkit's own words for some codes."""
 
     code = error.code
     if code is None:
@@ -95,13 +102,14 @@ def call_error_result(error: ConnectionCallError, slot: str) -> ToolResult:
         )
     if code == "too_many_calls":
         return rate_limited_result(str(error), error.retry_after)
-    if code in _ADVICE:
-        advice = _ADVICE[code].format(slot=slot)
+    known = {**_ADVICE, **(advice or {})}
+    if code in known:
+        said = known[code].format(slot=slot)
     elif code.startswith("upstream_"):
-        advice = TEMPORARY
+        said = TEMPORARY
     else:
-        advice = "The call was refused; don't retry it unchanged."
-    return error_result(code, str(error), advice, retry_after_seconds=error.retry_after)
+        said = "The call was refused; don't retry it unchanged."
+    return error_result(code, str(error), said, retry_after_seconds=error.retry_after)
 
 
 def rate_limited_result(message: str, retry_after: float | None) -> ToolResult:
@@ -140,8 +148,13 @@ def answer_result(answer: Mapping[str, Any]) -> ToolResult:
 
 
 def answer_fits(result: ToolResult) -> bool:
+    """Whether the model's answer is within its budget and the whole result within the
+    tool's declared terminal payload."""
+
+    if len(result.content.encode()) > ANSWER_BUDGET_BYTES:
+        return False
     size = len(json.dumps(result.model_dump(mode="json"), ensure_ascii=False).encode())
-    return size <= ANSWER_BUDGET_BYTES
+    return size <= _RESULT_BUDGET_BYTES
 
 
 def shortened(text: str, limit: int) -> tuple[str, bool]:

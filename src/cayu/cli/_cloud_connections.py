@@ -7,8 +7,10 @@ admin changes which Agents may use one, rotates its credential or removes it.
 
 Credentials are read from files, never from the command line: `--key-file PATH` for an API key,
 `--credential FIELD=@PATH` for a field kept in a file (a private key) and `--credential
-FIELD=VALUE` only for a field that isn't secret (`account`, `user`). No answer ever holds a
-credential.
+FIELD=VALUE` only for a field that isn't secret (`account`, `user`, and SAP's `base_url`,
+`token_url`, `client_id`, `oauth_scope`, `sap_client`). No answer ever holds a credential.
+`connections check` asks Cloud to test a connection that can be checked, such as SAP, and
+prints each service's result.
 
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
@@ -37,10 +39,19 @@ _CONNECTIONS = "/v1/connections"
 AGENT_ACTIONS = frozenset({"bound", "bind", "unbind"})
 #: The credential fields that aren't secret, which --credential may give as FIELD=VALUE; every
 #: other field is read from a file (FIELD=@PATH).
-PLAIN_FIELDS = frozenset({"account", "user"})
+PLAIN_FIELDS = frozenset(
+    {"account", "user", "base_url", "token_url", "client_id", "oauth_scope", "sap_client"}
+)
 #: The credential fields Cayu Cloud's connectors take; an error names only these, since anything
 #: else given as a field name may be a mistyped secret.
-KNOWN_FIELDS = PLAIN_FIELDS | {"api_key", "private_key"}
+KNOWN_FIELDS = PLAIN_FIELDS | {
+    "api_key",
+    "private_key",
+    "client_secret",
+    "client_certificate",
+    "client_key",
+    "ca_bundle",
+}
 
 
 class CredentialArgumentError(ValueError):
@@ -129,6 +140,22 @@ def add_connections_parsers(
     )
     rotate.add_argument("name")
     _add_credential_arguments(rotate)
+
+    check = actions.add_parser(
+        "check",
+        help="Test a connection and each service it reaches (admins).",
+        description=(
+            "Ask Cloud to test the connection now: that its credential signs in, and, for SAP, "
+            "one small read of each service it holds. Prints each service's result. A rejected "
+            "credential or certificate, or a host the install doesn't allow, sets the "
+            "connection to error."
+        ),
+    )
+    check.add_argument("name")
+    check.add_argument(
+        "--json", action="store_true", help="Print the JSON envelope instead of a table."
+    )
+    check.set_defaults(_cloud_render=render_check)
 
     remove = actions.add_parser(
         "remove",
@@ -274,6 +301,63 @@ def render_models(outcome: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+#: A connection check's own failures in words, for a Cayu Cloud that doesn't say them itself
+#: (`check_message`).
+_CHECK_ERRORS = {
+    "host_unreachable": "The check couldn't reach the SAP host.",
+    "token_url_unreachable": "The check couldn't reach the token URL.",
+    "auth_failed": "SAP rejected the connection's credential; an admin should check or rotate it.",
+    "certificate_rejected": (
+        "SAP rejected the connection's client certificate; an admin should check or rotate it."
+    ),
+    "host_not_allowed": (
+        "This Cayu Cloud doesn't allow the connection's host; an admin should fix base_url or "
+        "ask the install's operator to allow it."
+    ),
+}
+#: The check's failures that leave the connection's status as it was; every other one sets it
+#: to error.
+_TRANSIENT_CHECK_ERRORS = frozenset({"host_unreachable", "token_url_unreachable"})
+
+
+def render_check(outcome: Mapping[str, Any]) -> str:
+    """A connection check as text: the connection's status, why the check itself couldn't
+    finish when it couldn't, then one row per service."""
+
+    result = outcome["result"]
+    error = result.get("error")
+    if isinstance(error, Mapping):
+        error = error.get("message") or error.get("code")
+    heading = f"{result.get('name')}: {result.get('status') or 'unknown'}"
+    lines = [heading + (f" ({error})" if error else "")]
+    check_error = result.get("check_error")
+    if check_error:
+        said = result.get("check_message") or _CHECK_ERRORS.get(check_error, "The check failed.")
+        then = (
+            " The connection's status is unchanged; try again later."
+            if check_error in _TRANSIENT_CHECK_ERRORS
+            else ""
+        )
+        lines.append(f"{said} ({check_error}){then}")
+    services = result.get("services") or []
+    if services:
+        lines.append("")
+        lines.extend(
+            _table(
+                ("SERVICE", "RESULT", "DETAIL"),
+                [
+                    (
+                        str(item.get("service")),
+                        str(item.get("result")),
+                        str(item.get("message") or item.get("status") or "-"),
+                    )
+                    for item in services
+                ],
+            )
+        )
+    return "\n".join(lines)
+
+
 def _yes_no(value: object) -> str:
     return "unknown" if value is None else "yes" if value else "no"
 
@@ -326,6 +410,8 @@ def connections_command(
             result = client.request("GET", path)
         elif action == "authorize":
             result = client.request("POST", f"{path}/authorize")
+        elif action == "check":
+            result = client.request("POST", f"{path}/check")
         elif action == "agents":
             result = client.request(
                 "PUT", f"{path}/agents", payload={"agents": None if arguments.all else agents}

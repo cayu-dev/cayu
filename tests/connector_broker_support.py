@@ -13,8 +13,9 @@ import httpx
 
 from cayu import AgentSpec
 from cayu.connections import CloudConnectionBroker
+from cayu.connectors._common import ANSWER_BUDGET_BYTES, MAX_TERMINAL_PAYLOAD_BYTES
 from cayu.sessions.records import Session, SessionStatus
-from cayu.tools import ToolContext, ToolPolicyRequest
+from cayu.tools import ToolContext, ToolPolicyRequest, ToolResult
 from tests._session_provenance import fixture_session_invocation
 
 BROKER = "https://api.example.test/v1/agent-connections"
@@ -112,3 +113,12 @@ def policy_request(tool_name: str, **arguments: Any) -> ToolPolicyRequest:
         tool_call_id="call_1",
         arguments=arguments,
     )
+
+
+def assert_within_budgets(result: ToolResult) -> None:
+    """The model's answer within its budget, and the whole result within the tool's declared
+    terminal payload."""
+
+    assert len(result.content.encode()) <= ANSWER_BUDGET_BYTES
+    whole = json.dumps(result.model_dump(mode="json"), ensure_ascii=False).encode()
+    assert len(whole) <= MAX_TERMINAL_PAYLOAD_BYTES

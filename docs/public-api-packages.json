@@ -5,6 +5,7 @@
   "cayu.budgets",
   "cayu.collaboration",
   "cayu.connections",
+  "cayu.connectors.sap",
   "cayu.connectors.slack",
   "cayu.connectors.snowflake",
   "cayu.context",

@@ -823,6 +823,17 @@
         "URL_ENVIRONMENT"
       ]
     },
+    "cayu.connectors.sap": {
+      "defined_in": {
+        "cayu.connectors.sap.toolkit": [
+          "tools"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "DEFAULT_SLOT"
+      ]
+    },
     "cayu.connectors.slack": {
       "defined_in": {
         "cayu.connectors.slack.toolkit": [
@@ -5534,6 +5545,7 @@
       "defined_in": {},
       "identities": {},
       "present": [
+        "sap",
         "slack",
         "snowflake"
       ]

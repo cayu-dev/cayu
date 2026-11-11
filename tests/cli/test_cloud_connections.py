@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import httpx
+import pytest
 from tests.cli.test_cloud_api_keys import cloud as _cloud
 
 from cayu.cli import main
-
-if TYPE_CHECKING:
-    import pytest
 
 cloud = _cloud
 
@@ -378,3 +376,229 @@ def test_reconnecting_a_ready_connection_says_it_keeps_working(
     printed = capsys.readouterr().out
     assert printed.startswith("eng-slack keeps working until you sign in again. To reconnect it,")
     assert "waiting for its sign-in" not in printed
+
+
+def test_an_sap_connection_takes_its_settings_plain_and_its_secrets_from_files(
+    cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    secret = tmp_path / "sap-secret"
+    secret.write_text("fake-client-value\n")
+    plain = {
+        "base_url": "https://s4.example.test",
+        "token_url": "https://s4.example.test/oauth/token",
+        "client_id": "CAYU_READER",
+        "oauth_scope": "API_BUSINESS_PARTNER_0001",
+        "sap_client": "100",
+    }
+
+    code, output = _run(
+        [
+            "connections",
+            "add",
+            "sap",
+            "--name",
+            "erp",
+            *(
+                item
+                for name, value in plain.items()
+                for item in ("--credential", f"{name}={value}")
+            ),
+            "--credential",
+            f"client_secret=@{secret}",
+            "--scope",
+            "API_BUSINESS_PARTNER.read",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    sent = json.loads(fake.requests[0].content)
+    assert sent["credential"] == {**plain, "client_secret": "fake-client-value"}
+    assert sent["scopes"] == ["API_BUSINESS_PARTNER.read"]
+    assert "fake-client-value" not in json.dumps(output)
+
+
+def test_sap_secret_fields_given_on_the_command_line_are_refused_unrepeated(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({})
+
+    for field in ("client_secret", "client_certificate", "client_key", "ca_bundle", "api_key"):
+        code, output = _run(
+            [
+                "connections",
+                "add",
+                "sap-certificate",
+                "--name",
+                "erp",
+                "--credential",
+                f"{field}=not-a-file-value",
+            ],
+            capsys,
+        )
+        assert code == 2
+        assert f"{field}=@PATH" in output["error"]["message"]
+        assert "not-a-file-value" not in json.dumps(output)
+    assert fake.requests == []
+
+
+def test_a_certificate_connection_reads_its_pem_fields_from_files(
+    cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    files = {}
+    for field in ("client_certificate", "client_key", "ca_bundle"):
+        files[field] = tmp_path / f"{field}.pem"
+        files[field].write_text(f"-----BEGIN TEST {field}-----\n")
+
+    code, _ = _run(
+        [
+            "connections",
+            "add",
+            "sap-certificate",
+            "--name",
+            "erp",
+            "--credential",
+            "base_url=https://s4.example.test",
+            *(
+                item
+                for field, path in files.items()
+                for item in ("--credential", f"{field}=@{path}")
+            ),
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert json.loads(fake.requests[0].content)["credential"] == {
+        "base_url": "https://s4.example.test",
+        **{field: f"-----BEGIN TEST {field}-----" for field in files},
+    }
+
+
+_CHECK = {
+    "name": "erp",
+    "connector": "sap",
+    "status": "ready",
+    "error": None,
+    "check_error": None,
+    "check_message": None,
+    "services": [
+        {
+            "service": "API_BUSINESS_PARTNER",
+            "title": "Business partners",
+            "scope": "API_BUSINESS_PARTNER.read",
+            "result": "ok",
+            "status": 200,
+            "message": None,
+        },
+        {
+            "service": "API_SUPPLIERINVOICE_PROCESS_SRV",
+            "title": "Supplier invoices",
+            "scope": "API_SUPPLIERINVOICE_PROCESS_SRV.read",
+            "result": "not_authorised",
+            "status": 403,
+            "message": "The communication arrangement isn't set up.",
+        },
+    ],
+}
+
+
+def test_check_prints_each_services_result(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = cloud({("POST", "/v1/connections/erp/check"): httpx.Response(200, json=_CHECK)})
+
+    assert main(["cloud", "connections", "check", "erp"]) == 0
+
+    assert [(request.method, request.url.path) for request in fake.requests] == [
+        ("POST", "/v1/connections/erp/check")
+    ]
+    assert capsys.readouterr().out.splitlines() == [
+        "erp: ready",
+        "",
+        "SERVICE                          RESULT          DETAIL",
+        "API_BUSINESS_PARTNER             ok              200",
+        "API_SUPPLIERINVOICE_PROCESS_SRV  not_authorised  The communication arrangement isn't set up.",
+    ]
+
+
+def test_check_with_json_prints_the_envelope(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    failed = {**_CHECK, "status": "error", "error": "auth_failed", "services": []}
+    cloud({("POST", "/v1/connections/erp/check"): httpx.Response(200, json=failed)})
+
+    code, output = _run(["connections", "check", "erp", "--json"], capsys)
+    assert code == 0
+    assert output["operation"] == "connections.check"
+    assert output["result"] == failed
+
+    assert main(["cloud", "connections", "check", "erp"]) == 0
+    assert capsys.readouterr().out == "erp: error (auth_failed)\n"
+
+
+@pytest.mark.parametrize(
+    ("status", "check_error", "check_message", "said"),
+    [
+        (
+            "ready",
+            "host_unreachable",
+            None,
+            "The check couldn't reach the SAP host. (host_unreachable)",
+        ),
+        (
+            "ready",
+            "token_url_unreachable",
+            "The token URL didn't answer.",
+            "The token URL didn't answer. (token_url_unreachable)",
+        ),
+        (
+            "error",
+            "auth_failed",
+            None,
+            "SAP rejected the connection's credential; an admin should check or rotate it. "
+            "(auth_failed)",
+        ),
+        (
+            "error",
+            "auth_failed",
+            "SAP's sandbox rejected the API key.",
+            "SAP's sandbox rejected the API key. (auth_failed)",
+        ),
+        (
+            "error",
+            "certificate_rejected",
+            None,
+            "SAP rejected the connection's client certificate; an admin should check or rotate "
+            "it. (certificate_rejected)",
+        ),
+        (
+            "error",
+            "host_not_allowed",
+            None,
+            "This Cayu Cloud doesn't allow the connection's host; an admin should fix base_url "
+            "or ask the install's operator to allow it. (host_not_allowed)",
+        ),
+        ("error", "something_new", None, "The check failed. (something_new)"),
+    ],
+)
+def test_check_says_why_the_check_itself_failed_and_what_to_do(
+    cloud,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+    check_error: str,
+    check_message: str | None,
+    said: str,
+) -> None:
+    failed = {
+        **_CHECK,
+        "status": status,
+        "check_error": check_error,
+        "check_message": check_message,
+        "services": [],
+    }
+    cloud({("POST", "/v1/connections/erp/check"): httpx.Response(200, json=failed)})
+
+    assert main(["cloud", "connections", "check", "erp"]) == 0
+    heading, explained = capsys.readouterr().out.splitlines()
+    assert heading == f"erp: {status}"
+    unchanged = " The connection's status is unchanged; try again later."
+    assert explained == said + (unchanged if check_error.endswith("_unreachable") else "")

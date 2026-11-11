@@ -46,7 +46,7 @@ cayu cloud service status --application my-agent
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
-- `connectors` and `connections list|show|add|authorize|agents|rotate|remove|bound|bind|unbind` for the
+- `connectors` and `connections list|show|add|authorize|check|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
@@ -2058,6 +2058,31 @@ developer names the Agents a new connection is for with `--agent`, and an admin 
 makes it available to every Agent. Only an admin changes which Agents may use one (`agents`),
 rotates its credential or removes it, and Cloud refuses removing one while any Agent is bound to
 it. Members see only the connections the Agents they work with use.
+
+SAP S/4HANA comes as three connectors to one system: `sap` signs in with OAuth client
+credentials, `sap-certificate` with a client certificate, and `sap-sandbox` reaches SAP's public
+sandbox with an API key. Their plain fields are `base_url`, `token_url`, `client_id`,
+`oauth_scope` and `sap_client`; `client_secret`, `client_certificate`, `client_key`, `ca_bundle`
+and the sandbox's `api_key` come from files. Each scope is one OData service an Agent may read,
+such as `API_SUPPLIERINVOICE_PROCESS_SRV.read`.
+
+```console
+cayu cloud connections add sap --name erp --scope API_SUPPLIERINVOICE_PROCESS_SRV.read \
+  --credential base_url=https://my-s4.example.com --credential token_url=https://my-s4.example.com/oauth/token \
+  --credential client_id=CAYU_READER --credential client_secret=@~/.keys/sap-secret
+cayu cloud connections add sap-sandbox --name sap-demo --key-file ~/.keys/sap-sandbox-key
+cayu cloud connections check erp
+```
+
+`connections check NAME` (admins) asks Cloud to test the connection now: that its credential
+signs in, and one small read of each service it holds. It prints the connection's status, then
+each service's result (`ok`, `not_authorised`, `not_found` or `failed`) with its detail; `--json`
+prints the JSON envelope. A service that answers `not_authorised` usually lacks its communication
+arrangement or role in SAP. When the check itself fails, it prints why in words
+(`check_message`) with its code (`check_error`). Only an unreachable SAP host or token URL
+(`host_unreachable`, `token_url_unreachable`) leaves the connection's status unchanged, to try
+again later; a rejected credential or certificate (`auth_failed`, `certificate_rejected`) or a
+host this install doesn't allow (`host_not_allowed`) sets it to `error` until an admin fixes it.
 
 A connector that signs in, such as Slack where the install has its Slack app, takes no
 credential: an admin adds it, and the command prints the link where the connection is approved.

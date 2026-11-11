@@ -12,6 +12,7 @@
 `cayu cloud connectors|connections` manages connections. `cayu.connectors.slack` and
 `cayu.connectors.snowflake` are the first connector toolkits: ready tools on a slot, an approval
 policy for their write tools and an argument-review preset ([connector toolkits](../connector-toolkits.md)).
+`cayu.connectors.sap` reads SAP S/4HANA's OData V2 services, with no write tools.
 They take their client as an argument until `ToolContext.connections` exists. Model slots are
 built ([Models](#models)). Connection slot declarations, the manifest document,
 `ToolContext.connections` and MCP through a slot are still proposals.

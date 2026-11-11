@@ -1,4 +1,4 @@
-# Connector toolkits: Slack and Snowflake
+# Connector toolkits: Slack, Snowflake and SAP
 
 `cayu.connectors` has ready tools for an application's connections. Each toolkit calls its
 connector through a connection slot ([Connections in the Runtime](adr/0003-connections-runtime-contract.md)),
@@ -119,6 +119,14 @@ the SQL with its database and schema for `snowflake_execute`.
   cancels it. Either answer names the `statement_handle` and whether the cancel was confirmed.
   Snowflake's own statement timeout is set just past the tool's, in case the cancel never
   arrives.
+- **Suppliers' banks.** A supplier's number and its business partner's often differ, so
+  `include_bank` finds each supplier's partner in `A_BusinessPartner` by its `Supplier` field and
+  reads the partner's expanded `to_BusinessPartnerBank`. A supplier whose partner isn't found, or
+  whose bank accounts SAP pages, gets `banks: null` and the reason `banks_incomplete`, never an
+  empty list. In SAP's public sandbox each supplier's partner has the same number, so the
+  recorded answers don't show a mapping. The toolkit's field list is a convenience, not a
+  boundary: `sap_read` on `API_BUSINESS_PARTNER` reads any bank field the model asks for. The
+  binding's service scopes, and the SAP role behind the connection, are what limit it.
 - **Small answers.** An answer carries the statement handle, the columns (name and type), up to
   `max_rows` rows (default 200, at most 1,000), reading further result partitions only as
   needed, the total `row_count`, `returned_rows`, `truncated` and `truncation_reasons`
@@ -129,7 +137,57 @@ the SQL with its database and schema for `snowflake_execute`.
 - `warehouse`, `database`, `schema` and `role` passed to `tools()` set every statement's
   context; a call may name its own `database` and `schema`.
 
-Each answer is compact JSON for the model and the same object in `ToolResult.structured`.
+Each answer is compact JSON for the model and the same object in `ToolResult.structured`. The
+answer the model reads is at most about 60 KiB; each tool declares a terminal payload of 160
+KiB (`max_terminal_payload_bytes`), which holds that answer and its structured copy.
+
+## SAP reads
+
+`sap.tools(client=None, slot="sap")` reads SAP S/4HANA (Cloud Public Edition, Private Edition or
+on-premise) over its released OData V2 APIs. It has no write tools, so there is nothing to
+approve and no `approval_policy()` or `review_fields()`. The broker allows only `GET` under
+`/sap/opu/odata/sap/<SERVICE>/` and sets the SAP client itself; each scope of the binding is one
+service the Agent may read (`API_BUSINESS_PARTNER.read`), and a service it doesn't hold answers
+`scope_not_allowed`.
+
+```python
+from cayu.connectors import sap
+
+app.register_agent(spec, tools=sap.tools(slot="sap"))
+```
+
+| Tool | Reads |
+| --- | --- |
+| `sap_read` | Any entity set of a granted service: `service`, `entity_set`, `select` (required), and an OData `filter`, `orderby` and `expand` |
+| `sap_supplier_invoices` | `A_SupplierInvoice` for 1 to 20 `company_codes` posted from `posting_date_from` to `posting_date_to` (both included, at most 93 days), most recent first, each with its purchase-order references |
+| `sap_purchase_order_items` | `A_PurchaseOrderItem` of the given `purchase_orders` |
+| `sap_goods_receipts` | `A_MaterialDocumentItem` with movement type 101 or 102 of the given `purchase_orders` |
+| `sap_suppliers` | `A_Supplier` by `suppliers` ID; with `include_bank: true` also each one's `BusinessPartner` and its bank accounts: the bank, its country and validity, never the account number, IBAN, bank key or account holder |
+
+- **Filters from typed arguments.** The named reads write `$filter` themselves: string values
+  are quoted with their quotes doubled, dates are `datetime'YYYY-MM-DDT00:00:00'`, and a list
+  of up to 100 values is compared in `or` chains of 20, one request each, read in turn as one
+  list. The model writes OData only for `sap_read`.
+- **Pages.** Each tool answers up to `top` rows (default 50, at most 500) from `skip` on, with
+  `count` (SAP's `__count`; null when a named read stopped before its last chain of values),
+  `returned` and `next_skip`, which is null on the last page. `skip` counts the rows SAP
+  counts, chain after chain, and following `next_skip` answers each row once. SAP can count
+  rows that the connection's authorisations then hide. A chain that answers none of the rows it
+  counts ends a page that already holds rows; with none yet, the read moves on past those
+  positions with the truncation reason `count_mismatch`, so `next_skip` never repeats `skip`
+  and no row comes twice.
+- **Plain rows.** SAP's `d.results` are unwrapped, `__metadata` and links of navigation
+  properties that weren't expanded are dropped, and an expanded list is a plain list. When SAP
+  pages an expanded list itself, only its first part arrives: the row names the property in
+  `incomplete_expansions` and the answer has the truncation reason `expansion_incomplete`.
+  Read the rest with `sap_read` on the navigation's own entity set.
+  `/Date(ms)/` becomes `YYYY-MM-DD` (with its time when it has one) and `/Date(ms+mmmm)/` an ISO
+  timestamp in its offset. Decimals stay the strings SAP sends.
+- **Small answers.** Rows are dropped from the end until the answer fits in about 60 KiB, with
+  `truncated: true`, `truncation_reasons` (`answer_size`; or `banks_incomplete`, `count_mismatch`,
+  `expansion_incomplete` as above) and `next_skip` at the first row left out. An answer
+  over the broker's 5 MiB fails with `upstream_response_too_large`: ask for a smaller `top`, or
+  fewer fields or expansions.
 
 ## Errors
 
@@ -141,12 +199,17 @@ A call that fails answers a tool error (`is_error`) whose `structured` holds `er
 | `connection_unbound`, `connection_not_ready`, `connection_unavailable`, `credential_invalid` | An admin must bind the slot or reconnect its connection |
 | `scope_not_allowed`, `path_not_allowed`, `method_not_allowed`, `connector_not_brokered` | Not allowed for this Agent; don't retry |
 | `too_many_calls` | Retry after `retry_after_seconds` (the broker's or the connector's `Retry-After`) |
-| `upstream_failed`, `connection_failed`, `upstream_status` (5xx) | A temporary failure; retry later (a running statement is read again on its own) |
+| `upstream_failed`, `connection_failed`, `upstream_status` (5xx), `upstream_invalid_response` | A temporary failure; retry later (a running statement is read again on its own) |
 | `upstream_response_too_large` | Ask for less (with the statement handle when the statement finished) |
 | `result_too_wide` | The columns alone don't fit: select fewer, or give them shorter names |
 | `slack_error` | Slack's own `{"ok": false}` answer, its error in `slack_error` |
 | `sql_error` | Snowflake refused the statement: its message, `snowflake_code`, `sql_state` and handle |
 | `statement_timed_out` | The statement was cancelled at the tool's time |
+| `sap_not_authorized` | SAP answered 401: the connection's credential was rejected, and an admin should check or rotate it; or 403: the communication arrangement or role for this service is missing in SAP |
+| `sap_not_found` | SAP answered 404: check the service, entity set and field names |
+| `sap_error` | SAP refused the read (4xx): its message, `sap_code` and `transaction_id` from a JSON error, or the `status` alone from an HTML or XML page |
+| `query_not_allowed` | The broker refused a query option SAP reads don't take |
+| `row_too_large` | One SAP row alone doesn't fit: select fewer fields or expand less |
 | `invalid_arguments`, `not_a_read`, `deadline_too_close` | Fix the call |
 
 An error in the tool's own code still raises, as in any tool.
