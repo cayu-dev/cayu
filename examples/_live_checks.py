@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Collection
 from pathlib import PurePosixPath
 from typing import Any
@@ -46,8 +47,12 @@ def is_superseded_browser_read_abort(
         return path.startswith("/api/") or _is_dashboard_static_file(path)
     if method != "POST":
         return False
-    return path in _READ_ONLY_POST_PATHS or (
-        path.startswith("/api/sessions/") and path.endswith("/topology")
+    return (
+        path in _READ_ONLY_POST_PATHS
+        or (path.startswith("/api/sessions/") and path.endswith("/topology"))
+        # Captured previews score retained evidence without saving or starting work.
+        # Closing the editor deliberately cancels this read through AbortController.
+        or re.fullmatch(r"/api/evals/sessions/[^/]+/evaluation/preview", path) is not None
     )
 
 

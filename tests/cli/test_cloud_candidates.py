@@ -67,9 +67,21 @@ class CandidateCloud:
         self.staged_as_candidate = staged_as_candidate
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
         self.candidate: dict[str, Any] | None = None
+        self.session_policy: dict[str, Any] | None = None
+
+    def _store_session_choice(self, payload: dict[str, Any]) -> None:
+        if "session_policy" in payload:
+            self.session_policy = {
+                "mode": payload["session_policy"],
+                "wait_seconds": payload.get("session_wait_seconds", 900),
+                "acknowledge_sessions": payload.get("acknowledge_sessions", []),
+                "source": "explicit",
+            }
 
     def _release(self, status: str) -> dict[str, Any]:
         release: dict[str, Any] = {"id": "dep_candidate", "status": status}
+        if self.session_policy is not None:
+            release["session_policy"] = self.session_policy
         if self.staged_as_candidate:
             release["candidate"] = stored_candidate(self.candidate or {})
         return release
@@ -89,6 +101,7 @@ class CandidateCloud:
             }
         if method == "POST" and path == "/v1/applications/smoke-agent/deployments":
             self.candidate = kwargs["payload"].get("candidate")
+            self._store_session_choice(kwargs["payload"])
             return self._release("accepted")
         if method == "GET" and path == "/v1/applications/smoke-agent/deployments/dep_candidate":
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
@@ -459,6 +472,7 @@ class ConflictingCloud(CandidateCloud):
             if self.retry is not None:
                 raise self.retry
             self.candidate = {"evaluated_against_deployment_id": "dep_live"}
+            self._store_session_choice(kwargs["payload"])
             return self._release("accepted")
         if method == "GET" and path == "/v1/applications/smoke-agent/deployments":
             self.requests.append((method, path, kwargs))

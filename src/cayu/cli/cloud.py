@@ -219,7 +219,9 @@ _SESSION_PUBLICATION_FAILURES = frozenset(
     {"unfinished_sessions", "sessions_unreadable", "held_tasks"}
 )
 # Session checks after which Cloud publishes, whatever choice is stored later.
-_PASSED_SESSION_CHECKS = frozenset({"clear", "acknowledged", "unsupported", "not_running"})
+_PASSED_SESSION_CHECKS = frozenset(
+    {"clear", "acknowledged", "consented", "unsupported", "not_running"}
+)
 # A waiting preflight's `waiting_for` (Cloud names sessions, session_read or agent_wake).
 _SESSION_WAITING_FOR = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # Cloud's bounds on a candidate release's statement (`deploy --no-promote`).
@@ -367,7 +369,8 @@ class _CloudServicePublicationError(CloudApiError):
                     parts.append(
                         "Let the tasks finish and retry, or accept that "
                         + ("every task the worker holds is" if everyone else "they are")
-                        + f" interrupted with `{retry_command}`, or {wait_step}."
+                        + f" interrupted with `{retry_command}`, or {wait_step}. "
+                        "Any unfinished sessions named by the retry may not resume on this release."
                     )
                 else:
                     parts.append(
@@ -2041,17 +2044,15 @@ def _session_choice(arguments: argparse.Namespace) -> dict[str, Any] | None:
     }
 
 
-def _session_choice_payload(
-    arguments: argparse.Namespace, *, omit_default: bool = False
-) -> dict[str, Any] | None:
+def _session_choice_payload(arguments: argparse.Namespace) -> dict[str, Any] | None:
     """The request fields for the command line's session choice.
 
-    Omitted without a choice, so the Release keeps its current one. A create request also
-    omits Cloud's default choice, so it and its idempotency key stay as before.
+    Omitted without a choice, so the Release keeps its current one. Explicit wait is
+    retained: Cloud uses it to override the serving release's source declaration.
     """
 
     choice = _session_choice(arguments)
-    if choice is None or (omit_default and _default_session_choice(choice)):
+    if choice is None:
         return None
     payload: dict[str, Any] = {"session_policy": choice["mode"]}
     if getattr(arguments, "session_wait_seconds", None) is not None:
@@ -2089,6 +2090,13 @@ def _stored_session_choice(deployment: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _explicit_session_choice(deployment: dict[str, Any]) -> bool:
+    """Whether Cloud positively records an operator-supplied choice."""
+
+    stored = deployment.get("session_policy")
+    return isinstance(stored, dict) and stored.get("source") == "explicit"
+
+
 def _stored_session_wait_seconds(release: dict[str, Any] | None) -> int:
     """How long a Release's stored choice waits; Cloud's default when it's unreadable."""
 
@@ -2106,8 +2114,9 @@ def _session_retry_acknowledgements(
 ) -> list[str] | None:
     """The sessions a `proceed` retry of a refused Release names, or None if none can pass.
 
-    Cloud lists only the blocking sessions the Release's choice doesn't acknowledge yet,
-    and a retry replaces that choice, so the retry also names the ones it acknowledges.
+    Cloud names the sessions and tasks the retry must acknowledge, including consented
+    approvals that an explicit proceed choice would otherwise protect. A retry replaces
+    the stored choice, so retain its previous proceed acknowledgements too.
     Cloud lists at most 100 sessions; when its preflight is `truncated`, a retry naming
     only those can't pass, and neither can one over Cloud's limit.
     """
@@ -3041,9 +3050,8 @@ def _deploy(
     correlation_id = _correlation_id("deploy")
     acknowledged = _acknowledged_revisions(arguments)
     acknowledgement = _acknowledgement_payload(acknowledged)
-    # The choice given on the command line, even Cloud's default, is what a retry or
-    # promote of this source's Release carries. The create omits Cloud's default choice,
-    # so that request and its key stay as before.
+    # Every explicit choice, including default wait, goes to create/retry/promote.
+    # Its presence also belongs in the key because it overrides source consent.
     session_choice = _session_choice(arguments)
     session_payload = _session_choice_payload(arguments)
     candidate = _requested_candidate(arguments)
@@ -3051,7 +3059,7 @@ def _deploy(
     staging = candidate is not None
     create_payload = {
         **(acknowledgement or {}),
-        **(_session_choice_payload(arguments, omit_default=True) or {}),
+        **(session_payload or {}),
         **({} if candidate is None else {"candidate": candidate}),
     }
     retry_payload = {**(acknowledgement or {}), **(session_payload or {})} or None
@@ -3743,16 +3751,15 @@ def _published_before(
     Then whatever choice it keeps isn't this command's doing. A `promoted` Release may
     still be mid-check, so it counts only when its recorded check already passed or the
     Agent's service runs it; an unreadable service counts as not running it. Only read
-    when the command's session choice differs from the Release's.
+    the service when the command's session choice differs from the Release's.
     """
 
-    if _deployment_status(deployment) != "promoted" or not _session_choice_pending(
-        deployment, session_choice
-    ):
+    if _deployment_status(deployment) != "promoted" or session_choice is None:
         return False
-    preflight = deployment.get("session_preflight")
-    if isinstance(preflight, dict) and preflight.get("state") in _PASSED_SESSION_CHECKS:
+    if _passed_session_check(deployment):
         return True
+    if not _session_choice_pending(deployment, session_choice):
+        return False
     try:
         service = _read_or_none(client, f"/v1/applications/{application_id}/service")
     except CloudApiError as exc:
@@ -3762,10 +3769,20 @@ def _published_before(
     return service is not None and service.get("deployment_id") == deployment.get("id")
 
 
+def _passed_session_check(deployment: dict[str, Any]) -> bool:
+    preflight = deployment.get("session_preflight")
+    return isinstance(preflight, dict) and preflight.get("state") in _PASSED_SESSION_CHECKS
+
+
 def _session_choice_pending(deployment: dict[str, Any], choice: dict[str, Any] | None) -> bool:
     """Whether the command line made a session choice the Release doesn't have."""
 
-    return choice is not None and _stored_session_choice(deployment) != choice
+    if choice is None:
+        return False
+    if _stored_session_choice(deployment) != choice:
+        return True
+    # Only explicit positive evidence proves default wait overrode source consent.
+    return _default_session_choice(choice) and not _explicit_session_choice(deployment)
 
 
 def _not_applied(
@@ -3785,7 +3802,8 @@ def _not_applied(
     A choice sent with a promote is stored even when Cloud's own finalize already passed
     the session check under the earlier one, so `check_preflight` also compares the
     Release's recorded check with the choice. Without a recorded check the choice is
-    reported as unconfirmed.
+    reported as unconfirmed. An existing passed check is always compared, including
+    replays whose stored choice already matches: the receipt can predate that choice.
     """
 
     carried = deployment.get("acknowledge_breaking")
@@ -3799,6 +3817,19 @@ def _not_applied(
         outcome, checked = "applied", None
         if stored != session_choice:
             outcome = "not_applied"
+        elif _passed_session_check(deployment):
+            # The receipt proves publication's effect even when choice provenance is
+            # unreadable. It does not manufacture explicit provenance for later mutations.
+            outcome, checked = _checked_session_choice(deployment, session_choice)
+        elif _session_choice_pending(deployment, session_choice):
+            policy = deployment.get("session_policy")
+            # A known default proves the explicit override was not stored. Missing or
+            # unknown provenance proves neither application nor non-application.
+            outcome = (
+                "not_applied"
+                if isinstance(policy, dict) and policy.get("source") == "default"
+                else "unconfirmed"
+            )
         elif check_preflight:
             outcome, checked = _checked_session_choice(deployment, session_choice)
         if outcome != "applied":
@@ -3861,34 +3892,70 @@ def _checked_session_choice(
     state = preflight.get("state")
     if state in {"clear", "unsupported", "not_running", "superseded"}:
         return "applied", None
+    if state == "consented" and requested["mode"] != "proceed":
+        return "not_applied", {"mode": "wait", "source": "default"}
     if state in {"waiting", "blocked"}:
         # Cloud rechecks a waiting or refused publication under the stored choice.
         return ("applied" if preflight.get("policy") == requested["mode"] else "unconfirmed"), None
-    if state != "acknowledged":
+    if state not in {"acknowledged", "consented"}:
         return "unconfirmed", None
     if _ACKNOWLEDGE_ALL_SESSIONS in requested["acknowledge_sessions"]:
         return "applied", None
     if preflight.get("read") != "complete":
+        if state == "consented":
+            return "unconfirmed", None
         # Unread sessions pass only under '*'.
         acknowledged = [_ACKNOWLEDGE_ALL_SESSIONS]
     else:
         sessions = preflight.get("sessions")
         if not isinstance(sessions, list) or preflight.get("truncated") is not False:
             return "unconfirmed", None
+        if state == "consented" and any(
+            not isinstance(item, dict)
+            or not _valid_session_id(item.get("id"))
+            or (
+                not isinstance(item.get("replacement_consent"), dict)
+                and not _safe_unconsented_session(item)
+            )
+            for item in sessions
+        ):
+            return "unconfirmed", None
         acknowledged = sorted(
             {
                 item["id"]
                 for item in sessions
                 if isinstance(item, dict)
-                and item.get("blocking") is True
-                and item.get("acknowledged") is True
+                and (
+                    (
+                        state == "acknowledged"
+                        and item.get("blocking") is True
+                        and item.get("acknowledged") is True
+                    )
+                    or (state == "consented" and isinstance(item.get("replacement_consent"), dict))
+                )
                 and _valid_session_id(item.get("id"))
             }
         )
+    if state == "consented" and not acknowledged:
+        return "unconfirmed", None
     checked = {"acknowledge_sessions": acknowledged, "mode": "proceed"}
     if _more_permissive_session_choice(checked, requested):
         return "not_applied", checked
     return "applied", None
+
+
+def _safe_unconsented_session(item: dict[str, Any]) -> bool:
+    """Positive Cloud evidence that an unconsented row adds no replacement risk."""
+
+    outcome = item.get("outcome")
+    return (
+        "replacement_consent" in item
+        and item["replacement_consent"] is None
+        and item.get("blocking") is False
+        and item.get("acknowledged") is False
+        and isinstance(outcome, str)
+        and outcome in {"at_boundary", "earlier_release"}
+    )
 
 
 def _more_permissive_publication(
@@ -3906,6 +3973,12 @@ def _more_permissive_publication(
     preflight = deployment.get("session_preflight")
     state = preflight.get("state") if isinstance(preflight, dict) else None
     if state is None or state == "waiting":
+        if (
+            _default_session_choice(kept)
+            and not _explicit_session_choice(deployment)
+            and _ACKNOWLEDGE_ALL_SESSIONS not in requested["acknowledge_sessions"]
+        ):
+            return True
         return _more_permissive_session_choice(kept, requested)
     if state == "blocked":
         return False
@@ -3945,17 +4018,12 @@ def _deployment_idempotency_key(
     session_choice: dict[str, Any] | None = None,
     candidate: dict[str, Any] | None = None,
 ) -> str:
-    # Cloud refuses a key reused with another acknowledgement, session choice or candidate
-    # statement, so a nonempty acknowledgement, a non-default choice and a candidate are
-    # part of the key. Without them the key is unchanged from earlier CLI releases.
+    # Presence is authority: explicit default wait overrides source consent, whereas
+    # omission allows Cloud to consult it. Every supplied choice belongs in the key.
     identity = json.dumps(
         [application_id, version, revision]
         + ([sorted(set(acknowledge_breaking))] if acknowledge_breaking else [])
-        + (
-            [{"session_policy": session_choice}]
-            if session_choice is not None and not _default_session_choice(session_choice)
-            else []
-        )
+        + ([{"session_policy": session_choice}] if session_choice is not None else [])
         + ([{"candidate": candidate}] if candidate is not None else []),
         ensure_ascii=True,
         separators=(",", ":"),

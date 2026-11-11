@@ -98,7 +98,10 @@ class Client:
                 "acknowledge_breaking": kwargs["payload"].get("acknowledge_breaking", []),
                 "id": "dep_old",
                 "status": self.status,
-                "session_policy": _cloud_choice(kwargs["payload"]),
+                "session_policy": {
+                    **_cloud_choice(kwargs["payload"]),
+                    **({"source": "explicit"} if "session_policy" in kwargs["payload"] else {}),
+                },
             }
         if path.endswith("/timeline"):
             return {
@@ -115,7 +118,7 @@ class Client:
             return {
                 "id": "dep_new",
                 "status": "accepted",
-                "session_policy": _cloud_choice(kwargs.get("payload")),
+                "session_policy": {**_cloud_choice(kwargs.get("payload")), "source": "explicit"},
             }
         raise AssertionError((method, path))
 
@@ -261,11 +264,10 @@ def test_session_choice_normalizes_like_cloud(flags, choice):
 # Request bodies and idempotency
 
 
-@pytest.mark.parametrize("flags", [[], ["--session-policy", "wait"]])
-def test_deploy_with_the_default_choice_keeps_payload_and_submission_key(tmp_path, flags):
+def test_deploy_without_a_choice_keeps_payload_and_submission_key(tmp_path):
     project = _project(tmp_path)
     client = Client(project)
-    _deploy(client, project, tmp_path, *flags)
+    _deploy(client, project, tmp_path)
     create = _posts(client, "/deployments")[0]
     assert create["idempotency_key"] == _legacy_source_key(project)
     assert create["payload"] == project.manifest.deployment_payload(
@@ -566,7 +568,7 @@ class RefusedReleaseClient(Client):
             self.requests.append((method, path, kwargs))
             payload = kwargs["payload"]
             if "session_policy" in payload:
-                self.stored = _cloud_choice(payload)
+                self.stored = {**_cloud_choice(payload), "source": "explicit"}
             if self.after_retry is not None:
                 self.reads = [{**self.release, **self.after_retry}]
             return {
@@ -580,7 +582,7 @@ class RefusedReleaseClient(Client):
             # Cloud selects the Release and stores a choice the promote carries.
             payload = kwargs["payload"]
             if "session_policy" in payload:
-                self.stored = _cloud_choice(payload)
+                self.stored = {**_cloud_choice(payload), "source": "explicit"}
             last = self.reads[-1] if self.reads else self.current
             self.reads = [{**last, "status": "promoted", **self.on_promote}]
             return {"id": "session-agent", "revision": 2, "current_deployment_id": "dep_old"}
@@ -697,8 +699,11 @@ def test_rerun_without_waiting_fails_when_a_more_permissive_choice_stays(tmp_pat
         (_PROCEED_ALL, {"session_preflight": {"state": "clear", "policy": "proceed"}}),
         # Refused: nothing was published.
         (_PROCEED_ALL, {"session_preflight": {**_BLOCKED, "policy": "proceed"}}),
-        # `wait` keeps every session `block` protects; the difference is only reported.
-        (None, {"status": "image_built"}),
+        # Explicit wait keeps every session block protects.
+        (
+            {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": [], "source": "explicit"},
+            {"status": "image_built"},
+        ),
     ],
 )
 def test_rerun_of_a_candidate_reports_a_kept_choice_that_strands_nothing(
@@ -725,9 +730,18 @@ def test_rerun_of_a_candidate_reports_a_kept_choice_that_strands_nothing(
 
 
 def test_rerun_without_waiting_reports_a_kept_choice_that_strands_nothing(tmp_path, capsys):
-    # `wait` keeps every session `block` protects; the difference is only reported.
+    # Explicit wait keeps every session block protects.
     project = _project(tmp_path)
-    client = RefusedReleaseClient(project, current={"status": "image_built"})
+    client = RefusedReleaseClient(
+        project,
+        current={"status": "image_built"},
+        stored_choice={
+            "mode": "wait",
+            "wait_seconds": 900,
+            "acknowledge_sessions": [],
+            "source": "explicit",
+        },
+    )
     result = _deploy(client, project, tmp_path, "--session-policy", "block")
     not_applied = result["result"]["not_applied"]
     assert not_applied["more_permissive"] is False
@@ -798,16 +812,19 @@ def test_rerun_with_the_release_choice_already_stored_does_not_retry(tmp_path):
 
 def test_rerun_with_the_default_choice_retries_a_release_refused_under_another(tmp_path):
     # `deploy --session-policy block` was refused; rerunning with Cloud's default choice
-    # keeps the legacy create (which conflicts) and retries the Release with `wait`.
+    # sends explicit wait under its own identity and retries a conflicting release.
     project = _project(tmp_path)
     block = {"acknowledge_sessions": [], "mode": "block", "wait_seconds": 900}
     client = RefusedReleaseClient(project, stored_choice=block, conflict=True)
     result = _deploy(client, project, tmp_path, "--session-policy", "wait")
     (create,) = _posts(client, "/deployments")
-    assert create["idempotency_key"] == _legacy_source_key(project)
-    assert create["payload"] == project.manifest.deployment_payload(
-        repository=project.repository, revision=project.revision
-    )
+    assert create["idempotency_key"] != _legacy_source_key(project)
+    assert create["payload"] == {
+        **project.manifest.deployment_payload(
+            repository=project.repository, revision=project.revision
+        ),
+        "session_policy": "wait",
+    }
     (retry,) = _posts(client, "/retry")
     assert retry["payload"] == {"session_policy": "wait"}
     assert result["result"]["retry"]["session_policy"] == {
@@ -1615,7 +1632,9 @@ def test_wait_tolerates_unknown_fields_and_values(capsys):
     assert "waiting for the serving release's unfinished sessions" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("state", ["clear", "blocked", "acknowledged", "unsupported", None])
+@pytest.mark.parametrize(
+    "state", ["clear", "blocked", "acknowledged", "consented", "unsupported", None]
+)
 def test_a_preflight_that_is_not_waiting_does_not_hold_the_wait(state, capsys):
     clock = _Clock()
     client = _SequenceClient([_held(_waiting_preflight(state=state))])
@@ -1805,3 +1824,755 @@ def test_service_wait_stops_at_a_superseded_release(selected, superseded, capsys
         wait()
     assert clock.now == 0
     assert _failure_envelope(raised, capsys)["category"] == "release_superseded"
+
+
+@pytest.mark.parametrize("flags", [["--session-policy", "wait"], ["--session-wait-seconds", "900"]])
+def test_explicit_default_wait_is_distinct_from_omitted_choice(tmp_path, flags):
+    project = _project(tmp_path)
+    client = Client(project)
+    _deploy(client, project, tmp_path, *flags)
+    create = _posts(client, "/deployments")[0]
+    assert create["payload"]["session_policy"] == "wait"
+    assert create["idempotency_key"] != _legacy_source_key(project)
+
+
+def test_explicit_wait_requires_positive_stored_choice_provenance():
+    choice = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []}
+    for source in (None, "default", True, "future"):
+        stored = {**choice, **({} if source is None else {"source": source})}
+        assert cloud._session_choice_pending({"session_policy": stored}, choice)
+    assert not cloud._session_choice_pending(
+        {"session_policy": {**choice, "source": "explicit"}}, choice
+    )
+
+
+def test_declared_consent_does_not_confirm_an_explicit_wait():
+    choice = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []}
+    deployment = {
+        "session_policy": {**choice, "source": "explicit"},
+        "session_preflight": {"state": "consented", "policy": "wait"},
+    }
+    assert cloud._checked_session_choice(deployment, choice)[0] != "applied"
+
+
+def test_implicit_wait_may_apply_source_consent_and_cannot_confirm_block(tmp_path, capsys):
+    project = _project(tmp_path)
+    client = RefusedReleaseClient(project, current={"status": "image_built"})
+    with pytest.raises(CloudApiError) as raised:
+        _deploy(client, project, tmp_path, "--session-policy", "block")
+    error = _failure_envelope(raised, capsys)
+    assert error["category"] == "session_choice_not_applied"
+    assert error["not_applied"]["more_permissive"] is True
+
+
+def test_consented_preflight_is_past_check_without_reading_service(tmp_path):
+    project = _project(tmp_path)
+    client = Client(project)
+    deployment = {
+        "id": "dep_old",
+        "status": "promoted",
+        "session_preflight": {"state": "consented"},
+    }
+    assert cloud._published_before(
+        client,
+        deployment=deployment,
+        application_id="session-agent",
+        session_choice={"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []},
+    )
+    assert not client.requests
+
+
+def test_consented_preflight_agrees_with_explicit_wildcard_risk():
+    deployment = {"session_preflight": {"state": "consented"}}
+    assert cloud._checked_session_choice(
+        deployment, {"mode": "proceed", "acknowledge_sessions": ["*"], "wait_seconds": 900}
+    ) == ("applied", None)
+
+
+def test_explicit_default_wait_spellings_share_operation_identity(tmp_path):
+    project = _project(tmp_path)
+    keys = []
+    for flags in (["--session-policy", "wait"], ["--session-wait-seconds", "900"]):
+        client = Client(project)
+        _deploy(client, project, tmp_path, *flags)
+        keys.append(_posts(client, "/deployments")[0]["idempotency_key"])
+    assert keys[0] == keys[1]
+
+
+@pytest.mark.parametrize(
+    "ids,expected", [(["s1"], "applied"), (["s2"], "not_applied"), (["*"], "applied")]
+)
+def test_consent_receipt_compares_exact_acknowledged_session_risk(ids, expected):
+    preflight = {
+        "state": "consented",
+        "read": "complete",
+        "truncated": False,
+        "sessions": [
+            {
+                "id": "s1",
+                "blocking": False,
+                "replacement_consent": {"serving_deployment_id": "dep_serving", "actions": []},
+            }
+        ],
+    }
+    result, _ = cloud._checked_session_choice(
+        {"session_preflight": preflight},
+        {"mode": "proceed", "acknowledge_sessions": ids, "wait_seconds": 900},
+    )
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"id": True, "replacement_consent": {}}, {"id": "s2", "replacement_consent": True}, None],
+)
+def test_ambiguous_consent_receipt_cannot_be_hidden_by_valid_session(bad):
+    preflight = {
+        "state": "consented",
+        "read": "complete",
+        "truncated": False,
+        "sessions": [{"id": "s1", "replacement_consent": {}}, bad],
+    }
+    assert (
+        cloud._checked_session_choice(
+            {"session_preflight": preflight},
+            {"mode": "proceed", "acknowledge_sessions": ["s1"], "wait_seconds": 900},
+        )[0]
+        == "unconfirmed"
+    )
+
+
+def test_clear_sibling_null_receipt_does_not_hide_exact_consented_session():
+    preflight = {
+        "state": "consented",
+        "read": "complete",
+        "truncated": False,
+        "sessions": [
+            {"id": "s1", "replacement_consent": {}},
+            {
+                "id": "safe",
+                "replacement_consent": None,
+                "blocking": False,
+                "acknowledged": False,
+                "outcome": "at_boundary",
+            },
+        ],
+    }
+    assert (
+        cloud._checked_session_choice(
+            {"session_preflight": preflight},
+            {"mode": "proceed", "acknowledge_sessions": ["s1"], "wait_seconds": 900},
+        )[0]
+        == "applied"
+    )
+
+
+# Acceptance coverage through request preparation, promotion/readback, and final reporting.
+def _consented_preflight():
+    return {
+        "state": "consented",
+        "policy": "wait",
+        "read": "complete",
+        "truncated": False,
+        "sessions": [
+            {
+                "id": "s1",
+                "blocking": False,
+                "replacement_consent": {
+                    "serving_deployment_id": "dep_serving",
+                    "actions": [
+                        {
+                            "id": "approval_1",
+                            "agent_name": "issue_filer",
+                            "tool_name": "file_issue",
+                            "reason": "Continuation may be lost.",
+                        }
+                    ],
+                },
+            },
+            {
+                "id": "safe",
+                "blocking": False,
+                "replacement_consent": None,
+                "acknowledged": False,
+                "outcome": "earlier_release",
+            },
+        ],
+    }
+
+
+class ConsentCloud(RefusedReleaseClient):
+    """Record real deployment readbacks without replacing any CLI policy owner."""
+
+    def __init__(self, *args, forbid_service_read=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.readbacks = []
+        self.forbid_service_read = forbid_service_read
+
+    def request(self, method, path, **kwargs):
+        if self.forbid_service_read and method == "GET" and path.endswith("/service"):
+            raise AssertionError("A consented receipt must prove the earlier check passed.")
+        response = super().request(method, path, **kwargs)
+        if method == "GET" and path.endswith("/deployments/dep_old"):
+            self.readbacks.append(response)
+        return response
+
+
+def _consent_promotion(tmp_path, *flags, preflight):
+    project = _project(tmp_path, web=True)
+    client = ConsentCloud(
+        project,
+        stored_choice={"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []},
+        status="image_built",
+        reads=[{"status": "image_built"}, {"status": "image_built"}, {"status": "smoke_tested"}],
+        on_promote={"session_preflight": preflight},
+    )
+    return client, lambda: _deploy(client, project, tmp_path, *flags, wait=True)
+
+
+def _assert_consent_promotion(client, preflight, *, mode, sessions=None):
+    expected = {"session_policy": mode, "expected_application_revision": 1}
+    if sessions is not None:
+        expected["acknowledge_sessions"] = sessions
+    (promote,) = _posts(client, "/promote")
+    assert promote["payload"] == expected
+    assert not _posts(client, "/retry")
+    readback = client.readbacks[-1]
+    assert readback["session_policy"] == {
+        "mode": mode,
+        "wait_seconds": 900,
+        "acknowledge_sessions": sessions or [],
+        "source": "explicit",
+    }
+    # The full earlier receipt survives the readback; reporting cannot rewrite it as clear.
+    assert readback["session_preflight"] == preflight
+
+
+@pytest.mark.parametrize("mode", ["wait", "block"])
+def test_consent_cli_promotion_race_refuses_new_protection(tmp_path, capsys, mode):
+    preflight = _consented_preflight()
+    client, deploy = _consent_promotion(tmp_path, "--session-policy", mode, preflight=preflight)
+    with pytest.raises(CloudApiError) as raised:
+        deploy()
+    _assert_consent_promotion(client, preflight, mode=mode)
+    error = _failure_envelope(raised, capsys)
+    assert error["category"] == "session_choice_not_applied"
+    assert error["deployment_id"] == "dep_old"
+    reported = error["not_applied"]
+    assert reported["confirmed"] is True
+    assert reported["more_permissive"] is True
+    assert reported["release_session_policy"]["mode"] == mode
+    assert reported["checked_session_policy"] == {"mode": "wait", "source": "default"}
+    assert "passed its session check under the earlier `wait` choice" in error["message"]
+
+
+@pytest.mark.parametrize("mode", ["wait", "block"])
+def test_consent_cli_already_published_replay_warns_without_mutating(tmp_path, capsys, mode):
+    project = _project(tmp_path)
+    preflight = _consented_preflight()
+    client = ConsentCloud(
+        project,
+        status="promoted",
+        current={"status": "promoted", "session_preflight": preflight},
+        serving="dep_other",
+        forbid_service_read=True,
+    )
+    client.release["session_preflight"] = preflight
+    output = _deploy(client, project, tmp_path, "--session-policy", mode)
+    result = output["result"]
+    assert result["deployment"]["session_preflight"] == preflight
+    assert result["deployment"]["status"] == "promoted"
+    assert result["service_publication_requested"] is False
+    assert "retry" not in result
+    assert not _posts(client, "/retry")
+    assert not _posts(client, "/promote")
+    assert not [path for method, path, _ in client.requests if path.endswith("/service")]
+    reported = result["not_applied"]
+    assert reported["confirmed"] is True
+    assert reported["more_permissive"] is True
+    assert reported["session_policy"]["mode"] == mode
+    assert reported["release_session_policy"] == {
+        "mode": "wait",
+        "wait_seconds": 900,
+        "acknowledge_sessions": [],
+    }
+    assert reported["message"] in capsys.readouterr().err
+    assert "did not apply" in reported["message"]
+
+
+@pytest.mark.parametrize("session,accepted", [("s1", True), ("s2", False), ("*", True)])
+def test_consent_cli_promotion_compares_exact_session_risk(tmp_path, capsys, session, accepted):
+    preflight = _consented_preflight()
+    client, deploy = _consent_promotion(
+        tmp_path, "--acknowledge-session", session, preflight=preflight
+    )
+    if accepted:
+        result = deploy()["result"]
+        assert "not_applied" not in result
+        assert result["deployment"]["session_preflight"] == preflight
+        assert result["deployment"]["session_policy"]["source"] == "explicit"
+        assert "did not apply" not in capsys.readouterr().err
+    else:
+        with pytest.raises(CloudApiError) as raised:
+            deploy()
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        reported = error["not_applied"]
+        assert reported["confirmed"] is True
+        assert reported["more_permissive"] is True
+        assert reported["session_policy"]["acknowledge_sessions"] == ["s2"]
+        assert reported["checked_session_policy"] == {
+            "mode": "proceed",
+            "acknowledge_sessions": ["s1"],
+        }
+    _assert_consent_promotion(client, preflight, mode="proceed", sessions=[session])
+
+
+@pytest.mark.parametrize("session", ["s1", "*"])
+@pytest.mark.parametrize("order", ["before", "after", "only"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"id": True, "replacement_consent": {}},
+        {"id": "s2", "replacement_consent": True},
+        None,
+    ],
+)
+def test_consent_cli_ambiguous_promotion_receipts_fail_closed(
+    tmp_path, capsys, session, order, bad
+):
+    preflight = _consented_preflight()
+    valid = preflight["sessions"][0]
+    preflight["sessions"] = {"before": [bad, valid], "after": [valid, bad], "only": [bad]}[order]
+    client, deploy = _consent_promotion(
+        tmp_path, "--acknowledge-session", session, preflight=preflight
+    )
+    if session == "*":
+        # The explicit wildcard already accepts all continuation loss, including unknowns.
+        result = deploy()["result"]
+        assert "not_applied" not in result
+        assert result["deployment"]["session_preflight"] == preflight
+    else:
+        with pytest.raises(CloudApiError) as raised:
+            deploy()
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        reported = error["not_applied"]
+        assert reported["confirmed"] is False
+        assert reported["more_permissive"] is True
+        assert "checked_session_policy" not in reported
+        assert reported["session_policy"]["acknowledge_sessions"] == ["s1"]
+    _assert_consent_promotion(client, preflight, mode="proceed", sessions=[session])
+
+
+@pytest.mark.parametrize("session", ["s1", "*"])
+@pytest.mark.parametrize("incomplete", [{"read": "unreadable"}, {"truncated": True}])
+def test_consent_cli_incomplete_promotion_receipt_requires_wildcard(
+    tmp_path, capsys, session, incomplete
+):
+    preflight = {**_consented_preflight(), **incomplete}
+    client, deploy = _consent_promotion(
+        tmp_path, "--acknowledge-session", session, preflight=preflight
+    )
+    if session == "*":
+        result = deploy()["result"]
+        assert "not_applied" not in result
+        assert result["deployment"]["session_preflight"] == preflight
+    else:
+        with pytest.raises(CloudApiError) as raised:
+            deploy()
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        assert error["not_applied"]["confirmed"] is False
+        assert error["not_applied"]["more_permissive"] is True
+    _assert_consent_promotion(client, preflight, mode="proceed", sessions=[session])
+
+
+@pytest.mark.parametrize("source", [None, "default", True, "future", "explicit"])
+def test_consent_cli_retry_requires_positive_explicit_wait_provenance(capsys, source):
+    stored = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []}
+    if source is not None:
+        stored["source"] = source
+
+    class RetryCloud:
+        def __init__(self):
+            self.requests = []
+
+        def request(self, method, path, **kwargs):
+            self.requests.append((method, path, kwargs))
+            if method == "GET" and path == "/v1/applications":
+                return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
+            assert (method, path) == (
+                "POST",
+                "/v1/applications/session-agent/deployments/dep_old/retry",
+            )
+            return {"id": "dep_new", "status": "accepted", "session_policy": stored}
+
+    client = RetryCloud()
+    arguments = cloud._build_parser().parse_args(
+        [
+            "deployment",
+            "retry",
+            "dep_old",
+            "--application",
+            "session-agent",
+            "--session-policy",
+            "wait",
+        ]
+    )
+    if source == "explicit":
+        output = cloud._deployment(arguments, client=client)
+        assert output["operation"] == "deployment.retry"
+        assert output["result"]["session_policy"] == stored
+        assert "not_applied" not in output
+        assert "did not apply" not in capsys.readouterr().err
+    else:
+        with pytest.raises(CloudApiError) as raised:
+            cloud._deployment(arguments, client=client)
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        assert error["not_applied"]["confirmed"] is (source == "default")
+        assert error["not_applied"]["more_permissive"] is True
+        assert error["not_applied"]["session_policy"]["mode"] == "wait"
+    (retry,) = _posts(client, "/retry")
+    assert retry["payload"] == {"session_policy": "wait"}
+    assert "source" not in retry["payload"]
+
+
+@pytest.mark.parametrize("mode", ["wait", "block"])
+@pytest.mark.parametrize("state", ["consented", "acknowledged", "clear"])
+def test_replayed_matching_explicit_policy_still_checks_publication_receipt(
+    tmp_path, capsys, mode, state
+):
+    project = _project(tmp_path)
+    preflight = (
+        _consented_preflight()
+        if state == "consented"
+        else _ACKNOWLEDGED_S1
+        if state == "acknowledged"
+        else {"state": "clear"}
+    )
+    stored = {"mode": mode, "wait_seconds": 900, "acknowledge_sessions": [], "source": "explicit"}
+    client = ConsentCloud(
+        project,
+        status="promoted",
+        stored_choice=stored,
+        current={"status": "promoted", "session_preflight": preflight},
+        serving="dep_other",
+        forbid_service_read=True,
+    )
+    client.release["session_preflight"] = preflight
+    result = _deploy(client, project, tmp_path, "--session-policy", mode)["result"]
+    assert result["deployment"]["session_preflight"] == preflight
+    assert result["deployment"]["session_policy"] == stored
+    assert not _posts(client, "/retry")
+    assert not _posts(client, "/promote")
+    if state == "clear":
+        assert "not_applied" not in result
+        assert "did not apply" not in capsys.readouterr().err
+    else:
+        assert result["not_applied"]["confirmed"] is True
+        assert result["not_applied"]["more_permissive"] is True
+        assert "did not apply" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("session,accepted", [("s1", True), ("s2", False), ("*", True)])
+def test_replayed_matching_proceed_policy_compares_exact_receipt(
+    tmp_path, capsys, session, accepted
+):
+    project = _project(tmp_path)
+    preflight = _consented_preflight()
+    stored = {
+        "mode": "proceed",
+        "wait_seconds": 900,
+        "acknowledge_sessions": [session],
+        "source": "explicit",
+    }
+    client = ConsentCloud(
+        project,
+        status="promoted",
+        stored_choice=stored,
+        current={"status": "promoted", "session_preflight": preflight},
+        forbid_service_read=True,
+    )
+    client.release["session_preflight"] = preflight
+    result = _deploy(client, project, tmp_path, "--acknowledge-session", session)["result"]
+    assert ("not_applied" not in result) is accepted
+    assert ("did not apply" not in capsys.readouterr().err) is accepted
+    assert not _posts(client, "/retry")
+    assert not _posts(client, "/promote")
+
+
+def test_retry_replayed_matching_explicit_policy_checks_publication_receipt(capsys):
+    stored = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": [], "source": "explicit"}
+    preflight = _consented_preflight()
+
+    class RetryCloud:
+        def request(self, method, path, **kwargs):
+            if method == "GET" and path == "/v1/applications":
+                return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
+            assert (method, path) == (
+                "POST",
+                "/v1/applications/session-agent/deployments/dep_old/retry",
+            )
+            assert kwargs["payload"] == {"session_policy": "wait"}
+            return {
+                "id": "dep_old",
+                "status": "promoted",
+                "session_policy": stored,
+                "session_preflight": preflight,
+            }
+
+    arguments = cloud._build_parser().parse_args(
+        [
+            "deployment",
+            "retry",
+            "dep_old",
+            "--application",
+            "session-agent",
+            "--session-policy",
+            "wait",
+        ]
+    )
+    output = cloud._deployment(arguments, client=RetryCloud())
+    assert output["result"]["session_preflight"] == preflight
+    assert output["not_applied"]["confirmed"] is True
+    assert output["not_applied"]["more_permissive"] is True
+    assert "did not apply" in capsys.readouterr().err
+
+
+_AMBIGUOUS_NONCONSENT_ROWS = [
+    {},
+    {"id": "s2", "blocking": True, "outcome": "bound_to_release", "replacement_consent": None},
+    {"id": "s2", "blocking": False, "outcome": "bound_to_release", "replacement_consent": None},
+    {"id": "s2", "replacement_consent": None},
+    {
+        "id": "s2",
+        "blocking": 0,
+        "outcome": "at_boundary",
+        "acknowledged": False,
+        "replacement_consent": None,
+    },
+    {
+        "id": "s2",
+        "blocking": False,
+        "outcome": "future",
+        "acknowledged": False,
+        "replacement_consent": None,
+    },
+    {
+        "id": "s2",
+        "blocking": False,
+        "outcome": [],
+        "acknowledged": False,
+        "replacement_consent": None,
+    },
+    {"id": "s2", "blocking": False, "outcome": "at_boundary", "acknowledged": False},
+    {
+        "id": "s2",
+        "blocking": False,
+        "outcome": "at_boundary",
+        "acknowledged": True,
+        "replacement_consent": None,
+    },
+    {
+        "id": False,
+        "blocking": False,
+        "outcome": "at_boundary",
+        "acknowledged": False,
+        "replacement_consent": None,
+    },
+]
+
+
+def _receipt_reporting_command(tmp_path, entrance, preflight, session):
+    if entrance == "promotion":
+        return _consent_promotion(tmp_path, "--acknowledge-session", session, preflight=preflight)
+    project = _project(tmp_path)
+    stored = {
+        "mode": "proceed",
+        "wait_seconds": 900,
+        "acknowledge_sessions": [session],
+        "source": "explicit",
+    }
+    client = ConsentCloud(
+        project,
+        status="promoted",
+        stored_choice=stored,
+        current={"status": "promoted", "session_preflight": preflight},
+        forbid_service_read=True,
+    )
+    client.release["session_preflight"] = preflight
+    return client, lambda: _deploy(client, project, tmp_path, "--acknowledge-session", session)
+
+
+@pytest.mark.parametrize("bad", _AMBIGUOUS_NONCONSENT_ROWS)
+@pytest.mark.parametrize("history", ["valid-ambiguous", "ambiguous-valid", "ambiguous-only"])
+@pytest.mark.parametrize("entrance", ["promotion", "replay"])
+@pytest.mark.parametrize("session", ["s1", "*"])
+def test_unproven_nonconsent_sibling_cannot_disappear_from_receipt(
+    tmp_path, capsys, bad, history, entrance, session
+):
+    preflight = _consented_preflight()
+    valid = preflight["sessions"][0]
+    preflight["sessions"] = {
+        "valid-ambiguous": [valid, bad],
+        "ambiguous-valid": [bad, valid],
+        "ambiguous-only": [bad],
+    }[history]
+    client, command = _receipt_reporting_command(tmp_path, entrance, preflight, session)
+    if session == "*":
+        result = command()["result"]
+        assert "not_applied" not in result
+        assert "isn't confirmed" not in capsys.readouterr().err
+    elif entrance == "promotion":
+        with pytest.raises(CloudApiError) as raised:
+            command()
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        assert error["not_applied"]["confirmed"] is False
+        assert error["not_applied"]["more_permissive"] is True
+    else:
+        result = command()["result"]
+        assert result["not_applied"]["confirmed"] is False
+        assert result["not_applied"]["more_permissive"] is True
+        assert "isn't confirmed" in capsys.readouterr().err
+    observed = client.readbacks[-1] if entrance == "promotion" else result["deployment"]
+    assert observed["session_preflight"] == preflight
+    assert not _posts(client, "/retry")
+    if entrance == "replay":
+        assert not _posts(client, "/promote")
+
+
+@pytest.mark.parametrize("outcome", ["at_boundary", "earlier_release"])
+@pytest.mark.parametrize("entrance", ["promotion", "replay"])
+@pytest.mark.parametrize("session", ["s1", "*"])
+def test_positive_safe_nonconsent_sibling_preserves_exact_risk_comparison(
+    tmp_path, capsys, outcome, entrance, session
+):
+    preflight = _consented_preflight()
+    preflight["sessions"][1]["outcome"] = outcome
+    client, command = _receipt_reporting_command(tmp_path, entrance, preflight, session)
+    result = command()["result"]
+    assert "not_applied" not in result
+    assert "isn't confirmed" not in capsys.readouterr().err
+    observed = client.readbacks[-1] if entrance == "promotion" else result["deployment"]
+    assert observed["session_preflight"] == preflight
+
+
+def test_mixed_task_and_consented_session_retry_discloses_both_risks(capsys):
+    refusal = {
+        **_SESSION_REFUSAL,
+        "code": "held_tasks",
+        "message": "A held task prevents publication.",
+        "acknowledge_sessions": ["s1", "task1"],
+    }
+    preflight = {**_consented_preflight(), "state": "blocked"}
+    preflight["tasks"] = [{"id": "task1", "blocking": True, "outcome": "interrupted"}]
+    client = _PublicationClient(refusal, session_preflight=preflight)
+    arguments = cloud._build_parser().parse_args(
+        ["deployment", "wait", _DEPLOYMENT, "--application", "ready-agent", "--live"]
+    )
+    with pytest.raises(CloudApiError) as raised:
+        cloud._deployment(arguments, client=client)
+    error = _failure_envelope(raised, capsys)
+    assert error["acknowledge_sessions"] == ["s1", "task1"]
+    assert error["commands"]["retry"].endswith(
+        "--acknowledge-session s1 --acknowledge-session task1"
+    )
+    assert "interrupted" in error["message"]
+    assert "unfinished sessions named by the retry may not resume" in error["message"]
+    assert not any(method != "GET" for method, _, _ in client.requests)
+
+
+@pytest.mark.parametrize("source", [None, True, "future", "default", "explicit"])
+@pytest.mark.parametrize("receipt", [None, "clear", "consented"])
+@pytest.mark.parametrize(
+    "entrance", ["deploy-pending", "deploy-replay", "retry-pending", "retry-replay"]
+)
+def test_equal_wait_reports_receipt_and_provenance_with_distinct_authority(
+    tmp_path, capsys, source, receipt, entrance
+):
+    stored = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []}
+    if source is not None:
+        stored["source"] = source
+    preflight = (
+        _consented_preflight()
+        if receipt == "consented"
+        else {"state": "clear", "policy": "wait"}
+        if receipt == "clear"
+        else None
+    )
+    historical = entrance.endswith("replay")
+    status = "promoted" if historical else "image_built"
+    release = {"status": status, "session_policy": stored}
+    if preflight is not None:
+        release["session_preflight"] = preflight
+    if entrance.startswith("deploy"):
+        project = _project(tmp_path)
+        client = ConsentCloud(project, status=status, stored_choice=stored, current=release)
+        if preflight is not None:
+            client.release["session_preflight"] = preflight
+
+        def command():
+            return _deploy(client, project, tmp_path, "--session-policy", "wait")["result"]
+    else:
+
+        class RetryCloud:
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, path, **kwargs):
+                self.requests.append((method, path, kwargs))
+                if method == "GET" and path == "/v1/applications":
+                    return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
+                assert (method, path) == (
+                    "POST",
+                    "/v1/applications/session-agent/deployments/dep_old/retry",
+                )
+                return {"id": "dep_old", **release}
+
+        client = RetryCloud()
+        arguments = cloud._build_parser().parse_args(
+            [
+                "deployment",
+                "retry",
+                "dep_old",
+                "--application",
+                "session-agent",
+                "--session-policy",
+                "wait",
+            ]
+        )
+
+        def command():
+            return cloud._deployment(arguments, client=client)
+
+    applied = receipt == "clear" or (receipt is None and source == "explicit")
+    confirmed = receipt == "consented" or source == "default"
+    if applied or historical:
+        result = command()
+        if applied:
+            assert "not_applied" not in result
+            assert "did not apply" not in capsys.readouterr().err
+        else:
+            assert result["not_applied"]["confirmed"] is confirmed
+            assert result["not_applied"]["more_permissive"] is True
+            message = "did not apply" if confirmed else "isn't confirmed"
+            assert message in capsys.readouterr().err
+    else:
+        with pytest.raises(CloudApiError) as raised:
+            command()
+        error = _failure_envelope(raised, capsys)
+        assert error["category"] == "session_choice_not_applied"
+        assert error["not_applied"]["confirmed"] is confirmed
+        assert error["not_applied"]["more_permissive"] is True
+    if entrance.startswith("deploy"):
+        assert not _posts(client, "/retry")
+        assert not _posts(client, "/promote")
+    else:
+        assert _posts(client, "/retry")[0]["payload"] == {"session_policy": "wait"}
+    assert cloud._session_choice_pending(
+        {"session_policy": stored},
+        {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": []},
+    ) is (source != "explicit")

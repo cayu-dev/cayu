@@ -1213,6 +1213,43 @@ action, may not resume on the new release, so it blocks the replacement. A sessi
 nothing pending can adopt the new release at its next interaction and doesn't block.
 Agents without the Cayu control plane API are published as before.
 
+An Agent can declare standing consent for exact approval pairs in its root
+`cayu-cloud.toml` (schema version 2):
+
+```toml
+[[session_replacement.approvals]]
+agent_name = "issue_filer"
+tool_name = "file_issue"
+reason = "The application can raise a new approval request if continuation is lost."
+```
+
+This accepts possible loss of continuation; it does not guarantee recovery or replay
+an approval. Cloud uses the declaration admitted from the **serving release's source**.
+A new release cannot authorize replacing the old release retroactively. The first
+adoption may therefore need an explicit acknowledgement of its blocking sessions.
+Removing a declaration takes effect once that release is serving.
+
+The table accepts only `approvals`, with 1 to 20 entries containing exactly
+`agent_name`, `tool_name`, and `reason`. Agent/tool pairs must be unique. Names are
+exact, case-sensitive, printable strings of 1 to 128 characters, without surrounding
+whitespace or `*`; they are not patterns. Reasons are printable strings of 1 to 512
+characters without surrounding whitespace. Unicode is retained without normalization.
+Invalid or unknown fields are rejected. `cloud init` declares no consent; `cloud init
+--force` preserves an existing valid declaration in canonical pair order while
+regenerating unrelated descriptor fields, even if those fields are invalid. Invalid
+consent or unreadable TOML stops initialization before any files change; repair the
+file or explicitly remove it to regenerate without preserving its consent.
+
+Without explicit session flags, Cloud may apply this consent to matching
+approval-paused sessions. Other pending action kinds, unmatched approvals, unreadable
+session evidence, active interactions and held tasks retain their existing protection.
+Consent does not bypass migration acknowledgements, worker stopping or storage safety.
+Cloud records accepted replacement consent as `session_preflight.state = "consented"`
+when it permits publication. An explicit `wait` or `block` overrides standing consent.
+The declaration travels only in the root source file, never as a CLI-generated
+`proceed` choice or wildcard acknowledgement; `--manifest` cannot select another file
+containing it or hide a root declaration.
+
 You choose what Cloud does about blocking sessions, per release:
 
 - `wait` (the default) holds the publication until no session blocks, for at most
@@ -1244,10 +1281,12 @@ combination (`proceed` without sessions, sessions with `wait` or `block`,
 `--session-wait-seconds` without `wait`, more than 200 sessions, or an empty or
 whitespace-padded session ID) fails with `invalid_input` before the CLI signs in or
 uploads. Without the flags, the requests are unchanged: a new release gets Cloud's default
-`wait` choice, and a retry or rollback keeps the release's current one. As with
-`--acknowledge-breaking`, a deploy's idempotency key covers a choice other than Cloud's
-default, so a deploy without the flags (or with `--session-policy wait` alone) keeps the
-key earlier CLI releases used.
+`wait` choice with any applicable serving-source consent, and a retry or rollback keeps
+the release's current choice. Every explicitly supplied choice, including
+`--session-policy wait`, is sent to Cloud and included in the deploy's idempotency key.
+Omission and explicit default wait have distinct identities because only omission
+allows standing consent. Cloud's returned `session_policy.source = "explicit"` confirms
+that a default wait choice came from an operation rather than the implicit default.
 
 While Cloud holds a publication, the release keeps its `smoke_tested` or `promoted` status
 and its `session_preflight.state` is `waiting`; `waiting_for` says whether Cloud waits for
@@ -1325,7 +1364,7 @@ Promoting the release again doesn't help: it was already promoted, and Cloud ans
 what applies instead.
 
 Running `cayu cloud deploy` again with unchanged source and any of the three flags (even
-`--session-policy wait` alone, which keeps the original create request and key) gives the
+`--session-policy wait` alone, which has its own create request and key) gives the
 release that choice. The CLI finds the release, as for `--acknowledge-breaking`, and
 retries it with the choice when its publication was refused or is waiting
 (`result.retry` records it). A retry of a waiting publication takes only the session

@@ -30,6 +30,12 @@ from cayu._operator_credentials import (
     OPERATOR_USERNAME_VARIABLE,
 )
 from cayu.cli._cloud_api import CloudApiError
+from cayu.cli._cloud_session_replacement import (
+    CloudApprovalReplacementConsent,
+    render_session_replacement,
+    session_replacement,
+    validate_session_replacement,
+)
 from cayu.cli._serve_readiness import ServeSetupPlan, plan_serve_setup
 from cayu.cli.scaffold_app_database import APP_DATABASE
 
@@ -494,6 +500,7 @@ class CloudProjectManifest:
     database: CloudDatabase | None = None
     webhooks: CloudWebhooks | None = None
     operator_check: CloudOperatorCheck | None = None
+    session_replacement: tuple[CloudApprovalReplacementConsent, ...] | None = None
 
     @classmethod
     def load(cls, path: Path) -> CloudProjectManifest:
@@ -535,9 +542,14 @@ class CloudProjectManifest:
             "database",
             "webhooks",
             "operator_check",
+            "session_replacement",
         }
         schema_version = payload.get("schema_version")
-        if set(payload) - allowed or schema_version not in {1, 2}:
+        if (
+            set(payload) - allowed
+            or type(schema_version) is not int
+            or schema_version not in {1, 2}
+        ):
             raise CloudApiError(
                 "manifest_invalid",
                 "cayu-cloud.toml must use schema_version 1 or 2 and supported fields only.",
@@ -568,6 +580,11 @@ class CloudProjectManifest:
             raise CloudApiError(
                 "manifest_invalid",
                 "[operator_check] requires cayu-cloud.toml schema_version 2.",
+            )
+        if schema_version == 1 and "session_replacement" in payload:
+            raise CloudApiError(
+                "manifest_invalid",
+                "[session_replacement] requires cayu-cloud.toml schema_version 2.",
             )
         application = payload.get("application")
         if type(application) is not str:
@@ -695,6 +712,11 @@ class CloudProjectManifest:
                 database=_database(database),
                 webhooks=_webhooks(webhooks),
                 operator_check=_operator_check(operator_check),
+                session_replacement=(
+                    session_replacement(payload["session_replacement"])
+                    if "session_replacement" in payload
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CloudApiError(
@@ -705,6 +727,7 @@ class CloudProjectManifest:
         return manifest
 
     def validate(self) -> None:
+        validate_session_replacement(self.session_replacement)
         if not is_application_slug(self.application):
             raise CloudApiError(
                 "manifest_invalid",
@@ -957,6 +980,19 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
             "manifest_exists",
             "cayu-cloud.toml already exists; pass --force to replace it.",
         )
+    preserved_consent = None
+    if manifest_path.exists():
+        # Force regenerates the descriptor, but cannot silently erase standing consent.
+        try:
+            existing = tomllib.loads(manifest_path.read_text())
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            raise CloudApiError(
+                "manifest_invalid",
+                "Cannot read existing cayu-cloud.toml to preserve session replacement consent; "
+                "repair the file or explicitly remove it before running init again.",
+            ) from exc
+        if "session_replacement" in existing:
+            preserved_consent = session_replacement(existing["session_replacement"])
     try:
         payload = tomllib.loads(pyproject_path.read_text())
         project = payload["project"]
@@ -1038,6 +1074,8 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         sign_in=sign_in,
         database_migrate=database_migrate,
     )
+    if preserved_consent is not None:
+        content += render_session_replacement(preserved_consent)
     CloudProjectManifest.loads(content)
     if writes_auth_module:
         assert serve_setup is not None and serve_setup.auth_module is not None
@@ -1359,10 +1397,17 @@ def resolve_project(
 
 
 def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:
-    # Cloud reads storage acknowledgements, sign-in, home, webhooks and the operator check
+    # Cloud reads source settings, including replacement consent and the operator check
     # only from the root file, not from the selected CLI manifest path.
     if path == _ROOT_MANIFEST:
         return
+    if manifest.session_replacement is not None:
+        raise CloudApiError(
+            "manifest_invalid",
+            "[session_replacement] requires cayu-cloud.toml at the deployment root. "
+            "Move the manifest there as a regular file and deploy without --manifest; "
+            "Cloud reads replacement consent only from that file.",
+        )
     if manifest.home is not None or manifest.sign_in != CloudSignIn():
         raise CloudApiError(
             "manifest_invalid",
@@ -1402,16 +1447,21 @@ _ROOT_MANIFEST_UNREADABLE = (
 
 
 def _validate_root_settings(root_manifest: str | None, path: Path) -> None:
-    # A custom manifest deploys with the root file's sign-in, home, webhooks and operator
-    # check, because
-    # Cloud reads them only from there. Refuse when that file declares anything but the
-    # default.
+    # Cloud uses source-owned settings from the root file, including replacement
+    # consent. A custom selection must not hide a declaration in that source.
     if root_manifest is None:
         return
     try:
         payload = tomllib.loads(root_manifest)
     except tomllib.TOMLDecodeError as exc:
         raise CloudApiError("manifest_invalid", _ROOT_MANIFEST_UNREADABLE) from exc
+    if "session_replacement" in payload:
+        raise CloudApiError(
+            "manifest_invalid",
+            "The deployment root's cayu-cloud.toml declares [session_replacement], and "
+            f"Cloud reads replacement consent only from that file, not from {path.as_posix()}. "
+            "Deploy without --manifest, or remove [session_replacement] from the root file.",
+        )
     if payload.get("webhooks") is not None:
         raise CloudApiError(
             "manifest_invalid",
