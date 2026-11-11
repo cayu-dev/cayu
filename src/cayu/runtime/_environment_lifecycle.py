@@ -9482,6 +9482,13 @@ async def _release_unclaimed_factory_result(
                     original_error,
                     environment_factory_cleanup_settlement_task(cleanup_error) or release_task,
                 )
+            elif release_task.done() and _environment_factory_cleanup_handoffs(cleanup_error)[0]:
+                # Prompt callback failures need the same grouped successor
+                # settlement as callbacks that outlive the release bound.
+                attach_environment_factory_cleanup_settlement_task(
+                    original_error,
+                    start_release_settlement(release_attempt),
+                )
             elif (
                 settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
             ) is not None:
