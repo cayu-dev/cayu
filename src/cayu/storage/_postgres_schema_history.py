@@ -714,6 +714,90 @@ POSTGRES_TRANSCRIPT_MESSAGE_BYTES_FUNCTION = """
 # caller's keyring (or, for a caller without one, unless there is none). A
 # single-statement write runs it first in the same implicit transaction, so a
 # stale worker's write never runs. The SQLSTATEs are the session store's.
+# Cross-session readers page cayu_events by sequence, which is drawn at INSERT but
+# visible only at COMMIT. Before its first event insert, a transaction takes a
+# shared transaction-level advisory lock whose key encodes the sequence high-water
+# at that moment, so every sequence it draws is above its key; the lock goes away
+# when it commits or rolls back. A reader takes the high-water, then the lowest
+# such key, and returns only events at or below the smaller one: anything an open
+# transaction can still commit is above it. Readers must take the bound under READ
+# COMMITTED, before the snapshot their rows are read under. The key uses the two-integer
+# form: the first integer carries the events table's tag (its oid modulo 32768) in
+# its high 16 bits and bits 32-47 of the high-water in its low 16; the second
+# carries bits 0-31. High-waters past 2^48 are clamped, which only makes readers
+# more cautious.
+POSTGRES_EVENT_SEQUENCE_RESERVATION_DDL: tuple[str, ...] = (
+    """
+    CREATE OR REPLACE FUNCTION cayu_event_sequence_high_water(events regclass)
+    RETURNS BIGINT AS $$
+    DECLARE
+        high_water BIGINT;
+    BEGIN
+        -- Read-only roles may hold no privilege on the identity sequence.
+        IF (SELECT relname FROM pg_catalog.pg_class WHERE oid = events)
+            IS DISTINCT FROM 'cayu_events'
+        THEN
+            RAISE EXCEPTION 'cayu_event_sequence_high_water reads only cayu_events';
+        END IF;
+        high_water := pg_sequence_last_value(
+            pg_get_serial_sequence(events::text, 'sequence')::regclass
+        );
+        RETURN LEAST(COALESCE(high_water, 0), 281474976710655);
+    END;
+    $$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+    """,
+    """
+    CREATE OR REPLACE FUNCTION cayu_reserve_event_sequence() RETURNS trigger AS $$
+    DECLARE
+        high_water BIGINT;
+        low_bits BIGINT;
+    BEGIN
+        IF current_setting('cayu.event_sequence_reserved', true) = TG_RELID::text THEN
+            RETURN NULL;
+        END IF;
+        high_water := cayu_event_sequence_high_water(TG_RELID);
+        low_bits := high_water & 4294967295;
+        PERFORM pg_advisory_xact_lock_shared(
+            (((TG_RELID::bigint % 32768) << 16) | (high_water >> 32))::integer,
+            (low_bits - CASE WHEN low_bits >= 2147483648 THEN 4294967296 ELSE 0 END)::integer
+        );
+        PERFORM set_config('cayu.event_sequence_reserved', TG_RELID::text, true);
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    "DROP TRIGGER IF EXISTS cayu_reserve_event_sequence ON cayu_events",
+    """
+    CREATE TRIGGER cayu_reserve_event_sequence BEFORE INSERT ON cayu_events
+    FOR EACH STATEMENT EXECUTE FUNCTION cayu_reserve_event_sequence()
+    """,
+    """
+    CREATE OR REPLACE FUNCTION cayu_event_visible_sequence(events regclass)
+    RETURNS BIGINT AS $$
+    DECLARE
+        high_water BIGINT;
+        reserved BIGINT;
+    BEGIN
+        -- Under REPEATABLE READ the reader's snapshot predates these live reads,
+        -- so a writer that commits in between would be invisible yet unreserved.
+        IF current_setting('transaction_isolation') <> 'read committed' THEN
+            RAISE EXCEPTION 'cayu_event_visible_sequence must run under READ COMMITTED';
+        END IF;
+        -- The high-water first: a transaction that reserves after the locks are
+        -- read draws above it.
+        high_water := cayu_event_sequence_high_water(events);
+        SELECT min(((classid::bigint & 65535) << 32) | objid::bigint) INTO reserved
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND objsubid = 2
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND (classid::bigint >> 16) = events::oid::bigint % 32768;
+        RETURN LEAST(high_water, reserved);
+    END;
+    $$ LANGUAGE plpgsql VOLATILE
+    """,
+)
+
 POSTGRES_PUBLIC_AUTHORITY_ALIAS_CHECK_FUNCTION = """
         CREATE OR REPLACE FUNCTION cayu_require_public_authority_alias_config(
             expected_active_key_id TEXT,
@@ -852,6 +936,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     145: (),
     # Group execution obligations carry the claim generation that started them.
     146: POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL,
+    # Event writers reserve their sequence range for cross-session readers.
+    147: POSTGRES_EVENT_SEQUENCE_RESERVATION_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

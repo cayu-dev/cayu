@@ -776,6 +776,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     145: "",
     # Group execution obligations carry the claim generation that started them.
     146: SQLITE_GROUP_EXECUTION_GENERATION_BACKFILL,
+    # Postgres event sequence reservations; SQLite serializes its writers.
+    147: "",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

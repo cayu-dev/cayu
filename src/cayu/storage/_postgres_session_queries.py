@@ -159,6 +159,39 @@ def _event_query_is_single_session(query: EventQuery) -> bool:
     return query.session_id is not None or len(query.session_ids) == 1
 
 
+# The highest sequence no open transaction can still commit below: the event
+# sequence high-water, lowered to the smallest range an open event writer has
+# reserved (revision 147). Transaction ids don't order sequences, so the
+# snapshot's xmin is no such bound. The bound comes from live state, so the rows
+# it filters must be read under a snapshot taken after it: a later statement
+# under READ COMMITTED, or a REPEATABLE READ transaction begun after it.
+_VISIBLE_SEQUENCE_SQL = "SELECT cayu_event_visible_sequence('cayu_events'::regclass)"
+
+
+async def _read_visible_sequence(cur: Any) -> int:
+    # The first statement of its transaction. Set the level explicitly: a role or
+    # database may default to a stricter one, whose snapshot would predate the
+    # bound's live reads.
+    await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    await cur.execute(_VISIBLE_SEQUENCE_SQL)
+    row = await cur.fetchone()
+    if row is None:
+        raise RuntimeError("Failed to read the Postgres event visibility bound.")
+    return row[0]
+
+
+async def _visible_sequence_before_snapshot(
+    conn: Any, cur: Any, queries: Sequence[EventQuery]
+) -> int | None:
+    """Read the bound in its own transaction, before a REPEATABLE READ one begins."""
+
+    if not any(_event_query_needs_snapshot_cutoff(query) for query in queries):
+        return None
+    visible_sequence = await _read_visible_sequence(cur)
+    await conn.commit()
+    return visible_sequence
+
+
 def _event_query_needs_snapshot_cutoff(query: EventQuery) -> bool:
     return (
         query.after_sequence is not None or query.before_sequence is not None
@@ -455,7 +488,7 @@ async def query_events(
     if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
         return await _query_events_by_session_id_batches(connect, query)
     async with connect() as conn, conn.cursor() as cur:
-        return await _query_events(cur, query, safe_insert_xid=None)
+        return await _query_events(cur, query, visible_sequence=None)
 
 
 @runtime_session_query
@@ -464,7 +497,7 @@ async def query_event_heads(connect: PostgresConnection, query: EventQuery) -> l
     if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
         return [EventHead.of(record) for record in await query_events(connect, query)]
     async with connect() as conn, conn.cursor() as cur:
-        plan, params = await _event_query_plan(cur, query, safe_insert_xid=None)
+        plan, params = await _event_query_plan(cur, query, visible_sequence=None)
         # The timestamp comes from the stored event, as Event reads it.
         await cur.execute(
             cast(
@@ -748,9 +781,14 @@ async def query_events_bounded(
 ) -> list[EventRecord]:
     fold = EventSnapshotFold(query, max_bytes=max_bytes, max_pages=1)
     async with connect() as conn, conn.cursor() as cur:
+        visible_sequence = await _visible_sequence_before_snapshot(conn, cur, (fold.query,))
         await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         return await _query_events_bounded_snapshot(
-            cur, fold.query, max_bytes=max_bytes, exact_snapshot=False
+            cur,
+            fold.query,
+            max_bytes=max_bytes,
+            exact_snapshot=False,
+            visible_sequence=visible_sequence,
         )
 
 
@@ -763,12 +801,17 @@ async def query_events_bounded_many(
     ]
     results: list[list[EventRecord] | EventQueryResultTooLarge] = []
     async with connect() as conn, conn.cursor() as cur:
+        visible_sequence = await _visible_sequence_before_snapshot(conn, cur, bounded)
         await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         for query in bounded:
             try:
                 results.append(
                     await _query_events_bounded_snapshot(
-                        cur, query, max_bytes=max_bytes, exact_snapshot=False
+                        cur,
+                        query,
+                        max_bytes=max_bytes,
+                        exact_snapshot=False,
+                        visible_sequence=visible_sequence,
                     )
                 )
             except EventQueryResultTooLarge as error:
@@ -893,23 +936,26 @@ async def knowledge_lookup_totals(
 
 
 async def _query_events_bounded_snapshot(
-    cur: Any, query: EventQuery, *, max_bytes: int, exact_snapshot: bool
+    cur: Any,
+    query: EventQuery,
+    *,
+    max_bytes: int,
+    exact_snapshot: bool,
+    visible_sequence: int | None = None,
 ) -> list[EventRecord]:
     if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
         raise ValueError("Byte-bounded event queries require one bounded SQL batch.")
     needs_snapshot_cutoff = not exact_snapshot and _event_query_needs_snapshot_cutoff(query)
-    safe_insert_xid = None
     extra_clauses: tuple[session_store_sql.SqlClause, ...] = ()
     if needs_snapshot_cutoff:
-        await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
-        snapshot_row = await cur.fetchone()
-        if snapshot_row is None:
-            raise RuntimeError("Failed to read Postgres event visibility snapshot.")
-        safe_insert_xid = snapshot_row[0]
+        # This runs under REPEATABLE READ, whose snapshot is already taken, so
+        # the caller reads the bound before that transaction begins.
+        if visible_sequence is None:
+            raise RuntimeError("Read the event visibility bound before the snapshot.")
         extra_clauses = (
             session_store_sql.SqlClause(
-                "cayu_events.insert_xid < %s",
-                (safe_insert_xid,),
+                "cayu_events.sequence <= %s",
+                (visible_sequence,),
             ),
         )
     plan = session_store_sql.build_event_query_sql(
@@ -942,7 +988,7 @@ async def _query_events_bounded_snapshot(
     return await _query_events(
         cur,
         query,
-        safe_insert_xid=safe_insert_xid,
+        visible_sequence=visible_sequence,
         force_snapshot_cutoff=needs_snapshot_cutoff,
         exact_snapshot=exact_snapshot,
     )
@@ -1569,14 +1615,10 @@ async def _query_events_by_session_id_batches(
 ) -> list[EventRecord]:
     records: list[EventRecord] = []
     async with connect() as conn, conn.cursor() as cur:
-        safe_insert_xid = None
+        visible_sequence = None
         needs_snapshot_cutoff = query.after_sequence is not None
         if needs_snapshot_cutoff:
-            await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
-            row = await cur.fetchone()
-            if row is None:
-                raise RuntimeError("Failed to read Postgres event visibility snapshot.")
-            safe_insert_xid = row[0]
+            visible_sequence = await _read_visible_sequence(cur)
         for batch in _event_query_session_id_batches(query.session_ids):
             records.extend(
                 await _query_events(
@@ -1585,7 +1627,7 @@ async def _query_events_by_session_id_batches(
                         query,
                         session_ids=batch,
                     ),
-                    safe_insert_xid=safe_insert_xid,
+                    visible_sequence=visible_sequence,
                     force_snapshot_cutoff=needs_snapshot_cutoff,
                 )
             )
@@ -1706,7 +1748,7 @@ async def _event_query_plan(
     cur: Any,
     query: EventQuery,
     *,
-    safe_insert_xid: Any,
+    visible_sequence: Any,
     force_snapshot_cutoff: bool = False,
     exact_snapshot: bool = False,
 ) -> tuple[session_store_sql.EventQuerySqlPlan, list[object]]:
@@ -1715,21 +1757,18 @@ async def _event_query_plan(
     needs_snapshot_cutoff = not exact_snapshot and (
         force_snapshot_cutoff or _event_query_needs_snapshot_cutoff(query)
     )
-    if needs_snapshot_cutoff and safe_insert_xid is None:
-        await cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())")
-        row = await cur.fetchone()
-        if row is None:
-            raise RuntimeError("Failed to read Postgres event visibility snapshot.")
-        safe_insert_xid = row[0]
+    if needs_snapshot_cutoff and visible_sequence is None:
+        visible_sequence = await _read_visible_sequence(cur)
     extra_clauses: tuple[session_store_sql.SqlClause, ...] = ()
     if needs_snapshot_cutoff:
         # Postgres identity values are allocated at INSERT but published at COMMIT.
         # Cross-session event consumers must not advance an after_sequence cursor
-        # past an event inserted by a still-open transaction with a lower identity.
+        # past an event a still-open transaction can commit with a lower sequence,
+        # so they read only up to the bound cayu_event_visible_sequence() reports.
         extra_clauses = (
             session_store_sql.SqlClause(
-                "cayu_events.insert_xid < %s",
-                (safe_insert_xid,),
+                "cayu_events.sequence <= %s",
+                (visible_sequence,),
             ),
         )
     plan = session_store_sql.build_event_query_sql(
@@ -1744,14 +1783,14 @@ async def _query_events(
     cur: Any,
     query: EventQuery,
     *,
-    safe_insert_xid: Any,
+    visible_sequence: Any,
     force_snapshot_cutoff: bool = False,
     exact_snapshot: bool = False,
 ) -> list[EventRecord]:
     plan, params = await _event_query_plan(
         cur,
         query,
-        safe_insert_xid=safe_insert_xid,
+        visible_sequence=visible_sequence,
         force_snapshot_cutoff=force_snapshot_cutoff,
         exact_snapshot=exact_snapshot,
     )

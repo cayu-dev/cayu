@@ -611,6 +611,12 @@ REVISIONS: tuple[Revision, ...] = (
     # retained obligations. Older binaries reject the field and would match a
     # later claim under the same worker name, so they must not open it.
     Revision(revision=146, kind=RevisionKind.BREAKING, compatible_from=146),
+    # Each Postgres transaction that inserts events reserves its sequence range
+    # with a statement trigger, and cross-session event readers bound their
+    # pages by those reservations instead of the transaction-id horizon, which
+    # did not order sequences. The trigger also covers older binaries'
+    # writes, so they keep working beside it. Postgres session stores require it.
+    Revision(revision=147, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

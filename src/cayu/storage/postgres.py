@@ -447,7 +447,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 145
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 147
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 

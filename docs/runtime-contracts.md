@@ -6423,12 +6423,18 @@ Event ordering has two distinct cursors. The per-session event order is dense
 and gap-free within a session. The global `EventRecord.sequence` is the durable
 cross-session cursor used by dashboards, watchers, and outbox-style readers.
 Postgres allocates that global identity value at insert time, while the row only
-becomes visible at commit. A Postgres cross-session
-`query_events(... after_sequence=...)` implementation must therefore exclude
-rows inserted by transactions that are not yet old enough to be below
-`pg_snapshot_xmin(pg_current_snapshot())`; that reader may delay while an older
-writer is open, but it must never advance its cursor past an invisible lower
-sequence. Single-session reads use the per-session ordering invariant and should
+becomes visible at commit, and transaction ids don't order those values: a
+transaction can commit a higher sequence while one that started earlier still
+holds a lower one. Since storage revision 147, a statement trigger on
+`cayu_events` makes each transaction reserve its range before its first event
+insert, with a shared transaction-level advisory lock whose key is the sequence
+high-water at that moment. A Postgres cross-session
+`query_events(... after_sequence=...)` reads only up to
+`cayu_event_visible_sequence('cayu_events'::regclass)`: the high-water, lowered
+to the smallest reservation an open transaction holds. That reader may delay
+while an event writer is open, but it must never advance its cursor past an
+invisible lower sequence. Writers in other databases on the same server don't
+delay it. Single-session reads use the per-session ordering invariant and should
 not be delayed by unrelated open transactions. SQLite and in-memory stores
 serialize writes, so allocation order and visibility order are already aligned.
 
