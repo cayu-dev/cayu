@@ -2183,12 +2183,15 @@ async def _await_task_handler(
     # A cancellation request reaches the handler through this signal, then by
     # cancelling it after the grace period unless the worker opted out. A
     # callback that already returned (its acknowledgement may still be in
-    # flight) or that its time limit already cancelled is not cancelled again.
+    # flight), that its time limit already cancelled or that an enclosing
+    # handler's interrupt was already forwarded to is not cancelled again.
     cancellation = _TaskCancellationDelivery(
         signal=TaskCancellationSignal(),
         interrupt_after_s=cancellation_grace_s,
         may_interrupt=lambda: (
-            not callback_done.done() and (time_limit is None or not time_limit.cancelled)
+            not callback_done.done()
+            and not forwarded_handler_cancellation
+            and (time_limit is None or not time_limit.cancelled)
         ),
     )
 
