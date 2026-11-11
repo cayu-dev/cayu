@@ -1161,6 +1161,7 @@ class _ApprovalRecord:
     tool_round_id: str
     policy_decision: _PolicyDecision | None = None
     decision: _ApprovalDecision = "pending"
+    expiry_recorded: bool = False
     source_refs: list[RuntimeEvidenceSourceRef] = field(default_factory=list)
 
 
@@ -2647,9 +2648,20 @@ def _project_approvals(
         raw_policy = payload.get("policy_decision") or nested_payload.get("policy_decision")
         if raw_policy in {"allow", "deny", "require_approval", "ambiguous"}:
             existing.policy_decision = raw_policy
-        existing.decision = (
-            decisions[EventType(event_type)] if event_type in decisions else "blocked"
-        )
+        if event_type == EventType.TOOL_CALL_APPROVAL_EXPIRED:
+            existing.expiry_recorded = True
+        if event_type == EventType.TOOL_CALL_APPROVAL_DENIED and (
+            existing.expiry_recorded or payload.get("expired") is True
+        ):
+            # An expiry closes its call through the ordinary denial path: the
+            # expiry marker comes first and the denial that follows carries
+            # ``expired: true``. Either signal means the approval ran out, so
+            # the denial's own event type must not decide the outcome.
+            existing.decision = "expired"
+        else:
+            existing.decision = (
+                decisions[EventType(event_type)] if event_type in decisions else "blocked"
+            )
         existing.source_refs.append(_source_ref(record))
     return tuple(
         RuntimeEvidenceApproval(

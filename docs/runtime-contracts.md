@@ -10282,6 +10282,17 @@ reconciliation; arbitrary custom-event payload fields cannot increment either
 count. Every event-derived item carries its stable source event id and sequence.
 Task and session ids are themselves the owning durable-record identities.
 
+`RuntimeEvidenceApproval.decision` is `pending`, `approved`, `denied`, `expired`,
+or `blocked`. `denied` means the approval was answered with a denial; `expired`
+means no answer arrived before the approval's deadline. An expiry closes its call
+through the ordinary denial path, so the last approval event of an expired call
+is a `tool.call.approval_denied`. The projection reports `expired` when that
+denial carries `expired: true` or follows a `tool.call.approval_expired` for the
+same approval, and `denied` only when neither is present. Earlier schema version
+6 reports read every expired approval as `denied`; the schema version did not
+change with this correction, so a consumer that compares stored reports or
+counts denials sees those approvals move from `denied` to `expired`.
+
 Workspace mutation summaries correlate before/after revision observations,
 revision deltas, attribution, terminal outcomes, and artifact references by
 `window_id`. They retain the aliased workspace and tool-call identities, optional
