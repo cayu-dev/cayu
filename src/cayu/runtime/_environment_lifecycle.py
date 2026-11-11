@@ -8182,35 +8182,45 @@ class EnvironmentLifecycle:
                 ),
                 cancellation=caller_cancellation,
             )
-            checkpoint_may_be_committed = outcome.error is not None or bool(outcome.result)
-            if outcome.error is not None:
-                fatal_signal = binding_finalize_fatal_signal(outcome.error)
-                if fatal_signal is not None:
-                    _mark_environment_factory_checkpoint_may_be_committed(fatal_signal)
+            if outcome.cancellation is not None:
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+                )
+            try:
+                if outcome.cancellation is not None:
+                    # Drain the restored delivery without dropping caller-owned request counts.
+                    await asyncio.sleep(0)
+            finally:
+                # Always propagate the reconciled failure, not the restored delivery.
+                checkpoint_may_be_committed = outcome.error is not None or bool(outcome.result)
+                if outcome.error is not None:
+                    fatal_signal = binding_finalize_fatal_signal(outcome.error)
+                    if fatal_signal is not None:
+                        _mark_environment_factory_checkpoint_may_be_committed(fatal_signal)
+                        _add_exception_note_safely(
+                            fatal_signal,
+                            "The environment factory checkpoint write also failed; "
+                            "its commit outcome could not be reconciled.",
+                        )
+                        raise fatal_signal from exc
                     _add_exception_note_safely(
-                        fatal_signal,
-                        "The environment factory checkpoint write also failed; "
-                        "its commit outcome could not be reconciled.",
+                        exc,
+                        "Could not reconcile whether the environment factory checkpoint "
+                        "committed; the allocation will be preserved.",
                     )
-                    raise fatal_signal from exc
-                _add_exception_note_safely(
-                    exc,
-                    "Could not reconcile whether the environment factory checkpoint "
-                    "committed; the allocation will be preserved.",
-                )
-            propagated_error: BaseException = exc
-            if outcome.cancellation is not None and outcome.cancellation is not exc:
-                propagated_error = BaseExceptionGroup(
-                    "Environment factory checkpoint write failed during caller cancellation.",
-                    [exc, outcome.cancellation],
-                )
-            if checkpoint_may_be_committed:
-                _mark_environment_factory_checkpoint_may_be_committed(propagated_error)
-            if outcome.error is not None:
-                raise propagated_error from outcome.error
-            if propagated_error is exc:
-                raise
-            raise propagated_error from exc
+                propagated_error: BaseException = exc
+                if outcome.cancellation is not None and outcome.cancellation is not exc:
+                    propagated_error = BaseExceptionGroup(
+                        "Environment factory checkpoint write failed during caller cancellation.",
+                        [exc, outcome.cancellation],
+                    )
+                if checkpoint_may_be_committed:
+                    _mark_environment_factory_checkpoint_may_be_committed(propagated_error)
+                if outcome.error is not None:
+                    raise propagated_error from outcome.error
+                if propagated_error is exc:
+                    raise exc
+                raise propagated_error from exc
 
     async def _factory_checkpoint_matches(
         self,

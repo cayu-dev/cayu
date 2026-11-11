@@ -1223,6 +1223,38 @@ def test_checkpoint_preserves_factory_reconnect_state_and_current_control_state(
     }
 
 
+def test_checkpoint_cancellation_does_not_redeliver_after_timeout_is_handled() -> None:
+    class BlockingStore(InMemorySessionStore):
+        async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+            await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        session_id = "checkpoint-cancellation-delivery"
+        store = BlockingStore()
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0):
+                await _lifecycle(store)._checkpoint_factory_reconnect_metadata(
+                    session_id=session_id,
+                    environment_name="sandbox",
+                    reconnect_metadata={"sandbox_id": "sandbox-1"},
+                    allocation_fingerprint=None,
+                )
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        assert current_task.cancelling() == 0
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
 def test_checkpoint_preservation_rejects_deleting_transform() -> None:
     store = InMemorySessionStore()
 
