@@ -63,12 +63,19 @@ def current_task_cancellation() -> TaskCancellationSignal | None:
     return None if binding is None else binding[0]
 
 
-def refuse_run_after_task_cancellation() -> None:
-    """Refuse a new top-level run once any enclosing task was asked to stop."""
+def _enclosing_task_cancellation_requested() -> bool:
+    """Whether any enclosing handler has been asked to stop, including outer bindings."""
     binding = _CURRENT.get()
     while binding is not None:
         signal, binding = binding
         if signal.requested:
-            raise TaskCancellationRequested(
-                "The task running this handler was asked to stop; new runs are refused."
-            )
+            return True
+    return False
+
+
+def refuse_run_after_task_cancellation() -> None:
+    """Refuse a new top-level run once any enclosing task was asked to stop."""
+    if _enclosing_task_cancellation_requested():
+        raise TaskCancellationRequested(
+            "The task running this handler was asked to stop; new runs are refused."
+        )

@@ -162,7 +162,10 @@ from cayu.tasks.cancellation import (
     _task_retry_cancellation_requested,
 )
 from cayu.tasks.continuation_claims import TaskContinuationExpectation, TaskContinuationUnsupported
-from cayu.tasks.handler_cancellation import TaskCancellationSignal
+from cayu.tasks.handler_cancellation import (
+    TaskCancellationSignal,
+    _enclosing_task_cancellation_requested,
+)
 from cayu.tasks.handoff import (
     InterruptedTaskContinuationClaimPage,
     TaskInterruptedHandoffConflict,
@@ -2164,7 +2167,7 @@ async def _await_task_handler(
     event_dispatch_deadline: float | None,
     cancellation_grace_s: float | None = None,
 ) -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
-    forwarded_deadline_cancellation = False
+    forwarded_handler_cancellation = False
     # The callback may mutate its view. Settlement must remain bound to the
     # exact execution entered by this worker, not callback-authored authority.
     handler_view = copy_task(task)
@@ -2277,8 +2280,8 @@ async def _await_task_handler(
                 lease_authority=lease_authority,
                 lease_seconds=lease_seconds,
                 owner_cancellation=owner_cancellation,
-                deadline_cancellation_delivered=(
-                    forwarded_deadline_cancellation
+                handler_cancellation_delivered=(
+                    forwarded_handler_cancellation
                     or (time_limit is not None and time_limit.cancelled)
                 ),
             )
@@ -2495,17 +2498,20 @@ async def _await_task_handler(
         raise
     except asyncio.CancelledError as owner_cancellation:
         # A nested continuation has its own supervisor task, but an enclosing
-        # handler limit cancels only this owner task. Cancel the child before
-        # the ordinary cancellation fence drains it, so the deadline reaches
-        # the resumed provider as well.
+        # handler interrupt cancels only this owner task. Forward it before the
+        # ordinary shutdown fence drains the child. Check all enclosing signals:
+        # an intermediate handler's unrequested binding must not hide an outer
+        # operator request from deeper supervisors.
         enclosing_limit = current_handler_time_limit()
         if (
-            enclosing_limit is not None
-            and enclosing_limit.cancellation_requested
-            and not (time_limit is not None and time_limit.cancelled)
-        ):
+            (enclosing_limit is not None and enclosing_limit.cancellation_requested)
+            or (
+                cancellation.interrupt_after_s is not None
+                and _enclosing_task_cancellation_requested()
+            )
+        ) and cancellation.may_interrupt():
             handler_task.cancel()
-            forwarded_deadline_cancellation = True
+            forwarded_handler_cancellation = True
         owner_task = asyncio.current_task()
         if owner_task is None:  # pragma: no cover - coroutine execution invariant
             raise RuntimeError(
@@ -2720,7 +2726,7 @@ async def _restart_task_handler_after_shutdown(
     lease_authority: _TaskLeaseAuthority,
     lease_seconds: int,
     owner_cancellation: asyncio.CancelledError,
-    deadline_cancellation_delivered: bool,
+    handler_cancellation_delivered: bool,
 ) -> None:
     heartbeat_task = _heartbeat_during_quiescence(
         task_store,
@@ -2773,11 +2779,11 @@ async def _restart_task_handler_after_shutdown(
             and heartbeat_task.exception() is None
             and heartbeat_task.result() is _TaskHeartbeatOutcome.TERMINAL
         )
-        # An enclosing deadline may already have interrupted the handler.
+        # An enclosing handler may already have interrupted this handler.
         # A second cancel would abort the asynchronous cleanup we must join.
         # An internal asyncio.timeout cancellation is not a worker stop request:
         # its context manager can consume it, so only our own delivery counts.
-        if not terminal_heartbeat and not deadline_cancellation_delivered:
+        if not terminal_heartbeat and not handler_cancellation_delivered:
             handler_task.cancel()
         handler_failure: BaseException | None = None
         try:

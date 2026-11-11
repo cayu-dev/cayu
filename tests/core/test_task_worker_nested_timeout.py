@@ -138,7 +138,8 @@ async def test_worker_shutdown_does_not_interrupt_timed_out_handler_cleanup(rest
 
 
 @pytest.mark.anyio
-async def test_enclosing_timeout_preserves_restartable_handler_cleanup():
+@pytest.mark.parametrize("interrupt_on_cancel", [False, True])
+async def test_enclosing_timeout_preserves_restartable_handler_cleanup(interrupt_on_cancel):
     from cayu.deadlines import ExecutionDeadlineExceeded, HandlerTimeLimit
     from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
 
@@ -170,6 +171,7 @@ async def test_enclosing_timeout_preserves_restartable_handler_cleanup():
                 max_tasks=1,
                 reclaim=False,
                 recover_interrupted_handoffs=False,
+                interrupt_on_cancel=interrupt_on_cancel,
             )
 
     worker = asyncio.create_task(run())
