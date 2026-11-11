@@ -500,6 +500,13 @@ class HandlerTimeLimit:
             "sessions_started": self._sessions_started,
         }
 
+    def _disarm_cancellation(self) -> None:
+        """Let an external interrupt own cleanup without changing the soft deadline."""
+        if self._timer is not None and not self._timer.expired():
+            self._timer.reschedule(None)
+            assert self._hard_limit_handle is not None
+            self._hard_limit_handle.cancel()
+
     def _record_session(self, session_id: str) -> None:
         if self._parent is not None:
             self._parent._record_session(session_id)

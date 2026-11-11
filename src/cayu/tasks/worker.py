@@ -474,6 +474,7 @@ class _TaskCancellationDelivery:
     interrupt_after_s: float | None
     # Whether the callback is still running and nothing else has cancelled it yet.
     may_interrupt: Callable[[], bool]
+    time_limit: HandlerTimeLimit | None
 
 
 def _cancellation_grace_seconds(
@@ -2213,6 +2214,7 @@ async def _await_task_handler(
             and not forwarded_handler_cancellation
             and (time_limit is None or not time_limit.cancelled)
         ),
+        time_limit=time_limit,
     )
 
     async def invoke_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
@@ -2539,6 +2541,8 @@ async def _await_task_handler(
                 and _enclosing_task_cancellation_requested()
             )
         ) and cancellation.may_interrupt():
+            if cancellation.time_limit is not None:
+                cancellation.time_limit._disarm_cancellation()
             handler_task.cancel()
             forwarded_handler_cancellation = True
         owner_task = asyncio.current_task()
@@ -3797,6 +3801,10 @@ async def _quiesce_task_retry_handler_before_terminalization(
                 # Cancel once, as the handler time limit does. A handler
                 # that resists keeps the claim until it returns.
                 if not handler_task.done() and cancellation.may_interrupt():
+                    # The operator owns this interrupt; a later hard deadline
+                    # must not cancel the same handler again during cleanup.
+                    if cancellation.time_limit is not None:
+                        cancellation.time_limit._disarm_cancellation()
                     handler_task.cancel()
 
             # A stalled renewal must not delay the handler's grace deadline.
