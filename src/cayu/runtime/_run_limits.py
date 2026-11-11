@@ -3394,15 +3394,19 @@ class RunLimitController:
         *,
         authoritative_failure: BaseException,
     ) -> AsyncIterator[Event]:
+        # Finish cleanup before exposing events: a consumer may close at any yield.
+        emitted_events: list[Event] = []
         try:
             async for event in settlement_events:
-                yield event
+                emitted_events.append(event)
         except Exception as accounting_exc:
             add_budget_failure_note(
                 authoritative_failure,
                 operation="settlement",
                 accounting_failure=accounting_exc,
             )
+        for event in emitted_events:
+            yield event
 
     async def before_provider_dispatch(
         self,
