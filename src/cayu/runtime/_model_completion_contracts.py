@@ -330,6 +330,7 @@ def _copy_assistant_step_result(result: AssistantStepResult) -> AssistantStepRes
                 model_tool_name=call.model_tool_name,
                 targeted_tool_invocation=call.targeted_tool_invocation,
                 targeted_tool_rejection=call.targeted_tool_rejection,
+                literal_redaction_marker=call.literal_redaction_marker,
             )
             for call in result.tool_calls
         ],

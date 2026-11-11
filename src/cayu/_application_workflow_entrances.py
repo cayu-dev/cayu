@@ -112,6 +112,7 @@ class WorkflowEntrances:
         from cayu.approvals.proposals import (
             ToolCallProposalOutcome,
             _require_secret_free_proposal,
+            _require_unredacted_proposal_message,
             tool_call_proposal_request,
         )
 
@@ -125,6 +126,7 @@ class WorkflowEntrances:
         request = tool_call_proposal_request(
             agent_name, tool_name, arguments, tool_call_id=tool_call_id, **request_fields
         )
+        _require_unredacted_proposal_message(self._secret_redactor, request)
         async with aclosing(self.run(request)) as stream:
             events = [event async for event in stream]
         return ToolCallProposalOutcome.from_events(events)

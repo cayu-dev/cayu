@@ -41,6 +41,7 @@ from cayu.tools.grants import (
 from cayu.tools.inference import AuxiliaryInferencePolicy
 from cayu.tools.policy import ToolPolicy, ToolPolicyResult
 from cayu.tools.targeted_projection import TargetedToolMode
+from cayu.vaults.redaction import contains_redacted_secret
 
 if TYPE_CHECKING:
     from cayu.mcp.tools import McpToolset
@@ -247,10 +248,18 @@ class ToolCallRequest:
     model_tool_name: str | None = None
     targeted_tool_invocation: ResolvedTargetedToolInvocation | None = None
     targeted_tool_rejection: RejectedTargetedToolInvocation | None = None
+    # See ``PendingToolCallApproval.literal_redaction_marker``. It holds only
+    # while the arguments quote the marker, so a copy that drops them drops it.
+    # It is evidence about the arguments, not part of the call's identity.
+    literal_redaction_marker: bool = field(default=False, compare=False)
     argument_presence: dict[str, Any] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "argument_presence", argument_presence_fields(self.arguments))
+        if type(self.literal_redaction_marker) is not bool:
+            raise TypeError("literal_redaction_marker must be a bool.")
+        if self.literal_redaction_marker and not contains_redacted_secret(self.arguments):
+            object.__setattr__(self, "literal_redaction_marker", False)
         if self.targeted_tool_grant_id is not None:
             validate_targeted_tool_digest(
                 self.targeted_tool_grant_id,
@@ -349,6 +358,8 @@ def copy_tool_call_request(
                 value.targeted_tool_rejection.model_dump(mode="python")
             )
         ),
+        literal_redaction_marker=value.literal_redaction_marker
+        and (arguments is None or arguments == value.arguments),
     )
 
 

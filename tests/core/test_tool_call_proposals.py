@@ -21,9 +21,9 @@ from cayu.approvals import (
 )
 from cayu.budgets import default_price_book
 from cayu.events import EventType
-from cayu.messages import ToolResultPart
+from cayu.messages import TextPart, ToolResultPart
 from cayu.observability import EventWatcher, serve_event_watchers
-from cayu.providers import ModelRequest, ModelStreamEvent
+from cayu.providers import ModelProviderError, ModelRequest, ModelStreamEvent
 from cayu.runtime import ExecutionProfileBehaviorIdentity
 from cayu.runtime._tool_call_proposals import (
     TOOL_CALL_PROPOSAL_PROVIDER_NAME,
@@ -43,7 +43,7 @@ from cayu.tools.policy import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
-from cayu.vaults.redaction import SecretRedactor
+from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor
 
 FILED: list[dict] = []
 
@@ -506,6 +506,107 @@ def test_approved_but_unsettled_call_is_no_longer_pending() -> None:
         cut = next(index for index, event in enumerate(events) if event.type is event_type)
         outcome = ToolCallProposalOutcome.from_events(events[: cut + 1])
         assert outcome.status is ToolCallProposalStatus.UNSETTLED
+
+
+def test_proposal_that_quotes_the_redaction_marker_runs_exactly(tmp_path: Path) -> None:
+    """Quoting the marker is not a redaction, even after a restart."""
+
+    path = tmp_path / "sessions.sqlite"
+    arguments = {
+        "title": "Stored title",
+        "body": f"Cayu writes {REDACTED_SECRET} where a secret was.",
+        "labels": [REDACTED_SECRET],
+        REDACTED_SECRET: "a quoted key",
+    }
+
+    async def scenario():
+        first = _build(SQLiteSessionStore(path))
+        pending = await first.propose_tool_call(
+            "scout", "file_issue", arguments, session_id="quoted-marker"
+        )
+        await first.aclose()
+
+        second = _build(SQLiteSessionStore(path))
+        events = await _drain(
+            second.resolve_tool_approval(_resolution(pending, ToolApprovalDecision.APPROVE))
+        )
+        await second.aclose()
+        return pending, events
+
+    pending, events = asyncio.run(scenario())
+    assert pending.status is ToolCallProposalStatus.PENDING_APPROVAL
+    assert ToolCallProposalOutcome.from_events(events).status is ToolCallProposalStatus.COMPLETED
+    assert [arguments] == FILED
+
+
+def test_proposal_redacted_in_the_transcript_is_never_raised() -> None:
+    secret = "sk-live-proposal-canary"
+
+    async def scenario():
+        app = _build(secret_redactor=SecretRedactor(secret))
+        # Unlike propose_tool_call, the request builder does not refuse a
+        # secret, so the transcript records this proposal redacted.
+        request = tool_call_proposal_request(
+            "scout",
+            "file_issue",
+            {"title": "Stored title", "body": f"{REDACTED_SECRET} and {secret}"},
+        )
+        events = await _drain(app.run(request))
+        await app.aclose()
+        return events
+
+    events = asyncio.run(scenario())
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert "redacted in the session transcript" in events[-1].payload["error"]
+    assert not any(event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
+    assert FILED == []
+
+
+def test_proposal_message_tells_a_quoted_marker_from_a_redaction() -> None:
+    secret = "sk-live-proposal-canary"
+    provider = ToolCallProposalProvider()
+    arguments = {"body": f"{REDACTED_SECRET} {secret}", REDACTED_SECRET: [REDACTED_SECRET]}
+    proposal = proposal_message(tool_name="file_issue", arguments=arguments, tool_call_id="c")
+    [part] = proposal.content
+    assert REDACTED_SECRET not in part.text
+
+    async def stream(message):
+        request = ModelRequest(model="tool-proposal", messages=[message])
+        return [event async for event in provider.stream(request)]
+
+    raised = asyncio.run(stream(proposal))
+    assert raised[0] == ModelStreamEvent.tool_call(name="file_issue", arguments=arguments, id="c")
+    redacted = Message.text("user", SecretRedactor(secret).redact_text(part.text))
+    with pytest.raises(ModelProviderError, match="redacted") as refused:
+        asyncio.run(stream(redacted))
+    assert refused.value.retryable is False
+    # A short secret inside the escape breaks the JSON; that is still a
+    # redacted proposal, never "nothing was proposed".
+    broken = Message.text("user", SecretRedactor("005bRED").redact_text(part.text))
+    with pytest.raises(ModelProviderError, match="redacted"):
+        asyncio.run(stream(broken))
+    # Another part that merely mentions the envelope key and the marker is
+    # context, not a proposal.
+    note = TextPart(text=f'Notes: "cayu_tool_call_proposal" may quote {REDACTED_SECRET}.')
+    with_note = Message(role="user", content=[note, part])
+    assert asyncio.run(stream(with_note))[0] == raised[0]
+
+
+@pytest.mark.parametrize("secret", ["SECRET", "005bRED"])
+def test_secret_inside_the_stored_marker_escape_is_refused_before_any_session(
+    secret: str,
+) -> None:
+    app = _build(secret_redactor=SecretRedactor(secret))
+    arguments = {"title": "Stored title", "body": f"quote {REDACTED_SECRET}"}
+
+    async def scenario():
+        with pytest.raises(ValueError, match="altered by secret redaction"):
+            await app.propose_tool_call("scout", "file_issue", arguments)
+        page = await app.session_store.list_sessions()
+        await app.aclose()
+        return page
+
+    assert asyncio.run(scenario()).sessions == []
 
 
 def test_failed_proposal_session_reports_its_error_as_the_reason() -> None:

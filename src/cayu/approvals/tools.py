@@ -66,6 +66,7 @@ from cayu.tools.grants import (
     RejectedTargetedToolInvocation,
     ResolvedTargetedToolInvocation,
 )
+from cayu.vaults.redaction import contains_redacted_secret
 
 
 class ToolApprovalDecision(StrEnum):
@@ -404,6 +405,14 @@ class PendingToolCallApproval(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    # Set only when the runtime raised this call exactly as application code
+    # proposed it, so the redaction marker in its arguments is quoted text, not
+    # a redacted secret. Model-raised calls never carry it: a model can echo a
+    # marker it saw in place of a secret.
+    literal_redaction_marker: Literal[True] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     # ``None`` is accepted only as a legacy representation. Callers must use
     # ``effective_tool_policy_evidence`` before making an authority decision.
     policy_evidence: ToolPolicyEvidence | None = None
@@ -524,7 +533,15 @@ class PendingToolCallApproval(BaseModel):
             self.targeted_tool_invocation is None and self.targeted_tool_rejection is None
         ):
             raise ValueError("Pending model tool alias requires targeted-tool evidence.")
+        if self.literal_redaction_marker is True and not contains_redacted_secret(self.arguments):
+            raise ValueError("A literal redaction marker requires arguments that quote it.")
         return self
+
+    @property
+    def arguments_redacted(self) -> bool:
+        """Whether the arguments hold a redaction marker that may stand for a secret."""
+
+        return self.literal_redaction_marker is None and contains_redacted_secret(self.arguments)
 
     @property
     def transcript_arguments(self) -> dict[str, Any]:
@@ -899,6 +916,7 @@ class PendingToolApprovalEventView(BaseModel):
                         "targeted_tool_grant_id",
                         "targeted_tool_invocation",
                         "targeted_tool_rejection",
+                        "literal_redaction_marker",
                     },
                 ),
                 "arguments_state": state,
@@ -1119,6 +1137,7 @@ def copy_pending_tool_call_approval(
         model_tool_name=call.model_tool_name,
         targeted_tool_invocation=call.targeted_tool_invocation,
         targeted_tool_rejection=call.targeted_tool_rejection,
+        literal_redaction_marker=call.literal_redaction_marker,
         policy_evidence=call.policy_evidence,
         policy_decision=call.policy_decision,
         command_denial_code=call.command_denial_code,

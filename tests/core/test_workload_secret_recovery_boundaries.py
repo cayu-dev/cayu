@@ -17,6 +17,7 @@ import cayu.runtime.execution_profiles as execution_profiles_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
 from cayu.approvals.tools import (
+    PendingToolCallApproval,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
@@ -61,6 +62,41 @@ def test_pending_tool_round_recovery_rejects_redaction_marker_arguments() -> Non
 
     with pytest.raises(ValueError, match="redaction marker"):
         pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
+
+
+def test_pending_tool_round_executes_only_a_marker_raised_as_quoted_text() -> None:
+    quoted = runtime_records.ToolCallRequest(
+        id="quoted_marker_call",
+        name="side_effect",
+        arguments={"value": f"quotes {REDACTED_SECRET}"},
+        literal_redaction_marker=True,
+    )
+    checkpoint, pending = tool_round_recovery.checkpoint_with_pending_tool_round(
+        None,
+        agent_name="assistant",
+        environment_name=None,
+        task_id=None,
+        tool_calls=[quoted],
+        policy_outcomes=None,
+        structured_output=None,
+        tool_round_identity=tool_round_identity(),
+    )
+    assert pending.tool_calls[0].literal_redaction_marker is True
+    assert pending_round_reader.pending_tool_round_from_checkpoint(checkpoint) == pending
+    assert tool_round_recovery.pending_round_tool_calls(pending)[0].literal_redaction_marker
+
+    # Without the evidence the same arguments read as a redaction.
+    del checkpoint["pending_tool_round"]["tool_calls"][0]["literal_redaction_marker"]
+    with pytest.raises(ValueError, match="redaction marker"):
+        pending_round_reader.pending_tool_round_from_checkpoint(checkpoint)
+    # The evidence holds only for arguments that quote the marker.
+    assert not runtime_records.copy_tool_call_request(
+        quoted, arguments={"value": "changed"}
+    ).literal_redaction_marker
+    payload = pending.tool_calls[0].model_dump(mode="json")
+    payload["arguments"] = {"value": "safe"}
+    with pytest.raises(ValueError, match="literal redaction marker"):
+        PendingToolCallApproval.model_validate(payload)
 
 
 def test_pending_structured_output_round_retains_redacted_result_arguments() -> None:

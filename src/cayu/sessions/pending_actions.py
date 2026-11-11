@@ -758,6 +758,7 @@ def _approval_event_matches_checkpoint(
             pending_call.pop("targeted_tool_grant_id", None)
             pending_call.pop("targeted_tool_invocation", None)
             pending_call.pop("targeted_tool_rejection", None)
+            pending_call.pop("literal_redaction_marker", None)
             pending_call.pop("metadata", None)
             pending_call.pop("reason", None)
             pending_call.pop("arguments_state", None)

@@ -624,6 +624,7 @@ def pending_tool_call_records(
                 model_tool_name=tool_call.model_tool_name,
                 targeted_tool_invocation=tool_call.targeted_tool_invocation,
                 targeted_tool_rejection=tool_call.targeted_tool_rejection,
+                literal_redaction_marker=True if tool_call.literal_redaction_marker else None,
                 policy_evidence=policy_evidence_by_id.get(
                     tool_call.id,
                     default_policy_evidence,
@@ -658,6 +659,7 @@ def pending_round_tool_calls(
             model_tool_name=call.model_tool_name,
             targeted_tool_invocation=call.targeted_tool_invocation,
             targeted_tool_rejection=call.targeted_tool_rejection,
+            literal_redaction_marker=call.literal_redaction_marker is True,
         )
         for call in pending_round.tool_calls
     ]

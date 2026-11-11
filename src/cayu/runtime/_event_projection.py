@@ -1368,6 +1368,7 @@ def _quarantine_pre_execution_tool_arguments(
         value.pop("targeted_tool_grant_id", None)
         value.pop("targeted_tool_invocation", None)
         value.pop("targeted_tool_rejection", None)
+        value.pop("literal_redaction_marker", None)
         value.pop("arguments", None)
         value.pop("effective_arguments", None)
         value.pop("approved_arguments", None)

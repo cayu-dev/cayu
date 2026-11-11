@@ -23,7 +23,7 @@ from cayu.execution_units import ToolRoundIdentity
 from cayu.sessions import _pending_tool_round as pending_rounds
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.tools.policy import ToolPolicyDecision
-from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import SecretRedactor
 
 PENDING_TOOL_APPROVAL_CHECKPOINT_KEY = "pending_tool_approval"
 APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY = "approval_resolution_intent"
@@ -182,9 +182,8 @@ def _pending_approval_from_owned_checkpoint(
         raise ValueError(
             "Pending tool approval checkpoint is invalid and cannot be executed."
         ) from None
-    if contains_redacted_secret(approval.arguments) or any(
-        contains_redacted_secret(call.arguments) for call in approval.tool_calls
-    ):
+    # The approval's own arguments are its gating call's, so the calls cover them.
+    if any(call.arguments_redacted for call in approval.tool_calls):
         raise ValueError(
             "Pending approval arguments contain a redaction marker and cannot be executed."
         )

@@ -846,6 +846,7 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
             "targeted_tool_grant_id",
             "targeted_tool_invocation",
             "targeted_tool_rejection",
+            "literal_redaction_marker",
             "command_denial_code",
         }
         | {"arguments_state"}

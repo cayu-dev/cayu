@@ -217,7 +217,8 @@ def _project_tool_call_for_hook(
         if type(projected) is not dict:
             raise AssertionError("Hook argument projection returned a non-object.")
         arguments = projected
-    return replace(tool_call, arguments=arguments)
+    # A redacted projection says nothing about quoted markers.
+    return replace(tool_call, arguments=arguments, literal_redaction_marker=False)
 
 
 def _hook_failure_payload(

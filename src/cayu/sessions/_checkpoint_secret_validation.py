@@ -335,6 +335,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "targeted_tool_grant_id",
     "targeted_tool_invocation",
     "targeted_tool_rejection",
+    "literal_redaction_marker",
     "tool_ref",
     "grant_id",
     "use_id",

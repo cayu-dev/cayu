@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict
 
 from cayu._validation import copy_durable_json_object
 from cayu.events import Event, EventType
+from cayu.messages import TextPart
 from cayu.runtime._tool_call_proposals import (
     TOOL_CALL_PROPOSAL_MODEL,
     TOOL_CALL_PROPOSAL_PROVIDER_NAME,
@@ -203,6 +204,23 @@ def _require_secret_free_proposal(
                 "Tool call proposal contains a registered secret; bind the credential "
                 "to the tool instead of passing it as an argument."
             )
+
+
+def _require_unredacted_proposal_message(redactor: SecretRedactor, request: RunRequest) -> None:
+    """Refuse a proposal whose stored message redaction would still change.
+
+    Each string passed the check above, but the stored message escapes every
+    quoted redaction marker, and a short registered secret can match inside
+    that escape. The provider would then refuse the proposal, or not find it.
+    """
+
+    for message in request.messages:
+        for part in message.content:
+            if isinstance(part, TextPart) and redactor.redact_text(part.text) != part.text:
+                raise ValueError(
+                    "Tool call proposal would be altered by secret redaction when it is "
+                    "recorded; a registered secret matches part of its stored form."
+                )
 
 
 def tool_call_proposal_request(

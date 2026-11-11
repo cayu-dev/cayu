@@ -362,6 +362,7 @@ def bounded_pending_approval_event_payload(
         raw_call.pop("targeted_tool_grant_id", None)
         raw_call.pop("targeted_tool_invocation", None)
         raw_call.pop("targeted_tool_rejection", None)
+        raw_call.pop("literal_redaction_marker", None)
         raw_call.pop("arguments", None)
         raw_call[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
         if not publish_policy_output:
@@ -1200,6 +1201,7 @@ def pending_tool_call_approvals(
                 model_tool_name=tool_call.model_tool_name,
                 targeted_tool_invocation=tool_call.targeted_tool_invocation,
                 targeted_tool_rejection=tool_call.targeted_tool_rejection,
+                literal_redaction_marker=True if tool_call.literal_redaction_marker else None,
                 policy_evidence=policy_evidence_by_id.get(
                     tool_call.id,
                     default_policy_evidence,
@@ -1256,6 +1258,8 @@ def tool_call_request_from_pending(
         model_tool_name=call.model_tool_name,
         targeted_tool_invocation=call.targeted_tool_invocation,
         targeted_tool_rejection=call.targeted_tool_rejection,
+        # Replacement arguments come from the approver, not the proposal.
+        literal_redaction_marker=call.literal_redaction_marker is True and arguments is None,
     )
 
 

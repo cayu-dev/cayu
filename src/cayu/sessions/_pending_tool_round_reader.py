@@ -12,7 +12,7 @@ from cayu.sessions._checkpoint_secret_validation import durable_value_contains_s
 from cayu.sessions.checkpoints import _DecodedRuntimeCheckpoint
 from cayu.sessions.records import Session
 from cayu.sessions.store import SessionStore
-from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import SecretRedactor
 
 
 async def load_pending_tool_round(
@@ -157,7 +157,7 @@ def _require_executable_pending_tool_round(
     pending_round: pending_rounds.PendingToolRound,
 ) -> None:
     has_redacted_arguments = any(
-        call.targeted_tool_rejection is None and contains_redacted_secret(call.arguments)
+        call.targeted_tool_rejection is None and call.arguments_redacted
         for call in pending_round.tool_calls
     )
     is_internal_structured_output_round = pending_round.structured_output is not None and any(

@@ -58,7 +58,7 @@ from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
 )
-from cayu.vaults.redaction import SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import SecretRedactor
 
 if TYPE_CHECKING:
     from cayu.sessions.records import Session
@@ -828,6 +828,7 @@ def public_pending_user_input_event_payload(
         pending_call.pop("targeted_tool_grant_id", None)
         pending_call.pop("targeted_tool_invocation", None)
         pending_call.pop("targeted_tool_rejection", None)
+        pending_call.pop("literal_redaction_marker", None)
     if question is None:
         payload.pop("question", None)
         payload.pop("options", None)
@@ -1088,9 +1089,8 @@ def _pending_user_input_from_owned_checkpoint(
         raise ValueError(
             "Pending user-input checkpoint is invalid and cannot be executed."
         ) from None
-    if contains_redacted_secret(pending.arguments) or any(
-        contains_redacted_secret(call.arguments) for call in pending.tool_calls
-    ):
+    # The pause's own arguments are its gating call's, so the calls cover them.
+    if any(call.arguments_redacted for call in pending.tool_calls):
         raise ValueError(
             "Pending user-input arguments contain a redaction marker and cannot be executed."
         )

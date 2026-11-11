@@ -2190,6 +2190,7 @@ class ProviderOperationRecoveryOwner:
             try:
                 durable_step_result = _durable_assistant_step_result(
                     step_result,
+                    provider=registered_provider.provider,
                     redactor=self._secret_redactor,
                     targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                     native_tool_name_grant_ids={

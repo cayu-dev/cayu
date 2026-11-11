@@ -29,6 +29,7 @@ from cayu.runtime._model_completion_contracts import (
     _copy_assistant_step_result,
 )
 from cayu.runtime._session_control import SessionInterruptedByRequest
+from cayu.runtime._tool_call_proposals import ToolCallProposalProvider
 from cayu.runtime.model_steps import (
     AssistantStepResult,
     assistant_text_content,
@@ -87,6 +88,7 @@ class ModelAttemptFailed(Exception):
 def _durable_assistant_step_result(
     result: AssistantStepResult,
     *,
+    provider: object,
     redactor: SecretRedactor,
     targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
     native_tool_name_grant_ids: Mapping[str, str] | None = None,
@@ -110,6 +112,9 @@ def _durable_assistant_step_result(
         {} if targeted_tool_reference_grant_ids is None else dict(targeted_tool_reference_grant_ids)
     )
     name_grant_ids = {} if native_tool_name_grant_ids is None else dict(native_tool_name_grant_ids)
+    # The runtime-owned proposal provider raises exactly what application code
+    # proposed and refuses a proposal its transcript redacted.
+    proposed_by_application = type(provider) is ToolCallProposalProvider
     tool_calls: list[runtime_records.ToolCallRequest] = []
     for call in copied.tool_calls:
         projected_arguments = redactor.redact_json_values(call.arguments)
@@ -138,6 +143,12 @@ def _durable_assistant_step_result(
                 name=call.name,
                 arguments=projected_arguments,
                 targeted_tool_grant_id=targeted_tool_grant_id,
+                # A marker that redaction left unchanged is one the application
+                # quoted (the request keeps the flag only while the arguments
+                # quote it). A model may instead echo a marker it saw for a secret.
+                literal_redaction_marker=(
+                    proposed_by_application and projected_arguments == call.arguments
+                ),
             )
         )
     assistant_message = transcript_helpers.assistant_message_with_tool_call_arguments(
