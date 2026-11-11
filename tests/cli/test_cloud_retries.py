@@ -880,3 +880,90 @@ def test_public_retry_command_sends_the_acknowledgement(tmp_path: Path):
         "/v1/applications/retry-agent/deployments/dep_old/retry",
         {"idempotency_key": "one-submission", "payload": {"acknowledge_breaking": [115]}},
     )
+
+
+_PROCEED_ALL = {"acknowledge_sessions": ["*"], "mode": "proceed", "wait_seconds": 900}
+
+
+class _RetriedSwitchClient:
+    """Cloud accepting a retry of a Release whose session-held switch it refused."""
+
+    def __init__(self, release):
+        self.release = release
+
+    def request(self, method, path, **kwargs):
+        if path == "/v1/applications":
+            return {"items": [{"id": "retry-agent", "name": "Retry Agent", "revision": 4}]}
+        if method == "POST" and path.endswith("/retry"):
+            return self.release
+        raise AssertionError((method, path))
+
+
+@pytest.mark.parametrize(
+    "release",
+    [
+        # A built Release keeps `promoted` while Cloud checks sessions and selects it again.
+        {"id": "dep_old", "status": "promoted", "session_policy": _PROCEED_ALL},
+        # A failed Release's retry is a new attempt, followed by its own id.
+        {"id": "dep_new", "status": "accepted", "session_policy": _PROCEED_ALL},
+        # A staged Release a person promoted is published by its retry like any other.
+        {
+            "id": "dep_old",
+            "stage_only": True,
+            "status": "smoke_tested",
+            "session_policy": _PROCEED_ALL,
+        },
+    ],
+)
+def test_retry_says_it_returns_before_the_switch_and_how_to_follow_it(release, capsys):
+    client = _RetriedSwitchClient(release)
+    arguments = cloud._build_parser().parse_args(
+        [
+            "--context",
+            "/private/cloud.json",
+            "deployment",
+            "retry",
+            "dep_old",
+            "--application",
+            "retry-agent",
+            "--session-policy",
+            "proceed",
+            "--acknowledge-session",
+            "*",
+        ]
+    )
+
+    result = cloud._deployment(arguments, client=client)
+
+    wait = (
+        f"cayu cloud --context /private/cloud.json deployment wait {release['id']} "
+        "--application retry-agent --live"
+    )
+    assert result["result"] == release
+    assert result["commands"] == {"wait": wait}
+    assert f"`{release['status']}`" in result["message"]
+    assert result["message"].endswith(f"Follow it until it serves with `{wait}`.")
+    assert f"cayu cloud: {result['message']}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("staged", [{"stage_only": True}, {"candidate": {"expires_at": None}}])
+def test_a_staged_build_retry_says_it_waits_to_be_promoted(staged, capsys):
+    # A failed `deploy --no-promote` Release's retry builds a new staged attempt, which
+    # Cloud publishes only once someone promotes it.
+    release = {"id": "dep_new", "status": "accepted", "session_policy": _PROCEED_ALL, **staged}
+    arguments = cloud._build_parser().parse_args(
+        ["deployment", "retry", "dep_old", "--application", "retry-agent"]
+    )
+
+    result = cloud._deployment(arguments, client=_RetriedSwitchClient(release))
+
+    suffix = "dep_new --application retry-agent"
+    commands = {
+        "promote": f"cayu cloud deployment promote {suffix}",
+        "wait": f"cayu cloud deployment wait {suffix}",
+    }
+    assert result["commands"] == commands
+    assert "--live" not in result["message"]
+    assert f"`{commands['wait']}`" in result["message"]
+    assert f"`{commands['promote']}`" in result["message"]
+    assert f"cayu cloud: {result['message']}" in capsys.readouterr().err

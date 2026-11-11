@@ -967,7 +967,8 @@ def test_deployment_retry_reports_what_cloud_did_not_apply(response, not_applied
     output = cloud._deployment(arguments, client=RetryClient())
     if not_applied is None:
         assert "not_applied" not in output
-        assert capsys.readouterr().err == ""
+        # Only how to follow the retry.
+        assert capsys.readouterr().err == f"cayu cloud: {output['message']}\n"
         return
     reported = output["not_applied"]
     assert reported.get("acknowledge_breaking") == not_applied.get("acknowledge_breaking")

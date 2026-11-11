@@ -1300,12 +1300,29 @@ acknowledge sessions nobody has looked at. Check `deployment status` for the rel
 `session_preflight` and decide, or retry with `--acknowledge-session '*'` yourself.
 
 Answering or finishing the sessions and retrying with `--session-policy wait` publishes
-the release once nothing blocks. A refused rollback returns the Agent's selection to the
-serving release, and the same retry selects it again. A refused promotion doesn't: when
-the promotion selected the release before Cloud checked the sessions (as `deploy`'s
-promote can), it stays `promoted` and selected while the previous release keeps serving,
-and only its `publication_error` says so; when Cloud checked first, the selection never
-changed. Either way, the retry publishes it.
+the release once nothing blocks. A refused rollback or promotion that had already selected
+the release (as `deploy`'s promote can) returns the Agent's selection to the serving
+release. The release keeps `promoted`, and only its `publication_error` says it was
+refused. When Cloud checked first, the selection never changed. Either way, the retry
+publishes it: Cloud checks the sessions again, prepares the release and selects it.
+
+`deployment retry` returns as soon as Cloud has queued the retry, before any of that,
+and the release's status (`promoted`, say) doesn't mean the Agent's service runs it. So
+the command writes to standard error, and returns as `message` and `commands.wait`, the
+command that follows the release until the service runs it (for a failed release's
+retry, the new attempt Cloud answered with):
+
+```bash
+cayu cloud deployment wait DEPLOYMENT_ID --application AGENT_SLUG --live
+```
+
+A staged release's retry that is still building (a failed `deploy --no-promote`
+release's new attempt) is published only once someone promotes it, so for that one
+`commands.wait` waits for the build without `--live` and `commands.promote` is the
+promotion that publishes it.
+
+Promoting the release again doesn't help: it was already promoted, and Cloud answers with
+what applies instead.
 
 Running `cayu cloud deploy` again with unchanged source and any of the three flags (even
 `--session-policy wait` alone, which keeps the original create request and key) gives the

@@ -4307,12 +4307,17 @@ def _deployment(
             # publishes under the choice it keeps.
             already_selected=_deployment_status(result) == "promoted",
         )
-        if not_applied is not None:
-            return {
-                "not_applied": not_applied,
-                "operation": "deployment.retry",
-                "result": result,
-            }
+        follow = _retry_follow(
+            result,
+            application_id=application_id,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+        )
+        return {
+            **({} if not_applied is None else {"not_applied": not_applied}),
+            **follow,
+            "operation": "deployment.retry",
+            "result": result,
+        }
     elif arguments.deployment_command == "wait":
         result = _wait_for_deployment(
             client,
@@ -4371,6 +4376,48 @@ def _deployment(
         "operation": f"deployment.{arguments.deployment_command}",
         "result": result,
     }
+
+
+def _retry_follow(
+    release: dict[str, Any], *, application_id: str, recovery_arguments: Sequence[str]
+) -> dict[str, Any]:
+    """Say that a retry Cloud accepted returns before it finishes, and how to follow it.
+
+    Cloud finishes the retry on its own. A built Release keeps its status (`promoted` says
+    it passed its release gate) while Cloud checks the serving release's sessions, prepares
+    and selects it, and a failed Release's retry is a new attempt with its own id. So the
+    command follows the Release Cloud answered with until the Agent's service runs it. A
+    staged Release still being built is published only once someone promotes it, as
+    `_wait_until_serving` refuses it, so that one is followed until it is built.
+    """
+
+    app = _cloud_application_id(application_id)
+    deployment = _cloud_deployment_id(str(release.get("id")))
+    if app is None or deployment is None:
+        return {}
+    status = _deployment_status(release)
+    command = ["cayu", "cloud", *recovery_arguments, "deployment"]
+    suffix = [deployment, "--application", app]
+    staged = release.get("stage_only") is True or isinstance(release.get("candidate"), dict)
+    if staged and status not in _DEPLOYMENT_READY:
+        commands = {
+            "promote": shlex.join([*command, "promote", *suffix]),
+            "wait": shlex.join([*command, "wait", *suffix]),
+        }
+        message = (
+            f"Cayu Cloud queued the retry and builds Release {deployment} on its own; it is "
+            "staged, so Cloud publishes it only once someone promotes it. Wait for the build "
+            f"with `{commands['wait']}`, then promote it with `{commands['promote']}`."
+        )
+    else:
+        commands = {"wait": shlex.join([*command, "wait", *suffix, "--live"])}
+        message = (
+            f"Cayu Cloud queued the retry and finishes Release {deployment} on its own; its "
+            f"`{status}` status doesn't mean the Agent's service runs it yet. Follow it until "
+            f"it serves with `{commands['wait']}`."
+        )
+    print(f"cayu cloud: {message}", file=sys.stderr)
+    return {"commands": commands, "message": message}
 
 
 def _rollback(
