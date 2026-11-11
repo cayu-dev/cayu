@@ -11,7 +11,6 @@ from cayu._validation import copy_durable_metadata, copy_json_value, require_cle
 from cayu.messages import (
     Message,
     MessageRole,
-    TextPart,
     ToolResultPart,
     copy_message,
     detach_message,
@@ -298,7 +297,9 @@ class RequireFinalTool(LoopPolicy):
                 type(part) is ToolResultPart for part in message.content
             ):
                 continue
-            if index in context.continuation_message_indices and self._is_reminder(message):
+            # Provenance binds the durable message to this policy's configuration.
+            # Its text may have been redacted before publication.
+            if index in context.continuation_message_indices:
                 reminders += 1
                 continue
             break
@@ -316,13 +317,6 @@ class RequireFinalTool(LoopPolicy):
         if self._on_exhausted == BeforeStopAction.FAIL:
             return BeforeStopDecision.fail(reason, metadata=metadata)
         return BeforeStopDecision.interrupt(reason, metadata=metadata)
-
-    def _is_reminder(self, message: Message) -> bool:
-        return (
-            len(message.content) == 1
-            and type(message.content[0]) is TextPart
-            and message.content[0].text == self._reminder
-        )
 
 
 def copy_before_stop_decision(decision: BeforeStopDecision) -> BeforeStopDecision:

@@ -8490,7 +8490,11 @@ class SessionEngine(BeforeStopPolicies):
                                 raise RuntimeError(
                                     "Before-stop continue decision requires a message."
                                 )
-                            repair_message = before_stop_decision.message
+                            repair_message = redact_runtime_message_for_boundary(
+                                before_stop_decision.message,
+                                redactor=self._secret_redactor,
+                                field_name="before_stop_decision.message",
+                            )
                             if selected_policy_key is None:
                                 raise RuntimeError("Before-stop continuation lost its policy.")
                             messages.append(repair_message)

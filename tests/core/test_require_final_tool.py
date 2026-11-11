@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.core.test_targeted_tool_grants import _codec
 
 from cayu import (
     AgentSpec,
@@ -29,6 +30,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import InMemorySessionStore
 from cayu.storage import SQLiteSessionStore
 from cayu.tools import ToolPolicy, ToolPolicyDecision, ToolPolicyResult
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 EMPTY = [ModelStreamEvent.completed({"finish_reason": "stop"})]
 
@@ -204,6 +206,61 @@ def test_exhausted_reminders_interrupt_with_a_reason(max_reminders) -> None:
         "reminders": max_reminders,
         "tool_names": ["ask_customer"],
     }
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("max_reminders", [1, 2])
+def test_secret_bearing_reminders_exhaust_without_owning_matching_user_input(
+    store_kind, max_reminders, tmp_path
+) -> None:
+    async def scenario():
+        secret = "final-tool-reminder-private-canary"
+        reminder = f"Finish the operation for credential {secret}."
+        redacted_reminder = reminder.replace(secret, REDACTED_SECRET)
+        store = (
+            InMemorySessionStore(public_authority_alias_codec=_codec())
+            if store_kind == "memory"
+            else SQLiteSessionStore(
+                tmp_path / "sessions.sqlite", public_authority_alias_codec=_codec()
+            )
+        )
+        provider = ScriptedModelProvider([EMPTY] * (2 * (max_reminders + 1)))
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="support", model="scripted-model"))
+        policy = RequireFinalTool(["ask_customer"], reminder=reminder, max_reminders=max_reminders)
+        try:
+            events = await _run(app, policy, max_steps=max_reminders + 2)
+            assert len(provider.requests) == max_reminders + 1
+            assert (await store.load("s")).status == SessionStatus.INTERRUPTED
+            assert events[-1].payload["policy_metadata"]["reminders"] == max_reminders
+            transcript = await store.load_transcript("s")
+            assert len(_reminders(transcript, redacted_reminder)) == max_reminders
+            assert secret not in json.dumps([m.model_dump(mode="json") for m in transcript])
+
+            # Even identical redacted text has no ownership when supplied by a user.
+            resumed = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="s",
+                        messages=[Message.text("user", redacted_reminder)],
+                        loop_policies=(policy,),
+                        max_steps=max_reminders + 2,
+                    )
+                )
+            ]
+            assert len(provider.requests) == 2 * (max_reminders + 1)
+            assert (await store.load("s")).status == SessionStatus.INTERRUPTED
+            assert resumed[-1].payload["policy_metadata"]["reminders"] == max_reminders
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_exhausted_reminders_can_fail_instead() -> None:
