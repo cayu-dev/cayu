@@ -745,8 +745,8 @@ async def assert_hold_reason_cancellation_fence_conformance(store: TaskStore) ->
 
     A hold stores its caller's reason in ``status_reason``, the field that also
     carries a requested cancellation. A held task has no worker, so the same
-    text there must leave it cancellable and holdable (issue #3655). A claimed
-    task whose cancellation was requested must still refuse both.
+    text there must leave it cancellable and holdable. A claimed task whose
+    cancellation was requested must still refuse both.
     """
 
     holds = ("pause_task", "block_task", "mark_task_needs_attention")

@@ -798,6 +798,66 @@ POSTGRES_EVENT_SEQUENCE_RESERVATION_DDL: tuple[str, ...] = (
     """,
 )
 
+# Revision 148 replaces the two functions of revision 147 that run with their
+# caller's rights. Each now pins its search_path and reaches the high-water helper
+# through the schema of the events table, so no function or operator that another
+# role creates on the caller's search_path can take the place of one they use.
+POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL: tuple[str, ...] = (
+    """
+    CREATE OR REPLACE FUNCTION cayu_reserve_event_sequence() RETURNS trigger AS $$
+    DECLARE
+        high_water BIGINT;
+        low_bits BIGINT;
+    BEGIN
+        IF current_setting('cayu.event_sequence_reserved', true) = TG_RELID::text THEN
+            RETURN NULL;
+        END IF;
+        EXECUTE format('SELECT %I.cayu_event_sequence_high_water($1)', TG_TABLE_SCHEMA)
+            INTO high_water USING TG_RELID::regclass;
+        low_bits := high_water & 4294967295;
+        PERFORM pg_advisory_xact_lock_shared(
+            (((TG_RELID::bigint % 32768) << 16) | (high_water >> 32))::integer,
+            (low_bits - CASE WHEN low_bits >= 2147483648 THEN 4294967296 ELSE 0 END)::integer
+        );
+        PERFORM set_config('cayu.event_sequence_reserved', TG_RELID::text, true);
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+    """,
+    """
+    CREATE OR REPLACE FUNCTION cayu_event_visible_sequence(events regclass)
+    RETURNS BIGINT AS $$
+    DECLARE
+        events_schema NAME;
+        high_water BIGINT;
+        reserved BIGINT;
+    BEGIN
+        -- Under REPEATABLE READ the reader's snapshot predates these live reads,
+        -- so a writer that commits in between would be invisible yet unreserved.
+        IF current_setting('transaction_isolation') <> 'read committed' THEN
+            RAISE EXCEPTION 'cayu_event_visible_sequence must run under READ COMMITTED';
+        END IF;
+        SELECT n.nspname INTO STRICT events_schema
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = events;
+        -- The high-water first: a transaction that reserves after the locks are
+        -- read draws above it.
+        EXECUTE format('SELECT %I.cayu_event_sequence_high_water($1)', events_schema)
+            INTO high_water USING events;
+        SELECT min(((classid::bigint & 65535) << 32) | objid::bigint) INTO reserved
+        FROM pg_catalog.pg_locks
+        WHERE locktype = 'advisory'
+          AND objsubid = 2
+          AND database = (
+              SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()
+          )
+          AND (classid::bigint >> 16) = events::oid::bigint % 32768;
+        RETURN LEAST(high_water, reserved);
+    END;
+    $$ LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog, pg_temp
+    """,
+)
+
 POSTGRES_PUBLIC_AUTHORITY_ALIAS_CHECK_FUNCTION = """
         CREATE OR REPLACE FUNCTION cayu_require_public_authority_alias_config(
             expected_active_key_id TEXT,
@@ -938,6 +998,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     146: POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL,
     # Event writers reserve their sequence range for cross-session readers.
     147: POSTGRES_EVENT_SEQUENCE_RESERVATION_DDL,
+    # The event sequence functions pin their search_path.
+    148: POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

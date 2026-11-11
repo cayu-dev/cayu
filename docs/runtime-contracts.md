@@ -6440,7 +6440,11 @@ high-water at that moment. A Postgres cross-session
 to the smallest reservation an open transaction holds. That reader may delay
 while an event writer is open, but it must never advance its cursor past an
 invisible lower sequence. Writers in other databases on the same server don't
-delay it. Single-session reads use the per-session ordering invariant and should
+delay it. Since storage revision 148, the trigger function and
+`cayu_event_visible_sequence` pin their `search_path` to `pg_catalog` and call
+the high-water helper through the schema of the events table, so a function or
+operator another role creates on a caller's `search_path` never runs in their
+place. Single-session reads use the per-session ordering invariant and should
 not be delayed by unrelated open transactions. SQLite and in-memory stores
 serialize writes, so allocation order and visibility order are already aligned.
 

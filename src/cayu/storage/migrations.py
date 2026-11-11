@@ -617,6 +617,11 @@ REVISIONS: tuple[Revision, ...] = (
     # did not order sequences. The trigger also covers older binaries'
     # writes, so they keep working beside it. Postgres session stores require it.
     Revision(revision=147, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # The Postgres event sequence trigger and the readers' bound run with their
+    # caller's rights. They now pin their search_path and call the high-water
+    # helper by schema, so another role's function or operator cannot run in
+    # their place. Postgres session stores require it.
+    Revision(revision=148, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

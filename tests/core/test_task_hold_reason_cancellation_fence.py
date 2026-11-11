@@ -5,7 +5,7 @@ caller's ``reason`` in ``Task.status_reason``. The cancellation fence is the
 same field holding the literal ``"cancellation_requested"`` (or
 ``"retry_cancellation_requested"``) on a claimed or running task. A held task
 that has no worker and no cancel request must stay cancellable and re-holdable
-whatever its reason text is (issue #3655).
+whatever its reason text is.
 
 ``assert_hold_reason_cancellation_fence_conformance`` runs the same contract,
 and that a real fence still refuses, on every store including Postgres.

@@ -778,6 +778,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     146: SQLITE_GROUP_EXECUTION_GENERATION_BACKFILL,
     # Postgres event sequence reservations; SQLite serializes its writers.
     147: "",
+    # Postgres event sequence functions pin their search_path; nothing for SQLite.
+    148: "",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

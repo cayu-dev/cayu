@@ -108,7 +108,7 @@ def test_a_later_commit_with_a_lower_sequence_is_not_skipped(postgres_dsn: str) 
             await _create_sessions(store, "sess_early", "sess_late")
             cursor = await _head(store)
 
-            # The issue's interleaving: `early` takes its transaction id first, `late`
+            # The interleaving: `early` takes its transaction id first, `late`
             # draws the lower sequence, and `early` commits while `late` is still open.
             await early.execute("SELECT pg_current_xact_id()")
             await late.execute("SELECT pg_current_xact_id()")
@@ -351,6 +351,96 @@ def test_the_high_water_cannot_be_pointed_at_another_table(postgres_dsn: str) ->
     asyncio.run(scenario())
 
 
+def test_another_roles_functions_and_operators_never_run_for_writers_or_readers(
+    postgres_dsn: str,
+) -> None:
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    role = "cayu_event_cursor_planter"
+    planted = (
+        # An exact match for a call the trigger once made with an implicit cast.
+        "CREATE FUNCTION public.cayu_event_sequence_high_water(events oid) RETURNS BIGINT "
+        "AS $$ BEGIN RAISE EXCEPTION 'planted function ran'; END; $$ LANGUAGE plpgsql",
+        # Exact matches for operator calls that pg_catalog serves only with a cast.
+        "CREATE FUNCTION public.planted_modulo(bigint, integer) RETURNS BIGINT "
+        "AS $$ BEGIN RAISE EXCEPTION 'planted operator ran'; END; $$ LANGUAGE plpgsql",
+        "CREATE OPERATOR public.% "
+        "(LEFTARG = bigint, RIGHTARG = integer, FUNCTION = public.planted_modulo)",
+    )
+
+    async def scenario() -> None:
+        await _reset(postgres_dsn)
+        store = _store(postgres_dsn)
+        writer = await psycopg.AsyncConnection.connect(postgres_dsn)
+        try:
+            await _create_sessions(store, "sess_planted")
+            cursor = await _head(store)
+            async with await psycopg.AsyncConnection.connect(
+                postgres_dsn, autocommit=True
+            ) as admin:
+                await admin.execute(f"DROP ROLE IF EXISTS {role}")
+                await admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'planter'")
+                await admin.execute(f"GRANT USAGE, CREATE ON SCHEMA public TO {role}")
+            planter_dsn = make_conninfo(postgres_dsn, user=role, password="planter")
+            async with await psycopg.AsyncConnection.connect(
+                planter_dsn, autocommit=True
+            ) as planter:
+                for statement in planted:
+                    await planter.execute(statement)
+
+            await _insert_event(writer, "sess_planted", "evt_planted", 100)
+            await writer.commit()
+
+            records = await store.query_events(EventQuery(after_sequence=cursor))
+            assert _ids(records) == ["evt_planted"]
+        finally:
+            await writer.close()
+            await store.close()
+            async with await psycopg.AsyncConnection.connect(
+                postgres_dsn, autocommit=True
+            ) as admin:
+                await admin.execute(f"DROP OWNED BY {role}")
+                await admin.execute(f"DROP ROLE IF EXISTS {role}")
+
+    asyncio.run(scenario())
+
+
+def test_writes_and_cursor_reads_work_in_a_schema_whose_name_needs_quoting(
+    postgres_dsn: str,
+) -> None:
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    schema = "Cayu-Events"
+    schema_dsn = make_conninfo(postgres_dsn, options=f'-c search_path="{schema}"')
+
+    async def scenario() -> None:
+        async with await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True) as admin:
+            await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            await admin.execute(f'CREATE SCHEMA "{schema}"')
+        store = _store(schema_dsn)
+        writer = await psycopg.AsyncConnection.connect(schema_dsn)
+        try:
+            await _create_sessions(store, "sess_quoted")
+            cursor = await _head(store)
+
+            await _insert_event(writer, "sess_quoted", "evt_quoted", 100)
+            await writer.commit()
+
+            records = await store.query_events(EventQuery(after_sequence=cursor))
+            assert _ids(records) == ["evt_quoted"]
+        finally:
+            await writer.close()
+            await store.close()
+            async with await psycopg.AsyncConnection.connect(
+                postgres_dsn, autocommit=True
+            ) as admin:
+                await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+    asyncio.run(scenario())
+
+
 def test_cursor_reads_work_when_the_database_defaults_to_repeatable_read(
     postgres_dsn: str,
 ) -> None:
@@ -362,15 +452,15 @@ def test_cursor_reads_work_when_the_database_defaults_to_repeatable_read(
 
     async def set_default(level: str | None) -> None:
         async with await psycopg.AsyncConnection.connect(postgres_dsn, autocommit=True) as admin:
-            statement = (
-                sql.SQL("ALTER DATABASE {} RESET default_transaction_isolation")
-                if level is None
-                else sql.SQL("ALTER DATABASE {} SET default_transaction_isolation = {}").format(
-                    sql.Identifier(str(database)), sql.Literal(level)
-                )
-            )
+            database_name = sql.Identifier(str(database))
             if level is None:
-                statement = statement.format(sql.Identifier(str(database)))
+                statement = sql.SQL("ALTER DATABASE {} RESET default_transaction_isolation").format(
+                    database_name
+                )
+            else:
+                statement = sql.SQL(
+                    "ALTER DATABASE {} SET default_transaction_isolation = {}"
+                ).format(database_name, sql.Literal(level))
             await admin.execute(statement)
 
     async def scenario() -> None:
