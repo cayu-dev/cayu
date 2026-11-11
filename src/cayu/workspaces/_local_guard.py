@@ -263,9 +263,21 @@ def _write_temp(
 ) -> str:
     descriptor: int | None = None
     temp_name: str | None = None
+    prefix = f".{name}.cayu-"
+    token_length = 24
+    if staging_name is None:
+        name_max = -1
+        with suppress(OSError, ValueError):
+            name_max = os.fpathconf(parent_fd, "PC_NAME_MAX")
+        if 0 < name_max < len(os.fsencode(prefix)) + token_length:
+            # Bound the entire staging basename, including its random suffix.
+            prefix = ".cayu-" if name_max > len(".cayu-") else ""
+            token_length = min(token_length, name_max - len(prefix))
     for _attempt in range(1 if staging_name is not None else 100):
         candidate = (
-            staging_name if staging_name is not None else f".{name}.cayu-{secrets.token_hex(12)}"
+            staging_name
+            if staging_name is not None
+            else f"{prefix}{secrets.token_hex(12)[:token_length]}"
         )
         try:
             descriptor = os.open(candidate, _TEMP_OPEN_FLAGS, 0o666, dir_fd=parent_fd)
