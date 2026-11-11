@@ -20,35 +20,30 @@ and the approval still pending for a later recovery.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 
 import pytest
-from tests.runtime.runtime_session_support import (
-    _approval_pause_app,
-    collect_events,
-    collect_tool_approval_events,
+from tests.runtime.operator_interrupt_support import (
+    OperatorInterrupt,
+    assert_operator_interruption_finalized,
+    session_paused_for_approval,
 )
-from tests.runtime.runtime_tool_support import PureRecordingTool, RequireApprovalPolicy
+from tests.runtime.runtime_session_support import collect_tool_approval_events
 
 from cayu.approvals.tools import (
-    ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
 )
 from cayu.events import EventType
-from cayu.messages import Message
 from cayu.runtime._environment_lifecycle import (
     EnvironmentFactoryOperation,
     EnvironmentFactoryResolutionResult,
 )
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
-from cayu.sessions.requests import InterruptSessionRequest, RunRequest
 from cayu.storage.sqlite import SQLiteSessionStore
 
 _SESSION_ID = "interrupted-during-failing-recovery"
-_REASON = "operator stop"
 
 
 class _RecoveryFault:
@@ -105,104 +100,11 @@ def _recovery(worker, resolution: ToolApprovalRequest):
 async def _session_needing_manual_recovery(store):
     """Return a worker, an API app and the approval whose tool lost its result."""
 
-    worker, _ = _approval_pause_app(
-        store=store, tool=PureRecordingTool(), policy=RequireApprovalPolicy()
-    )
-    # A second app on the same store stands in for another process: it owns no
-    # active run, so its interrupt only writes the durable request.
-    api, _ = _approval_pause_app(
-        store=store, tool=PureRecordingTool(), policy=RequireApprovalPolicy()
-    )
-    initial = await collect_events(
-        worker,
-        RunRequest(
-            agent_name="assistant",
-            session_id=_SESSION_ID,
-            messages=[Message.text("user", "Use the tool")],
-        ),
-    )
-    approval = next(e for e in initial if e.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
-    resolution = ToolApprovalRequest(
-        session_id=_SESSION_ID,
-        approval_id=approval.payload["approval_id"],
-        tool_round_id=approval.payload["tool_round_id"],
-        tool_call_id=approval.payload["tool_call_id"],
-        decision=ToolApprovalDecision.APPROVE,
-    )
+    worker, api, resolution = await session_paused_for_approval(store, session_id=_SESSION_ID)
     failed = await collect_tool_approval_events(worker, resolution)
     assert failed[-1].type is EventType.SESSION_INTERRUPTED
     assert store.failed_terminal_once
     return worker, api, resolution
-
-
-class _OperatorInterrupt:
-    """Interrupt through the API app, as another process would, and wait for the store."""
-
-    def __init__(self, api, store) -> None:
-        self._api = api
-        self._store = store
-        self.tasks: list[asyncio.Task[None]] = []
-        self.outcome: dict[str, object] = {}
-
-    async def _interrupt(self) -> None:
-        try:
-            self.outcome["events"] = [
-                event
-                async for event in self._api.interrupt_session(
-                    InterruptSessionRequest(session_id=_SESSION_ID, reason=_REASON)
-                )
-            ]
-        except TimeoutError as exc:
-            # Documented answer when another process owns the run: the request
-            # is durable and the caller waits for ``session.interrupted``.
-            self.outcome["error"] = exc
-
-    async def commit(self) -> None:
-        # A fresh context keeps the worker's run fence out of the API call.
-        task = asyncio.get_running_loop().create_task(
-            self._interrupt(), context=contextvars.Context()
-        )
-        self.tasks.append(task)
-        for _ in range(5000):
-            current = await self._store.load(_SESSION_ID)
-            assert current is not None
-            if current.status is SessionStatus.INTERRUPTING or task.done():
-                break
-            await asyncio.sleep(0.001)
-        current = await self._store.load(_SESSION_ID)
-        assert current is not None
-        # The store accepted the operator's request while recovery was running.
-        assert current.status is SessionStatus.INTERRUPTING, self.outcome
-        checkpoint = await self._store.load_checkpoint(_SESSION_ID)
-        assert checkpoint is not None and "pending_session_interrupt" in checkpoint
-        assert "pending_interruption_cascade" in checkpoint
-
-    async def settle(self) -> None:
-        for task in self.tasks:
-            await task
-
-
-async def _assert_operator_interruption_finalized(store, worker, *, events_before: int) -> None:
-    session = await store.load(_SESSION_ID)
-    assert session is not None
-    assert session.status is SessionStatus.INTERRUPTED
-    interrupted = [
-        event
-        for event in (await store.load_events(_SESSION_ID))[events_before:]
-        if event.type is EventType.SESSION_INTERRUPTED
-    ]
-    # The only interruption since the recovery started is the operator's own.
-    assert [event.payload.get("interruption_type") for event in interrupted] == [
-        "operator_requested"
-    ]
-    assert interrupted[0].payload["reason"] == _REASON
-    assert await worker.drain_background_interruptions(timeout_s=5) is True
-    checkpoint = await store.load_checkpoint(_SESSION_ID)
-    assert checkpoint is not None
-    assert "pending_session_interrupt" not in checkpoint
-    assert "pending_interruption_cascade" not in checkpoint
-    # The unapplied recovery keeps its approval for an explicit retry.
-    assert "pending_tool_approval" in checkpoint
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
@@ -211,7 +113,7 @@ def test_failed_manual_recovery_does_not_overwrite_requested_interruption(backen
         store = _store(backend, tmp_path)
         worker, api, resolution = await _session_needing_manual_recovery(store)
         try:
-            operator = _OperatorInterrupt(api, store)
+            operator = OperatorInterrupt(api, store, session_id=_SESSION_ID)
             events_before = len(await store.load_events(_SESSION_ID))
             store.before_failure = operator.commit
             store.fail_recovery_read = True
@@ -221,8 +123,8 @@ def test_failed_manual_recovery_does_not_overwrite_requested_interruption(backen
             await operator.settle()
             assert operator.tasks
 
-            await _assert_operator_interruption_finalized(
-                store, worker, events_before=events_before
+            await assert_operator_interruption_finalized(
+                store, worker, session_id=_SESSION_ID, events_before=events_before
             )
 
             # The verified outcome was not applied, so the same recovery still works.
@@ -245,7 +147,7 @@ def test_failed_recovery_reconnect_does_not_overwrite_requested_interruption(
         store = _store(backend, tmp_path)
         worker, api, resolution = await _session_needing_manual_recovery(store)
         try:
-            operator = _OperatorInterrupt(api, store)
+            operator = OperatorInterrupt(api, store, session_id=_SESSION_ID)
             lifecycle = worker._recovery_coordinator._environment_lifecycle
             resolve_factory = lifecycle.resolve_factory
 
@@ -270,8 +172,8 @@ def test_failed_recovery_reconnect_does_not_overwrite_requested_interruption(
             # The stream ends with the operator's interruption, not a second pause.
             assert recovery_events[-1].type is EventType.SESSION_INTERRUPTED
             assert recovery_events[-1].payload["interruption_type"] == "operator_requested"
-            await _assert_operator_interruption_finalized(
-                store, worker, events_before=events_before
+            await assert_operator_interruption_finalized(
+                store, worker, session_id=_SESSION_ID, events_before=events_before
             )
 
             retried = [event async for event in _recovery(worker, resolution)]

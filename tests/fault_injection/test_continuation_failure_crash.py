@@ -78,7 +78,7 @@ def _recovered(result: explore.CaseResult, invariant: str) -> list[str]:
 def test_the_crash_point_follows_the_raw_status_write() -> None:
     baseline = explore._run_isolated(_SCENARIO, None, None)
     points = explore.injection_points(baseline, FaultKind.CRASH)
-    assert points[points.index(_SESSION_EVENT_WRITE) - 1] == "store.update_status:enter#0"
+    assert points[points.index(_SESSION_EVENT_WRITE) - 1] == "store.transition_status:enter#0"
     assert not _recovered(baseline, _SESSION_EVENT_MISSING)
     assert explore.run_point(_SCENARIO, FaultKind.CRASH, _SESSION_EVENT_WRITE).reached
 

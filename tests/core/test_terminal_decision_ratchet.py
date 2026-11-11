@@ -131,7 +131,7 @@ _ALLOWED_RAW_TERMINAL_WRITES: dict[str, dict[str, int]] = {
         "RecoveryCoordinator._interrupt_for_resumable_manual_recovery": 1,
         "RecoveryCoordinator._pause_gate_on_child": 1,
         "RecoveryCoordinator._recover_tool_round_claimed": 1,
-        "RecoveryCoordinator.continue_tool_approval_resolution": 2,
+        "RecoveryCoordinator.continue_tool_approval_resolution": 1,
         "RecoveryCoordinator.continue_user_input_resolution": 1,
         "RecoveryCoordinator.recover_tool_approval": 1,
         "RecoveryCoordinator.recover_user_input": 3,

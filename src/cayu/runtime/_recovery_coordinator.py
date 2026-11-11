@@ -5554,48 +5554,12 @@ class RecoveryCoordinator:
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
-            if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired):
-                session = await self._session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
-                async for event in self._terminal_event_publication.publish_recovered(
-                    RecoveryTerminalEventRequest(
-                        event=Event(
-                            type=EventType.SESSION_INTERRUPTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment.name,
-                            payload={
-                                **_continuation_failure_payload(
-                                    exc,
-                                    session=session,
-                                    redactor=self._secret_redactor,
-                                ),
-                                **tool_round_identity.payload(),
-                                "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                                **approval_support.bounded_pending_approval_event_payload(
-                                    pending_approval,
-                                    redactor=self._secret_redactor,
-                                ),
-                                "approval_id": pending_approval.approval_id,
-                                "tool_call_id": exc.tool_call_id,
-                                "tool_name": exc.tool_name,
-                                "manual_recovery_required": True,
-                            },
-                        ),
-                        phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
-                        session=session,
-                        registered_agent=registered_agent,
-                        registered_environment=environment.registered_environment,
-                        execution_profile=execution_profile_snapshot.profile,
-                        invocation_context=environment.invocation_context,
-                    )
-                ):
-                    yield event
-                return
-
-            if not pending_approval_cleared:
+            manual_recovery = (
+                exc
+                if isinstance(exc, approval_support.ToolApprovalManualRecoveryRequired)
+                else None
+            )
+            if manual_recovery is None and not pending_approval_cleared:
                 try:
                     clear_event = await self._load_exact_approval_close_event(
                         session_id=session.id,
@@ -5611,11 +5575,48 @@ class RecoveryCoordinator:
                         f"{type(receipt_error).__name__}: {receipt_error}"
                     )
 
-            if not pending_approval_cleared:
-                session = await self._session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
+            if manual_recovery is not None or not pending_approval_cleared:
+                try:
+                    # A requested interruption commits ``interrupting`` with its
+                    # request and cascade markers, so that status is not replaced.
+                    # Every other status is, as the continuation's own stops may
+                    # have moved it before they failed.
+                    session = await self._session_store.transition_status(
+                        session.id,
+                        from_statuses=set(SessionStatus) - {SessionStatus.INTERRUPTING},
+                        to_status=SessionStatus.INTERRUPTED,
+                    )
+                except SessionStatusConflict as conflict:
+                    async for event in self._finalize_interruption_that_won_status(
+                        conflict,
+                        session_id=session.id,
+                        registered_agent=registered_agent,
+                        registered_environment=environment.registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=environment.invocation_context,
+                    ):
+                        yield event
+                    return
+                payload = {
+                    **_continuation_failure_payload(
+                        exc,
+                        session=session,
+                        redactor=self._secret_redactor,
+                    ),
+                    **tool_round_identity.payload(),
+                    "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                    **approval_support.bounded_pending_approval_event_payload(
+                        pending_approval,
+                        redactor=self._secret_redactor,
+                    ),
+                }
+                if manual_recovery is not None:
+                    payload["approval_id"] = pending_approval.approval_id
+                    payload["tool_call_id"] = manual_recovery.tool_call_id
+                    payload["tool_name"] = manual_recovery.tool_name
+                    payload["manual_recovery_required"] = True
+                elif isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
+                    payload[tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
                 async for event in self._terminal_event_publication.publish_recovered(
                     RecoveryTerminalEventRequest(
                         event=Event(
@@ -5623,26 +5624,7 @@ class RecoveryCoordinator:
                             session_id=session.id,
                             agent_name=registered_agent.spec.name,
                             environment_name=environment.name,
-                            payload={
-                                **_continuation_failure_payload(
-                                    exc,
-                                    session=session,
-                                    redactor=self._secret_redactor,
-                                ),
-                                **tool_round_identity.payload(),
-                                "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                                **approval_support.bounded_pending_approval_event_payload(
-                                    pending_approval,
-                                    redactor=self._secret_redactor,
-                                ),
-                                **(
-                                    {
-                                        tool_call_evidence.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY: True,
-                                    }
-                                    if isinstance(exc, resume_ledger.ToolCallEvidenceConflict)
-                                    else {}
-                                ),
-                            },
+                            payload=payload,
                         ),
                         phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                         session=session,

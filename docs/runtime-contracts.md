@@ -1743,6 +1743,17 @@ request can be retried. If the settlement cannot run (the recovery lost its run
 fence, or the process is stopping), the session stays `interrupting` for
 `recover_incomplete_session(...)`.
 
+The same holds for the ordinary continuation of an approved round. When
+`resolve_tool_approval` continues the round, another process commits an operator
+interruption, and the round then fails before its approval is closed, the
+continuation does not pause the session for approval again. It finalizes the
+operator's request: its stream ends with that request's `session.interrupted`
+event (`interruption_type="operator_requested"`), the
+`pending_session_interrupt` marker is cleared, the
+`pending_interruption_cascade` is reconciled, and the approval and its
+resolution intent stay pending. Without a requested interruption the failed
+round still ends in a `tool_approval_required` interruption.
+
 Legacy private `tool.call.approval_requested` events may nest the complete
 approval under `event.payload["approval"]`. Current durable and public events
 retain the typed approval descriptor but set `arguments_state="quarantined"`
