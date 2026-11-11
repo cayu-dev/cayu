@@ -18,7 +18,10 @@ from tests.core.session_store_conformance.support import (
 import cayu.runtime._model_step_executor as model_step_executor_module
 from cayu.agents import AgentSpec
 from cayu.applications import CayuApp
-from cayu.budgets.aggregates import estimate_usage_rollup_cost
+from cayu.budgets.aggregates import (
+    estimate_usage_rollup_cost,
+    estimate_usage_session_cost_breakdown,
+)
 from cayu.budgets.base import (
     BudgetLimit,
     BudgetPolicy,
@@ -26,8 +29,16 @@ from cayu.budgets.base import (
     BudgetReservationIdentityConflict,
 )
 from cayu.budgets.billing import BillingIdentity
-from cayu.budgets.pricing import ModelPrice, PriceBook
-from cayu.budgets.usage import UsageMetrics
+from cayu.budgets.pricing import (
+    ModelPrice,
+    PriceBook,
+    PriceSchedule,
+    PriceTier,
+    Provenance,
+    TieredPricing,
+    estimate_model_step_cost,
+)
+from cayu.budgets.usage import CacheUsageMetrics, UsageMetrics
 from cayu.events import (
     Event,
     EventType,
@@ -1454,6 +1465,241 @@ def test_session_store_conformance_context_usage_pages_past_compaction(
             assert usage.last_total_tokens == 10
             assert usage.last_transcript_cursor == 2
             assert usage.last_model == "fake-model"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_prices_a_busy_window_by_price(
+    session_store_case,
+) -> None:
+    """Pricing inputs grow with the window's distinct prices, not its model steps."""
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"busy-window-pricing-{session_store_case[0]}"
+        start = datetime(2026, 11, 2, tzinfo=UTC)
+        # More distinct steps than the largest pricing_input_limit and the
+        # stores' raw candidate bound: every step has its own token counts.
+        steps = 6000
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=_identity(),
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=start + timedelta(seconds=10 * index),
+                        payload={
+                            "usage_metrics": {
+                                "provider_name": "busy-provider",
+                                "model": "busy-model",
+                                "input_tokens": 1000 + index,
+                                "output_tokens": 100 + index % 7,
+                                "total_tokens": 1100 + index + index % 7,
+                            }
+                        },
+                    )
+                    for index in range(steps)
+                ],
+            )
+            result = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=start,
+                    end_at=start + timedelta(days=1),
+                    include_pricing_inputs=True,
+                )
+            )
+            cost = estimate_usage_rollup_cost(
+                result,
+                PriceBook(
+                    prices=(
+                        ModelPrice.fixed(
+                            provider_name="busy-provider",
+                            model="busy-model",
+                            input_per_million=Decimal("3"),
+                            output_per_million=Decimal("15"),
+                        ),
+                    )
+                ),
+            )
+
+            assert result.totals.model_steps == steps
+            assert result.pricing_inputs_accuracy.kind == "exact"
+            assert result.pricing_input_group_count == 1
+            assert cost.accuracy.kind == "exact"
+            assert cost.priced_model_steps == steps
+            assert cost.unevaluated_model_steps == 0
+            assert [(item.currency, item.total_cost) for item in cost.currencies] == [
+                (
+                    "USD",
+                    sum(
+                        Decimal(1000 + index) * 3 + Decimal(100 + index % 7) * 15
+                        for index in range(steps)
+                    )
+                    / 1_000_000,
+                )
+            ]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_keeps_price_groups_exact_across_tiers(
+    session_store_case,
+) -> None:
+    """Price groups split at tier boundaries and counter shapes, and match per-step cost."""
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        start = datetime(2026, 11, 2, tzinfo=UTC)
+        price_book = PriceBook(
+            prices=(
+                ModelPrice(
+                    provider_name="tiered-provider",
+                    model="tiered-model",
+                    schedules=(
+                        PriceSchedule(
+                            pricing=TieredPricing(
+                                standard=(
+                                    PriceTier(
+                                        max_input_tokens=200,
+                                        input_per_million=Decimal("1"),
+                                        output_per_million=Decimal("2"),
+                                        cache_read_input_per_million=Decimal("0.1"),
+                                    ),
+                                    PriceTier(
+                                        input_per_million=Decimal("10"),
+                                        output_per_million=Decimal("20"),
+                                        cache_read_input_per_million=Decimal("1"),
+                                    ),
+                                )
+                            ),
+                            provenance=Provenance(
+                                source="application",
+                                url="application://price-book",
+                                as_of="2026-11-01",
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        def step_metrics(index: int) -> UsageMetrics:
+            # Input tokens straddle the 200-token tier; every other step reads
+            # the cache, which changes how its input tokens are charged.
+            input_tokens = 150 + index
+            read_tokens = input_tokens // 2 if index % 2 else 0
+            return UsageMetrics(
+                provider_name="tiered-provider",
+                model="tiered-model",
+                input_tokens=input_tokens,
+                output_tokens=10 + index % 3,
+                total_tokens=input_tokens + 10 + index % 3,
+                cache=CacheUsageMetrics(
+                    read_tokens=read_tokens,
+                    cached_input_tokens=read_tokens,
+                    uncached_input_tokens=input_tokens - read_tokens if read_tokens else 0,
+                ),
+            )
+
+        sessions = {
+            f"tiered-heavy-{store_kind}": range(0, 80),
+            f"tiered-light-{store_kind}": range(80, 100),
+        }
+        try:
+            for session_id, indexes in sessions.items():
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "hello")],
+                    ),
+                    identity=_identity(),
+                )
+                await store.append_events(
+                    session_id,
+                    [
+                        Event(
+                            type=EventType.MODEL_COMPLETED,
+                            session_id=session_id,
+                            timestamp=start + timedelta(minutes=index),
+                            payload={"usage_metrics": step_metrics(index).model_dump(mode="json")},
+                        )
+                        for index in indexes
+                    ],
+                )
+
+            def step_cost(indexes: range) -> Decimal:
+                return sum(
+                    (
+                        estimate_model_step_cost(
+                            metrics=step_metrics(index),
+                            pricing=price_book,
+                            effective_on=start.date(),
+                        ).total_cost
+                        for index in indexes
+                    ),
+                    Decimal(0),
+                )
+
+            window = {"start_at": start, "end_at": start + timedelta(days=1)}
+            result = await store.aggregate_usage(
+                UsageRollupQuery(
+                    **window,
+                    session_group_limit=1,
+                    include_pricing_inputs=True,
+                    pricing_tier_boundaries=price_book.input_token_tier_boundaries(),
+                )
+            )
+            cost = estimate_usage_rollup_cost(result, price_book)
+            session_costs = estimate_usage_session_cost_breakdown(result, price_book)
+
+            # Two tiers times two counter shapes, whatever the number of steps.
+            assert result.pricing_input_group_count == 4
+            assert all(
+                item.max_event_input_tokens <= 200 or item.min_event_input_tokens > 200
+                for item in result.pricing_inputs
+            )
+            assert cost.accuracy.kind == "exact"
+            assert cost.priced_model_steps == 100
+            assert [(item.currency, item.total_cost) for item in cost.currencies] == [
+                ("USD", step_cost(range(100)))
+            ]
+            assert session_costs.accuracy.kind == "truncated"
+            assert [group.session_id for group in session_costs.groups] == [
+                f"tiered-heavy-{store_kind}"
+            ]
+            assert session_costs.groups[0].cost.currencies[0].total_cost == step_cost(range(80))
+            assert session_costs.remainder is not None
+            assert session_costs.remainder.cost.currencies[0].total_cost == step_cost(
+                range(80, 100)
+            )
+
+            # Without the book's boundaries a group crossing a tier stays unpriced
+            # instead of being charged at one tier.
+            unbounded = await store.aggregate_usage(
+                UsageRollupQuery(**window, include_pricing_inputs=True)
+            )
+            unbounded_cost = estimate_usage_rollup_cost(unbounded, price_book)
+            assert unbounded.pricing_input_group_count == 2
+            assert unbounded_cost.priced_model_steps == 0
+            assert unbounded_cost.unpriced_model_steps == 100
+            assert [item.reason for item in unbounded_cost.unpriced_reasons] == [
+                "usage group spans input-token price tiers"
+            ]
         finally:
             await _close_store(store)
 

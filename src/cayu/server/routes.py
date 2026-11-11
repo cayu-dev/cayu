@@ -5418,6 +5418,9 @@ def create_router(
             session_group_limit=body.session_group_limit,
             include_pricing_inputs=body.pricing is not None,
             pricing_input_limit=body.pricing_input_limit,
+            pricing_tier_boundaries=()
+            if body.pricing is None
+            else body.pricing.input_token_tier_boundaries(),
         )
         unavailable_reason = None
         try:

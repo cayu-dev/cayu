@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     FrozenJsonDict,
     copy_json_value,
     json_utf8_size_within_limit,
@@ -592,6 +593,29 @@ class PriceBook(BaseModel):
             prices=(*kept, *prices),
             contextual_pricing_requirements=self.contextual_pricing_requirements,
             resource_mappings=self.resource_mappings,
+        )
+
+    def input_token_tier_boundaries(self) -> tuple[int, ...]:
+        """Input-token counts at which any price in this book changes tier.
+
+        Each boundary is a bounded tier's ``max_input_tokens``. Grouping usage
+        within these boundaries (``UsageRollupQuery.pricing_tier_boundaries``)
+        keeps every group inside one tier of every price, so it prices exactly.
+        A boundary at or above the largest durable usage counter splits nothing
+        and is left out.
+        """
+
+        return tuple(
+            sorted(
+                {
+                    tier.max_input_tokens
+                    for price in self.prices
+                    for schedule in price.schedules
+                    for tier in schedule.pricing.standard
+                    if tier.max_input_tokens is not None
+                    and tier.max_input_tokens < MAX_DURABLE_JSON_INTEGER
+                }
+            )
         )
 
     def _requires_cache_write_ttls(self, provider_name: str) -> bool:
@@ -1488,7 +1512,59 @@ def estimate_model_step_cost(
         raise TypeError("pricing must be a PriceBook instance.")
     if type(effective_on) is not date:
         raise TypeError("effective_on must be a date.")
-    resolution = _resolve_price(metrics=metrics, pricing=pricing, effective_on=effective_on)
+    return _estimate_resolved_cost(
+        metrics=metrics,
+        pricing=pricing,
+        effective_on=effective_on,
+        resolution=_resolve_price(metrics=metrics, pricing=pricing, effective_on=effective_on),
+    )
+
+
+def _estimate_usage_group_cost(
+    *,
+    metrics: UsageMetrics,
+    pricing: PriceBook,
+    effective_on: date,
+    min_input_tokens: int,
+    max_input_tokens: int,
+) -> ModelStepCostEstimate:
+    """Estimate the summed counters of events that share one price.
+
+    ``metrics`` sums events whose own input tokens lie between
+    ``min_input_tokens`` and ``max_input_tokens``. The price tier comes from that
+    per-event range, never from the summed input tokens. A range that crosses one
+    of the matched price's tier boundaries is unpriced rather than priced at
+    either tier.
+    """
+
+    resolution = _resolve_price(
+        metrics=metrics,
+        pricing=pricing,
+        effective_on=effective_on,
+        input_tokens=max_input_tokens,
+    )
+    resolved = resolution.resolved
+    # Tiers are ascending, so one tier at both ends covers every event between.
+    if (
+        resolved is not None
+        and resolved.schedule.pricing.tier_for(min_input_tokens) is not resolved.tier
+    ):
+        resolution = _PriceResolution(None, "usage group spans input-token price tiers")
+    return _estimate_resolved_cost(
+        metrics=metrics,
+        pricing=pricing,
+        effective_on=effective_on,
+        resolution=resolution,
+    )
+
+
+def _estimate_resolved_cost(
+    *,
+    metrics: UsageMetrics,
+    pricing: PriceBook,
+    effective_on: date,
+    resolution: _PriceResolution,
+) -> ModelStepCostEstimate:
     if resolution.resolved is None:
         return ModelStepCostEstimate(
             priced=False,
@@ -1580,6 +1656,7 @@ def _resolve_price(
     metrics: UsageMetrics,
     pricing: PriceBook,
     effective_on: date,
+    input_tokens: int | None = None,
 ) -> _PriceResolution:
     # A provider-reported model is authoritative for billing. Falling back from a
     # present-but-unpriced resolved model to the requested model could silently apply
@@ -1595,7 +1672,7 @@ def _resolve_price(
         pricing,
         provider_name=metrics.provider_name,
         model=billing_model,
-        input_tokens=metrics.input_tokens,
+        input_tokens=metrics.input_tokens if input_tokens is None else input_tokens,
         effective_on=effective_on,
         billing_identity=metrics.billing_identity,
     )

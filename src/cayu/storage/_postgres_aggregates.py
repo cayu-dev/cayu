@@ -848,7 +848,9 @@ async def aggregate_session_usage(
             [dict(zip(_SESSION_ROW_COLUMNS, row, strict=True)) for row in raw_session_rows],
             limit=query.retained_session_limit,
         )
-    pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
     if query.include_pricing_inputs:
         pricing_sql, pricing_params = pricing_input_statement(
             session_plan=session_plan,
@@ -861,7 +863,9 @@ async def aggregate_session_usage(
                 if row is None:
                     break
                 _add_pricing_input_from_values(pricing, row)
-    session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    session_pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
     if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
         session_pricing_sql, session_pricing_params = session_pricing_input_statement(
             session_plan=session_plan,

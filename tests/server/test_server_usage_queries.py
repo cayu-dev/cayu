@@ -833,6 +833,35 @@ def test_server_rejects_price_books_and_resolution_work_without_reflecting_input
     response = client.post("/api/usage/rollup", json=excessive_context_work)
     assert_sanitized_validation_error(response)
 
+    def tiers(count: int) -> list[dict[str, object]]:
+        return [
+            *(
+                {"max_input_tokens": index + 1, "input_per_million": "1", "output_per_million": "1"}
+                for index in range(count)
+            ),
+            {"input_per_million": "1", "output_per_million": "1"},
+        ]
+
+    excessive_tier_boundaries = json.loads(json.dumps(request))
+    excessive_tier_boundaries["pricing_input_limit"] = 1
+    excessive_tier_boundaries["pricing"]["prices"][0]["schedules"][0]["pricing"]["standard"] = (
+        tiers(1001)
+    )
+    response = client.post("/api/usage/rollup", json=excessive_tier_boundaries)
+    assert_sanitized_validation_error(response)
+    excessive_tier_boundaries["pricing"]["prices"][0]["schedules"][0]["pricing"]["standard"] = (
+        tiers(1000)
+    )
+    response = client.post("/api/usage/rollup", json=excessive_tier_boundaries)
+    assert response.status_code == 200, response.text
+    # A tier above every possible usage counter splits nothing and is still accepted.
+    excessive_tier_boundaries["pricing"]["prices"][0]["schedules"][0]["pricing"]["standard"] = [
+        {"max_input_tokens": 2**64, "input_per_million": "1", "output_per_million": "1"},
+        {"input_per_million": "1", "output_per_million": "1"},
+    ]
+    response = client.post("/api/usage/rollup", json=excessive_tier_boundaries)
+    assert response.status_code == 200, response.text
+
     bounded_shared_work = json.loads(json.dumps(request))
     bounded_shared_work["pricing_input_limit"] = 5000
     bounded_shared_work["pricing"]["prices"][0]["aliases"] = [

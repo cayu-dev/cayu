@@ -354,14 +354,14 @@ def test_empty_cost_order_and_request_validation():
 def test_all_cost_sections_reuse_canonical_price_resolution(usage_client, monkeypatch):
     from cayu.budgets import pricing as pricing_module
 
-    original = pricing_module.estimate_model_step_cost
+    original = pricing_module._estimate_usage_group_cost
     calls = []
 
     def count(*args, **kwargs):
         calls.append((args, kwargs))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(pricing_module, "estimate_model_step_cost", count)
+    monkeypatch.setattr(pricing_module, "_estimate_usage_group_cost", count)
     response = usage_client.post(
         "/api/usage/rollup",
         json={**WINDOW, "session_group_limit": 1, "session_order": "cost", "pricing": prices()},

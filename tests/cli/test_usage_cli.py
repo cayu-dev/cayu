@@ -75,6 +75,97 @@ def test_usage_cli_rollup_and_counts_use_real_http_contract(monkeypatch, capsys,
         assert sum(int(b["total_count"]) for b in output["series"]["buckets"]) == 1
 
 
+def test_usage_cli_rollup_prices_a_busy_day_exactly(monkeypatch, capsys, tmp_path):
+    """A day with more model steps than pricing inputs still has an exact cost."""
+
+    import asyncio
+    from decimal import Decimal
+
+    from cayu.applications import CayuApp
+    from cayu.budgets.pricing import default_price_book, estimate_model_step_cost
+    from cayu.budgets.usage import UsageMetrics
+    from cayu.events import Event, EventType
+    from cayu.messages import Message
+    from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    start = datetime(2026, 10, 1, tzinfo=UTC)
+
+    def step(index: int) -> UsageMetrics:
+        # Half the steps are above gpt-6-sol's 272k-token tier in the bundled book.
+        input_tokens = (300_000 if index % 2 else 1_000) + index
+        return UsageMetrics(
+            provider_name="openai",
+            model="gpt-6-sol",
+            input_tokens=input_tokens,
+            output_tokens=50,
+            total_tokens=input_tokens + 50,
+        )
+
+    steps = 6000
+
+    async def seed(store: SQLiteSessionStore) -> None:
+        await store.create(
+            RunRequest(
+                session_id="busy", agent_name="writer", messages=[Message.text("user", "hi")]
+            ),
+            identity=SessionIdentity(provider_name="openai", model="gpt-6-sol"),
+        )
+        await store.append_events(
+            "busy",
+            [
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="busy",
+                    timestamp=start + timedelta(seconds=10 * index),
+                    payload={"usage_metrics": step(index).model_dump(mode="json")},
+                )
+                for index in range(steps)
+            ],
+        )
+
+    store = SQLiteSessionStore(tmp_path / "busy.sqlite")
+    asyncio.run(seed(store))
+    try:
+        app = CayuApp(session_store=store, enable_logging=False)
+        with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+            monkeypatch.setattr(
+                "cayu.cli._cloud_agent_api.CayuApi",
+                lambda url, **kwargs: CayuApi(url, http=client, **kwargs),
+            )
+            arguments = [
+                "--server-url",
+                "http://127.0.0.1",
+                "--since",
+                start.isoformat(),
+                "--until",
+                (start + timedelta(days=1)).isoformat(),
+                "--json",
+            ]
+            assert main(["usage", "rollup", *arguments]) == 0
+            cost = json.loads(capsys.readouterr().out)["cost"]
+    finally:
+        asyncio.run(store.close())
+
+    price_book = default_price_book()
+    expected = sum(
+        (
+            estimate_model_step_cost(
+                metrics=step(index), pricing=price_book, effective_on=start.date()
+            ).total_cost
+            for index in range(steps)
+        ),
+        Decimal(0),
+    )
+    assert cost["accuracy"] == {"kind": "exact", "limit": None, "reason": None}
+    assert int(cost["priced_model_steps"]) == steps
+    assert int(cost["unevaluated_model_steps"]) == 0
+    assert [(row["currency"], Decimal(row["total_cost"])) for row in cost["currencies"]] == [
+        ("USD", expected)
+    ]
+
+
 def test_usage_help_and_output_input_alias_preserve_source(tmp_path, capsys):
 
     for name in ("rollup", "counts"):

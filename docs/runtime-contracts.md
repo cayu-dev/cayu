@@ -10652,11 +10652,25 @@ snapshot. Price-relevant JSON is stripped of unneeded evidence and
 size-classified in SQL before it crosses the database-driver boundary;
 oversized candidates become a small sentinel, and PostgreSQL fetches one
 candidate row at a time. The grouped query also reports its raw candidate count
-and returns at most 5,000 rows; if raw JSON variants exceed that independent work
-bound, pricing is conservatively marked truncated before canonicalization.
-Candidate rows are otherwise canonicalized incrementally and discarded as soon
-as `pricing_input_limit + 1` distinct canonical groups are known. Retained
-canonical pricing inputs have a separate 8 MiB serialized byte ceiling.
+and returns at most 250,000 rows; if raw JSON variants exceed that independent
+validation-work bound, pricing is conservatively marked truncated before
+canonicalization. Candidate rows are otherwise validated and folded
+incrementally into price groups, and collection stops as soon as
+`pricing_input_limit + 1` groups are known. A price group (`UsagePricingInput`)
+holds events that share their effective UTC date, event type, model and billing
+identity, which counters are nonzero (`usage_pricing_group_key`) and one
+input-token tier band; its `metrics` sum those events' counters and
+`min_event_input_tokens`/`max_event_input_tokens` bound each event's own input
+tokens. Every branch of the cost formula other than the input-token tier tests
+only whether a counter is zero, so a group's cost is exactly the sum of its
+events' costs, and the number of groups follows distinct prices rather than
+model steps. `UsageRollupQuery.pricing_tier_boundaries` (the server passes the
+request price book's `input_token_tier_boundaries()`) splits groups at every
+tier's `max_input_tokens`. A group whose range still crosses the matched price's
+tier, because the query omitted that book's boundaries, is reported unpriced
+with `usage group spans input-token price tiers` instead of being charged at
+either tier. Retained canonical pricing inputs have a separate 8 MiB serialized
+byte ceiling.
 Crossing any ceiling discards the partial pricing projection and reports
 truncated cost rather than retaining or pricing a partial result.
 The server also validates custom `SessionStore` results against the original
@@ -10673,7 +10687,7 @@ known valid counters must remain within that session's reported totals, before
 cost can be attributed. For exact per-session pricing, the original validated
 projection privately commits each retained session to its complete canonical
 pricing inputs, including model and billing identity, effective date, counters,
-and occurrences. The server compares that commitment after reconstruction so a
+input-token range, and occurrences. The server compares that commitment after reconstruction so a
 trusted post-construction copy cannot silently exchange otherwise equal usage
 between differently priced sessions. Violations fail closed.
 The in-memory reference store keeps a bounded 512-entry heavy-hitter candidate
@@ -11153,7 +11167,8 @@ Aggregate session filters accept at most 50 exact labels, 25 label-selector
 clauses, and 100 values across those selectors, preventing a request body from
 expanding into an unbounded database predicate.
 
-Supplying `pricing` requests estimated cost. Price-relevant groups are separately
+Supplying `pricing` requests estimated cost. Price-relevant groups (one per
+distinct price, effective date and counter shape, not per model step) are separately
 bounded by `pricing_input_limit`; if that bound is exceeded, the response marks
 cost as truncated and reports all model steps as unevaluated instead of
 publishing a misleading partial total. Different currencies remain separate,
@@ -11162,7 +11177,8 @@ the store's totals accuracy: sampled totals produce sampled cost, while
 truncated totals are not partially priced. Request price books are bounded
 before nested validation to 2 MiB, 500 price rows, 2,000 match rules, 1,000
 resource mappings, 100 contextual requirements, and 2,000 contextual selector
-values. Currency identities are limited to 64 UTF-8 bytes before store work so
+values, and at most 1,000 distinct tier `max_input_tokens` values. Currency
+identities are limited to 64 UTF-8 bytes before store work so
 per-session cost groups cannot amplify a bounded price-book field. Selector
 values are included in the resolution-work calculation; the product of the
 price-input limit and resolution work is capped at 500,000. As with the other

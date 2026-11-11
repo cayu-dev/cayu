@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date
 from decimal import Decimal
 from typing import Literal
 
@@ -118,7 +117,7 @@ class _CostReporter:
     def __init__(self, result: UsageRollupStoreResult, pricing: PriceBook):
         self.result = result
         self.pricing = pricing
-        self.cache: dict[tuple[date, str | None], object] = {}
+        self.cache: dict[tuple[object, ...], object] = {}
 
     def summarize(
         self,

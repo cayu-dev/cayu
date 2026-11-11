@@ -44,6 +44,7 @@ from cayu.budgets.aggregates import (
     build_aggregate_usage_metrics,
     normalize_aggregate_event_timestamp,
     require_bounded_usage_session_id,
+    require_pricing_tier_boundaries,
     usage_session_display,
 )
 from cayu.budgets.reported import ReportedCostCollector
@@ -69,6 +70,9 @@ class UsageRollupQuery(BaseModel):
     include_cost_candidates: StrictBool = False
     include_pricing_inputs: StrictBool = False
     pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
+    # Pass the price book's input_token_tier_boundaries() so tiered prices stay
+    # exact; without them, a group that spans a tier is reported unpriced.
+    pricing_tier_boundaries: tuple[StrictInt, ...] = ()
 
     @property
     def retained_session_limit(self) -> int | None:
@@ -82,6 +86,11 @@ class UsageRollupQuery(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(f"{info.field_name} must be timezone-aware.")
         return value.astimezone(UTC)
+
+    @field_validator("pricing_tier_boundaries")
+    @classmethod
+    def validate_pricing_tier_boundaries(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        return require_pricing_tier_boundaries(value)
 
     @model_validator(mode="after")
     def validate_window(self) -> UsageRollupQuery:
@@ -345,8 +354,12 @@ def _usage_rollup_from_session_records(
     starts = tuple(bucket.start_at for bucket in buckets)
     bucket_totals = [_UsageAccumulator() for _ in buckets]
     bucket_tools = [0 for _ in buckets]
-    pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
-    session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
+    session_pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
     provider_candidates = _InMemoryUsageGroupCandidates()
     model_candidates = _InMemoryUsageGroupCandidates()
     retained_session_groups: list[_SessionUsageCandidate] = []

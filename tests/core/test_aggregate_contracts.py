@@ -34,7 +34,12 @@ from cayu.budgets.aggregates import (
 )
 from cayu.budgets.billing import BillingIdentity, PricingContext
 from cayu.budgets.pricing import ModelPrice, PriceBook
-from cayu.budgets.usage import HostedToolUsageMetrics, UsageMetrics, build_aggregate_usage_metrics
+from cayu.budgets.usage import (
+    CacheUsageMetrics,
+    HostedToolUsageMetrics,
+    UsageMetrics,
+    build_aggregate_usage_metrics,
+)
 from cayu.events import Event, EventType
 from cayu.messages import Message
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
@@ -758,6 +763,37 @@ def test_usage_rollup_treats_naive_event_timestamps_as_utc(tmp_path) -> None:
     asyncio.run(run())
 
 
+def _pricing_input_events(item: UsagePricingInput, *, occurrences: int) -> UsagePricingInput:
+    """Return ``occurrences`` of ``item``'s identical events as their own group."""
+
+    assert item.metrics is not None
+    per_event = item.metrics.input_tokens // item.occurrences
+    assert per_event * item.occurrences == item.metrics.input_tokens
+    return item.model_copy(
+        update={
+            "occurrences": occurrences,
+            "metrics": item.metrics.model_copy(
+                update={
+                    "input_tokens": per_event * occurrences,
+                    "total_tokens": per_event * occurrences,
+                }
+            ),
+        }
+    )
+
+
+def _with_usage_of(item: UsagePricingInput, source: UsagePricingInput) -> UsagePricingInput:
+    """Return ``item`` carrying ``source``'s usage and input-token range."""
+
+    return item.model_copy(
+        update={
+            "metrics": source.metrics,
+            "min_event_input_tokens": source.min_event_input_tokens,
+            "max_event_input_tokens": source.max_event_input_tokens,
+        }
+    )
+
+
 def test_usage_rollup_canonicalizes_pricing_groups_before_enforcing_limit(
     tmp_path,
 ) -> None:
@@ -1006,14 +1042,89 @@ def test_aggregate_usage_rejects_legacy_oversized_persisted_counters(tmp_path) -
     asyncio.run(run())
 
 
+def test_pricing_input_groups_bound_each_events_input_tokens() -> None:
+    effective_on = datetime(2026, 7, 1).date()
+    metrics = UsageMetrics(provider_name="provider", model="model", input_tokens=30)
+
+    single = UsagePricingInput(
+        effective_on=effective_on,
+        occurrences=1,
+        metrics=metrics,
+    )
+    assert (single.min_event_input_tokens, single.max_event_input_tokens) == (30, 30)
+    group = UsagePricingInput(
+        effective_on=effective_on,
+        occurrences=2,
+        metrics=metrics,
+        min_event_input_tokens=10,
+        max_event_input_tokens=20,
+    )
+    assert group.metrics is not None
+    assert group.metrics.input_tokens == 30
+    for invalid, message in (
+        ({}, "require each event's input-token range"),
+        ({"min_event_input_tokens": 20, "max_event_input_tokens": 10}, "cannot exceed"),
+        ({"min_event_input_tokens": 16, "max_event_input_tokens": 20}, "within the events'"),
+        ({"min_event_input_tokens": 10, "max_event_input_tokens": 14}, "within the events'"),
+    ):
+        with pytest.raises(ValidationError, match=message):
+            UsagePricingInput(effective_on=effective_on, occurrences=2, metrics=metrics, **invalid)
+    with pytest.raises(ValidationError, match="without metrics have no input-token range"):
+        UsagePricingInput(
+            effective_on=effective_on,
+            occurrences=1,
+            min_event_input_tokens=0,
+            max_event_input_tokens=0,
+        )
+
+
+def test_pricing_input_accumulator_folds_events_by_price_and_tier_band() -> None:
+    effective_on = datetime(2026, 7, 1).date()
+    accumulator = BoundedUsagePricingInputAccumulator(limit=10, tier_boundaries=(100,))
+    for input_tokens, read_tokens in ((10, 0), (100, 0), (101, 0), (500, 0), (20, 5), (30, 5)):
+        accumulator.add_metrics(
+            event_type="model.completed",
+            effective_on=effective_on,
+            occurrences=2,
+            metrics=UsageMetrics(
+                provider_name="provider",
+                model="model",
+                input_tokens=input_tokens,
+                cache=CacheUsageMetrics(read_tokens=read_tokens),
+            ),
+        )
+
+    inputs, group_count, accuracy = accumulator.result()
+
+    assert accuracy.kind == "exact"
+    assert group_count == 3
+    assert [
+        (
+            item.occurrences,
+            item.metrics.input_tokens if item.metrics is not None else None,
+            item.metrics.cache.read_tokens if item.metrics is not None else None,
+            item.min_event_input_tokens,
+            item.max_event_input_tokens,
+        )
+        for item in inputs
+    ] == [(4, 220, 0, 10, 100), (4, 1202, 0, 101, 500), (4, 100, 20, 20, 30)]
+    with pytest.raises(ValueError, match="strictly ascending"):
+        BoundedUsagePricingInputAccumulator(limit=10, tier_boundaries=(200, 100))
+    with pytest.raises(ValidationError, match="strictly ascending"):
+        UsageRollupQuery(
+            start_at=datetime(2026, 7, 1, tzinfo=UTC),
+            end_at=datetime(2026, 7, 2, tzinfo=UTC),
+            pricing_tier_boundaries=(100, 100),
+        )
+
+
 def test_pricing_input_accumulator_enforces_serialized_byte_limit() -> None:
     accumulator = BoundedUsagePricingInputAccumulator(limit=10, max_bytes=32)
-    accumulator.add(
-        UsagePricingInput(
-            effective_on=datetime(2026, 7, 1).date(),
-            occurrences=1,
-            metrics=UsageMetrics(provider_name="provider", model="model"),
-        )
+    accumulator.add_metrics(
+        event_type="model.completed",
+        effective_on=datetime(2026, 7, 1).date(),
+        occurrences=1,
+        metrics=UsageMetrics(provider_name="provider", model="model"),
     )
 
     inputs, group_count, accuracy = accumulator.result()
@@ -1627,8 +1738,8 @@ def test_usage_rollup_store_result_rejects_duplicate_canonical_pricing_inputs() 
 
         shared_item = result.pricing_inputs[0]
         duplicate_shared = (
-            shared_item.model_copy(update={"occurrences": 1}),
-            shared_item.model_copy(update={"occurrences": 2}),
+            _pricing_input_events(shared_item, occurrences=1),
+            _pricing_input_events(shared_item, occurrences=2),
         )
         invalid_shared = result.model_dump()
         invalid_shared["pricing_inputs"] = duplicate_shared
@@ -1641,8 +1752,8 @@ def test_usage_rollup_store_result_rejects_duplicate_canonical_pricing_inputs() 
 
         session_item = result.session_pricing_inputs[0]
         duplicate_session = (
-            session_item.model_copy(update={"occurrences": 1}),
-            session_item.model_copy(update={"occurrences": 1}),
+            _pricing_input_events(session_item, occurrences=1),
+            _pricing_input_events(session_item, occurrences=1),
         )
         invalid_session = result.model_dump()
         invalid_session["session_pricing_inputs"] = duplicate_session
@@ -1769,8 +1880,8 @@ def test_usage_rollup_store_result_rejects_swapped_session_pricing_attribution()
         first, second = result.session_pricing_inputs
         invalid = result.model_dump()
         invalid["session_pricing_inputs"] = (
-            first.model_copy(update={"metrics": second.metrics}),
-            second.model_copy(update={"metrics": first.metrics}),
+            _with_usage_of(first, second),
+            _with_usage_of(second, first),
         )
 
         with pytest.raises(
@@ -2157,7 +2268,7 @@ def test_sqlite_session_usage_breakdown_matches_in_memory_reference(
         ) == memory_remainder_result.model_dump(exclude={"as_of"})
         import cayu.budgets.pricing as runtime_costs
 
-        original_estimate = runtime_costs.estimate_model_step_cost
+        original_estimate = runtime_costs._estimate_usage_group_cost
         resolution_count = 0
 
         def count_estimate(**kwargs):
@@ -2165,7 +2276,7 @@ def test_sqlite_session_usage_breakdown_matches_in_memory_reference(
             resolution_count += 1
             return original_estimate(**kwargs)
 
-        monkeypatch.setattr(runtime_costs, "estimate_model_step_cost", count_estimate)
+        monkeypatch.setattr(runtime_costs, "_estimate_usage_group_cost", count_estimate)
         remainder_cost = estimate_usage_session_cost_breakdown(
             sqlite_remainder_result,
             pricing,
@@ -2403,7 +2514,7 @@ def test_sqlite_usage_rollup_matches_hosted_search_accounting_reference(tmp_path
             assert sqlite_result.pricing_inputs == memory_result.pricing_inputs
             assert (
                 sum(
-                    item.metrics.hosted_tools.web_search_calls * item.occurrences
+                    item.metrics.hosted_tools.web_search_calls
                     for item in sqlite_result.pricing_inputs
                     if item.metrics is not None
                 )

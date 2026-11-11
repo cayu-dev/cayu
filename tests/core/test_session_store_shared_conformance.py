@@ -188,6 +188,8 @@ from tests.core.session_store_conformance.budget import (
     test_session_store_conformance_preserves_only_safe_bedrock_aggregate_evidence,
     test_session_store_conformance_reconstructs_gemini_thinking_usage,
     test_session_store_conformance_context_usage_pages_past_compaction,
+    test_session_store_conformance_prices_a_busy_window_by_price,
+    test_session_store_conformance_keeps_price_groups_exact_across_tiers,
 )
 
 from tests.core.session_store_conformance.compaction import (

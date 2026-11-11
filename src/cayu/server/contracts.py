@@ -34,6 +34,7 @@ from cayu._validation import (
 from cayu.approvals.actors import ResolutionActorSource
 from cayu.approvals.revisions import ApprovalArgumentsRevision, ApprovalRevision
 from cayu.budgets.aggregates import (
+    MAX_USAGE_PRICING_TIER_BOUNDARIES,
     AggregateAccuracy,
     AggregateCount,
     UsageAggregateBreakdown,
@@ -544,6 +545,11 @@ class UsageRollupRequest(ApiBaseModel):
             raise ValueError(
                 "pricing.contextual_pricing_requirements cannot contain more than "
                 f"{MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS} items."
+            )
+        if len(self.pricing.input_token_tier_boundaries()) > MAX_USAGE_PRICING_TIER_BOUNDARIES:
+            raise ValueError(
+                "pricing cannot contain more than "
+                f"{MAX_USAGE_PRICING_TIER_BOUNDARIES} distinct tier max_input_tokens values."
             )
         rule_counts = tuple(
             1 + len(price.aliases) + len(price.match_prefixes) for price in self.pricing.prices

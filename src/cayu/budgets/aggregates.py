@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import (
@@ -90,7 +92,10 @@ EXACT_AGGREGATE = AggregateAccuracy(kind=AggregateAccuracyKind.EXACT)
 _IN_MEMORY_AGGREGATE_CANCELLATION_INTERVAL = 256
 MAX_AGGREGATE_USAGE_COUNTER = 2**63 - 1
 MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
-MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
+# Raw store rows are one per distinct event usage, so this bounds the
+# validation work of one pricing projection rather than its result size.
+MAX_USAGE_PRICING_RAW_CANDIDATES = 250_000
+MAX_USAGE_PRICING_TIER_BOUNDARIES = 1000
 MAX_USAGE_COST_CANDIDATES = 1000
 MAX_USAGE_ROLLUP_SESSION_ID_BYTES = 1024
 MAX_USAGE_ROLLUP_STORE_RESULT_BYTES = 24 * 1024 * 1024
@@ -710,7 +715,15 @@ def _usage_pricing_event_type(event_type: EventType) -> UsagePricingEventType:
 
 
 class UsagePricingInput(BaseModel):
-    """One bounded group of identical, price-relevant event inputs."""
+    """One bounded group of price-equivalent event inputs.
+
+    ``metrics`` sums the counters of all ``occurrences`` events in the group.
+    Those events share their model and billing identity and which counters are
+    nonzero (``usage_pricing_group_key``), so the group's cost is linear in the
+    summed counters. Each event's own input tokens lie between
+    ``min_event_input_tokens`` and ``max_event_input_tokens``, which select the
+    input-token price tier.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -722,6 +735,18 @@ class UsagePricingInput(BaseModel):
     occurrences: StrictInt = Field(ge=1)
     event_type: UsagePricingEventType = "model.completed"
     metrics: UsageMetrics | None = None
+    min_event_input_tokens: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_AGGREGATE_USAGE_COUNTER,
+        exclude_if=lambda value: value is None,
+    )
+    max_event_input_tokens: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_AGGREGATE_USAGE_COUNTER,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("session_id")
     @classmethod
@@ -735,59 +760,229 @@ class UsagePricingInput(BaseModel):
     def copy_metrics(cls, value: object) -> object:
         return revalidate_model_input(value, UsageMetrics)
 
+    @model_validator(mode="after")
+    def validate_event_input_token_range(self) -> UsagePricingInput:
+        low, high = self.min_event_input_tokens, self.max_event_input_tokens
+        if self.metrics is None:
+            if low is not None or high is not None:
+                raise ValueError("Pricing inputs without metrics have no input-token range.")
+            return self
+        if low is None and high is None and self.occurrences == 1:
+            # One event is its own range.
+            self.min_event_input_tokens = self.max_event_input_tokens = self.metrics.input_tokens
+            return self
+        if low is None or high is None:
+            raise ValueError("Pricing inputs with metrics require each event's input-token range.")
+        if low > high:
+            raise ValueError("min_event_input_tokens cannot exceed max_event_input_tokens.")
+        if not low * self.occurrences <= self.metrics.input_tokens <= high * self.occurrences:
+            raise ValueError("Summed input tokens must lie within the events' input-token range.")
+        return self
+
+
+def _usage_pricing_counters(metrics: UsageMetrics) -> tuple[int, ...]:
+    """Return every counter of ``metrics`` in one stable order."""
+
+    cache = metrics.cache
+    hosted_tools = metrics.hosted_tools
+    return (
+        metrics.input_tokens,
+        metrics.output_tokens,
+        metrics.total_tokens,
+        metrics.reasoning_output_tokens,
+        cache.read_tokens,
+        cache.write_tokens,
+        cache.write_5m_tokens,
+        cache.write_1h_tokens,
+        cache.write_unknown_ttl_tokens,
+        cache.cached_input_tokens,
+        cache.uncached_input_tokens,
+        hosted_tools.web_search_calls,
+        hosted_tools.web_search_outcome_unknown,
+    )
+
+
+def _usage_metrics_with_counters(metrics: UsageMetrics, counters: Iterable[int]) -> UsageMetrics:
+    """Return ``metrics``'s identity with counters in ``_usage_pricing_counters`` order."""
+
+    (
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_output_tokens,
+        read_tokens,
+        write_tokens,
+        write_5m_tokens,
+        write_1h_tokens,
+        write_unknown_ttl_tokens,
+        cached_input_tokens,
+        uncached_input_tokens,
+        web_search_calls,
+        web_search_outcome_unknown,
+    ) = counters
+    return UsageMetrics(
+        provider_name=metrics.provider_name,
+        requested_model=metrics.requested_model,
+        model=metrics.model,
+        billing_identity=metrics.billing_identity,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        cache=CacheUsageMetrics(
+            read_tokens=read_tokens,
+            write_tokens=write_tokens,
+            write_5m_tokens=write_5m_tokens,
+            write_1h_tokens=write_1h_tokens,
+            write_unknown_ttl_tokens=write_unknown_ttl_tokens,
+            cached_input_tokens=cached_input_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+        ),
+        hosted_tools=HostedToolUsageMetrics(
+            web_search_calls=web_search_calls,
+            web_search_outcome_unknown=web_search_outcome_unknown,
+        ),
+    )
+
+
+def usage_pricing_group_key(metrics: UsageMetrics | None) -> str | None:
+    """Return the canonical key of the price group one event's metrics fall in.
+
+    Events share a group when their model and billing identity match and the
+    same counters are nonzero. Apart from the input-token tier, which pricing
+    inputs bound separately, every branch of the cost formula tests only whether
+    a counter is zero, so a group's cost is linear in its summed counters.
+    """
+
+    if metrics is None:
+        return None
+    return usage_pricing_metrics_key(
+        _usage_metrics_with_counters(
+            metrics,
+            (min(value, 1) for value in _usage_pricing_counters(metrics)),
+        )
+    )
+
+
+_UsagePricingInputKey = tuple[
+    str | None, date, UsagePricingEventType, str | None, int | None, int | None
+]
+
+
+def _usage_pricing_input_key(item: UsagePricingInput) -> _UsagePricingInputKey:
+    return (
+        item.session_id,
+        item.effective_on,
+        item.event_type,
+        usage_pricing_group_key(item.metrics),
+        item.min_event_input_tokens,
+        item.max_event_input_tokens,
+    )
+
 
 def coalesce_usage_pricing_inputs(
     inputs: Iterable[UsagePricingInput],
 ) -> tuple[UsagePricingInput, ...]:
-    """Merge store-native candidate groups after canonical usage validation."""
+    """Merge identical price groups and return them in canonical order."""
 
-    grouped: dict[
-        tuple[str | None, date, UsagePricingEventType, str | None],
-        tuple[int, UsageMetrics | None],
-    ] = {}
+    grouped: dict[_UsagePricingInputKey, UsagePricingInput] = {}
     for item in inputs:
-        metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.session_id, item.effective_on, item.event_type, metrics_key)
-        occurrences, _ = grouped.get(key, (0, item.metrics))
-        grouped[key] = (occurrences + item.occurrences, item.metrics)
-    return tuple(
-        sorted(
-            (
-                UsagePricingInput(
-                    session_id=session_id,
-                    effective_on=effective_on,
-                    occurrences=occurrences,
-                    event_type=event_type,
-                    metrics=metrics,
-                )
-                for (
-                    session_id,
-                    effective_on,
-                    event_type,
-                    _,
-                ), (occurrences, metrics) in grouped.items()
+        key = _usage_pricing_input_key(item)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = item
+            continue
+        grouped[key] = UsagePricingInput(
+            session_id=item.session_id,
+            effective_on=item.effective_on,
+            occurrences=existing.occurrences + item.occurrences,
+            event_type=item.event_type,
+            metrics=None
+            if existing.metrics is None or item.metrics is None
+            else _usage_metrics_with_counters(
+                existing.metrics,
+                (
+                    left + right
+                    for left, right in zip(
+                        _usage_pricing_counters(existing.metrics),
+                        _usage_pricing_counters(item.metrics),
+                        strict=True,
+                    )
+                ),
             ),
-            key=lambda item: (
-                item.session_id is None,
-                item.session_id or "",
-                -item.occurrences,
-                item.effective_on,
-                item.event_type,
-                "" if item.metrics is None else usage_pricing_metrics_key(item.metrics) or "",
+            min_event_input_tokens=item.min_event_input_tokens,
+            max_event_input_tokens=item.max_event_input_tokens,
+        )
+    return tuple(
+        item
+        for _, item in sorted(
+            grouped.items(),
+            key=lambda entry: (
+                entry[0][0] is None,
+                entry[0][0] or "",
+                -entry[1].occurrences,
+                entry[0][1],
+                entry[0][2],
+                entry[0][3] or "",
+                -1 if entry[0][4] is None else entry[0][4],
+                -1 if entry[0][5] is None else entry[0][5],
             ),
         )
     )
 
 
+def _require_disjoint_pricing_groups(
+    inputs: Iterable[UsagePricingInput],
+    *,
+    message: str,
+) -> None:
+    """Reject two groups of one price key whose input-token ranges overlap."""
+
+    ranges: dict[tuple[str | None, date, UsagePricingEventType, str | None], list[tuple[int, int]]]
+    ranges = {}
+    for item in inputs:
+        ranges.setdefault(
+            (
+                item.session_id,
+                item.effective_on,
+                item.event_type,
+                usage_pricing_group_key(item.metrics),
+            ),
+            [],
+        ).append((item.min_event_input_tokens or 0, item.max_event_input_tokens or 0))
+    for spans in ranges.values():
+        spans.sort()
+        if any(left[1] >= right[0] for left, right in pairwise(spans)):
+            raise ValueError(message)
+
+
+@dataclass
+class _UsagePricingGroup:
+    metrics: UsageMetrics | None
+    occurrences: int = 0
+    counters: list[int] = dataclass_field(default_factory=lambda: [0] * 13)
+    min_input_tokens: int | None = None
+    max_input_tokens: int | None = None
+
+
 @dataclass
 class BoundedUsagePricingInputAccumulator:
-    """Canonicalize price inputs within group-count and serialized-byte bounds."""
+    """Fold price inputs into price groups within group-count and serialized-byte bounds.
+
+    Events fold together when they share session, effective date, event type,
+    ``usage_pricing_group_key`` and input-token tier band: the input-token
+    counts between two adjacent ``tier_boundaries``, where a boundary is a
+    tier's inclusive ``max_input_tokens``. With a price book's
+    ``input_token_tier_boundaries()``, every group lies in one tier of every
+    price, so the number of groups follows distinct prices rather than events.
+    """
 
     limit: int
     max_bytes: int = MAX_USAGE_PRICING_INPUT_BYTES
+    tier_boundaries: tuple[int, ...] = ()
     _groups: dict[
-        tuple[str | None, date, UsagePricingEventType, str | None],
-        tuple[int, UsageMetrics | None],
+        tuple[str | None, date, UsagePricingEventType, str | None, int],
+        _UsagePricingGroup,
     ] = dataclass_field(default_factory=dict, init=False)
     _retained_bytes: int = dataclass_field(default=0, init=False)
     _truncated_group_count: int = dataclass_field(default=0, init=False)
@@ -800,38 +995,66 @@ class BoundedUsagePricingInputAccumulator:
             raise ValueError("limit must be a positive integer.")
         if type(self.max_bytes) is not int or self.max_bytes < 1:
             raise ValueError("max_bytes must be a positive integer.")
+        self.tier_boundaries = require_pricing_tier_boundaries(self.tier_boundaries)
 
-    def add(self, item: UsagePricingInput) -> None:
+    def add_metrics(
+        self,
+        *,
+        event_type: UsagePricingEventType,
+        session_id: str | None = None,
+        effective_on: date,
+        occurrences: int,
+        metrics: UsageMetrics | None,
+    ) -> None:
+        """Fold ``occurrences`` events that each carry ``metrics`` into their group."""
+
         if self.truncated:
             return
-        metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.session_id, item.effective_on, item.event_type, metrics_key)
-        existing = self._groups.get(key)
-        if existing is not None:
-            self._groups[key] = (existing[0] + item.occurrences, existing[1])
-            return
-        observed_group_count = len(self._groups) + 1
-        if len(self._groups) >= self.limit:
-            self._truncate(
-                group_count=observed_group_count,
-                reason="Price-relevant model-step groups exceed pricing_input_limit.",
-                limit=self.limit,
+        group_key = usage_pricing_group_key(metrics)
+        band = 0 if metrics is None else bisect_left(self.tier_boundaries, metrics.input_tokens)
+        key = (session_id, effective_on, event_type, group_key, band)
+        group = self._groups.get(key)
+        if group is None:
+            observed_group_count = len(self._groups) + 1
+            if len(self._groups) >= self.limit:
+                self._truncate(
+                    group_count=observed_group_count,
+                    reason="Price-relevant model-step groups exceed pricing_input_limit.",
+                    limit=self.limit,
+                )
+                return
+            retained_bytes = (
+                (0 if session_id is None else len(session_id.encode("utf-8")))
+                + len(event_type.encode("ascii"))
+                + (0 if group_key is None else len(group_key.encode("utf-8")))
             )
+            if self._retained_bytes + retained_bytes > self.max_bytes:
+                self._truncate(
+                    group_count=observed_group_count,
+                    reason="Price-relevant model-step groups exceed the serialized-byte limit.",
+                    limit=self.max_bytes,
+                )
+                return
+            group = _UsagePricingGroup(metrics=metrics)
+            self._groups[key] = group
+            self._retained_bytes += retained_bytes
+        group.occurrences += occurrences
+        if metrics is None:
             return
-        retained_bytes = (
-            (0 if item.session_id is None else len(item.session_id.encode("utf-8")))
-            + len(item.event_type.encode("ascii"))
-            + (0 if metrics_key is None else len(metrics_key.encode("utf-8")))
-        )
-        if self._retained_bytes + retained_bytes > self.max_bytes:
-            self._truncate(
-                group_count=observed_group_count,
-                reason="Price-relevant model-step groups exceed the serialized-byte limit.",
-                limit=self.max_bytes,
-            )
-            return
-        self._groups[key] = (item.occurrences, item.metrics)
-        self._retained_bytes += retained_bytes
+        for index, value in enumerate(_usage_pricing_counters(metrics)):
+            group.counters[index] += value * occurrences
+            if group.counters[index] > MAX_AGGREGATE_USAGE_COUNTER:
+                self._truncate(
+                    group_count=len(self._groups),
+                    reason="Price-relevant model-step groups exceed the usage counter limit.",
+                    limit=None,
+                )
+                return
+        input_tokens = metrics.input_tokens
+        if group.min_input_tokens is None or input_tokens < group.min_input_tokens:
+            group.min_input_tokens = input_tokens
+        if group.max_input_tokens is None or input_tokens > group.max_input_tokens:
+            group.max_input_tokens = input_tokens
 
     def add_payload(
         self,
@@ -855,14 +1078,12 @@ class BoundedUsagePricingInputAccumulator:
         except _UsagePricingInputTooLarge:
             self.reject_oversized_candidate()
             return
-        self.add(
-            UsagePricingInput(
-                session_id=session_id,
-                effective_on=effective_on,
-                occurrences=occurrences,
-                event_type=_usage_pricing_event_type(event_type),
-                metrics=metrics,
-            )
+        self.add_metrics(
+            event_type=_usage_pricing_event_type(event_type),
+            session_id=session_id,
+            effective_on=effective_on,
+            occurrences=occurrences,
+            metrics=metrics,
         )
 
     def reject_oversized_candidate(self) -> None:
@@ -896,7 +1117,7 @@ class BoundedUsagePricingInputAccumulator:
             limit=limit,
         )
 
-    def _truncate(self, *, group_count: int, reason: str, limit: int) -> None:
+    def _truncate(self, *, group_count: int, reason: str, limit: int | None) -> None:
         self._groups.clear()
         self._retained_bytes = 0
         self._truncated_group_count = group_count
@@ -909,7 +1130,6 @@ class BoundedUsagePricingInputAccumulator:
     ) -> tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy]:
         if self.truncated:
             assert self._truncation_reason is not None
-            assert self._truncation_limit is not None
             return (
                 (),
                 self._truncated_group_count,
@@ -923,56 +1143,41 @@ class BoundedUsagePricingInputAccumulator:
             UsagePricingInput(
                 session_id=session_id,
                 effective_on=effective_on,
-                occurrences=occurrences,
+                occurrences=group.occurrences,
                 event_type=event_type,
-                metrics=metrics,
+                metrics=None
+                if group.metrics is None
+                else _usage_metrics_with_counters(group.metrics, group.counters),
+                min_event_input_tokens=group.min_input_tokens,
+                max_event_input_tokens=group.max_input_tokens,
             )
             for (
                 session_id,
                 effective_on,
                 event_type,
                 _,
-            ), (occurrences, metrics) in self._groups.items()
+                _,
+            ), group in self._groups.items()
         )
         return inputs, len(inputs), EXACT_AGGREGATE.model_copy()
 
 
-def _session_pricing_remainder_groups(
-    *,
-    shared: tuple[UsagePricingInput, ...],
-    retained: tuple[UsagePricingInput, ...],
-) -> dict[
-    tuple[date, UsagePricingEventType, str | None],
-    tuple[int, UsageMetrics | None],
-]:
-    """Subtract retained occurrences without allocating another input projection."""
+def require_pricing_tier_boundaries(value: object) -> tuple[int, ...]:
+    """Return strictly ascending positive input-token tier boundaries."""
 
-    shared_groups: dict[
-        tuple[date, UsagePricingEventType, str | None],
-        tuple[int, UsageMetrics | None],
-    ] = {}
-    for item in shared:
-        key = (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
-        occurrences, _ = shared_groups.get(key, (0, item.metrics))
-        shared_groups[key] = occurrences + item.occurrences, item.metrics
-    retained_occurrences: dict[tuple[date, UsagePricingEventType, str | None], int] = {}
-    for item in retained:
-        key = (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
-        retained_occurrences[key] = retained_occurrences.get(key, 0) + item.occurrences
-
-    remainder: dict[
-        tuple[date, UsagePricingEventType, str | None],
-        tuple[int, UsageMetrics | None],
-    ] = {}
-    for key, (shared_count, metrics) in shared_groups.items():
-        retained_count = retained_occurrences.pop(key, 0)
-        if retained_count > shared_count:
-            raise ValueError("Session pricing inputs exceed shared pricing occurrences.")
-        if retained_count < shared_count:
-            remainder[key] = shared_count - retained_count, metrics
-    if retained_occurrences:
-        raise ValueError("Session pricing inputs are absent from shared pricing inputs.")
-    return remainder
+    if type(value) is not tuple or any(
+        type(boundary) is not int or not 0 < boundary <= MAX_AGGREGATE_USAGE_COUNTER
+        for boundary in value
+    ):
+        raise ValueError("Pricing tier boundaries must be a tuple of positive integers.")
+    boundaries = cast("tuple[int, ...]", value)
+    if any(left >= right for left, right in pairwise(boundaries)):
+        raise ValueError("Pricing tier boundaries must be strictly ascending.")
+    if len(boundaries) > MAX_USAGE_PRICING_TIER_BOUNDARIES:
+        raise ValueError(
+            f"Pricing tier boundaries cannot exceed {MAX_USAGE_PRICING_TIER_BOUNDARIES} values."
+        )
+    return boundaries
 
 
 def _session_pricing_input_remainder(
@@ -980,41 +1185,81 @@ def _session_pricing_input_remainder(
     shared: tuple[UsagePricingInput, ...],
     retained: tuple[UsagePricingInput, ...],
 ) -> tuple[UsagePricingInput, ...]:
-    """Build exact canonical inputs for sessions omitted from bounded detail."""
+    """Subtract retained session groups from shared groups for omitted sessions.
 
-    remainder = _session_pricing_remainder_groups(shared=shared, retained=retained)
-    return coalesce_usage_pricing_inputs(
-        UsagePricingInput(
-            effective_on=effective_on,
-            occurrences=occurrences,
-            event_type=event_type,
-            metrics=metrics,
+    Every retained group lies inside exactly one shared group: the same
+    effective date, event type and price group key, with an input-token range
+    inside the shared group's range. A remainder keeps the shared range, which
+    still bounds every omitted event.
+    """
+
+    shared = coalesce_usage_pricing_inputs(shared)
+    remaining: list[tuple[int, list[int] | None]] = []
+    candidates: dict[tuple[date, UsagePricingEventType, str | None], list[int]] = {}
+    for index, item in enumerate(shared):
+        remaining.append(
+            (
+                item.occurrences,
+                None if item.metrics is None else list(_usage_pricing_counters(item.metrics)),
+            )
         )
-        for (effective_on, event_type, _), (occurrences, metrics) in remainder.items()
-    )
+        candidates.setdefault(
+            (item.effective_on, item.event_type, usage_pricing_group_key(item.metrics)),
+            [],
+        ).append(index)
+    for item in retained:
+        matches = [
+            index
+            for index in candidates.get(
+                (item.effective_on, item.event_type, usage_pricing_group_key(item.metrics)),
+                (),
+            )
+            if (shared[index].min_event_input_tokens or 0) <= (item.min_event_input_tokens or 0)
+            and (item.max_event_input_tokens or 0) <= (shared[index].max_event_input_tokens or 0)
+        ]
+        if len(matches) != 1:
+            raise ValueError("Session pricing inputs are absent from shared pricing inputs.")
+        occurrences, counters = remaining[matches[0]]
+        occurrences -= item.occurrences
+        if counters is not None and item.metrics is not None:
+            for position, value in enumerate(_usage_pricing_counters(item.metrics)):
+                counters[position] -= value
+        if occurrences < 0 or (counters is not None and min(counters) < 0):
+            raise ValueError("Session pricing inputs exceed shared pricing occurrences.")
+        remaining[matches[0]] = occurrences, counters
+
+    remainder: list[UsagePricingInput] = []
+    for item, (occurrences, counters) in zip(shared, remaining, strict=True):
+        if not occurrences:
+            if counters is not None and any(counters):
+                raise ValueError("Session pricing inputs do not account for shared counters.")
+            continue
+        remainder.append(
+            UsagePricingInput(
+                effective_on=item.effective_on,
+                occurrences=occurrences,
+                event_type=item.event_type,
+                metrics=None
+                if item.metrics is None or counters is None
+                else _usage_metrics_with_counters(item.metrics, counters),
+                min_event_input_tokens=item.min_event_input_tokens,
+                max_event_input_tokens=item.max_event_input_tokens,
+            )
+        )
+    return coalesce_usage_pricing_inputs(remainder)
 
 
-def _scaled_pricing_usage(
-    metrics: UsageMetrics,
-    occurrences: int,
-) -> AggregateUsageMetrics:
-    """Scale one valid pricing input into identity-free aggregate counters."""
+def _event_input_token_range(item: UsagePricingInput, metrics: UsageMetrics) -> tuple[int, int]:
+    """Return the bounds of one event's input tokens in a pricing input.
 
-    return build_aggregate_usage_metrics(
-        input_tokens=metrics.input_tokens * occurrences,
-        output_tokens=metrics.output_tokens * occurrences,
-        total_tokens=metrics.total_tokens * occurrences,
-        reasoning_output_tokens=metrics.reasoning_output_tokens * occurrences,
-        cache_read_tokens=metrics.cache.read_tokens * occurrences,
-        cache_write_tokens=metrics.cache.write_tokens * occurrences,
-        cache_write_5m_tokens=metrics.cache.write_5m_tokens * occurrences,
-        cache_write_1h_tokens=metrics.cache.write_1h_tokens * occurrences,
-        cache_write_unknown_ttl_tokens=(metrics.cache.write_unknown_ttl_tokens * occurrences),
-        cached_input_tokens=metrics.cache.cached_input_tokens * occurrences,
-        uncached_input_tokens=metrics.cache.uncached_input_tokens * occurrences,
-        web_search_calls=metrics.hosted_tools.web_search_calls * occurrences,
-        web_search_outcome_unknown=(metrics.hosted_tools.web_search_outcome_unknown * occurrences),
-    )
+    A trusted copy that bypassed validation may lack the range; every event then
+    lies between zero and the summed input tokens, so a tier is still never guessed.
+    """
+
+    low, high = item.min_event_input_tokens, item.max_event_input_tokens
+    if low is None or high is None:
+        return 0, metrics.input_tokens
+    return low, high
 
 
 def _is_hosted_resource_pricing_input(item: UsagePricingInput) -> bool:
@@ -1054,7 +1299,7 @@ def _session_pricing_attribution_fingerprint(
     """Commit to every price-relevant field for one retained session."""
 
     digest = hashlib.sha256(_SESSION_PRICING_ATTRIBUTION_DOMAIN)
-    canonical_inputs: list[tuple[bytes, bytes, bytes, bytes]] = []
+    canonical_inputs: list[tuple[bytes, bytes, bytes, bytes, bytes]] = []
     for item in inputs:
         metrics_key = (
             b"\x00"
@@ -1067,6 +1312,7 @@ def _session_pricing_attribution_fingerprint(
                 str(item.occurrences).encode("ascii"),
                 item.event_type.encode("ascii"),
                 metrics_key,
+                f"{item.min_event_input_tokens}:{item.max_event_input_tokens}".encode("ascii"),
             )
         )
     for components in sorted(canonical_inputs):
@@ -1242,12 +1488,10 @@ class UsageRollupStoreResult(BaseModel):
             raise ValueError("Pricing inputs cannot be returned when they were not requested.")
         if any(item.session_id is not None for item in self.pricing_inputs):
             raise ValueError("Shared pricing inputs cannot retain session identity.")
-        pricing_input_keys = [
-            (item.effective_on, item.event_type, usage_pricing_metrics_key(item.metrics))
-            for item in self.pricing_inputs
-        ]
-        if len(set(pricing_input_keys)) != len(pricing_input_keys):
-            raise ValueError("Shared pricing inputs must have distinct canonical keys.")
+        _require_disjoint_pricing_groups(
+            self.pricing_inputs,
+            message="Shared pricing inputs must have distinct canonical keys.",
+        )
         if (
             self.pricing_inputs_included
             and self.pricing_inputs_accuracy.kind is AggregateAccuracyKind.EXACT
@@ -1298,17 +1542,10 @@ class UsageRollupStoreResult(BaseModel):
             for item in self.session_pricing_inputs
         ):
             raise ValueError("Session pricing inputs must belong to retained session groups.")
-        session_pricing_input_keys = [
-            (
-                item.session_id,
-                item.effective_on,
-                item.event_type,
-                usage_pricing_metrics_key(item.metrics),
-            )
-            for item in self.session_pricing_inputs
-        ]
-        if len(set(session_pricing_input_keys)) != len(session_pricing_input_keys):
-            raise ValueError("Session pricing inputs must have distinct canonical keys.")
+        _require_disjoint_pricing_groups(
+            self.session_pricing_inputs,
+            message="Session pricing inputs must have distinct canonical keys.",
+        )
         self._validate_exact_session_pricing_attribution()
         self._validate_exact_session_pricing_projection()
         if self.session_breakdown is not None:
@@ -1518,7 +1755,7 @@ class UsageRollupStoreResult(BaseModel):
                     session_id,
                     build_aggregate_usage_metrics(),
                 ),
-                _scaled_pricing_usage(item.metrics, item.occurrences),
+                item.metrics,
             )
 
         for group in self.session_breakdown.groups:
@@ -1572,7 +1809,7 @@ class UsageRollupStoreResult(BaseModel):
                 "Exact session pricing inputs require the shared usage projection."
             )
         try:
-            remainder_groups = _session_pricing_remainder_groups(
+            remainder = _session_pricing_input_remainder(
                 shared=self.pricing_inputs,
                 retained=self.session_pricing_inputs,
             )
@@ -1586,15 +1823,7 @@ class UsageRollupStoreResult(BaseModel):
             else self.session_breakdown.remainder.totals.model_steps
         )
         if (
-            sum(
-                occurrences
-                for (
-                    _,
-                    event_type,
-                    _,
-                ), (occurrences, _) in remainder_groups.items()
-                if event_type == "model.completed"
-            )
+            sum(item.occurrences for item in remainder if item.event_type == "model.completed")
             != expected_remainder_steps
         ):
             raise UsageRollupInconsistent(
@@ -2071,9 +2300,9 @@ def _estimate_usage_cost(
     pricing_inputs_accuracy: AggregateAccuracy,
     pricing,
     billing_group_limit: int,
-    estimate_cache: dict[tuple[date, str | None], object] | None = None,
+    estimate_cache: dict[tuple[object, ...], object] | None = None,
 ) -> UsageCostRollup:
-    from cayu.budgets.pricing import ModelStepCostEstimate, estimate_model_step_cost
+    from cayu.budgets.pricing import ModelStepCostEstimate, _estimate_usage_group_cost
 
     cost_accuracy = _combined_aggregate_accuracy(
         totals_accuracy,
@@ -2130,17 +2359,26 @@ def _estimate_usage_cost(
             unpriced_model_steps += model_step_occurrences
             unpriced_auxiliary_attempts += auxiliary_occurrences
             continue
+        # A group's metrics already sum its occurrences (see UsagePricingInput).
         hosted_resource_occurrences = (
             item.metrics.hosted_tools.web_search_calls
             + item.metrics.hosted_tools.web_search_outcome_unknown
-        ) * item.occurrences
-        estimate_key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        )
+        min_input_tokens, max_input_tokens = _event_input_token_range(item, item.metrics)
+        estimate_key = (
+            item.effective_on,
+            usage_pricing_metrics_key(item.metrics),
+            min_input_tokens,
+            max_input_tokens,
+        )
         estimate = None if estimate_cache is None else estimate_cache.get(estimate_key)
         if estimate is None:
-            estimate = estimate_model_step_cost(
+            estimate = _estimate_usage_group_cost(
                 metrics=item.metrics,
                 pricing=pricing,
                 effective_on=item.effective_on,
+                min_input_tokens=min_input_tokens,
+                max_input_tokens=max_input_tokens,
             )
             if estimate_cache is not None:
                 estimate_cache[estimate_key] = estimate
@@ -2175,7 +2413,7 @@ def _estimate_usage_cost(
                 billing_groups[group_key] = group
             group.model_steps += model_step_occurrences
             group.auxiliary_attempts += auxiliary_occurrences
-            group.total_cost += estimate.total_cost * item.occurrences
+            group.total_cost += estimate.total_cost
         if not estimate.priced:
             reason = estimate.missing_pricing_reason or "no matching model pricing"
             reason_steps, reason_resources, reason_auxiliary = unpriced_reasons.get(
@@ -2191,9 +2429,7 @@ def _estimate_usage_cost(
             continue
         assert estimate.currency is not None
         currency = estimate.currency.upper()
-        currency_costs[currency] = currency_costs.get(currency, Decimal(0)) + (
-            estimate.total_cost * item.occurrences
-        )
+        currency_costs[currency] = currency_costs.get(currency, Decimal(0)) + estimate.total_cost
         currency_steps[currency] = currency_steps.get(currency, 0) + model_step_occurrences
         currency_auxiliary_attempts[currency] = (
             currency_auxiliary_attempts.get(currency, 0) + auxiliary_occurrences
@@ -2327,7 +2563,7 @@ def _estimate_usage_session_cost_breakdown(
     result: UsageRollupStoreResult,
     pricing,
     *,
-    estimate_cache: dict[tuple[date, str | None], object] | None = None,
+    estimate_cache: dict[tuple[object, ...], object] | None = None,
 ) -> UsageSessionCostBreakdown:
     """Price retained session groups without publishing partial session costs."""
 

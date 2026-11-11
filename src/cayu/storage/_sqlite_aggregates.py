@@ -731,7 +731,9 @@ def aggregate_session_usage(
                 session_rows,
                 limit=query.retained_session_limit,
             )
-        pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+        pricing = BoundedUsagePricingInputAccumulator(
+            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+        )
         if query.include_pricing_inputs:
             pricing_sql, pricing_params = pricing_input_statement(
                 session_plan=session_plan,
@@ -742,7 +744,9 @@ def aggregate_session_usage(
                 _add_pricing_input_from_row(pricing, row)
                 if pricing.truncated:
                     break
-        session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+        session_pricing = BoundedUsagePricingInputAccumulator(
+            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+        )
         if (
             query.include_pricing_inputs
             and session_breakdown is not None
