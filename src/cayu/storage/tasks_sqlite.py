@@ -6954,6 +6954,9 @@ class SQLiteTaskStore(TaskStore):
                 prior: Task | None = None
                 for row in rows:
                     candidate = self._require_task_unlocked(row["id"])
+                    # Earlier schedule settlements may cancel other group members.
+                    if candidate.status is not TaskStatus.PENDING:
+                        continue
                     if candidate.schedule is not None and candidate.schedule.admitted_at is None:
                         assert candidate.available_at is not None
                         eligibility = task_schedule_eligibility(
