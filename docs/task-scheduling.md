@@ -33,6 +33,55 @@ schedules require queue admission; they cannot be directly started while still
 unadmitted. Ordinary immediate tasks and trusted direct-start semantics for
 unmanaged tasks remain separate.
 
+## Restarting work after worker loss
+
+A managed scheduled task cannot set `restartable=True`:
+`TaskCreate(available_at=..., schedule_policy=TaskSchedulePolicy(), restartable=True)`
+is rejected with "Restartable tasks must be ordinary unattached root queue jobs."
+This restriction applies to `schedule_policy`, not to `available_at` alone.
+
+Stopping a worker **before admission** does not lose the pending scheduled task;
+another worker can claim it when it is due. That is different from restarting
+its handler after the worker dies **during execution**. Setting
+`restart_abandoned=True` on the worker does not make a non-restartable scheduled
+task restartable: abandoned-task settlement cancels it rather than rerunning it.
+
+Choose the smallest recovery contract the work needs:
+
+- For a delayed ordinary job that must be restartable, omit `schedule_policy`:
+
+  ```python
+  request = TaskCreate(
+      task_id="customer-42-restartable-followup-1",
+      type="customer-followup",
+      available_at=datetime(2027, 1, 15, 12, tzinfo=UTC),
+      restartable=True,
+      max_restarts=2,
+      input={"customer_id": "42"},
+  )
+  task = await app.create_task(request)
+  ```
+
+  This delays queue eligibility but provides none of the managed schedule's
+  revision-fenced edits, expiry/misfire policy, scheduling journal, or exact
+  creation-replay contract described above. It must remain an ordinary unattached
+  root job, without a retry policy or work contract. Configure the
+  [single-worker abandoned-task recovery](project-workers.md#a-deploy-during-a-long-task)
+  path to restart it after worker loss. A restart reruns the handler; use durable
+  step evidence and downstream idempotency or reconciliation to avoid repeating
+  an external effect whose acknowledgement was lost.
+- If managed scheduling is required, keep `restartable=False` and provide an
+  application-owned recovery path. After proving the old worker has stopped,
+  reconcile any external effects and settle its abandoned task before deciding
+  whether to create a new scheduled occurrence. Persist that decision and its
+  new task ID/timestamp so publication can be retried safely. A recurring
+  repository scan may already provide the fallback; a one-off reminder needs
+  explicit recovery and must not rely on another scan happening by chance.
+
+An expired lease alone is not proof that an old worker or its external mutation
+has stopped. Follow [worker-loss recovery](triggering-runs.md#when-a-worker-dies-mid-task)
+before allowing replacement work.
+
 ## Edit or cancel with a revision
 
 ```python
