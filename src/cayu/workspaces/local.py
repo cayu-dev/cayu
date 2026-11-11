@@ -897,13 +897,10 @@ def _list_git_entries(
     retained: list[tuple[str, WorkspaceGitEntry]] = []
     total_count = 0
 
-    def add(path: Path, info: os.stat_result) -> None:
+    def add(relative_path: str, name: str, parent_fd: int, info: os.stat_result) -> None:
         nonlocal total_count
-        relative_path = path.relative_to(root).as_posix()
-        if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
-            return
         if stat.S_ISLNK(info.st_mode):
-            target = os.fsencode(os.readlink(path))
+            target = os.fsencode(os.readlink(name, dir_fd=parent_fd))
             entry = WorkspaceGitEntry(
                 path=relative_path,
                 git_mode="120000",
@@ -925,42 +922,67 @@ def _list_git_entries(
             retained.pop()
 
     with workspace_source_lock(root, exclusive=False):
-        for directory, child_directories, filenames in os.walk(
-            root,
-            topdown=True,
-            followlinks=False,
-            onerror=_raise_workspace_walk_error,
-        ):
-            parent = Path(directory)
-            traversable: list[str] = []
-            for name in child_directories:
-                if _directory_name_key(name) in excluded_directory_keys:
-                    continue
-                path = parent / name
-                relative_path = path.relative_to(root).as_posix()
-                if _path_matches_excluded_pattern(
-                    relative_path,
-                    excluded_path_pattern_keys,
-                ):
-                    continue
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode):
-                    add(path, info)
-                elif stat.S_ISDIR(info.st_mode):
-                    traversable.append(name)
+        _require_descriptor_guard_support()
+        if not _SUPPORTS_LIST_DIRECTORY_FD:
+            raise RuntimeError(
+                "LocalWorkspace requires POSIX descriptor-relative filesystem primitives."
+            )
+        root_fd = _open_list_root(root)
+        root_entries = _read_list_directory(
+            root_fd,
+            "",
+            excluded_directory_keys,
+            excluded_path_pattern_keys,
+            False,
+            include_non_regular=True,
+        )
+        stack = [] if root_entries is None else [_ListLevel(root_fd, "", root_entries)]
+        try:
+            while stack:
+                level = stack[-1]
+                for name, relative_path, _is_directory in level.pending:
+                    # Unlike ordinary listing, metadata for files also needs a
+                    # pinned parent, including after a deep descent closed it.
+                    if level.fd is None:
+                        level.fd = _reopen_list_level(stack, False)
+                        if level.fd is None:
+                            stack.pop()
+                            break
+                    info = os.stat(name, dir_fd=level.fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(info.st_mode):
+                        add(relative_path, name, level.fd, info)
+                        continue
+                    try:
+                        child = _open_list_directory(
+                            level.fd,
+                            name,
+                            relative_path + "/",
+                            excluded_directory_keys,
+                            excluded_path_pattern_keys,
+                            False,
+                            include_non_regular=True,
+                        )
+                    except _ListEntryNotDirectoryError:
+                        # O_NOFOLLOW refuses a directory swapped for a symlink.
+                        continue
+                    if child is not None:
+                        stack.append(_ListLevel(child[0], name, child[1]))
+                        # Keep the root pinned, but bound descriptors by the
+                        # same limit as ordinary listing rather than by depth.
+                        if len(stack) > _LIST_OPEN_DIRECTORY_LIMIT + 1:
+                            ancestor = stack[-_LIST_OPEN_DIRECTORY_LIMIT - 1]
+                            if ancestor.fd is not None:
+                                os.close(ancestor.fd)
+                                ancestor.fd = None
+                        break
                 else:
-                    raise WorkspaceGitEntryObservationUnsupportedError(
-                        "Workspace directory traversal encountered an unsupported entry."
-                    )
-            child_directories[:] = traversable
-            for name in filenames:
-                path = parent / name
-                relative_path = path.relative_to(root).as_posix()
-                if _path_has_excluded_directory(relative_path, excluded_directory_keys):
-                    continue
-                if _path_matches_excluded_pattern(relative_path, excluded_path_pattern_keys):
-                    continue
-                add(path, path.lstat())
+                    stack.pop()
+                    if level.fd is not None:
+                        os.close(level.fd)
+        finally:
+            for level in stack:
+                if level.fd is not None:
+                    os.close(level.fd)
     return WorkspaceGitEntryListResult(
         entries=tuple(entry for _path, entry in retained),
         total_count=total_count,
@@ -1155,6 +1177,8 @@ def _open_list_directory(
     excluded_directory_keys: frozenset[str],
     excluded_path_pattern_keys: tuple[str, ...],
     skip_unreadable: bool,
+    *,
+    include_non_regular: bool = False,
 ) -> tuple[int, _ListEntries] | None:
     """Open and read one subdirectory; ``None`` when it is skipped as unreadable."""
     try:
@@ -1171,6 +1195,7 @@ def _open_list_directory(
         excluded_directory_keys,
         excluded_path_pattern_keys,
         skip_unreadable,
+        include_non_regular=include_non_regular,
     )
     if entries is None:
         return None
@@ -1183,12 +1208,15 @@ def _read_list_directory(
     excluded_directory_keys: frozenset[str],
     excluded_path_pattern_keys: tuple[str, ...],
     skip_unreadable: bool,
+    *,
+    include_non_regular: bool = False,
 ) -> _ListEntries | None:
     """Return one opened directory's listable entries in walk order.
 
     Entries are ``(name, relative_path, is_directory)``. Excluded names and
     paths are dropped here, so excluded directories are never opened. The
-    descriptor is closed when this returns ``None`` or raises.
+    descriptor is closed when this returns ``None`` or raises. Git listing
+    includes non-regular entries to observe symlinks and reject special files.
     """
     keyed: list[tuple[str, str, str, bool]] = []
     try:
@@ -1198,7 +1226,7 @@ def _read_list_directory(
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         is_directory = True
-                    elif entry.is_file(follow_symlinks=False):
+                    elif include_non_regular or entry.is_file(follow_symlinks=False):
                         is_directory = False
                     else:
                         continue
@@ -1222,10 +1250,6 @@ def _read_list_directory(
         raise
     keyed.sort()
     return ((entry_name, path, is_dir) for _key, entry_name, path, is_dir in keyed)
-
-
-def _raise_workspace_walk_error(error: OSError) -> None:
-    raise error
 
 
 def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]:
