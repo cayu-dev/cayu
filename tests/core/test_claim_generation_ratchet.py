@@ -73,8 +73,10 @@ _ALLOWED: frozenset[str] = frozenset(
         # reclaim never requeues for a cancellation-fenced claim.
         "cayu/tasks/cancellation.py::TaskCancellationReconciliationResult.validate_result"
         "::TaskTerminalizationRequest",
-        # Receipts derived from the row's lease; the worker builds them under the
-        # lease lock and the store fences the write by the generation it presents.
+        # A store-side receipt, not a claim write: the runtime retry settlement and
+        # its reconciliation rebuild one request identity from the row, with a
+        # synthetic worker and no generation. Its idempotency key names the
+        # attempt; changing its material changes the digest reconciliation compares.
         "cayu/tasks/retry.py::_task_retry_runtime_terminal_request::TaskRetrySettlementRequest",
         # The retry-deadline receipt is derived from the lease the worker still holds
         # under its lock; the store fences the write by the generation it presents.
@@ -94,8 +96,10 @@ _ALLOWED: frozenset[str] = frozenset(
         "::_task_cancellation_terminalization_request",
         "cayu/tasks/worker.py::_settle_ordinary_task_cancellation_after_quiescence"
         "::_task_cancellation_terminalization_request",
-        # The verified worker serializes renewal and every write under its own owner
-        # lock, and retains the exact lease tuple for its preparation handoff.
+        # Still fenced by the lease alone, and open: the verified worker serializes
+        # renewal and every write under its owner lock, but a lost renewal
+        # acknowledgement still fences its own holder, which the generation removes
+        # for the main worker. Its claims already carry claim_generation.
         "cayu/verification/verified_task_worker.py::VerifiedTaskWorker._prepare_and_run"
         "::mark_claimed_task_execution_started",
         "cayu/verification/verified_task_worker.py::_LeaseOwner.heartbeat::heartbeat",

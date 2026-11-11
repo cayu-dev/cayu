@@ -6436,6 +6436,14 @@ class EnvironmentLifecycle:
             for owner in self._active_environment_setups.values()
         )
 
+    def _settling_retained_work(self) -> tuple[asyncio.Future[Any], ...]:
+        """Retained work that settles by itself; a drain waits without cancelling it."""
+
+        return (
+            *self._retained_environment_ends.settling(),
+            *self._leftover_teardown.settling(),
+        )
+
     async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained cleanup owners without cancelling dispatched work."""
 
@@ -6463,10 +6471,7 @@ class EnvironmentLifecycle:
                 for owner in self._active_environment_setups.values()
                 if owner.cleanup_ready_for_retry
             )
-            settling = (
-                *self._retained_environment_ends.settling(),
-                *self._leftover_teardown.settling(),
-            )
+            settling = self._settling_retained_work()
             if (
                 not retained
                 and not self._deferred_factory_cleanup_tasks
@@ -6520,8 +6525,7 @@ class EnvironmentLifecycle:
                     )
                     and not self._deferred_factory_cleanup_tasks
                     and not self._deferred_run_fence_release_tasks
-                    and not self._retained_environment_ends.settling()
-                    and not self._leftover_teardown.settling()
+                    and not self._settling_retained_work()
                 )
             if (
                 not any(

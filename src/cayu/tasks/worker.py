@@ -116,6 +116,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
 )
+from cayu.sessions._paired_writes import OWED_OUTCOME_STATUSES
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
@@ -4642,12 +4643,7 @@ async def _recover_expired_interrupted_task_handoffs(
             session = await app.session_store.load(task.session_id)
             if session is None or session.instance_id != task.session_instance_id:
                 continue
-        if session.status is not SessionStatus.INTERRUPTED and not (
-            # A completed or failed session fences the lost worker's run as an
-            # interrupted one does; its pending cancellation still decides the task.
-            session.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}
-            and _task_cancellation_requested(task)
-        ):
+        if not _outcome_fences_lost_worker_run(session, task):
             continue
         from cayu.external_wait_tasks import stop_wait_left_arming
 
@@ -4728,6 +4724,20 @@ async def _recover_expired_interrupted_task_handoffs(
         exhausted=len(candidates) < limit,
         failed=frozenset(failed),
         manual_recovery_required=manual_recovery_required,
+    )
+
+
+def _outcome_fences_lost_worker_run(session: Session, task: Task) -> bool:
+    """Whether the session's committed outcome lets expired-owner recovery act on its task.
+
+    Every outcome a terminal decision can record fences the lost worker's run.
+    An interrupted session hands its task off; any other outcome leaves only the
+    task's pending cancellation to decide it. The set comes from the decision's
+    own outcomes, so a new outcome cannot be left out here.
+    """
+
+    return session.status in OWED_OUTCOME_STATUSES and (
+        session.status is SessionStatus.INTERRUPTED or _task_cancellation_requested(task)
     )
 
 

@@ -22,6 +22,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
+from cayu._task_wait import cancel_and_join
 from cayu.events import Event, EventType
 from cayu.observability.event_loop_lag import (
     DEFAULT_SAMPLE_INTERVAL_S,
@@ -122,12 +123,11 @@ class SessionEventLoopLagRecorder:
         write, self._write = self._write, None
         if write is None or write.done():
             return
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(asyncio.shield(write), timeout_s)
-        except TimeoutError:
-            write.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await write
+            return
+        if (failure := await cancel_and_join(write)) is not None:
+            raise failure
 
     def _event(
         self, session_id: str, entry: _SessionLag, *, lag_s: float, now: float, running: int

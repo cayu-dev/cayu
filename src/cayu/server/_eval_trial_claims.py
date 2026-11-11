@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Any
 
+from cayu._task_wait import cancel_and_join
 from cayu.evals.runner import TrialExecution
 from cayu.evals.store import (
     EvalRunClaim,
@@ -92,6 +93,9 @@ class StoreClaimedTrial:
             raise RuntimeError("A claimed eval trial settles only behind a redaction boundary.")
         trial: asyncio.Future[TrialExecution] | None = None
         retained = False
+        # A cancellation or process-control exit already ending the trial stays
+        # the one that propagates while the trial stops.
+        leaving: BaseException | None = None
         try:
             if not await self._still_held():
                 return
@@ -122,12 +126,31 @@ class StoreClaimedTrial:
                 ),
                 redact_json=self._redact_json,
             )
+        except BaseException as exiting:
+            if not isinstance(exiting, Exception):
+                leaving = exiting
+            raise
         finally:
+            # A cancellation of this worker while the trial stops, or a
+            # process-control exit of the stopped trial, is kept: the claim is
+            # still finished, then it is raised.
+            stopped: BaseException | None = None
             if trial is not None and not trial.done():
-                trial.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await trial
-            await self._finish(retained=retained)
+                try:
+                    failure = await cancel_and_join(trial, leaving=leaving)
+                except asyncio.CancelledError as cancellation:
+                    stopped = cancellation
+                else:
+                    # An exit already leaving ``settle`` stays the one raised.
+                    if (
+                        leaving is None
+                        and failure is not None
+                        and not isinstance(failure, Exception)
+                    ):
+                        stopped = failure
+            await self._finish(retained=retained, leaving=leaving or stopped)
+            if stopped is not None:
+                raise stopped
 
     async def _still_held(self) -> bool:
         """Confirm the claim right before the trial starts, so a lapsed claim never runs.
@@ -204,19 +227,29 @@ class StoreClaimedTrial:
             except (EvalRunClaimLost, EvalRunStateConflict):
                 return False
 
-    async def _finish(self, *, retained: bool) -> None:
-        if not self._keep_alive.done():
-            self._keep_alive.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await self._keep_alive
-        if retained:
-            return
+    async def _finish(self, *, retained: bool, leaving: BaseException | None = None) -> None:
+        # The renewal's own ordinary failure only ends it; a process-control exit
+        # from it propagates. ``leaving`` is the exit already ending the trial and
+        # stays the one that propagates. Otherwise a cancellation of this worker
+        # while the renewal stops is kept: the claim is still released, then it
+        # is raised.
+        stopped: asyncio.CancelledError | None = None
         try:
-            await self._store.release_run_trial(self._claim)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("Failed to release an eval trial claim; its lease will expire.")
+            failure = await cancel_and_join(self._keep_alive, leaving=leaving)
+        except asyncio.CancelledError as cancellation:
+            stopped = cancellation
+        else:
+            if failure is not None and not isinstance(failure, Exception):
+                raise failure
+        if not retained:
+            try:
+                await self._store.release_run_trial(self._claim)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Failed to release an eval trial claim; its lease will expire.")
+        if stopped is not None:
+            raise stopped
 
 
 class StoreTrialClaims:

@@ -25,6 +25,7 @@ from cayu._exception_groups import (
 from cayu._exception_groups import set_exception_cause as _set_exception_cause
 from cayu._task_wait import (
     await_shielded_task_outcome,
+    cancel_and_join,
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
@@ -1387,6 +1388,9 @@ class TaskStoreDispatcher(Dispatcher):
                 envelope=envelope,
             )
 
+        # A cancellation or process-control exit already ending the claim, kept
+        # as the one that propagates while the heartbeat stops.
+        leaving: BaseException | None = None
         if settlement.state is not _QueuedDispatchSettlementState.NOT_ADMITTED:
             status = settlement.terminal_status or DispatchStatus.SUBMITTED
             if loop.time() >= claim_deadline_monotonic:
@@ -1420,8 +1424,12 @@ class TaskStoreDispatcher(Dispatcher):
                     )
                 except TaskClaimLost:
                     return await self._reclaimed_dispatch_handle(task, envelope)
+            except BaseException as exiting:
+                if not isinstance(exiting, Exception):
+                    leaving = exiting
+                raise
             finally:
-                await self._stop_heartbeat(heartbeat_stop, heartbeat)
+                await self._stop_heartbeat(heartbeat_stop, heartbeat, leaving=leaving)
 
         # Heartbeat in the background so the lease survives long gaps between events (a slow
         # model/tool turn would otherwise let the lease lapse and another worker re-run it).
@@ -1758,8 +1766,12 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             except TaskClaimLost:
                 return await self._reclaimed_dispatch_handle(task, envelope)
+        except BaseException as exiting:
+            if not isinstance(exiting, Exception):
+                leaving = exiting
+            raise
         finally:
-            await self._stop_heartbeat(heartbeat_stop, heartbeat)
+            await self._stop_heartbeat(heartbeat_stop, heartbeat, leaving=leaving)
 
     async def _reject_claimed_dispatch(
         self,
@@ -2665,15 +2677,22 @@ class TaskStoreDispatcher(Dispatcher):
     async def _stop_heartbeat(
         stop: asyncio.Event,
         heartbeat: asyncio.Task[None],
+        *,
+        leaving: BaseException | None = None,
     ) -> None:
+        """Stop the heartbeat in the finally around terminalization.
+
+        ``leaving`` is a cancellation or process-control exit already ending the
+        claim; a cancellation delivered while the heartbeat stops does not
+        replace it. Without one, such a cancellation is raised once the heartbeat
+        has stopped. A heartbeat failure other than a lost claim is raised in
+        either case.
+        """
+
         stop.set()
-        heartbeat.cancel()
-        if heartbeat.done():
-            with contextlib.suppress(asyncio.CancelledError, TaskClaimLost):
-                heartbeat.result()
-            return
-        with contextlib.suppress(asyncio.CancelledError, TaskClaimLost):
-            await heartbeat
+        failure = await cancel_and_join(heartbeat, leaving=leaving)
+        if failure is not None and not isinstance(failure, TaskClaimLost):
+            raise failure
 
     async def run_worker(
         self,

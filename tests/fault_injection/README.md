@@ -161,6 +161,8 @@ points unless the fault says otherwise.
 |---|---|---|---|---|
 | `group-crash-conflict` | crash: task-group | 50 | task running forever: the next worker's continuation raises `TaskGroupConflict: Prior group execution is still unsettled` | a crash anywhere in the member's run |
 | `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled; recovery completes the member but nothing proves its callback returned | a crash after the member's live terminalization, before `_settle_task_group_execution` |
+| `continuation-pause-interaction-open` | none: approval continuation whose close fails (`test_continuation_failure_crash.py`) | - | interaction started never settled | the continuation restores the pause with `update_status` and no interaction transition |
+| `continuation-pause-event-lost` | crash: the same continuation | 1 | no SESSION_INTERRUPTED after the resume, after recovery | a crash between that `update_status` and the SESSION_INTERRUPTED write |
 
 Each finding names its tracking issue in `known_failures.py`; findings with no
 issue of their own share one tracking issue there.

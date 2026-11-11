@@ -18,6 +18,7 @@ from cayu._exception_state import exception_state, set_exception_state
 from cayu._fork_controller_errors import ForkControllerDenied
 from cayu._task_wait import (
     await_shielded_task_outcome,
+    cancel_and_join,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -4353,9 +4354,8 @@ class RunLimitController:
                 next_item_task = None
                 yield item
 
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
+            if (heartbeat_failure := await cancel_and_join(heartbeat_task)) is not None:
+                raise heartbeat_failure
             async with lifecycle.reservation_transition_lock:
                 await self.renew_reservations(reservations)
         except asyncio.CancelledError as authoritative_exc:
@@ -4500,9 +4500,8 @@ class RunLimitController:
                     )
                 raise failure
             result = operation_task.result()
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
+            if (heartbeat_failure := await cancel_and_join(heartbeat_task)) is not None:
+                raise heartbeat_failure
             try:
                 await self.renew_reservations(reservations)
             except BudgetReservationLeaseLost as exc:

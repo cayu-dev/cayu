@@ -6,12 +6,12 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncGenerator
-from contextlib import suppress
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from cayu._task_wait import (
     await_shielded_task_outcome,
+    cancel_and_join,
     capture_awaitable_outcome,
     restore_task_cancellation_requests,
 )
@@ -222,9 +222,8 @@ async def _owned_inbox_continuation(
                 receive = None
                 yield event
             else:
-                receive.cancel()
-                with suppress(asyncio.CancelledError):
-                    await receive
+                if (failure := await cancel_and_join(receive)) is not None:
+                    raise failure
                 receive = None
         outcome = worker.result()
         if outcome.error is not None:

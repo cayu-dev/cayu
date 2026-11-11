@@ -42,6 +42,18 @@ FINDINGS: dict[str, Finding] = {
         "the execution, leaves the group obligation unsettled: nothing durable proves the "
         "callback returned",
     ),
+    # Found by test_continuation_failure_crash.py, whose scenario fails the
+    # approval close on purpose, so it has no point list of its own here.
+    "continuation-pause-interaction-open": Finding(
+        "#3345",
+        "An approval continuation that fails before its close restores the pause with a "
+        "raw status write, so the resumed interaction is never settled",
+    ),
+    "continuation-pause-event-lost": Finding(
+        "#3345",
+        "A crash between that raw status write and SESSION_INTERRUPTED loses the event: "
+        "its ID is random and nothing owes it",
+    ),
 }
 
 

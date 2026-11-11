@@ -247,7 +247,7 @@ from cayu.sessions._invocation_terminal_decision import (
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._model_stage import ModelCompletionStage
-from cayu.sessions._paired_writes import owed_decision_of_status
+from cayu.sessions._paired_writes import OUTCOME_SESSION_STATUS, owed_decision_of_status
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
@@ -1332,7 +1332,7 @@ class IncompleteSessionRecovery:
         """
 
         results: list[IncompleteSessionRecoveryResult] = []
-        for status in (SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.INTERRUPTED):
+        for status in OUTCOME_SESSION_STATUS.values():
             request = IncompleteSessionsRecoveryRequest(
                 statuses={status},
                 inactive_for_seconds=inactive_for_seconds,

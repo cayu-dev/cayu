@@ -350,6 +350,45 @@ async def run_thread_to_completion(
     return cast("_ResultT", outcome.result)
 
 
+async def cancel_and_join(
+    task: asyncio.Future[Any],
+    *,
+    leaving: BaseException | None = None,
+) -> BaseException | None:
+    """Cancel a child, wait until it has finished, and keep the caller's cancellation.
+
+    ``task.cancel()`` followed by ``with suppress(CancelledError): await task``
+    also swallows a cancellation of the calling task that arrives during the wait.
+    Here the child's own cancellation is its expected end, while a cancellation
+    of the caller is forwarded to the child (as ``await task`` does) and raised
+    once the child has finished. The caller's cancellation keeps its request
+    count and message. Returns the child's own failure, or ``None`` when it
+    returned or ended cancelled; when the caller's cancellation is raised, the
+    child's failure is not returned and is named in a note on it.
+
+    ``leaving`` is a cancellation or process-control exit the caller is already
+    propagating, as in a ``finally`` on its way out: it stays the one that
+    propagates, so a cancellation delivered during the wait is absorbed (and
+    still forwarded to the child) and the child's failure is returned.
+    """
+
+    task.cancel()
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait((task,))
+        except asyncio.CancelledError as delivered:
+            if cancellation is None:
+                cancellation = delivered
+            task.cancel()
+    failure = None if task.cancelled() else task.exception()
+    if leaving is None and cancellation is not None:
+        if failure is not None:
+            cancellation.add_note(f"The stopped task also failed: {type(failure).__name__}.")
+        raise cancellation
+    return failure
+
+
 async def wait_until_idle(
     running: Callable[[], set[asyncio.Future[Any]]], *, timeout_s: float
 ) -> bool:
