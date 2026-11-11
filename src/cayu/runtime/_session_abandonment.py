@@ -614,6 +614,7 @@ class SessionAbandonment:
             is None
         ):
             raise SessionStatusConflict("Abandoned session changed before its cleanup.")
+        await self._finish_retired_observations(session_id, passes)
         passes.append(
             await self._session_recovery.recover_incomplete_session(
                 request.model_copy(update={"inactive_for_seconds": 0})
@@ -632,6 +633,28 @@ class SessionAbandonment:
         except KeyError:
             return True
         return False
+
+    async def _finish_retired_observations(
+        self, session_id: str, passes: list[IncompleteSessionRecoveryResult]
+    ) -> None:
+        """Close the workspace observations an abandonment retired the round of.
+
+        Ordinary recovery refuses them without their round, so this comes before its
+        pass; it adds a pass to ``passes`` when it closed any.
+        """
+
+        events = await self._incomplete_recovery.finish_abandoned_workspace_observations(session_id)
+        if events:
+            passes.append(
+                IncompleteSessionRecoveryResult(
+                    session_id=session_id,
+                    previous_status=SessionStatus.FAILED,
+                    status=SessionStatus.FAILED,
+                    actions=(IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION,),
+                    events=events,
+                    message="Closed the workspace observations of the abandoned round.",
+                )
+            )
 
     async def _finish_failed_round(
         self,
@@ -662,6 +685,7 @@ class SessionAbandonment:
                 ),
             )
         )
+        await self._finish_retired_observations(session.id, passes)
         try:
             passes.append(
                 await self._session_recovery.recover_incomplete_session(
@@ -794,6 +818,9 @@ class SessionAbandonment:
             inactive_for_seconds=inactive_for_seconds,
             closed=closed,
         )
+        retired = await self._incomplete_recovery.finish_abandoned_workspace_observations(
+            session.id
+        )
         # No recovery owner reconstructed the run, so nothing closed its interaction.
         await self._session_recovery.settle_released_open_interaction(session.id)
         record = abandoned_session_from_checkpoint(
@@ -813,7 +840,13 @@ class SessionAbandonment:
                 else IncompleteSessionRecoveryAction.ABANDONED_TOOL_EFFECT
                 if unknown
                 else IncompleteSessionRecoveryAction.ABANDONED_ORPHANED_RUN,
+                *(
+                    (IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION,)
+                    if retired
+                    else ()
+                ),
             ),
+            events=retired,
             message=(
                 ("Closed" if closed is not None else "Failed")
                 + " the session its lost worker left running; it can no longer continue."
@@ -1190,6 +1223,7 @@ class SessionAbandonment:
             # first.
             await self._incomplete_recovery.release_abandoned_model_call_invocation(session.id)
             await self._session_recovery.settle_released_open_interaction(session.id)
+        await self._finish_retired_observations(session.id, passes)
         try:
             passes.append(
                 await self._session_recovery.recover_incomplete_session(

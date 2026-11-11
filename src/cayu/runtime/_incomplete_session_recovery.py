@@ -5787,6 +5787,83 @@ class IncompleteSessionRecovery:
             claim_has_not_dispatched_work=True,
         )
 
+    async def finish_abandoned_workspace_observations(self, session_id: str) -> tuple[Event, ...]:
+        """Close the workspace observations an abandonment left open with its round.
+
+        Abandoning retires the session's pending tool round into its abandonment
+        record, but the workspace observation of a call in that round, such as one a
+        lost worker was running, stays open. Ordinary recovery refuses an observation
+        without its pending round, so this closes each one as recovery closes a lost
+        worker's, with the round the record retains as its authority. Where the
+        environment isn't registered here, its artifacts stay unverified and it ends
+        incomplete or ambiguous. No tool or model work is dispatched. It takes no
+        recovery claim: the session failed as abandoned, so nothing runs or resumes it,
+        and each observation's transition commits only from the state it read. A
+        concurrent finisher that closed them first wins; this one then returns no
+        events. Does nothing unless the session failed as abandoned with open
+        observations and no pending round.
+        """
+
+        session = await self._session_store.load(session_id)
+        if session is None or session.status is not SessionStatus.FAILED:
+            return ()
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        record = abandoned_session_from_checkpoint(checkpoint)
+        if (
+            record is None
+            or not workspace_observations_from_checkpoint(checkpoint)
+            or pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY in (checkpoint or {})
+        ):
+            return ()
+        retired_round = pending_round_reader.pending_tool_round_from_checkpoint(
+            {pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY: record["tool_round"]},
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if retired_round is None:
+            # Nothing retains the round the observations belong to.
+            return ()
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        try:
+            registered_environment = self._resolve_registered_environment(session.environment_name)
+        except KeyError:
+            registered_environment = None
+        windows = set(workspace_observations_from_checkpoint(checkpoint))
+        try:
+            return await self._workspace_observation_recovery.recover_workspace_observations(
+                session=session,
+                registered_environment=registered_environment,
+                execution_profile_snapshot=profile,
+                retired_round=retired_round,
+            )
+        except Exception:
+            # A concurrent finisher's terminal event differs from this one's only in
+            # its time, so this publication conflicts once that one committed.
+            if not await self._workspace_observations_finalized(session_id, windows):
+                raise
+            return ()
+
+    async def _workspace_observations_finalized(self, session_id: str, windows: set[str]) -> bool:
+        """Whether each of ``windows`` is closed and has its terminal event."""
+
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        if windows & set(workspace_observations_from_checkpoint(checkpoint)):
+            return False
+        finalized = {
+            record.event.payload.get("window_id")
+            for record in await self._session_store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    # A concurrent finisher's terminal events are the newest.
+                    order_by=EventOrder.SEQUENCE_DESC,
+                    limit=len(windows) + 100,
+                )
+            )
+        }
+        return windows <= finalized
+
     async def _orphaned_model_call(
         self, session: Session, *, unavailable: str
     ) -> _OrphanedModelCall | None:

@@ -165,8 +165,14 @@ class WorkspaceObservationRecovery:
         execution_profile_snapshot: ActiveInvocationExecutionProfile | None,
         invocation_context: InvocationContext | None = None,
         staged_only: bool = False,
+        retired_round: pending_rounds.PendingToolRound | None = None,
     ) -> tuple[Event, ...]:
-        """Close crash-interrupted observation state without redispatching effects."""
+        """Close crash-interrupted observation state without redispatching effects.
+
+        ``retired_round`` is the round an abandonment retired from the checkpoint into
+        its record, which stands in for the pending round as the observations'
+        authority once the session has none.
+        """
 
         if invocation_context is not None and (
             invocation_context.binding.session_id != session.id
@@ -188,6 +194,8 @@ class WorkspaceObservationRecovery:
             consume_on_rejection=True,
             runtime_session=session,
         )
+        if pending_round is None:
+            pending_round = retired_round
         # Revalidate the complete aggregate after the recovery claim. Otherwise
         # a valid record ordered before a foreign record could be terminalized
         # (and could trigger artifact-store reads) before the malformed
@@ -216,6 +224,7 @@ class WorkspaceObservationRecovery:
                 session=session,
                 checkpoint=checkpoint,
                 lifecycle=durable_lifecycle,
+                retired_round=retired_round,
             )
             if reconstructed_stage is not None:
                 await publish_workspace_observation_transition(
@@ -238,6 +247,7 @@ class WorkspaceObservationRecovery:
                         session=session,
                         checkpoint=checkpoint,
                         lifecycle=durable_lifecycle,
+                        retired_round=retired_round,
                     )
                 )
 
@@ -317,6 +327,7 @@ class WorkspaceObservationRecovery:
                     lifecycle=lifecycle,
                     capture_status=("recorded" if delta_evidence_valid else "failed"),
                     capture_detail_code=(None if delta_evidence_valid else terminal_detail),
+                    retired_round=retired_round,
                 )
                 if repaired_lifecycle is None:
                     terminal_status = WorkspaceObservationTerminalStatus.AMBIGUOUS
@@ -384,6 +395,7 @@ class WorkspaceObservationRecovery:
                     lifecycle=lifecycle,
                     capture_status="failed",
                     capture_detail_code=detail_code,
+                    retired_round=retired_round,
                 )
                 if repaired_lifecycle is None:
                     terminal_status = WorkspaceObservationTerminalStatus.AMBIGUOUS
@@ -624,18 +636,26 @@ class WorkspaceObservationRecovery:
         session: Session,
         checkpoint: dict[str, Any] | None,
         lifecycle: WorkspaceObservationLifecycle,
+        retired_round: pending_rounds.PendingToolRound | None = None,
     ) -> WorkspaceObservationLifecycle | None:
-        """Bind a pre-crash private terminal stage to its exact observation owner."""
+        """Bind a pre-crash private terminal stage to its exact observation owner.
+
+        ``retired_round`` stands in for the pending round once an abandonment
+        retired it, as in ``recover_workspace_observations``.
+        """
 
         if (
             lifecycle.phase is not WorkspaceObservationPhase.BEFORE_CAPTURED
             or lifecycle.tool_outcome_event_id is not None
         ):
             return None
-        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            runtime_session=session,
+        pending_round = (
+            pending_round_reader.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                runtime_session=session,
+            )
+            or retired_round
         )
         if pending_round is None:
             return None
@@ -683,8 +703,14 @@ class WorkspaceObservationRecovery:
         lifecycle: WorkspaceObservationLifecycle,
         capture_status: Literal["recorded", "failed"],
         capture_detail_code: str | None,
+        retired_round: pending_rounds.PendingToolRound | None = None,
     ) -> WorkspaceObservationLifecycle | None:
-        """Repair one staged tool outcome and return its exact lifecycle binding."""
+        """Repair one staged tool outcome and return its exact lifecycle binding.
+
+        A stage only ``retired_round`` holds is authenticated but not rewritten: the
+        abandonment record that retains it is immutable, so the observation stays
+        bound to it as retained.
+        """
 
         if lifecycle.tool_outcome_event_id is None or lifecycle.tool_outcome_event_digest is None:
             return None
@@ -703,6 +729,9 @@ class WorkspaceObservationRecovery:
             redactor=self._secret_redactor,
             runtime_session=session,
         )
+        retired = pending_round is None and retired_round is not None
+        if retired:
+            pending_round = retired_round
         matching_raw_stages = []
         matching_safe_stages = []
         if pending_round is not None:
@@ -761,6 +790,8 @@ class WorkspaceObservationRecovery:
             raise workspace_observation_recovery_rejected(
                 "Workspace observation safe tool outcome conflicts with its stage."
             )
+        if retired:
+            return durable_lifecycle
         identity = ToolRoundIdentity(
             model_step_id=lifecycle.model_step_id,
             model_attempt_id=lifecycle.model_attempt_id,
@@ -924,17 +955,25 @@ class WorkspaceObservationRecovery:
         session: Session,
         checkpoint: dict[str, Any] | None,
         lifecycle: WorkspaceObservationLifecycle,
+        retired_round: pending_rounds.PendingToolRound | None = None,
     ) -> bool:
-        """Validate exact tool evidence before any extension-owned artifact read."""
+        """Validate exact tool evidence before any extension-owned artifact read.
+
+        ``retired_round`` stands in for the pending round once an abandonment
+        retired it, as in ``recover_workspace_observations``.
+        """
 
         if await self._workspace_observation_uncertainty_evidence_valid(
             session=session, lifecycle=lifecycle
         ):
             return True
-        pending_round = pending_round_reader.pending_tool_round_from_checkpoint(
-            checkpoint,
-            redactor=self._secret_redactor,
-            runtime_session=session,
+        pending_round = (
+            pending_round_reader.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                runtime_session=session,
+            )
+            or retired_round
         )
         matching_raw_stages = (
             []
