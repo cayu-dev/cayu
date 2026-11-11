@@ -1557,6 +1557,10 @@ class ModelStepExecutor:
                 slot["slot"]
                 if (slot := session_model_slot(session)) is not None
                 and effective_model == slot["model"]
+                and (
+                    model_execution_selection is None
+                    or model_execution_selection.candidate_index == 0
+                )
                 else None
             ),
         )
