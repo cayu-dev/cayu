@@ -1093,8 +1093,12 @@ class EnvironmentLifecycle:
             session.id, _command_binding_key(name)
         )
         if record is None:
-            if registered_environment is not None and isinstance(
-                registered_environment.factory, DockerCodingEnvironmentFactory
+            # Deferred bindings do not publish the eager command-binding record;
+            # their allocation receipt alone does not imply a missing owner.
+            if (
+                registered_environment is not None
+                and isinstance(registered_environment.factory, DockerCodingEnvironmentFactory)
+                and not registered_environment.factory.deferred_materialization
             ):
                 checkpoint = await self._session_store.load_checkpoint(session.id)
                 if (
