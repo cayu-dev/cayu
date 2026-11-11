@@ -218,8 +218,10 @@ class LocalWorkspace(Workspace, WorkspaceGitModeMutator, WorkspaceDirectoryPrune
 
         if not transfers_use_helpers():
             return await run_in_thread(function, *args)
-        acquiring = asyncio.ensure_future(
-            asyncio.to_thread(acquire_local_source_read_gate, self.root)
+        # Keep this as an executor future, not a task: loop shutdown cancels
+        # tasks even when shielded, losing a still-running worker's release.
+        acquiring = asyncio.get_running_loop().run_in_executor(
+            None, acquire_local_source_read_gate, self.root
         )
         try:
             release = await asyncio.shield(acquiring)
