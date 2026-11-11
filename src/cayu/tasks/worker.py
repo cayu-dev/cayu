@@ -1781,7 +1781,7 @@ async def _handle_with_heartbeat_owned(
                             "Task handler shutdown failed after heartbeat authority loss.",
                             [heartbeat_failure, exc],
                         ) from None
-                if recover_interrupted_authority_loss and isinstance(
+                if recover_interrupted_authority_loss and exception_tree_contains(
                     exc,
                     (SessionRunFenced, TaskClaimLost),
                 ):
