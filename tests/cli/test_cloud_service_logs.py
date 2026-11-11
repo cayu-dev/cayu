@@ -4,11 +4,18 @@ from before line times."""
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -529,3 +536,472 @@ def test_an_older_cloud_refuses_what_it_would_ignore(
     error = json.loads(capsys.readouterr().out)["error"]
     assert error["category"] == "service_logs_filters_unsupported"
     assert named in error["message"]
+
+
+def test_structured_event_is_exact_and_decodes_json(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    messages = [
+        '{"event":"worker.done.extra"}',
+        '{"event":"other","message":"worker.done"}',
+        ' { "ev\\u0065nt" : "worker.done", "count": 2 } ',
+        '{"event":"worker.done"',
+        '[{"event":"worker.done"}]',
+        '{"event":"worker.done","value":NaN}',
+        '{"event":"worker.done","value":Infinity}',
+        "worker.done",
+    ]
+    fake = cloud(_page(*(_line(str(n), message) for n, message in enumerate(messages))))
+
+    assert _logs("--since", "1h", "--event", "worker.done", "--json") == 0
+
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert result["items"] == [messages[2]]
+    assert [line["id"] for line in result["lines"]] == ["2"]
+    assert "event" not in fake.queries[0]
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("value=1", ["number", "decimal"]),
+        ('value="1"', ["string"]),
+        ("value=true", ["boolean"]),
+        ("value=null", ["null"]),
+        ("value=hello=there", ["text"]),
+        ("a.b=yes", ["literal"]),
+    ],
+)
+def test_fields_match_json_scalar_types_and_literal_keys(
+    cloud: Callable[..., _Cloud],
+    capsys: pytest.CaptureFixture[str],
+    expression: str,
+    expected: list[str],
+) -> None:
+    values = {
+        "number": 1,
+        "decimal": 1.0,
+        "string": "1",
+        "boolean": True,
+        "null": None,
+        "text": "hello=there",
+        "object": {"a": 1},
+        "array": [1],
+    }
+    fake = cloud(
+        _page(
+            *(_line(key, json.dumps({"value": value})) for key, value in values.items()),
+            _line("missing", "{}"),
+            _line("literal", '{"a.b":"yes"}'),
+            _line("nested", '{"a":{"b":"yes"}}'),
+        )
+    )
+
+    assert _logs("--since", "1h", "--field", expression, "--json") == 0
+
+    assert [
+        line["id"] for line in json.loads(capsys.readouterr().out)["result"]["lines"]
+    ] == expected
+    assert "field" not in fake.queries[0]
+
+
+def test_structured_filters_compose_and_search_past_full_nonmatching_pages(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    wanted = '{"event":"done","status":"ok","count":2}'
+    fake = cloud(
+        _page(
+            _line("0", '{"event":"done","status":"bad","count":2}'),
+            more=True,
+            next_cursor="c1",
+            searched=_DAY[0],
+        ),
+        _page(_line("1", wanted), more=True, next_cursor="c2", searched=_DAY[1]),
+    )
+    assert (
+        _logs(
+            "--since",
+            "1h",
+            "--event",
+            "done",
+            "--field",
+            "status=ok",
+            "--field",
+            "count=2",
+            "--process",
+            "worker",
+            "--release",
+            "dep_one",
+            "--grep",
+            "done",
+            "--limit",
+            "1",
+            "--json",
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert result["items"] == [wanted]
+    assert result["next_cursor"] == "c2"
+    assert [query.get("cursor") for query in fake.queries] == [None, "c1"]
+    assert all(query["limit"] == "1" and query["grep"] == "done" for query in fake.queries)
+
+
+def test_default_structured_search_retains_newest_matches_across_whole_window(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        _page(
+            _line("1", '{"event":"done"}'),
+            _line("2", '{"event":"done"}'),
+            more=True,
+            next_cursor="c1",
+            searched=_DAY[0],
+        ),
+        _page(
+            _line("3", '{"event":"done"}'),
+            _line("4", '{"event":"other"}'),
+            next_cursor="end",
+            searched=_DAY[1],
+        ),
+    )
+    assert _logs("--event", "done", "--limit", "2", "--json") == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert [line["id"] for line in result["lines"]] == ["2", "3"]
+    assert result["more"] is False
+    assert result["next_cursor"] == "end"
+    first = fake.queries[0]
+    assert datetime.fromisoformat(first["until"]) - datetime.fromisoformat(
+        first["since"]
+    ) == timedelta(days=7)
+    assert [query["limit"] for query in fake.queries] == ["1000", "1000"]
+
+
+def test_future_until_does_not_move_default_lookback_into_the_future(
+    cloud: Callable[..., _Cloud],
+) -> None:
+    fake = cloud(_page())
+    before = datetime.now(UTC)
+    assert _logs("--event", "done", "--until", "2099-01-01T00:00:00Z") == 0
+    upper = datetime.fromisoformat(fake.queries[0]["until"])
+    assert before <= upper <= datetime.now(UTC)
+    assert upper - datetime.fromisoformat(fake.queries[0]["since"]) == timedelta(days=7)
+
+
+def test_partial_newest_scan_says_newer_matches_may_remain(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        _page(_line("1", '{"event":"done"}'), more=True, next_cursor="c1", searched=_DAY[0])
+    )
+    assert _logs("--event", "done", "--search-for", "0") == 0
+    text = capsys.readouterr().out
+    assert "newer matches may remain" in text
+    assert "--cursor c1" in text
+    assert len(fake.queries) == 1
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_newest_follow_keeps_raw_page_overlap_outside_display_tail(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str], limit: int
+) -> None:
+    fake = cloud(
+        _page(
+            *(_line(name, '{"event":"done"}') for name in ("old", "middle", "new")),
+            more=True,
+            next_cursor="c1",
+        ),
+        _page(
+            *(_line(name, '{"event":"done"}') for name in ("old", "new", "later")),
+            more=True,
+            next_cursor="c2",
+        ),
+        _page(_line("old", '{"event":"done"}'), next_cursor=None),
+    )
+    assert (
+        _logs("--event", "done", "--limit", str(limit), "--search-for", "0", "--follow", "--json")
+        == 0
+    )
+    envelopes = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["id"] for envelope in envelopes for line in envelope["result"]["lines"]] == [
+        *["middle", "new"][-limit:],
+        "later",
+    ]
+    assert [query.get("cursor") for query in fake.queries] == [None, "c1", "c2"]
+
+
+@pytest.mark.parametrize("limit", [1, 1000])
+def test_newest_tail_bounds_and_boundary_duplicates(
+    cloud: Callable[..., _Cloud],
+    capsys: pytest.CaptureFixture[str],
+    limit: int,
+) -> None:
+    records = [_line(str(index), '{"event":"done"}') for index in range(1000)]
+    cloud(
+        _page(*records, more=True, next_cursor="c1"),
+        _page(records[0], _line("1000", '{"event":"done"}')),
+    )
+    assert _logs("--event", "done", "--limit", str(limit), "--json") == 0
+    lines = json.loads(capsys.readouterr().out)["result"]["lines"]
+    assert [line["id"] for line in lines] == [str(index) for index in range(1001 - limit, 1001)]
+
+
+def test_structured_follow_advances_nonmatching_pages_and_keeps_original_until(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        _page(_line("1", '{"event":"other"}'), next_cursor="c1", more=True),
+        _page(_line("2", '{"event":"done"}'), next_cursor="c2", more=True),
+        _page(_line("2", '{"event":"done"}'), next_cursor=None),
+    )
+    assert (
+        _logs(
+            "--since",
+            "1h",
+            "--until",
+            "2099-01-01T00:00:00Z",
+            "--event",
+            "done",
+            "--follow",
+            "--json",
+        )
+        == 0
+    )
+    envelopes = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["id"] for envelope in envelopes for line in envelope["result"]["lines"]] == ["2"]
+    assert [query.get("cursor") for query in fake.queries] == [None, "c1", "c2"]
+    assert all(query["until"] == "2099-01-01T00:00:00+00:00" for query in fake.queries)
+
+
+@pytest.mark.parametrize("expression", ["missing", "=value", "a=[]", "a={}", "a=NaN", "a=Infinity"])
+def test_invalid_field_filters_fail_before_request(
+    cloud: Callable[..., _Cloud],
+    capsys: pytest.CaptureFixture[str],
+    expression: str,
+) -> None:
+    fake = cloud()
+    assert _logs("--field", expression) == 2
+    message = json.loads(capsys.readouterr().out)["error"]["message"]
+    assert "--field" in message
+    assert "unrecognized" not in message
+    assert fake.queries == []
+
+
+def test_cursor_structured_search_keeps_first_matches_without_implicit_window(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(_page(_line("1", '{"event":"done"}'), more=True, next_cursor="c2"))
+    assert _logs("--cursor", "c1", "--event", "done", "--limit", "1", "--json") == 0
+    assert fake.queries == [{"cursor": "c1", "limit": "1"}]
+    assert json.loads(capsys.readouterr().out)["result"]["next_cursor"] == "c2"
+
+
+def test_newest_scan_budget_retains_latest_matches_and_coverage(
+    cloud: Callable[..., _Cloud],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Advance time at real request dispatch, rather than expiring before the search starts.
+    clock = [0.0]
+    original = _Cloud.__call__
+
+    def dispatch(self: _Cloud, request: httpx.Request) -> httpx.Response:
+        result = original(self, request)
+        if request.url.path == _LOGS:
+            clock[0] += 50
+        return result
+
+    monkeypatch.setattr(_Cloud, "__call__", dispatch)
+    fake = cloud(
+        _page(_line("1", '{"event":"done"}'), more=True, next_cursor="c1", searched=_DAY[0]),
+        _page(_line("2", '{"event":"done"}'), more=True, next_cursor="c2", searched=_DAY[1]),
+    )
+    from cayu.cli.cloud import _build_parser
+
+    arguments = _build_parser().parse_args(
+        [
+            "service",
+            "logs",
+            "--application",
+            "my-agent",
+            "--event",
+            "done",
+            "--limit",
+            "1",
+            "--search-for",
+            "60s",
+        ]
+    )
+    result = cloud_cli._service(
+        arguments,
+        client=CloudApiClient(api_url="https://cloud.example", api_key="login-token"),
+        monotonic=lambda: clock[0],
+    )
+    assert len(fake.queries) == 2
+    assert [line["id"] for line in result["result"]["lines"]] == ["2"]
+    assert result["result"]["searched"] == {"from": _DAY[0][0], "to": _DAY[1][1]}
+    assert "newer matches may remain" in result["warnings"][0]
+
+
+def test_unknown_coverage_and_truncated_messages_are_not_upgraded(
+    cloud: Callable[..., _Cloud], capsys: pytest.CaptureFixture[str]
+) -> None:
+    truncated = {**_line("bad", '{"event":"done"}'), "truncated": True}
+    cloud(
+        _page(truncated, more=True, next_cursor="c1", searched=_DAY[0]),
+        _page(_line("1", '{"event":"done"}'), more=True, next_cursor="c2"),
+        _page(_line("2", '{"event":"done"}'), searched=_DAY[2]),
+    )
+    assert _logs("--event", "done", "--json") == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert [line["id"] for line in result["lines"]] == ["1", "2"]
+    assert result["searched"] is None
+
+
+@pytest.mark.parametrize("phase", ["scan", "follow", "follow_cursor", "overlap"])
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGINT delivery")
+def test_structured_follow_over_real_http_preserves_sigint_checkpoint(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    requests: list[dict[str, list[str]]] = []
+    waiting, release = threading.Event(), threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            target = urlsplit(self.path)
+            if target.path == "/v1/applications":
+                body = {"items": [{"id": "my-agent", "name": "My Agent"}]}
+            else:
+                assert target.path == _LOGS
+                requests.append(parse_qs(target.query))
+                number = len(requests)
+                blocked = {"scan": 2, "follow": 3, "follow_cursor": 4, "overlap": 3}[phase]
+                if number == blocked:
+                    waiting.set()
+                    release.wait(20)
+                    return
+                if phase == "overlap":
+                    response = _page(
+                        *(
+                            _line(identity, '{"event":"done"}')
+                            for identity in (("old", "new") if number == 1 else ("old", "next"))
+                        ),
+                        more=True,
+                        next_cursor=f"c{number}",
+                    )
+                elif number == 1:
+                    response = _page(
+                        _line("old", '{"event":"done"}'),
+                        more=True,
+                        next_cursor="c1",
+                        searched=_DAY[0],
+                    )
+                elif number == 2:
+                    response = _page(
+                        _line("new", '{"event":"done"}'), next_cursor=None, searched=_DAY[1]
+                    )
+                else:
+                    # Same inclusive integer-millisecond bounds as Cloud's LogQuery.
+                    upper = datetime.fromisoformat(requests[0]["until"][0])
+                    after = datetime.fromisoformat(requests[-1]["since"][0])
+                    until = datetime.fromisoformat(requests[-1]["until"][0])
+                    assert until - after <= timedelta(days=7)
+                    end_ms = int(upper.timestamp() * 1000)
+                    candidates = [(end_ms, "old"), (end_ms, "new"), (end_ms + 1, "next")]
+                    lines = [
+                        _line(identity, '{"event":"done"}')
+                        for milliseconds, identity in candidates
+                        if milliseconds >= int(after.timestamp() * 1000)
+                    ]
+                    response = _page(*lines, next_cursor="live", more=True)
+                body = response.json()
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    environment = {
+        **os.environ,
+        "CAYU_CLOUD_CONFIG": str(tmp_path / "config.json"),
+        "CAYU_CLOUD_API_URL": f"http://127.0.0.1:{server.server_port}",
+        "CAYU_CLOUD_API_KEY": "local-test-token",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+    }
+    for name in ("CAYU_CLOUD_CONTEXT", "CAYU_CLOUD_API_KEY_FILE"):
+        environment.pop(name, None)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "cayu",
+            "cloud",
+            "service",
+            "logs",
+            "--application",
+            "my-agent",
+            "--event",
+            "done",
+            "--limit",
+            "1",
+            "--until",
+            "2099-01-01T00:00:00Z",
+            "--follow",
+            "--json",
+            *(["--search-for", "0"] if phase == "overlap" else []),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if not waiting.wait(15):
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+            pytest.fail(f"CLI did not reach the {phase} request: {stdout!r} {stderr!r}")
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0
+        assert stderr == ""
+        envelopes = [json.loads(line) for line in stdout.splitlines()]
+        assert [line["id"] for envelope in envelopes for line in envelope["result"]["lines"]] == {
+            "scan": ["old"],
+            "follow": ["new"],
+            "follow_cursor": ["new", "next"],
+            "overlap": ["new", "next"],
+        }[phase]
+        assert (
+            envelopes[-1]["result"]["next_cursor"]
+            == {"scan": "c1", "follow": None, "follow_cursor": "live", "overlap": "c2"}[phase]
+        )
+        assert all("event" not in query and "field" not in query for query in requests)
+        if phase == "follow":
+            upper = datetime.fromisoformat(requests[0]["until"][0])
+            after = upper + timedelta(milliseconds=1)
+            assert datetime.fromisoformat(requests[-1]["since"][0]) == after
+            assert datetime.fromisoformat(requests[-1]["until"][0]) == after + timedelta(days=7)
+            assert envelopes[-1]["result"]["next_since"] == after.isoformat()
+        elif phase == "follow_cursor":
+            assert requests[-1]["cursor"] == ["live"]
+            assert requests[-1]["until"] == ["2099-01-01T00:00:00+00:00"]
+            assert "next_since" not in envelopes[-1]["result"]
+        elif phase == "overlap":
+            assert [query.get("cursor") for query in requests] == [None, ["c1"], ["c2"]]
+    finally:
+        release.set()
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

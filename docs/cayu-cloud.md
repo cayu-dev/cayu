@@ -1488,7 +1488,26 @@ $ cayu cloud service logs --application my-agent --process worker --since 2026-1
 - `--since` and `--until` take a span back from now (`90s`, `15m`, `1h`, `2d`) or an ISO 8601
   time; one without an offset is local. A read spans at most 7 days.
 - `--grep TEXT` keeps lines containing the text, plainly and case-sensitively.
+- `--event NAME` keeps JSON log messages whose top-level `event` field is exactly that string.
+- `--field KEY=VALUE` matches a literal top-level JSON field. Repeat it to require every field;
+  it also combines with `--event` and the other filters. Values are JSON scalars or plain text:
+  `--field status=ok`, `--field count=2`, `--field ready=true`, `--field reason=null`.
+  Use `--field 'count="2"'` for the string `"2"` instead of the number `2`. Numbers compare
+  numerically (`2` equals `2.0`); booleans, strings and null stay distinct. A missing field
+  does not match null. Keys containing dots are literal keys, not nested paths.
 - `--limit N` prints up to N lines (100 by default, at most 1000).
+
+For example, to inspect a worker's structured events during a deploy window:
+
+```bash
+cayu cloud service logs --application my-agent --process worker \
+  --event worker.completed --field status=ok --since 1h --until 5m
+```
+
+Structured filters inspect the JSON object in each line's redacted `message`, locally in the
+CLI. Plain text, malformed JSON, JSON values that are not objects, and truncated messages do
+not match. Nonstandard JSON constants such as `NaN` and `Infinity` are rejected. Matching
+lines retain their original message and metadata in both readable and `--json` output.
 
 Without `--since` the command prints the newest lines, up to 7 days back. With it, it prints the
 first lines after that time, oldest first, and when more follow it ends with
@@ -1504,6 +1523,17 @@ one page), and prints the lines of every page it read. When it stops before the 
 window, it ends with `Searched FROM to TO; more may follow. Go on with --cursor CURSOR`, so the
 part it covered is never in doubt; Ctrl-C stops the search early the same way.
 
+For `--event` or `--field` without `--since` or `--cursor`, the CLI scans forward through that
+seven-day window and retains the newest N matches, oldest first. The window ends at the earlier
+of `--until` and the time the command starts. This may require several requests even after N
+matches have been found. `--search-for` bounds this scan too; when it stops early, the output
+warns that newer matches may remain, and `--json` includes the warning alongside the available
+`searched`, `more` and `next_cursor` evidence. Continue with that cursor and the same filters
+to read subsequent matches, or increase `--search-for` to complete a new newest-match search.
+With an explicit `--since` or `--cursor`, the command collects the first N matching lines,
+continuing past nonmatching pages. A backend that cannot report its searched span retains
+`searched: null`; the CLI does not manufacture coverage evidence.
+
 `--follow` prints the lines, then asks Cloud every two seconds for the lines after the last one
 printed, until Ctrl-C, which ends it without an error. It shows each line once. Cloud holds back
 the last 10 seconds of lines, so a line that reaches it late is still shown. With `--until`, it
@@ -1513,7 +1543,12 @@ stops once that time has been read.
 `release`, `instance` (the ECS task or Kubernetes pod) and `message`, with `next_cursor`,
 `more` and `searched` (`from` inclusive, `to` exclusive, of every page read; `null` for the
 newest lines). With `--follow`, it prints one envelope per page that has lines, then one with the
-cursor to go on from.
+cursor to go on from. A partial initial structured scan also prints its warning when it has no
+matches. If interrupted before a structured follow read has obtained a cursor, the final result
+can instead contain `next_since`; readable output gives the corresponding `--since` command.
+This includes the transition after a completed initial snapshot: continuation starts one
+millisecond after its inclusive end. The normal seven-day bound applies when resuming with
+`--since`. Follow otherwise keeps the original `--until`, including a future time.
 
 Cloud redacts credential-shaped text (`[redacted]`) and removes terminal control sequences
 before a line leaves it, and cuts a line longer than 8,192 characters; `--grep` matches the
