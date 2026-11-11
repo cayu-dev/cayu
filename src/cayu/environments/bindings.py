@@ -1994,7 +1994,7 @@ class SyncBinding(WorkspaceBinding):
                         workspace,
                         source_paths,
                         max_file_bytes=cast("int", self.max_file_bytes),
-                        max_total_bytes=cast("int", self.max_total_bytes),
+                        max_total_bytes=self.max_total_bytes,
                         preserve_git_modes=self.preserve_git_modes,
                         staging_capacity=self.staging_capacity,
                     )
@@ -2117,7 +2117,7 @@ class SyncBinding(WorkspaceBinding):
                         workspace,
                         source_revisions,
                         max_file_bytes=cast("int", self.max_file_bytes),
-                        max_total_bytes=cast("int", self.max_total_bytes),
+                        max_total_bytes=self.max_total_bytes,
                         preserve_git_modes=self.preserve_git_modes,
                         staging_capacity=self.staging_capacity,
                     )
@@ -2710,11 +2710,13 @@ class SyncBinding(WorkspaceBinding):
                 items_total=len(revisions),
             )
             if not allow_idempotent_replay:
+                # A partial publication can mix old and new files above the
+                # transfer total. Verify its retained revisions, not its total.
                 await _verify_sync_source_revisions(
                     source,
                     revisions,
                     max_file_bytes=max_file_bytes,
-                    max_total_bytes=max_total_bytes,
+                    max_total_bytes=None,
                     preserve_git_modes=self.preserve_git_modes,
                     staging_capacity=None if archive is not None else staging_capacity,
                     max_read_bytes=revision_read_limit,
@@ -3588,7 +3590,7 @@ async def _capture_sync_source_revisions(
     paths: tuple[str, ...],
     *,
     max_file_bytes: int,
-    max_total_bytes: int,
+    max_total_bytes: int | None,
     preserve_git_modes: bool,
     staging_capacity: SyncBindingStagingCapacity | None = None,
     retained_staged_bytes: int = 0,
@@ -3629,7 +3631,7 @@ async def _capture_sync_source_revisions(
                 f"SyncBinding source file exceeds max_file_bytes={max_file_bytes}: {path}"
             )
         observed_bytes += total_bytes
-        if observed_bytes > max_total_bytes:
+        if max_total_bytes is not None and observed_bytes > max_total_bytes:
             raise RuntimeError(
                 f"SyncBinding source files exceed max_total_bytes={max_total_bytes}."
             )
@@ -3737,7 +3739,7 @@ async def _verify_sync_source_revisions(
     revisions: tuple[_SyncSourceRevision, ...],
     *,
     max_file_bytes: int,
-    max_total_bytes: int,
+    max_total_bytes: int | None,
     preserve_git_modes: bool,
     staging_capacity: SyncBindingStagingCapacity | None = None,
     retained_staged_bytes: int = 0,
@@ -3896,7 +3898,7 @@ async def _copy_paths(
                     source,
                     source_observation.revisions,
                     max_file_bytes=cast("int", max_file_bytes),
-                    max_total_bytes=cast("int", max_total_bytes),
+                    max_total_bytes=max_total_bytes,
                     preserve_git_modes=preserve_git_modes,
                     staging_capacity=None,
                 )
@@ -3938,7 +3940,7 @@ async def _copy_paths(
                 source,
                 source_observation.revisions,
                 max_file_bytes=cast("int", max_file_bytes),
-                max_total_bytes=cast("int", max_total_bytes),
+                max_total_bytes=max_total_bytes,
                 preserve_git_modes=preserve_git_modes,
                 staging_capacity=staging_capacity,
                 retained_staged_bytes=archive.archive_bytes,
