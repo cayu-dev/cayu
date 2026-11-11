@@ -756,7 +756,10 @@ def _read_file(
             if max_bytes is None
             else file.read(min(max_bytes, total_bytes - offset + 1))
         )
-        file_mode = os.fstat(file.fileno()).st_mode
+        info = os.fstat(file.fileno())
+        if info.st_size != total_bytes:
+            raise OSError(f"Workspace file changed during read: {relative_path}")
+        file_mode = info.st_mode
     complete = offset == 0 and len(content) == total_bytes
     revision, digest = content_identity(content) if complete else (None, None)
     return WorkspaceReadResult(
