@@ -309,11 +309,8 @@ def test_reconciliation_ends_a_run_its_lost_worker_left_where_the_environment_is
         reader = _application(store, task_store=InMemoryTaskStore())
         assert (await store.load("scan")).status is SessionStatus.RUNNING
         assert (await store.inspect_session_execution("scan")).state == "owner_lost"
-        # Its activity is too recent for an hour's window.
-        assert await reader.reconcile_orphaned_sessions(inactive_for_seconds=3600) == ()
-        assert (await store.load("scan")).status is SessionStatus.RUNNING
-
-        [result] = await reader.reconcile_orphaned_sessions(inactive_for_seconds=0)
+        # Attested loss and an unavailable environment do not wait for conversation grace.
+        [result] = await reader.reconcile_orphaned_sessions()
 
         assert result.session_id == "scan"
         assert result.status is SessionStatus.FAILED
@@ -705,9 +702,7 @@ def test_reconciliation_ends_a_run_its_lost_worker_left_inside_a_model_call(
         reader = _application(store, budget_policy=_budget())
         stage = await _lost_model_call(store)
         assert (await store.inspect_session_execution("scan")).state == "owner_lost"
-        assert await reader.reconcile_orphaned_sessions(inactive_for_seconds=3600) == ()
-
-        [result] = await reader.reconcile_orphaned_sessions(inactive_for_seconds=0)
+        [result] = await reader.reconcile_orphaned_sessions()
 
         assert result.status is SessionStatus.FAILED, result.message
         assert result.actions == (IncompleteSessionRecoveryAction.ABANDONED_ORPHANED_RUN,)

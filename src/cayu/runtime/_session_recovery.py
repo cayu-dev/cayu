@@ -550,13 +550,18 @@ class SessionRecovery:
         )
 
     async def _settle_abandoned_model_dispatch(
-        self, session: Session, *, invocation_context: InvocationContext | None = None
+        self,
+        session: Session,
+        *,
+        invocation_context: InvocationContext | None = None,
+        interruption_reason: str | None = None,
     ) -> tuple[Event, ...]:
-        """Interrupt an assistant model call whose owning process is gone.
+        """Interrupt an assistant or compaction model call whose owner is gone.
 
         Only an ordinary dispatched call qualifies: no terminal response, no provider
         operation that can be resumed or inspected, and no task contract that needs an
-        explicit completion decision. Everything else stays on the operator path.
+        explicit completion decision. Auxiliary inference keeps its separate
+        attempt recovery owner; other unresolved work stays on the operator path.
         """
 
         from cayu.runtime.provider_operations import load_recoverable_provider_operation_start
@@ -568,7 +573,7 @@ class SessionRecovery:
         context = model_completion_recovery_context_from_stage(stage)
         if (
             stage.state != "in_flight"
-            or stage.purpose != "assistant-turn"
+            or stage.purpose not in {"assistant-turn", "context-compaction"}
             or stage.intent.get("provider_operation_start") is not None
             or context is None
             or context.task_id is not None
@@ -594,6 +599,25 @@ class SessionRecovery:
                 return ()
         except ProviderOperationEvidenceError:
             return ()
+        interruption_payload = None
+        if invocation_context is not None:
+            from cayu.runtime._interruption_coordinator import (
+                _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
+            )
+            from cayu.sessions._terminal_evidence import (
+                interruption_request_id_from_payload,
+                is_valid_interruption_type,
+            )
+
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            if checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint:
+                interruption_payload = await self._background_interruption_coordinator.load_pending_session_interrupt_payload(
+                    session.id, default={}
+                )
+                if not is_valid_interruption_type(
+                    interruption_payload.get("interruption_type")
+                ) or (interruption_request_id_from_payload(interruption_payload) is None):
+                    raise ValueError("Owned model recovery has an invalid pending interruption.")
         result = await self._manual_model_completion_recovery.recover_model_completion_stage(
             ModelCompletionManualRecoveryRequest(
                 session_id=session.id,
@@ -610,6 +634,8 @@ class SessionRecovery:
                 ),
             ),
             invocation_context=invocation_context,
+            interruption_reason=interruption_reason if invocation_context is not None else None,
+            interruption_payload=interruption_payload,
         )
         return result.budget_events
 
@@ -768,14 +794,21 @@ class SessionRecovery:
                 )
             retained_invocation_context = context
 
+        async def settle_abandoned_model(
+            session: Session, context: InvocationContext
+        ) -> tuple[Event, ...]:
+            return await self._settle_abandoned_model_dispatch_hook(
+                session,
+                context,
+                interruption_reason=request.reason,
+            )
+
         result = await self._incomplete_recovery.recover_incomplete_session(
             request,
             execution_to_wait=execution_to_wait,
             abandon_unknown_tool_effects=abandon_unknown_tool_effects,
             # A lost ordinary model call settles as unknown, as the abandoned sweep does.
-            recover_abandoned_model=(
-                self._settle_abandoned_model_dispatch_hook if recover_abandoned_models else None
-            ),
+            recover_abandoned_model=(settle_abandoned_model if recover_abandoned_models else None),
             before_mutation=before_mutation,
             participant_context=participant_context,
             retain_open_interaction_invocation=(interaction_id is not None),
@@ -807,10 +840,16 @@ class SessionRecovery:
         return await self._reap_shared_allocations(reconciled)
 
     async def _settle_abandoned_model_dispatch_hook(
-        self, session: Session, invocation_context: InvocationContext
+        self,
+        session: Session,
+        invocation_context: InvocationContext,
+        *,
+        interruption_reason: str | None = None,
     ) -> tuple[Event, ...]:
         return await self._settle_abandoned_model_dispatch(
-            session, invocation_context=invocation_context
+            session,
+            invocation_context=invocation_context,
+            interruption_reason=interruption_reason,
         )
 
     async def settle_released_open_interaction(self, session_id: str) -> Event | None:
@@ -1022,7 +1061,9 @@ class SessionRecovery:
             session: Session, invocation_context: InvocationContext
         ) -> tuple[Event, ...]:
             return await self._settle_abandoned_model_dispatch(
-                session, invocation_context=invocation_context
+                session,
+                invocation_context=invocation_context,
+                interruption_reason=request.reason,
             )
 
         recovery = self._incomplete_recovery.recover_incomplete_sessions(
@@ -1033,7 +1074,6 @@ class SessionRecovery:
             after_recovery=deactivate_interaction,
             reconcile_result=reconcile_result,
         )
-        del request
         return await recovery
 
     async def _latest_interaction_activity_at(

@@ -149,6 +149,23 @@ def completed_task_result(context: SessionOutcomeContext) -> dict[str, Any]:
     }
 
 
+def bind_owed_terminal_to_run_operation(
+    *,
+    checkpoint: dict[str, Any] | None,
+    terminal_event_id: str,
+    terminal_payload: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Retain the resumed run's exact terminal identity in its owed outcome."""
+
+    payload = dict(terminal_payload)
+    run_operation = _session_run_operation_from_checkpoint(checkpoint)
+    if run_operation is not None:
+        payload[SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = run_operation.operation_id
+        if run_operation.terminal_event_id is not None:
+            terminal_event_id = run_operation.terminal_event_id
+    return terminal_event_id, payload
+
+
 async def owed_decision_install(
     *,
     checkpoint: dict[str, Any] | None,
@@ -177,12 +194,11 @@ async def owed_decision_install(
         source_id=interaction_event.id,
         event_kind="session",
     )
-    run_operation = _session_run_operation_from_checkpoint(checkpoint)
-    if run_operation is not None:
-        # The terminal publication binds itself to the run operation the same way.
-        terminal_payload[SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = run_operation.operation_id
-        if run_operation.terminal_event_id is not None:
-            terminal_event_id = run_operation.terminal_event_id
+    terminal_event_id, terminal_payload = bind_owed_terminal_to_run_operation(
+        checkpoint=checkpoint,
+        terminal_event_id=terminal_event_id,
+        terminal_payload=terminal_payload,
+    )
     turn_completed_payload = owed.turn_completed_payload
     if turn_completed_payload is None:
         turn_completed_payload = session_finalization.publication_safe_event(

@@ -87,8 +87,18 @@ class SessionAbandonmentEntrances:
         answer was published or its background provider operation cancelled); its
         environment binding stays recorded.
 
-        A session with a live owner, an unfinished task, or activity within the
-        window is left alone, as is one without attested ownership and tasks. It
+        An attested lost execution qualifies immediately, without the inactivity
+        window, including registered environments and runs without attached tasks.
+        Native invocation admission still protects a later successor; recovery
+        does not mutate a task newly attached after selection. Unknown effects
+        remain unknown. A live owner, unfinished attached task or unattested
+        fresh run stays alone. Expired attached task owners are recovered by the
+        task worker's separate handoff recovery.
+        Missing terminal evidence of an already committed abandonment is finished
+        immediately. Interrupted sessions from the last seven days with a validated
+        pending interruption marker are also repaired without the window; native
+        admission still protects a live publisher. Fully published pauses are not
+        selected by this repair. It
         also finishes every completed, failed or paused turn whose process stopped
         before it published its terminal events or released its session, as
         :meth:`recover_abandoned_sessions` does. The server runs this on a schedule (``ServerLifecycleConfig``); call it yourself

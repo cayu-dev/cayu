@@ -1323,12 +1323,16 @@ class IncompleteSessionRecovery:
         self,
         *,
         inactive_for_seconds: int,
+        repair_without_inactivity: bool = False,
     ) -> list[IncompleteSessionRecoveryResult]:
         """Finish terminal sessions whose terminal decision is still unsettled.
 
         The sweep over running and interrupting sessions never sees them: their
         completed, failed or interrupted transition committed, but the process
         stopped before their task, terminal events or fence release caught up.
+        The worker sweep may discover fresh exact decisions too: native invocation
+        reservation protects live publishers before that committed work is repaired.
+        Stores without native execution retain the requested inactivity guard.
         """
 
         results: list[IncompleteSessionRecoveryResult] = []
@@ -1345,7 +1349,9 @@ class IncompleteSessionRecovery:
                     page = await list_owed(
                         SessionQuery(
                             status=status,
-                            inactive_for_seconds=inactive_for_seconds,
+                            inactive_for_seconds=None
+                            if repair_without_inactivity
+                            else inactive_for_seconds,
                             order_by=SessionOrder.CREATED_AT_ASC,
                             limit=1000,
                             cursor=cursor,
@@ -1365,10 +1371,23 @@ class IncompleteSessionRecovery:
                     if owed_decision_of_status(checkpoint, status) is None:
                         # An election that precedes its transition has its own owner.
                         continue
+                    candidate_request = request
+                    if repair_without_inactivity:
+                        owner = await self.execution_owner(session)
+                        if owner == "live":
+                            continue
+                        if owner == "lost" or self._session_store.supports_session_execution:
+                            # The exact committed decision above is positive
+                            # settlement evidence even when a terminal status
+                            # hides execution presence. Native reservation still
+                            # refuses a live publisher or recovery claim.
+                            candidate_request = request.model_copy(
+                                update={"inactive_for_seconds": 0}
+                            )
                     results.append(
                         await self._recover_incomplete_session_fault_isolated(
                             session=session,
-                            request=request,
+                            request=candidate_request,
                             before_recovery=None,
                             before_mutation=None,
                             after_recovery=None,
@@ -1923,6 +1942,7 @@ class IncompleteSessionRecovery:
                 checkpoint=checkpoint,
             )
             terminal_repair_required = terminal_repair
+            owed_terminal_decision = owed_decision_of_status(checkpoint, session.status)
             has_pending_work = (
                 execution_to_wait is not None
                 or pending_approval is not None
@@ -1940,33 +1960,28 @@ class IncompleteSessionRecovery:
                 session.status is SessionStatus.FAILED
                 and abandoned_session_from_checkpoint(checkpoint) is not None
             )
-            if (
-                not has_pending_work
-                and active_invocation_profile is not None
-                and (
-                    # An abandoned session was interrupted, which released its
-                    # profile, before it failed. Its binding still owns the
-                    # environment, so finalize it as for any failed run.
-                    abandoned
-                    or not active_invocation_execution_profile_is_released(
-                        active_invocation_profile,
-                        session_id=session.id,
-                        run_epoch=session.run_epoch,
-                    )
-                )
-            ):
+            if not has_pending_work and active_invocation_profile is not None:
+                # Invocation release does not dispose a saved environment.
+                # Inspect that exact binding even when an unavailable-environment
+                # repair released the run before its registration returned.
                 try:
                     registered_for_binding = self._resolve_registered_environment(
                         session.environment_name
                     )
                 except KeyError:
-                    if not abandoned:
+                    if (
+                        not abandoned
+                        and owed_terminal_decision is None
+                        and not active_invocation_execution_profile_is_released(
+                            active_invocation_profile,
+                            session_id=session.id,
+                            run_epoch=session.run_epoch,
+                        )
+                    ):
                         raise
-                    # Nothing runs an abandoned session again, so its terminal
-                    # evidence doesn't wait on an environment this application
-                    # doesn't register (an earlier release's, or another
-                    # process's per-run one). The binding stays recorded and is
-                    # finalized by recovery where the environment is registered.
+                    # Decided outcomes need no executable reconstruction. The
+                    # unavailable binding stays recorded; a later explicit
+                    # recovery with its registration can still finalize it.
                 else:
                     terminal_binding_finalization = (
                         await self._environment_lifecycle.prepare_terminal_binding_finalization(
@@ -1978,6 +1993,28 @@ class IncompleteSessionRecovery:
                 if terminal_binding_finalization is not None:
                     pending_completion_finalization = terminal_binding_finalization.marker()
                     has_pending_work = True
+            if (
+                owed_terminal_decision is not None
+                and pending_completion_finalization is None
+                and not unsettled_environment_lifecycle
+                and not pending_allocations
+            ):
+                # Only after saved cleanup ownership has been inspected may the
+                # decided outcome publish and release without reconstruction.
+                await admit_before_mutation()
+                if not terminal_repair and active_invocation_profile is not None:
+                    return await self._settle_terminal_invocation_closure_owned(
+                        session=session,
+                        inactive_for_seconds=inactive_for_seconds,
+                        previous_status=previous_status,
+                        execution_profile_snapshot=active_invocation_profile,
+                    )
+                return await self.terminal_finalization.repair_owned(
+                    session=session,
+                    inactive_for_seconds=inactive_for_seconds,
+                    previous_status=previous_status,
+                    required_run_epoch=session.run_epoch,
+                )
             if not terminal_repair and not has_pending_work:
                 if active_invocation_profile is not None and not (
                     active_invocation_execution_profile_is_released(
@@ -3814,6 +3851,38 @@ class IncompleteSessionRecovery:
             model_interrupted = session.status is SessionStatus.INTERRUPTED
             if model_interrupted:
                 actions.append(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED)
+                if registered_environment is not None:
+                    terminal_binding = (
+                        await self._environment_lifecycle.prepare_terminal_binding_finalization(
+                            session=session,
+                            execution_profile=invocation_context.profile,
+                            registered_environment=registered_environment,
+                        )
+                    )
+                    if terminal_binding is not None:
+                        await self._environment_lifecycle.checkpoint_terminal_binding_finalization(
+                            session=session,
+                            invocation_context=invocation_context,
+                            expected=terminal_binding,
+                        )
+                        finalized = await self._recover_pending_completion_finalization(
+                            session=session,
+                            session_before_fence=session_before_fence,
+                            previous_status=previous_status,
+                            claim_id=claim_id,
+                            marker=terminal_binding.marker(),
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            execution_profile=invocation_context.profile,
+                            invocation_context=invocation_context,
+                            retain_cleanup_context=retain_cleanup_context,
+                        )
+                        return finalized.model_copy(
+                            update={
+                                "actions": (*actions, *finalized.actions),
+                                "events": (*events, *finalized.events),
+                            }
+                        )
 
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES and (
             await self.terminal_finalization.repair_required(

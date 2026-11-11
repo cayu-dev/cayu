@@ -3549,6 +3549,7 @@ def test_repaired_failed_deferred_release_does_not_poison_next_invocation() -> N
         stranded = await store.load(session_id)
         assert stranded is not None
         assert stranded.run_epoch == first_profile.run_epoch
+        terminal_events = await store.load_events(session_id)
         recovered_page = await app.recover_incomplete_sessions(
             IncompleteSessionsRecoveryRequest(
                 statuses={SessionStatus.COMPLETED},
@@ -3559,6 +3560,9 @@ def test_repaired_failed_deferred_release_does_not_poison_next_invocation() -> N
         assert recovered_page.results[0].actions == (
             IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_OWNERSHIP,
         )
+        # The terminal evidence is already durable: repairing only its failed
+        # fence release must not duplicate those events.
+        assert await store.load_events(session_id) == terminal_events
         assert first_release_key not in lifecycle._deferred_run_fence_release_tasks
 
         resumed = await collect(

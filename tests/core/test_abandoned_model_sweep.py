@@ -91,7 +91,25 @@ def test_abandoned_model_sweep_settles_only_after_native_inactivity_check(
                 await ledger.load_reservation(rid) for rid in active.stage.reservation_ids
             ] == reservations
 
-            [result] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
+            from cayu.sessions._invocation_terminal_decision import (
+                invocation_terminal_decision_from_checkpoint,
+            )
+
+            committed_decisions = []
+            fan_out = app._event_writer.fan_out_persisted
+
+            async def observe_model_commit(events, *args, **kwargs):
+                if any(event.type is EventType.INTERACTION_INTERRUPTED for event in events):
+                    decision = invocation_terminal_decision_from_checkpoint(
+                        await store.load_checkpoint(sid)
+                    )
+                    assert decision is not None
+                    committed_decisions.append(decision)
+                return await fan_out(events, *args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(app._event_writer, "fan_out_persisted", observe_model_commit)
+                [result] = await app.recover_abandoned_sessions(inactive_for_seconds=0)
             assert result.previous_status is SessionStatus.RUNNING
             assert result.status is SessionStatus.INTERRUPTED
             assert IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED in result.actions
@@ -113,7 +131,15 @@ def test_abandoned_model_sweep_settles_only_after_native_inactivity_check(
                 for event in await store.load_events(sid)
                 if event.type == EventType.SESSION_INTERRUPTED
             ]
-            assert interrupted.payload["terminal_evidence_repaired"] is True
+            checkpoint = await store.load_checkpoint(sid)
+            assert committed_decisions
+            assert all(decision == committed_decisions[0] for decision in committed_decisions)
+            decision = committed_decisions[0]
+            assert invocation_terminal_decision_from_checkpoint(checkpoint) is None
+            assert decision.terminal_event_id == interrupted.id
+            assert decision.terminal_payload == interrupted.payload
+            assert interrupted.payload["recovered"] is True
+            assert interrupted.payload["reason"] == "abandoned_session_recovered"
             [public_interruption] = [
                 event for event in result.events if event.type == EventType.SESSION_INTERRUPTED
             ]

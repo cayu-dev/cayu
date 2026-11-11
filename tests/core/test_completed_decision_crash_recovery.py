@@ -97,7 +97,9 @@ def test_recovery_finishes_a_completion_cut_short_by_a_crash(
 
 
 def test_task_worker_finishes_a_completion_without_the_sweep(backend: str, monkeypatch) -> None:
-    async def no_sweep(self, *, inactive_for_seconds: int) -> list:
+    async def no_sweep(
+        self, *, inactive_for_seconds: int, repair_without_inactivity: bool = False
+    ) -> list:
         return []
 
     # Only the next worker's expired-owner scan can find the completed session.

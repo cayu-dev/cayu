@@ -545,6 +545,10 @@ def test_server_startup_retries_sessions_skipped_for_live_lease_after_expiry(mon
             lifecycle=ServerLifecycleConfig(
                 startup_recovery_statuses={SessionStatus.RUNNING},
                 recovery_inactive_after_seconds=0,
+                # This test isolates the planner's lease-expiry retry. The
+                # independent orphan loop may legitimately claim the lost run
+                # first and become a new active owner of the retried plan.
+                orphaned_session_reconcile_interval_seconds=None,
             )
         ),
     )

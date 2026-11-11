@@ -105,11 +105,11 @@ def test_a_worker_reconciles_what_a_lost_worker_left_running(project: Path) -> N
     assert (project / "done.txt").is_file()
 
 
-def test_a_worker_reconciles_by_default_after_the_inactivity_window(project: Path) -> None:
-    # The session's activity is too recent for the default hour.
+def test_a_worker_reconciles_a_fresh_orphan_by_default(project: Path) -> None:
+    # The unavailable environment and lost owner qualify without the default hour.
     assert main(["worker", "once", "--processes", "1"]) == 0
 
-    assert _status(project)[0] is SessionStatus.RUNNING
+    assert _status(project)[0] is SessionStatus.FAILED
 
 
 @pytest.mark.parametrize(

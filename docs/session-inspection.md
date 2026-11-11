@@ -1051,11 +1051,24 @@ closed session; interrupt that child and the next sweep, or a repeated close,
 closes the rest.
 
 You often don't have to close such a session yourself. `cayu serve` and `cayu
-worker` reconcile, when they start and every 10 minutes after, each running session
+worker` reconcile, when they start and every minute after a pass, each running session
 whose owner is provably gone and that has been quiet for an hour
 (`CayuApp.reconcile_orphaned_sessions`): it is left interrupted, with a recovery item
 in the inbox when a call it was running has an unknown outcome, or, where its
 environment isn't registered, it fails with reason `orphaned_session_reconciled`.
+Every attested lost execution skips the hour, including registered environments
+and sessions without an attached task. Native invocation admission protects
+successor runs; unfinished attached tasks remain with the task worker's separate
+expired-handoff recovery. Unknown effects and unavailable environment bindings
+remain recorded. Lease expiry never proves an external call stopped. The next
+startup also repairs these runs after a shutdown timeout or SIGKILL. Retained human
+gates and foreground-child obligations with unavailable environments remain with
+their existing recovery owner. Unknown external effects still require manual recovery. Governed tasks
+with unknown model dispatches retain their explicit recovery contract and fence.
+Missing terminal evidence for a committed abandonment is retried
+immediately. Within the existing seven-day finisher lookback, committed
+interruptions with a validated pending interruption marker are also repaired
+without waiting for inactivity; this does not select fully published pauses.
 `ServerLifecycleConfig` sets both times for the server
 (`orphaned_session_reconcile_interval_seconds`, `None` to turn it off, and
 `orphaned_session_inactive_after_seconds`), and `cayu worker`'s flags of the same

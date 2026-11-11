@@ -54,6 +54,7 @@ from cayu.sessions._terminal_evidence import (
     _SessionRunOperation,
     classify_current_terminal_evidence,
     interruption_request_id_from_payload,
+    is_valid_interruption_type,
     require_interruption_event_matches_pending_marker,
 )
 from cayu.sessions.event_queries import EventOrder, EventQuery
@@ -146,6 +147,8 @@ class TerminalEvidenceReader:
             if type(marker) is not dict:
                 raise ValueError("Pending session interrupt checkpoint must be an object.")
             pending_interrupt_payload = copy_json_value(marker, "pending_session_interrupt")
+            if not is_valid_interruption_type(pending_interrupt_payload.get("interruption_type")):
+                raise ValueError("Pending session interruption type is invalid.")
             provider_interrupt_payload = _provider_cancellation_interrupt_payload(checkpoint)
             if provider_interrupt_payload is not None:
                 pending_interrupt_payload = provider_interrupt_payload

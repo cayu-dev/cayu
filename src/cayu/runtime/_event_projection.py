@@ -63,6 +63,7 @@ from cayu.sessions._correlation import (
 from cayu.sessions._terminal_evidence import (
     INTERRUPTION_ORIGIN_BACKGROUND_CASCADE,
     INTERRUPTION_ORIGIN_PAYLOAD_KEY,
+    is_valid_interruption_type,
 )
 from cayu.tools import _argument_publication as tool_argument_publication
 from cayu.tools import _terminal_controls as tool_terminal_controls
@@ -160,18 +161,6 @@ _INTERACTION_TERMINAL_EVENT_TYPE_VALUES = frozenset(
         EventType.INTERACTION_COMPLETED,
         EventType.INTERACTION_FAILED,
         EventType.INTERACTION_INTERRUPTED,
-    }
-)
-_INTERRUPTION_TYPES = frozenset(
-    {
-        "limit_reached",
-        "operator_requested",
-        "provider_operation_unavailable",
-        "runtime_interrupted",
-        "tool_approval_required",
-        "user_input_required",
-        "waiting_on_child_action",
-        "wake_scheduled",
     }
 )
 _POLICY_DENIAL_DECISIONS = {
@@ -3085,7 +3074,7 @@ def _recognized_controls(
         interruption_type = event.payload.get("interruption_type")
         if interruption_type is None:
             return {}
-        if type(interruption_type) is str and interruption_type in _INTERRUPTION_TYPES:
+        if is_valid_interruption_type(interruption_type):
             return {"interruption_type": interruption_type}
         if reject_malformed:
             raise ValueError("Invalid session interruption_type control.")

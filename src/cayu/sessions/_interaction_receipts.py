@@ -149,12 +149,16 @@ class _InteractionTransitionReceipt(BaseModel):
         elif self.schema_version == 5:
             if (
                 self.checkpoint_mutation is None
-                or self.recovery_claim_id is not None
                 or (not carries_invocation_authority or self.invocation_authority_state != "active")
                 or self.terminal_event is not None
                 or self.terminal_decision is not None
             ):
                 raise ValueError("Interaction-transition receipt version conflicts with mutation.")
+            # A claimed recovery may atomically install its owed outcome with
+            # model settlement. The receipt retains both authorities, and replay
+            # validates the exact recovery claim as well as the active profile.
+            if self.recovery_claim_id is not None:
+                require_clean_nonblank(self.recovery_claim_id, "recovery_claim_id")
         else:
             if (self.terminal_event is None) != (self.terminal_decision is None):
                 raise ValueError("Terminal interaction receipt authority is incomplete.")

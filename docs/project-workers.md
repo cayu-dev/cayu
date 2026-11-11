@@ -236,12 +236,26 @@ entrypoint doesn't pass `restart_abandoned` and `max_abandoned_restarts` itself.
 A worker that is stopped or killed while a handler runs sessions leaves those
 sessions `running`, with nothing to continue them. `cayu worker` ends them as
 `cayu serve` does (`CayuApp.reconcile_orphaned_sessions`): when it starts and every
-10 minutes after, each `running` session whose owner is provably gone (its execution
-lease lapsed or its process died, and every task of it is finished) and that has been
-quiet for an hour is left interrupted, or fails with reason
-`orphaned_session_reconciled` where its environment isn't registered in this
-process. A session with a live owner, an unfinished task or recent activity is left
-alone. The worker does this too because a deployed web process may sleep while the
+minute after a pass, a lost execution whose environment is unregistered can fail
+with reason `orphaned_session_reconciled` immediately. Its attached tasks must be
+terminal, and the runtime preserves unknown external effects and the recorded
+environment binding. This also repairs runs left by the worker's shutdown timeout
+or SIGKILL on the next startup; it does not mark work stopped before process exit.
+Every attested lost execution skips the hour, including a registered environment,
+a session with no attached task, and a handler whose task was requeued. Native
+invocation admission protects successor runs; inherited task IDs do not authorize
+mutating that task's current attempt. Recovery does not make every session safe for
+a deploy: a settled model call can expose a resumable boundary, while a tool call
+with an unknown external outcome retains a manual-recovery item and can still hold
+Cloud's publication. Live owners and unattested fresh runs are left alone.
+Unfinished attached tasks stay with the task worker's expired-handoff recovery.
+Unavailable environments with retained human gates or foreground-child obligations
+still need their existing recovery owner; this sweep does not consume that work.
+Verifier-governed work with
+an unknown model dispatch retains its existing explicit recovery requirement and
+its task/run fence; generic recovery does not bypass the verifier.
+A large population can make a pass take
+longer than a minute; queries are paged in groups of at most 1000 sessions. The worker does this too because a deployed web process may sleep while the
 worker runs, as a Cayu Cloud Agent's does. Only the first of several processes
 reconciles (`CAYU_WORKER_INDEX` `0`), and a run until idle finishes the pass it
 started before it exits. Change the times with

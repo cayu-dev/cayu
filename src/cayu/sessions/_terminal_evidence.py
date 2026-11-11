@@ -29,6 +29,18 @@ _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
+_INTERRUPTION_TYPES = frozenset(
+    {
+        _INTERRUPTION_TYPE_LIMIT_REACHED,
+        _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+        "provider_operation_unavailable",
+        _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+        _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+        _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+        "waiting_on_child_action",
+        "wake_scheduled",
+    }
+)
 INTERRUPTION_ORIGIN_PAYLOAD_KEY = "interruption_origin"
 INTERRUPTION_ORIGIN_BACKGROUND_CASCADE = "background_cascade"
 
@@ -65,6 +77,12 @@ class CurrentTerminalEvidence:
     events: tuple[Event, ...]
     latest_lifecycle_event_type: EventType | str | None
     run_operation_conflict: bool = False
+
+
+def is_valid_interruption_type(value: object) -> bool:
+    """Recognize the normalized classification shared by events and retained markers."""
+
+    return type(value) is str and value in _INTERRUPTION_TYPES
 
 
 def interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None:

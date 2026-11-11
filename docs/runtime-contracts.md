@@ -1906,18 +1906,73 @@ with reason `orphaned_session_reconciled` and action `abandoned_orphaned_run` (o
 `abandoned_tool_effect` when it lists unknown tool calls). A run that stopped inside
 model work (an assistant turn, a context compaction, an auxiliary call, a background
 provider operation, or an answer recorded but not published) ends the same way, with
-that work settled as a close without the environment settles it (below). A session with a live owner, an
-unfinished task, activity within the window, or no attested owner and no tasks is
-left alone and not reported; one session's failure is reported with a `failed` action
+that work settled as a close without the environment settles it (below).
+
+Every attested lost execution is eligible without waiting for the inactivity
+window, regardless of environment registration or task attribution. The
+abandonment owner still atomically freezes its terminal attached task set and
+preserves unknown effects and the environment binding. Lease expiry fences old
+runtime writes; it does not prove an external call stopped and never authorizes
+replay. Native session invocation admission protects a later successor run, and
+recovery leaves newly attached tasks to their own lifecycle. An inherited task ID
+is attribution, not proof that that task's current attempt belongs to the old run.
+A live owner or unattested fresh run is left alone. An unfinished attached task
+remains with the task worker's separate expired-handoff recovery. One session's
+failure is reported with a `failed` action
 and never stops the sweep. The sweep also finishes an abandonment that failed a
 session but stopped before publishing `session.failed` or settling the run's
-interaction (a process that died in between), for sessions that ended up to seven
-days before the window. `run_orphaned_session_reconciliation(app, stop,
-interval_seconds=600, inactive_for_seconds=3600)` from `cayu.runtime.orphaned_sessions`
+interaction (a process that died in between), immediately for abandonments from
+the last seven days. Model settlement commits its exact terminal decision together
+with the model stage and interaction outcome. Other interrupted recovery paths
+retain their pending interruption marker. Native committed decisions and validated
+interruption markers are repaired without inactivity grace; native admission still
+protects live terminal publishers. Exact decided outcomes finish through terminal
+repair without reconstructing executable work, including after a runtime upgrade
+or loss of the environment registration. A saved registered environment binding or
+pending finalization retains its existing cleanup owner before the invocation is
+released. An unavailable binding stays recorded; explicit session recovery can
+finalize it when its original environment is registered again, even after terminal
+evidence was repaired. Fully published approval/input pauses are not selected by
+this repair. Stores without native execution keep the requested
+inactivity guard for committed-decision recovery.
+
+Ordinary recovery runs in the exact selected invocation's takeover scope. Settlement
+of a lost assistant-turn or context-compaction model dispatch without a terminal response records its provider outcome
+as unknown and retains the original stage/profile identity. When no interruption
+request was recorded, the repaired session interruption uses the sweep reason
+`orphaned_session_reconciled`. An existing interruption request instead retains its
+original reason, type, metadata and request ID. A change only to the runtime build may finalize that
+lost invocation under its admitted, retained profile without redispatch or a
+profile-rejection event. For registered-environment recovery this takeover exception
+does not waive mismatches in other profile components; normal validation and
+rejection evidence still apply. Auxiliary inference retains its existing dedicated
+settlement owner. It permits
+terminalization, not continuation or replay under an incompatible application profile.
+
+The interrupted status alone does not establish a deploy-safe boundary. A settled
+model call with no pending action exposes `resume`; an unknown external tool effect
+retains `continuation` and a `manual_recovery` action. Cloud can therefore still hold
+the latter for a person's decision. Positive native owner loss removes the
+inactivity delay for registered conversations too. An inherited task ID does not
+authorize changing that task's current attempt.
+
+Retained human gates and foreground-child obligations with unavailable environments
+remain subject to their existing recovery owner. This generic sweep does not
+consume their accepted work or bypass the task worker's attached-task guards.
+
+Verifier-governed work keeps its existing recovery contract. An unknown dispatched
+model call can retain the governed task and run fence for explicit operator
+recovery; generic recovery does not bypass verifier decisions or declare that work
+safe for replacement. Inspection reports lost ownership and the unresolved dispatch,
+and Cloud intentionally continues to protect that uncertain work.
+
+Candidate scans use keyset pages of at most 1000 sessions; total work scales with the running/interrupting
+population and recent interrupted records and can exceed the interval. `run_orphaned_session_reconciliation(app, stop,
+interval_seconds=60, inactive_for_seconds=3600)` from `cayu.runtime.orphaned_sessions`
 runs it at once and then every interval until `stop` is set; a failed pass is logged
 and retried. The server built by `create_server` (`cayu serve`) runs that loop from
 startup with `ServerLifecycleConfig.orphaned_session_reconcile_interval_seconds`
-(default 600; `None` turns it off) and `orphaned_session_inactive_after_seconds`
+(default 60; `None` turns it off) and `orphaned_session_inactive_after_seconds`
 (default 3600), and `cayu worker` runs it in its first process with the flags of the
 same names (`--orphaned-session-reconcile-interval-seconds off` turns it off), since a
 deployed web process may sleep while the worker runs. An application that mounts Cayu

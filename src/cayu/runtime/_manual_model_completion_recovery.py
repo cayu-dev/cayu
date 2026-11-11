@@ -9,9 +9,19 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 
-from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+    require_clean_nonblank,
+)
 from cayu.budgets.base import BudgetPolicy
-from cayu.events import Event, EventType, event_with_runtime_envelope_authority
+from cayu.events import (
+    Event,
+    EventType,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_payload_authority,
+    runtime_payload_authority_paths,
+)
 from cayu.execution_units import ModelAttemptIdentity
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_execution_profile
@@ -28,6 +38,7 @@ from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
 )
+from cayu.runtime._outcome_decision_settlement import bind_owed_terminal_to_run_operation
 from cayu.runtime._recovery_claims import _IncompleteRecoveryClaim
 from cayu.runtime._recovery_ownership import RecoveryOwnership
 from cayu.runtime._run_limits import RunLimitController
@@ -44,6 +55,7 @@ from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
+    build_owed_invocation_terminal_decision,
     checkpoint_with_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_event_id,
@@ -63,6 +75,14 @@ from cayu.sessions._model_stage import (
 from cayu.sessions._model_stage_rules import (
     model_completion_stage_settlement_request,
     require_terminalization_plan_owner,
+)
+from cayu.sessions._paired_writes import (
+    owed_decision_from_install_mutation,
+    owed_decision_install_mutation,
+)
+from cayu.sessions._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    _session_run_operation_from_checkpoint,
 )
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.records import Session, SessionStatus, SessionStatusConflict
@@ -115,18 +135,33 @@ class ManualModelCompletionRecovery:
         request: ModelCompletionManualRecoveryRequest,
         *,
         invocation_context: InvocationContext | None = None,
+        interruption_reason: str | None = None,
+        interruption_payload: dict[str, Any] | None = None,
     ) -> ModelCompletionManualRecoveryResult:
         """Conservatively settle one ambiguous model dispatch before clearing it."""
 
         request = copy_model_completion_manual_recovery_request(request)
         if invocation_context is not None and type(invocation_context) is not InvocationContext:
             raise TypeError("Model recovery requires an authenticated InvocationContext.")
+        if interruption_reason is not None:
+            if invocation_context is None:
+                raise ValueError("Owned model recovery reason requires an invocation context.")
+            interruption_reason = require_clean_nonblank(interruption_reason, "interruption_reason")
+        if interruption_payload is not None:
+            if invocation_context is None:
+                raise ValueError("Owned interruption payload requires an invocation context.")
+            interruption_payload = copy_durable_json_object(
+                interruption_payload, "interruption_payload"
+            )
         if request.terminalization_only:
             if invocation_context is not None:
                 raise ValueError("Terminalization-only recovery cannot borrow an invocation.")
             return await self._terminalize_dispatched_model(request)
         return await self._recover_model_completion_stage(
-            request, invocation_context=invocation_context
+            request,
+            invocation_context=invocation_context,
+            interruption_reason=interruption_reason,
+            interruption_payload=interruption_payload,
         )
 
     async def _recover_model_completion_stage(
@@ -134,6 +169,8 @@ class ManualModelCompletionRecovery:
         request: ModelCompletionManualRecoveryRequest,
         *,
         invocation_context: InvocationContext | None = None,
+        interruption_reason: str | None = None,
+        interruption_payload: dict[str, Any] | None = None,
         terminalization: tuple[_IncompleteRecoveryClaim, InvocationTerminalDecision, Event]
         | None = None,
     ) -> ModelCompletionManualRecoveryResult:
@@ -251,6 +288,20 @@ class ManualModelCompletionRecovery:
                 raise SessionModelCompletionStageConflict(
                     "Model terminalization lost exact stage/profile authority."
                 )
+        elif invocation_context is not None:
+            # The recovery owner admitted this exact frozen profile before claiming
+            # the invocation. Revalidating current registrations here would undo its
+            # runtime-only takeover decision. This internal capability is never
+            # reconstructed from the public request or from matching stored values.
+            invocation_context._validate()
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                active_profile is None
+                or active_profile.interaction_id != interaction_id
+                or active_profile.profile.fingerprint
+                != recovery_context.execution_profile_fingerprint
+            ):
+                raise SessionRunFenced("Claimed model recovery lost its exact stage/profile.")
         else:
             try:
                 registered_agent = self._get_registered_agent(session.agent_name)
@@ -320,7 +371,144 @@ class ManualModelCompletionRecovery:
             if invocation_context is None
             else invocation_context.recovery_claim_id
         )
+        recovery_event_id = (
+            "evt_model_completion_manual_"
+            + hashlib.sha256(
+                canonical_durable_json_bytes(
+                    request.model_dump(mode="json"), "model_completion_manual_recovery"
+                )
+            ).hexdigest()
+        )
+        owned_terminal_event_id = None
+        owned_terminal_payload = None
+        owned_payload_authority: tuple[str, ...] = ()
+        owned_nested_payload_authority: tuple[tuple[str, ...], ...] = ()
+        if invocation_context is not None:
+            # Freeze the same publication-safe payload that the claimed recovery
+            # would otherwise publish later. Raw/public manual recovery cannot
+            # install this owner-specific terminal obligation.
+            terminal_event = Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session.id,
+                agent_name=session.agent_name,
+                environment_name=session.environment_name,
+                payload=interruption_payload
+                if interruption_payload is not None
+                else {
+                    "interruption_type": "runtime_interrupted",
+                    "reason": interruption_reason or "operator_model_outcome_unknown",
+                    "recovered": True,
+                },
+            )
+            if interruption_payload is not None:
+                terminal_event = event_with_runtime_payload_authority(
+                    terminal_event, "interruption_request_id"
+                )
+            prepared_terminal = self._event_writer.prepare(terminal_event)
+            owned_terminal_payload = prepared_terminal.payload
+            owned_payload_authority, owned_nested_payload_authority = (
+                runtime_payload_authority_paths(prepared_terminal)
+            )
+            owned_terminal_event_id = invocation_terminal_event_id(
+                outcome=InvocationTerminalOutcome(request.terminal_status.value),
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+                interaction_id=interaction_id,
+                source_id=recovery_event_id,
+                event_kind="session",
+            )
+            if prior is not None and _session_run_operation_from_checkpoint(checkpoint) is None:
+                # Terminal publication transfers/clears the live run marker.
+                # Restore only its binding from the native immutable transition,
+                # authenticated to this exact request, incarnation and profile.
+                retained = (
+                    await self.session_store._load_interaction_transition_receipt_by_event_id(
+                        session.id,
+                        event_id=recovery_event_id,
+                        expected_session_instance_id=session.instance_id,
+                        expected_active_invocation_profile=active_profile,
+                    )
+                )
+                if retained is None:
+                    raise SessionRunFenced("Claimed model recovery lost its settlement receipt.")
+                retained_mutation = retained.transition.checkpoint_mutation
+                if retained_mutation is None:
+                    raise SessionRunFenced("Claimed model recovery lacks its owed settlement.")
+                original = owed_decision_from_install_mutation(
+                    retained_mutation,
+                    event=retained.transition.event,
+                    to_status=retained.transition.to_status,
+                )
+                operation_id = original.terminal_payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+                if operation_id is not None:
+                    owned_terminal_payload[SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation_id
+                    owned_terminal_event_id = original.terminal_event_id
+            owned_terminal_event_id, owned_terminal_payload = bind_owed_terminal_to_run_operation(
+                checkpoint=checkpoint,
+                terminal_event_id=owned_terminal_event_id,
+                terminal_payload=owned_terminal_payload,
+            )
+
+        async def require_owned_outcome(
+            current_checkpoint: dict[str, Any] | None,
+            transition: InteractionTransitionSpec | None = None,
+        ) -> None:
+            if owned_terminal_payload is None:
+                return
+            owed = invocation_terminal_decision_from_checkpoint(current_checkpoint) or (
+                settled_invocation_terminal_decision_from_checkpoint(current_checkpoint)
+            )
+            expected_event_id = recovery_event_id
+            if (
+                owed is None
+                or owed.session_id != session.id
+                or owed.session_instance_id != session.instance_id
+                or owed.run_epoch != request.expected_run_epoch
+                or owed.profile_interaction_id != active_profile.interaction_id
+                or owed.execution_profile_fingerprint != active_profile.profile.fingerprint
+                or owed.interaction_id != interaction_id
+                or owed.interaction_event_id != expected_event_id
+                or owed.outcome.value != request.terminal_status.value
+                or owed.terminal_event_id != owned_terminal_event_id
+                or owed.terminal_payload != owned_terminal_payload
+                or (owed.terminal_payload_authority or ()) != owned_payload_authority
+                or (owed.terminal_nested_payload_authority or ()) != owned_nested_payload_authority
+                or owed.turn_completed_payload
+                != {
+                    "status": request.terminal_status.value,
+                    "interaction_ids": [interaction_id],
+                }
+                or owed.task_id is not None
+            ):
+                raise SessionModelCompletionStageConflict(
+                    "Claimed model recovery conflicts with its durable terminal obligation."
+                )
+            if transition is None:
+                # Reconstruct only from the existing immutable receipt owner;
+                # current checkpoint equality cannot authenticate an old claim.
+                retained = (
+                    await self.session_store._load_interaction_transition_receipt_by_event_id(
+                        session.id,
+                        event_id=expected_event_id,
+                        expected_session_instance_id=session.instance_id,
+                        expected_active_invocation_profile=active_profile,
+                    )
+                )
+                if retained is None:
+                    raise SessionRunFenced("Claimed model recovery lost its settlement receipt.")
+                transition = retained.transition
+            receipt = await self.session_store.load_interaction_transition_receipt(
+                session.id,
+                transition=transition,
+                expected_recovery_claim_id=recovery_claim_id,
+            )
+            if receipt is None:
+                raise SessionRunFenced("Claimed model recovery lost its exact settlement receipt.")
+
         if prior is not None:
+            validate_replay(prior)
+            await require_owned_outcome(checkpoint)
             budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
                 session_id=request.session_id
             )
@@ -429,13 +617,7 @@ class ManualModelCompletionRecovery:
 
         recovery_event = event_with_runtime_envelope_authority(
             Event(
-                id="evt_model_completion_manual_"
-                + hashlib.sha256(
-                    canonical_durable_json_bytes(
-                        request.model_dump(mode="json"),
-                        "model_completion_manual_recovery",
-                    )
-                ).hexdigest(),
+                id=recovery_event_id,
                 type=(
                     EventType.INTERACTION_FAILED
                     if request.terminal_status is SessionStatus.FAILED
@@ -458,6 +640,41 @@ class ManualModelCompletionRecovery:
                 }
             )
         recovery_event = self._event_writer.prepare(recovery_event)
+        checkpoint_mutation = None
+        if owned_terminal_payload is not None:
+            assert owned_terminal_event_id is not None
+            outcome = InvocationTerminalOutcome(request.terminal_status.value)
+            owed = build_owed_invocation_terminal_decision(
+                outcome=outcome,
+                session_id=current.id,
+                session_instance_id=current.instance_id,
+                run_epoch=current.run_epoch,
+                profile_interaction_id=active_profile.interaction_id,
+                interaction_id=interaction_id,
+                execution_profile_fingerprint=active_profile.profile.fingerprint,
+                interaction_event_id=recovery_event.id,
+                terminal_event_id=owned_terminal_event_id,
+                observed_at=recovery_event.timestamp,
+                terminal_payload=owned_terminal_payload,
+                terminal_payload_authority=owned_payload_authority or None,
+                terminal_nested_payload_authority=owned_nested_payload_authority or None,
+                # Recovery knows the outcome, not the lost turn's duration or
+                # counters. Do not fabricate usage for its recovered summary.
+                turn_completed_payload={
+                    "status": request.terminal_status.value,
+                    "interaction_ids": [interaction_id],
+                },
+            )
+            checkpoint_mutation = owed_decision_install_mutation(owed)
+        transition_spec = InteractionTransitionSpec(
+            event=recovery_event,
+            from_statuses=(current.status,),
+            to_status=request.terminal_status,
+            model_completion_stage_settlement=expected_settlement,
+            checkpoint_mutation=checkpoint_mutation,
+            terminal_event=None if terminalization is None else terminalization[2],
+            terminal_decision=None if terminalization is None else terminalization[1],
+        )
         try:
             transition_result = await self.session_store.apply_invocation_lifecycle_command(
                 SettleInvocationCommand(
@@ -470,14 +687,7 @@ class ManualModelCompletionRecovery:
                     terminalization_plan_ownership=terminalization_plan_owner()
                     if terminalization is not None
                     else None,
-                    transition=InteractionTransitionSpec(
-                        event=recovery_event,
-                        from_statuses=(current.status,),
-                        to_status=request.terminal_status,
-                        model_completion_stage_settlement=expected_settlement,
-                        terminal_event=None if terminalization is None else terminalization[2],
-                        terminal_decision=None if terminalization is None else terminalization[1],
-                    ),
+                    transition=transition_spec,
                 )
             )
             if type(transition_result) is not InteractionTransitionResult:
@@ -491,6 +701,9 @@ class ManualModelCompletionRecovery:
             if reconciled is None:
                 raise
             validate_replay(reconciled)
+            await require_owned_outcome(
+                await self.session_store.load_checkpoint(request.session_id)
+            )
             transitioned = await self.session_store.load(request.session_id)
             if transitioned is None:
                 raise KeyError(f"Session not found: {request.session_id}") from None
