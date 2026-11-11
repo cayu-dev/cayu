@@ -446,6 +446,34 @@ def test_static_policy_supports_empty_and_canonical_ordered_profiles() -> None:
     )
 
 
+@pytest.mark.parametrize("ceiling", [(), ("first",), ("second",), ("first", "second")])
+def test_static_policy_narrows_without_mutating_its_allow_list(ceiling) -> None:
+    policy = StaticToolExposurePolicy(profile_id="selected", tools=("first",))
+    identity = policy.execution_profile_identity
+    request = _request(_capability("first"), _capability("second"), ceiling=ceiling)
+
+    exposure = resolve_tool_exposure(policy, request)
+
+    assert exposure.tool_names == tuple(name for name in ceiling if name == "first")
+    assert exposure.profile_id == "selected"
+    assert exposure.registered_count == 2
+    assert exposure.ceiling_count == len(ceiling)
+    assert policy.tools == ("first",)
+    assert policy.execution_profile_identity == identity
+    assert resolve_tool_exposure(
+        policy, _request(_capability("first"), _capability("second"))
+    ).tool_names == ("first",)
+
+
+@pytest.mark.parametrize("ceiling", [(), ("first",)])
+def test_static_policy_rejects_unknown_configuration_even_outside_ceiling(ceiling) -> None:
+    with pytest.raises(ValueError, match="unregistered tool"):
+        resolve_tool_exposure(
+            StaticToolExposurePolicy(profile_id="invalid", tools=("first", "unknown")),
+            _request(_capability("first"), ceiling=ceiling),
+        )
+
+
 def test_resolved_exposure_fingerprint_binds_profile_and_definitions() -> None:
     original_request = _request(_capability("remember", description="Save a fact."))
     changed_request = _request(_capability("remember", description="Save one fact."))

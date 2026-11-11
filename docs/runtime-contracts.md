@@ -3985,7 +3985,11 @@ summaries are derived once at agent registration and reused by execution-profile
 resolution rather than rehashed on every admission check.
 `AllRegisteredToolsExposurePolicy` exposes the registered tools inside the
 effective ceiling. `StaticToolExposurePolicy` defines one stable named
-allow-list and supports an empty tool-free profile.
+allow-list and exposes its intersection with the effective ceiling. An empty
+ceiling makes any valid static profile tool-free without changing its configured
+allow-list or profile ID. Configured names must still be registered, even when
+the ceiling excludes them. Custom policy decisions outside the ceiling remain
+invalid.
 `ToolExposureDecision` is deliberately distinct from `ToolExposure`, the
 content-minimized public evidence record for definitions frozen into one
 prepared logical model step. Schema-v2 `tool.exposure.recorded` carries the

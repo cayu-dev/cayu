@@ -479,7 +479,8 @@ async def _reopen_failed_session_for_recovery(
     await runtime_checkpoint_session_store(store).apply_invocation_lifecycle_command(command)
 
 
-def test_static_exposure_drives_counting_and_provider_request_in_registered_order() -> None:
+@pytest.mark.parametrize("ceiling", [None, (), ("beta",), ("alpha", "beta")])
+def test_static_exposure_drives_counting_and_provider_request_in_registered_order(ceiling) -> None:
     provider = _ScriptedProvider(
         [
             [
@@ -505,18 +506,25 @@ def test_static_exposure_drives_counting_and_provider_request_in_registered_orde
         ),
     )
 
-    events = _run(app, "static-exposure")
+    events = _run(
+        app,
+        "static-exposure",
+        tool_capability_ceiling=None
+        if ceiling is None
+        else ToolCapabilityCeiling(tool_names=ceiling),
+    )
+    expected = [name for name in ("alpha", "gamma") if ceiling is None or name in ceiling]
 
     assert events[-1].type is EventType.SESSION_COMPLETED
-    assert [_tool_names(request) for request in provider.requests] == [["alpha", "gamma"]]
-    assert [_tool_names(request) for request in provider.count_requests] == [["alpha", "gamma"]]
+    assert [_tool_names(request) for request in provider.requests] == [expected]
+    assert [_tool_names(request) for request in provider.count_requests] == [expected]
     assert provider.requests[0].tools == provider.count_requests[0].tools
     [exposure_event] = [event for event in events if event.type is EventType.TOOL_EXPOSURE_RECORDED]
     exposure = ToolExposure.model_validate(exposure_event.payload)
     assert exposure.profile_id == "selected"
     assert exposure.registered_count == 3
-    assert exposure.ceiling_count == 3
-    assert exposure.exposed_count == 2
+    assert exposure.ceiling_count == (3 if ceiling is None else len(ceiling))
+    assert exposure.exposed_count == len(expected)
     assert exposure.profile_changed is False
     [footprint] = [event for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED]
     assert footprint.payload["schema_version"] == 3
@@ -529,6 +537,29 @@ def test_static_exposure_drives_counting_and_provider_request_in_registered_orde
         "profile_changed": exposure.profile_changed,
     }
     assert footprint.payload["fingerprints"]["tool_manifest"]["availability"] == "unavailable"
+
+
+def test_static_unknown_tool_is_not_hidden_by_an_empty_run_ceiling() -> None:
+    provider = _ScriptedProvider([])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[_RecordingTool("alpha")],
+        tool_exposure_policy=StaticToolExposurePolicy(
+            profile_id="invalid", tools=("alpha", "unknown")
+        ),
+    )
+
+    events = _run(
+        app, "static-unknown", tool_capability_ceiling=ToolCapabilityCeiling(tool_names=())
+    )
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "Tool exposure selected an unregistered tool."
+    assert not provider.requests
+    assert not provider.count_requests
+    assert not any(event.type is EventType.TOOL_EXPOSURE_RECORDED for event in events)
 
 
 def test_default_exposure_preserves_all_tools_and_unbounded_run_metadata() -> None:

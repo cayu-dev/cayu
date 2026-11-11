@@ -1031,7 +1031,7 @@ class AllRegisteredToolsExposurePolicy(ToolExposurePolicy):
 
 
 class StaticToolExposurePolicy(ToolExposurePolicy):
-    """Expose one deterministic named allow-list, including an empty list."""
+    """Expose a named allow-list narrowed by the request's capability ceiling."""
 
     def __init__(self, *, profile_id: str, tools: Iterable[str]) -> None:
         tool_names = cast(
@@ -1060,7 +1060,15 @@ class StaticToolExposurePolicy(ToolExposurePolicy):
         return {"profile_id": self.profile_id, "tools": list(self.tools)}
 
     def select(self, request: ToolExposurePolicyRequest) -> ToolExposureDecision:
-        return self._exposure
+        registered = {tool.name for tool in request.registered_tools}
+        if any(name not in registered for name in self.tools):
+            # Narrowing must not hide invalid configuration, even for a tool-free run.
+            raise ValueError("Tool exposure selected an unregistered tool.")
+        ceiling = set(request.capability_ceiling)
+        return ToolExposureDecision(
+            profile_id=self.profile_id,
+            tool_names=tuple(name for name in self.tools if name in ceiling),
+        )
 
 
 def _copy_tool_exposure_policy_request(

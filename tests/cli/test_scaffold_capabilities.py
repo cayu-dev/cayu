@@ -33,6 +33,7 @@ from cayu.storage import (
     SQLiteTaskStore,
 )
 from cayu.tasks import InMemoryTaskStore
+from cayu.tools import ToolCapabilityCeiling, ToolExposure
 
 
 @pytest.fixture(autouse=True)
@@ -479,6 +480,53 @@ def test_cli_reports_live_task_store_drift(tmp_path, capsys, monkeypatch, comman
         item["code"] == "SCAFFOLD_CAPABILITY_DRIFT" and item["path"] == "stores.task"
         for item in payload["diagnostics"]
     )
+
+
+@pytest.mark.parametrize("preset", ("agent", "long-running"))
+@pytest.mark.parametrize("ceiling", (None, (), ("ask_user",)))
+def test_generated_app_static_exposure_respects_run_ceiling(tmp_path, capsys, preset, ceiling):
+    assert main(["new", "profile", "--dir", str(tmp_path), "--preset", preset]) == 0
+    capsys.readouterr()
+    project = tmp_path / "profile"
+    with project_context(project):
+        provider = ScriptedModelProvider(
+            [[ModelStreamEvent.text_delta("done"), ModelStreamEvent.completed({})]]
+        )
+        app = importlib.import_module("app").build_app(provider=provider)
+        registered = tuple(tool.name for tool in app.describe().agents[0].tools)
+        assert "ask_user" in registered and len(registered) > 1
+        expected = registered if ceiling is None else ceiling
+
+        async def exercise():
+            try:
+                events = [
+                    event
+                    async for event in app.run(
+                        RunRequest(
+                            agent_name="profile",
+                            session_id="static-ceiling",
+                            messages=[Message.text("user", "Summarize this untrusted text.")],
+                            tool_capability_ceiling=(
+                                None
+                                if ceiling is None
+                                else ToolCapabilityCeiling(tool_names=ceiling)
+                            ),
+                        )
+                    )
+                ]
+                assert events[-1].type == EventType.SESSION_COMPLETED
+                assert len(provider.requests) == 1
+                assert {tool["name"] for tool in provider.requests[0].tools} == set(expected)
+                durable = await app.session_store.load_events("static-ceiling")
+                [record] = [e for e in durable if e.type == EventType.TOOL_EXPOSURE_RECORDED]
+                exposure = ToolExposure.model_validate(record.payload)
+                assert exposure.profile_id == "standard-local-v1"
+                assert exposure.registered_count == len(registered)
+                assert exposure.ceiling_count == exposure.exposed_count == len(expected)
+            finally:
+                await app.aclose()
+
+        asyncio.run(exercise())
 
 
 def test_inspect_does_not_treat_invalid_capability_metadata_as_freeform(
