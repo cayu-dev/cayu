@@ -1897,6 +1897,8 @@ class SessionEngine(BeforeStopPolicies):
             # and failures while recording the original setup failure.
             release_before_run = True
             pre_run_task_started = False
+            setup_returned = False
+            setup_group_observation = None
             interaction_started = True
             messages: list[Message] | None = None
             prompt_contribution_manifest: PromptContributionManifest | None = None
@@ -1976,6 +1978,17 @@ class SessionEngine(BeforeStopPolicies):
                     ):
                         yield queued_event
                     if request.task_id is not None:
+                        from cayu.runtime._task_group_invocation import (
+                            bind_invocation,
+                            prepare_invocation_obligation,
+                        )
+
+                        setup_group_observation = await prepare_invocation_obligation(
+                            self.task_store,
+                            task_id=request.task_id,
+                            context=invocation_context,
+                            redactor=self._secret_redactor,
+                        )
                         task = await self._session_tasks.start_task(
                             task_id=request.task_id,
                             session=session,
@@ -1985,6 +1998,12 @@ class SessionEngine(BeforeStopPolicies):
                         pre_run_task_started = True
                         if active_factory_run is not None:
                             active_factory_run.task_started = True
+                        await bind_invocation(
+                            self.task_store,
+                            task_id=request.task_id,
+                            context=invocation_context,
+                            redactor=self._secret_redactor,
+                        )
                         yield await self._event_writer.emit(
                             _task_event(
                                 event_type=EventType.TASK_STARTED,
@@ -2153,6 +2172,7 @@ class SessionEngine(BeforeStopPolicies):
                         invocation_context=invocation_context,
                     ):
                         yield event
+                    setup_returned = True
                     return
                 release_before_run = False
             except asyncio.CancelledError as cancellation:
@@ -2170,6 +2190,7 @@ class SessionEngine(BeforeStopPolicies):
                         invocation_context=invocation_context,
                     ):
                         yield event
+                    setup_returned = True
                     return
                 await abandon_cancelled_setup(cancellation)
                 raise
@@ -2272,6 +2293,10 @@ class SessionEngine(BeforeStopPolicies):
                         session.id
                     ):
                         failure_events.append(queued_event)
+                # Failure settlement is complete before these buffered events
+                # become visible. Closing at a terminal event must still retire
+                # the setup owner after the finally block releases its fence.
+                setup_returned = True
                 for event in failure_events:
                     yield event
                 return
@@ -2436,6 +2461,22 @@ class SessionEngine(BeforeStopPolicies):
                             finally:
                                 if release_before_run:
                                     _deactivate_session_interaction(session.id)
+
+                # Setup can start a group execution before _run_session owns it.
+                # A normal early return acknowledges that owner only after cleanup
+                # and fence release. Do not use sys.exception(): it may belong to
+                # an exception handler in the stream's caller, not to setup.
+                if pre_run_task_started and setup_returned and setup_group_observation is not None:
+                    from cayu.runtime._task_group_invocation import observe_owner_return
+
+                    store = self.task_store
+                    assert store is not None
+                    await observe_owner_return(
+                        store,
+                        self.session_store,
+                        setup_group_observation,
+                        redactor=self._secret_redactor,
+                    )
 
             if messages is None:
                 raise RuntimeError("Initial transcript was not finalized during setup.")
