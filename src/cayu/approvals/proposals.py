@@ -87,7 +87,8 @@ class ToolCallProposalOutcome(BaseModel):
 
     ``approval_id``, ``tool_round_id`` and ``tool_call_id`` are the identifiers
     ``ToolApprovalRequest`` takes. ``result`` is set when the tool ran.
-    ``reason`` carries a block or denial reason when the event recorded one.
+    ``reason`` carries a block or denial reason when the event recorded one,
+    or the error the session failed with before the call settled.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -112,12 +113,21 @@ class ToolCallProposalOutcome(BaseModel):
         session_id: str | None = None
         status = ToolCallProposalStatus.UNSETTLED
         fields: dict[str, Any] = {}
+        session_error: str | None = None
         for event in events:
             if type(event) is not Event:
                 raise TypeError("events must contain Event instances.")
             session_id = session_id or event.session_id
             payload = event.payload
             terminal = _TERMINAL_STATUS.get(event.type)
+            if event.type == EventType.SESSION_FAILED:
+                error = payload.get("error")
+                session_error = error if type(error) is str else None
+                if status is ToolCallProposalStatus.PENDING_APPROVAL:
+                    # A failed (for example closed) session no longer waits
+                    # for anyone, so nobody can answer its approval.
+                    status = ToolCallProposalStatus.UNSETTLED
+                continue
             if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
                 status = ToolCallProposalStatus.PENDING_APPROVAL
             elif terminal is not None:
@@ -137,6 +147,8 @@ class ToolCallProposalOutcome(BaseModel):
                 status = ToolCallProposalStatus.UNSETTLED
             else:
                 continue
+            # A later call event supersedes an earlier session failure.
+            session_error = None
             if event.tool_name is not None:
                 fields["tool_name"] = event.tool_name
             for name in ("tool_call_id", "tool_round_id", "approval_id"):
@@ -145,6 +157,10 @@ class ToolCallProposalOutcome(BaseModel):
                     fields[name] = value
         if session_id is None:
             raise ValueError("A proposal outcome needs at least one session event.")
+        if status is ToolCallProposalStatus.UNSETTLED and session_error is not None:
+            # The call stays unsettled: a session that failed after the tool
+            # started may have had its effect. The error says why it stopped.
+            fields["reason"] = session_error
         return cls(session_id=session_id, status=status, **fields)
 
 

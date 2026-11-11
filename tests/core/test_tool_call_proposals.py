@@ -508,6 +508,47 @@ def test_approved_but_unsettled_call_is_no_longer_pending() -> None:
         assert outcome.status is ToolCallProposalStatus.UNSETTLED
 
 
+def test_failed_proposal_session_reports_its_error_as_the_reason() -> None:
+    secret = "sk-live-proposal-canary"
+
+    async def scenario():
+        app = _build(secret_redactor=SecretRedactor(secret))
+        # Unlike propose_tool_call, the request builder does not refuse a
+        # secret. The transcript records the proposal redacted, so the session
+        # fails instead of raising the call.
+        request = tool_call_proposal_request("scout", "file_issue", {"title": secret})
+        events = await _drain(app.run(request))
+        await app.aclose()
+        return events
+
+    events = asyncio.run(scenario())
+    assert events[-1].type is EventType.SESSION_FAILED
+    error = events[-1].payload["error"]
+    assert type(error) is str and secret not in error
+    outcome = ToolCallProposalOutcome.from_events(events)
+    assert outcome.status is ToolCallProposalStatus.UNSETTLED
+    assert outcome.reason == error
+    assert FILED == []
+
+
+def test_closed_pending_proposal_is_no_longer_pending() -> None:
+    async def scenario():
+        app = _build()
+        pending = await app.propose_tool_call("scout", "file_issue", {"title": "Stored title"})
+        await app.close_session(pending.session_id, reason="Nobody will review it.")
+        events = await app.session_store.load_events(pending.session_id)
+        await app.aclose()
+        return pending, events
+
+    pending, events = asyncio.run(scenario())
+    assert pending.status is ToolCallProposalStatus.PENDING_APPROVAL
+    [failed] = [event for event in events if event.type is EventType.SESSION_FAILED]
+    outcome = ToolCallProposalOutcome.from_events(events)
+    assert outcome.status is ToolCallProposalStatus.UNSETTLED
+    assert outcome.reason == failed.payload["error"]
+    assert FILED == []
+
+
 def test_provider_finds_the_proposal_beside_context_policy_parts() -> None:
     from cayu.memory.context import _overlay_manifest
 
