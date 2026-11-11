@@ -225,6 +225,7 @@ from cayu.runtime._invocation_lifecycle import (
     _authenticated_invocation_context,
     _release_invocation_command_with_cleanup_authority,
 )
+from cayu.runtime._outcome_decision_settlement import checkpoint_with_completion_decision
 from cayu.runtime._retained_environment_end import (
     RetainedEnvironmentEndWatches,
     release_is_retained,
@@ -240,7 +241,10 @@ from cayu.sessions._checkpoint_mutations import (
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
 )
-from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
+from cayu.sessions._checkpoint_preservation import (
+    _invocation_lifecycle_authority_mutation_scope,
+    _invocation_lifecycle_authority_read_scope,
+)
 from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
 from cayu.sessions._execution_profile_checkpoint import (
     ActiveInvocationExecutionProfile,
@@ -260,6 +264,9 @@ from cayu.sessions._invocation_scope import (
     _current_session_invocation_terminal_event,
     _current_session_run_epoch,
     _deactivate_session_run_fence,
+)
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalDecision,
 )
 from cayu.sessions._operation_records import SessionOperationPublication
 from cayu.sessions._paired_writes import unsettled_owed_decision
@@ -4705,8 +4712,9 @@ class EnvironmentLifecycle:
         *,
         session: Session,
         expected_marker: dict[str, Any],
+        completion_decision: InvocationTerminalDecision | None = None,
     ) -> Session:
-        """Atomically publish success only after the exact workspace commit succeeds."""
+        """Commit success and its owed publication after the exact workspace commit."""
 
         expected = completion_finalization.pending_completion_finalization_from_checkpoint(
             {
@@ -4730,16 +4738,25 @@ class EnvironmentLifecycle:
             )
             if not _same_completion_marker(current, expected):
                 raise RuntimeError("Completion finalization marker changed before commit.")
-            copied = copy_durable_record(checkpoint, "checkpoint")
+            if completion_decision is not None:
+                copied = checkpoint_with_completion_decision(
+                    checkpoint,
+                    decision=completion_decision,
+                    session=current_session,
+                    execution_profile_fingerprint=expected["execution_profile_fingerprint"],
+                )
+            else:
+                copied = copy_durable_record(checkpoint, "checkpoint")
             copied.pop(completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY)
-            return copied or None
+            return copied
 
-        return await self._session_store.transition_status_and_checkpoint(
-            session.id,
-            from_statuses={SessionStatus.RUNNING},
-            to_status=SessionStatus.COMPLETED,
-            checkpoint_transform=complete_and_clear,
-        )
+        with _invocation_lifecycle_authority_mutation_scope():
+            return await self._session_store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+                checkpoint_transform=complete_and_clear,
+            )
 
     def checkpoint_transform_preserving_runtime_state(
         self,

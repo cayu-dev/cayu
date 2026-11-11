@@ -23,10 +23,15 @@ from cayu.events import (
     event_with_runtime_payload_authority,
     runtime_payload_authority_paths,
 )
+from cayu.sessions._execution_profile_checkpoint import (
+    active_invocation_execution_profile_from_checkpoint,
+)
 from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
     build_owed_invocation_terminal_decision,
+    checkpoint_with_invocation_terminal_decision,
+    invocation_terminal_decision_matches_active_profile,
     invocation_terminal_event_id,
     owed_decision_event_id,
 )
@@ -39,6 +44,7 @@ from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     _session_run_operation_from_checkpoint,
 )
+from cayu.sessions.authority import SessionRunFenced
 from cayu.tasks.records import Task, TaskStatus
 
 if TYPE_CHECKING:
@@ -216,6 +222,33 @@ async def owed_decision_install(
     )
     context.state.outcome_decision = decision
     return owed_decision_install_mutation(decision)
+
+
+def checkpoint_with_completion_decision(
+    checkpoint: dict[str, Any] | None,
+    *,
+    decision: InvocationTerminalDecision,
+    session: Session,
+    execution_profile_fingerprint: str,
+) -> dict[str, Any]:
+    """Install a completion decision only for the exact finalizing invocation."""
+
+    active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+    if (
+        active_profile is None
+        or active_profile.profile.fingerprint != execution_profile_fingerprint
+        or decision.outcome is not InvocationTerminalOutcome.COMPLETED
+        or not invocation_terminal_decision_matches_active_profile(
+            decision,
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
+            interaction_id=active_profile.interaction_id,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+        )
+    ):
+        raise SessionRunFenced("Completion finalization lost its decision authority.")
+    return checkpoint_with_invocation_terminal_decision(checkpoint, decision)
 
 
 def completed_task_event(decision: InvocationTerminalDecision, task_event: Event) -> Event:

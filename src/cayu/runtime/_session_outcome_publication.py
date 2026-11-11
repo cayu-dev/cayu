@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -97,8 +97,10 @@ from cayu.runtime._invocation_lifecycle import (
     InvocationContext,
 )
 from cayu.runtime._outcome_decision_settlement import (
+    OwedOutcome,
     completed_task_event,
     completion_terminal_payload,
+    owed_decision_install,
     owed_terminal_event,
     owed_turn_event,
     prepared_outcome,
@@ -290,14 +292,18 @@ class SessionOutcomePublication:
         binding = (
             None if registered_environment is None else registered_environment.environment.binding
         )
-        if (
+        completion_critical = (
             binding is not None
             and registered_environment is not None
             and registered_environment.bound_workspace is not None
             and binding._completion_requires_successful_finalization(
                 registered_environment.bound_workspace
             )
+        )
+        if completion_critical and not (
+            state.session.status is SessionStatus.COMPLETED and state.outcome_decision is not None
         ):
+            assert registered_environment is not None
             if execution_profile is None:
                 raise RuntimeError(
                     "Completion-critical workspace finalization lost its execution profile."
@@ -446,12 +452,50 @@ class SessionOutcomePublication:
                     async for failed_terminal_event in owned_terminal_stream:
                         yield failed_terminal_event
                 return
+            transition = await self.session_store.load_invocation_settlement_transition(
+                state.session.id,
+                expected_session_instance_id=state.session.instance_id,
+                expected_active_invocation_profile=invocation_context.active_profile,
+            )
+            if transition is None or transition.event.type is not EventType.INTERACTION_COMPLETED:
+                raise RuntimeError("Completion finalization lost its interaction settlement.")
+            receipt = await self.session_store.load_interaction_transition_receipt(
+                state.session.id,
+                transition=transition,
+                expected_recovery_claim_id=invocation_context.recovery_claim_id,
+            )
+            if receipt is None:
+                raise RuntimeError("Completion finalization lost its transition receipt.")
+            completion_decision = None
+            if receipt.status_changed:
+                # Unlike terminal-only queue completion, this publication is
+                # not shielded through terminal proof. Transfer the copy-back
+                # marker's remaining work to a durable completion decision.
+                await owed_decision_install(
+                    checkpoint=await self.session_store.load_checkpoint(state.session.id),
+                    session_finalization=self._session_finalization,
+                    owed=OwedOutcome(context=context, terminal_event=prefinalized_completion.event),
+                    interaction_event=transition.event,
+                )
+                completion_decision = state.outcome_decision
+                assert completion_decision is not None
             state.session = await self._environment_lifecycle.complete_completion_finalization(
                 session=state.session,
                 expected_marker=completion_marker,
+                completion_decision=completion_decision,
             )
+            if completion_decision is not None:
+                prefinalized_completion = replace(
+                    prefinalized_completion,
+                    event=owed_terminal_event(completion_decision, state.session),
+                )
         # The completion transition fixed the identity of every event it still owes.
         owed = state.outcome_decision
+        if completion_critical and prefinalized_completion is None and owed is not None:
+            # Copy-back already committed; replay publication, not finalization.
+            prefinalized_completion = EnvironmentBindingFinalizeResult(
+                event=owed_terminal_event(owed, state.session), events=[]
+            )
         # A restarted publication replays whatever the first one made durable.
         replay = state.completion_publication_started
         state.completion_publication_started = True
