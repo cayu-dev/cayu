@@ -1997,7 +1997,12 @@ async def _handle_with_heartbeat_owned(
 
         if task.retry_series is None:
             if not await _dispose_within_deadline(
-                app, task, lease_authority, lease_seconds, finalize_handler_outcome()
+                app,
+                task,
+                lease_authority,
+                lease_seconds,
+                finalize_handler_outcome(),
+                stop_heartbeat=stop_heartbeat,
             ):
                 return
         else:
@@ -4026,6 +4031,8 @@ async def _dispose_within_deadline(
     lease_authority: _TaskLeaseAuthority,
     lease_seconds: int,
     disposition: Awaitable[None],
+    *,
+    stop_heartbeat: asyncio.Event,
 ) -> bool:
     """Run an ordinary task's disposition while its heartbeat keeps renewing.
 
@@ -4036,6 +4043,9 @@ async def _dispose_within_deadline(
 
     deadline_s = max(float(lease_seconds), _MIN_TASK_DISPOSITION_DEADLINE_S)
     deadline = asyncio.timeout(deadline_s)
+    # Handoffs retain supervision of dispatched mutations through cancellation.
+    # Bound renewal independently, even while such a mutation is still joining.
+    stop_heartbeat_handle = asyncio.get_running_loop().call_later(deadline_s, stop_heartbeat.set)
     try:
         async with deadline:
             await disposition
@@ -4050,6 +4060,8 @@ async def _dispose_within_deadline(
             lease_authority.claim_generation,
         )
         return False
+    finally:
+        stop_heartbeat_handle.cancel()
     return True
 
 
