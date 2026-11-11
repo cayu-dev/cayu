@@ -47,6 +47,8 @@ _MAX_SERIES_ATTEMPTS = 100
 _CANCELLATION_REQUEST_REASONS = frozenset(
     {"cancellation_requested", "retry_cancellation_requested"}
 )
+# Only a task a worker holds carries the request; a hold's own reason may use the same text.
+_CANCELLATION_REQUEST_STATUSES = frozenset({TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value})
 
 
 class WorkerLossEvidence(StrEnum):
@@ -558,7 +560,7 @@ def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:
 
     status = task.get("status")
     reason = task.get("status_reason")
-    requested = reason in _CANCELLATION_REQUEST_REASONS
+    requested = status in _CANCELLATION_REQUEST_STATUSES and reason in _CANCELLATION_REQUEST_REASONS
     if status != TaskStatus.CANCELLED.value and not requested:
         return None
     payload = _object(task.get("status_payload"))

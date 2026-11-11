@@ -736,6 +736,70 @@ def test_rescheduling_first_retry_attempt_preserves_original_envelope(
     asyncio.run(run())
 
 
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("reason", ["cancellation_requested", "retry_cancellation_requested"])
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_held_schedule_with_fence_text_reason_can_be_rescheduled_and_cancelled(
+    tmp_path, request, backend, reason
+):
+    # A hold's reason is caller text. Nothing is settling a cancellation of this
+    # task, so its schedule stays changeable and records no cancellation request.
+    async def run():
+        now = datetime.now(UTC)
+        identity = f"held-fence-text-{backend}-{reason}"
+        if backend == "memory":
+            store = InMemoryTaskStore(clock=lambda: now)
+        elif backend == "sqlite":
+            store = SQLiteTaskStore(tmp_path / "held-fence-text.sqlite", clock=lambda: now)
+        else:
+            store = PostgresTaskStore(
+                request.getfixturevalue("postgres_dsn"),
+                schema_mode=SchemaMode.CREATE,
+                clock=lambda: now,
+            )
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id=identity,
+                    type=identity,
+                    available_at=now + timedelta(hours=1),
+                    schedule_policy=TaskSchedulePolicy(),
+                )
+            )
+            held = await store.pause_task(identity, reason=reason)
+            assert held.schedule is not None
+            kinds = [event.type for event in await store.list_task_schedule_events(identity)]
+            assert kinds[-1] is TaskScheduleEventType.HELD
+            assert TaskScheduleEventType.CANCELLATION_REQUESTED not in kinds
+
+            await store.reschedule_task(
+                TaskRescheduleRequest(
+                    task_id=identity,
+                    operation_id="delay",
+                    expected_revision=held.schedule.revision,
+                    available_at=now + timedelta(hours=2),
+                )
+            )
+            delayed = await store.load_task(identity)
+            assert delayed is not None and delayed.schedule is not None
+            assert (delayed.status, delayed.status_reason) == (TaskStatus.PAUSED, reason)
+            receipt = await store.cancel_scheduled_task(
+                TaskScheduleCancelRequest(
+                    task_id=identity,
+                    operation_id="cancel",
+                    expected_revision=delayed.schedule.revision,
+                )
+            )
+            assert receipt.type is TaskScheduleEventType.CANCELLED
+            cancelled = await store.load_task(identity)
+            assert cancelled is not None and cancelled.status is TaskStatus.CANCELLED
+        finally:
+            if isinstance(store, (SQLiteTaskStore, PostgresTaskStore)):
+                await store.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_worker_wakes_at_persisted_due_time_before_long_poll(tmp_path, persistent):
     async def run():

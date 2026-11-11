@@ -37,6 +37,7 @@ from tests.core.task_store_conformance import (
     assert_claim_generation_conformance,
     assert_claim_generation_increments_conformance,
     assert_exact_claimed_task_cancellation_conformance,
+    assert_hold_reason_cancellation_fence_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_contract_queue_filter_conformance,
@@ -3533,6 +3534,13 @@ def test_postgres_task_store_claim_generation_increments_conformance(postgres_ds
 def test_postgres_task_store_exact_claimed_cancellation_conformance(postgres_dsn):
     async def ops(store):
         await assert_exact_claimed_task_cancellation_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_hold_reason_cancellation_fence_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_hold_reason_cancellation_fence_conformance(store)
 
     _run(postgres_dsn, ops)
 

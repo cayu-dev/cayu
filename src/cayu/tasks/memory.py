@@ -2405,8 +2405,8 @@ class InMemoryTaskStore(TaskStore):
                     state is None
                     or task.status
                     in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-                    or task.status_reason
-                    in {"cancellation_requested", "retry_cancellation_requested"}
+                    or _task_cancellation_requested(task)
+                    or _task_retry_cancellation_requested(task)
                 ):
                     continue
                 if state.status.value != "active" or (

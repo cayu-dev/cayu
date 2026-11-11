@@ -411,6 +411,32 @@ def test_paused_human_wait_does_not_reset_event_deadline(backend, tmp_path, requ
     asyncio.run(scenario())
 
 
+# The fence texts are a hold's own reason here: no worker holds the task, so its
+# event deadline still applies. Each store filters this in its own query.
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("reason", ["cancellation_requested", "retry_cancellation_requested"])
+@pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])
+def test_held_task_with_fence_text_reason_still_expires_with_its_event(
+    backend, reason, tmp_path, request
+):
+    now = [datetime(2026, 10, 27, tzinfo=UTC)]
+
+    async def scenario():
+        store = _store(backend, tmp_path, request, clock=lambda: now[0])
+        task = await store.create_task(
+            TaskCreate(
+                type="job", event_id="one", retry_budget=TaskRetryBudget(max_elapsed_seconds=60)
+            )
+        )
+        await store.pause_task(task.id, reason=reason)
+        now[0] += timedelta(seconds=61)
+        assert await store.expired_task_event_ids() == [task.id]
+        await reconcile_task_event_deadlines(store)
+        assert (await store.load_task(task.id)).status is TaskStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
 def test_custom_store_must_support_automatic_event_execution():
     class LegacyStore(InMemoryTaskStore):
         supports_task_event_execution = False

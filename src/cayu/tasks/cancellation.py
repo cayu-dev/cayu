@@ -37,6 +37,11 @@ _TASK_CANCELLATION_REQUESTED_REASON = "cancellation_requested"
 _TASK_RETRY_CANCELLATION_REQUESTED_REASON = "retry_cancellation_requested"
 
 
+# The statuses a cancellation fence can be set on. ``status_reason`` also holds the
+# caller's own text on a held task, so the fence texts mean a fence only here.
+_TASK_CANCELLATION_FENCE_STATUSES = frozenset({TaskStatus.CLAIMED, TaskStatus.RUNNING})
+
+
 _TASK_RETRY_RECONCILIATION_EVIDENCE_ID_MAX_BYTES = 256
 
 
@@ -1489,12 +1494,26 @@ def _replay_task_cancellation_reconciliation_rejection(
 
 
 def _task_retry_cancellation_requested(task: Task) -> bool:
-    """Return whether an owned retry attempt carries a durable cancel request."""
+    """Return whether an owned retry attempt carries a durable cancel request.
 
-    return task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+    Only a claimed or running task can: on any other status the same text is a
+    hold's caller-supplied reason, not a fence.
+    """
+
+    return (
+        task.status in _TASK_CANCELLATION_FENCE_STATUSES
+        and task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+    )
 
 
 def _task_cancellation_requested(task: Task) -> bool:
-    """Return whether an ordinary live task carries a durable cancel request."""
+    """Return whether an ordinary live task carries a durable cancel request.
 
-    return task.status_reason == _TASK_CANCELLATION_REQUESTED_REASON
+    Only a claimed or running task can: on any other status the same text is a
+    hold's caller-supplied reason, not a fence.
+    """
+
+    return (
+        task.status in _TASK_CANCELLATION_FENCE_STATUSES
+        and task.status_reason == _TASK_CANCELLATION_REQUESTED_REASON
+    )

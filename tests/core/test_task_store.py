@@ -22,6 +22,7 @@ from tests.core.task_store_conformance import (
     assert_claim_generation_conformance,
     assert_claim_generation_increments_conformance,
     assert_exact_claimed_task_cancellation_conformance,
+    assert_hold_reason_cancellation_fence_conformance,
     assert_interrupted_continuation_scan_bound_conformance,
     assert_task_claim_lost_conformance,
     assert_task_contract_queue_filter_conformance,
@@ -322,6 +323,21 @@ def test_task_stores_exact_claimed_cancellation_conformance(
             if store_factory is SQLiteTaskStore:
                 resources.own(store)
             await assert_exact_claimed_task_cancellation_conformance(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_hold_reason_cancellation_fence_conformance(
+    store_factory: StoreFactory,
+    sqlite_resources,
+):
+    async def run_store_operations() -> None:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
+            await assert_hold_reason_cancellation_fence_conformance(store)
 
     asyncio.run(run_store_operations())
 

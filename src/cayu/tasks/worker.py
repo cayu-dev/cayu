@@ -149,8 +149,6 @@ from cayu.tasks.abandoned import (
     restart_abandoned_from_environment,
 )
 from cayu.tasks.cancellation import (
-    _TASK_CANCELLATION_REQUESTED_REASON,
-    _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     TaskCancellationReconciliationEvent,
     TaskCancellationReconciliationEvidence,
     TaskCancellationReconciliationOutcome,
@@ -6107,7 +6105,9 @@ async def _settle_task_refused_by_shutdown(
     """
 
     current = await task_store.load_task(task_id)
-    if current is not None and current.status_reason in _TASK_CANCELLATION_REASONS:
+    if current is not None and (
+        _task_cancellation_requested(current) or _task_retry_cancellation_requested(current)
+    ):
         return False
     if (
         current is None
@@ -6122,11 +6122,6 @@ async def _settle_task_refused_by_shutdown(
             task_id, worker_id, claim_generation=lease_authority.claim_generation
         )
     return True
-
-
-_TASK_CANCELLATION_REASONS = frozenset(
-    {_TASK_CANCELLATION_REQUESTED_REASON, _TASK_RETRY_CANCELLATION_REQUESTED_REASON}
-)
 
 
 def _worker_should_stop(app: CayuApp, stop: asyncio.Event | None) -> bool:

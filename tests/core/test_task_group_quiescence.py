@@ -120,6 +120,20 @@ async def test_idle_loser_and_finalizer_release_commit_together(store):
     ).quiescence.finalizer_status is TaskGroupFinalizerStatus.SETTLED
 
 
+@pytest.mark.parametrize("reason", ["cancellation_requested", "retry_cancellation_requested"])
+async def test_held_loser_with_fence_text_reason_is_cancelled_by_the_decision(store, reason):
+    # The hold's reason is caller text: no worker is draining this loser.
+    app = CayuApp(task_store=store, enable_logging=False)
+    await app.create_task_group(request())
+    held = await store.pause_task("b", reason=reason)
+    assert held.worker_id is None
+    await store.complete_task("a", {"ok": True})
+    assert (await store.load_task("b")).status is TaskStatus.CANCELLED
+    snapshot = await app.load_task_group("race")
+    assert snapshot.quiescence.status is TaskGroupQuiescenceStatus.QUIESCENT
+    assert snapshot.quiescence.finalizer_status is TaskGroupFinalizerStatus.RELEASED
+
+
 async def test_failure_makes_finalizer_explicitly_ineligible(store):
     app = CayuApp(task_store=store, enable_logging=False)
     await app.create_task_group(request(policy="all"))

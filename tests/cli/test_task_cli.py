@@ -428,6 +428,40 @@ def test_pending_cancellation_shows_the_requests_reason_and_time(
     assert isinstance(cancellation["requested_at"], str)
 
 
+@pytest.mark.parametrize("reason", ["cancellation_requested", "retry_cancellation_requested"])
+def test_held_task_with_fence_text_reason_shows_no_cancellation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], reason: str
+) -> None:
+    # A hold's reason is the caller's own text: nobody asked to cancel this task.
+    path = tmp_path / "cayu.db"
+
+    async def seed() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            await store.create_task(TaskCreate(task_id="held", type="scan"))
+            await store.pause_task("held", reason=reason)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+    code, shown = _run(capsys, "show", "held", "--sqlite", str(path), "--json")
+
+    assert code == 0
+    assert (shown["task"]["status"], shown["task"]["status_reason"]) == ("paused", reason)
+    assert shown["cancellation"] is None
+
+
+def test_cancel_action_is_not_settled_by_a_hold_reason_with_fence_text() -> None:
+    from cayu.cli._control_plane_actions import _task_action_settled
+
+    fenced = {"status": "running", "status_reason": "cancellation_requested"}
+    held = {"status": "paused", "status_reason": "cancellation_requested"}
+    assert _task_action_settled("cancel", fenced) is True
+    assert _task_action_settled("cancel", {"status": "cancelled", "status_reason": None}) is True
+    assert _task_action_settled("cancel", held) is False
+
+
 def test_reconciled_cancellation_names_its_outcome_and_actor() -> None:
     from cayu.cli.task import cancellation_summary
 

@@ -22,9 +22,13 @@ from cayu.tasks.contracts import (
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.handoff import interrupted_task_handoff_request
 from cayu.tasks.queries import TaskQuery
-from cayu.tasks.records import Task, TaskClaimLost, TaskStatus
+from cayu.tasks.records import Task, TaskClaimLost, TaskRetryPolicy, TaskStatus
 from cayu.tasks.store import TaskStore
-from cayu.tasks.terminalization import TaskTerminalizationRequest, TaskTerminalKind
+from cayu.tasks.terminalization import (
+    TaskTerminalizationConflict,
+    TaskTerminalizationRequest,
+    TaskTerminalKind,
+)
 
 
 async def assert_task_contract_queue_filter_conformance(store: TaskStore) -> None:
@@ -734,6 +738,77 @@ async def assert_exact_claimed_task_cancellation_conformance(store: TaskStore) -
         {"reason": "late-owner-fence"},
     )
     assert replayed_drain == draining
+
+
+async def assert_hold_reason_cancellation_fence_conformance(store: TaskStore) -> None:
+    """The fence texts fence a claimed or running task, never a held one.
+
+    A hold stores its caller's reason in ``status_reason``, the field that also
+    carries a requested cancellation. A held task has no worker, so the same
+    text there must leave it cancellable and holdable (issue #3655). A claimed
+    task whose cancellation was requested must still refuse both.
+    """
+
+    holds = ("pause_task", "block_task", "mark_task_needs_attention")
+    fence_reasons = ("cancellation_requested", "retry_cancellation_requested")
+    for hold in holds:
+        for reason in fence_reasons:
+            task = await store.create_task(TaskCreate(type="hold-reason-cancel"))
+            held = await getattr(store, hold)(task.id, reason=reason)
+            assert held.status_reason == reason
+            assert held.worker_id is None
+            assert held.lease_expires_at is None
+            cancelled = await store.cancel_task(task.id)
+            assert cancelled.status is TaskStatus.CANCELLED
+
+    for reason in fence_reasons:
+        task = await store.create_task(TaskCreate(type="hold-reason-hold"))
+        await store.pause_task(task.id, reason=reason)
+        blocked = await store.block_task(task.id, reason="waiting for a human")
+        assert blocked.status is TaskStatus.BLOCKED
+        assert blocked.status_reason == "waiting for a human"
+        attention = await store.mark_task_needs_attention(task.id, reason=reason)
+        assert attention.status is TaskStatus.NEEDS_ATTENTION
+        assert attention.status_reason == reason
+        resumed = await store.resume_task(task.id)
+        assert resumed.status is TaskStatus.PENDING
+        assert resumed.status_reason is None
+
+    # A real fence: the worker still holds the task, so it refuses what it did before.
+    await store.create_task(TaskCreate(task_id="hold_reason_fenced", type="hold-reason-fenced"))
+    claimed = await store.claim_task(
+        "worker-a", TaskQuery(type="hold-reason-fenced"), lease_seconds=300
+    )
+    assert claimed is not None
+    requested = await store.cancel_task(claimed.id)
+    assert requested.status is TaskStatus.CLAIMED
+    assert requested.status_reason == "cancellation_requested"
+    assert requested.worker_id == "worker-a"
+    for hold in holds:
+        with pytest.raises(TaskTerminalizationConflict, match="still draining"):
+            await getattr(store, hold)(claimed.id, reason="operator hold")
+    with pytest.raises(TaskTerminalizationConflict, match="still draining"):
+        await store.cancel_task(claimed.id)
+    assert await store.load_task(claimed.id) == requested
+
+    await store.create_task(
+        TaskCreate(
+            task_id="hold_reason_retry_fenced",
+            type="hold-reason-retry-fenced",
+            retry_policy=TaskRetryPolicy(max_attempts=2),
+        )
+    )
+    retry_claimed = await store.claim_task(
+        "worker-a", TaskQuery(type="hold-reason-retry-fenced"), lease_seconds=300
+    )
+    assert retry_claimed is not None
+    retry_requested = await store.cancel_task(retry_claimed.id)
+    assert retry_requested.status is TaskStatus.CLAIMED
+    assert retry_requested.status_reason == "retry_cancellation_requested"
+    for hold in holds:
+        with pytest.raises(TaskTerminalizationConflict, match="still draining"):
+            await getattr(store, hold)(retry_claimed.id, reason="operator hold")
+    assert await store.load_task(retry_claimed.id) == retry_requested
 
 
 async def assert_task_store_time_conformance(

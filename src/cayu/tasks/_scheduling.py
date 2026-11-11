@@ -11,6 +11,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     revalidate_model_input,
 )
+from cayu.tasks.cancellation import _task_cancellation_requested, _task_retry_cancellation_requested
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -85,7 +86,7 @@ def require_schedule_mutation(task: Task, expected_revision: int) -> TaskSchedul
         raise TaskScheduleConflict("Task schedule revision changed.")
     if task.status in {"completed", "failed", "cancelled", "dependency_skipped"}:
         raise TaskScheduleConflict("Terminal task schedules cannot be changed.")
-    if task.status_reason in {"cancellation_requested", "retry_cancellation_requested"}:
+    if _task_cancellation_requested(task) or _task_retry_cancellation_requested(task):
         raise TaskScheduleConflict("Task schedule cancellation is already settling.")
     schedule_revision_after(state)
     return state
@@ -201,7 +202,8 @@ def schedule_transition_events(
             if eligibility is TaskScheduleEligibility.MISFIRED
             else TaskScheduleEventType.ELIGIBLE
         )
-    if current.status_reason in {"cancellation_requested", "retry_cancellation_requested"} and (
+    # Only a claimed or running task carries the fence; a hold may use the same text.
+    if (_task_cancellation_requested(current) or _task_retry_cancellation_requested(current)) and (
         prior is None or prior.status_reason != current.status_reason
     ):
         kinds.append(TaskScheduleEventType.CANCELLATION_REQUESTED)

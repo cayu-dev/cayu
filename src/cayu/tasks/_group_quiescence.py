@@ -19,6 +19,7 @@ from cayu.tasks._cancellation import (
 )
 from cayu.tasks._graphs import GRAPH_TERMINAL_STATUSES, GraphTransition, plan_graph_transition
 from cayu.tasks._groups import GroupPublication, plan_group_transition
+from cayu.tasks.cancellation import _task_cancellation_requested, _task_retry_cancellation_requested
 from cayu.tasks.graphs import graph_identifier
 from cayu.tasks.groups import (
     TaskGroupConflict,
@@ -599,7 +600,7 @@ def plan_group_graph_transition(
                         )
                     )
                 continue
-            if task.status_reason in {"cancellation_requested", "retry_cancellation_requested"}:
+            if _task_cancellation_requested(task) or _task_retry_cancellation_requested(task):
                 continue
             if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
                 if task.worker_id is None or task.lease_expires_at is None:

@@ -153,10 +153,14 @@ def _task_action_settled(command: str, task: dict[str, Any]) -> bool:
     status = task.get("status")
     if command == "cancel":
         # A running task stays running, marked, until its worker stops.
-        return status == "cancelled" or task.get("status_reason") in {
-            "cancellation_requested",
-            "retry_cancellation_requested",
-        }
+        return status == "cancelled" or (
+            status in {"claimed", "running"}
+            and task.get("status_reason")
+            in {
+                "cancellation_requested",
+                "retry_cancellation_requested",
+            }
+        )
     if command == "resume":
         # Back in the queue, or waiting there for its prerequisites or its group.
         return status in {"pending", "waiting_dependencies", "waiting_group"}

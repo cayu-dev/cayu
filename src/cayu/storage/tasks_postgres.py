@@ -152,6 +152,7 @@ from cayu.tasks.cancellation import (
     _task_cancellation_requested,
     _task_retry_cancellation_reconciliation_conflict,
     _task_retry_cancellation_reconciliation_rejection_record,
+    _task_retry_cancellation_requested,
     _task_retry_reconciliation_identity_is_bounded,
     _TaskCancellationReconciliationRejectionRecord,
     _TaskRetryCancellationReconciliationRejectionRecord,
@@ -1365,7 +1366,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 """SELECT t.id FROM cayu_tasks t JOIN cayu_task_retry_keys k
                    ON t.invocation->>'event_retry_key' = k.retry_key
                    WHERE t.status NOT IN ('completed', 'failed', 'cancelled')
-                   AND (t.status_reason IS NULL OR t.status_reason NOT IN
+                   AND (t.status NOT IN ('claimed', 'running')
+                       OR t.status_reason IS NULL OR t.status_reason NOT IN
                        ('cancellation_requested', 'retry_cancellation_requested'))
                    AND (k.state_json::jsonb->>'status' != 'active' OR
                        (k.state_json::jsonb->>'first_attempt_at')::timestamptz +
@@ -4493,7 +4495,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 current.status is not TaskStatus.CLAIMED
                 or current.session_id is not None
                 or _task_cancellation_requested(current)
-                or current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                or _task_retry_cancellation_requested(current)
             ):
                 raise TaskTerminalizationConflict(
                     "Claimed task cannot begin ordinary worker execution."
@@ -5675,6 +5677,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     )
                 _ensure_can_hold_task(prior, status)
                 now = await self._database_now(cur)
+                # The fence texts are a fence only on a claimed or running task;
+                # on a held one they are the caller's reason.
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -5694,8 +5698,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         OR (status = %s AND session_id IS NULL)
                         OR status IN ('waiting_dependencies', 'waiting_group')
                       )
-                      AND status_reason IS DISTINCT FROM %s
-                      AND status_reason IS DISTINCT FROM %s
+                      AND (
+                        status NOT IN (%s, %s)
+                        OR (
+                          status_reason IS DISTINCT FROM %s
+                          AND status_reason IS DISTINCT FROM %s
+                        )
+                      )
                     RETURNING {pg_support.TASK_COLUMNS}
                     """,
                     (
@@ -5709,6 +5718,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         str(TaskStatus.PAUSED),
                         str(TaskStatus.BLOCKED),
                         str(TaskStatus.NEEDS_ATTENTION),
+                        str(TaskStatus.RUNNING),
+                        str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
@@ -5820,8 +5831,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             )
         verified_work_support.require_contracted_completion_authority(task, status)
         if request_claimed_cancellation and (
-            _task_cancellation_requested(task)
-            or task.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+            _task_cancellation_requested(task) or _task_retry_cancellation_requested(task)
         ):
             return task.model_copy(deep=True)
         if worker_id is not None:

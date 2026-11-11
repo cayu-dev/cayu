@@ -193,6 +193,7 @@ from cayu.tasks.cancellation import (
     _task_cancellation_requested,
     _task_retry_cancellation_reconciliation_conflict,
     _task_retry_cancellation_reconciliation_rejection_record,
+    _task_retry_cancellation_requested,
     _task_retry_reconciliation_identity_is_bounded,
     _TaskCancellationReconciliationRejectionRecord,
     _TaskRetryCancellationReconciliationRejectionRecord,
@@ -3837,7 +3838,8 @@ class SQLiteTaskStore(TaskStore):
                 """SELECT t.id FROM cayu_tasks t JOIN cayu_task_retry_keys k
                    ON json_extract(t.invocation_json, '$.event_retry_key') = k.retry_key
                    WHERE t.status NOT IN ('completed', 'failed', 'cancelled')
-                   AND (t.status_reason IS NULL OR t.status_reason NOT IN
+                   AND (t.status NOT IN ('claimed', 'running')
+                       OR t.status_reason IS NULL OR t.status_reason NOT IN
                        ('cancellation_requested', 'retry_cancellation_requested'))
                    AND (json_extract(k.state_json, '$.status') != 'active' OR
                        julianday(json_extract(k.state_json, '$.first_attempt_at')) +
@@ -6609,8 +6611,8 @@ class SQLiteTaskStore(TaskStore):
                     raise TaskClaimLost(
                         "Claimed-task cancellation no longer owns the expected worker lease."
                     )
-                if _task_cancellation_requested(current) or (
-                    current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                if _task_cancellation_requested(current) or _task_retry_cancellation_requested(
+                    current
                 ):
                     return current.model_copy(deep=True)
                 if current.started_at is not None:
@@ -6666,7 +6668,7 @@ class SQLiteTaskStore(TaskStore):
                     current.status is not TaskStatus.CLAIMED
                     or current.session_id is not None
                     or _task_cancellation_requested(current)
-                    or current.status_reason == _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+                    or _task_retry_cancellation_requested(current)
                 ):
                     raise TaskTerminalizationConflict(
                         "Claimed task cannot begin ordinary worker execution."
@@ -7843,6 +7845,8 @@ class SQLiteTaskStore(TaskStore):
                         "Admitted work attempts cannot use ordinary task holds."
                     )
                 _ensure_can_hold_task(prior, status)
+                # The fence texts are a fence only on a claimed or running task;
+                # on a held one they are the caller's reason.
                 cursor = self._connection.execute(
                     """
                     UPDATE cayu_tasks
@@ -7862,7 +7866,11 @@ class SQLiteTaskStore(TaskStore):
                         OR status = ?
                         OR (status = ? AND session_id IS NULL)
                       )
-                      AND (status_reason IS NULL OR status_reason NOT IN (?, ?))
+                      AND (
+                        status NOT IN (?, ?)
+                        OR status_reason IS NULL
+                        OR status_reason NOT IN (?, ?)
+                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM cayu_work_attempt_admissions
                           WHERE task_id = ?
@@ -7879,6 +7887,8 @@ class SQLiteTaskStore(TaskStore):
                         str(TaskStatus.PAUSED),
                         str(TaskStatus.BLOCKED),
                         str(TaskStatus.NEEDS_ATTENTION),
+                        str(TaskStatus.RUNNING),
+                        str(TaskStatus.CLAIMED),
                         str(TaskStatus.RUNNING),
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         _TASK_CANCELLATION_REQUESTED_REASON,
