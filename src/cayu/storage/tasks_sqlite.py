@@ -1688,6 +1688,7 @@ class SQLiteTaskStore(TaskStore):
                     contract,
                     request,
                 )
+                schedule = task.schedule
                 if continuation is None:
                     if request.kind != "initial":
                         raise WorkAttemptAdmissionConflict(
@@ -1724,6 +1725,7 @@ class SQLiteTaskStore(TaskStore):
                         raise WorkAttemptAdmissionConflict(
                             "Initial admission conflicts with the task's session."
                         )
+                    schedule = admitted_schedule(task, now=availability_now)
                 else:
                     if request.task_lease_expires_at is not None:
                         raise WorkAttemptAdmissionConflict(
@@ -1812,6 +1814,7 @@ class SQLiteTaskStore(TaskStore):
                 updated_task = task.model_copy(
                     update={
                         "status": TaskStatus.RUNNING,
+                        "schedule": schedule,
                         "session_id": request.session_id,
                         "session_instance_id": session_instance_id,
                         "worker_id": request.worker_id,

@@ -869,6 +869,7 @@ class InMemoryTaskStore(TaskStore):
                     "A decided group loser cannot admit another execution."
                 )
             continuation = self._work_attempt_continuation_context(task, contract, request)
+            schedule = task.schedule
             if continuation is None:
                 if request.kind != "initial":
                     raise WorkAttemptAdmissionConflict(
@@ -905,6 +906,7 @@ class InMemoryTaskStore(TaskStore):
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission conflicts with the task's session."
                     )
+                schedule = admitted_schedule(task, now=availability_now)
             else:
                 if request.task_lease_expires_at is not None:
                     raise WorkAttemptAdmissionConflict(
@@ -991,6 +993,7 @@ class InMemoryTaskStore(TaskStore):
             updated_task = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
+                    "schedule": schedule,
                     "session_id": request.session_id,
                     "session_instance_id": session_instance_id,
                     "worker_id": request.worker_id,

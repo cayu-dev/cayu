@@ -38,6 +38,7 @@ from cayu.tasks._lifecycle import (
     _ensure_exact_owned_active_task_lease,
     work_attempt_claim_execution,
 )
+from cayu.tasks._scheduling import admitted_schedule
 from cayu.tasks.admission import (
     WORK_ATTEMPT_RENEWABLE_STATES,
     AdmittedCompletionProposalRequest,
@@ -1537,6 +1538,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
             await self._ensure_session_authority(cur, request.session_id, "contracted")
             lease_now = await self._verified_lease_now(cur)
             availability_now = await self._verified_evidence_now(cur)
+            schedule = task.schedule
             if continuation is None:
                 if request.kind != "initial":
                     raise WorkAttemptAdmissionConflict(
@@ -1577,6 +1579,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
                     raise WorkAttemptAdmissionConflict(
                         "Initial admission conflicts with the task's session."
                     )
+                schedule = admitted_schedule(task, now=availability_now)
             else:
                 if request.task_lease_expires_at is not None:
                     raise WorkAttemptAdmissionConflict(
@@ -1658,6 +1661,7 @@ class PostgresVerifiedWorkMixin(PostgresMutationMixin):
             updated_task = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
+                    "schedule": schedule,
                     "session_id": request.session_id,
                     "session_instance_id": session_instance_id,
                     "worker_id": request.worker_id,
