@@ -927,6 +927,126 @@ def test_allowed_response_redacts_echoed_real_secret() -> None:
     _no_real_secret(decisions)
 
 
+@pytest.mark.parametrize("coding", ["gzip", "deflate"])
+def test_credentialed_custom_upstream_encoded_body_is_refused(coding: str) -> None:
+    echoed = f'{{"debug":"{REAL_SECRET}"}}'.encode()
+    encoded = gzip.compress(echoed) if coding == "gzip" else zlib.compress(echoed)
+    upstream = _FakeUpstream(
+        CapturedResponse(status_code=200, headers={"Content-Encoding": coding}, body=encoded)
+    )
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+    request = _request(grant.presented_value, "/v1/customers")
+    request = request.model_copy(
+        update={"headers": {**request.headers, "Accept-Encoding": "gzip, deflate"}}
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    # Redaction cannot see the secret inside compressed bytes, so the broker
+    # asks for identity and refuses an encoded body instead of forwarding it.
+    assert upstream.sent is not None
+    assert [
+        value for key, value in upstream.sent.headers.items() if key.lower() == "accept-encoding"
+    ] == ["identity"]
+    assert response.status_code == 502
+    assert response.headers[CAYU_EGRESS_ERROR_HEADER] == "unsupported_content"
+    assert encoded not in response.body
+    assert decisions[-1].allowed is False
+    assert decisions[-1].error_code == "unsupported_content"
+    _no_real_secret(decisions)
+
+
+def test_credentialed_custom_upstream_may_announce_a_coding_without_a_body() -> None:
+    upstream = _FakeUpstream(
+        CapturedResponse(status_code=204, headers={"Content-Encoding": "gzip"})
+    )
+    broker, registry, _resolver, decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 204
+    assert response.body == b""
+    assert decisions[-1].allowed is True
+
+
+# The built-in upstream sends header values as Latin-1 octets, so an origin that
+# echoes this credential returns bytes that differ from its UTF-8 encoding.
+LATIN1_SECRET = "sk_test_51RéalDeadBeefSecretValue"
+
+
+def _non_ascii_secret_broker(
+    upstream: Any,
+    *,
+    secret: str = LATIN1_SECRET,
+) -> tuple[TransparentEgressBroker, VirtualCredentialRegistry, list[EgressDecision]]:
+    registry = VirtualCredentialRegistry()
+    decisions: list[EgressDecision] = []
+    broker = TransparentEgressBroker(
+        registry=registry,
+        resolver=StaticVault({"stripe_test_key": secret}),
+        policies={"stripe-example": _stripe_example_policy()},
+        upstream=upstream,
+        audit=decisions.append,
+    )
+    return broker, registry, decisions
+
+
+def test_response_redacts_every_byte_form_of_a_non_ascii_secret() -> None:
+    latin1 = LATIN1_SECRET.encode("latin-1")
+    utf8 = LATIN1_SECRET.encode()
+    upstream = _FakeUpstream(
+        CapturedResponse(
+            status_code=200,
+            headers={
+                "X-Echo-Latin-1": latin1.decode("latin-1"),
+                "X-Echo-Utf-8": utf8.decode("latin-1"),
+            },
+            body=b'{"latin1":"' + latin1 + b'","utf8":"' + utf8 + b'"}',
+        )
+    )
+    broker, registry, decisions = _non_ascii_secret_broker(upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 200
+    assert latin1 not in response.body
+    assert utf8 not in response.body
+    assert response.body == b'{"latin1":"[REDACTED_SECRET]","utf8":"[REDACTED_SECRET]"}'
+    assert response.headers["X-Echo-Latin-1"] == "[REDACTED_SECRET]"
+    assert response.headers["X-Echo-Utf-8"] == "[REDACTED_SECRET]"
+    assert all(LATIN1_SECRET not in str(asdict(decision)) for decision in decisions)
+
+
+def test_httpx_upstream_echo_of_a_non_ascii_secret_is_redacted() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Echo the exact Authorization octets the origin received.
+        authorization = next(
+            value for key, value in request.headers.raw if key.lower() == b"authorization"
+        )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=b'{"received":"' + authorization + b'"}',
+            request=request,
+        )
+
+    upstream = HttpxUpstream(
+        transport=httpx.MockTransport(handler),
+        destination_resolver=_destination_resolver("93.184.216.34"),
+    )
+    broker, registry, _decisions = _non_ascii_secret_broker(upstream)
+    grant = _mint(registry)
+
+    response = asyncio.run(broker.handle_request(_request(grant.presented_value, "/v1/customers")))
+
+    assert response.status_code == 200
+    assert LATIN1_SECRET.encode("latin-1") not in response.body
+    assert response.body == b'{"received":"Bearer [REDACTED_SECRET]"}'
+
+
 def test_response_redaction_cannot_expand_body_beyond_hard_limit() -> None:
     short_secret = "sk_test_x"
     body = short_secret.encode() * 4

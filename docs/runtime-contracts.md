@@ -3535,7 +3535,13 @@ is separate from the decoded-byte allowance. Deflate's raw-format fallback
 retains at most the received-byte ceiling and discards output from a failed
 wrapped interpretation before replaying through the bounded decoder. The
 decoded body is returned without `Content-Encoding`; unknown or stacked
-codings are rejected before the body is read. Their default DNS resolution runs in an owned helper process that is
+codings are rejected before the body is read. Every credentialed request asks
+the upstream for identity encoding, and the broker refuses a custom upstream's
+non-empty credentialed response body that still carries a non-identity
+`Content-Encoding` (502 `unsupported_content`), because the injected credential
+could not be scrubbed from it. Response scrubbing covers the credential's UTF-8
+bytes and, when it has non-ASCII characters, the Latin-1 bytes the built-in
+upstream sends header values as, in buffered and streamed bodies alike. Their default DNS resolution runs in an owned helper process that is
 terminated and reaped at the same absolute total deadline. Custom upstreams
 must prepare a side-effect-free
 `EgressUpstreamOperation` from the supplied byte and time limits before

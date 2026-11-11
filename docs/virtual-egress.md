@@ -146,7 +146,16 @@ custom upstream returns.
 
 Response scrubbing projects each body
 replacement before allocating it and rejects redaction that would expand the
-body beyond the same ceiling. Proxy
+body beyond the same ceiling. It replaces every byte form in which the broker
+may have sent the credential: its UTF-8 bytes and, for a credential with
+non-ASCII characters, its Latin-1 bytes, which is how the built-in upstream
+sends header values. Streamed bodies and response headers are scrubbed for the
+same forms. Redaction can only find a credential in identity bytes, so every
+credentialed upstream request asks for identity content encoding, and a custom
+upstream response to a credentialed request whose body still carries a
+non-identity `Content-Encoding` is refused with 502 `unsupported_content`
+rather than forwarded unscrubbed. The built-in upstream decodes such bodies
+before scrubbing, as described below. Proxy
 diagnostics use fixed codes and never reflect request targets, headers, or
 values. Chromium's opaque
 `ERR_TUNNEL_CONNECTION_FAILED` signal is reported as `fetch_failed`; only an

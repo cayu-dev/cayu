@@ -14,9 +14,11 @@ from typing import Any
 import httpx
 import pytest
 from tests.egress.test_broker_pipeline import (
+    LATIN1_SECRET,
     REAL_SECRET,
     _destination_resolver,
     _mint,
+    _non_ascii_secret_broker,
     _request,
     _stripe_example_policy,
 )
@@ -205,6 +207,71 @@ def test_streamed_scrubbing_redacts_a_secret_split_at_any_chunk_boundary(split: 
     assert items[-1] == ("end", None)
     data = b"".join(payload for kind, payload in items if kind == "data")  # type: ignore[misc]
     assert data == b"data: " + REDACTED_SECRET.encode() + b"\n\n"
+
+
+# Ends in U+00C3, whose Latin-1 byte is the lead byte of its UTF-8 form, so the
+# Latin-1 form of this secret is a prefix of its UTF-8 form.
+PREFIX_SECRET = "sk_test_51RealDeadBeefSecretValue\u00c3"
+_PREFIX_LATIN1 = PREFIX_SECRET.encode("latin-1")
+_PREFIX_UTF8 = PREFIX_SECRET.encode()
+
+
+def _split_after(secret: bytes, marker: bytes) -> list[bytes]:
+    cut = len(b"data: ") + secret.index(marker) + len(marker)
+    payload = b"data: " + secret + b"\n\n"
+    return [payload[:cut], payload[cut:]]
+
+
+@pytest.mark.parametrize(
+    ("secret", "chunks"),
+    [
+        (LATIN1_SECRET, _split_after(LATIN1_SECRET.encode("latin-1"), b"R\xe9")),
+        (LATIN1_SECRET, _split_after(LATIN1_SECRET.encode(), b"R\xc3")),
+        (PREFIX_SECRET, _split_after(_PREFIX_UTF8, b"\xc3")),
+        (PREFIX_SECRET, [b"data: " + _PREFIX_LATIN1, b"\n\n"]),
+        (PREFIX_SECRET, [b"data: " + _PREFIX_LATIN1]),
+    ],
+    ids=[
+        "latin-1-split",
+        "utf-8-split-inside-character",
+        "utf-8-split-after-latin-1-form",
+        "latin-1-form-completed-by-next-chunk",
+        "latin-1-form-at-end-of-stream",
+    ],
+)
+def test_streamed_scrubbing_redacts_every_byte_form_of_a_non_ascii_secret(
+    secret: str, chunks: list[bytes]
+) -> None:
+    async def body() -> AsyncIterator[bytes]:
+        for chunk in chunks:
+            yield chunk
+
+    async def run() -> list[tuple[str, object]]:
+        broker, registry, _decisions = _non_ascii_secret_broker(
+            _StreamingOrigin(body).upstream(), secret=secret
+        )
+        grant = _mint(registry)
+        channel = _ResponseStreamChannel(asyncio.get_running_loop())
+        response, buffers = await broker._handle_request_holding_buffer(
+            _request(grant.presented_value, "/v1/customers"),
+            response_stream=channel,
+        )
+        for response_buffer in buffers:
+            response_buffer.release()
+        assert response.body == b""
+        items = []
+        while (item := channel.get(0)) is not None:
+            items.append(item)
+        return items
+
+    items = asyncio.run(run())
+
+    assert items[0][0] == "head"
+    assert items[-1] == ("end", None)
+    data = b"".join(payload for kind, payload in items if kind == "data")  # type: ignore[misc]
+    # The whole credential is replaced; no byte of a longer form is left behind.
+    expected = b"data: " + REDACTED_SECRET.encode()
+    assert data == (expected + b"\n\n" if chunks[-1].endswith(b"\n\n") else expected)
 
 
 def test_streamed_response_over_the_byte_limit_is_truncated_after_its_head() -> None:

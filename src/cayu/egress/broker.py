@@ -5,6 +5,7 @@ import contextlib
 import contextvars
 import json
 import math
+import re
 import ssl
 import threading
 from collections import deque
@@ -809,6 +810,7 @@ class EgressResponseStream:
         "_forwarded_bytes",
         "_head",
         "_max_body_bytes",
+        "_pattern",
         "_received_bytes",
         "_response_buffer",
         "_secrets",
@@ -822,6 +824,7 @@ class EgressResponseStream:
     _forwarded_bytes: int
     _head: CapturedResponse | None
     _max_body_bytes: int
+    _pattern: re.Pattern[bytes] | None
     _received_bytes: int
     _response_buffer: EgressResponseBuffer | None
     _secrets: tuple[bytes, ...]
@@ -845,7 +848,13 @@ class EgressResponseStream:
         stream = cls.__new__(cls)
         stream._channel = channel
         stream._accept = accept
-        stream._secrets = tuple(secret.encode() for secret in secrets if secret)
+        stream._secrets = _secret_wire_forms(secrets)
+        # Longest first, so a match at a position is the longest form there.
+        stream._pattern = (
+            re.compile(b"|".join(re.escape(secret) for secret in stream._secrets))
+            if stream._secrets
+            else None
+        )
         stream._max_body_bytes = max_body_bytes
         stream._response_buffer = response_buffer
         stream._ensure_authority = ensure_authority
@@ -923,26 +932,32 @@ class EgressResponseStream:
             self._failure = error
 
     def _redact(self, data: bytes) -> bytes:
-        if not self._secrets:
+        if self._pattern is None:
             return data
         window = self._tail + data
-        replacement = REDACTED_SECRET.encode()
-        for secret in self._secrets:
-            window = window.replace(secret, replacement)
-        # Hold back only the longest suffix that could still grow into a secret.
-        # Any secret starting earlier is complete in the window and replaced.
-        hold = 0
+        # Hold back the longest suffix that could still grow into a longer
+        # secret form, even when it already ends a shorter one: a secret's
+        # Latin-1 form can be a prefix of its UTF-8 form.
+        cut = len(window)
         longest = max(len(secret) for secret in self._secrets) - 1
         for size in range(min(longest, len(window)), 0, -1):
             suffix = window[-size:]
-            if any(secret.startswith(suffix) for secret in self._secrets):
-                hold = size
+            if any(len(secret) > size and secret.startswith(suffix) for secret in self._secrets):
+                cut -= size
                 break
-        if hold:
-            window, self._tail = window[:-hold], window[-hold:]
-        else:
-            self._tail = b""
-        return window
+        # A match starting before the cut cannot grow any longer, so it is
+        # replaced whole even when it ends inside the held-back suffix.
+        parts: list[bytes] = []
+        position = 0
+        for match in self._pattern.finditer(window):
+            if match.start() >= cut:
+                break
+            parts += (window[position : match.start()], REDACTED_SECRET.encode())
+            position = match.end()
+        cut = max(cut, position)
+        parts.append(window[position:cut])
+        self._tail = window[cut:]
+        return b"".join(parts)
 
     async def _forward(self, data: bytes) -> None:
         if not data:
@@ -967,6 +982,9 @@ class EgressResponseStream:
                 raise self._failure
             raise RuntimeError("The egress response stream is not streaming.")
         tail, self._tail = self._tail, b""
+        if self._pattern is not None:
+            # No more bytes can extend a form the tail already completes.
+            tail = self._pattern.sub(REDACTED_SECRET.encode(), tail)
         try:
             await self._forward(tail)
         except BaseException as error:
@@ -2277,7 +2295,8 @@ class TransparentEgressBroker:
                 ensure_authority()
             except VirtualCredentialError:
                 return self._authority_revoked(request, authorization)
-        if authorization.require_identity_encoding:
+        if authorization.require_identity_encoding or authorization.secrets:
+            # Redaction matches a secret's bytes, which a compressed body hides.
             upstream_request = upstream_request.model_copy(
                 update={
                     "headers": {
@@ -2415,21 +2434,28 @@ class TransparentEgressBroker:
                 ensure_authority()
             except VirtualCredentialError:
                 return self._authority_revoked(request, authorization)
+        # The built-in upstream decodes any accepted coding and strips the
+        # header. A custom upstream must do the same: the guest never receives
+        # encoded bytes on browser or public-web paths, and a credentialed body
+        # must be identity bytes for redaction to find the secret in it.
+        content_encoding = _header_get(response.headers, "content-encoding")
+        if (
+            content_encoding is not None
+            and content_encoding.strip().lower() != "identity"
+            and (
+                authorization.require_identity_encoding or (authorization.secrets and response.body)
+            )
+        ):
+            return self._deny(
+                request,
+                authorization.grant_id,
+                authorization.policy_name,
+                502,
+                "Upstream returned an encoded response body.",
+                authorization_kind=authorization.authorization_kind,
+                error_code="unsupported_content",
+            )
         if authorization.require_identity_encoding:
-            # The built-in upstream decodes any accepted coding and strips the
-            # header. A custom upstream must do the same: the guest never
-            # receives encoded bytes on browser or public-web paths.
-            content_encoding = _header_get(response.headers, "content-encoding")
-            if content_encoding is not None and content_encoding.strip().lower() != "identity":
-                return self._deny(
-                    request,
-                    authorization.grant_id,
-                    authorization.policy_name,
-                    502,
-                    "Upstream returned an encoded response body.",
-                    authorization_kind=authorization.authorization_kind,
-                    error_code="unsupported_content",
-                )
             if len(response.body) > self._browser_max_response_bytes:
                 return self._deny(
                     request,
@@ -2997,6 +3023,24 @@ def _identity_response_headers(headers: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _secret_wire_forms(secrets: Sequence[str]) -> tuple[bytes, ...]:
+    """Return every byte form in which a secret may have been sent upstream.
+
+    The built-in upstream sends header values as Latin-1 octets, and a custom
+    upstream may send UTF-8, so an origin can echo either. Longest first, so a
+    secret that contains another is replaced whole.
+    """
+
+    forms: set[bytes] = set()
+    for secret in secrets:
+        if not secret:
+            continue
+        forms.add(secret.encode("utf-8"))
+        with contextlib.suppress(UnicodeEncodeError):
+            forms.add(secret.encode("latin-1"))
+    return tuple(sorted(forms, key=lambda form: (-len(form), form)))
+
+
 def _scrub_response(
     response: CapturedResponse,
     *,
@@ -3009,18 +3053,18 @@ def _scrub_response(
     if not secrets:
         return response.model_copy(update={"headers": headers, "set_cookie_headers": cookies})
 
-    # Header values preserve wire bytes through Latin-1, including UTF-8 secrets.
-    redactor = SecretRedactor(
-        (*secrets, *(secret.encode("utf-8").decode("latin-1") for secret in secrets))
-    )
+    wire_forms = _secret_wire_forms(secrets)
+    # Header values preserve wire bytes through Latin-1, so each byte form of a
+    # secret appears as its Latin-1 reading; a custom upstream may also return
+    # the secret's own characters.
+    redactor = SecretRedactor((*secrets, *(form.decode("latin-1") for form in wire_forms)))
     redacted_headers = {key: redactor.redact_text(value) for key, value in headers.items()}
     redacted_cookies = _validated_set_cookie_headers(
         tuple(redactor.redact_text(value) for value in cookies)
     )
     redacted_body = response.body
     replacement = REDACTED_SECRET.encode()
-    for secret in secrets:
-        encoded_secret = secret.encode()
+    for encoded_secret in wire_forms:
         occurrences = redacted_body.count(encoded_secret)
         if not occurrences:
             continue
