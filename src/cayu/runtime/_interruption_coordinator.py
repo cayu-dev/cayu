@@ -285,6 +285,7 @@ class BackgroundInterruptionCoordinator:
         self._workers: set[asyncio.Task[None]] = set()
         self._worker_stop = asyncio.Event()
         self._states: dict[str, _BackgroundInterruptionCascadeState] = {}
+        self._cascade_completions: set[asyncio.Future[None]] = set()
         self._draining = False
         self._sealed = False
         self._shutdown_active = False
@@ -364,8 +365,10 @@ class BackgroundInterruptionCoordinator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         drained = True
+        # Recovery may run a claimed cascade directly, without a scheduled task.
         while (
             self._tasks
+            or self._cascade_completions
             or self._has_drain_required_background_interruptions()
             or self._detached_store_tasks
         ):
@@ -373,7 +376,11 @@ class BackgroundInterruptionCoordinator:
             if remaining <= 0:
                 drained = False
                 break
-            tasks: tuple[asyncio.Task[Any], ...] = (*self._tasks, *self._detached_store_tasks)
+            tasks: tuple[asyncio.Future[Any], ...] = (
+                *self._tasks,
+                *self._detached_store_tasks,
+                *self._cascade_completions,
+            )
             deferred_task = self._deferred_task
             if deferred_task is not None and not deferred_task.done():
                 tasks = (*tasks, deferred_task)
@@ -385,13 +392,6 @@ class BackgroundInterruptionCoordinator:
                 timeout=remaining,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if loop.time() >= deadline and (
-                self._tasks
-                or self._has_drain_required_background_interruptions()
-                or self._detached_store_tasks
-            ):
-                drained = False
-                break
         if not drained:
             await self._cancel_background_interruption_work()
         else:
@@ -450,7 +450,12 @@ class BackgroundInterruptionCoordinator:
     def pending(self) -> bool:
         """Whether cascade work, or a store write it left behind, still runs."""
 
-        return bool(self._tasks) or bool(self._deferred) or bool(self._detached_store_tasks)
+        return (
+            bool(self._tasks)
+            or bool(self._cascade_completions)
+            or bool(self._deferred)
+            or bool(self._detached_store_tasks)
+        )
 
     def _retain_detached_store_task(self, task: asyncio.Task[Any]) -> None:
         self._detached_store_tasks.add(task)
@@ -665,6 +670,7 @@ class BackgroundInterruptionCoordinator:
                 node = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            node.state.claim_lost.set()
             node.state.outstanding -= 1
             if node.state.outstanding == 0:
                 node.state.done.set()
@@ -777,23 +783,31 @@ class BackgroundInterruptionCoordinator:
             cascade_session_ids={parent_session_id},
         )
         self._states[parent_session_id] = state
+        # Unlike the caller-owned recovery task, this signal covers only the
+        # cascade, including claim release, and survives hard drain cleanup.
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._cascade_completions.add(completion)
         heartbeat = asyncio.create_task(self._heartbeat_background_interruption_claim(state))
         try:
             await self._run_claimed_background_interruption_cascade(state)
         finally:
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-            if self._shutdown_active:
-                await self._workers_stopped.wait()
-            with contextlib.suppress(Exception):
-                await self.release_pending_interruption_cascade_claim(
-                    state.parent_session_id,
-                    state.attempt_id,
-                    state.generation,
-                    state.claim_id,
-                )
-            if self._states.get(parent_session_id) is state:
-                self._states.pop(parent_session_id, None)
+            try:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                if self._shutdown_active:
+                    await self._workers_stopped.wait()
+                with contextlib.suppress(Exception):
+                    await self.release_pending_interruption_cascade_claim(
+                        state.parent_session_id,
+                        state.attempt_id,
+                        state.generation,
+                        state.claim_id,
+                    )
+            finally:
+                if self._states.get(parent_session_id) is state:
+                    self._states.pop(parent_session_id, None)
+                self._cascade_completions.discard(completion)
+                completion.set_result(None)
 
     async def _run_claimed_background_interruption_cascade(
         self,
@@ -1040,6 +1054,7 @@ class BackgroundInterruptionCoordinator:
             try:
                 await self._process_background_interruption_node(node)
             except asyncio.CancelledError:
+                node.state.claim_lost.set()
                 raise
             except Exception as exc:
                 self._record_background_interruption_failure(

@@ -88,6 +88,128 @@ def test_cancelled_drain_keeps_the_callers_cancellation_request() -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("cancel_worker", [False, True])
+def test_abandoned_interruption_node_invalidates_its_cascade(monkeypatch, cancel_worker) -> None:
+    async def scenario() -> None:
+        coordinator = _bare_coordinator()
+        state = interruption_coordinator._BackgroundInterruptionCascadeState(
+            parent_session_id="parent",
+            attempt_id="attempt",
+            generation=1,
+            claim_id="claim",
+            claim_deadline_monotonic=0.0,
+            reason=None,
+            metadata={},
+            requested_by=None,
+        )
+        coordinator._enqueue_background_interruption_node(state, session_id="parent", session=None)
+        if cancel_worker:
+            started = asyncio.Event()
+
+            async def blocked_node(_node) -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(coordinator, "_process_background_interruption_node", blocked_node)
+            worker = asyncio.create_task(
+                coordinator._background_interruption_worker(asyncio.Event())
+            )
+            await started.wait()
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+        else:
+            coordinator._discard_background_interruption_queue()
+
+        assert state.outstanding == 0
+        assert state.done.is_set()
+        assert state.claim_lost.is_set()
+        await coordinator._queue.join()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action", ["complete", "timeout", "cancel"])
+def test_direct_cascade_drain_waits_without_polling_through_claim_release(
+    monkeypatch, action
+) -> None:
+    async def scenario() -> None:
+        coordinator = _bare_coordinator()
+        started = asyncio.Event()
+        finish_traversal = asyncio.Event()
+        release_started = asyncio.Event()
+        finish_release = asyncio.Event()
+        finish_caller = asyncio.Event()
+        original_sleep = asyncio.sleep
+        zero_yields = 0
+
+        async def claim(*_args, **_kwargs):
+            return {"attempt_id": "attempt", "generation": 1, "claim_id": "claim"}
+
+        async def traverse(state):
+            started.set()
+            if action == "complete":
+                await finish_traversal.wait()
+            else:
+                await state.claim_lost.wait()
+
+        async def release(*_args):
+            release_started.set()
+            await finish_release.wait()
+
+        async def recover():
+            await coordinator.run_cascade(
+                parent_session_id="parent",
+                interrupt_payload={"interruption_type": "operator_requested"},
+            )
+            # Drain must not wait for unrelated work in the caller's task.
+            await finish_caller.wait()
+
+        async def observe_sleep(delay, *args, **kwargs):
+            nonlocal zero_yields
+            if asyncio.current_task() is drainer and delay == 0:
+                zero_yields += 1
+            await original_sleep(delay, *args, **kwargs)
+
+        monkeypatch.setattr(coordinator, "claim_pending_interruption_cascade", claim)
+        monkeypatch.setattr(coordinator, "_run_claimed_background_interruption_cascade", traverse)
+        monkeypatch.setattr(coordinator, "release_pending_interruption_cascade_claim", release)
+        recovery = asyncio.create_task(recover())
+        await started.wait()
+        drainer = asyncio.create_task(coordinator.drain(timeout_s=0.05))
+        monkeypatch.setattr(asyncio, "sleep", observe_sleep)
+        try:
+            await original_sleep(0)
+            assert zero_yields == 0
+            assert not drainer.done()
+            if action == "complete":
+                finish_traversal.set()
+            else:
+                if action == "cancel":
+                    drainer.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await drainer
+                else:
+                    assert await drainer is False
+                assert coordinator.pending
+                assert await coordinator.drain(timeout_s=0.01) is False
+                drainer = asyncio.create_task(coordinator.drain(timeout_s=1))
+            await asyncio.wait_for(release_started.wait(), 1)
+            assert coordinator.pending
+            assert not drainer.done()
+            finish_release.set()
+            assert await asyncio.wait_for(drainer, 1) is True
+            assert not coordinator.pending
+            assert not recovery.done()
+        finally:
+            finish_traversal.set()
+            finish_release.set()
+            finish_caller.set()
+            await asyncio.gather(recovery, drainer, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_sealed_coordinator_refuses_new_cascades_but_drain_does_not_seal() -> None:
 
     async def scenario() -> None:

@@ -95,12 +95,13 @@ value to record: the current total plus the standard headroom of 2,000 lines or
 5 names. Lower the budget in the same pull request that removed the code, so the
 reduction cannot quietly come back.
 
-The source-line budget is 1,219,264, retaining the standard 2,000-line
-headroom above the merged total of 1,217,264 lines after the nested-worker
-cancellation fix and concurrent main-branch changes. This keeps the
-cancellation-provenance fix local to task supervision rather than coupling it
-to unrelated source removal; per-file caps and the public-name budget are
-unchanged.
+The source-line budget is 1,219,305, retaining the standard 2,000-line
+headroom above the merged total of 1,217,305 lines after the recovery-cascade
+drain completion signal, nested-worker cancellation fix and concurrent
+main-branch changes. This keeps claim-release cleanup visible to subsequent
+drains and the cancellation-provenance fix local to task supervision without
+coupling either fix to unrelated source removal. Per-file caps and the
+public-name budget are unchanged.
 
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
