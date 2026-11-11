@@ -2331,22 +2331,39 @@ class TaskStoreDispatcher(Dispatcher):
 
         requested: Task | None = None
         fence_failure: BaseException | None = None
-        try:
-            requested = await self._request_dispatch_cancellation_fence(
-                task,
-                worker_id,
-                error,
-                lease_authority=lease_authority,
-            )
-        except BaseException as exc:
-            fence_failure = (
-                unexpected_child_cancellation_error(
-                    exc,
-                    operation="Queued dispatch cancellation-fence publication",
+        # Bound retries and retained tracebacks even when the store never recovers.
+        # Exhaustion still joins the operation; failure is not quiescence evidence.
+        for attempt in range(3):
+            try:
+                if attempt:
+                    await asyncio.sleep(0.05 * (2 ** (attempt - 1)))
+                requested = await self._request_dispatch_cancellation_fence(
+                    task,
+                    worker_id,
+                    error,
+                    lease_authority=lease_authority,
                 )
-                if isinstance(exc, asyncio.CancelledError)
-                else exc
-            )
+                break
+            except BaseException as exc:
+                failure = (
+                    unexpected_child_cancellation_error(
+                        exc,
+                        operation="Queued dispatch cancellation-fence publication",
+                    )
+                    if isinstance(exc, asyncio.CancelledError)
+                    else exc
+                )
+                if fence_failure is not None:
+                    _attach_dispatch_secondary_failure(
+                        failure,
+                        fence_failure,
+                        label="Dispatch cancellation-fence publication failures",
+                    )
+                fence_failure = failure
+                if isinstance(
+                    exc, (TaskClaimLost, asyncio.CancelledError)
+                ) or _dispatch_failure_contains_process_control(exc):
+                    break
 
         operation_outcome = await await_shielded_task_outcome(operation_task)
         operation_failure = operation_outcome.error
