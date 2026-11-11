@@ -1794,6 +1794,18 @@ async def _handle_with_heartbeat_owned(
                     handler_error = exc
 
         if retry_elapsed or retry_cancellation_requested:
+            if retry_cancellation_requested:
+                # Quiescence renewed only through handler completion. Keep the
+                # claim live until the cancellation settlement commits as well.
+                heartbeat_task = _heartbeat_during_quiescence(
+                    task_store,
+                    task,
+                    worker_id,
+                    lease_seconds,
+                    heartbeat_task,
+                    stop_heartbeat,
+                    lease_authority=lease_authority,
+                )
             terminalization_label = "cancellation" if retry_cancellation_requested else "deadline"
             if retry_cancellation_requested and task.retry_series is None:
                 # The heartbeat may still be renewing (cancellation can win before dispatch,
@@ -3797,6 +3809,7 @@ async def _quiesce_task_retry_handler_before_terminalization(
                 completed, _pending = await asyncio.wait((handler_task,), timeout=interval)
                 if handler_task in completed:
                     break
+                renewal_started = monotonic()
                 renewed = await task_store.heartbeat(
                     task_id,
                     worker_id,
@@ -3804,6 +3817,9 @@ async def _quiesce_task_retry_handler_before_terminalization(
                     extend_seconds=lease_seconds,
                 )
                 lease_authority.lease_expires_at = _require_task_lease_expires_at(renewed)
+                lease_authority.deadline_monotonic = _conservative_task_lease_deadline(
+                    renewal_started, lease_seconds
+                )
                 # A successful renewal recovers the transient maintenance failure.
                 lease_maintenance_failure = None
             except asyncio.CancelledError as exc:
@@ -5733,17 +5749,11 @@ async def _settle_task_retry_cancellation_resisting_cancellation(
 ) -> tuple[TaskRetrySettlementResult | None, asyncio.CancelledError | None]:
     """Settle an operator cancellation without releasing its live owner early.
 
-    With ``lease_authority`` (a heartbeat may still be renewing the lease), the attempt is
-    read and settled under its lock, so no renewal makes the settlement's lease stale.
+    With ``lease_authority``, the settlement presents the claim's generation,
+    so renewals can keep the lease live throughout the store write.
     """
 
     async def settle() -> TaskRetrySettlementResult:
-        if lease_authority is None:
-            return await attempt()
-        async with lease_authority.lock:
-            return await attempt()
-
-    async def attempt() -> TaskRetrySettlementResult:
         task = await task_store.load_task(task_id)
         if task is None:
             raise RuntimeError("Task retry cancellation lost its durable attempt.")

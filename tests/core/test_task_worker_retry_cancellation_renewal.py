@@ -4,6 +4,7 @@ import asyncio
 
 from cayu.applications import CayuApp
 from cayu.tasks.creation import TaskCreate
+from cayu.tasks.handler_cancellation import current_task_cancellation
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskRetryPolicy, TaskStatus
 from cayu.tasks.retry import TaskRetryAttemptDisposition, TaskRetryAttemptReport
@@ -77,6 +78,66 @@ def test_cancellation_fallback_settles_after_a_renewal_moves_the_lease():
             assert store.renewed_after_read
             assert current.status is TaskStatus.CANCELLED, (current.status, current.status_reason)
         finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_settlement_retains_renewals_from_a_slow_handler_drain():
+    async def scenario():
+        class SlowSettlementStore(InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+
+            async def settle_task_retry_attempt(self, request):
+                await asyncio.sleep(1.25)
+                return await super().settle_task_retry_attempt(request)
+
+        store = SlowSettlementStore()
+        app = CayuApp(task_store=store, enable_logging=False)
+        task = await store.create_task(
+            TaskCreate(type="job", retry_policy=TaskRetryPolicy(max_attempts=2))
+        )
+        started = asyncio.Event()
+
+        async def handler(_app, _task, _worker_id):
+            signal = current_task_cancellation()
+            started.set()
+            await signal.wait()
+            # The quiescence helper must renew at least once before handing
+            # its last acknowledged deadline back to the settlement owner.
+            await asyncio.sleep(1.1)
+            return TaskRetryAttemptReport(
+                idempotency_key="drained-report",
+                disposition=TaskRetryAttemptDisposition.CANCELLED,
+                error={"code": "handler_stopped"},
+                token_count=17,
+            )
+
+        worker = asyncio.create_task(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id="drain-owner",
+                lease_seconds=1,
+                max_tasks=1,
+                reclaim=False,
+                recover_interrupted_handoffs=False,
+                interrupt_on_cancel=False,
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            await store.cancel_task(task.id, {"code": "operator"})
+            assert await asyncio.wait_for(worker, 10) == 1
+            current = await store.load_task(task.id)
+            assert current.status is TaskStatus.CANCELLED
+            assert current.error == {"code": "operator"}
+            assert current.retry_series.cumulative_tokens == 17
+        finally:
+            if not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
             await app.aclose()
 
     asyncio.run(scenario())
