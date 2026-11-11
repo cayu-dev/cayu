@@ -6164,10 +6164,19 @@ async def _settle_task_refused_by_shutdown(
     ):
         return True
     # A claim that moved on or changed meanwhile is left to lease expiry.
-    with contextlib.suppress(TaskClaimLost, TaskTerminalizationConflict):
+    try:
         await task_store.release_task(
             task_id, worker_id, claim_generation=lease_authority.claim_generation
         )
+    except TaskClaimLost:
+        pass
+    except TaskTerminalizationConflict:
+        # Cancellation may have won after the initial read but before release.
+        current = await task_store.load_task(task_id)
+        if current is not None and (
+            _task_cancellation_requested(current) or _task_retry_cancellation_requested(current)
+        ):
+            return False
     return True
 
 
