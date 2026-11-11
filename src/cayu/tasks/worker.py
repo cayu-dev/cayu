@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from cayu._exception_groups import (
     exception_cause,
     exception_tree_contains,
+    exception_tree_leaves,
     iter_exception_tree,
     set_exception_cause,
 )
@@ -1886,8 +1887,10 @@ async def _handle_with_heartbeat_owned(
             if handler_error is not None:
                 # Only this worker's own closing app counts as shutdown: a refusal
                 # from another, closed app is an ordinary handler failure.
+                # TaskGroup may wrap refusals, but a mixed group must retain
+                # ordinary handler or cleanup failures instead of requeuing.
                 if (
-                    isinstance(handler_error, ApplicationAdmissionsSealed)
+                    _is_shutdown_refusal(handler_error)
                     and app.lifecycle_state != "open"
                     and await _settle_task_refused_by_shutdown(
                         task_store,
@@ -6125,6 +6128,13 @@ async def _safe_fail_unfinished(
 
 def _is_stopped(stop: asyncio.Event | None) -> bool:
     return worker_stop_requested(stop)
+
+
+def _is_shutdown_refusal(error: BaseException) -> bool:
+    failures = exception_tree_leaves(error)
+    return bool(failures) and all(
+        isinstance(failure, ApplicationAdmissionsSealed) for failure in failures
+    )
 
 
 async def _settle_task_refused_by_shutdown(
