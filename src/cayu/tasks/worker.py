@@ -6003,17 +6003,29 @@ async def _settle_retry_attempt_report(
     series = task.retry_series
     if series is None:
         raise TypeError("TaskRetryAttemptReport requires a task retry policy.")
-    await _settle_task_retry_request_with_lease_authority(
-        task_store,
-        TaskRetrySettlementRequest(
-            task_id=task.id,
-            worker_id=worker_id,
-            claim_generation=lease_authority.claim_generation,
-            causal_budget_id=series.causal_budget_id,
-            **copied.model_dump(mode="python", warnings=False),
-        ),
-        lease_authority,
-    )
+    try:
+        await _settle_task_retry_request_with_lease_authority(
+            task_store,
+            TaskRetrySettlementRequest(
+                task_id=task.id,
+                worker_id=worker_id,
+                claim_generation=lease_authority.claim_generation,
+                causal_budget_id=series.causal_budget_id,
+                **copied.model_dump(mode="python", warnings=False),
+            ),
+            lease_authority,
+        )
+    except TaskClaimLost:
+        current = await task_store.load_task(task.id)
+        if (
+            current is not None
+            and current.status in _HELD_TASK_STATUSES
+            and current.claim_generation == lease_authority.claim_generation
+        ):
+            # A deliberate hold ends this claim, just as it does for heartbeats.
+            # Preserve it without letting this handler settle a later claim.
+            return
+        raise
 
 
 async def _settle_task_retry_request_with_lease_authority(
