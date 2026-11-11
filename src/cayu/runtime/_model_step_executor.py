@@ -1605,6 +1605,7 @@ class ModelStepExecutor:
         model_execution_selection: ModelExecutionSelection | None = None,
         prior_provider_effect_observed: bool = False,
         context_overflow: _ModelFailoverContextOverflow | None = None,
+        retry_window_started_at: float | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         if type(prior_provider_effect_observed) is not bool:
             raise TypeError("Prior model effect observation must be a boolean.")
@@ -1813,7 +1814,8 @@ class ModelStepExecutor:
             raise ValueError("Initial model attempt belongs to a different logical step.")
         attempt = 1
         # The rate-limit retry budget counts from the step's first attempt.
-        retry_window_started_at = asyncio.get_running_loop().time()
+        if retry_window_started_at is None:
+            retry_window_started_at = asyncio.get_running_loop().time()
 
         def retry_elapsed_s() -> float:
             return max(0.0, asyncio.get_running_loop().time() - retry_window_started_at)
@@ -4571,6 +4573,8 @@ class ModelStepRun:
         )
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
         selected_context_overflow: _ModelFailoverContextOverflow | None = None
+        # Rebuilding context retains the logical step's original retry window.
+        retry_window_started_at = asyncio.get_running_loop().time()
 
         def record_model_attempt_identity(identity: ModelAttemptIdentity) -> None:
             nonlocal latest_model_attempt_identity
@@ -4601,6 +4605,7 @@ class ModelStepRun:
                 model_step_identity=model_step_identity,
                 initial_model_attempt_identity=initial_identity,
                 retry_policy=self._retry_policy,
+                retry_window_started_at=retry_window_started_at,
                 transcript_cursor_before_request=transcript_cursor_before_request,
                 record_model_completion=record_model_completion,
                 prepare_provider_dispatch=prepare_provider_dispatch,
