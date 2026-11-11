@@ -21,6 +21,7 @@ from cayu._exception_groups import (
 from cayu._task_wait import (
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
+    unexpected_child_cancellation_error,
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
@@ -2098,6 +2099,11 @@ class ToolInvocation:
                         post_tool_cancellation,
                         publication_outcome.error,
                         restore_cancellation_requests=post_tool_cancellation_requests_consumed,
+                    )
+                if isinstance(publication_outcome.error, asyncio.CancelledError):
+                    raise unexpected_child_cancellation_error(
+                        publication_outcome.error,
+                        operation="Tool invocation evidence publication",
                     )
                 raise publication_outcome.error
 
