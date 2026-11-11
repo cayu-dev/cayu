@@ -40,6 +40,10 @@ from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.execution import CorpusTarget, WorkflowEvalTarget
 from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
+from cayu.runtime.orphaned_sessions import (
+    DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
+    DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
+)
 from cayu.runtime.system_diagnostics import DeploymentKind
 from cayu.server._browser_control_config import BrowserControlServerConfig
 from cayu.server.auth import TrustedLocalAuth
@@ -60,8 +64,6 @@ DEFAULT_SERVER_TITLE = "Cayu"
 DEFAULT_DASHBOARD_PATH = "/cayu"
 DEFAULT_LOCAL_CORS_ORIGIN = "http://localhost:5173"
 DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS = 300
-DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS = 600.0
-DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS = 3600
 DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS = 10.0
 DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS = 10.0
@@ -576,7 +578,8 @@ class ServerLifecycleConfig(BaseModel):
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS
     # How often the server ends runs a lost worker left holding sessions running
-    # (``CayuApp.reconcile_orphaned_sessions``); ``None`` turns it off.
+    # (``CayuApp.reconcile_orphaned_sessions``), starting when it starts; ``None``
+    # turns it off.
     orphaned_session_reconcile_interval_seconds: float | None = (
         DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS
     )

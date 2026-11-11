@@ -130,7 +130,8 @@ async def handle_hunt(app: CayuApp, task: Task, claimed_by: str) -> None:
 The CLI does not infer a handler, query, task store, abandoned-session
 boundary, or recovery policy. Configure those in the factory or named
 entrypoint. In particular, `cayu worker` performs no implicit incomplete-session
-recovery.
+recovery, apart from reconciling sessions whose worker is provably gone
+([below](#sessions-a-lost-worker-left-running)).
 
 ## A deploy during a long task
 
@@ -219,6 +220,25 @@ crashes its worker every time doesn't loop. Tasks that aren't restartable are
 still cancelled. The flags set `CAYU_WORKER_RESTART_ABANDONED` and
 `CAYU_WORKER_MAX_ABANDONED_RESTARTS`, which `run_task_worker` reads when the
 entrypoint doesn't pass `restart_abandoned` and `max_abandoned_restarts` itself.
+
+### Sessions a lost worker left running
+
+A worker that is stopped or killed while a handler runs sessions leaves those
+sessions `running`, with nothing to continue them. `cayu worker` ends them as
+`cayu serve` does (`CayuApp.reconcile_orphaned_sessions`): when it starts and every
+10 minutes after, each `running` session whose owner is provably gone (its execution
+lease lapsed or its process died, and every task of it is finished) and that has been
+quiet for an hour is left interrupted, or fails with reason
+`orphaned_session_reconciled` where its environment isn't registered in this
+process. A session with a live owner, an unfinished task or recent activity is left
+alone. The worker does this too because a deployed web process may sleep while the
+worker runs, as a Cayu Cloud Agent's does. Only the first of several processes
+reconciles (`CAYU_WORKER_INDEX` `0`), and a run until idle finishes the pass it
+started before it exits. Change the times with
+`--orphaned-session-reconcile-interval-seconds SECONDS` (`off` turns it off) and
+`--orphaned-session-inactive-after-seconds SECONDS`. A worker started another way
+runs `run_orphaned_session_reconciliation(app, stop)` from
+`cayu.runtime.orphaned_sessions` beside its entrypoint.
 
 ## Inspect tasks
 

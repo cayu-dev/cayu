@@ -46,11 +46,11 @@ from cayu.project_control_plane import (
     resolve_project_control_plane_context,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.runtime.orphaned_sessions import run_orphaned_session_reconciliation
 from cayu.server._event_side_effect_health import EventSideEffectRecoveryLoop
 from cayu.sessions.event_delivery import safe_error
 from cayu.sessions.records import SessionStatus
 from cayu.sessions.recovery import (
-    IncompleteSessionRecoveryAction,
     RecoveryBlockerCode,
     RecoveryExecutionRequest,
     RecoveryPlan,
@@ -1513,41 +1513,19 @@ def _start_storage_growth_report(app: CayuApp) -> asyncio.Task[None] | None:
     return asyncio.create_task(report(), name="cayu-storage-growth-report")
 
 
-async def _reconcile_orphaned_sessions_forever(
-    app: CayuApp, *, interval_seconds: float, inactive_for_seconds: int
-) -> None:
-    """End, on a schedule, the runs a lost worker left holding sessions running."""
-
-    while True:
-        await asyncio.sleep(interval_seconds)
-        try:
-            results = await app.reconcile_orphaned_sessions(
-                inactive_for_seconds=inactive_for_seconds
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Orphaned-session reconciliation failed; it retries next interval.")
-            continue
-        if results:
-            logger.info(
-                "Reconciled %d orphaned running session(s); %d could not be reconciled.",
-                sum(IncompleteSessionRecoveryAction.FAILED not in r.actions for r in results),
-                sum(IncompleteSessionRecoveryAction.FAILED in r.actions for r in results),
-            )
-
-
 def _start_orphaned_session_reconciliation(
     app: CayuApp, lifecycle: ServerLifecycleConfig
 ) -> asyncio.Task[None] | None:
-    """Run ``CayuApp.reconcile_orphaned_sessions`` every configured interval, if any."""
+    """Run ``CayuApp.reconcile_orphaned_sessions`` at startup and every configured
+    interval, if any; shutdown cancels it."""
 
     interval = lifecycle.orphaned_session_reconcile_interval_seconds
     if interval is None:
         return None
     return asyncio.create_task(
-        _reconcile_orphaned_sessions_forever(
+        run_orphaned_session_reconciliation(
             app,
+            asyncio.Event(),
             interval_seconds=interval,
             inactive_for_seconds=lifecycle.orphaned_session_inactive_after_seconds,
         ),

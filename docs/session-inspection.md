@@ -1050,14 +1050,16 @@ running again, the sweep closes none of them and reports `skipped_active` for th
 closed session; interrupt that child and the next sweep, or a repeated close,
 closes the rest.
 
-You often don't have to close such a session yourself. `cayu serve` reconciles,
-every 10 minutes, each running session whose owner is provably gone and that has
-been quiet for an hour (`CayuApp.reconcile_orphaned_sessions`): it is left
-interrupted, with a recovery item in the inbox when a call it was running has an
-unknown outcome, or, where its environment isn't registered, it fails with reason
-`orphaned_session_reconciled`. `ServerLifecycleConfig` sets both times
+You often don't have to close such a session yourself. `cayu serve` and `cayu
+worker` reconcile, when they start and every 10 minutes after, each running session
+whose owner is provably gone and that has been quiet for an hour
+(`CayuApp.reconcile_orphaned_sessions`): it is left interrupted, with a recovery item
+in the inbox when a call it was running has an unknown outcome, or, where its
+environment isn't registered, it fails with reason `orphaned_session_reconciled`.
+`ServerLifecycleConfig` sets both times for the server
 (`orphaned_session_reconcile_interval_seconds`, `None` to turn it off, and
-`orphaned_session_inactive_after_seconds`).
+`orphaned_session_inactive_after_seconds`), and `cayu worker`'s flags of the same
+names for a worker ([how](project-workers.md#sessions-a-lost-worker-left-running)).
 
 With `--application NAME` it goes through the Agent's own Cayu API as you, like the
 reads below, which needs a developer or admin. Without it, it opens the project's

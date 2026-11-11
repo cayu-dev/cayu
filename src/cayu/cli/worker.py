@@ -34,6 +34,11 @@ from cayu.runtime._process_workers import (
     supervisor_watchdog,
     watch_supervisor,
 )
+from cayu.runtime.orphaned_sessions import (
+    DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
+    DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
+    run_orphaned_session_reconciliation,
+)
 from cayu.tasks.abandoned import (
     MAX_ABANDONED_RESTARTS_ENV,
     RECONCILE_ABANDONED_AFTER_ENV,
@@ -56,6 +61,7 @@ _EVAL_TASK_SERVICE_SECONDS = 5.0
 WORKER_PROCESSES_ENV = "CAYU_WORKER_PROCESSES"
 _AUTO = "auto"
 _PROCESSES_TABLE = "worker_processes"
+_OFF = "off"
 
 
 class WorkerError(ValueError):
@@ -141,6 +147,28 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument(
+        "--orphaned-session-reconcile-interval-seconds",
+        type=_reconcile_interval,
+        default=DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "How often the worker's first process ends the runs a lost worker left holding "
+            "sessions running (CayuApp.reconcile_orphaned_sessions), starting when it starts, "
+            "as cayu serve does; off turns it off (default: "
+            f"{DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS:g})."
+        ),
+    )
+    parser.add_argument(
+        "--orphaned-session-inactive-after-seconds",
+        type=_inactive_seconds,
+        default=DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "How long such a session must have been quiet before it is reconciled "
+            f"(default: {DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS})."
+        ),
+    )
+    parser.add_argument(
         "--until-idle",
         action="store_true",
         help=(
@@ -200,6 +228,16 @@ def _run_worker(args: argparse.Namespace) -> int:
             os.environ[RESTART_ABANDONED_ENV] = "1"
         if max_restarts is not None:
             os.environ[MAX_ABANDONED_RESTARTS_ENV] = str(max_restarts)
+        reconcile_interval = getattr(
+            args,
+            "orphaned_session_reconcile_interval_seconds",
+            DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
+        )
+        inactive_after = getattr(
+            args,
+            "orphaned_session_inactive_after_seconds",
+            DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
+        )
         if processes > 1:
             print(_processes_notice(args.name, processes, requested), file=sys.stderr, flush=True)
             outcome = asyncio.run(
@@ -216,6 +254,10 @@ def _run_worker(args: argparse.Namespace) -> int:
                                 "1",
                                 "--shutdown-grace-seconds",
                                 str(args.shutdown_grace_seconds),
+                                "--orphaned-session-reconcile-interval-seconds",
+                                _OFF if reconcile_interval is None else repr(reconcile_interval),
+                                "--orphaned-session-inactive-after-seconds",
+                                str(inactive_after),
                             ),
                             cwd=project.root,
                             environment=process_worker_environment(index, processes),
@@ -244,6 +286,13 @@ def _run_worker(args: argparse.Namespace) -> int:
                         name=args.name,
                         shutdown_grace_seconds=args.shutdown_grace_seconds,
                         until_idle=until_idle,
+                        # One process of a worker started with several reconciles.
+                        orphaned_session_reconcile_interval_seconds=(
+                            reconcile_interval
+                            if os.environ.get("CAYU_WORKER_INDEX", "0") == "0"
+                            else None
+                        ),
+                        orphaned_session_inactive_after_seconds=inactive_after,
                         evals=None if evals is None else evals.coordinator,
                         eval_apps=() if evals is None else evals.apps,
                         eval_context=None if evals is None else evals.context,
@@ -408,11 +457,19 @@ async def _invoke_worker(
     name: str,
     shutdown_grace_seconds: float,
     until_idle: bool = False,
+    orphaned_session_reconcile_interval_seconds: float | None = None,
+    orphaned_session_inactive_after_seconds: int = DEFAULT_ORPHANED_SESSION_INACTIVE_AFTER_SECONDS,
     evals: EvalRunCoordinator | None = None,
     eval_apps: tuple[CayuApp, ...] = (),
     eval_context: ProjectControlPlaneContext | None = None,
 ) -> int:
     """Run ``target`` until it returns or a signal stops it.
+
+    With ``orphaned_session_reconcile_interval_seconds``, the runs a lost worker left
+    holding sessions ``running`` are reconciled beside it, at once and then every
+    interval (``run_orphaned_session_reconciliation``): an Agent's web process, which
+    reconciles them too, may be asleep while its worker runs. A run until idle finishes
+    the pass it started before it exits; otherwise the pass stops with the worker.
 
     ``evals`` runs the project's eval runs beside it: until no run is left when
     the worker runs until idle, and otherwise until it stops. A drained worker
@@ -466,12 +523,24 @@ async def _invoke_worker(
     worker_task: asyncio.Future[Any] | None = None
     idle_result: TaskWorkerIdleResult | None = None
     signal_wait: asyncio.Task[bool] | None = None
+    reconciliation: asyncio.Task[None] | None = None
+    reconciliation_stop = asyncio.Event()
     supervisor_watch = asyncio.create_task(watch_supervisor(request_stop))
     drain_watch = asyncio.create_task(watch_cloud_drain(request_drain))
     try:
         # No-ops outside Cayu Cloud; close_project_app stops them.
         await app.start_managed_settings(role="worker")
         await app.start_model_slots()
+        if orphaned_session_reconcile_interval_seconds is not None:
+            reconciliation = asyncio.create_task(
+                run_orphaned_session_reconciliation(
+                    app,
+                    reconciliation_stop,
+                    interval_seconds=orphaned_session_reconcile_interval_seconds,
+                    inactive_for_seconds=orphaned_session_inactive_after_seconds,
+                ),
+                name=f"cayu-worker-{name}-orphaned-sessions",
+            )
 
         def start_entrypoint() -> asyncio.Future[Any]:
             # The entrypoint's task copies this context when it is created.
@@ -502,7 +571,17 @@ async def _invoke_worker(
         if worker_task in done and received_signal is None:
             outcome = await worker_task
             if until_idle:
-                idle_result = _idle_result(outcome, name)
+                result = _idle_result(outcome, name)
+                if reconciliation is not None:
+                    # Its pass may be all this run does for a session a lost worker
+                    # left running. A signal stops it, and the run, instead.
+                    reconciliation_stop.set()
+                    await asyncio.wait(
+                        {reconciliation, signal_wait}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if received_signal is not None:
+                        return 128 + received_signal
+                idle_result = result
             if evals is None or until_idle:
                 return 0
             # A drained worker finishes the eval run it holds; otherwise it releases it.
@@ -535,6 +614,24 @@ async def _invoke_worker(
             )
         return 128 + received_signal
     finally:
+
+        def remaining_grace() -> float:
+            # After a stop signal, what is left of its grace, so the whole shutdown
+            # stays within the supervisor's bound.
+            if stop_requested_at is None:
+                return shutdown_grace_seconds
+            return max(
+                stop_requested_at + shutdown_grace_seconds - loop.time(),
+                _MIN_APP_SHUTDOWN_SECONDS,
+            )
+
+        if reconciliation is not None and not await _cancelled_within(
+            reconciliation, remaining_grace()
+        ):
+            _exit_after_shutdown_timeout(
+                f"Worker {name!r} did not stop reconciling orphaned sessions within "
+                f"{shutdown_grace_seconds:g} seconds."
+            )
         supervisor_watch.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await supervisor_watch
@@ -555,20 +652,8 @@ async def _invoke_worker(
             loop.remove_signal_handler(signum)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-        # After a stop signal the apps get what is left of the same grace, so
-        # the whole shutdown stays within the supervisor's bound.
         for closing in (*eval_apps, app):
-            await close_project_app(
-                closing,
-                timeout_s=(
-                    shutdown_grace_seconds
-                    if stop_requested_at is None
-                    else max(
-                        stop_requested_at + shutdown_grace_seconds - loop.time(),
-                        _MIN_APP_SHUTDOWN_SECONDS,
-                    )
-                ),
-            )
+            await close_project_app(closing, timeout_s=remaining_grace())
         if eval_context is not None:
             await eval_context.close()
         # Last, so a host can read the final stdout line.
@@ -656,6 +741,28 @@ def _non_negative_seconds(value: str) -> float:
     return seconds
 
 
+def _reconcile_interval(value: str) -> float | None:
+    if value.strip().lower() == _OFF:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds or off.") from None
+    if not isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive, or off.")
+    return seconds
+
+
+def _inactive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number of seconds.") from None
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must not be negative.")
+    return seconds
+
+
 def _restart_count(value: str) -> int:
     try:
         count = int(value)
@@ -664,6 +771,19 @@ def _restart_count(value: str) -> int:
     if not 0 <= count <= TASK_MAX_RESTARTS_LIMIT:
         raise argparse.ArgumentTypeError(f"must be from 0 to {TASK_MAX_RESTARTS_LIMIT}.")
     return count
+
+
+async def _cancelled_within(task: asyncio.Task[Any], timeout: float) -> bool:
+    """Cancel ``task`` and wait up to ``timeout`` seconds for it; whether it ended."""
+
+    task.cancel()
+    await asyncio.wait({task}, timeout=timeout)
+    if not task.done():
+        return False
+    if not task.cancelled():
+        # Retrieved so it isn't reported unhandled; the loop logs its own failures.
+        task.exception()
+    return True
 
 
 def _exit_after_shutdown_timeout(message: str) -> NoReturn:

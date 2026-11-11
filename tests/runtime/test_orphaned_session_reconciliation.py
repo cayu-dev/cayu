@@ -1015,3 +1015,77 @@ def test_an_abandonment_that_died_before_releasing_its_claim_finishes(
         await stores.close()
 
     asyncio.run(scenario())
+
+
+def test_the_server_reconciles_as_soon_as_it_starts(tmp_path) -> None:
+    # A Cloud Agent's web process sleeps when nobody uses it and starts again on the
+    # next request, such as the next deploy's session check: it reconciles then, not
+    # an interval later.
+    path = tmp_path / "sessions.sqlite"
+    _orphan(path, "scan", crash="setup")
+    store = SQLiteSessionStore(path)
+    reader = _application(store)
+    config = ServerConfig.protected(
+        _authenticate,
+        lifecycle=ServerLifecycleConfig(
+            orphaned_session_reconcile_interval_seconds=3600,
+            orphaned_session_inactive_after_seconds=0,
+        ),
+    )
+
+    with TestClient(create_server(reader, config=config)) as client:
+        client.portal.call(_wait_until_failed, store, "scan")
+        payload = client.portal.call(_failure, store, "scan")
+        assert payload["reason"] == "orphaned_session_reconciled"
+
+
+async def _wait_until_failed(store, session_id: str) -> None:
+    for _attempt in range(200):
+        # The sweep fails the session, then publishes session.failed.
+        if (await store.load(session_id)).status is SessionStatus.FAILED and any(
+            event.type is EventType.SESSION_FAILED for event in await store.load_events(session_id)
+        ):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("The orphaned session was not reconciled.")
+
+
+def test_the_reconciliation_loop_runs_at_once_and_until_stopped(tmp_path) -> None:
+    from cayu.runtime.orphaned_sessions import run_orphaned_session_reconciliation
+
+    path = tmp_path / "sessions.sqlite"
+    _orphan(path, "scan", crash="setup")
+
+    async def scenario() -> None:
+        store = SQLiteSessionStore(path)
+        reader = _application(store)
+        stop = asyncio.Event()
+        loop = asyncio.create_task(
+            run_orphaned_session_reconciliation(
+                reader, stop, interval_seconds=3600, inactive_for_seconds=0
+            )
+        )
+        await _wait_until_failed(store, "scan")
+        assert (await _failure(store, "scan"))["reason"] == "orphaned_session_reconciled"
+        stop.set()
+        await asyncio.wait_for(loop, 5)
+        await reader.aclose()
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("interval", "inactive", "error"),
+    [(0, 0, ValueError), (float("inf"), 0, ValueError), (True, 0, TypeError), (1, -1, ValueError)],
+)
+def test_the_reconciliation_loop_refuses_bad_timing(interval, inactive, error) -> None:
+    from cayu.runtime.orphaned_sessions import run_orphaned_session_reconciliation
+
+    app = CayuApp(enable_logging=False)
+    with pytest.raises(error):
+        asyncio.run(
+            run_orphaned_session_reconciliation(
+                app, asyncio.Event(), interval_seconds=interval, inactive_for_seconds=inactive
+            )
+        )

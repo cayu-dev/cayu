@@ -1895,11 +1895,16 @@ left alone and not reported; one session's failure is reported with a `failed` a
 and never stops the sweep. The sweep also finishes an abandonment that failed a
 session but stopped before publishing `session.failed` or settling the run's
 interaction (a process that died in between), for sessions that ended up to seven
-days before the window. The server built by `create_server` (`cayu serve`) runs it
-every `ServerLifecycleConfig.orphaned_session_reconcile_interval_seconds` (default
-600; `None` turns it off) with `orphaned_session_inactive_after_seconds` (default
-3600). An application that mounts Cayu into its own server, or runs without one,
-calls it itself.
+days before the window. `run_orphaned_session_reconciliation(app, stop,
+interval_seconds=600, inactive_for_seconds=3600)` from `cayu.runtime.orphaned_sessions`
+runs it at once and then every interval until `stop` is set; a failed pass is logged
+and retried. The server built by `create_server` (`cayu serve`) runs that loop from
+startup with `ServerLifecycleConfig.orphaned_session_reconcile_interval_seconds`
+(default 600; `None` turns it off) and `orphaned_session_inactive_after_seconds`
+(default 3600), and `cayu worker` runs it in its first process with the flags of the
+same names (`--orphaned-session-reconcile-interval-seconds off` turns it off), since a
+deployed web process may sleep while the worker runs. An application that mounts Cayu
+into its own server, or runs its workers another way, runs the loop itself.
 
 `CayuApp.close_session(session_id, reason=..., closed_by=...)` ends any pending or
 interrupted session as abandoned, including one paused on an approval or a question
