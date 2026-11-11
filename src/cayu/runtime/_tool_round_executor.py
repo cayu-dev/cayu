@@ -27,6 +27,7 @@ from cayu._exception_groups import (
     iter_exception_tree,
     set_exception_cause,
 )
+from cayu._exception_state import pop_exception_state, set_exception_state
 from cayu._task_wait import (
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
@@ -225,6 +226,7 @@ CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
 
 
 _logger = logging.getLogger(__name__)
+_COOPERATIVE_CANCELLATION_EVIDENCE_ATTRIBUTE = "_cayu_cooperative_cancellation_evidence"
 
 
 @dataclass(frozen=True)
@@ -2045,6 +2047,8 @@ class ToolRoundRun:
                     exc,
                     closure_error=closure_error,
                 )
+            finally:
+                pop_exception_state(exc, _COOPERATIVE_CANCELLATION_EVIDENCE_ATTRIBUTE)
             for event in interruption_events:
                 yield event
             raise
@@ -2191,7 +2195,14 @@ class ToolRoundRun:
         cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None
         cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
         if isinstance(exc, SessionInterruptedByRequest):
-            pass
+            cancellation = pop_exception_state(exc, _COOPERATIVE_CANCELLATION_EVIDENCE_ATTRIBUTE)
+            if isinstance(cancellation, asyncio.CancelledError):
+                cancellation_artifacts_by_id = invocation_secrets.cancellation_artifacts_by_id(
+                    cancellation
+                )
+                cancellation_redactors_by_id = invocation_secrets.cancellation_redactors_by_id(
+                    cancellation
+                )
         elif isinstance(exc, BaseExceptionGroup):
             if not is_current_runner_cancellation_group(exc):
                 raise TypeError("Unsupported interrupt exception group.")
@@ -2584,6 +2595,21 @@ class ToolRoundRun:
                         break
             else:
                 parallel_failure = _parallel_tool_round_exception(exc_group)
+                if isinstance(parallel_failure, SessionInterruptedByRequest):
+                    # TaskGroup omits cancelled siblings from its exception group.
+                    # Carry their authenticated per-call evidence with the
+                    # cooperative signal until interrupted-round closure consumes it.
+                    cancellation_evidence = asyncio.CancelledError()
+                    _transfer_cancellation_evidence(
+                        cancellation_evidence,
+                        cancellation_sources,
+                        tool_calls=tool_calls,
+                    )
+                    set_exception_state(
+                        parallel_failure,
+                        _COOPERATIVE_CANCELLATION_EVIDENCE_ATTRIBUTE,
+                        cancellation_evidence,
+                    )
                 if child_runner_failures:
                     failure_cause = _parallel_tool_round_cause(
                         exc_group,
