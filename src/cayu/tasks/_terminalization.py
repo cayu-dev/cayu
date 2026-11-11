@@ -438,14 +438,20 @@ async def _terminalize_claimed_task_or_requested_cancellation(
 async def _settle_claim_or_requested_cancellation(
     task_store: TaskStore,
     request: TaskTerminalizationRequest,
+    *,
+    cancellation_claim_generation: int | None = None,
 ) -> tuple[Task, bool]:
     """The terminal task, and whether the owner's cancellation request settled it.
 
     The cancellation is fenced by the failing request: its worker, its handoff,
     and its claim generation, or without one its lease when it carries one.
     Once settled, a repeat of the same request returns the task that request's
-    receipt cancelled.
+    receipt cancelled. A worker may supply its stable generation for cancellation
+    settlement separately, preserving an elected failure request's digest.
     """
+
+    if cancellation_claim_generation is None:
+        cancellation_claim_generation = request.claim_generation
 
     try:
         return await _terminalize_claimed_task(task_store, request), False
@@ -484,7 +490,7 @@ async def _settle_claim_or_requested_cancellation(
         cancellation = _task_cancellation_terminalization_request(
             task,
             worker_id=request.worker_id,
-            claim_generation=request.claim_generation,
+            claim_generation=cancellation_claim_generation,
         )
         if cancellation is None:
             raise

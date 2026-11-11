@@ -140,7 +140,7 @@ from cayu.tasks._task_run_settlement import (
     release_unstarted_claims,
 )
 from cayu.tasks._terminalization import (
-    _terminalize_claimed_task,
+    _settle_claim_or_requested_cancellation,
     _terminalize_claimed_task_or_detect_peer_winner,
     settle_task_retry_attempt_with_retry,
 )
@@ -5329,7 +5329,7 @@ async def _settle_pending_runtime_task_failure_owner(
         raise TaskClaimLost(
             "Pending runtime task failure conflicts with its elected task mutation."
         ) from None
-    terminal = await _terminalize_claimed_task(
+    terminal, settled_by_cancellation = await _settle_claim_or_requested_cancellation(
         task_store,
         runtime_task_failure_terminalization_request(
             task_id=task_id,
@@ -5338,12 +5338,16 @@ async def _settle_pending_runtime_task_failure_owner(
             session_id=pending.session_id,
             error=decision.task_error_payload,
         ),
+        # Keep the elected failure mutation unchanged, but fence cancellation by
+        # the stable claim: heartbeats may renew its lease during settlement.
+        cancellation_claim_generation=lease_authority.claim_generation,
     )
+    expected_status = TaskStatus.CANCELLED if settled_by_cancellation else TaskStatus.FAILED
     if (
-        terminal.status is not TaskStatus.FAILED
+        terminal.status is not expected_status
         or terminal.session_id != pending.session_id
         or terminal.session_instance_id != pending.session_instance_id
-        or terminal.error != decision.task_error_payload
+        or (not settled_by_cancellation and terminal.error != decision.task_error_payload)
     ):
         raise TaskClaimLost(
             "Task terminalization returned conflicting runtime failure evidence."
