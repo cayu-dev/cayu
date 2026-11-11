@@ -3036,11 +3036,25 @@ async def _raise_task_retry_owner_cancellation(
                 lease_authority=lease_authority,
             )
         else:
-            await task_store.release_task(
-                task.id,
-                worker_id,
-                claim_generation=lease_authority.claim_generation,
-            )
+            try:
+                await task_store.release_task(
+                    task.id,
+                    worker_id,
+                    claim_generation=lease_authority.claim_generation,
+                )
+            except TaskTerminalizationConflict:
+                # Cancellation may commit after the last heartbeat but before release.
+                current = await task_store.load_task(task.id)
+                if current is None:
+                    raise
+                requested_cancellation = _task_retry_requested_cancellation_settlement(
+                    current,
+                    worker_id=worker_id,
+                    claim_generation=lease_authority.claim_generation,
+                )
+                if requested_cancellation is None:
+                    raise
+                await settle_task_retry_attempt_with_retry(task_store, requested_cancellation)
         if handler_failure is not None:
             raise handler_failure
 
