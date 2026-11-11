@@ -1720,6 +1720,23 @@ Accepted arguments and their SHA-256 are written into the approval's resolution 
 
 If a tool has `tool.call.started` for that approval without a terminal event, Cayu leaves the session `interrupted` with `manual_recovery_required` instead of re-running a side-effecting tool whose outcome is unknown. The caller can then use `CayuApp.recover_tool_approval(ToolApprovalRecoveryRequest(...))` to mark the externally verified outcome as `completed` or `failed` and provide the exact message the model should see. Recovery performs the same atomic approval and intent claim and persists the caller-supplied message as the terminal tool result. It closes the exact approval pair and continues only when every call in the round now has a terminal outcome and the claimed modern intent supplies the original request digest. Recovery never treats its own reason, metadata, or actor as authority to run a remaining sibling; when any call remains unresolved, the verified result stays durable, the approval remains interrupted, and an exact retry of the original `ToolApprovalRequest` is required before pending work can execute. Cayu does not infer domain facts for recovery. Normal `ResumeRequest` rejects sessions with pending tool approvals because provider histories require the assistant tool-call round to be followed by matching tool results before any later conversation.
 
+An operator interruption that another process commits while `recover_tool_approval`
+is running wins over a recovery that then fails. The recovery replaces only the
+`running` status it set itself, so it never writes `interrupted` over the
+`interrupting` status of that request. When the environment reconnect fails, the
+recovery finalizes the durable operator request and its stream ends with that
+request's `session.interrupted` event (`interruption_type="operator_requested"`,
+with its reason, metadata, and `interruption_request_id`) in place of a
+`tool_approval_required` interruption. When the recovery fails before the
+caller-supplied result is durable, its exit settlement finalizes the request the
+same way and the failure is still raised to the caller. Either way the request's
+`pending_session_interrupt` marker is cleared once that event is durable, its
+`pending_interruption_cascade` is reconciled as for any operator interruption,
+and the approval and its resolution intent stay pending, so the same recovery
+request can be retried. If the settlement cannot run (the recovery lost its run
+fence, or the process is stopping), the session stays `interrupting` for
+`recover_incomplete_session(...)`.
+
 Legacy private `tool.call.approval_requested` events may nest the complete
 approval under `event.payload["approval"]`. Current durable and public events
 retain the typed approval descriptor but set `arguments_state="quarantined"`

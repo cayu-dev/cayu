@@ -6127,21 +6127,14 @@ class RecoveryCoordinator:
                 from_statuses={SessionStatus.RUNNING},
                 to_status=SessionStatus.INTERRUPTED,
             )
-        except SessionStatusConflict:
-            current = await self._recovery_ownership.require_session(session.id)
-            if current.status not in {SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED}:
-                raise
-            # An operator interruption won the status transition. Finalize its
-            # durable request so its identity, reason, and cascade are preserved.
-            async for event in self._session_finalization.interrupt_recovery(
-                RecoveryInterruptionRequest(
-                    session=current,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                    execution_profile=execution_profile,
-                    invocation_context=invocation_context,
-                )
+        except SessionStatusConflict as conflict:
+            async for event in self._finalize_interruption_that_won_status(
+                conflict,
+                session_id=session.id,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
             ):
                 yield event
             return
@@ -6170,6 +6163,61 @@ class RecoveryCoordinator:
             )
         ):
             yield event
+
+    async def _finalize_interruption_that_won_status(
+        self,
+        conflict: SessionStatusConflict,
+        *,
+        session_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        execution_profile: ExecutionProfileIdentity,
+        invocation_context: InvocationContext | None,
+    ) -> AsyncGenerator[Event, None]:
+        """Finish the interruption that moved a status this recovery tried to close.
+
+        ``conflict`` is the refused transition. It is raised again unless the
+        status is now an interruption's.
+        """
+        current = await self._recovery_ownership.require_session(session_id)
+        if current.status not in {SessionStatus.INTERRUPTING, SessionStatus.INTERRUPTED}:
+            raise conflict
+        # An operator interruption won the status transition. Finalize its
+        # durable request so its identity, reason, and cascade are preserved.
+        async for event in self._session_finalization.interrupt_recovery(
+            RecoveryInterruptionRequest(
+                session=current,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=_environment_name(registered_environment),
+                execution_profile=execution_profile,
+                invocation_context=invocation_context,
+            )
+        ):
+            yield event
+
+    async def _restore_status_after_failed_manual_recovery(
+        self,
+        session: Session,
+        *,
+        restored_status: SessionStatus,
+    ) -> None:
+        """Put back the status a failed manual recovery was admitted from.
+
+        ``session`` is the recovery's own admitted session, so its status is the
+        only one this owner may replace. A status another writer moved in the
+        same run epoch is kept: an operator interruption commits ``interrupting``
+        with its request and cascade markers, and the recovery's exit settlement
+        finalizes it from that durable request while the failure is raised.
+        """
+        try:
+            await self._session_store.transition_status(
+                session.id,
+                from_statuses={session.status},
+                to_status=restored_status,
+            )
+        except SessionStatusConflict:
+            return
 
     async def recover_user_input(
         self,
@@ -6677,10 +6725,25 @@ class RecoveryCoordinator:
                 async for event in preparation:
                     yield event
             if environment.error is not None:
-                session = await self._session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
-                )
+                try:
+                    session = await self._session_store.transition_status(
+                        session.id,
+                        from_statuses={session.status},
+                        to_status=SessionStatus.INTERRUPTED,
+                    )
+                except SessionStatusConflict as conflict:
+                    # An operator interruption accepted while the environment was
+                    # reconnecting keeps its status, request and cascade markers.
+                    async for event in self._finalize_interruption_that_won_status(
+                        conflict,
+                        session_id=session.id,
+                        registered_agent=registered_agent,
+                        registered_environment=environment.registered_environment,
+                        execution_profile=execution_profile_snapshot.profile,
+                        invocation_context=environment.invocation_context,
+                    ):
+                        yield event
+                    return
                 async for event in self._terminal_event_publication.publish_recovered(
                     RecoveryTerminalEventRequest(
                         event=Event(
@@ -6925,7 +6988,9 @@ class RecoveryCoordinator:
                 # state. It must not suppress a later fence-release failure.
                 authoritative_failure = None
                 return
-            await self._session_store.update_status(session.id, loaded_session.status)
+            await self._restore_status_after_failed_manual_recovery(
+                session, restored_status=loaded_session.status
+            )
             raise
         except BaseExceptionGroup as exc:
             authoritative_failure = exc
