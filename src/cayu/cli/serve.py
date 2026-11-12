@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import copy
 import importlib
+import inspect
 import math
 import sys
 from collections.abc import Sequence
@@ -49,7 +50,11 @@ class _ServeSettings:
     startup_recovery_statuses: frozenset[SessionStatus] | None = None
     recovery_inactive_after_seconds: int = 300
     # The project's own routes: `module:function` targets, each called with the app and
-    # `development=` and returning a FastAPI router served next to Cayu's routes.
+    # `development=` and returning a FastAPI router served next to Cayu's routes. A
+    # function that also takes `auth=` gets the auth dependency `cayu serve` resolved
+    # (`--auth` over `[tool.cayu.serve].auth`, as a dependency returning an
+    # `AuthContext`; `None` under `--dev`), so its routes can use the same auth as
+    # Cayu's own. Functions without it get only the app and `development=`.
     routers: tuple[str, ...] = ()
     # The project's built web app, served at / for every path no route answers.
     ui: Path | None = None
@@ -322,7 +327,7 @@ def _build_serve_app(
             config=config,
             project_context=project_control_plane,
         )
-        _include_project_routers(server, app, settings.routers, development=args.dev)
+        _include_project_routers(server, app, settings.routers, development=args.dev, auth=auth)
         if settings.ui is not None:
             # Last, so every route above answers first.
             from cayu.server import WebAppError, serve_web_app
@@ -382,13 +387,21 @@ def serve_uvicorn_options(uvicorn: Any, *, covered: bool) -> dict[str, Any]:
 
 
 def _include_project_routers(
-    server: Any, app: Any, targets: tuple[str, ...], *, development: bool
+    server: Any,
+    app: Any,
+    targets: tuple[str, ...],
+    *,
+    development: bool,
+    auth: Any,
 ) -> None:
     """Serve the project's own routes next to Cayu's, never in place of one.
 
     These routes, like the delivery route of ``app.host_external_waits`` served
     first, are outside ``--auth`` and the Developer dashboard's access policy: they
     authenticate their own callers (each ``ExternalEventSource`` does for its route).
+    A router function that takes ``auth`` gets the dependency ``cayu serve`` resolved,
+    adapted as for Cayu's routes to return an ``AuthContext`` (``None`` under
+    ``--dev``), so it can protect its routes the same way.
     """
 
     from fastapi import APIRouter
@@ -411,12 +424,35 @@ def _include_project_routers(
             raise ServeError(str(exc)) from exc
         if not callable(build):
             raise ServeError(f"Serve router target {target} must be callable.")
-        router = build(app, development=development)
+        options: dict[str, Any] = {"development": development}
+        if _accepts_keyword(build, "auth"):
+            from cayu.server.auth import server_auth_dependency
+
+            # The same adapter as Cayu's own routes: it takes the request and
+            # returns a validated AuthContext, whatever the target's signature.
+            options["auth"] = None if auth is None else server_auth_dependency(auth)
+        router = build(app, **options)
         if not isinstance(router, APIRouter):
             raise ServeError(f"Serve router target {target} must return a fastapi.APIRouter.")
         _include_router(
             server, router, reserved, delivery_path, label=f"Serve router target {target}"
         )
+
+
+def _accepts_keyword(function: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        (
+            parameter.name == name
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _include_router(

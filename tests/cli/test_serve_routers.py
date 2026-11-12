@@ -75,6 +75,28 @@ def root(app, *, development):
 
 def not_a_router(app, *, development):
     return object()
+
+
+def protected(app, *, development, auth):
+    from fastapi import Depends
+
+    router = APIRouter()
+
+    @router.get("/app/whoami")
+    def whoami(context=Depends(auth)):
+        return {"subject": context.subject}
+
+    return router
+
+
+def any_options(app, **options):
+    router = APIRouter()
+
+    @router.get("/app/options")
+    def listed():
+        return {"options": sorted(options), "auth": options.get("auth") is not None}
+
+    return router
 """
 
 _AUTH = """from fastapi import Request
@@ -84,6 +106,16 @@ from cayu.server import AuthContext
 
 async def operator(request: Request) -> AuthContext:
     return AuthContext(subject="operator")
+
+
+async def other(request):
+    # Unannotated and returning a mapping: Cayu's routes accept both, and so must
+    # the dependency a project router gets.
+    if request.headers.get("x-other") != "yes":
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=401, detail="other auth refused")
+    return {"subject": "other"}
 """
 
 
@@ -136,6 +168,52 @@ def test_a_projects_routes_are_served_next_to_cayus(
     # Cayu's own routes are still there.
     assert any(getattr(route, "path", "").startswith("/api/") for route in client.app.routes)
     assert "Project routes: project_routes:build_router" in capsys.readouterr().out
+
+
+def test_a_router_that_takes_auth_gets_the_one_serve_resolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launched: dict[str, Any],
+) -> None:
+    project = _project(
+        tmp_path,
+        'routers = ["project_routes:protected", "project_routes:build_router"]\n'
+        'auth = "project_auth:operator"\n',
+    )
+    monkeypatch.chdir(project)
+
+    # --auth overrides the file's target for the project's routes as for Cayu's.
+    assert main(["serve", "--host", "127.0.0.1", "--auth", "project_auth:other"]) == 0
+
+    client = TestClient(launched["server"])
+    refused = client.get("/app/whoami")
+    assert refused.status_code == 401 and refused.json()["detail"] == "other auth refused"
+    assert client.get("/app/whoami", headers={"x-other": "yes"}).json() == {"subject": "other"}
+    assert client.get("/api/sessions").status_code == 401
+    # A factory without `auth` is still called with just the app and `development=`.
+    assert client.get("/app/hello").json()["development"] is False
+
+
+@pytest.mark.parametrize("development", [True, False])
+def test_a_router_taking_any_keyword_gets_auth_too(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launched: dict[str, Any],
+    development: bool,
+) -> None:
+    project = _project(
+        tmp_path, 'routers = ["project_routes:any_options"]\nauth = "project_auth:operator"\n'
+    )
+    monkeypatch.chdir(project)
+
+    assert main(["serve", "--dev"] if development else ["serve", "--host", "127.0.0.1"]) == 0
+
+    client = TestClient(launched["server"])
+    # Under --dev there is no auth to pass: Cayu's routes are open, and so is `auth`.
+    assert client.get("/app/options").json() == {
+        "options": ["auth", "development"],
+        "auth": not development,
+    }
 
 
 @pytest.mark.parametrize(

@@ -455,7 +455,11 @@ not end-user product login, which belongs in the service preset's
 with `[tool.cayu.serve] routers = ["module:function"]`: `cayu serve` calls each function
 with the app and `development=` (whether `--dev` is set) and serves the
 `fastapi.APIRouter` it returns next to Cayu's routes. Those routes authenticate their own
-callers, since the Developer dashboard's target doesn't cover them. Each route must start
+callers, since the Developer dashboard's target doesn't cover them. A function that also
+takes `auth` gets the auth dependency `cayu serve` resolved (`--auth` over
+`[tool.cayu.serve].auth`, or `None` under `--dev`), adapted as for Cayu's routes so
+`Depends(auth)` gives an `AuthContext` and follows the same `--auth` as `/api`;
+functions without it get only the app and `development=`. Each route must start
 with a fixed path segment that isn't one of Cayu's own (such as `/api` or `/cayu`), so a
 parameter or catch-all can't answer for Cayu's paths; the b2b preset serves its API under
 `/app` this way. A project with its own pages serves their build at `/` with
