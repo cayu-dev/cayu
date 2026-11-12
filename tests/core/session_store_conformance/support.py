@@ -193,6 +193,7 @@ _POSTGRES_TABLES = (
     "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_budget_reservation_identities",
+    "cayu_usage_events",
     "cayu_child_session_lifecycle_candidates",
     "cayu_events",
     "cayu_session_labels",

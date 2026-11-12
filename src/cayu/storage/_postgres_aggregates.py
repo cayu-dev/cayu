@@ -128,7 +128,7 @@ usage_events AS MATERIALIZED (
         {uncached_input_tokens} AS uncached_input_tokens,
         {web_search_calls} AS web_search_calls,
         {web_search_outcome_unknown} AS web_search_outcome_unknown
-    FROM cayu_events AS event
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     CROSS JOIN scope
     WHERE event.timestamp >= %s::timestamptz
@@ -407,7 +407,7 @@ pricing_candidates AS (
         (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
         {usage_metrics_projection} AS usage_metrics,
         {billing_identity_projection} AS billing_identity
-    FROM cayu_events AS event
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
@@ -483,7 +483,7 @@ pricing_candidates AS (
         (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
         {usage_metrics_projection} AS usage_metrics,
         {billing_identity_projection} AS billing_identity
-    FROM cayu_events AS event
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz
@@ -582,7 +582,7 @@ usage_events AS MATERIALIZED (
         {uncached_input_tokens} AS uncached_input_tokens,
         {web_search_calls} AS web_search_calls,
         {web_search_outcome_unknown} AS web_search_outcome_unknown
-    FROM cayu_events AS event
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= %s::timestamptz
       AND event.timestamp < %s::timestamptz

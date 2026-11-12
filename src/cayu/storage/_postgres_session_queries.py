@@ -109,11 +109,13 @@ from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _tool_usage_sql as tool_usage_sql
 
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
+    from cayu.sessions.tool_usage import ToolUsageTally
 
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -933,6 +935,57 @@ async def knowledge_lookup_totals(
         for namespace, entry_id, count, last in await cur.fetchall():
             totals[(namespace, entry_id)] = int(count), pg_support.to_utc(last)
     return totals, 0 if newest is None else newest[0]
+
+
+@runtime_session_query
+async def tool_usage_totals(
+    connect: PostgresConnection,
+) -> tuple[dict[str, ToolUsageTally], int]:
+    """Tally retained tool usage in one grouped statement inside one snapshot.
+
+    Matches ``fold_tool_usage_totals`` from the narrow ``cayu_usage_events`` copy
+    instead of loading event documents.
+    """
+
+    from cayu.sessions.tool_usage import ToolUsageTally
+
+    statements = tool_usage_sql.tool_usage_totals_sql(
+        dialect=SQL_DIALECT,
+        payload_text=lambda key: f"(cayu_events.payload ->> '{key}')",
+        payload_is_string=lambda key: f"jsonb_typeof(cayu_events.payload -> '{key}') = 'string'",
+    )
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT cayu_events.sequence
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {statements.newest.where_sql}
+                ORDER BY cayu_events.sequence DESC
+                LIMIT 1
+                """,
+            ),
+            statements.newest.params,
+        )
+        newest = await cur.fetchone()
+        await cur.execute(cast("LiteralString", statements.totals_sql), statements.totals_params)
+        rows = await cur.fetchall()
+    return (
+        {
+            str(tool): ToolUsageTally(
+                calls=int(calls),
+                failures=int(failures),
+                approved=int(approved),
+                rejected=int(rejected),
+                last_used_at=None if last is None else pg_support.to_utc(last),
+            )
+            for tool, calls, failures, approved, rejected, last in rows
+        },
+        0 if newest is None else int(newest[0]),
+    )
 
 
 async def _query_events_bounded_snapshot(

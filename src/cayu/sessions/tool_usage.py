@@ -7,7 +7,8 @@ import binascii
 import hashlib
 import json
 from collections.abc import Callable
-from datetime import UTC
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
@@ -55,6 +56,59 @@ class _Cursor(BaseModel):
             raise InvalidToolUsageQuery("Invalid tool-call cursor.") from None
 
 
+@dataclass(frozen=True, slots=True)
+class ToolUsageTally:
+    """Retained usage of one raw tool name: terminal calls and approval decisions.
+
+    ``last_used_at`` is the newest terminal call (UTC), or ``None`` when the
+    name has only approval decisions.
+    """
+
+    calls: int = 0
+    failures: int = 0
+    approved: int = 0
+    rejected: int = 0
+    last_used_at: datetime | None = None
+
+
+async def fold_tool_usage_totals(store: SessionStore) -> tuple[dict[str, ToolUsageTally], int]:
+    """Tally every retained tool usage event by folding one stable event snapshot.
+
+    This is the portable default behind ``SessionStore.tool_usage_totals``. It reads
+    every retained tool event's payload, so native stores count in their own query.
+    Returns the tallies by raw tool name and the snapshot's newest sequence.
+    """
+
+    tallies: dict[str, ToolUsageTally] = {}
+
+    def consume(page: list[EventRecord]) -> None:
+        for record in page:
+            contribution = tool_usage_contribution(record.event)
+            if contribution is None:
+                continue
+            tally = tallies.get(contribution.name, ToolUsageTally())
+            last_used_at = tally.last_used_at
+            if contribution.calls:
+                at = record.event.timestamp
+                at = at.replace(tzinfo=UTC) if at.tzinfo is None else at.astimezone(UTC)
+                if last_used_at is None or at > last_used_at:
+                    last_used_at = at
+            tallies[contribution.name] = ToolUsageTally(
+                calls=tally.calls + contribution.calls,
+                failures=tally.failures + contribution.failures,
+                approved=tally.approved + contribution.approved,
+                rejected=tally.rejected + contribution.rejected,
+                last_used_at=last_used_at,
+            )
+
+    through = await store.fold_event_snapshot(
+        EventQuery(limit=_PAGE, event_types=TOOL_USAGE_EVENT_TYPES),
+        consume,
+        max_bytes=_BYTES,
+    )
+    return tallies, through
+
+
 class ToolUsageReader:
     def __init__(
         self,
@@ -89,26 +143,16 @@ class ToolUsageReader:
             }
             for name in sorted(set(self.names.values()))
         }
-
-        def consume(page: list[EventRecord]) -> None:
-            for record in page:
-                contribution = tool_usage_contribution(record.event)
-                if contribution is None or contribution.name not in self.names:
-                    continue
-                row = rows[self.names[contribution.name]]
-                for field in ("calls", "failures", "approved", "rejected"):
-                    row[field] += getattr(contribution, field)
-                if contribution.calls:
-                    at = record.event.timestamp
-                    at = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-                    if row["last_used_at"] is None or at > row["last_used_at"]:
-                        row["last_used_at"] = at
-
-        through = await self.store.fold_event_snapshot(
-            EventQuery(limit=_PAGE, event_types=TOOL_USAGE_EVENT_TYPES),
-            consume,
-            max_bytes=_BYTES,
-        )
+        tallies, through = await self.store.tool_usage_totals()
+        for raw_name, tally in tallies.items():
+            if raw_name not in self.names:
+                continue
+            row = rows[self.names[raw_name]]
+            for field in ("calls", "failures", "approved", "rejected"):
+                row[field] += getattr(tally, field)
+            at = tally.last_used_at
+            if at is not None and (row["last_used_at"] is None or at > row["last_used_at"]):
+                row["last_used_at"] = at
         return {"tools": list(rows.values()), "through_sequence": through}
 
     async def recent(self, *, name: str | None, cursor: str | None, limit: int) -> dict[str, Any]:

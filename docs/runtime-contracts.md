@@ -10694,6 +10694,25 @@ configured secret redaction would alter a retained session identity, the
 endpoint fails closed with `409` instead of returning a redacted identity that
 could collide with another session or become an invalid drill-down target.
 
+Since storage revision 149, SQLite and PostgreSQL answer rollups, series,
+per-session breakdowns, pricing inputs and reported costs from
+`cayu_usage_events` rather than from `cayu_events`. It holds one row per
+`model.completed`, `model.auxiliary.attempt_settled`, `model.hosted_tool_call`
+and `tool.call.*` lifecycle event the aggregates count, with that event's
+sequence, session, event ID, type, timestamp and tool name, and a payload reduced
+to the top-level members the aggregates read (`usage_metrics`, `usage`,
+`billing_identity`, `usage_normalization_failed`, `provider_name`, `model`,
+`tool_type`, `status` and `id`), each copied whole when present. Triggers on
+`cayu_events` keep it in step with every insert, payload update and deletion,
+including writes from older binaries, and the migration copies the events
+already retained. PostgreSQL evaluates every aggregate expression over the
+reduced payload exactly as it did over the event. SQLite reparses JSON text for
+each member it reads, so its trigger evaluates those expressions once, when it
+copies the event, and stores the results beside the reduced payload. Results are
+unchanged, and a rollup no longer reads event content, which on a large store was
+most of its cost. Session stores require revision 149, so
+run `cayu storage migrate` before starting the upgraded application.
+
 Cost reporting additionally accepts public `session_order="cost"`. Native
 stores advertise `supports_usage_cost_details` (custom-store default false),
 covering bounded complete candidates and snapshot session display metadata.
@@ -21718,6 +21737,14 @@ state. SQLite can invoke it on a worker thread. Publish accumulated state only
 after successful return; failure or cancellation invalidates it. Native stores
 finish owned read cleanup before propagating cancellation. Cloud registration limits, payload fitting and reporting
 windows are unchanged.
+
+`GET /api/tools/usage` reads its totals through `SessionStore.tool_usage_totals`,
+which tallies calls, failures, approvals and the newest call time by raw tool name
+inside one snapshot and returns the snapshot's newest sequence of any event type.
+Its default folds every retained tool event through `fold_event_snapshot`, so a
+custom store stays correct without overriding it. SQLite and PostgreSQL answer it
+with one grouped query over `cayu_usage_events`, reading payload members only for
+hosted web searches, so the read no longer loads each tool event's content.
 
 The kept-knowledge listing reads a page's lookup totals, source sessions and
 activation receipts through three batch methods: `SessionStore.knowledge_lookup_totals`,

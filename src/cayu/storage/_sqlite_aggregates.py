@@ -9,7 +9,6 @@ from cayu._time_buckets import time_buckets
 from cayu.budgets.aggregates import (
     _BEDROCK_AGGREGATE_COMPLETION_EVIDENCE,
     _BEDROCK_AGGREGATE_REQUEST_EVIDENCE,
-    AGGREGATE_IDENTITY_TRIM_CHARACTERS,
     EXACT_AGGREGATE,
     MAX_AGGREGATE_USAGE_COUNTER,
     MAX_USAGE_COST_CANDIDATES,
@@ -54,22 +53,11 @@ _HOSTED_USAGE_ELIGIBILITY_SQL = """(
           )
       )"""
 
-_USAGE_EVENTS_SQL = """
-WITH
-scope(group_limit, as_of, identity_trim) AS (
-    SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?
-),
-matched_sessions AS MATERIALIZED (
-    SELECT id, status
-    FROM cayu_sessions
-    {session_where_sql}
-),
-usage_events AS MATERIALIZED (
-    SELECT
-        event.session_id,
-        event.event_type,
-        event.timestamp,
-        CASE
+# These projections run once per event, when the revision-149 triggers copy it into
+# cayu_usage_events (see usage_event_projection_sql); rollups read the stored values.
+# Changing one changes what new copies store, so it needs a storage revision that
+# recomputes the copy.
+_HAS_USAGE_SQL = """        CASE
             WHEN json_type(
                      event.payload_json,
                      '$.usage_normalization_failed'
@@ -77,8 +65,9 @@ usage_events AS MATERIALIZED (
              AND json_type(event.payload_json, '$.usage_metrics') = 'object'
             THEN 1
             ELSE 0
-        END AS has_usage,
-        CASE
+        END"""
+
+_PROVIDER_NAME_SQL = """        CASE
             WHEN json_type(
                      event.payload_json,
                      '$.usage_normalization_failed'
@@ -98,8 +87,9 @@ usage_events AS MATERIALIZED (
              ) = json_extract(event.payload_json, '$.provider_name')
              AND json_extract(event.payload_json, '$.provider_name') <> ''
             THEN json_extract(event.payload_json, '$.provider_name')
-        END AS provider_name,
-        CASE
+        END"""
+
+_MODEL_SQL = """        CASE
             WHEN json_type(
                      event.payload_json,
                      '$.usage_normalization_failed'
@@ -119,21 +109,40 @@ usage_events AS MATERIALIZED (
              ) = json_extract(event.payload_json, '$.model')
              AND json_extract(event.payload_json, '$.model') <> ''
             THEN json_extract(event.payload_json, '$.model')
-        END AS model,
-        {input_tokens} AS input_tokens,
-        {output_tokens} AS output_tokens,
-        {total_tokens} AS total_tokens,
-        {reasoning_tokens} AS reasoning_output_tokens,
-        {cache_read_tokens} AS cache_read_tokens,
-        {cache_write_tokens} AS cache_write_tokens,
-        {cache_write_5m_tokens} AS cache_write_5m_tokens,
-        {cache_write_1h_tokens} AS cache_write_1h_tokens,
-        {cache_write_unknown_tokens} AS cache_write_unknown_ttl_tokens,
-        {cached_input_tokens} AS cached_input_tokens,
-        {uncached_input_tokens} AS uncached_input_tokens,
-        {web_search_calls} AS web_search_calls,
-        {web_search_outcome_unknown} AS web_search_outcome_unknown
-    FROM cayu_events AS event
+        END"""
+
+_USAGE_EVENTS_SQL = """
+WITH
+scope(group_limit, as_of) AS (
+    SELECT ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+),
+matched_sessions AS MATERIALIZED (
+    SELECT id, status
+    FROM cayu_sessions
+    {session_where_sql}
+),
+usage_events AS MATERIALIZED (
+    SELECT
+        event.session_id,
+        event.event_type,
+        event.timestamp,
+        event.has_usage,
+        event.provider_name,
+        event.model,
+        event.input_tokens,
+        event.output_tokens,
+        event.total_tokens,
+        event.reasoning_output_tokens,
+        event.cache_read_tokens,
+        event.cache_write_tokens,
+        event.cache_write_5m_tokens,
+        event.cache_write_1h_tokens,
+        event.cache_write_unknown_ttl_tokens,
+        event.cached_input_tokens,
+        event.uncached_input_tokens,
+        event.web_search_calls,
+        event.web_search_outcome_unknown
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     CROSS JOIN scope
     WHERE event.timestamp >= ?
@@ -141,7 +150,7 @@ usage_events AS MATERIALIZED (
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
-      AND {hosted_usage_eligibility}
+      AND event.usage_eligible = 1
 ),
 """
 
@@ -353,8 +362,8 @@ FROM model_remainder
 # session set makes SQLite prefer an unbounded session-history index scan.
 _PRICING_INPUT_SQL = """
 WITH
-scope(max_input_bytes, identity_trim) AS (
-    SELECT ?, ?
+scope(max_input_bytes) AS (
+    SELECT ?
 ),
 matched_sessions AS MATERIALIZED (
     SELECT id
@@ -365,16 +374,16 @@ pricing_candidates AS (
     SELECT
         event.event_type,
         substr(event.timestamp, 1, 10) AS effective_on,
-        {usage_metrics_projection} AS usage_metrics_json,
-        {billing_identity_projection} AS billing_identity_json
-    FROM cayu_events AS event INDEXED BY idx_cayu_events_type_timestamp
+        event.usage_metrics_json,
+        event.billing_identity_json
+    FROM cayu_usage_events AS event INDEXED BY idx_cayu_usage_events_type_timestamp
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND {hosted_usage_eligibility}
+      AND event.usage_eligible = 1
 ),
 measured_candidates AS (
     SELECT
@@ -427,8 +436,8 @@ LIMIT ?
 
 _SESSION_PRICING_INPUT_SQL = """
 WITH
-scope(max_input_bytes, identity_trim) AS (
-    SELECT ?, ?
+scope(max_input_bytes) AS (
+    SELECT ?
 ),
 requested_sessions(session_id) AS (
     VALUES {requested_session_values}
@@ -444,16 +453,16 @@ pricing_candidates AS (
         event.event_type,
         event.session_id,
         substr(event.timestamp, 1, 10) AS effective_on,
-        {usage_metrics_projection} AS usage_metrics_json,
-        {billing_identity_projection} AS billing_identity_json
-    FROM cayu_events AS event INDEXED BY idx_cayu_events_type_timestamp
+        event.usage_metrics_json,
+        event.billing_identity_json
+    FROM cayu_usage_events AS event INDEXED BY idx_cayu_usage_events_type_timestamp
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call'
       )
-      AND {hosted_usage_eligibility}
+      AND event.usage_eligible = 1
 ),
 measured_candidates AS (
     SELECT
@@ -524,36 +533,28 @@ usage_events AS MATERIALIZED (
     SELECT
         event.session_id,
         event.event_type,
-        CASE
-            WHEN json_type(
-                     event.payload_json,
-                     '$.usage_normalization_failed'
-                 ) IS NOT 'true'
-             AND json_type(event.payload_json, '$.usage_metrics') = 'object'
-            THEN 1
-            ELSE 0
-        END AS has_usage,
-        {input_tokens} AS input_tokens,
-        {output_tokens} AS output_tokens,
-        {total_tokens} AS total_tokens,
-        {reasoning_tokens} AS reasoning_output_tokens,
-        {cache_read_tokens} AS cache_read_tokens,
-        {cache_write_tokens} AS cache_write_tokens,
-        {cache_write_5m_tokens} AS cache_write_5m_tokens,
-        {cache_write_1h_tokens} AS cache_write_1h_tokens,
-        {cache_write_unknown_tokens} AS cache_write_unknown_ttl_tokens,
-        {cached_input_tokens} AS cached_input_tokens,
-        {uncached_input_tokens} AS uncached_input_tokens,
-        {web_search_calls} AS web_search_calls,
-        {web_search_outcome_unknown} AS web_search_outcome_unknown
-    FROM cayu_events AS event
+        event.has_usage,
+        event.input_tokens,
+        event.output_tokens,
+        event.total_tokens,
+        event.reasoning_output_tokens,
+        event.cache_read_tokens,
+        event.cache_write_tokens,
+        event.cache_write_5m_tokens,
+        event.cache_write_1h_tokens,
+        event.cache_write_unknown_ttl_tokens,
+        event.cached_input_tokens,
+        event.uncached_input_tokens,
+        event.web_search_calls,
+        event.web_search_outcome_unknown
+    FROM cayu_usage_events AS event
     JOIN matched_sessions AS session ON session.id = event.session_id
     WHERE event.timestamp >= ?
       AND event.timestamp < ?
       AND event.event_type IN (
           'model.completed', 'model.auxiliary.attempt_settled', 'tool.call.started', 'model.hosted_tool_call'
       )
-      AND {hosted_usage_eligibility}
+      AND event.usage_eligible = 1
 ),
 session_grouped_raw AS (
     SELECT
@@ -707,6 +708,65 @@ _USAGE_COUNTER_COLUMNS = (
 )
 _EXACT_SUM_ZERO = "0" * 38
 
+_TOKEN_COLUMNS = {
+    "input_tokens": "input_tokens",
+    "output_tokens": "output_tokens",
+    "total_tokens": "total_tokens",
+    "reasoning_tokens": "reasoning_output_tokens",
+    "cache_read_tokens": "cache_read_tokens",
+    "cache_write_tokens": "cache_write_tokens",
+    "cache_write_5m_tokens": "cache_write_5m_tokens",
+    "cache_write_1h_tokens": "cache_write_1h_tokens",
+    "cache_write_unknown_tokens": "cache_write_unknown_ttl_tokens",
+    "cached_input_tokens": "cached_input_tokens",
+    "uncached_input_tokens": "uncached_input_tokens",
+}
+
+
+def usage_event_projection_sql(*, identity_trim: str) -> tuple[tuple[str, str], ...]:
+    """Columns and expressions the revision-149 triggers store for each copied event.
+
+    Expressions read ``event.event_type`` and ``event.payload_json`` of the copy's
+    reduced payload. ``identity_trim`` is the SQL for the identity trim characters,
+    which a trigger cannot take from a parameter.
+    """
+
+    def trimmed(expression: str) -> str:
+        return expression.replace("(SELECT identity_trim FROM scope)", identity_trim)
+
+    eligible = f"CASE WHEN {_HOSTED_USAGE_ELIGIBILITY_SQL} THEN 1 ELSE 0 END"
+    priced = (
+        "event.event_type IN "
+        "('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call')"
+    )
+    return (
+        ("usage_eligible", eligible),
+        ("has_usage", _HAS_USAGE_SQL),
+        ("provider_name", trimmed(_PROVIDER_NAME_SQL)),
+        ("model", trimmed(_MODEL_SQL)),
+        *(
+            (column, _nonnegative_json_integer(_TOKEN_PATHS[name]))
+            for name, column in _TOKEN_COLUMNS.items()
+        ),
+        ("web_search_calls", _web_search_terminal_count()),
+        ("web_search_outcome_unknown", _web_search_unknown_count()),
+        (
+            "usage_metrics_json",
+            f"CASE WHEN {priced} THEN {trimmed(_sqlite_usage_metrics_projection())} END",
+        ),
+        (
+            "billing_identity_json",
+            f"CASE WHEN {priced} THEN "
+            f"{trimmed(_sqlite_billing_identity_projection('$.billing_identity'))} END",
+        ),
+        (
+            "reported_cost",
+            "CASE WHEN event.event_type = 'model.completed' "
+            "AND json_type(event.payload_json, '$.usage.cost_status') IS NOT NULL "
+            "THEN 1 ELSE 0 END",
+        ),
+    )
+
 
 def aggregate_session_usage(
     connection: sqlite3.Connection,
@@ -811,10 +871,6 @@ def _format_usage_statement(
 ) -> tuple[str, tuple[object, ...]]:
     sql = template.format(
         session_where_sql=session_plan.filter_where_sql,
-        hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
-        **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
-        web_search_calls=_web_search_terminal_count(),
-        web_search_outcome_unknown=_web_search_unknown_count(),
         overall_usage_sum=_exact_event_usage_sum(),
         group_usage_sum=_exact_usage_sum("{column}"),
         event_usage_sum=_exact_usage_sum("event.{column}"),
@@ -824,7 +880,6 @@ def _format_usage_statement(
         sql,
         (
             query.group_limit,
-            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
             *session_plan.filter_params,
             query.start_at.isoformat(),
             query.end_at.isoformat(),
@@ -890,10 +945,6 @@ def session_breakdown_statement(
         raise ValueError("session_group_limit is required for a session breakdown.")
     sql = _SESSION_BREAKDOWN_SQL.format(
         session_where_sql=session_plan.filter_where_sql,
-        hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
-        **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
-        web_search_calls=_web_search_terminal_count(),
-        web_search_outcome_unknown=_web_search_unknown_count(),
         session_usage_sum=_exact_event_usage_sum(qualifier="event."),
         remainder_group_usage_sum=_exact_usage_sum("session.{column}"),
         usage_sum_projection=_usage_sum_projection(),
@@ -921,13 +972,9 @@ def pricing_input_statement(
     return (
         _PRICING_INPUT_SQL.format(
             session_where_sql=session_plan.filter_where_sql,
-            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
-            usage_metrics_projection=_sqlite_usage_metrics_projection(),
-            billing_identity_projection=_sqlite_billing_identity_projection("$.billing_identity"),
         ),
         (
             max_input_bytes,
-            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
             *session_plan.filter_params,
             query.start_at.isoformat(),
             query.end_at.isoformat(),
@@ -953,13 +1000,9 @@ def session_pricing_input_statement(
         _SESSION_PRICING_INPUT_SQL.format(
             requested_session_values=", ".join("(?)" for _ in session_ids),
             session_where_sql=session_plan.filter_where_sql,
-            hosted_usage_eligibility=_HOSTED_USAGE_ELIGIBILITY_SQL,
-            usage_metrics_projection=_sqlite_usage_metrics_projection(),
-            billing_identity_projection=_sqlite_billing_identity_projection("$.billing_identity"),
         ),
         (
             max_input_bytes,
-            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
             *session_ids,
             *session_plan.filter_params,
             query.start_at.isoformat(),
@@ -1134,7 +1177,13 @@ def _exact_event_usage_sum(*, qualifier: str = "") -> str:
             include = f"{event_type} = 'model.hosted_tool_call' AND {value} > 0"
         arguments.append(f"CASE WHEN {include} THEN {value} ELSE 0 END")
     joined = ",\n            ".join(arguments)
-    return f"cayu_exact_usage_sum(\n            {joined}\n        )"
+    # Other event types (tool call starts) contribute only zeros; skip them before
+    # they reach the Python aggregate, which runs once per row.
+    counted = (
+        f"{event_type} IN "
+        "('model.completed', 'model.auxiliary.attempt_settled', 'model.hosted_tool_call')"
+    )
+    return f"cayu_exact_usage_sum(\n            {joined}\n        ) FILTER (WHERE {counted})"
 
 
 def _usage_sum_projection() -> str:

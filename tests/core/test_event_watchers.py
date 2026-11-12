@@ -46,6 +46,7 @@ _POSTGRES_TABLES = (
     "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
+    "cayu_usage_events",
     "cayu_child_session_lifecycle_candidates",
     "cayu_events",
     "cayu_session_labels",

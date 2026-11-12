@@ -45,6 +45,7 @@ from cayu.storage._task_group_schema import (
 )
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
+from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,
@@ -1000,6 +1001,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     147: POSTGRES_EVENT_SEQUENCE_RESERVATION_DDL,
     # The event sequence functions pin their search_path.
     148: POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL,
+    # Usage rollups and tool totals read a narrow trigger-maintained event copy.
+    149: POSTGRES_USAGE_EVENTS_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

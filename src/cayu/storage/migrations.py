@@ -622,6 +622,11 @@ REVISIONS: tuple[Revision, ...] = (
     # helper by schema, so another role's function or operator cannot run in
     # their place. Postgres session stores require it.
     Revision(revision=148, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # Usage rollups and tool usage totals read cayu_usage_events, a narrow copy
+    # of the aggregated events with only the payload members they read. Triggers
+    # on cayu_events maintain it for every writer, older binaries included, and
+    # the migration copies retained events. Session stores require it.
+    Revision(revision=149, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

@@ -36,6 +36,7 @@ from cayu.storage._task_group_schema import (
 )
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
+from cayu.storage._usage_event_schema import SQLITE_USAGE_EVENTS_DDL
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
 # (Decision 5) so Cayu state never collides with an app's own tables. The
@@ -780,6 +781,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     147: "",
     # Postgres event sequence functions pin their search_path; nothing for SQLite.
     148: "",
+    # Usage rollups and tool totals read a narrow trigger-maintained event copy.
+    149: SQLITE_USAGE_EVENTS_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

@@ -842,11 +842,13 @@ def test_recent_calls_use_bounded_identity_and_safe_cutoff(
             ) as client:
                 totals = await client.get("/api/tools/usage")
                 assert totals.status_code == 200, totals.text
-                assert cutoffs == [None]
+                # Native stores tally in their own query; the portable default folds.
+                folded = [None] if isinstance(store, InMemorySessionStore) else []
+                assert cutoffs == folded
                 response = await client.get("/api/tools/calls")
                 assert response.status_code == 200, response.text
                 assert len(response.json()["calls"]) == 2
-                assert cutoffs == [None, 1]
+                assert cutoffs == [*folded, 1]
         finally:
             await app.aclose()
 
@@ -1170,7 +1172,7 @@ def test_postgres_usage_snapshot_does_not_confuse_xid_and_sequence_order(postgre
     asyncio.run(run())
 
 
-def test_sqlite_http_usage_does_not_mix_retention_between_pages(tmp_path):
+def test_sqlite_http_usage_counts_one_retained_snapshot(tmp_path):
     import threading
 
     from cayu import Event, EventType
@@ -1205,17 +1207,15 @@ def test_sqlite_http_usage_does_not_mix_retention_between_pages(tmp_path):
                         ),
                     )
 
-            def before_second_page(statement):
-                if (
-                    "bounded_candidates" in statement
-                    and "cayu_events.sequence > 100" in statement
-                    and not entered.is_set()
-                ):
+            # The newest-sequence read opens the snapshot; a deletion that
+            # commits before the grouped tally must not change what it counts.
+            def before_tally(statement):
+                if "FROM cayu_usage_events AS cayu_events" in statement and not entered.is_set():
                     loop.call_soon_threadsafe(entered.set)
                     release.wait(10)
 
             for _, connection in store._readers:
-                connection.set_trace_callback(before_second_page)
+                connection.set_trace_callback(before_tally)
             server = create_server(app, config=ServerConfig.local_development())
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=server), base_url="http://test"

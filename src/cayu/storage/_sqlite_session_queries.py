@@ -100,12 +100,14 @@ from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage import _tool_usage_sql as tool_usage_sql
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 if TYPE_CHECKING:
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
+    from cayu.sessions.tool_usage import ToolUsageTally
 
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
@@ -833,6 +835,58 @@ async def fold_event_snapshot(
             )
         finally:
             connection.rollback()
+
+    return await run_read(read)
+
+
+@runtime_session_query
+async def tool_usage_totals(
+    run_read: SQLiteOperationRunner,
+) -> tuple[dict[str, ToolUsageTally], int]:
+    """Tally retained tool usage in one grouped statement inside one read snapshot.
+
+    Matches ``fold_tool_usage_totals`` from the narrow ``cayu_usage_events`` copy
+    instead of loading event payloads.
+    """
+
+    from cayu.sessions.tool_usage import ToolUsageTally
+
+    statements = tool_usage_sql.tool_usage_totals_sql(
+        dialect=SQL_DIALECT,
+        payload_text=lambda key: f"json_extract(cayu_events.payload_json, '$.{key}')",
+        payload_is_string=lambda key: f"json_type(cayu_events.payload_json, '$.{key}') = 'text'",
+    )
+
+    def read(connection: sqlite3.Connection) -> tuple[dict[str, ToolUsageTally], int]:
+        connection.execute("BEGIN")
+        try:
+            newest = connection.execute(
+                f"""
+                SELECT cayu_events.sequence
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {statements.newest.where_sql}
+                ORDER BY cayu_events.sequence DESC
+                LIMIT 1
+                """,
+                statements.newest.params,
+            ).fetchone()
+            rows = connection.execute(statements.totals_sql, statements.totals_params).fetchall()
+        finally:
+            connection.rollback()
+        return (
+            {
+                str(row["tool"]): ToolUsageTally(
+                    calls=int(row["calls"]),
+                    failures=int(row["failures"]),
+                    approved=int(row["approved"]),
+                    rejected=int(row["rejected"]),
+                    last_used_at=sqlite_records.parse_optional_datetime(row["last_used_at"]),
+                )
+                for row in rows
+            },
+            0 if newest is None else int(newest[0]),
+        )
 
     return await run_read(read)
 

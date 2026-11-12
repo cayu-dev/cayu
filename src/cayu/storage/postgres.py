@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.sessions.tool_usage import ToolUsageTally
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -447,7 +448,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 148
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 149
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -6302,6 +6303,9 @@ class PostgresSessionStore(
         self, identities: Collection[tuple[str, str]]
     ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
         return await session_queries.knowledge_lookup_totals(self._ready_connection, identities)
+
+    async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
+        return await session_queries.tool_usage_totals(self._ready_connection)
 
     async def query_events_bounded_many(
         self,

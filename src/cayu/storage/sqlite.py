@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
+    from cayu.sessions.tool_usage import ToolUsageTally
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -437,7 +438,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 145
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 149
 _T = TypeVar("_T")
 
 
@@ -6662,6 +6663,9 @@ class SQLiteSessionStore(
                 max_bytes=max_bytes,
                 max_pages=max_pages,
             )
+
+    async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
+        return await session_queries.tool_usage_totals(self._run_read)
 
     async def query_events_bounded_many(
         self,

@@ -34,15 +34,16 @@ def reported_cost_statement(where: str, dialect: Literal["sqlite", "postgres"]) 
             f"CASE WHEN {typed} AND length({expr}) <= 256 THEN {expr} {invalid} END AS {name}"
         )
     marker = "?" if dialect == "sqlite" else "%s"
+    # SQLite's usage-event copy records whether a reported cost status is present.
     present = (
-        "json_type(event.payload_json, '$.usage.cost_status') IS NOT NULL"
+        "event.reported_cost = 1"
         if dialect == "sqlite"
         else "event.payload #> '{usage,cost_status}' IS NOT NULL"
     )
     return f"""
         WITH matched AS (SELECT id FROM cayu_sessions {where})
         SELECT event.session_id, event.event_id, event.timestamp, {", ".join(fields)}
-        FROM cayu_events AS event JOIN matched ON matched.id = event.session_id
+        FROM cayu_usage_events AS event JOIN matched ON matched.id = event.session_id
         WHERE event.event_type = 'model.completed' AND {present}
           AND event.timestamp >= {marker} AND event.timestamp < {marker}
         ORDER BY event.timestamp DESC, event.session_id DESC, event.event_id DESC

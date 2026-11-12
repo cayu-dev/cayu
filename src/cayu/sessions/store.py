@@ -282,6 +282,7 @@ if TYPE_CHECKING:
         ExternalWaitRetirementRequest,
         ExternalWaitScope,
     )
+    from cayu.sessions.tool_usage import ToolUsageTally
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -4942,6 +4943,18 @@ class SessionStore(ABC):
         from cayu.sessions.knowledge_usage import fold_knowledge_lookup_totals
 
         return await fold_knowledge_lookup_totals(self, identities)
+
+    async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
+        """Tally retained tool calls, failures and approval decisions by raw tool name.
+
+        Counts what ``cayu.tool_inventory.tool_usage_contribution`` counts, inside
+        one stable snapshot, and returns the tallies with the snapshot's newest
+        sequence of any type. This default folds every retained tool event through
+        ``fold_event_snapshot``; a native store counts in its own query instead.
+        """
+        from cayu.sessions.tool_usage import fold_tool_usage_totals
+
+        return await fold_tool_usage_totals(self)
 
     async def query_events_bounded(
         self,

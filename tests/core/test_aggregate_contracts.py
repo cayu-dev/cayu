@@ -2803,14 +2803,14 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
         asyncio.run(store.close())
 
     assert any(
-        "idx_cayu_events_type_timestamp " in detail
+        "idx_cayu_usage_events_type_timestamp " in detail
         and "event_type=?" in detail
         and "timestamp>?" in detail
         and "timestamp<?" in detail
         for detail in details
     )
     assert any(
-        "idx_cayu_events_type_timestamp " in detail
+        "idx_cayu_usage_events_type_timestamp " in detail
         and "event_type=?" in detail
         and "timestamp>?" in detail
         and "timestamp<?" in detail
@@ -2818,7 +2818,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
     )
     for projection_details in (session_details, session_pricing_details):
         assert any(
-            "idx_cayu_events_type_timestamp " in detail
+            "idx_cayu_usage_events_type_timestamp " in detail
             and "event_type=?" in detail
             and "timestamp>?" in detail
             and "timestamp<?" in detail
@@ -3615,23 +3615,20 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
                 relation_name = node.get("Relation Name")
                 index_name = str(node.get("Index Name", ""))
                 if "Index" in node_type and (
-                    relation_name == "cayu_events" or index_name.startswith("idx_cayu_events")
+                    relation_name == "cayu_usage_events"
+                    or index_name.startswith("idx_cayu_usage_events")
                 ):
                     indexed_event_access.append(node)
-            # Rollups may use the type/time index or the partial accounting
-            # attempt index, which selects the billed event types directly.
-            # Session projections may instead use a per-session event index
-            # when table statistics favor it, but must retain indexed access and
-            # the half-open time and event-type predicates in the selected plan.
+            # Rollups read the narrow usage-event copy through its type/time
+            # index. Session projections may use another plan when table
+            # statistics favor it, but must retain indexed access and the
+            # half-open time and event-type predicates in the selected plan.
             assert indexed_event_access
             if require_type_time_index:
                 assert any(
-                    (
-                        node.get("Index Name") == "idx_cayu_events_type_timestamp"
-                        and "event_type" in str(node.get("Index Cond", ""))
-                        and "timestamp" in str(node.get("Index Cond", ""))
-                    )
-                    or node.get("Index Name") == "idx_cayu_events_cost_attempt"
+                    node.get("Index Name") == "idx_cayu_usage_events_type_timestamp"
+                    and "event_type" in str(node.get("Index Cond", ""))
+                    and "timestamp" in str(node.get("Index Cond", ""))
                     for node in indexed_event_access
                 ), json.dumps(indexed_event_access, indent=2, sort_keys=True)
 
