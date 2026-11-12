@@ -116,6 +116,8 @@ const specs: SessionSpec[] = [
   {
     id: "ap-ai-c33e300e024d3a41afd6",
     agent: "ap-auditor",
+    environment: "invoice-checkout",
+    setup: { factory: "InvoiceCheckoutFactory", binding: "NativeBinding", runner: true },
     status: "running",
     startedAgo: 22,
     title: "Invoice batch AP-2026-10-21",
@@ -363,6 +365,8 @@ const specs: SessionSpec[] = [
   {
     id: "ap-ai-7d21f09b44e1c2a0",
     agent: "ap-auditor",
+    environment: "invoice-checkout",
+    setup: { factory: "InvoiceCheckoutFactory", binding: "NativeBinding", runner: true },
     status: "completed",
     startedAgo: 60 * 75,
     seconds: 342,

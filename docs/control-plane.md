@@ -1245,6 +1245,16 @@ commands, connection URLs, environment variables and headers are not included.
 artifact store is configured. It is a storage description, not an availability
 check. The server does not infer the kind from a class name, store ID or path.
 
+An environment registered with `register_environment_factory` has `is_factory: true`
+and `factory_type`, the factory's class name. Its runner, workspace, binding, vault,
+proxy, knowledge store and MCP servers come from the environment the factory creates
+for each session, so the inventory reports them as `null` (or zero MCP servers)
+rather than starting the factory. Only `artifact_store_id` and `artifact_store_kind`
+can be set, from the store passed at registration. A session's
+`environment.factory.completed` and `environment.binding.completed` events record
+what that session got. `factory_type` is `null` for an environment registered
+directly.
+
 `session_count` is the exact number of currently retained sessions with that
 stored environment name, serialized as a decimal string. It includes all
 statuses, eval trials and forks. Deleted sessions are absent. This inventory

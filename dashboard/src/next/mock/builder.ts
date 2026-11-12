@@ -46,6 +46,11 @@ export type SessionSpec = {
   metadata?: Record<string, unknown>
   parent?: string
   environment?: string
+  /**
+   * The environment is created for this session by a factory: the session records the
+   * factory and binding events the runtime writes, with what the environment had.
+   */
+  setup?: { factory: string; binding: string; runner: boolean }
   waiting?: Waiting
   steps: Step[]
 }
@@ -237,6 +242,34 @@ export function buildSession(
   }
 
   emit("session.started", { agent_name: spec.agent, run_epoch: 1 }, null, false)
+  if (spec.setup) {
+    const name = spec.environment ?? "local"
+    const factory = { factory_type: spec.setup.factory, requested_environment_name: name }
+    emit("environment.factory.started", factory, null, false)
+    pause(400, 900)
+    emit(
+      "environment.factory.completed",
+      { ...factory, environment_name: name, result_metadata: {} },
+      null,
+      false,
+    )
+    const binding = { binding_type: spec.setup.binding, configured_workspace_id: spec.id }
+    emit("environment.binding.started", binding, null, false)
+    pause(200, 600)
+    emit(
+      "environment.binding.completed",
+      {
+        ...binding,
+        has_configured_runner: spec.setup.runner,
+        source_workspace_id: spec.id,
+        bound_workspace_id: spec.id,
+        bound_path: "/workspace",
+        has_bound_runner: spec.setup.runner,
+      },
+      null,
+      false,
+    )
+  }
   emit("interaction.started", { status: "active" })
   for (const item of spec.steps) {
     if ("user" in item) {

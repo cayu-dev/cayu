@@ -65,3 +65,30 @@ test("prototype inventory counts every retained session and reports durable acti
   assert.equal(sandbox.artifact_store_kind, "s3")
   assert.equal(sandbox.mcp_server_names.length, 3)
 })
+
+test("prototype has an environment set up for each session, as a factory registration reports it", () => {
+  const api = createMockApi()
+  const seed = structuredClone(api.records())
+  const initial = seed.sessions[0]
+  seed.sessions = [{ ...initial, session: { ...initial.session, environment_name: "local" } }]
+  const route = coreRoutes.find((route) => route.path === "/environments")
+  const page = route.handle({}, { records: () => seed, now: () => Date.now() })
+  const local = page.environments.find((row) => row.name === "local")
+  assert.equal(local.is_factory, false)
+  assert.equal(local.factory_type, null)
+  seed.sessions[0].session.environment_name = "invoice-checkout"
+  const factory = route
+    .handle({}, { records: () => seed, now: () => Date.now() })
+    .environments.find((row) => row.name === "invoice-checkout")
+  assert.equal(factory.is_factory, true)
+  assert.equal(factory.factory_type, "InvoiceCheckoutFactory")
+  for (const field of [
+    "runner_type",
+    "workspace_id",
+    "binding_type",
+    "artifact_store_id",
+    "artifact_store_kind",
+    "knowledge_store_type",
+  ])
+    assert.equal(factory[field], null, field)
+})

@@ -1393,6 +1393,18 @@
               }
             ]
           },
+          "factory_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Class name of the environment factory that sets this environment up for each session; null for an environment registered directly. A factory's runner, workspace, stores and MCP servers come from the environment it creates, so the registration reports them as null.",
+            "title": "Factory Type"
+          },
           "is_factory": {
             "title": "Is Factory",
             "type": "boolean"

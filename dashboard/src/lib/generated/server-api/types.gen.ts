@@ -770,6 +770,12 @@ export type ApiEnvironmentSummary = {
     } | null;
     execution_snapshot_capability?: ExecutionSnapshotCapability | null;
     /**
+     * Factory Type
+     *
+     * Class name of the environment factory that sets this environment up for each session; null for an environment registered directly. A factory's runner, workspace, stores and MCP servers come from the environment it creates, so the registration reports them as null.
+     */
+    factory_type?: string | null;
+    /**
      * Is Factory
      */
     is_factory: boolean;

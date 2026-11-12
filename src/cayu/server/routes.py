@@ -3694,6 +3694,7 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
         "name": record.spec.name,
         "metadata": _redact_control_plane_json(cayu_app, record.spec.metadata, "metadata"),
         "is_factory": record.factory is not None,
+        "factory_type": _object_type_name(record.factory),
         "workspace_id": _object_id(workspace),
         "workspace_branch_capabilities": _workspace_branch_capabilities(cayu_app, workspace),
         "workspace_branch_lifecycle": _workspace_branch_lifecycle(workspace),

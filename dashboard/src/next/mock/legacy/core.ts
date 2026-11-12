@@ -1178,9 +1178,20 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
     mcp_server_count: 1,
     mcp_server_names: ["Local docs"],
   },
+  // Created for each session by a factory, as `register_environment_factory` reports it: the
+  // registration has no runner, workspace or stores; each session's environment does.
+  "invoice-checkout": {
+    metadata: {},
+    is_factory: true,
+    factory_type: "InvoiceCheckoutFactory",
+    artifact_store_id: null,
+    artifact_store_kind: null,
+    knowledge_store_type: null,
+  },
   sandbox: {
     metadata: { profile: "aws-lambda-microvm-v1", region: "us-west-2" },
     is_factory: true,
+    factory_type: "MicroVMSandboxFactory",
     workspace_id: "sandbox-workspace",
     workspace_branch_capabilities: DURABLE_RUNNER_BRANCHES,
     runner_type: "LambdaMicroVMRunner",
@@ -1209,6 +1220,9 @@ const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
   },
 }
 
+/** Whether the environment's registration names a file store (a factory's may not). */
+const hasFileStore = (name: string) => ENVIRONMENT_PROFILES[name]?.artifact_store_id !== null
+
 function environment(name: string, seed: AppSeed, now: number): EnvironmentSummary {
   const sessions = seed.sessions.filter((s) => s.session.environment_name === name)
   const last = sessions.reduce<string | null>(
@@ -1231,6 +1245,7 @@ function environment(name: string, seed: AppSeed, now: number): EnvironmentSumma
     name,
     metadata: { profile: "standard-local-v1", runner: "unavailable", network: "unavailable" },
     is_factory: false,
+    factory_type: null,
     workspace_id: null,
     workspace_branch_capabilities: NO_BRANCHES,
     artifact_store_id: storeOf(name),
@@ -1271,6 +1286,7 @@ function environments(_: LegacyRequest, context: LegacyContext): EnvironmentsPag
 
 function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiagnostics {
   const seed = context.records()
+  const fileStores = environmentNames(seed).filter(hasFileStore)
   const version = seed.app.runtime_version
   const costs = seedHasCosts(seed)
   const pricing = { enabled: costs, unavailable_reason: costs ? null : ("not_configured" as const) }
@@ -1299,11 +1315,11 @@ function systemDiagnostics(_: LegacyRequest, context: LegacyContext): SystemDiag
       },
     },
     artifact_stores: {
-      registrations: environmentNames(seed).map((name) => ({
+      registrations: fileStores.map((name) => ({
         fingerprint: `sha256:${hex(storeOf(name), 64)}`,
         store_contract_operations: ["list", "read", "write", "delete"],
       })),
-      total_count: environmentNames(seed).length,
+      total_count: fileStores.length,
       truncated: false,
     },
     pricing_catalog: costs
@@ -1498,6 +1514,7 @@ function stored(
 
 function sessionFiles(s: SeedSession, index: number): StoredArtifact[] {
   const environmentName = s.session.environment_name ?? "local"
+  if (!hasFileStore(environmentName)) return []
   const name = slug(titleOf(s))
   const ended = Date.parse(s.overview.ended_at ?? s.overview.last_activity_at)
   const file = (

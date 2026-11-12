@@ -24,9 +24,29 @@ const RUNNERS: Record<string, string> = {
   DeferredRunner: "Chosen when a session starts",
 }
 
+/**
+ * A factory environment is created for each session (`register_environment_factory`). Its
+ * registration declares no runner, workspace or stores; the environment the factory creates
+ * has them. So a missing part means "not known until a session starts", not "none".
+ */
+export const DECIDED_PER_SESSION = "Decided when a session starts"
+
+const perSession = (env: EnvironmentSummary) => env.is_factory
+
+/** The same, in a list cell: "Per session". Other text is unchanged. */
+export const brief = (text: string) => (text === DECIDED_PER_SESSION ? "Per session" : text)
+
+/** "Set up for each session by CheckoutEnvironmentFactory", or null for a registered environment. */
+export function setupText(env: EnvironmentSummary): string | null {
+  if (!perSession(env)) return null
+  return env.factory_type
+    ? `Set up for each session by ${env.factory_type}`
+    : "Set up for each session"
+}
+
 /** Where the environment's commands run, as a short phrase. */
 export function runsOn(env: EnvironmentSummary): string {
-  if (!env.runner_type) return "No runner"
+  if (!env.runner_type) return perSession(env) ? "Set up for each session" : "No runner"
   return (
     (Object.hasOwn(RUNNERS, env.runner_type) ? RUNNERS[env.runner_type] : undefined) ??
     `${words(env.runner_type, "Runner")} runner`
@@ -38,6 +58,8 @@ export function runsOn(env: EnvironmentSummary): string {
  * tools return "No runner configured"; file tools and the agent's own tools still work.
  */
 export function runsOnDetail(env: EnvironmentSummary): string {
+  if (!env.runner_type && perSession(env))
+    return `${env.factory_type ?? "A factory"} creates this environment when a session starts, so where commands run, the workspace and the stores are whatever it gives that session.`
   if (!env.runner_type)
     return env.workspace_id
       ? "Shell, Git and text-search tools aren't available. File tools and the agent's own tools still work."
@@ -45,6 +67,17 @@ export function runsOnDetail(env: EnvironmentSummary): string {
   return env.is_factory
     ? "A fresh environment is set up for each session and removed when it ends."
     : "Every session shares the same one."
+}
+
+/** The line under "Commands run in" in the list. */
+export function runsOnShort(env: EnvironmentSummary): string {
+  if (!env.runner_type)
+    return perSession(env)
+      ? env.factory_type
+        ? `By ${env.factory_type}`
+        : "By an environment factory"
+      : "No shell, Git or search tools"
+  return perSession(env) ? "Fresh for each session" : "Shared by all sessions"
 }
 
 const KNOWLEDGE: Record<string, string> = {
@@ -56,12 +89,20 @@ const KNOWLEDGE: Record<string, string> = {
 }
 
 export function knowledgeText(env: EnvironmentSummary): string {
-  if (!env.knowledge_store_type) return "None"
+  if (!env.knowledge_store_type) return perSession(env) ? DECIDED_PER_SESSION : "None"
   return (
     (Object.hasOwn(KNOWLEDGE, env.knowledge_store_type)
       ? KNOWLEDGE[env.knowledge_store_type]
       : undefined) ?? words(env.knowledge_store_type, "KnowledgeStore")
   )
+}
+
+/** The "Stored in" line on the detail page. */
+export function knowledgeDetail(env: EnvironmentSummary): string {
+  if (env.knowledge_store_type) return knowledgeText(env)
+  return perSession(env)
+    ? `${DECIDED_PER_SESSION}, by the environment the factory creates.`
+    : "No knowledge store. Sessions here can't look things up or save what they learn."
 }
 
 const BINDINGS: Record<string, string> = {
@@ -71,14 +112,20 @@ const BINDINGS: Record<string, string> = {
   BrokeredSandboxCodingBinding: "Sandboxed repository",
 }
 
+/** A binding class name in words: `GitRepositoryBinding` → "Git repository". */
+const bindingText = (binding: string) =>
+  (Object.hasOwn(BINDINGS, binding) ? BINDINGS[binding] : undefined) ?? words(binding, "Binding")
+
 /** What the workspace is, or null when the environment has none. */
 export function workspaceText(env: EnvironmentSummary): string | null {
   if (!env.workspace_id) return null
   if (!env.binding_type) return "Workspace"
-  return (
-    (Object.hasOwn(BINDINGS, env.binding_type) ? BINDINGS[env.binding_type] : undefined) ??
-    words(env.binding_type, "Binding")
-  )
+  return bindingText(env.binding_type)
+}
+
+/** The workspace in a few words: its kind, "Decided when a session starts", or `none`. */
+export function workspaceLabel(env: EnvironmentSummary, none = "None"): string {
+  return workspaceText(env) ?? (perSession(env) ? DECIDED_PER_SESSION : none)
 }
 
 /**
@@ -94,7 +141,12 @@ export function branchShort(env: EnvironmentSummary): string {
 /** What the workspace's branch support means, as sentences for the detail page. */
 export function branchDetails(env: EnvironmentSummary): string[] {
   const caps = env.workspace_branch_capabilities
-  if (!env.workspace_id) return ["This environment has no workspace."]
+  if (!env.workspace_id)
+    return [
+      perSession(env)
+        ? "Decided when a session starts, by the workspace the factory gives it."
+        : "This environment has no workspace.",
+    ]
   if (!caps.isolation) return ["Not supported. Code works on the workspace files directly."]
   const lines = [
     "The agent's code can open a branch: a private copy of the workspace whose changes are kept or thrown away together. Sessions don't get one automatically.",
@@ -119,7 +171,7 @@ const VAULTS: Record<string, string> = {
 }
 
 export function secretsText(env: EnvironmentSummary): string {
-  if (!env.vault_type) return "None"
+  if (!env.vault_type) return perSession(env) ? DECIDED_PER_SESSION : "None"
   return (
     (Object.hasOwn(VAULTS, env.vault_type) ? VAULTS[env.vault_type] : undefined) ??
     words(env.vault_type, "Vault")
@@ -132,7 +184,7 @@ const PROXIES: Record<string, string> = {
 }
 
 export function networkText(env: EnvironmentSummary): string {
-  if (!env.proxy_type) return "Not managed by Cayu"
+  if (!env.proxy_type) return perSession(env) ? DECIDED_PER_SESSION : "Not managed by Cayu"
   return (
     (Object.hasOwn(PROXIES, env.proxy_type) ? PROXIES[env.proxy_type] : undefined) ??
     words(env.proxy_type, "Proxy")
@@ -165,20 +217,71 @@ export function branchObservationText(
 
 /** Storage is a declaration, not an inference from its opaque ID or a health check. */
 export function artifactStorageText(env: EnvironmentSummary): string {
-  if (!savesFiles(env)) return "No file storage"
+  if (!savesFiles(env)) return perSession(env) ? DECIDED_PER_SESSION : "No file storage"
   if (env.artifact_store_kind === "local_disk") return "Local disk"
   if (env.artifact_store_kind === "s3") return "S3"
   return "Storage kind unavailable"
 }
 
 export function mcpNamesText(env: EnvironmentSummary): string {
-  if (env.mcp_server_count === 0) return "None"
+  if (env.mcp_server_count === 0) return perSession(env) ? DECIDED_PER_SESSION : "None"
   const names = env.mcp_server_names
   return Array.isArray(names) &&
     names.length === env.mcp_server_count &&
     names.every((name) => typeof name === "string" && name.length > 0)
     ? names.join(", ")
     : `${mcpText(env.mcp_server_count)} (names unavailable)`
+}
+
+/** MCP servers under the environment's name in the list. */
+export function mcpShort(env: EnvironmentSummary): string {
+  if (env.mcp_server_count > 0) return mcpNamesText(env)
+  return perSession(env) ? "MCP servers decided per session" : "No MCP servers"
+}
+
+/** The "Where they go" line for an environment whose registration names no file store. */
+export function noFileStoreText(env: EnvironmentSummary): string {
+  return perSession(env)
+    ? `${DECIDED_PER_SESSION}. Files are listed here only when the factory is registered with an artifact_store.`
+    : "Nowhere. Sessions here can't save files; give the environment an ArtifactStore to keep them."
+}
+
+/** The event that records what a session's environment gave it once set up. */
+export const SESSION_SETUP_EVENT = "environment.binding.completed"
+
+/**
+ * What one session's environment had, from its `environment.binding.completed` payload:
+ * whether a runner was there for commands, and the workspace. Null when the payload is missing.
+ * The binding names a class (or an opaque alias when redacted); only a plain class name is shown.
+ */
+export function sessionSetupFacts(
+  payload: Record<string, unknown> | null | undefined,
+): { commands: string; workspace: string } | null {
+  if (!payload || typeof payload !== "object") return null
+  // The binding can replace or drop the configured runner; what it bound is what the session had.
+  const runner =
+    typeof payload.has_bound_runner === "boolean"
+      ? payload.has_bound_runner
+      : typeof payload.has_configured_runner === "boolean"
+        ? payload.has_configured_runner
+        : null
+  const workspaceId = ["bound_workspace_id", "source_workspace_id", "configured_workspace_id"].some(
+    (key) => typeof payload[key] === "string" && (payload[key] as string).length > 0,
+  )
+  const binding = payload.binding_type
+  const kind =
+    typeof binding === "string" && /^[A-Z][A-Za-z0-9]*Binding$/.test(binding)
+      ? bindingText(binding)
+      : "Workspace"
+  return {
+    commands:
+      runner === true
+        ? "Had a runner, so shell, Git and text-search tools could run"
+        : runner === false
+          ? "No runner, so shell, Git and text-search tools weren't available"
+          : "Not recorded",
+    workspace: workspaceId ? kind : "None",
+  }
 }
 
 /** Only a complete, supported native observation proves a count (including zero). */

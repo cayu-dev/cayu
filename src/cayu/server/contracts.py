@@ -2895,6 +2895,15 @@ class ApiEnvironmentSummary(ApiBaseModel):
     name: str
     metadata: dict[str, Any]
     is_factory: StrictBool
+    factory_type: str | None = Field(
+        default=None,
+        description=(
+            "Class name of the environment factory that sets this environment up for each "
+            "session; null for an environment registered directly. A factory's runner, "
+            "workspace, stores and MCP servers come from the environment it creates, so "
+            "the registration reports them as null."
+        ),
+    )
     workspace_id: str | None
     workspace_branch_capabilities: ApiWorkspaceBranchCapabilities
     workspace_branch_lifecycle: ApiWorkspaceBranchLifecycle

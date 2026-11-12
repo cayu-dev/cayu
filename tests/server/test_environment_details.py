@@ -70,6 +70,10 @@ def test_environment_unknown_storage_kind_and_no_factory_materialization():
         rows = {row["name"]: row for row in response.json()["environments"]}
         assert rows["factory"]["artifact_store_kind"] == "s3"
         assert rows["factory"]["is_factory"] is True
+        assert rows["factory"]["factory_type"] == "Factory"
+        assert rows["factory"]["runner_type"] is None
+        assert rows["custom"]["is_factory"] is False
+        assert rows["custom"]["factory_type"] is None
         assert rows["custom"]["artifact_store_kind"] == "unknown"
         assert rows["none"]["artifact_store_kind"] is None
         assert all(row["session_count"] == "0" for row in rows.values())

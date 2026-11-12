@@ -2,9 +2,11 @@
  * Environments: where the agent's sessions run. The list gives one row per environment in
  * plain words (where commands run, the workspace, files, knowledge, MCP servers, and when a
  * session last ran there); an environment's page adds its recent sessions and files.
- * Class names, IDs and raw capability records stay in Debug.
+ * An environment created for each session by a factory is named by its factory, as Trace
+ * names it, and its page reads what the latest session got. Other class names, IDs and raw
+ * capability records stay in Debug.
  */
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useParams, useSearch } from "@tanstack/react-router"
 import { Box, ChevronRight, RefreshCw } from "lucide-react"
 import type { ReactNode } from "react"
@@ -14,6 +16,7 @@ import { useArtifacts } from "@/lib/artifact-query"
 import { formatBytes, formatCount } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { overviewForDisplay } from "../api/overview"
+import type { SessionOverview } from "../api/types"
 import { useEnvironments } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
@@ -36,15 +39,24 @@ import {
   branchDetails,
   branchObservationText,
   branchShort,
+  brief,
   environmentActivity,
   environmentRoute,
+  knowledgeDetail,
   knowledgeText,
   mcpNamesText,
+  mcpShort,
   networkText,
+  noFileStoreText,
   runsOn,
   runsOnDetail,
+  runsOnShort,
+  SESSION_SETUP_EVENT,
   savesFiles,
   secretsText,
+  sessionSetupFacts,
+  setupText,
+  workspaceLabel,
   workspaceText,
 } from "./environments/environment-model"
 
@@ -149,23 +161,19 @@ function EnvironmentList() {
                         </div>
                         <div className="mt-0.5 truncate pl-6 text-xs text-muted-foreground">
                           <span className="md:hidden">
-                            {runsOn(env)} · {workspace ?? "No workspace"} ·{" "}
+                            {runsOn(env)} · {brief(workspaceLabel(env, "No workspace"))} ·{" "}
                           </span>
-                          {env.mcp_server_count === 0 ? "No MCP servers" : mcpNamesText(env)}
+                          {mcpShort(env)}
                         </div>
                       </td>
                       <td className="hidden px-3 py-2.5 md:table-cell">
                         <div>{runsOn(env)}</div>
                         <div className="mt-0.5 text-xs text-muted-foreground">
-                          {!env.runner_type
-                            ? "No shell, Git or search tools"
-                            : env.is_factory
-                              ? "Fresh for each session"
-                              : "Shared by all sessions"}
+                          {runsOnShort(env)}
                         </div>
                       </td>
                       <td className="hidden px-3 py-2.5 md:table-cell">
-                        <div>{workspace ?? "None"}</div>
+                        <div>{brief(workspaceLabel(env))}</div>
                         {workspace && (
                           <div className="mt-0.5 text-xs text-muted-foreground">
                             {branchShort(env)}
@@ -173,10 +181,10 @@ function EnvironmentList() {
                         )}
                       </td>
                       <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
-                        {artifactStorageText(env)}
+                        {brief(artifactStorageText(env))}
                       </td>
                       <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
-                        {knowledgeText(env)}
+                        {brief(knowledgeText(env))}
                       </td>
                       <td className="px-3 py-2.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                         <div title={activity?.last ?? undefined}>
@@ -292,14 +300,17 @@ export function EnvironmentPage() {
 
 function EnvironmentView({ name }: { name: string }) {
   const environments = useEnvironments()
+  const queryClient = useQueryClient()
   const env = environments.data?.environments.find((e) => e.name === name)
+  // Refresh rereads the page's sessions and the latest session's setup, not only the inventory.
+  const refresh = () => {
+    void environments.refetch()
+    for (const key of ["environment-sessions", "environment-latest-setup"])
+      void queryClient.invalidateQueries({ queryKey: [key, name] })
+  }
 
   const header = (
-    <TopBar
-      actions={
-        <Refresh fetching={environments.isFetching} onRefresh={() => void environments.refetch()} />
-      }
-    >
+    <TopBar actions={<Refresh fetching={environments.isFetching} onRefresh={refresh} />}>
       <span className="flex min-w-0 items-center gap-1">
         <NavLink
           to="/environments"
@@ -387,7 +398,6 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
     { environment_name: env.name, limit: 5 },
     artifactsEnabled && savesFiles(env),
   )
-  const workspace = workspaceText(env)
   const branches = branchDetails(env)
   const fileCount = files.data?.total_count
   const knownCount =
@@ -419,7 +429,7 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
         <div className="min-w-0">
           <h1 className="truncate text-xl font-semibold">{env.name}</h1>
           <p className="text-sm text-muted-foreground">
-            {runsOn(env)} · {workspace ?? "No workspace"}
+            {setupText(env) ?? `${runsOn(env)} · ${workspaceLabel(env, "No workspace")}`}
           </p>
         </div>
       </div>
@@ -458,6 +468,13 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
         <p className="mt-2 text-xs text-muted-foreground">{COUNT_SCOPE}</p>
       </Section>
 
+      {env.is_factory && !recent.error && (
+        <LatestSessionSetup
+          env={env}
+          latest={recent.isSuccess ? (recent.data.rows[0] ?? null) : undefined}
+        />
+      )}
+
       <Section title="Where it runs">
         <Facts
           rows={[
@@ -479,7 +496,7 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
       <Section title="Workspace">
         <Facts
           rows={[
-            ["Workspace", workspace ?? "None"],
+            ["Workspace", workspaceLabel(env)],
             [
               "Branches",
               <div key="branches" className="space-y-1">
@@ -521,12 +538,7 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
                   ],
                   ["Saved so far", savedFiles],
                 ]
-              : [
-                  [
-                    "Where they go",
-                    "Nowhere. Sessions here can't save files; give the environment an ArtifactStore to keep them.",
-                  ],
-                ]
+              : [["Where they go", noFileStoreText(env)]]
           }
         />
       </Section>
@@ -541,16 +553,7 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
           ) : undefined
         }
       >
-        <Facts
-          rows={[
-            [
-              "Stored in",
-              env.knowledge_store_type
-                ? knowledgeText(env)
-                : "No knowledge store. Sessions here can't look things up or save what they learn.",
-            ],
-          ]}
-        />
+        <Facts rows={[["Stored in", knowledgeDetail(env)]]} />
       </Section>
 
       <Section title="MCP servers">
@@ -669,6 +672,7 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
           ["Last activity", activity?.last],
           ["Activity observed at", activity?.asOf],
           ["Factory-backed", env.is_factory ? "yes" : "no"],
+          ["Factory", env.factory_type],
           [
             "Branches",
             `${env.workspace_branch_lifecycle.attached_count} attached${
@@ -698,5 +702,83 @@ function RunsOn({ env }: { env: EnvironmentSummary }) {
       <p>{runsOn(env)}</p>
       <p className="mt-0.5 text-xs text-muted-foreground">{runsOnDetail(env)}</p>
     </div>
+  )
+}
+
+/**
+ * A factory environment's parts exist only once a session starts, so the page reads what the
+ * newest session's environment had from its `environment.binding.completed` event.
+ */
+function LatestSessionSetup({
+  env,
+  latest,
+}: {
+  env: EnvironmentSummary
+  /** The newest session here; null when there is none, undefined while loading. */
+  latest:
+    | { session: { id: string; updated_at: string }; overview?: SessionOverview }
+    | null
+    | undefined
+}) {
+  const api = useApi()
+  const now = useNow()
+  const setup = useQuery<ReturnType<typeof sessionSetupFacts>>({
+    queryKey: ["environment-latest-setup", env.name, latest?.session.id],
+    enabled: !!latest,
+    // A session still setting up has no binding event yet; look again until it has one.
+    refetchInterval: (query) =>
+      query.state.data == null && latest?.overview?.state === "running" ? 5000 : false,
+    queryFn: async ({ signal }) => {
+      if (!latest) return null
+      const page = await api.events(
+        latest.session.id,
+        { event_type: SESSION_SETUP_EVENT, order_by: "sequence_desc", limit: 1 },
+        signal,
+      )
+      return sessionSetupFacts(page.events[0]?.payload as Record<string, unknown> | undefined)
+    },
+  })
+  const facts = setup.data
+  return (
+    <Section title="Latest session">
+      {latest === undefined ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Loading sessions…
+        </p>
+      ) : latest === null ? (
+        <p className="text-sm text-muted-foreground">
+          No session has run here yet. Each one gets the environment{" "}
+          {env.factory_type ?? "the factory"} creates for it.
+        </p>
+      ) : setup.isPending ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Loading what it got…
+        </p>
+      ) : setup.error ? (
+        <ErrorState error={setup.error} />
+      ) : (
+        <Facts
+          rows={[
+            [
+              "Session",
+              <span key="session">
+                <NavLink
+                  {...sessionRoute(latest.session.id)}
+                  className="underline-offset-4 hover:underline"
+                >
+                  {sessionTitle(latest.overview)}
+                </NavLink>
+                <span className="text-muted-foreground">
+                  {" "}
+                  · {relativeTime(Date.parse(latest.session.updated_at), now())}
+                </span>
+              </span>,
+            ],
+            ["Commands", facts?.commands ?? "Not recorded"],
+            ["Workspace", facts?.workspace ?? "Not recorded"],
+          ]}
+        />
+      )}
+    </Section>
   )
 }
