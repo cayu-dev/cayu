@@ -471,7 +471,11 @@ def configured_memory_evidence_key() -> str:
     except OSError as exc:
         raise RuntimeError(
             "automatic memory requires CAYU_MEMORY_EVIDENCE_KEY or the private "
-            "data/memory-evidence.key created by `cayu new`"
+            "data/memory-evidence.key created by `cayu new`. That file is git-ignored, so "
+            "a fresh checkout such as a CI job has none: there, set CAYU_MEMORY_EVIDENCE_KEY "
+            "to a throwaway value of at least 32 bytes, for example the output of "
+            "`python -c 'import secrets; print(secrets.token_urlsafe(48))'`. A deployment "
+            "needs its own stable key; Cayu Cloud sets it for a deployed Agent"
         ) from exc
 '''
 

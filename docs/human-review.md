@@ -160,6 +160,16 @@ app = CayuApp(
   One derived policy object can't serve apps with different keyrings.
 - Calls to tools it doesn't name stay approvable, as they are without a policy.
   The view names the tool and says its arguments are not shown.
+- A local run usually has no keyring, so an app that builds the policy only when
+  it has one (the common pattern) runs without a review there. The approver then
+  sees an approval's title, tool name and any question but none of its
+  arguments: inbox items report `arguments_unavailable_reason:
+  "no_review_policy"`, and the decision needs no `review_reference`. With a
+  policy, the inbox item reports `"quarantined"` instead and the arguments are
+  read through the review. `cayu check` reports a project that imports
+  `ToolArgumentReview` in such a run as `HUMAN_REVIEW_KEYRING_MISSING` (info).
+  To see the review locally, run `cayu keys generate --env-file .env` and start
+  the app with `uv run --env-file .env ...`.
 - A question from `ask_user` shows its question and options in static secret
   scope. Dynamic or unknown scope requires a separate `attest_questions=True`
   assertion that the question and options are safe for the recipient.

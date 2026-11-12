@@ -509,7 +509,9 @@ def test_check_deploy_checks_custom_auth_source_before_import(
 
     monkeypatch.setattr(cloud_deploy_check, "load_target", observe_load)
 
-    assert main(["check", "--deploy", "--json"]) == 1
+    # The scaffold has no private memory key file; the check lends the factory a
+    # throwaway key, so only the unsafe auth source fails it.
+    assert main(["check", "--deploy", "--json"]) == (1 if unsafe else 0)
     report = json.loads(capsys.readouterr().out)
     assert not (project / "unsafe-auth-import.txt").exists()
     assert (

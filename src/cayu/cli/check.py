@@ -4,8 +4,14 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from cayu.cli._check_keys import (
+    lent_memory_evidence_key,
+    lent_memory_key_diagnostic,
+    review_without_keyring_diagnostic,
+    uses_tool_argument_review,
+)
 from cayu.cli._local_alias_keys import keyring_required_diagnostic
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import (
@@ -41,6 +47,9 @@ from cayu.runtime.checks import (
 from cayu.runtime.manifest import AppManifest
 from cayu.runtime.public_authority import _AliasStoreKeyringRequired
 from cayu.runtime.service_manifest import PublicServiceManifest
+
+if TYPE_CHECKING:
+    from cayu.applications import CayuApp
 
 
 def add_check_parser(subparsers: Any) -> None:
@@ -248,7 +257,10 @@ def check_project(
             mode="production",
         )
         try:
-            with project_context(project.root):
+            with (
+                project_context(project.root),
+                lent_memory_evidence_key(project.root) as lent_memory_key,
+            ):
                 service = (
                     None
                     if project.service_target is None
@@ -265,6 +277,9 @@ def check_project(
                     else service.cayu_app
                 )
                 manifest = app.describe(project_root=project.root)
+            key_findings = _key_findings(
+                project.root, app, lent_memory_key=lent_memory_key, deploy=deploy_only
+            )
             check_evidence = ProjectControlPlaneCheckEvidence(
                 project_identity_configured=(control_plane_context.project_identity_configured),
                 eval_store_configured=control_plane_context.eval_store_configured,
@@ -287,6 +302,9 @@ def check_project(
                 tags=tags,
                 deploy_only=deploy_only,
             )
+            report = _with_diagnostics(
+                report, filter_findings(key_findings, tags=tags, deploy_only=deploy_only)
+            )
         finally:
             close_project_control_plane_context(control_plane_context)
     except _AliasStoreKeyringRequired as exc:
@@ -303,6 +321,23 @@ def check_project(
         raise
 
     return report
+
+
+def _key_findings(
+    root: Path, app: CayuApp, *, lent_memory_key: bool, deploy: bool
+) -> tuple[ProjectDiagnostic, ...]:
+    """Keys this run lacks: a lent memory evidence key, a review without a keyring."""
+
+    findings: list[ProjectDiagnostic] = []
+    if lent_memory_key:
+        findings.append(lent_memory_key_diagnostic(deploy=deploy))
+    if (
+        app._public_authority_alias_codec is None
+        and not app.human_review_configured
+        and (module := uses_tool_argument_review(root)) is not None
+    ):
+        findings.append(review_without_keyring_diagnostic(module))
+    return tuple(findings)
 
 
 def build_project_check_report(

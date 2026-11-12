@@ -45,7 +45,9 @@ _UNLISTED_TOOL_TEXT = "Arguments are not shown for this tool."
 _LONG_FIELD_KEY = re.compile(r"([1-9][0-9]{0,3})\.([1-9][0-9]{0,3})\Z")
 _NO_KEY_TEXT = (
     "ToolArgumentReview has no binding_key: pass one, or give the CayuApp (or its "
-    "session store) a public authority alias keyring to derive one from."
+    "session store) a public authority alias keyring to derive one from. For a local "
+    "run, `cayu keys generate --env-file .env` writes a keyring and `uv run --env-file "
+    ".env ...` loads it; Cayu Cloud sets one for a deployed Agent."
 )
 
 

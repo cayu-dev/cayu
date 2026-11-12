@@ -21,6 +21,36 @@ Installed packages also report replacement imports when a removed name is
 accessed directly. These known removed routes raise `ImportError`; unknown
 attributes retain `AttributeError`. No removed route loads its former object.
 
+## memory-evidence-key-unset
+
+`MEMORY_EVIDENCE_KEY_UNSET` is informational: `CAYU_MEMORY_EVIDENCE_KEY` is unset
+and `data/memory-evidence.key` doesn't exist, so `cayu check` built the
+application with a throwaway memory evidence key. Describing the app derives no
+evidence, so the check doesn't need the real key. `cayu new` creates the file,
+but it is git-ignored, so a fresh checkout such as a CI job has none, and tests
+that build the app fail there with "automatic memory requires
+CAYU_MEMORY_EVIDENCE_KEY". In CI, set `CAYU_MEMORY_EVIDENCE_KEY` to a throwaway
+value of at least 32 bytes before the tests, for example the output of
+`python -c 'import secrets; print(secrets.token_urlsafe(48))'`. Under
+`cayu check --deploy` the finding also says a deployment needs its own stable
+key: Cayu Cloud sets it for a deployed Agent; elsewhere, store one as a secret.
+
+## human-review-keyring-missing
+
+`HUMAN_REVIEW_KEYRING_MISSING` is informational: project source imports
+`ToolArgumentReview`, but this run has no public authority alias keyring and the
+loaded app has no human review policy (an app usually skips the policy when the
+keyring is missing, because `CayuApp` refuses a `ToolArgumentReview` without
+one). In such a run an approver sees each approval's title, tool name and any
+question, but none of its arguments: the inbox reports
+`arguments_unavailable_reason: no_review_policy`, and the approval is decided
+without a `review_reference`. With the keyring, the approver reads the listed
+arguments in the protected review and decides with its reference, as a
+deployed Agent does (Cayu Cloud sets the keyring). To see the review locally,
+run `cayu keys generate --env-file .env` once and start the app with
+`uv run --env-file .env ...`. A database opened with a keyring keeps requiring
+it, so keep using the same keys.
+
 ## session-store-alias-keyring-required
 
 `SESSION_STORE_ALIAS_KEYRING_REQUIRED` means the application factory could not
