@@ -4902,6 +4902,7 @@
           "AllowAllToolPolicy",
           "AllowlistRule",
           "AlwaysRequireApprovalToolPolicy",
+          "ApprovalFloorToolPolicy",
           "DenyPatternRule",
           "EnvironmentScopedToolPolicy",
           "EveryCallRule",

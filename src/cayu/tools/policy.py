@@ -388,6 +388,50 @@ class AlwaysRequireApprovalToolPolicy(ToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class ApprovalFloorToolPolicy(ToolPolicy):
+    """Require approval for named tools wherever ``inner`` (default: allow all) allows them.
+
+    ``tools`` maps each tool name to the reason the approver reads: a string, or a function of
+    the call's arguments that answers one. Every other decision is ``inner``'s, so a call it
+    denies stays denied and one it sends for approval keeps its result and metadata. ``cayu
+    check`` reads it: a named tool is ``approval_required`` wherever ``inner`` allows it.
+    """
+
+    def __init__(
+        self,
+        tools: Mapping[str, str | Callable[[Mapping[str, Any]], str]],
+        inner: ToolPolicy | None = None,
+    ) -> None:
+        inner = AllowAllToolPolicy() if inner is None else inner
+        if not isinstance(inner, ToolPolicy):
+            raise TypeError("inner must be a ToolPolicy.")
+        names = _copy_tool_name_set(tools, "tools")
+        if not names:
+            raise ValueError("tools names at least one tool.")
+        self._inner = inner
+        self._tools = names
+        self._reasons = MappingProxyType({name: tools[name] for name in names})
+
+    @property
+    def inner(self) -> ToolPolicy:
+        return self._inner
+
+    @property
+    def tools(self) -> frozenset[str]:
+        return self._tools
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        decided = await self._inner.authorize(request)
+        reason = self._reasons.get(request.tool_name)
+        if reason is None or decided.decision is not ToolPolicyDecision.ALLOW:
+            return decided
+        return ToolPolicyResult(
+            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+            reason=reason if isinstance(reason, str) else reason(request.arguments),
+            metadata=decided.metadata,
+        )
+
+
 class ParameterRule(ABC):
     """Validates one argument path in a tool call.
 

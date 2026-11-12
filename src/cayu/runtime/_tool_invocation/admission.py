@@ -132,6 +132,7 @@ from cayu.tools.grants import (
 )
 from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
+    ApprovalFloorToolPolicy,
     GuardedToolPolicy,
     TaintAwareToolPolicy,
     ToolPolicy,
@@ -237,6 +238,9 @@ def _taint_policy(policy: ToolPolicy) -> TaintAwareToolPolicy | None:
     while True:
         if type(policy) is GuardedToolPolicy:
             policy = policy.then
+            continue
+        if type(policy) is ApprovalFloorToolPolicy:
+            policy = policy.inner
             continue
         downstream = policy.then if type(policy) is ToolAuthorizationGrantPolicy else None
         if downstream is None:

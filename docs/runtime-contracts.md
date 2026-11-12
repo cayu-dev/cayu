@@ -1696,6 +1696,15 @@ are denied; there are no wildcard rules. Successful matches execute without a
 human approval checkpoint. Use `AlwaysRequireApprovalToolPolicy` when each call
 needs an operator decision instead.
 
+`ApprovalFloorToolPolicy(tools, inner)` puts an approval floor under another
+policy: each named tool needs approval wherever `inner` allows it, with the reason
+`tools` gives it (a string, or a function of the call's arguments), and every
+other decision is `inner`'s. The connector toolkits' `approval_policy()` is one.
+`cayu check` reads it, so a named external tool counts as guarded wherever
+`inner` allows it, and `inner`'s denials and opaque coverage stay as they are. The
+floor hides nothing of `inner`: a taint-aware inner policy still tracks taint, and a
+tool an inner allowlist names stays deliberately allowed for the check.
+
 Scopes authorize operations in application-configured environments; naming an
 environment does not certify sandboxing, select a different runner, or grant host
 execution. Native execution admission, workload identity and binding, command

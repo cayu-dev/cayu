@@ -11,6 +11,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "AllowAllToolPolicy": ("cayu.tools.policy", "AllowAllToolPolicy"),
     "AllowlistRule": ("cayu.tools.policy", "AllowlistRule"),
     "AlwaysRequireApprovalToolPolicy": ("cayu.tools.policy", "AlwaysRequireApprovalToolPolicy"),
+    "ApprovalFloorToolPolicy": ("cayu.tools.policy", "ApprovalFloorToolPolicy"),
     "ApplyPatchTool": ("cayu.tools.patches", "ApplyPatchTool"),
     "ArtifactExternalizingToolResultPolicy": (
         "cayu.tools.result_projection",
@@ -465,6 +466,7 @@ PUBLIC_NAMES = [
     "AllowlistRule",
     "AlwaysRequireApprovalToolPolicy",
     "ApplyPatchTool",
+    "ApprovalFloorToolPolicy",
     "ArtifactExternalizingToolResultPolicy",
     "ArtifactReadRequest",
     "ArtifactReader",

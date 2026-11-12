@@ -78,6 +78,8 @@ approval before its write tools run, with a reason naming the channel (`Post a S
 C0123.`) or the kind of statement (`Run a DELETE statement in Snowflake.`), and leaves every other
 decision to `inner` (default: allow). A call `inner` denies stays denied, and one `inner` already
 sends for approval keeps `inner`'s result. Wrap one toolkit's policy in the other's to use both.
+Each is an `ApprovalFloorToolPolicy`, which `cayu check` reads: a toolkit's write tools are
+`approval_required` wherever `inner` allows them, so `--deploy` accepts them as guarded.
 
 `review_fields()` names the arguments an approver sees, for
 [`ToolArgumentReview`](human-review.md): the channel, thread and text of a Slack post or edit, and

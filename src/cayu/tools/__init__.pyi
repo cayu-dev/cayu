@@ -204,6 +204,7 @@ from cayu.tools.policy import (
 from cayu.tools.policy import AllowAllToolPolicy as AllowAllToolPolicy
 from cayu.tools.policy import AllowlistRule as AllowlistRule
 from cayu.tools.policy import AlwaysRequireApprovalToolPolicy as AlwaysRequireApprovalToolPolicy
+from cayu.tools.policy import ApprovalFloorToolPolicy as ApprovalFloorToolPolicy
 from cayu.tools.policy import DenyPatternRule as DenyPatternRule
 from cayu.tools.policy import EnvironmentScopedToolPolicy as EnvironmentScopedToolPolicy
 from cayu.tools.policy import EveryCallRule as EveryCallRule

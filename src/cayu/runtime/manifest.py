@@ -43,6 +43,7 @@ from cayu.tools.policy import (
     AllowAllToolPolicy,
     AllowlistRule,
     AlwaysRequireApprovalToolPolicy,
+    ApprovalFloorToolPolicy,
     DenyPatternRule,
     EnvironmentScopedToolPolicy,
     EveryCallRule,
@@ -947,6 +948,8 @@ def _policy_allows_explicitly(
     seen = _seen | {id(policy)}
     if type(policy) is GuardedToolPolicy:
         return _policy_allows_explicitly(policy.then, tool_name, _seen=seen)
+    if type(policy) is ApprovalFloorToolPolicy:
+        return _policy_allows_explicitly(policy.inner, tool_name, _seen=seen)
     if type(policy) is StaticToolPolicy:
         return (
             policy.allow is not None and tool_name in policy.allow and tool_name not in policy.deny
@@ -1150,12 +1153,11 @@ def _parameter_policy_decision(
         seen.add(id(policy))
         policy = policy._base_policy
     # Do not project built-in semantics onto an overriding extension subclass.
-    if type(policy) is GuardedToolPolicy:
+    if type(policy) is GuardedToolPolicy or type(policy) is ApprovalFloorToolPolicy:
         if id(policy) in seen:
             return None
-        return _parameter_policy_decision(
-            policy.then, tool_name, _seen=frozenset(seen) | {id(policy)}
-        )
+        inner = policy.inner if isinstance(policy, ApprovalFloorToolPolicy) else policy.then
+        return _parameter_policy_decision(inner, tool_name, _seen=frozenset(seen) | {id(policy)})
     if (
         type(policy) is ParameterConstrainedToolPolicy
         and type(policy.decision) is ToolPolicyDecision
@@ -1175,6 +1177,8 @@ def _policy_environment_names(
         return None
     if type(policy) is GuardedToolPolicy:
         return _policy_environment_names(policy.then, tool_name, _seen=_seen | {id(policy)})
+    if type(policy) is ApprovalFloorToolPolicy:
+        return _policy_environment_names(policy.inner, tool_name, _seen=_seen | {id(policy)})
     if type(policy) is EnvironmentScopedToolPolicy:
         return tuple(sorted(policy.allow.get(tool_name, ())))
     return None
@@ -1213,6 +1217,11 @@ def _tool_policy_coverage(
             for guard in policy.guards
         ):
             return "conditional"
+        return coverage
+    if type(policy) is ApprovalFloorToolPolicy:
+        coverage = _tool_policy_coverage(policy.inner, tool_name, schema, _seen=seen)
+        if coverage == "allowed" and tool_name in policy.tools:
+            return "approval_required"
         return coverage
     if type(policy) is AllowAllToolPolicy:
         return "allowed"

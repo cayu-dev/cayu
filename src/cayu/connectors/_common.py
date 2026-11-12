@@ -17,13 +17,7 @@ from cayu.connections import (
 )
 from cayu.tools._errors import invalid_tool_arguments_result
 from cayu.tools.base import ToolResult
-from cayu.tools.policy import (
-    AllowAllToolPolicy,
-    ToolPolicy,
-    ToolPolicyDecision,
-    ToolPolicyRequest,
-    ToolPolicyResult,
-)
+from cayu.tools.policy import ApprovalFloorToolPolicy, ToolPolicy
 
 #: The largest answer the model reads: a result's ``content``, in UTF-8 bytes.
 ANSWER_BUDGET_BYTES = 60 * 1024
@@ -172,34 +166,8 @@ def reason_argument(value: object) -> str:
     return shortened(text, _REASON_ARGUMENT_CHARACTERS)[0] or "(none)"
 
 
-class _ApprovalPolicy(ToolPolicy):
-    """Ask for approval on named write tools; every other decision is ``inner``'s."""
-
-    def __init__(
-        self,
-        inner: ToolPolicy | None,
-        reasons: Mapping[str, Callable[[Mapping[str, Any]], str]],
-    ) -> None:
-        inner = AllowAllToolPolicy() if inner is None else inner
-        if not isinstance(inner, ToolPolicy):
-            raise TypeError("inner must be a ToolPolicy.")
-        self.inner = inner
-        self._reasons = dict(reasons)
-
-    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
-        decided = await self.inner.authorize(request)
-        reason = self._reasons.get(request.tool_name)
-        if reason is None or decided.decision is not ToolPolicyDecision.ALLOW:
-            return decided
-        return ToolPolicyResult(
-            decision=ToolPolicyDecision.REQUIRE_APPROVAL,
-            reason=reason(request.arguments),
-            metadata=decided.metadata,
-        )
-
-
 def approval_policy(
     inner: ToolPolicy | None,
     reasons: Mapping[str, Callable[[Mapping[str, Any]], str]],
 ) -> ToolPolicy:
-    return _ApprovalPolicy(inner, reasons)
+    return ApprovalFloorToolPolicy(reasons, inner)

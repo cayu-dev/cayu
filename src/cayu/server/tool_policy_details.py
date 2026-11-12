@@ -10,6 +10,7 @@ from cayu.tools.policy import (
     AllowAllToolPolicy,
     AllowlistRule,
     AlwaysRequireApprovalToolPolicy,
+    ApprovalFloorToolPolicy,
     DenyPatternRule,
     EnvironmentScopedToolPolicy,
     EveryCallRule,
@@ -86,6 +87,14 @@ def _details(policy: ToolPolicy, name: str, seen: frozenset[int]) -> tuple[list[
             + ", ".join(environments)
             + ". Missing or other environments deny the call."
         ], True
+    if type(policy) is ApprovalFloorToolPolicy:
+        details, complete = _details(policy.inner, name, seen)
+        if name not in policy.tools:
+            return details, complete
+        return [
+            "A person's approval is required wherever the policy below allows this tool.",
+            *details,
+        ], complete
     if type(policy) is GuardedToolPolicy:
         details, complete = _details(policy.then, name, seen)
         if not policy.guards:
