@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from tests.runtime.test_orphaned_session_reconciliation import (
@@ -204,6 +205,23 @@ def test_remote_lease_expiry_fences_late_tool_result_without_claiming_abort(
 
     async def scenario():
         async with _stores(backend, request, sqlite_resources) as (store, reopen):
+            now = [datetime.now(UTC)]
+            reader_store = reopen()
+            if backend == "postgres":
+                from cayu.storage import _postgres_locked_reads as locked_reads
+
+                # Both single and pipelined server-clock reads use this decoder.
+                # Keep the real queries, locks and writes, controlling only time.
+                decode = locked_reads.decode_store_now
+
+                def store_now(row):
+                    decode(row)
+                    return now[0]
+
+                monkeypatch.setattr(locked_reads, "decode_store_now", store_now)
+            else:
+                for session_store in (store, reader_store):
+                    monkeypatch.setattr(session_store, "_ownership_clock", lambda: now[0])
             tool = _Blocking()
             writer = _application(store, environment=_slot(), tool=tool)
             writer._session_control.execution_presence.config = SessionExecutionConfig(
@@ -218,9 +236,11 @@ def test_remote_lease_expiry_fences_late_tool_result_without_claiming_abort(
             )
             renew = store._renew_session_execution
             outage = False
+            partition_observed = asyncio.Event()
 
             async def renew_unless_partitioned(*args, **kwargs):
                 if outage:
+                    partition_observed.set()
                     raise OSError("controlled writer partition")
                 return await renew(*args, **kwargs)
 
@@ -230,13 +250,23 @@ def test_remote_lease_expiry_fences_late_tool_result_without_claiming_abort(
                 return [event async for event in writer.run(_request("remote-scan"))]
 
             task = asyncio.create_task(run())
-            reader = _application(reopen())
+            reader = _application(reader_store)
             try:
-                await asyncio.wait_for(tool.started.wait(), 15)
+                try:
+                    await asyncio.wait_for(tool.started.wait(), 30)
+                except TimeoutError:
+                    if task.done():
+                        task.result()
+                    raise
                 before = await store.load("remote-scan")
                 assert await reader.reconcile_orphaned_sessions() == ()
+                live = await reader.session_store.inspect_session_execution("remote-scan")
+                assert live.state == "executing"
                 outage = True
-                await asyncio.sleep(0.4)
+                await asyncio.wait_for(partition_observed.wait(), 30)
+                # Expiry follows an observed failed renewal. Host scheduling
+                # cannot expire the lease during the initial live-owner check.
+                now[0] = live.lease_expires_at + timedelta(microseconds=1)
                 assert (
                     await reader.session_store.inspect_session_execution("remote-scan")
                 ).state == "owner_lost"

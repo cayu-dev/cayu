@@ -204,25 +204,42 @@ def test_documented_reference_handler_completes_through_public_worker(backend, t
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("replacement_lease,cancel_recovery", [(1, False), (5, False), (5, True)])
+@pytest.mark.parametrize("replacement_lease", [1, 5])
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "expire"])
 def test_worker_renews_during_unentered_attempt_recovery(
-    backend, replacement_lease, cancel_recovery, tmp_path
+    backend, replacement_lease, outcome, tmp_path, monkeypatch
 ):
     from tests.core.test_work_attempt_admission import (
         _BlockFirstSQLiteWorkAttemptSettlementFence,
         _BlockFirstWorkAttemptSettlementFence,
     )
 
+    from cayu.verification import verified_task_worker as worker_module
+
     async def scenario():
+        now = [datetime.now(UTC)]
+
+        def clock():
+            return now[0]
+
+        class WorkerDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                assert tz is UTC
+                return clock()
+
+        monkeypatch.setattr(worker_module, "datetime", WorkerDateTime)
         sessions = (
-            _BlockFirstWorkAttemptSettlementFence()
+            _BlockFirstWorkAttemptSettlementFence(ownership_clock=clock)
             if backend == "memory"
-            else _BlockFirstSQLiteWorkAttemptSettlementFence(tmp_path / "sessions.sqlite")
+            else _BlockFirstSQLiteWorkAttemptSettlementFence(
+                tmp_path / "sessions.sqlite", ownership_clock=clock
+            )
         )
         tasks = (
-            InMemoryTaskStore()
+            InMemoryTaskStore(clock=clock, ownership_clock=clock)
             if backend == "memory"
-            else SQLiteTaskStore(tmp_path / "tasks.sqlite")
+            else SQLiteTaskStore(tmp_path / "tasks.sqlite", clock=clock, ownership_clock=clock)
         )
         running = None
         release_fence = sessions.release_fence
@@ -253,10 +270,7 @@ def test_worker_renews_during_unentered_attempt_recovery(
                 ),
             )
             assert admission.execution_entry is None
-            await asyncio.sleep(
-                max(0, (admission.claim.lease_expires_at - datetime.now(UTC)).total_seconds())
-                + 0.05
-            )
+            now[0] = admission.claim.lease_expires_at + timedelta(microseconds=1)
             replacement = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
             provider = _RecordingProvider()
             replacement.register_provider(provider, default=True)
@@ -267,7 +281,15 @@ def test_worker_renews_during_unentered_attempt_recovery(
                 contract.result_resolver, _Resolver(_task_result())
             )
             handler = _StaticHandler()
-            expired_recovery = False
+            renewals = asyncio.Queue()
+            renew = replacement.renew_work_attempt_claim
+
+            async def observe_renewal(request):
+                renewed = await renew(request)
+                renewals.put_nowait(renewed)
+                return renewed
+
+            monkeypatch.setattr(replacement, "renew_work_attempt_claim", observe_renewal)
             async with VerifiedTaskWorker(
                 replacement,
                 handler,
@@ -276,15 +298,19 @@ def test_worker_renews_during_unentered_attempt_recovery(
                 callback_timeout_seconds=0.5,
             ) as worker:
                 running = asyncio.create_task(worker.run(max_tasks=1))
-                await asyncio.wait_for(sessions.fence_committed.wait(), 5)
+                await asyncio.wait_for(sessions.fence_committed.wait(), 30)
                 claimed = await tasks.load_work_attempt_admission(admission.admission_id)
                 assert claimed.state.value == "recovering"
                 assert claimed.claim.generation == 2
-                await asyncio.sleep(
-                    max(0, (claimed.claim.lease_expires_at - datetime.now(UTC)).total_seconds())
-                    + 0.15
-                )
-                renewed = await tasks.load_work_attempt_admission(admission.admission_id)
+                # The lease authority advances only here. Wait for a real worker
+                # heartbeat to commit before crossing the original expiry.
+                now[0] += timedelta(seconds=replacement_lease / 2)
+                async with asyncio.timeout(30):
+                    while True:
+                        renewed = await renewals.get()
+                        if renewed.claim.lease_expires_at > claimed.claim.lease_expires_at:
+                            break
+                now[0] = claimed.claim.lease_expires_at
                 assert renewed.claim.lease_expires_at > claimed.claim.lease_expires_at
                 assert renewed.claim.renewal is not None
                 assert not running.done()
@@ -298,39 +324,37 @@ def test_worker_renews_during_unentered_attempt_recovery(
                             lease_seconds=10,
                         )
                     )
-                if cancel_recovery:
+                if outcome == "cancel":
                     running.cancel("cancel recovery owner")
                     with pytest.raises(asyncio.CancelledError) as cancelled:
                         await running
                     assert cancelled.value.args == ("cancel recovery owner",)
                     assert running.cancelling() == 1 and running.cancelled()
                     assert provider.requests == handler.proposals == verifier.requests == []
+                if outcome == "expire":
+                    # Expire before execution can enter, rather than accepting a
+                    # lease loss at an arbitrary point during checkpoint work.
+                    now[0] += timedelta(seconds=replacement_lease + 1)
                 sessions.release_fence.set()
-                if cancel_recovery:
+                if outcome == "cancel":
                     if worker._running is not None:
-                        done, _ = await asyncio.wait({worker._running}, timeout=10)
+                        done, _ = await asyncio.wait({worker._running}, timeout=30)
                         assert done
                     await worker.aclose()
-                    expired_recovery = True
-                try:
-                    if not cancel_recovery:
-                        assert await asyncio.wait_for(running, 10) == 1
-                except (WorkAttemptExecutionClaimLost, ExceptionGroup) as error:
-                    # A one-second lease may expire while the runtime performs
-                    # synchronous checkpoint validation. Success is not the
-                    # contract once ownership expires: reject stale effects
-                    # and leave the same attempt recoverable by its next owner.
-                    assert replacement_lease == 1
+                elif outcome == "expire":
+                    with pytest.raises((WorkAttemptExecutionClaimLost, ExceptionGroup)) as caught:
+                        await asyncio.wait_for(running, 30)
                     leaves = [
                         item
-                        for item in iter_exception_tree(error)
+                        for item in iter_exception_tree(caught.value)
                         if not isinstance(item, BaseExceptionGroup)
                     ]
                     assert leaves and all(
                         isinstance(item, WorkAttemptExecutionClaimLost) for item in leaves
                     )
-                    expired_recovery = True
-            if expired_recovery:
+                else:
+                    assert await asyncio.wait_for(running, 30) == 1
+            if outcome != "complete":
                 stale = await tasks.load_work_attempt_admission(admission.admission_id)
                 assert stale.claim.generation == 2
                 assert stale.execution_entry is None
@@ -340,15 +364,16 @@ def test_worker_renews_during_unentered_attempt_recovery(
                     await tasks.load_completion_proposal_for_attempt(admission.attempt_id) is None
                 )
                 assert (await tasks.load_task(task.id)).status is TaskStatus.RUNNING
-                await asyncio.sleep(
-                    max(0, (stale.claim.lease_expires_at - datetime.now(UTC)).total_seconds())
-                    + 0.05
-                )
+                now[0] = stale.claim.lease_expires_at + timedelta(microseconds=1)
                 if backend == "sqlite":
                     await tasks.close()
                     await sessions.close()
-                    tasks = SQLiteTaskStore(tmp_path / "tasks.sqlite")
-                    sessions = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+                    tasks = SQLiteTaskStore(
+                        tmp_path / "tasks.sqlite", clock=clock, ownership_clock=clock
+                    )
+                    sessions = SQLiteSessionStore(
+                        tmp_path / "sessions.sqlite", ownership_clock=clock
+                    )
                 successor = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
                 successor.register_provider(provider, default=True)
                 successor.register_agent(AgentSpec(name="worker", model="verified-work-test-model"))
