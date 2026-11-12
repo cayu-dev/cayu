@@ -323,7 +323,6 @@ def _size_policy(root: Path, exceptions=None, budgets=None) -> Path:
 
     sources = sorted((root / "src/cayu").rglob("*.py"))
     current = {
-        "source_python_lines": sum(len(path.read_text().splitlines()) for path in sources),
         "public_names": sum(
             public_name_count(path.read_text(), str(path))
             for path in sources
@@ -428,7 +427,7 @@ def test_source_size_exception_does_not_follow_an_oversized_replacement(reposito
 _VALID_POLICY = {
     "schema_version": 2,
     "default_max_lines": 9999,
-    "total_budgets": {"source_python_lines": 7, "public_names": 1},
+    "total_budgets": {"public_names": 1},
     "exceptions": {},
 }
 
@@ -444,9 +443,10 @@ _VALID_POLICY = {
         {**_VALID_POLICY, "exceptions": []},
         {**_VALID_POLICY, "typo": 1},
         {key: value for key, value in _VALID_POLICY.items() if key != "total_budgets"},
-        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7}},
-        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7, "public_names": True}},
-        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 0, "public_names": 1}},
+        {**_VALID_POLICY, "total_budgets": {}},
+        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7, "public_names": 1}},
+        {**_VALID_POLICY, "total_budgets": {"public_names": True}},
+        {**_VALID_POLICY, "total_budgets": {"public_names": 0}},
     ],
 )
 def test_source_size_guard_rejects_invalid_policy(repository, invalid_policy):
@@ -567,25 +567,14 @@ def test_source_size_guard_rejects_an_empty_source_population(repository):
         check_source_size(
             root,
             "HEAD",
-            _size_policy(root, budgets={"source_python_lines": 1, "public_names": 1}),
+            _size_policy(root, budgets={"public_names": 1}),
         )
 
 
 @pytest.mark.parametrize(
     ("budgets", "failure"),
     [
-        pytest.param({"source_python_lines": 5_007, "public_names": 21}, None, id="within-margin"),
-        pytest.param(
-            {"source_python_lines": 6},
-            "source_python_lines: 7 exceeds the recorded budget of 6",
-            id="lines-over",
-        ),
-        pytest.param(
-            {"source_python_lines": 5_008},
-            "source_python_lines: 7 is more than 5,000 below the recorded budget of 5,008; "
-            "lower total_budgets.source_python_lines to 2,007",
-            id="lines-under",
-        ),
+        pytest.param({"public_names": 21}, None, id="within-margin"),
         pytest.param(
             {"public_names": 22},
             "public_names: 1 is more than 20 below the recorded budget of 22; "
@@ -594,7 +583,7 @@ def test_source_size_guard_rejects_an_empty_source_population(repository):
         ),
     ],
 )
-def test_total_budgets_fail_above_and_well_below_the_recorded_value(repository, budgets, failure):
+def test_public_name_budget_fails_well_below_the_recorded_value(repository, budgets, failure):
     root, _ = repository
     policy = _size_policy(root, budgets=budgets)
     if failure is None:

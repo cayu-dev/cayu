@@ -75,33 +75,25 @@ PR. Malformed policies, duplicate keys and unexplained exceptions fail closed.
 Do not delete comments, compress formatting or move arbitrary lines merely to
 pass the check. Review complete responsibilities and their verification needs.
 
-### Total budgets
+### Public-name budget
 
-The same check holds two totals to the `total_budgets` recorded in the policy
-file:
+The same check holds one total to the `total_budgets` recorded in the policy
+file: `public_names`, the names declared in the literal `EXPORTS` dict of every
+`_exports.py` under `src/cayu/`. These are the per-package export declarations
+that `docs/public-api-packages.json` lists and the public-API tests check.
 
-| Budget | What it counts |
-| --- | --- |
-| `source_python_lines` | Physical lines in every committed `.py` file under `src/cayu/`. Stubs (`.pyi`) are not included. |
-| `public_names` | Names declared in the literal `EXPORTS` dict of every `_exports.py` under `src/cayu/`, the per-package export declarations that `docs/public-api-packages.json` lists and the public-API tests check. |
-
-Each budget is recorded a little above the current total, so that small fixes
+The budget is recorded a little above the current total, so that small fixes
 pass without every pull request editing, and conflicting on, the same line of
-the policy file. The check fails when a total is above its budget. A change that
-reaches the ceiling either removes as much elsewhere or raises the budget, with
-the reason in the pull request. The check also fails when a total is more than
-5,000 source lines or 20 public names below its budget. Its message names the
-value to record: the current total plus the standard headroom of 2,000 lines or
-5 names. Lower the budget in the same pull request that removed the code, so the
-reduction cannot quietly come back.
+the policy file. The check fails when the total is above its budget. A change
+that reaches the ceiling either removes as many names elsewhere or raises the
+budget, with the reason in the pull request. The check also fails when the total
+is more than 20 names below its budget. Its message names the value to record:
+the current total plus the standard headroom of 5 names. Lower the budget in the
+same pull request that removed the names, so the reduction cannot quietly come
+back.
 
-The source-line budget is 1,219,305, retaining the standard 2,000-line
-headroom above the merged total of 1,217,305 lines after the recovery-cascade
-drain completion signal, nested-worker cancellation fix and concurrent
-main-branch changes. This keeps claim-release cleanup visible to subsequent
-drains and the cancellation-provenance fix local to task supervision without
-coupling either fix to unrelated source removal. Per-file caps and the
-public-name budget are unchanged.
+There is no budget on total source lines. The per-file caps above still apply,
+and `scripts/scoreboard.py` still reports the total.
 
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
@@ -121,7 +113,7 @@ python3 scripts/scoreboard.py --revision <commit>   # any commit or ref
 | Field | Meaning |
 | --- | --- |
 | `commit` | The measured commit. |
-| `source_python_lines` | The same count as the `source_python_lines` budget above. |
+| `source_python_lines` | Physical lines in every committed `.py` file under `src/cayu/`. Stubs (`.pyi`) are not included. |
 | `test_python_lines` | Physical lines in committed `.py` files under `tests/`. |
 | `public_names` | The same count as the `public_names` budget above. |
 | `store_call_budgets` | Every `store_calls` entry in the `BUDGETS` table of `tests/test_overhead_budgets.py`, keyed by its step name. These are the recorded ceilings, which that test holds equal to the measured counts; the scoreboard reads the table and does not run the test. |

@@ -34,9 +34,9 @@ _PROVIDER_NAMES = frozenset(
     {"cayu.ModelProvider", "cayu.providers.ModelProvider", "cayu.providers.base.ModelProvider"}
 )
 # Room a recorded budget leaves above the total, so small fixes need no policy edit.
-_TOTAL_BUDGET_HEADROOM = {"source_python_lines": 2_000, "public_names": 5}
+_TOTAL_BUDGET_HEADROOM = {"public_names": 5}
 # How far below its recorded budget a total may fall before the budget must be lowered.
-_TOTAL_BUDGET_MARGIN = {"source_python_lines": 5_000, "public_names": 20}
+_TOTAL_BUDGET_MARGIN = {"public_names": 20}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -459,7 +459,7 @@ def _source_size_limits(path: Path) -> tuple[int, dict[str, int], dict[str, int]
 
 
 def source_totals(repo: Path, commit: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Return per-file line counts and the budgeted totals for committed ``src/cayu``."""
+    """Return per-file line counts and the reported totals for committed ``src/cayu``."""
 
     sizes = {}
     public_names = 0
