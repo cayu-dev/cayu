@@ -212,6 +212,40 @@ def test_the_environment_applies_when_cloud_has_no_value(monkeypatch, caplog):
         app.read_managed_setting("app.nope")
 
 
+def test_a_restart_setting_keeps_the_environment_it_was_declared_with(monkeypatch):
+    monkeypatch.setenv("APP_MODE", "first")
+    monkeypatch.setenv("APP_TONE", "first")
+    app = CayuApp(enable_logging=False)
+    app.declare_settings(
+        [
+            ManagedSetting(
+                key="mode", type="string", max_length=50, label="Mode", env="APP_MODE",
+                applies="restart",
+            ),
+            ManagedSetting(key="tone", type="string", max_length=50, label="Tone", env="APP_TONE"),
+        ]
+    )  # fmt: skip
+    monkeypatch.setenv("APP_MODE", "second")
+    monkeypatch.setenv("APP_TONE", "second")
+
+    # What was built from a restart setting does not change, so neither does its value.
+    assert app.managed_setting_value("app.mode") == "first"
+    assert app.read_managed_setting("app.mode").source == "environment"
+    # A setting that applies to the next session reads the environment as it is.
+    assert app.managed_setting_value("app.tone") == "second"
+    # A new process reads the variable afresh.
+    restarted = CayuApp(enable_logging=False)
+    restarted.declare_settings(
+        [
+            ManagedSetting(
+                key="mode", type="string", max_length=50, label="Mode", env="APP_MODE",
+                applies="restart",
+            )
+        ]
+    )  # fmt: skip
+    assert restarted.managed_setting_value("app.mode") == "second"
+
+
 def test_cloud_wins_over_the_environment_and_a_bad_cloud_item_is_refused(monkeypatch):
     cloud = FakeCloud()
     cloud.values = {"app.repositories": "o/c", "app.merge_modes": "o/a=merge"}

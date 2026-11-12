@@ -306,6 +306,8 @@ class ManagedSettingsEntrances:
     # under an earlier one can still be matched to its execution profile.
     _managed_config_history: tuple[CayuConfig, ...] = ()
     _managed_environment_warned: frozenset[tuple[str, str]] = frozenset()
+    # The environment's text for each restart setting, as it was when first read.
+    _managed_restart_environment: Mapping[str, str | None] = MappingProxyType({})
 
     @property
     def managed_settings_controller(self) -> ManagedSettings | None:
@@ -501,7 +503,7 @@ class ManagedSettingsEntrances:
                         env=setting.env,
                     )
                 refused.append(f"Cayu Cloud's value: {reason}")
-        raw = None if setting.env is None else os.environ.get(setting.env)
+        raw = self._managed_environment_text(setting)
         if raw is not None:
             try:
                 value = setting.parse_text(raw)
@@ -531,6 +533,24 @@ class ManagedSettingsEntrances:
             env=setting.env,
             refused="; ".join(refused) or None,
         )
+
+    def _managed_environment_text(self: CayuApp, setting: ManagedSetting) -> str | None:
+        """What the setting's environment variable holds, if it names one.
+
+        A ``restart`` setting keeps what the variable held when the setting was
+        declared, as it keeps Cloud's value from the build: what was built from it
+        does not change, so neither does the value.
+        """
+
+        if setting.env is None:
+            return None
+        if setting.applies != "restart":
+            return os.environ.get(setting.env)
+        if setting.key not in self._managed_restart_environment:
+            self._managed_restart_environment = MappingProxyType(
+                {**self._managed_restart_environment, setting.key: os.environ.get(setting.env)}
+            )
+        return self._managed_restart_environment[setting.key]
 
     def _warn_managed_environment(self: CayuApp, key: str, raw: str, reason: str) -> None:
         """Say once per value that an environment variable was ignored."""
@@ -763,11 +783,17 @@ class ManagedSettingsEntrances:
         self._managed_setting_declarations = tuple(
             item for item in self._managed_setting_declarations if item.owner != owner
         )
+        kept = {item.key for item in self._managed_setting_declarations}
+        self._managed_restart_environment = MappingProxyType(
+            {k: v for k, v in self._managed_restart_environment.items() if k in kept}
+        )
 
     def _add_managed_settings(self: CayuApp, declared: tuple[ManagedSetting, ...]) -> None:
         if declared:
             self._check_managed_settings(declared)
             self._managed_setting_declarations = (*self._managed_setting_declarations, *declared)
+            for setting in declared:
+                self._managed_environment_text(setting)  # A restart setting's is kept from here.
 
     def _agent_managed_settings(
         self: CayuApp,

@@ -117,6 +117,10 @@ Release's value even where the variable is set on the Agent, so on Cloud set the
 value in Cloud rather than in the environment. The settings Cayu applies to an
 agent itself (`model`, `thinking.effort`, `provider_options.*`) can't take `env`.
 
+A `restart` setting keeps what its variable held when the setting was declared,
+as it keeps Cloud's value from the build: changing the variable in a running
+process doesn't change the value until the process starts again.
+
 ### Reading a value and its source
 
 `app.read_managed_setting(key)` returns a `ManagedSettingReading`: the `value`
