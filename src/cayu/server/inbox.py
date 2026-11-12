@@ -43,7 +43,8 @@ InboxSettledDecision = Literal[
 InboxItemStatus = Literal["pending", "settled", "superseded", "unavailable"]
 # ``profile_changed``: the application changed while the approval was pending and
 # the decision did not adopt the current execution profile; settle it again with
-# ``profile_adoption``.
+# ``profile_adoption``. A question can't adopt a change: it answers
+# ``not_settleable``, as does a session whose provider this server doesn't have.
 InboxConflictCode = Literal[
     "already_settled",
     "superseded",

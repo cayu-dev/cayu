@@ -221,6 +221,7 @@ from cayu.server._kept_knowledge import (
 from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._model_check_routes import register_model_check_route
+from cayu.server._provider_setup_errors import provider_setup_http_error
 from cayu.server._request_timing import RequestTimingRecorder
 from cayu.server._request_validation import invalid_parameters_detail
 from cayu.server._runtime_timing_routes import register_runtime_timing_route
@@ -1427,6 +1428,7 @@ async def _accepted_event_stream_response(
     after_accept: Callable[[Event], Awaitable[None]] | None = None,
     acceptance_callbacks: _MutationAcceptanceCallbacks | None = None,
     conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
+    continues_session: bool = True,
 ) -> EventSourceResponse:
     """Establish one durable event before accepting an SSE mutation response.
 
@@ -1441,6 +1443,7 @@ async def _accepted_event_stream_response(
         after_accept=after_accept,
         acceptance_callbacks=acceptance_callbacks,
         conflict_error_types=conflict_error_types,
+        continues_session=continues_session,
     )
     return accepted.response
 
@@ -1496,6 +1499,7 @@ async def _start_accepted_mutation(
     acceptance_callbacks: _MutationAcceptanceCallbacks | None = None,
     conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
     on_event: Callable[[Event], None] | None = None,
+    continues_session: bool = True,
 ) -> _AcceptedMutation:
     if after_accept is not None and acceptance_callbacks is not None:
         raise TypeError("after_accept and acceptance_callbacks are mutually exclusive.")
@@ -1595,6 +1599,11 @@ async def _start_accepted_mutation(
             status_code=403,
             detail="Session-message access is not authorized.",
         ) from acceptance_error
+    setup_error = await provider_setup_http_error(
+        cayu_app, acceptance_error, session_id=session_id if continues_session else None
+    )
+    if setup_error is not None:
+        raise setup_error from acceptance_error
     if isinstance(acceptance_error, KeyError):
         raise HTTPException(
             status_code=404,
@@ -6153,6 +6162,7 @@ def create_router(
                 session_id=session_id,
                 after_accept=after_accept,
             ),
+            continues_session=False,
         )
 
     @bounded_control_plane_router.post(

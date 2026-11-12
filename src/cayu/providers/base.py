@@ -463,6 +463,17 @@ class AuxiliaryInferenceUnsupportedError(ModelProviderError):
         )
 
 
+class ProviderNotConfigured(RuntimeError):
+    """No usable model provider is set up; the message says what to set.
+
+    Raise it from ``ModelProvider.preflight_model_target`` in a placeholder that
+    stands in for a provider the configuration hasn't selected or can't build
+    (a missing ``CAYU_PROVIDER`` or API key). Cayu's run routes answer 503 with the
+    message, so an app can show it as it is. It is a ``RuntimeError``, so code that
+    caught the placeholder's plain ``RuntimeError`` keeps working.
+    """
+
+
 class ModelStreamDeadlineError(ModelProviderError):
     """Typed content-free expiry of one dispatched model stream."""
 

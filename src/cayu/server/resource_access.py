@@ -21,6 +21,7 @@ from cayu.applications import CayuApp
 from cayu.knowledge.scopes import KnowledgeAccessScope
 from cayu.knowledge.search import KnowledgeListQuery, KnowledgeQuery
 from cayu.resource_access import ScopedCayuAccess
+from cayu.server._provider_setup_errors import provider_setup_http_error
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionQuery
 from cayu.sessions.requests import ForkSessionRequest, ResumeRequest, RunRequest
@@ -61,7 +62,7 @@ async def _checked(operation):
         raise HTTPException(status_code=404, detail="Resource unavailable.") from None
 
 
-async def _stream(events, revalidate):
+async def _stream(events, revalidate, *, app: CayuApp | None = None, session_id: str | None = None):
     # Do not commit successful HTTP headers before the first admission check.
     try:
         first = await anext(events)
@@ -70,6 +71,18 @@ async def _stream(events, revalidate):
     except ResourceAccessDenied:
         await events.aclose()
         raise HTTPException(status_code=404, detail="Resource unavailable.") from None
+    except Exception as exc:
+        # A provider this server hasn't set up: 503 with what to set, or 409 naming
+        # a provider it doesn't have.
+        setup_error = (
+            None
+            if app is None
+            else await provider_setup_http_error(app, exc, session_id=session_id)
+        )
+        if setup_error is None:
+            raise
+        await events.aclose()
+        raise setup_error from exc
 
     async def body():
         async with aclosing(events):
@@ -269,15 +282,22 @@ def create_resource_router(
 
     @router.post("/runs")
     async def run(body: RunRequest, handle: ScopedCayuAccess = access_dependency):
-        return await _stream(handle.run(body), handle.revalidate_delivery)
+        return await _stream(handle.run(body), handle.revalidate_delivery, app=app, session_id=None)
 
     @router.post("/resume")
     async def resume(body: ResumeRequest, handle: ScopedCayuAccess = access_dependency):
-        return await _stream(handle.resume(body), handle.revalidate_delivery)
+        return await _stream(
+            handle.resume(body), handle.revalidate_delivery, app=app, session_id=body.session_id
+        )
 
     @router.post("/fork")
     async def fork(body: ForkSessionRequest, handle: ScopedCayuAccess = access_dependency):
-        return await _stream(handle.fork(body), handle.revalidate_delivery)
+        return await _stream(
+            handle.fork(body),
+            handle.revalidate_delivery,
+            app=app,
+            session_id=body.source_session_id,
+        )
 
     if knowledge_scope is not None:
 

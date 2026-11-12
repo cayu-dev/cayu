@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from fastapi import APIRouter, HTTPException, Path, Query, Response
 from pydantic import ValidationError
 
+from cayu._application_provider_registry import ProviderNotRegistered
 from cayu._event_schema import private_event_linkage_value
 from cayu.approvals.actors import (
     ResolutionActor,
@@ -429,6 +430,43 @@ def _conflict(code: InboxConflictCode, message: str, item: InboxItemState | None
         detail=InboxConflict(code=code, message=message, item=item).model_dump(mode="json"),
         headers=_NO_STORE,
     )
+
+
+# Adoption covers neither a changed tool set nor a changed provider or model.
+_NOT_ADOPTABLE = frozenset(
+    {ExecutionProfileComponentClass.DIRECT_TOOLS, ExecutionProfileComponentClass.PROVIDER_TARGET}
+)
+_QUESTION_PROFILE_CHANGED = (
+    "This question was asked before the application changed ({changes}), and a question "
+    "can't continue under the update the way an approval can. Answer it from a server "
+    "running the configuration it was asked under, or dismiss it, which closes the session."
+)
+
+
+def _refused_settlement(
+    kind: str, exc: HTTPException, body: InboxSettleRequest
+) -> tuple[InboxConflictCode, str]:
+    """The conflict code and message for a decision the Runtime refused.
+
+    Only an approval whose change can be adopted is offered ``profile_changed``,
+    to be settled again with ``profile_adoption``. A refused adoption, or one
+    already requested, stays a plain conflict. A question can't adopt a change at
+    all, and a session whose provider this server doesn't have can't continue here.
+    """
+
+    cause = exc.__cause__
+    if isinstance(cause, ProviderNotRegistered):
+        return "not_settleable", str(exc.detail)
+    if type(cause) is not ExecutionProfileMismatchError:
+        return "conflict", str(exc.detail)
+    if kind == "question":
+        changes = ", ".join(component.value for component in cause.changed_component_classes)
+        return "not_settleable", _QUESTION_PROFILE_CHANGED.format(changes=changes)
+    if body.profile_adoption is None and not _NOT_ADOPTABLE.intersection(
+        cause.changed_component_classes
+    ):
+        return "profile_changed", str(exc.detail)
+    return "conflict", str(exc.detail)
 
 
 def _state_conflict(state: InboxItemState) -> HTTPException:
@@ -1042,19 +1080,8 @@ def register_inbox_routes(
             if current is None:
                 raise HTTPException(status_code=404, detail=_NOT_FOUND) from exc
             if current.pending is not None:
-                # Only an unadopted change can be settled again with profile_adoption.
-                # A refused adoption, or one already requested, stays a plain conflict.
-                # A changed tool set can't be adopted either way, so it isn't offered.
-                cause = exc.__cause__
-                code: InboxConflictCode = (
-                    "profile_changed"
-                    if type(cause) is ExecutionProfileMismatchError
-                    and body.profile_adoption is None
-                    and ExecutionProfileComponentClass.DIRECT_TOOLS
-                    not in cause.changed_component_classes
-                    else "conflict"
-                )
-                raise _conflict(code, str(exc.detail), await session_item_state(current)) from exc
+                code, message = _refused_settlement(item.kind, exc, body)
+                raise _conflict(code, message, await session_item_state(current)) from exc
             return await settled_answer(current, request)
         settled = await session_item_state(replace(item, pending=None))
         if settled.settlement is None or settled.settlement.decision == "expire":

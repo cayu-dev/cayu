@@ -107,6 +107,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "ProviderDeadlineKind": ("cayu.providers.deadlines", "ProviderDeadlineKind"),
     "ProviderErrorCapture": ("cayu.providers.diagnostics", "ProviderErrorCapture"),
+    "ProviderNotConfigured": ("cayu.providers.base", "ProviderNotConfigured"),
     "ProviderOperationAdapter": ("cayu.providers.operations", "ProviderOperationAdapter"),
     "ProviderOperationCancellationSupport": (
         "cayu.providers.operations",
@@ -269,6 +270,7 @@ PUBLIC_NAMES = [
     "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "ProviderDeadlineKind",
     "ProviderErrorCapture",
+    "ProviderNotConfigured",
     "ProviderOperationAdapter",
     "ProviderOperationCancellationSupport",
     "ProviderOperationConnection",

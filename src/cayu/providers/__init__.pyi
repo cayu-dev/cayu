@@ -33,6 +33,7 @@ from cayu.providers.base import ModelStreamEventType as ModelStreamEventType
 from cayu.providers.base import (
     NativeStructuredOutputSchemaInvalid as NativeStructuredOutputSchemaInvalid,
 )
+from cayu.providers.base import ProviderNotConfigured as ProviderNotConfigured
 from cayu.providers.base import TargetedToolProjectionRequest as TargetedToolProjectionRequest
 from cayu.providers.base import ToolDiscoveryProjectionRequest as ToolDiscoveryProjectionRequest
 from cayu.providers.base import ToolDiscoveryProjectionResult as ToolDiscoveryProjectionResult

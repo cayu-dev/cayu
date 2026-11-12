@@ -37,6 +37,16 @@ the base including its version path, such as `https://host/v1`, and adds only
 put the version in different places; the one exception is a bare
 `https://api.openai.com`, which it treats as `https://api.openai.com/v1`.
 
+### When no provider is set up
+
+A project that can start without a provider (no `CAYU_PROVIDER`, or no API key)
+registers a placeholder whose `preflight_model_target` raises
+`cayu.providers.ProviderNotConfigured` with what to set. Cayu's run routes, `/api`
+and `create_resource_router`'s `/runs`, answer 503 with that message, so an app can
+show it as it is instead of a bare 500. A session started under a provider the
+server doesn't register can't continue there: `/api/resume`, the inbox and the
+resource router's `/resume` answer 409 naming the provider.
+
 ## Check that a model answers
 
 `cayu providers check MODEL` tells you whether a model answers through the

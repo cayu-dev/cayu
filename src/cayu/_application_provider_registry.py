@@ -20,6 +20,21 @@ from cayu.runtime._tool_call_proposals import (
 from cayu.vaults.redaction import SecretRedactor
 
 
+class ProviderNotRegistered(KeyError):
+    """No provider is registered under ``provider_name`` in this application.
+
+    A ``KeyError`` whose text is the sentence rather than its repr, so a route or
+    command can show it as it is.
+    """
+
+    def __init__(self, provider_name: str) -> None:
+        super().__init__(f"Provider not registered: {provider_name}")
+        self.provider_name = provider_name
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
 class ApplicationProviderRegistry:
     """Own validated provider declarations and their default without an application.
 
@@ -107,7 +122,7 @@ class ApplicationProviderRegistry:
         try:
             return self._providers[provider_name]
         except KeyError as exc:
-            raise KeyError(f"Provider not registered: {provider_name}") from exc
+            raise ProviderNotRegistered(provider_name) from exc
 
     def matching(self, *, model: str) -> tuple[runtime_records.RegisteredProvider, ...]:
         """Find pattern matches in registration order, including ambiguous matches."""

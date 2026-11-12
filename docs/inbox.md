@@ -282,7 +282,7 @@ caller can show who decided instead:
 | `superseded` | It was replaced before it was settled |
 | `expired` | The approval expired before anyone decided it |
 | `unavailable` | Its state can't be read right now; try again |
-| `not_settleable` | A recovery item whose session can't be abandoned now (still active, a task still running, or waiting on something else); recover it in the Developer dashboard |
+| `not_settleable` | A recovery item whose session can't be abandoned now (still active, a task still running, or waiting on something else); recover it in the Developer dashboard. Also a question asked before the application changed, which can't adopt the change (answer it from a server running the configuration it was asked under, or dismiss it), and an item whose session was started under a provider this server doesn't register |
 | `conflict` | The Runtime refused this decision and the item is still pending, for example an edit its schema rejects |
 | `profile_changed` | The application changed while the approval waited and the decision didn't adopt the change; settle again with `profile_adoption` |
 
@@ -305,6 +305,13 @@ adopted: approving answers 409 `conflict`. The
 Developer dashboard offers the same decision under the update after a
 `profile_changed` refusal, and `cayu inbox approve|deny --adopt-profile --reason ...`
 sends it from a terminal. Use a new `idempotency_key` for each adoption.
+
+A question can't adopt a change the way an approval can: answering one after the
+application changed answers 409 `not_settleable`, naming the changed components.
+Answer it from a server running the configuration it was asked under, or dismiss it,
+which closes the session. A session started under a provider this server doesn't
+register can't continue here either; its items answer 409 `not_settleable` with the
+provider's name, and so does `/api/resume`.
 
 A denial always settles. When the change can't be adopted, or the session's
 execution deadline passed while the approval waited, the paused round can't

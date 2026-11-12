@@ -2972,6 +2972,7 @@
           "ModelStreamEvent",
           "ModelStreamEventType",
           "NativeStructuredOutputSchemaInvalid",
+          "ProviderNotConfigured",
           "TargetedToolProjectionRequest",
           "ToolDiscoveryProjectionRequest",
           "ToolDiscoveryProjectionResult",
