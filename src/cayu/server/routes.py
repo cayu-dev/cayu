@@ -202,6 +202,7 @@ from cayu.server._evaluation_promotion_routes import register_evaluation_promoti
 from cayu.server._evaluation_result_routes import register_evaluation_result_routes
 from cayu.server._evaluation_run_routes import register_evaluation_run_routes
 from cayu.server._event_side_effect_health import EventSideEffectHealthResponse
+from cayu.server._heavy_reads import HeavyReadLimiter
 from cayu.server._http_json import (
     _PREPARSED_PRIVATE_JSON_SCOPE_KEY,
     _parse_json_without_duplicate_keys,
@@ -4349,6 +4350,11 @@ async def _delegation_ends_in_wake(store: SessionStore, action: PendingActionRec
     return False
 
 
+def _session_list_reads_aggregates(request: Request) -> bool:
+    include = set(request.query_params.getlist("include"))
+    return bool(include & {"overview", "usage"})
+
+
 def create_router(
     *,
     cayu_app,
@@ -4782,6 +4788,13 @@ def create_router(
     # sequence like no dependencies, so `auth=None` keeps explicit open access.
     auth_dependency = server_auth_dependency(auth) if auth is not None else None
     protected: list[Any] = [Depends(auth_dependency)] if auth_dependency is not None else []
+
+    # Aggregate dashboard reads run on the stores' bulk read lane, admitted after
+    # authentication, so single-session reads stay fast. Each kind has its own
+    # limit, so a slow kind (overview counts) never queues a quick one (tool usage);
+    # the bulk lane still bounds how many touch the store at once.
+    def heavy_read(applies: Callable[[Request], bool] | None = None) -> list[Any]:
+        return [*protected, HeavyReadLimiter().dependency(applies)]
 
     async def _optional_auth_context(request: Request) -> AuthContext | None:
         # The interruption and approval/user-input resolution routes take this as a
@@ -5536,7 +5549,7 @@ def create_router(
         methods=["POST"],
         response_model=UsageRollupResponse,
         responses=USAGE_ROLLUP_ENDPOINT_RESPONSES,
-        dependencies=protected,
+        dependencies=heavy_read(),
         description=(
             "Aggregate usage-bearing events in a UTC-normalized half-open event-time "
             "window. Session filters apply to current session attributes. Totals remain "
@@ -7098,7 +7111,7 @@ def create_router(
 
     register_tool_usage(
         router,
-        protected=protected,
+        protected=heavy_read(),
         reader=lambda: ToolUsageReader(
             session_store,
             names=public_tool_names(cayu_app),
@@ -7811,11 +7824,15 @@ def create_router(
     register_session_overview_counts(
         router,
         service=overview_service,
-        protected=protected,
+        protected=heavy_read(),
         resolve_lineage_filters=_resolve_session_query_authority_filters,
     )
 
-    @router.get("/sessions", response_model=ListSessionsResponse, dependencies=protected)
+    @router.get(
+        "/sessions",
+        response_model=ListSessionsResponse,
+        dependencies=heavy_read(_session_list_reads_aggregates),
+    )
     async def list_sessions(
         response: Response,
         ids: Annotated[list[str] | None, Query(max_length=200)] = None,

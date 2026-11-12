@@ -8,6 +8,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, LiteralString, cast
 
@@ -25,6 +26,7 @@ from cayu.storage import _postgres_transcript_schema as postgres_transcript_sche
 from cayu.storage import _postgres_verified_work_schema as postgres_verified_work_schema
 from cayu.storage import _postgres_work_context_schema as postgres_work_context_schema
 from cayu.storage._phase_timing import PostgresTimingScope
+from cayu.storage._read_lanes import ReadLane, current_read_lane
 
 try:
     from psycopg import sql
@@ -605,6 +607,23 @@ async def _acquire_schema_transaction_lock(
         await asyncio.sleep(_SCHEMA_ADVISORY_LOCK_POLL_SECONDS)
 
 
+# Stores (by id) whose bulk-lane slot the current context already holds. A store
+# operation that opens a nested connection, or a task it starts, reuses the slot
+# instead of waiting on a limit its own caller may be holding.
+_held_bulk_connection_slots: ContextVar[frozenset[int]] = ContextVar(
+    "cayu_postgres_held_bulk_connection_slots", default=frozenset()
+)
+
+
+def bulk_connection_limit(max_size: int) -> int:
+    """Pooled connections bulk-lane reads may hold at once: a quarter of the pool.
+
+    The rest stay free for interactive reads and writes while dashboard aggregates run.
+    """
+
+    return max(1, max_size // 4)
+
+
 class _PostgresStoreBase:
     """Shared async connection-pool management for Postgres-backed stores.
 
@@ -707,13 +726,32 @@ class _PostgresStoreBase:
                 configure=_configure_store_connection,
             )
             self._owns_pool = True
+        self._bulk_connections = asyncio.Semaphore(bulk_connection_limit(self._pool.max_size))
         self._open_lock = asyncio.Lock()
         self._opened = False
         self._schema_ready = False
 
     @asynccontextmanager
+    async def _bulk_lane_slot(self) -> AsyncIterator[None]:
+        """Hold one of the store's bulk-lane connection slots when the read is bulk."""
+
+        held = _held_bulk_connection_slots.get()
+        if current_read_lane() is not ReadLane.BULK or id(self) in held:
+            yield
+            return
+        async with self._bulk_connections:
+            token = _held_bulk_connection_slots.set(held | {id(self)})
+            try:
+                yield
+            finally:
+                _held_bulk_connection_slots.reset(token)
+
+    @asynccontextmanager
     async def _connection(self) -> AsyncIterator[Any]:
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with (
+            self._bulk_lane_slot(),
+            PostgresTimingScope(self._pool.connection()) as conn,
+        ):
             if self._read_only:
                 # Keep the guard in the same transaction as the store operation.
                 # Session defaults are not stable behind transaction-pooled PgBouncer.
@@ -727,7 +765,10 @@ class _PostgresStoreBase:
         For one standalone read this is a single round trip instead of BEGIN,
         the read and COMMIT. Only use it for statements that need no transaction.
         """
-        async with PostgresTimingScope(self._pool.connection()) as conn:
+        async with (
+            self._bulk_lane_slot(),
+            PostgresTimingScope(self._pool.connection()) as conn,
+        ):
             autocommit = conn.autocommit
             await conn.set_autocommit(True)
             try:

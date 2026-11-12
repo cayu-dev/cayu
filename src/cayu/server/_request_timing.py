@@ -50,6 +50,13 @@ from cayu.runtime.request_costs import (
 )
 from cayu.server.config import RequestTimingConfig
 
+# Set in the request scope when a request ended without a response because its
+# client disconnected and the server stopped the work (see _heavy_reads).
+CLIENT_DISCONNECTED_SCOPE_KEY = "cayu.client_disconnected"
+# Recorded for such a request, as nginx does: the client closed it, the server
+# did not fail, so it counts with 4xx rather than 5xx.
+CLIENT_CLOSED_REQUEST_STATUS = 499
+
 _SLOW_REQUEST_EVENT = "cayu.server.slow_request"
 _GROWING_COST_EVENT = "cayu.server.growing_cost"
 _HOT_POLL_EVENT = "cayu.server.hot_poll"
@@ -646,6 +653,9 @@ class RequestTimingMiddleware:
         finally:
             if watch is not None:
                 watch.cancel()
+            if logged.status is None and scope.get(CLIENT_DISCONNECTED_SCOPE_KEY) is True:
+                status = CLIENT_CLOSED_REQUEST_STATUS
+                outcome = "client disconnected"
             try:
                 body_digest = None
                 if hasher is not None:
@@ -760,7 +770,11 @@ def _log_finished(
     else:
         # No response started: the app raised (the server answers 500), the request
         # was cancelled, or the app returned without answering.
-        status = {"error": "500 error", "cancelled": "cancelled"}.get(outcome or "", "no response")
+        status = {
+            "error": "500 error",
+            "cancelled": "cancelled",
+            "client disconnected": f"{CLIENT_CLOSED_REQUEST_STATUS} client disconnected",
+        }.get(outcome or "", "no response")
     status += f" {_log_duration(seconds)}"
     if logged.request_id is not None:
         status += f" (request {logged.request_id})"

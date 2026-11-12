@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -69,6 +70,7 @@ from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
+from cayu.storage._read_lanes import ReadLane, current_read_lane
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
 
@@ -440,6 +442,11 @@ from cayu.tools.grants import (
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 150
 _T = TypeVar("_T")
+# Read-only connections per file-backed session store. Interactive reads (one
+# session, a transcript, state) lease the first set; bulk-lane reads (dashboard
+# aggregates) lease only the second, so a slow aggregate never delays them.
+_INTERACTIVE_READERS = 4
+_BULK_READERS = 2
 
 
 def _claim_budget_reservation_identity(
@@ -1274,13 +1281,18 @@ class SQLiteSessionStore(
         # Private in-memory databases must continue sharing the writer.
         self._closed = False
         self._readers: list[tuple[asyncio.Lock, sqlite3.Connection]] = []
+        bulk_readers: list[tuple[asyncio.Lock, sqlite3.Connection]] = []
         try:
             if str(effective_db_path) == ":memory:":
                 self._readers.append((self._lock, self._connection))
             else:
-                for _ in range(4):
+                for _ in range(_INTERACTIVE_READERS):
                     connection = self._connect_read_only(effective_db_path)
                     self._readers.append((TimedStoreLock(), connection))
+                for _ in range(_BULK_READERS):
+                    connection = self._connect_read_only(effective_db_path)
+                    bulk_readers.append((TimedStoreLock(), connection))
+                self._readers.extend(bulk_readers)
             for _, connection in self._readers:
                 connection.execute("PRAGMA temp_store = FILE")
                 connection.execute("PRAGMA temp.cache_size = -2048")
@@ -1294,8 +1306,22 @@ class SQLiteSessionStore(
         self._available_readers: asyncio.LifoQueue[tuple[asyncio.Lock, sqlite3.Connection]] = (
             TimedStoreReadQueue()
         )
-        for reader in reversed(self._readers):
+        for reader in reversed(self._readers[: len(self._readers) - len(bulk_readers)]):
             self._available_readers.put_nowait(reader)
+        # Without separate bulk connections (an in-memory database) both lanes share
+        # the one reader queue.
+        self._available_bulk_readers = self._available_readers
+        self._bulk_read_executor: ThreadPoolExecutor | None = None
+        if bulk_readers:
+            self._available_bulk_readers = TimedStoreReadQueue()
+            for reader in reversed(bulk_readers):
+                self._available_bulk_readers.put_nowait(reader)
+            # Bulk workers never take threads from the loop's default executor, which
+            # interactive reads, writes and to_thread calls share.
+            self._bulk_read_executor = ThreadPoolExecutor(
+                max_workers=len(bulk_readers),
+                thread_name_prefix="cayu-sqlite-bulk-read",
+            )
 
     def durable_state_paths(self) -> tuple[Path, ...]:
         """Return the primary SQLite file for state-boundary validation."""
@@ -1336,17 +1362,28 @@ class SQLiteSessionStore(
             )
             return query(connection)
 
+        if current_read_lane() is ReadLane.BULK:
+            available = self._available_bulk_readers
+            executor = self._bulk_read_executor
+        else:
+            available = self._available_readers
+            executor = None
+
         async def read_with_lease() -> _T:
-            reader = await self._available_readers.get()
+            reader = await available.get()
             try:
                 if self._closed:
                     raise RuntimeError("SQLite session store is closed.")
                 lock, connection = reader
                 return await _run_off_thread_with_connection_ownership(
-                    lock, connection, guarded, interrupt_on_cancellation=True
+                    lock,
+                    connection,
+                    guarded,
+                    executor=executor,
+                    interrupt_on_cancellation=True,
                 )
             finally:
-                self._available_readers.put_nowait(reader)
+                available.put_nowait(reader)
 
         if _settled_evidence_reads_required():
             return await read_with_lease()
@@ -8788,6 +8825,9 @@ class SQLiteSessionStore(
                     async with lock:
                         connection.close()
             self._connection.close()
+        if self._bulk_read_executor is not None:
+            # Every bulk reader's lock was taken above, so no bulk worker is running.
+            self._bulk_read_executor.shutdown(wait=False)
 
     def _connect(self, path: Path) -> sqlite3.Connection:
         return sqlite_connection.connect(path)

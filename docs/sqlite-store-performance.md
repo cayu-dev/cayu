@@ -6,6 +6,20 @@ physically finished, including after cancellation. Closing the store waits for
 active connection owners. In-memory stores retain one shared connection because
 separate `:memory:` connections represent different databases.
 
+Reads started on the bulk read lane lease two further read-only connections,
+run on a two-thread executor of their own, and never take one of the four.
+The control-plane server puts its aggregate dashboard reads on that lane:
+overview counts, session lists that include overviews or usage, usage rollups,
+and tool usage. It admits two reads of each kind at a time, after
+authentication, so a slow kind never queues a quick one, and a single-session
+read, transcript or state read keeps answering while they run.
+When the client of such a read disconnects before its response starts, the
+server cancels the request, which interrupts the running SQLite statement.
+Request diagnostics record it as status 499 (client closed request), counted
+with 4xx, not as a server error.
+Postgres stores let bulk-lane reads hold at most a quarter of the connection
+pool.
+
 SQLite session, task, and checkpoint readers cache successful validation by
 exact stored content, including column names, scalar types, and session labels.
 Updates invalidate the cached projection even when timestamps do not change.

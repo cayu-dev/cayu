@@ -79,6 +79,7 @@ try:
     from cayu.runtime.system_diagnostics import DeploymentKind, resolve_deployment_kind
     from cayu.server._browser_client import browser_client_base_path, browser_client_router
     from cayu.server._diagnostics import SystemDiagnosticsSnapshot, dashboard_pricing_metadata
+    from cayu.server._heavy_reads import ClientDisconnectMiddleware
     from cayu.server._request_timing import RequestTimingMiddleware, RequestTimingRecorder
     from cayu.server.auth import AuthConfigurationError, AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
@@ -498,6 +499,8 @@ def create_server(
         None if resolved_project_context is None else resolved_project_context.safe_summary()
     )
 
+    # Innermost, so a heavy read cancelled because its client left ends here quietly.
+    server.add_middleware(ClientDisconnectMiddleware)
     if resolved_config.cors.allowed_origins:
         server.add_middleware(
             CORSMiddleware,
@@ -873,6 +876,7 @@ def mount_cayu(
 
     # All caller-controlled values and route construction are validated before
     # changing the host application. A rejected mount must leave it reusable.
+    server.add_middleware(ClientDisconnectMiddleware, path_prefix=api_path)
     _install_request_timing(
         server,
         resolved_request_timing,
