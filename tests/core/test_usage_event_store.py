@@ -245,8 +245,9 @@ async def test_migration_copies_events_retained_before_it(backend) -> None:
     for trigger in ("insert", "delete", "update"):
         await backend.execute(f"DROP TRIGGER cayu_usage_events_{trigger}{on_table}")
     await backend.execute("DROP TABLE cayu_usage_events")
-    await backend.execute("DELETE FROM cayu_schema_migrations WHERE revision = 149")
-    with pytest.raises(SchemaTooOld, match="requires >= 149"):
+    # Back to revision 148, as before the usage copy and every later revision.
+    await backend.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 149")
+    with pytest.raises(SchemaTooOld, match="requires >= "):
         await (await backend.open()).close()
     store = await backend.open(SchemaMode.MIGRATE)
     try:

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextvars
 import json
+import re
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -858,6 +859,13 @@ def test_sqlite_store_that_used_a_keyring_names_the_variables_and_opens_read_onl
     assert "CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS" in message
     assert "base64url encoding of 32 random bytes" in message
     assert "keeps requiring it for every writable open" in message
+    # It names the database, the recorded key ID and when it was first used.
+    assert str(db_path) in message
+    assert re.search(r"key ID 'primary' \(active\); it was first used at \d{4}-\d\d-\d\dT", message)
+    assert "cayu storage reset-aliases" in message
+    assert raised.value.recorded is not None
+    assert [key for key, _used in raised.value.recorded.keys] == ["primary"]
+    assert isinstance(raised.value, RuntimeError)
     # `cayu doctor` forces the app's writable store read-only. It must still
     # report the missing keyring, because the real writable open fails.
     with (
@@ -3615,6 +3623,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (147, 146),
         (148, 146),
         (149, 146),
+        (150, 146),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

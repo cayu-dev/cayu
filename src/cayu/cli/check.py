@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from cayu.cli._local_alias_keys import keyring_required_diagnostic
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import (
     CayuProject,
@@ -38,6 +39,7 @@ from cayu.runtime.checks import (
     severity_at_least,
 )
 from cayu.runtime.manifest import AppManifest
+from cayu.runtime.public_authority import _AliasStoreKeyringRequired
 from cayu.runtime.service_manifest import PublicServiceManifest
 
 
@@ -287,6 +289,11 @@ def check_project(
             )
         finally:
             close_project_control_plane_context(control_plane_context)
+    except _AliasStoreKeyringRequired as exc:
+        # The local database, not the project's code, stopped the factory.
+        return _source_only_report(
+            (*source_diagnostics, keyring_required_diagnostic(exc, root=project.root))
+        )
     except Exception as exc:
         if source_errors and not isinstance(exc, ProjectError):
             # Source drift often explains a factory failure; keep it visible.

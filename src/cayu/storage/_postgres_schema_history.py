@@ -1003,6 +1003,14 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     148: POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL,
     # Usage rollups and tool totals read a narrow trigger-maintained event copy.
     149: POSTGRES_USAGE_EVENTS_DDL,
+    # When each alias key was first used. A table of its own, so binaries from
+    # revision 146 on, which check the alias key table's exact shape, still open it.
+    150: (
+        """CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_key_first_uses (
+        key_id TEXT PRIMARY KEY,
+        first_used_at TIMESTAMPTZ NOT NULL
+    )""",
+    ),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

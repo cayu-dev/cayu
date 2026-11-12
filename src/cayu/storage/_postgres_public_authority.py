@@ -15,9 +15,10 @@ from uuid import uuid4
 from cayu.events import Event, EventType
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
+    _AliasStoreKeyringRequired,
     _authenticated_public_authority_alias_private_value,
-    _initialized_alias_store_requires_keyring_message,
     _public_authority_alias_store_key,
+    _RecordedAliasKeyring,
 )
 from cayu.storage._postgres_transcript import PostgresConnection
 from cayu.tools.grants import TARGETED_TOOL_REFERENCE_FIELD_NAME
@@ -226,7 +227,7 @@ def configuration_check_failure(error: BaseException) -> RuntimeError | None:
             "Postgres public authority alias key configuration is stale; reopen the store."
         )
     if sqlstate == _KEYRING_REQUIRED_SQLSTATE:
-        return RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
+        return _AliasStoreKeyringRequired("Postgres")
     return None
 
 
@@ -279,7 +280,7 @@ def require_current_configuration_row(
 ) -> None:
     if codec is None:
         if row is not None:
-            raise RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
+            raise _AliasStoreKeyringRequired("Postgres")
         return
     if (
         row is None
@@ -319,8 +320,32 @@ async def reconcile_keys(
                     )
                     config_exists = await cur.fetchone()
                     if durable or (config_exists is not None and bool(config_exists[0])):
-                        raise RuntimeError(
-                            _initialized_alias_store_requires_keyring_message("Postgres")
+                        await cur.execute(
+                            "SELECT recorded.key_id, first_use.first_used_at "
+                            "FROM cayu_public_authority_alias_keys AS recorded "
+                            "LEFT JOIN cayu_public_authority_alias_key_first_uses AS first_use "
+                            "USING (key_id) "
+                            "ORDER BY first_use.first_used_at NULLS LAST, recorded.key_id"
+                        )
+                        keys = tuple(
+                            (
+                                str(row[0]),
+                                None
+                                if row[1] is None
+                                else row[1].isoformat(timespec="seconds").replace("+00:00", "Z"),
+                            )
+                            for row in await cur.fetchall()
+                        )
+                        await cur.execute(
+                            "SELECT active_key_id FROM cayu_public_authority_alias_config "
+                            "WHERE singleton = TRUE"
+                        )
+                        active = await cur.fetchone()
+                        raise _AliasStoreKeyringRequired(
+                            "Postgres",
+                            recorded=_RecordedAliasKeyring(
+                                keys=keys, active_key_id=None if active is None else str(active[0])
+                            ),
                         )
                 if codec is None:
                     await conn.commit()
@@ -374,6 +399,12 @@ async def reconcile_keys(
                         "(key_id, fingerprint, backfill_completed) "
                         "VALUES (%s, %s, FALSE)",
                         (key_id, configured[key_id]),
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_public_authority_alias_key_first_uses "
+                        "(key_id, first_used_at) VALUES (%s, now()) "
+                        "ON CONFLICT (key_id) DO NOTHING",
+                        (key_id,),
                     )
 
             if missing or incomplete:
@@ -558,7 +589,7 @@ async def register_authorities(
         await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_keys)")
         row = await cur.fetchone()
         if row is not None and row[0] is True:
-            raise RuntimeError(_initialized_alias_store_requires_keyring_message("Postgres"))
+            raise _AliasStoreKeyringRequired("Postgres")
         return
     await cur.execute(
         "SELECT active_key_id, keyring_fingerprint "

@@ -416,17 +416,81 @@ def _public_authority_alias_environment_hint() -> str:
     )
 
 
-def _initialized_alias_store_requires_keyring_message(backend: str) -> str:
+@dataclass(frozen=True)
+class _RecordedAliasKeyring:
+    """What a store records about the alias keyring it has used."""
+
+    # Each key ID with when it was first used, oldest first; None for a key
+    # first used before stores recorded the time (schema revision 150).
+    keys: tuple[tuple[str, str | None], ...]
+    active_key_id: str | None
+
+    @property
+    def first_used_at(self) -> str | None:
+        times = [used for _key_id, used in self.keys if used is not None]
+        return min(times) if times else None
+
+    def describe(self) -> str:
+        if not self.keys:
+            return ""
+        names = ", ".join(
+            f"'{key_id}'" + (" (active)" if key_id == self.active_key_id else "")
+            for key_id, _used in self.keys
+        )
+        noun = "key ID" if len(self.keys) == 1 else "key IDs"
+        since = (
+            f"; it was first used at {self.first_used_at}"
+            if self.first_used_at is not None
+            else "; when it was first used isn't recorded (before Cayu recorded it)"
+        )
+        return f"It records {noun} {names}{since}. "
+
+
+class _AliasStoreKeyringRequired(ValueError, RuntimeError):
+    """A store that has used an alias keyring was opened for writing without one.
+
+    It is both a ValueError and a RuntimeError because the stores raised either
+    for this case before it had its own type.
+    """
+
+    def __init__(
+        self,
+        backend: str,
+        *,
+        recorded: _RecordedAliasKeyring | None = None,
+        database: str | None = None,
+    ) -> None:
+        self.backend = backend
+        self.recorded = recorded
+        self.database = database
+        super().__init__(
+            _initialized_alias_store_requires_keyring_message(
+                backend, recorded=recorded, database=database
+            )
+        )
+
+
+def _initialized_alias_store_requires_keyring_message(
+    backend: str,
+    *,
+    recorded: _RecordedAliasKeyring | None = None,
+    database: str | None = None,
+) -> str:
     """Explain why a store that has used a keyring needs it for every writable open."""
 
+    where = f" ({database})" if database else ""
+    details = "" if recorded is None else recorded.describe()
     return (
-        f"This {backend} session store has used a public authority alias keyring, and a "
-        "store that has used one keeps requiring it for every writable open: sessions "
-        "written without it would get no aliases, so the keyed store could not resolve "
-        f"them later. {_public_authority_alias_environment_hint()}. Use the same keys as "
-        "before and pass the codec as public_authority_alias_codec. A read-only store "
-        "opens without the keyring; tests that run without these variables can use their "
-        "own database file or an InMemorySessionStore."
+        f"This {backend} session store{where} has used a public authority alias keyring, "
+        "and a store that has used one keeps requiring it for every writable open: "
+        "sessions written without it would get no aliases, so the keyed store could not "
+        f"resolve them later. {details}{_public_authority_alias_environment_hint()}. Use "
+        "the same keys as before and pass the codec as public_authority_alias_codec. A "
+        "read-only store opens without the keyring; tests that run without these "
+        "variables can use their own database file or an InMemorySessionStore. "
+        "`cayu keys status` compares a project's local database with the keys in the "
+        "environment, and for a local development database whose keys are lost, "
+        "`cayu storage reset-aliases` drops its alias data after a confirmation."
     )
 
 

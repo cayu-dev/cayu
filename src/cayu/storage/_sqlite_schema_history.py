@@ -783,6 +783,12 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     148: "",
     # Usage rollups and tool totals read a narrow trigger-maintained event copy.
     149: SQLITE_USAGE_EVENTS_DDL,
+    # When each alias key was first used. A table of its own, so binaries from
+    # revision 146 on, which check the alias key table's exact shape, still open it.
+    150: """CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_key_first_uses (
+        key_id TEXT PRIMARY KEY,
+        first_used_at TEXT NOT NULL
+    );""",
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

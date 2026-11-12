@@ -49,6 +49,7 @@ _SUBCOMMANDS = (
     ("export", "Export sessions (or tasks) as JSON or JSONL for backup/replay."),
     ("prune", "Dry-run or apply storage retention to sessions, evals, artifacts, workspaces."),
 )
+# `reset-aliases` takes its own options; see _add_reset_aliases_parser.
 
 #: ``cayu storage status`` exit codes. 1 remains a general error and 2 an
 #: argparse usage error, so deploy steps can branch on the migration need.
@@ -207,10 +208,35 @@ def add_storage_parser(subparsers: Any) -> None:
                     ),
                 )
             add_output_options(sub)
+    _add_reset_aliases_parser(inner)
+
+
+def _add_reset_aliases_parser(inner: Any) -> None:
+    reset = inner.add_parser(
+        "reset-aliases",
+        help="Drop a local development database's public authority alias data.",
+        description=(
+            "Drop the public authority alias data (aliases, recorded keys and the active "
+            "key) from a local SQLite development database, so it opens without a keyring "
+            "again. Sessions, events and tasks stay. Public aliases issued before stop "
+            "resolving, and protected reviews bound to the old keys can't be settled. Only "
+            "for a SQLite file inside the project's data/ directory; PostgreSQL is refused. "
+            "Asks for confirmation unless --yes is given. Stop servers and workers using "
+            "the database first."
+        ),
+    )
+    reset.add_argument(
+        "--sqlite",
+        metavar="PATH",
+        help="SQLite database to reset (default: the project's session store).",
+    )
+    reset.add_argument("--yes", action="store_true", help="Reset without asking for confirmation.")
 
 
 def run_storage(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``storage`` invocation; return a process exit code."""
+    if args.storage_command == "reset-aliases":
+        return _reset_aliases(args)
     try:
         if args.storage_command == "prune" and _prune_needs_app(args):
             if args.sqlite is not None or args.postgres is not None:
@@ -236,6 +262,56 @@ def run_storage(args: argparse.Namespace) -> int:
         _render_error(args, message)
         return 1
     return 1
+
+
+def _reset_aliases(args: argparse.Namespace) -> int:
+    from cayu.cli._local_alias_keys import (
+        read_store_keyring,
+        require_development_database,
+        reset_aliases,
+    )
+    from cayu.cli.project import ProjectError, discover_cayu_project_configuration
+
+    try:
+        target = resolve_session_store_target(sqlite=args.sqlite)
+        if target.backend is not SessionStoreBackend.SQLITE or target.sqlite_path is None:
+            raise ValueError(
+                "reset-aliases only resets a local SQLite development database; the "
+                "resolved store is PostgreSQL."
+            )
+        project = discover_cayu_project_configuration(discovery_keys=("session_store", "factory"))
+        path = target.sqlite_path
+        require_development_database(path, project_root=None if project is None else project.root)
+        store = read_store_keyring(path)
+    except (ProjectError, SessionStoreTargetError, ValueError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if store is None or store.recorded is None:
+        print(f"{path} has no public authority alias data; nothing to reset.")
+        return 0
+    keys = ", ".join(
+        f"{key_id!r} (first used at {used or 'an unrecorded time'})"
+        for key_id, used in store.recorded.keys
+    )
+    print(
+        f"{path} records alias keys {keys} and {store.alias_count} aliases. Resetting drops "
+        "them; sessions and tasks stay, but aliases issued before stop resolving."
+    )
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("error: pass --yes to reset without a terminal to confirm.", file=sys.stderr)
+            return 1
+        answer = input(f"Type {path.name} to reset it: ").strip()
+        if answer != path.name:
+            print("Not reset.")
+            return 1
+    try:
+        removed = reset_aliases(path)
+    except sqlite3.Error as exc:
+        print(f"error: could not reset {path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Reset {path}: dropped {removed} aliases and the recorded keyring.")
+    return 0
 
 
 def _resolve_storage_target(args: argparse.Namespace) -> None:

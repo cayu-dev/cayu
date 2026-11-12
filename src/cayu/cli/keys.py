@@ -1,8 +1,9 @@
-"""`cayu keys generate`: make a public authority alias keyring for the environment.
+"""`cayu keys`: make a public authority alias keyring, and compare one with a store.
 
 Nothing generates these keys implicitly. ``cayu new`` leaves them unset, because a
-store that has used a keyring keeps requiring it, so this command is the explicit
-step a project takes when it needs one.
+store that has used a keyring keeps requiring it, so ``cayu keys generate`` is the
+explicit step a project takes when it needs one. ``cayu keys status`` says whether
+the project's local database requires a keyring and whether the environment's matches.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -39,13 +41,14 @@ _DEFINITION = re.compile(
 def add_keys_parser(subparsers: Any) -> None:
     group = subparsers.add_parser(
         "keys",
-        help="Generate keys that Cayu reads from the environment.",
+        help="Generate and check keys that Cayu reads from the environment.",
         description=(
-            "Generate keys that Cayu reads from the environment. Nothing is written "
-            "unless you pass --env-file."
+            "Generate keys that Cayu reads from the environment, and check them against "
+            "the project's local database. Nothing is written unless you pass --env-file."
         ),
     )
     commands = group.add_subparsers(dest="keys_command", required=True)
+    _add_status_parser(commands)
     generate = commands.add_parser(
         "generate",
         help="Generate a public authority alias keyring.",
@@ -96,7 +99,31 @@ def add_keys_parser(subparsers: Any) -> None:
     )
 
 
+def _add_status_parser(commands: Any) -> None:
+    status = commands.add_parser(
+        "status",
+        help="Show whether the local database requires a keyring and the environment's matches.",
+        description=(
+            "Show whether the project's local SQLite database has used a public authority "
+            "alias keyring (its key IDs and when each was first used), whether "
+            f"{PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV} and {PUBLIC_AUTHORITY_ALIAS_KEYS_ENV} "
+            "are set, and whether they match. Reads the database without writing. Exits 0 "
+            "when a writable open would succeed with this environment, 3 when it would "
+            "be refused, 4 when the store is PostgreSQL, which it doesn't inspect, and 1 "
+            "when the store can't be resolved or read."
+        ),
+    )
+    status.add_argument(
+        "--sqlite",
+        metavar="PATH",
+        help="SQLite database to inspect (default: the project's session store).",
+    )
+    status.add_argument("--json", action="store_true", help="Print a JSON object.")
+
+
 def run_keys(args: argparse.Namespace) -> int:
+    if args.keys_command == "status":
+        return _run_status(args)
     if args.replace and args.env_file is None:
         print("error: --replace needs --env-file.", file=sys.stderr)
         return 2
@@ -133,6 +160,139 @@ def run_keys(args: argparse.Namespace) -> int:
         f"{keyring.active_key_id!r}). Keep this file out of version control."
     )
     return 0
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    from cayu.cli._local_alias_keys import (
+        environment_keyring,
+        key_states,
+        read_store_keyring,
+        store_opens,
+    )
+    from cayu.cli.store_targets import (
+        SessionStoreBackend,
+        SessionStoreTargetError,
+        resolve_session_store_target,
+    )
+
+    environment = environment_keyring()
+    payload: dict[str, Any] = {
+        "environment": {
+            "state": environment.state,
+            "error": environment.error,
+            "active_key_id": (
+                None if environment.codec is None else environment.codec.keyring.active_key_id
+            ),
+            "key_ids": (
+                [] if environment.codec is None else list(environment.codec.keyring.key_ids)
+            ),
+        },
+        "store": None,
+    }
+    try:
+        target = resolve_session_store_target(sqlite=args.sqlite)
+    except SessionStoreTargetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if target.backend is not SessionStoreBackend.SQLITE or target.sqlite_path is None:
+        payload["store"] = {
+            "inspected": False,
+            "backend": "postgres",
+            "reason": "This command reads a local SQLite store; the resolved store is PostgreSQL.",
+        }
+        payload["writable_open"] = "not_checked"
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            _print_status(payload)
+        return 4
+    path = target.sqlite_path
+    try:
+        store = read_store_keyring(path)
+    except sqlite3.Error as exc:
+        print(f"error: could not read {path}: {exc}", file=sys.stderr)
+        return 1
+    states = {} if store is None else key_states(store, environment)
+    payload["store"] = {
+        "inspected": True,
+        "backend": "sqlite",
+        "database": str(path),
+        "exists": store is not None,
+        "requires_keyring": store is not None and store.requires_keyring,
+        "active_key_id": (
+            None if store is None or store.recorded is None else store.recorded.active_key_id
+        ),
+        "keys": (
+            []
+            if store is None or store.recorded is None
+            else [
+                {
+                    "key_id": key_id,
+                    "first_used_at": used,
+                    "environment": states[key_id],
+                }
+                for key_id, used in store.recorded.keys
+            ]
+        ),
+        "retired_key_ids": [] if store is None else sorted(store.retired_key_ids),
+        "aliases": 0 if store is None else store.alias_count,
+    }
+    opens = store_opens(store, environment)
+    payload["writable_open"] = "succeeds" if opens else "refused"
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        _print_status(payload)
+    return 0 if opens else 3
+
+
+def _print_status(payload: dict[str, Any]) -> None:
+    environment = payload["environment"]
+    if environment["state"] == "set":
+        print(
+            f"Environment: keyring set, active key {environment['active_key_id']!r}, "
+            f"key IDs {', '.join(repr(key) for key in environment['key_ids'])}."
+        )
+    elif environment["state"] == "invalid":
+        print(f"Environment: keyring set but invalid: {environment['error']}")
+    else:
+        print(
+            f"Environment: no keyring ({PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV} and "
+            f"{PUBLIC_AUTHORITY_ALIAS_KEYS_ENV} are unset)."
+        )
+    store = payload["store"]
+    if not store or not store.get("inspected"):
+        reason = "" if not store else f" {store['reason']}"
+        print(f"Store: not inspected.{reason} Whether it opens with this keyring is not checked.")
+        return
+    if not store["exists"]:
+        print(f"Store: {store['database']} doesn't exist yet; it opens with or without a keyring.")
+        return
+    if not store["requires_keyring"]:
+        print(f"Store: {store['database']} has not used a keyring; it opens without one.")
+        if environment["state"] == "set":
+            print("Opening it with this keyring makes it require the same keyring from then on.")
+        return
+    print(
+        f"Store: {store['database']} requires a keyring (active key {store['active_key_id']!r}, "
+        f"{store['aliases']} aliases)."
+    )
+    labels = {
+        "matches": "the environment has the same key",
+        "different": "the environment has DIFFERENT material for this key ID",
+        "not_in_environment": "not in the environment",
+    }
+    for key in store["keys"]:
+        used = key["first_used_at"] or "an unrecorded time"
+        print(f"  {key['key_id']!r}: first used at {used}; {labels[key['environment']]}.")
+    if payload["writable_open"] == "succeeds":
+        print("A writable open succeeds with this environment.")
+    else:
+        print(
+            "A writable open is refused with this environment. Set the keys this database "
+            "used; for a development database whose keys are lost, `cayu storage "
+            "reset-aliases` drops its alias data."
+        )
 
 
 class _EnvFileRefused(ValueError):

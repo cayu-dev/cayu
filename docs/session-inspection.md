@@ -381,6 +381,23 @@ sessions normally, but alias lookups find nothing and it can't issue aliases.
 Tests that build the app without the variables should use their own database
 file or an `InMemorySessionStore` instead of the project's local database.
 
+The store records each key ID and when it was first used, and the error names
+them. `cayu keys status` reads the project's local SQLite database without
+writing and says whether it requires a keyring, which key IDs it recorded and
+when each was first used, and whether the keyring in the environment matches. It
+exits 0 when a writable open would succeed, 3 when it would be refused, and 4
+for a PostgreSQL store, which it doesn't inspect (`--json` for scripts). `cayu
+check` reports such a database as `SESSION_STORE_ALIAS_KEYRING_REQUIRED` rather
+than as a broken project.
+
+If the keys of a local development database are lost, `cayu storage
+reset-aliases` drops its alias data (the aliases, the recorded keys and the
+active key) after you type the file name to confirm, or with `--yes`. Sessions,
+events and tasks stay; aliases issued before stop resolving, and protected
+reviews bound to the old keys can't be settled. It refuses a PostgreSQL store and
+any database outside the project's `data/` directory. Stop servers and workers
+that use the database first.
+
 ## Configure the session store
 
 New local projects use one SQLite database at `data/cayu.db`:

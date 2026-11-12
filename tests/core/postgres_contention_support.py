@@ -44,6 +44,7 @@ POSTGRES_CONTENTION_TABLES = (
     "cayu_targeted_tool_grant_uses",
     "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
+    "cayu_public_authority_alias_key_first_uses",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
     "cayu_transcript_search_configuration",

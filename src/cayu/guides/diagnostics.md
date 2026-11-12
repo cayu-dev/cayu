@@ -21,6 +21,22 @@ Installed packages also report replacement imports when a removed name is
 accessed directly. These known removed routes raise `ImportError`; unknown
 attributes retain `AttributeError`. No removed route loads its former object.
 
+## session-store-alias-keyring-required
+
+`SESSION_STORE_ALIAS_KEYRING_REQUIRED` means the application factory could not
+open its session store because the store has used a public authority alias
+keyring and the environment doesn't set one. The finding names the database,
+the key IDs it recorded and when the keyring was first used (stores record that
+time from schema revision 150 on). The project's code is not at fault, but the
+checks that need the loaded application did not run.
+
+Set the same `CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID` and
+`CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS` the database was used with; `cayu keys status`
+shows what the database recorded and whether the environment matches. If it's a
+local development database whose keys are lost, `cayu storage reset-aliases`
+drops its alias data after a confirmation (it refuses PostgreSQL and any file
+outside the project's `data/` directory).
+
 ## task-event-retry-policy-undeclared
 
 `TASK_EVENT_RETRY_POLICY_UNDECLARED` is an advisory source finding: a worker

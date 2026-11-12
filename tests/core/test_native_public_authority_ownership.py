@@ -30,6 +30,7 @@ OPERATIONS = (
     "public_authority_private_value_exists",
 )
 TABLES = (
+    "cayu_public_authority_alias_key_first_uses",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
     "cayu_public_authority_aliases",

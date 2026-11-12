@@ -627,6 +627,11 @@ REVISIONS: tuple[Revision, ...] = (
     # on cayu_events maintain it for every writer, older binaries included, and
     # the migration copies retained events. Session stores require it.
     Revision(revision=149, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # cayu_public_authority_alias_key_first_uses records when each alias key
+    # was first used, so a store that requires its keyring can say since when.
+    # Older binaries ignore the table and record no time for keys they add.
+    # Session stores require it.
+    Revision(revision=150, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

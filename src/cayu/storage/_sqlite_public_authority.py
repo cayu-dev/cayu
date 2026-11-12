@@ -9,12 +9,14 @@ from __future__ import annotations
 import hmac
 import json
 import sqlite3
+from datetime import UTC, datetime
 
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
+    _AliasStoreKeyringRequired,
     _authenticated_public_authority_alias_private_value,
-    _initialized_alias_store_requires_keyring_message,
     _public_authority_alias_store_key,
+    _RecordedAliasKeyring,
 )
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
@@ -27,6 +29,58 @@ def _alias_key_fingerprint_matches(value: object, expected: str) -> bool:
     except UnicodeEncodeError:
         return False
     return hmac.compare_digest(encoded, expected.encode("ascii"))
+
+
+def recorded_keyring(connection: sqlite3.Connection) -> _RecordedAliasKeyring | None:
+    """The keyring this database has used, or None if it has used none. Read-only."""
+
+    present = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+            ("cayu_public_authority_alias_keys", "cayu_public_authority_alias_config"),
+        )
+    }
+    if len(present) != 2:
+        return None
+    first_uses = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_public_authority_alias_key_first_uses'"
+    ).fetchone()
+    query = (
+        "SELECT recorded.key_id, first_use.first_used_at FROM cayu_public_authority_alias_keys AS recorded "
+        "LEFT JOIN cayu_public_authority_alias_key_first_uses AS first_use USING (key_id) "
+        "ORDER BY first_use.first_used_at IS NULL, first_use.first_used_at, recorded.key_id"
+        if first_uses is not None
+        else "SELECT key_id, NULL FROM cayu_public_authority_alias_keys ORDER BY key_id"
+    )
+    keys = tuple(
+        (str(row[0]), None if row[1] is None else str(row[1])) for row in connection.execute(query)
+    )
+    config = connection.execute(
+        "SELECT active_key_id FROM cayu_public_authority_alias_config WHERE singleton = 1"
+    ).fetchone()
+    if config is None and not keys:
+        return None
+    return _RecordedAliasKeyring(
+        keys=keys, active_key_id=None if config is None else str(config[0])
+    )
+
+
+def _keyring_required(connection: sqlite3.Connection) -> _AliasStoreKeyringRequired:
+    database = next(
+        (str(row[2]) for row in connection.execute("PRAGMA database_list") if row[1] == "main"),
+        None,
+    )
+    try:
+        recorded = recorded_keyring(connection)
+    except sqlite3.Error:
+        recorded = None
+    return _AliasStoreKeyringRequired("SQLite", recorded=recorded, database=database or None)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def register_sql_functions(
@@ -117,7 +171,7 @@ def initialize_registry(
             "SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_config)"
         ).fetchone()[0]
         if initialized:
-            raise ValueError(_initialized_alias_store_requires_keyring_message("SQLite"))
+            raise _keyring_required(connection)
         return
 
     configured = tuple((key_id, codec.key_fingerprint(key_id)) for key_id in codec.keyring.key_ids)
@@ -154,7 +208,7 @@ def initialize_registry(
     try:
         with connection:
             for key_id, fingerprint in configured:
-                connection.execute(
+                inserted = connection.execute(
                     """
                         INSERT INTO cayu_public_authority_alias_keys (
                             key_id, fingerprint, backfill_completed
@@ -163,6 +217,13 @@ def initialize_registry(
                         """,
                     (key_id, fingerprint),
                 )
+                if inserted.rowcount == 1:
+                    # Only a key this open adds: an existing key's first use is older.
+                    connection.execute(
+                        "INSERT INTO cayu_public_authority_alias_key_first_uses "
+                        "(key_id, first_used_at) VALUES (?, ?) ON CONFLICT(key_id) DO NOTHING",
+                        (key_id, _now()),
+                    )
                 row = connection.execute(
                     """
                         SELECT fingerprint, backfill_completed
@@ -348,7 +409,7 @@ def require_current_configuration(
     ).fetchone()
     if codec is None:
         if row is not None:
-            raise RuntimeError(_initialized_alias_store_requires_keyring_message("SQLite"))
+            raise _keyring_required(connection)
         return
     if (
         row is None
