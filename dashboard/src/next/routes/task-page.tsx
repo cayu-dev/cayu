@@ -14,6 +14,8 @@ import type { TaskHold, TaskInfo, TaskItem, TaskScheduleEvent } from "../api/typ
 import { useTask, useTaskScheduleEvents } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import {
+  GROUP_DOT,
+  GROUP_TEXT,
   groupOf,
   HELD_STATUSES,
   holdable,
@@ -35,7 +37,6 @@ import {
 } from "./common"
 import { ValueView } from "./session/value-view"
 import { TaskActions } from "./task-actions"
-import { GROUP_DOT, GROUP_TEXT } from "./tasks-page"
 
 const HOLDS: { hold: TaskHold; label: string; verb: string; icon: typeof Pause }[] = [
   { hold: "pause", label: "Pause", verb: "Pause task", icon: Pause },

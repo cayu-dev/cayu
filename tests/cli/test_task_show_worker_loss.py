@@ -553,3 +553,38 @@ def test_a_server_without_error_codes_in_its_rows_still_lists_settled_cancellati
     assert all("error_code" not in row for row in rows)
     for task_id in ("lost-settled", "asked-settled"):
         assert "(quiescent)" in table[task_id]
+
+
+def test_list_says_why_a_task_failed_locally_through_a_server_and_from_a_cloud_agent(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    """A failed row carries its error's one-line summary, and the table's reason shows it."""
+
+    database = tmp_path / "tasks.sqlite"
+
+    async def build() -> None:
+        store = SQLiteTaskStore(database)
+        try:
+            await store.create_task(TaskCreate(task_id="review-217", type="review"))
+            await store.fail_task(
+                "review-217",
+                {
+                    "error": "GitError",
+                    "message": "couldn't find remote ref refs/pull/217/head\nfatal: more",
+                },
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(build())
+    targets = {
+        "local": ("--sqlite", str(database)),
+        "server": ("--server-url", "http://127.0.0.1"),
+        "cloud": ("--application", _APPLICATION),
+    }
+    summary = "GitError: couldn't find remote ref refs/pull/217/head"
+    with _served(database, monkeypatch):
+        for name, target in targets.items():
+            (row,) = json.loads(_task(capsys, "list", *target, "--json"))["tasks"]
+            assert "error" not in row and row["error_summary"] == summary, name
+            assert summary in _table_rows(capsys, *target)["review-217"], name

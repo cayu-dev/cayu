@@ -731,3 +731,50 @@ def test_unavailable_related_task_preserves_readable_sibling():
             await expect(page.get_by_text("Waiting on prerequisites", exact=True)).to_be_visible()
 
     asyncio.run(scenario())
+
+
+def test_failed_tasks_say_why_on_home_tasks_and_the_task_page():
+    async def scenario():
+        store = InMemoryTaskStore()
+        await store.create_task(
+            TaskCreate(task_id="review-217", type="review", title="Review scout#217")
+        )
+        await store.fail_task(
+            "review-217",
+            {
+                "error": "GitError",
+                "message": "couldn't find remote ref refs/pull/217/head\nfatal: more output",
+            },
+        )
+        await store.create_task(TaskCreate(task_id="claimed", type="review", title="Claimed"))
+        await store.claim_task("worker-a", lease_seconds=300)
+        why = "GitError: couldn't find remote ref refs/pull/217/head"
+        async with _home_browser(seeded_runtime=_app(task_store=store)) as (
+            page,
+            base,
+            _requests,
+            _responses,
+        ):
+            await page.goto(base + "/cayu/", wait_until="networkidle")
+            attention = page.get_by_role(
+                "heading", name="Tasks needing attention", exact=True
+            ).locator("../..")
+            await expect(attention.get_by_text(f"Failed: {why}", exact=True)).to_be_visible()
+            recent = page.get_by_role("heading", name="Recent tasks", exact=True).locator("../..")
+            await expect(recent.get_by_text("Starting", exact=True)).to_be_visible()
+            await expect(recent.get_by_text("claimed", exact=True)).to_have_count(0)
+
+            await page.goto(base + "/cayu/tasks", wait_until="networkidle")
+            await expect(page.get_by_text(f"Failed: {why}", exact=True)).to_be_visible()
+
+            await page.goto(base + "/cayu/tasks/review-217", wait_until="networkidle")
+            await expect(
+                page.get_by_text(
+                    "Can't run this task again. Only the agent's code starts tasks of this "
+                    "type; it isn't one you can create here.",
+                    exact=True,
+                )
+            ).to_be_visible()
+            await expect(page.get_by_role("button", name="Run again", exact=True)).to_have_count(0)
+
+    asyncio.run(scenario())

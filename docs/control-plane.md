@@ -758,6 +758,11 @@ submitting new work. Missing task declarations or replay authority are explained
 in the UI. Handler deadline failures say "Task handler ran out of time".
 
 Task list and detail records include `graph_id` and `prerequisite_task_ids`.
+List rows leave out each task's error but carry its `error_code` and an
+`error_summary`: the error's type and the first line of its message, such as
+`GitError: couldn't find remote ref refs/pull/217/head`, redacted the way the
+detail's error is and cut to 240 characters. Home and Tasks show it on failed
+rows as "Failed: …"; the task's detail has the full error.
 `GET /api/tasks?include=counts` returns `{items, total_count, counts_by_status,
 next_cursor, as_of}`. The `task_index.read` capability reports native snapshot
 support. Counts cover all eligible records in one store read snapshot, without

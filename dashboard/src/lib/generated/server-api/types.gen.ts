@@ -2785,6 +2785,12 @@ export type ApiTaskDetail = {
      */
     error_code?: string | null;
     /**
+     * Error Summary
+     *
+     * Why the task failed, in one line: the error's type and the first line of its message, such as "GitError: couldn't find remote ref refs/pull/217/head". Redacted like the detail's error, then cut to 240 characters with an ellipsis. Null when the task has no error or the error has no type or message; the full error is in the task's detail.
+     */
+    error_summary?: string | null;
+    /**
      * Graph Id
      */
     graph_id: string | null;
@@ -3000,6 +3006,12 @@ export type ApiTaskListItem = {
      * Error Code
      */
     error_code?: string | null;
+    /**
+     * Error Summary
+     *
+     * Why the task failed, in one line: the error's type and the first line of its message, such as "GitError: couldn't find remote ref refs/pull/217/head". Redacted like the detail's error, then cut to 240 characters with an ellipsis. Null when the task has no error or the error has no type or message; the full error is in the task's detail.
+     */
+    error_summary?: string | null;
     /**
      * Graph Id
      */

@@ -712,7 +712,9 @@ def test_home_task_attention_is_independent_of_recent_task_sample():
             await expect(
                 section.get_by_role("link", name=re.compile("Review older invoice"))
             ).to_be_visible()
-            await expect(section.get_by_text("Needs operator review", exact=True)).to_be_visible()
+            await expect(
+                section.get_by_text("Blocked: Needs operator review", exact=True)
+            ).to_be_visible()
             await expect(
                 page.get_by_text("Showing the eight most recently updated tasks.", exact=False)
             ).to_be_visible()

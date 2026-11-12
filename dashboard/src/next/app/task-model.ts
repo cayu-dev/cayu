@@ -2,6 +2,7 @@
  * How tasks read on the Tasks page: five plain groups instead of twelve raw statuses, and
  * one line per task saying what it's doing or waiting for.
  */
+import type { TaskReplayAvailability } from "@/lib/generated/server-api"
 import type { TaskItem } from "../api/types"
 
 export type TaskGroup = "active" | "waiting" | "held" | "failed" | "done"
@@ -17,6 +18,22 @@ export const TASK_GROUPS: { id: TaskGroup; label: string; statuses: string[] }[]
   { id: "failed", label: "Failed", statuses: ["failed", "dependency_skipped"] },
   { id: "done", label: "Done", statuses: ["completed", "cancelled"] },
 ]
+
+/** Each group's status dot and status text, shared by every task list. */
+export const GROUP_DOT: Record<TaskGroup, string> = {
+  active: "bg-info animate-pulse motion-reduce:animate-none",
+  waiting: "border border-muted-foreground/60 bg-transparent",
+  held: "bg-warning",
+  failed: "bg-destructive",
+  done: "bg-muted-foreground/40",
+}
+export const GROUP_TEXT: Record<TaskGroup, string> = {
+  active: "text-foreground",
+  waiting: "text-muted-foreground",
+  held: "text-warning",
+  failed: "text-destructive",
+  done: "text-muted-foreground",
+}
 
 export function groupOf(status: string): TaskGroup {
   return TASK_GROUPS.find((g) => g.statuses.includes(status))?.id ?? "waiting"
@@ -60,7 +77,8 @@ const HOLD_WORD: Record<string, string> = {
 
 /**
  * What the task is doing or waiting for, in plain words: "Waiting on 2 tasks", "Scheduled
- * for Nov 1, 6:00 AM", "Blocked: vendor file late", "Retry 2 of 3 in 6m".
+ * for Nov 1, 6:00 AM", "Blocked: vendor file late", "Retry 2 of 3 in 6m", "Failed: GitError:
+ * couldn't find remote ref refs/pull/217/head".
  */
 export function statusLine(
   task: TaskItem & { error?: Record<string, unknown> | null },
@@ -108,7 +126,10 @@ export function statusLine(
       if (task.error?.error === "ExecutionDeadlineExceeded" && task.error?.scope === "task_handler")
         return "Task handler ran out of time"
       const next = retry?.successor_task_id ? byId.get(retry.successor_task_id) : undefined
-      if (!next) return `Failed${reason}`
+      // The error summary says why; a failed task's status reason, when the runtime sets
+      // one, is usually a code such as a retry series' "attempts_exhausted".
+      const why = task.error_summary || task.status_reason
+      if (!next) return why ? `Failed: ${why}` : "Failed"
       const outcome = FINISHED_STATUSES.has(next.status) ? next.status : "queued"
       return `Failed · attempt ${next.retry_series?.attempt ?? (retry?.attempt ?? 1) + 1} ${outcome}`
     }
@@ -125,4 +146,24 @@ export function statusLine(
 export function holdable(task: TaskItem): boolean {
   if (FINISHED_STATUSES.has(task.status) || HELD_STATUSES.has(task.status)) return false
   return !(task.status === "running" && task.session_id)
+}
+
+type ReplayUnavailable = NonNullable<TaskReplayAvailability["unavailable_reason"]>
+
+/** Why Run again can't start a task, for each code `GET /api/tasks/{id}/replay` returns. */
+const REPLAY_UNAVAILABLE: Record<ReplayUnavailable, string> = {
+  unsupported: "This server's task store can't start tasks.",
+  task_type_not_declared:
+    "Only the agent's code starts tasks of this type; it isn't one you can create here.",
+  specialist_unavailable: "The specialist that runs it isn't available.",
+  input_invalid: "Its input no longer fits its task type.",
+  source_identity_unavailable: "Its original run can't be matched exactly.",
+  not_task_session: "It wasn't started as a task.",
+  task_source_unavailable: "Its original run can't be found.",
+  task_source_ambiguous: "Its original run can't be matched exactly.",
+}
+
+/** "Can't run this task again. The specialist that runs it isn't available." */
+export function replayUnavailableText(reason: ReplayUnavailable | null | undefined): string {
+  return `Can't run this task again. ${(reason && REPLAY_UNAVAILABLE[reason]) || "Its original run can't be found."}`
 }

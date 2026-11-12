@@ -3,8 +3,10 @@ import { useDashboardCapability } from "@/components/dashboard/server-contract"
 import { fetchTasks, type Task } from "@/lib/api"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
 import { activityPollInterval, taskStatusIsActive } from "@/lib/polling"
+import { cn } from "@/lib/utils"
 import { useTasks } from "../app/queries"
-import { useServices } from "../app/services"
+import { useNow, useServices } from "../app/services"
+import { GROUP_DOT, GROUP_TEXT, groupOf, statusLine, taskName } from "../app/task-model"
 import { ErrorState, NavLink } from "./common"
 
 const ATTENTION = new Set(["blocked", "needs_attention", "failed"])
@@ -62,6 +64,7 @@ function RuntimeTasks() {
 }
 
 function TaskSections({ recent, attention }: { recent: Task[]; attention: Task[] }) {
+  const now = useNow()
   return (
     <>
       {[
@@ -76,25 +79,38 @@ function TaskSections({ recent, attention }: { recent: Task[]; attention: Task[]
                 All tasks
               </NavLink>
             </div>
-            <div className="divide-y rounded-xl border border-border bg-card">
+            <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
               {tasks.length === 0 ? (
                 <p className="p-3 text-sm text-muted-foreground">No tasks to show.</p>
               ) : (
-                tasks.map((task) => (
-                  <NavLink
-                    key={task.id}
-                    to="/tasks"
-                    search={{ task_id: task.id }}
-                    className="flex gap-3 px-3.5 py-2.5 text-sm hover:bg-muted/60"
-                  >
-                    <span className="min-w-0 flex-1 truncate">
-                      {task.title || task.type || task.id}
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      {task.status_reason || task.status.replaceAll("_", " ")}
-                    </span>
-                  </NavLink>
-                ))
+                tasks.map((task) => {
+                  const group = groupOf(task.status)
+                  // These rows load no related tasks, so retry and dependency words stay general.
+                  const status = statusLine(task, tasks, now(), undefined, false)
+                  return (
+                    <NavLink
+                      key={task.id}
+                      to="/tasks"
+                      search={{ task_id: task.id }}
+                      className="flex items-center gap-3 px-3.5 py-2.5 text-sm hover:bg-muted/60"
+                    >
+                      <span
+                        className={cn("size-2 shrink-0 rounded-full", GROUP_DOT[group])}
+                        aria-hidden="true"
+                      />
+                      <span className="min-w-0 flex-1 truncate">{taskName(task) || task.id}</span>
+                      <span
+                        title={status}
+                        className={cn(
+                          "max-w-[50%] shrink-0 truncate text-right text-xs",
+                          GROUP_TEXT[group],
+                        )}
+                      >
+                        {status}
+                      </span>
+                    </NavLink>
+                  )
+                })
               )}
             </div>
             {tasks.length === 8 && (

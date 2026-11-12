@@ -573,8 +573,11 @@ export function seedTask(now: number, spec: TaskSpec): TaskItem {
     title: spec.title,
     description: null,
     status: spec.status,
-    status_reason: spec.reason ?? spec.retry?.disposition ?? null,
+    // Like the runtime, a failure's reason is its error's summary, not a status reason.
+    status_reason:
+      (spec.status === "failed" ? null : spec.reason) ?? spec.retry?.disposition ?? null,
     status_payload: null,
+    error_summary: spec.status === "failed" ? (spec.reason ?? null) : null,
     session_id: spec.session ?? null,
     parent_task_id: spec.parent ?? null,
     assigned_agent_name: spec.agent,

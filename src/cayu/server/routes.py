@@ -462,7 +462,13 @@ from cayu.storage._knowledge_rejection import DROP_OPERATION_ANNOTATION, Knowled
 from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
 from cayu.tasks.creation import TaskCreate, task_create_with_runtime_invocation
 from cayu.tasks.queries import TaskOrder, TaskQuery
-from cayu.tasks.records import TASK_ERROR_CODE_MAX_CHARS, Task, TaskStatus, task_error_code
+from cayu.tasks.records import (
+    TASK_ERROR_CODE_MAX_CHARS,
+    Task,
+    TaskStatus,
+    task_error_code,
+    task_error_summary,
+)
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
     TaskScheduleCancelRequest,
@@ -4057,6 +4063,11 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
     if type(error_code) is str and len(error_code) > TASK_ERROR_CODE_MAX_CHARS:
         # Redaction can lengthen a code that held a secret; leave it out instead.
         projected["error_code"] = None
+    # Redacted the way the detail's ``error`` is, before its first line is picked and cut.
+    redactor = getattr(cayu_app, "redact_json", None)
+    projected["error_summary"] = task_error_summary(
+        task, redact=redactor if callable(redactor) else None
+    )
     projected_status_payload = projected.get("status_payload")
     if (
         task.retry_series is not None

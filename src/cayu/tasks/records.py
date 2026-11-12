@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -699,6 +700,48 @@ def task_error_code(task: Task) -> str | None:
     if type(code) is not str or not code.strip() or len(code) > TASK_ERROR_CODE_MAX_CHARS:
         return None
     return code
+
+
+#: The longest error summary a task list row carries, ellipsis included.
+TASK_ERROR_SUMMARY_MAX_CHARS = 240
+
+
+def task_error_summary(task: Task, *, redact: Callable[[str], Any] | None = None) -> str | None:
+    """One line saying why ``task`` failed, for list rows that leave the error itself out.
+
+    The error's type (its ``error`` field) and the first non-blank line of its ``message``,
+    such as ``"GitError: couldn't find remote ref refs/pull/217/head"``; either alone when
+    the other is missing. ``redact`` masks the whole type and message before the line is
+    picked and cut, the way the task's detail masks its error, so a secret split across
+    lines or across the cut is masked rather than partly shown. At most
+    ``TASK_ERROR_SUMMARY_MAX_CHARS``, ending with ``…`` when cut. ``None`` when the task has
+    no error, or the error has neither a text type nor a non-blank message.
+    """
+
+    error = task.error
+    if type(error) is not dict:
+        return None
+
+    def text(key: str) -> str | None:
+        value = error.get(key)
+        if type(value) is not str:
+            return None
+        if redact is not None:
+            value = redact(value)
+            if type(value) is not str:
+                return None
+        return value
+
+    kind = text("error")
+    kind = " ".join(kind.split()) if kind else None
+    message = text("message")
+    line = next((part.strip() for part in (message or "").splitlines() if part.strip()), None)
+    summary = ": ".join(part for part in (kind, line) if part)
+    if not summary:
+        return None
+    if len(summary) > TASK_ERROR_SUMMARY_MAX_CHARS:
+        summary = summary[: TASK_ERROR_SUMMARY_MAX_CHARS - 1].rstrip() + "…"
+    return summary
 
 
 def _copy_task_retry_policy(policy: TaskRetryPolicy) -> TaskRetryPolicy:

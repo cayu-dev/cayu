@@ -15,11 +15,12 @@ import { useNow, useServices } from "../app/services"
 import { constantColumns, relativeTime } from "../app/session-model"
 import { taskGroupCount } from "../app/task-index-model"
 import {
+  GROUP_DOT,
+  GROUP_TEXT,
   groupOf,
   isCayuTask,
   statusLine,
   TASK_GROUPS,
-  type TaskGroup,
   taskName,
 } from "../app/task-model"
 import { type TaskFilters, useTaskIndex, useTaskLinks } from "../app/task-queries"
@@ -38,21 +39,6 @@ import {
 import { StartSession } from "./start-session"
 
 type Filters = TaskFilters
-
-export const GROUP_DOT: Record<TaskGroup, string> = {
-  active: "bg-info animate-pulse motion-reduce:animate-none",
-  waiting: "border border-muted-foreground/60 bg-transparent",
-  held: "bg-warning",
-  failed: "bg-destructive",
-  done: "bg-muted-foreground/40",
-}
-export const GROUP_TEXT: Record<TaskGroup, string> = {
-  active: "text-foreground",
-  waiting: "text-muted-foreground",
-  held: "text-warning",
-  failed: "text-destructive",
-  done: "text-muted-foreground",
-}
 
 const COLUMNS: Record<string, (t: TaskItem) => string | null> = {
   Specialist: (t) => t.assigned_agent_name,
@@ -293,6 +279,7 @@ export function TasksPage() {
               <tbody>
                 {rows.map((t) => {
                   const group = groupOf(t.status)
+                  const status = statusLine(failedById.get(t.id) ?? t, all, now(), undefined, false)
                   return (
                     <tr key={t.id} onClick={rowClick(taskRoute(t.id))} className={ROW_CLASS}>
                       <td className="max-w-[26rem] px-3 py-2">
@@ -315,8 +302,8 @@ export function TasksPage() {
                         </div>
                       </td>
                       <td className={cn("max-w-[22rem] px-3 py-2", GROUP_TEXT[group])}>
-                        <span className="line-clamp-2">
-                          {statusLine(failedById.get(t.id) ?? t, all, now(), undefined, false)}
+                        <span title={status} className="line-clamp-2">
+                          {status}
                         </span>
                       </td>
                       {varying.map((c) => (

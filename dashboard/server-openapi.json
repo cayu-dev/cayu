@@ -5659,6 +5659,20 @@
             ],
             "title": "Error Code"
           },
+          "error_summary": {
+            "anyOf": [
+              {
+                "maxLength": 240,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the task failed, in one line: the error's type and the first line of its message, such as \"GitError: couldn't find remote ref refs/pull/217/head\". Redacted like the detail's error, then cut to 240 characters with an ellipsis. Null when the task has no error or the error has no type or message; the full error is in the task's detail.",
+            "title": "Error Summary"
+          },
           "graph_id": {
             "anyOf": [
               {
@@ -6122,6 +6136,20 @@
               }
             ],
             "title": "Error Code"
+          },
+          "error_summary": {
+            "anyOf": [
+              {
+                "maxLength": 240,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the task failed, in one line: the error's type and the first line of its message, such as \"GitError: couldn't find remote ref refs/pull/217/head\". Redacted like the detail's error, then cut to 240 characters with an ellipsis. Null when the task has no error or the error has no type or message; the full error is in the task's detail.",
+            "title": "Error Summary"
           },
           "graph_id": {
             "anyOf": [

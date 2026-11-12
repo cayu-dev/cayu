@@ -281,7 +281,9 @@ cayu task wait TASK_ID --application my-agent --wait-seconds 3600
 `list` prints the newest-updated tasks first with their status, the reason for it, the
 assigned agent, the retry attempt and the worker holding the claim; add `--offset` for
 the next page. Like `GET /api/tasks`, its rows leave out each task's input, result and error,
-but carry the error's code as `error_code` (never its message or details).
+but carry the error's code as `error_code` and a one-line `error_summary`: the error's type
+and the first line of its message (never its details or later lines). A failed task with no
+status reason shows that summary in the reason column.
 `show` adds the input, result or error, a `cancellation` summary (whether cancelling was
 asked for or done, the reason, and for a task cancelled after its worker was lost, the
 reconciliation outcome such as `quiescent`, and `fenced_by`: `worker_loss` when the worker or

@@ -7,7 +7,7 @@ import type { TaskReplaySource } from "@/lib/generated/server-api"
 import { cancelDeclaredTask, readTaskReplay, replayDeclaredTask } from "../api/tasks"
 import type { Api, TaskInfo } from "../api/types"
 import { useServices } from "../app/services"
-import { FINISHED_STATUSES } from "../app/task-model"
+import { FINISHED_STATUSES, replayUnavailableText } from "../app/task-model"
 import { TaskOperation } from "../app/task-operation"
 import { TASK_POLL_MS } from "../app/task-polling"
 import { ErrorState, taskRoute, useGo } from "./common"
@@ -137,7 +137,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
           Cancel task
         </Button>
       )}
-      {creatable && (
+      {creatable && availability.data?.available !== false && (
         <Button
           variant="outline"
           size="sm"
@@ -155,10 +155,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
       )}
       {creatable && availability.data?.available === false && (
         <p className="text-xs text-muted-foreground">
-          Run again unavailable:{" "}
-          {availability.data.unavailable_reason?.replaceAll("_", " ") ??
-            "no authorized replay source"}
-          .
+          {replayUnavailableText(availability.data.unavailable_reason)}
         </p>
       )}
       {availability.error && <ErrorState error={availability.error} />}

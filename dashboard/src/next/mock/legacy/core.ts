@@ -817,8 +817,10 @@ function sessionTask(seed: AppSeed, s: SeedSession, now: number): Task {
     title: titleOf(s),
     description: null,
     status,
-    status_reason: reason,
+    // Like the runtime, a failure's reason is its error's summary, not a status reason.
+    status_reason: status === "failed" ? null : reason,
     status_payload: null,
+    error_summary: status === "failed" ? reason : null,
     session_id: s.session.id,
     graph_id: null,
     prerequisite_task_ids: [],
@@ -876,7 +878,7 @@ function taskDetail(context: LegacyContext, task: TaskItem): TaskInfo {
         : null,
     error:
       task.status === "failed" || task.status === "dependency_skipped"
-        ? { reason: task.status_reason ?? s?.overview.reason ?? null }
+        ? { message: task.error_summary ?? task.status_reason ?? s?.overview.reason ?? null }
         : null,
     invocation: {
       schema_version: 1,

@@ -614,19 +614,19 @@ def test_server_task_lifecycle_endpoints_validate_request_body() -> None:
     assert response.status_code == 422
 
 
-def test_server_task_list_rows_carry_the_error_code_but_never_the_error() -> None:
+def test_server_task_list_rows_carry_the_error_code_and_summary_but_never_the_error() -> None:
     task_store = InMemoryTaskStore()
     errors = {
         "operator": {
             "code": "operator_stop",
-            "message": "private-error-message",
+            "message": "operator stopped it",
             "details": {"note": "private-error-details"},
         },
-        "too_long": {"code": "c" * 129, "message": "private-error-message"},
-        "not_text": {"code": 42, "message": "private-error-message"},
-        "blank": {"code": " ", "message": "private-error-message"},
-        "redacted": {"code": "stop-private-code-canary", "message": "private-error-message"},
-        "no_code": {"message": "private-error-message"},
+        "too_long": {"code": "c" * 129, "message": "too long"},
+        "not_text": {"code": 42, "message": "not text"},
+        "blank": {"code": " ", "message": "blank"},
+        "redacted": {"code": "stop-private-code-canary", "message": "redacted"},
+        "no_code": {"message": "no code"},
     }
 
     async def setup_tasks() -> None:
@@ -665,4 +665,64 @@ def test_server_task_list_rows_carry_the_error_code_but_never_the_error() -> Non
         assert "private-error" not in response.text
     detail = client.get("/api/tasks/operator").json()
     assert detail["error_code"] == "operator_stop"
-    assert detail["error"]["message"] == "private-error-message"
+    assert detail["error"]["details"] == {"note": "private-error-details"}
+
+
+def test_server_task_list_rows_say_why_a_task_failed_in_one_redacted_line() -> None:
+    task_store = InMemoryTaskStore()
+    long_line = "word " * 80
+    errors = {
+        "git": {
+            "error": "GitError",
+            "message": (
+                "\n  couldn't find remote ref refs/pull/217/head  \n"
+                "private-second-line with more output"
+            ),
+            "details": {"stderr": "private-error-details"},
+        },
+        "type_only": {"error": "  Handler\nCrashed  "},
+        "message_only": {"message": "the vendor file is late"},
+        "long": {"error": "SlowError", "message": long_line},
+        # A secret split by the line break is masked before the first line is picked.
+        "secret": {"error": "AuthError", "message": "token private-\ncanary rejected"},
+        "nothing": {"error": 7, "message": "   \n  "},
+        "code_only": {"code": "operator_stop"},
+    }
+
+    async def setup_tasks() -> None:
+        await task_store.create_task(TaskCreate(task_id="pending", type="review"))
+        for task_id, error in errors.items():
+            await task_store.create_task(TaskCreate(task_id=task_id, type="review"))
+            await task_store.cancel_task(task_id, error)
+
+    asyncio.run(setup_tasks())
+    client = TestClient(
+        create_server(
+            CayuApp(
+                task_store=task_store,
+                secret_redactor=SecretRedactor("private-\ncanary"),
+            ),
+            config=_LOCAL_SERVER_CONFIG,
+        )
+    )
+
+    listed = client.get("/api/tasks")
+    index = client.get("/api/tasks", params={"include": "counts"})
+
+    assert listed.status_code == 200 and index.status_code == 200
+    for rows in (listed.json(), index.json()["items"]):
+        summaries = {row["id"]: row["error_summary"] for row in rows}
+        assert summaries["git"] == "GitError: couldn't find remote ref refs/pull/217/head"
+        assert summaries["type_only"] == "Handler Crashed"
+        assert summaries["message_only"] == "the vendor file is late"
+        assert len(summaries["long"]) == 240 and summaries["long"].endswith("…")
+        assert summaries["long"].startswith("SlowError: word word")
+        assert summaries["secret"].startswith("AuthError: token ")
+        assert "private-" not in summaries["secret"]
+        assert summaries["nothing"] is None
+        assert summaries["code_only"] is None and summaries["pending"] is None
+    for response in (listed, index):
+        assert "private-" not in response.text
+    detail = client.get("/api/tasks/git").json()
+    assert detail["error_summary"] == "GitError: couldn't find remote ref refs/pull/217/head"
+    assert "private-second-line" in detail["error"]["message"]

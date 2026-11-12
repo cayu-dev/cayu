@@ -768,7 +768,8 @@ def _table_row(task: dict[str, Any]) -> dict[str, Any]:
         limit = policy.get("max_attempts") if isinstance(policy, dict) else None
         attempt = f"{series.get('attempt')}/{limit}" if limit is not None else series.get("attempt")
     cancellation = task.get("cancellation")
-    reason = task.get("status_reason")
+    # A failed task's reason is its error summary; servers that predate it send none.
+    reason = task.get("status_reason") or task.get("error_summary")
     if isinstance(cancellation, dict):
         details = [
             detail

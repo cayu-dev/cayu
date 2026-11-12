@@ -1,6 +1,13 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { groupOf, holdable, isCayuTask, statusLine, when } from "../src/next/app/task-model.ts"
+import {
+  groupOf,
+  holdable,
+  isCayuTask,
+  replayUnavailableText,
+  statusLine,
+  when,
+} from "../src/next/app/task-model.ts"
 
 process.env.TZ = "UTC"
 const NOW = Date.parse("2026-10-21T23:30:00Z")
@@ -71,6 +78,42 @@ test("holds and failures carry their reason; a retried failure points at the ret
     statusLine(task({ status: "failed", status_reason: "boom" }), [], NOW),
     "Failed: boom",
   )
+})
+
+test("a failure says why with its error summary, over a status code", () => {
+  const summary = "GitError: couldn't find remote ref refs/pull/217/head"
+  assert.equal(
+    statusLine(task({ status: "failed", error_summary: summary }), [], NOW),
+    `Failed: ${summary}`,
+  )
+  // A retry series' failed attempt carries a disposition code as its status reason.
+  const exhausted = task({
+    status: "failed",
+    status_reason: "attempts_exhausted",
+    error_summary: summary,
+    retry_series: { attempt: 3, policy: { max_attempts: 3 } },
+  })
+  assert.equal(statusLine(exhausted, [exhausted], NOW), `Failed: ${summary}`)
+  assert.equal(
+    statusLine(task({ status: "failed", status_reason: null, error_summary: null }), [], NOW),
+    "Failed",
+  )
+})
+
+test("Run again says in words why it can't start a task", () => {
+  assert.equal(
+    replayUnavailableText("task_type_not_declared"),
+    "Can't run this task again. Only the agent's code starts tasks of this type; it isn't one you can create here.",
+  )
+  assert.equal(
+    replayUnavailableText("specialist_unavailable"),
+    "Can't run this task again. The specialist that runs it isn't available.",
+  )
+  for (const reason of [null, undefined, "some_future_code"])
+    assert.equal(
+      replayUnavailableText(reason),
+      "Can't run this task again. Its original run can't be found.",
+    )
 })
 
 test("running tasks count their subtasks", () => {
