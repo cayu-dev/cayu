@@ -63,6 +63,47 @@ def _crash_model(root: Path) -> None:
     asyncio.run(run())
 
 
+def _crash_model_during_operator_interrupt(root: Path) -> None:
+    from cayu.sessions.requests import InterruptSessionRequest
+
+    async def run():
+        with pytest.MonkeyPatch.context() as patch:
+            app, _store, provider = _application(root, patch)
+            started = asyncio.Event()
+
+            async def stream(_request):
+                assert (root / "allocated").exists()
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    os._exit(137)
+                yield  # pragma: no cover
+
+            patch.setattr(provider, "stream", stream)
+
+            async def interrupt_started_model():
+                await started.wait()
+                async for _ in app.interrupt_session(
+                    InterruptSessionRequest(session_id="lost-model", reason="operator stop")
+                ):
+                    pass
+
+            interruption = asyncio.create_task(interrupt_started_model())
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="coding",
+                    session_id="lost-model",
+                    messages=[Message.text("user", "work")],
+                )
+            ):
+                pass
+            await interruption
+            raise AssertionError("The provider did not receive the operator cancellation")
+
+    asyncio.run(run())
+
+
 def _run_crashing_process(root, entry):
     worker = subprocess.run(
         [
@@ -137,6 +178,46 @@ def test_owed_model_outcome_keeps_registered_binding_cleanup_reachable(
     asyncio.run(recover())
 
 
+def test_recorded_operator_interruption_keeps_binding_cleanup_reachable(tmp_path, database_url):
+    _database(tmp_path, database_url)
+    _run_crashing_process(tmp_path, "_crash_model_during_operator_interrupt")
+    _run_crashing_process(tmp_path, "_crash_settlement")
+
+    async def recover():
+        with pytest.MonkeyPatch.context() as patch:
+            app, store, provider = _application(tmp_path, patch)
+            try:
+                await _settlement_claim_expired(store)
+                assert (await store.load("lost-model")).status is SessionStatus.INTERRUPTED
+                assert not (tmp_path / "disposed").exists()
+                checkpoint = await store.load_checkpoint("lost-model")
+                assert checkpoint["pending_session_interrupt"]["reason"] == "operator stop"
+                await app.reconcile_orphaned_sessions()
+                assert (tmp_path / "disposed").exists()
+                assert not provider.requests
+                events = await store.load_events("lost-model")
+                assert sum(event.type is EventType.SESSION_INTERRUPTED for event in events) == 1
+            finally:
+                await app.aclose()
+                await store.close()
+                await app.task_store.close()
+
+    asyncio.run(recover())
+
+
+async def _settlement_claim_expired(store):
+    from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
+
+    async with asyncio.timeout(10):
+        while True:
+            claim = _incomplete_recovery_claim_from_checkpoint(
+                await store.load_checkpoint("lost-model")
+            )
+            if claim is None or claim[1] <= datetime.now(UTC):
+                break
+            await asyncio.sleep(0.05)
+
+
 def _crash_settlement(root):
     import cayu.runtime._recovery_ownership as recovery_ownership
 
@@ -168,18 +249,9 @@ def test_retained_binding_can_be_finalized_when_environment_registration_returns
 
     async def recover():
         with pytest.MonkeyPatch.context() as patch:
-            from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
-
             app, store, provider = _application(tmp_path, patch, register_environment=False)
             try:
-                async with asyncio.timeout(10):
-                    while True:
-                        claim = _incomplete_recovery_claim_from_checkpoint(
-                            await store.load_checkpoint("lost-model")
-                        )
-                        if claim is None or claim[1] <= datetime.now(UTC):
-                            break
-                        await asyncio.sleep(0.05)
+                await _settlement_claim_expired(store)
                 await app.reconcile_orphaned_sessions()
                 assert (await store.load("lost-model")).status is SessionStatus.INTERRUPTED
                 assert not (tmp_path / "disposed").exists()

@@ -1337,11 +1337,6 @@ class IncompleteSessionRecovery:
 
         results: list[IncompleteSessionRecoveryResult] = []
         for status in OUTCOME_SESSION_STATUS.values():
-            request = IncompleteSessionsRecoveryRequest(
-                statuses={status},
-                inactive_for_seconds=inactive_for_seconds,
-                reason="committed_outcome_recovered",
-            )
             cursor: str | None = None
             while True:
                 try:
@@ -1367,38 +1362,58 @@ class IncompleteSessionRecovery:
                         )
                     return results
                 for session in page.sessions:
-                    checkpoint = await self._session_store.load_checkpoint(session.id)
-                    if owed_decision_of_status(checkpoint, status) is None:
-                        # An election that precedes its transition has its own owner.
-                        continue
-                    candidate_request = request
-                    if repair_without_inactivity:
-                        owner = await self.execution_owner(session)
-                        if owner == "live":
-                            continue
-                        if owner == "lost" or self._session_store.supports_session_execution:
-                            # The exact committed decision above is positive
-                            # settlement evidence even when a terminal status
-                            # hides execution presence. Native reservation still
-                            # refuses a live publisher or recovery claim.
-                            candidate_request = request.model_copy(
-                                update={"inactive_for_seconds": 0}
-                            )
-                    results.append(
-                        await self._recover_incomplete_session_fault_isolated(
-                            session=session,
-                            request=candidate_request,
-                            before_recovery=None,
-                            before_mutation=None,
-                            after_recovery=None,
-                            reconcile_result=None,
-                            recover_abandoned_model=None,
-                        )
+                    result = await self.recover_committed_outcome(
+                        session,
+                        inactive_for_seconds=inactive_for_seconds,
+                        repair_without_inactivity=repair_without_inactivity,
                     )
+                    if result is not None:
+                        results.append(result)
                 if page.next_cursor is None or page.next_cursor == cursor:
                     break
                 cursor = page.next_cursor
         return results
+
+    async def recover_committed_outcome(
+        self,
+        session: Session,
+        *,
+        inactive_for_seconds: int,
+        repair_without_inactivity: bool = False,
+    ) -> IncompleteSessionRecoveryResult | None:
+        """Finish one terminal session that still owes its terminal decision.
+
+        Returns ``None`` when the session owes no decision of its status, or a
+        live owner is still publishing it.
+        """
+
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        if owed_decision_of_status(checkpoint, session.status) is None:
+            # An election that precedes its transition has its own owner.
+            return None
+        if repair_without_inactivity:
+            owner = await self.execution_owner(session)
+            if owner == "live":
+                return None
+            if owner == "lost" or self._session_store.supports_session_execution:
+                # The exact committed decision above is positive
+                # settlement evidence even when a terminal status
+                # hides execution presence. Native reservation still
+                # refuses a live publisher or recovery claim.
+                inactive_for_seconds = 0
+        return await self._recover_incomplete_session_fault_isolated(
+            session=session,
+            request=IncompleteSessionsRecoveryRequest(
+                statuses={session.status},
+                inactive_for_seconds=inactive_for_seconds,
+                reason="committed_outcome_recovered",
+            ),
+            before_recovery=None,
+            before_mutation=None,
+            after_recovery=None,
+            reconcile_result=None,
+            recover_abandoned_model=None,
+        )
 
     async def _recover_incomplete_session_fault_isolated(
         self,

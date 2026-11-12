@@ -34,6 +34,7 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
+from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions._pending_approval_reader import (
     PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
     pending_approval_from_checkpoint,
@@ -1504,6 +1505,12 @@ class SessionAbandonment:
                 checkpoint = await self._session_store.load_checkpoint(session.id)
                 if _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY not in (checkpoint or {}):
                     return None
+                if owed_decision_of_status(checkpoint, session.status) is not None:
+                    # An owed decision takes the terminal-decision recovery, which
+                    # also finalizes a saved environment binding before releasing.
+                    return await self._incomplete_recovery.recover_committed_outcome(
+                        session, inactive_for_seconds=0, repair_without_inactivity=True
+                    )
                 # Validate the exact retained record before claiming. This is
                 # already-committed publication, not new takeover eligibility;
                 # the original owner may have released its execution presence.
