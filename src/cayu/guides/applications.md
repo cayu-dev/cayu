@@ -105,7 +105,9 @@ require a stronger proof than this static check supports. Keep lifecycle and
 external work in methods or explicit builders. External roots of a local class
 hierarchy must also have reviewed subclass-creation behavior: builtin exceptions,
 `object`, the builtin value types (`tuple`, `list`, `dict`, `set`, `frozenset`,
-`str`, `int`, `float`, `bytes`), `abc.ABC`, and Cayu's `Tool` are supported.
+`str`, `int`, `float`, `bytes`), `abc.ABC`, Cayu's `Tool`, and `httpx`'s
+`AsyncBaseTransport`, `BaseTransport` and `Auth` (as `httpx.AsyncBaseTransport`
+or imported by name) are supported.
 Enum-derived application
 bases remain unproven because enum metaclasses can execute inherited member
 initializers; mixing a local base with an enum has the same restriction.
@@ -139,6 +141,26 @@ the check accepts without executing them:
   `cayu.tasks`, `cayu.budgets` or `cayu.providers`, with keyword arguments that
   are literals or a literal `Decimal(...)`, and `TaskRetryBudget.unlimited()`.
 - `Path(...)` and `Path(...).resolve()`, for example `Path(__file__).resolve()`.
+- `re.compile(...)` as a module constant, and reading `.pattern`, `.flags`,
+  `.groups` or `.groupindex` from such a constant, for example
+  `ISSUE = re.compile(_REPOSITORY.pattern + r"#\d+")`. A `ToolSpec` schema may use
+  `_REPOSITORY.pattern`. Calling the pattern's methods (`.match(...)`) stays
+  unproven.
+- Reading a module-level name from a project module bound with
+  `from package import module` or `import package.module as module`, for example
+  a default argument `run_key=task_runs.default_run_key`, unless the package's
+  `__init__.py` binds the same name. Dunder names, chained reads
+  (`module.NAME.attr`) and calls (`module.helper()`) are not covered by this
+  form; a call is proven like any other helper call.
+- Instances of a plain frozen dataclass defined in the project, for example
+  `QUESTIONS = (Question("a", answer="b"),)`. The class must be decorated with
+  `@dataclass(frozen=True, ...)` alone, bind no dunder names (no
+  `__post_init__` method or field), have no decorated methods (a `@property`
+  runs when the generated `__hash__` or `__eq__` reads a field), have field
+  defaults that are literals or
+  `field(default_factory=list)` and the like (a lambda factory runs at
+  construction), and inherit only from other such dataclasses. `*args` and
+  `**kwargs` unpacking stays unproven.
 - Type aliases such as `Callable[..., AbstractContextManager[T]]` built from
   `typing`, `collections.abc` and the `contextlib` context-manager ABCs.
 - `Enum`/`StrEnum`/`IntEnum`, `TypedDict` and `NamedTuple` declarations with
@@ -204,16 +226,36 @@ helpers deep are refused. A refused helper call is reported at the call, and the
 finding's message, `obstacle` and `obstacle_location` name the construct in the
 body that could not be proven.
 
-Build `ZoneInfo(...)` values lazily, inside a function or the factory, not at
-import: a zone missing from the system database is loaded from the `tzdata`
-package, and a project-local `tzdata` module would then run while `cayu check`
-imports the application. A module-level `ZoneInfo("...")` is reported as
-`SCAFFOLD_IMPORT_SIDE_EFFECT`.
+`ZoneInfo(...)` at import stays refused on purpose, and will not be added to
+the accepted forms: a zone missing from the system database is loaded from the
+`tzdata` package, and a project-local `tzdata` module would then run while
+`cayu check` imports the application. A module-level `ZoneInfo("...")` is
+reported as `SCAFFOLD_IMPORT_SIDE_EFFECT` with `accepted_form: cached_function`.
+Build the zone in a cached function and call it where the zone is used:
+
+```python
+import functools
+from zoneinfo import ZoneInfo
+
+
+@functools.cache
+def pacific() -> ZoneInfo:
+    return ZoneInfo("America/Los_Angeles")
+```
+
+`ZoneInfo` as an annotation, including a Pydantic field's, is accepted.
 
 Every module in the application packages is checked, whether or not the factory
 imports it at module level. The factory, a service target or a deployment check can
 import modules lazily or by `module:attribute` name while `cayu check` runs, so a
-finding in any of them stops the import.
+finding in any of them stops the import. One exception: a script, meaning a
+module with a top-level `if __name__ == "__main__":` block that you run with
+`python -m`, is not checked while nothing could import it. It is checked again
+as soon as any checked module imports it (at any depth, including inside a
+function), any string in checked source contains its module name, `pyproject.toml`
+or `cayu-cloud.toml` mentions its name, or checked source uses dynamic import
+machinery (`importlib`, `pkgutil`, `__import__`, `runpy`, `exec`, `eval`). A
+package's `__init__.py` is never treated as a script.
 
 Each cause is reported once, at the expression the check cannot prove. A class,
 annotation or import that only depends on a failing definition, such as every

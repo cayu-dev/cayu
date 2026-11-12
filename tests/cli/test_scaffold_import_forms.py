@@ -74,6 +74,45 @@ class Probe(Tool):
     "typed_dict": (
         "from typing import TypedDict\n\n\nclass Row(TypedDict):\n    name: str\n    count: int\n"
     ),
+    # A pattern built from another compiled constant's source.
+    "pattern_from_compiled_constant": (
+        'import re\n\n_REPOSITORY = re.compile(r"[a-z]+/[a-z]+")\n'
+        'ISSUE = re.compile(_REPOSITORY.pattern + r"#\\d+", _REPOSITORY.flags)\n'
+    ),
+    "pattern_source_in_toolspec": (
+        "import re\n\nfrom cayu import Tool, ToolEffect, ToolSpec\n\n"
+        '_REPOSITORY = re.compile(r"^[a-z]+/[a-z]+$")\n\n\n'
+        "class Probe(Tool):\n    spec = ToolSpec(\n        name='probe',\n"
+        "        description='d',\n"
+        "        input_schema={'type': 'object', 'properties': "
+        "{'repository': {'type': 'string', 'pattern': _REPOSITORY.pattern}}},\n"
+        "        effect=ToolEffect.NONE,\n    )\n"
+    ),
+    "httpx_transport_attribute": (
+        "import httpx\n\n\nclass ReadOnly(httpx.AsyncBaseTransport):\n"
+        "    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:\n"
+        "        self._inner = inner\n\n"
+        "    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:\n"
+        "        return await self._inner.handle_async_request(request)\n"
+    ),
+    "httpx_transport_name": (
+        "from httpx import BaseTransport, Request, Response\n\n\n"
+        "class Refuse(BaseTransport):\n"
+        "    def handle_request(self, request: Request) -> Response:\n"
+        "        raise RuntimeError('read only')\n"
+    ),
+    "frozen_dataclass_data": (
+        "from dataclasses import dataclass, field\n\n\n@dataclass(frozen=True)\n"
+        'class Question:\n    """A demo question."""\n\n    text: str\n'
+        "    answer: str = ''\n    tags: tuple[str, ...] = field(default_factory=tuple)\n\n"
+        "    def short(self) -> str:\n        return self.text[:10]\n\n\n"
+        "@dataclass(frozen=True, slots=True)\nclass Followup(Question):\n    after: int = 0\n\n\n"
+        "QUESTIONS = (Question('a', answer='b'), Followup(text='c', after=1))\n"
+    ),
+    "zoneinfo_cached_function": (
+        "import functools\nfrom zoneinfo import ZoneInfo\n\n\n@functools.cache\n"
+        "def pacific() -> ZoneInfo:\n    return ZoneInfo('America/Los_Angeles')\n"
+    ),
     "memoized": (
         "import functools\nfrom functools import lru_cache\n\n\n@functools.cache\n"
         "def first(key: str) -> str:\n    return key\n\n\n@lru_cache(maxsize=32)\n"
@@ -130,6 +169,61 @@ _REJECTED = {
         "@dataclass\nclass Row:\n    tags: list[str] = field(default_factory=build)\n",
         "unsupported_expression",
         None,
+    ),
+    "pattern_method": (
+        'import re\n\n_WORD = re.compile(r"[a-z]+")\nFIRST = _WORD.match("a")\n',
+        "unsupported_expression",
+        "_WORD.match",
+    ),
+    "frozen_dataclass_post_init": (
+        "from dataclasses import dataclass\n\n\n@dataclass(frozen=True)\nclass Question:\n"
+        "    text: str\n\n    def __post_init__(self) -> None:\n        print(self.text)\n\n\n"
+        "QUESTIONS = (Question('a'),)\n",
+        "unsupported_expression",
+        "Question(...)",
+    ),
+    "frozen_dataclass_lambda_factory": (
+        "from dataclasses import dataclass, field\n\n\n@dataclass(frozen=True)\nclass Question:\n"
+        "    tags: list = field(default_factory=lambda: print('x'))\n\n\n"
+        "QUESTIONS = (Question(),)\n",
+        "unsupported_expression",
+        "Question(...)",
+    ),
+    "mutable_dataclass_instance": (
+        "from dataclasses import dataclass\n\n\n@dataclass\nclass Question:\n    text: str\n\n\n"
+        "QUESTIONS = (Question('a'),)\n",
+        "unsupported_expression",
+        "Question(...)",
+    ),
+    "frozen_dataclass_unpacked": (
+        "from dataclasses import dataclass\n\n\n@dataclass(frozen=True)\nclass Question:\n"
+        "    text: str\n\n\nQUESTIONS = (Question(*['a']),)\n",
+        "unsupported_expression",
+        "Question(...)",
+    ),
+    "frozen_dataclass_property": (
+        "from dataclasses import dataclass\n\n\n@dataclass(frozen=True, init=False)\n"
+        "class Question:\n    text: str\n\n    @property\n    def label(self) -> str:\n"
+        "        return self.text\n\n\nQUESTIONS = {Question()}\n",
+        "unsupported_expression",
+        "Question(...)",
+    ),
+    "frozen_dataclass_dunder_field": (
+        "from dataclasses import dataclass\nfrom typing import Any\n\n\n@dataclass(frozen=True)\n"
+        "class Record:\n    __post_init__: Any = None\n\n\nVALUE = Record(lambda: None)\n",
+        "unsupported_expression",
+        "Record(...)",
+    ),
+    "zone_inside_an_effect": (
+        "import subprocess\nfrom zoneinfo import ZoneInfo\n\n"
+        "OUT = subprocess.run(['date'], env={'TZ': str(ZoneInfo('UTC'))})\n",
+        "import_time_effect",
+        "subprocess.run(...)",
+    ),
+    "zoneinfo": (
+        'from zoneinfo import ZoneInfo\n\nPACIFIC = ZoneInfo("America/Los_Angeles")\n',
+        "unsupported_expression",
+        "ZoneInfo(...)",
     ),
     "environment_get": (
         'import os\n\nREGION = os.environ.get("REGION", "us")\n',
@@ -224,3 +318,26 @@ def test_effects_and_opaque_calls_are_named_and_classified(project: Path, name: 
     if construct is not None:
         assert findings[0].parameters["construct"] == construct
         assert f"`{construct}`" in findings[0].message
+
+
+def test_zoneinfo_finding_says_why_and_names_the_accepted_form(project: Path) -> None:
+    # Zone construction at import stays refused on purpose.
+    (finding,) = _findings(project, _REJECTED["zoneinfo"][0])
+
+    assert "tzdata" in finding.message
+    assert "@functools.cache" in finding.hint
+    assert finding.parameters["accepted_form"] == "cached_function"
+
+
+@pytest.mark.parametrize(
+    ("name", "accepted"),
+    (
+        ("frozen_dataclass_post_init", "@dataclass(frozen=True)"),
+        ("mutable_dataclass_instance", "@dataclass(frozen=True)"),
+        ("pattern_method", "`.pattern`"),
+    ),
+)
+def test_refused_forms_name_the_accepted_way(project: Path, name: str, accepted: str) -> None:
+    (finding,) = _findings(project, _REJECTED[name][0])
+
+    assert accepted in finding.hint

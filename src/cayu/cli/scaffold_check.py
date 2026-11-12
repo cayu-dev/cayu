@@ -1530,6 +1530,22 @@ def _import_side_effect_diagnostic(
             "Move it into a function that a builder, lifecycle hook or tool `run` "
             "calls, so importing the application stays side-effect free."
         )
+    elif _is_zone_construction(unsafe_node):
+        # Refused on purpose (#2778): a zone missing from the system database is
+        # loaded from the `tzdata` package, which project source can shadow.
+        reason = "unsupported_expression"
+        message = (
+            f"`{construct}` runs when the module is imported. Cayu refuses zone "
+            "construction at import on purpose: a zone that the system time zone "
+            "database lacks is loaded from the `tzdata` package, and a project module "
+            "named `tzdata` would then run while `cayu check` imports the application."
+        )
+        hint = (
+            "Build the zone in a cached function and call it where the zone is used, "
+            "for example `@functools.cache` on `def pacific() -> ZoneInfo: return "
+            'ZoneInfo("America/Los_Angeles")`. `ZoneInfo` as an annotation is accepted.'
+        )
+        extra = {"accepted_form": "cached_function"}
     else:
         reason = "unsupported_expression"
         message = (
@@ -1541,6 +1557,24 @@ def _import_side_effect_diagnostic(
             "for the accepted forms), or move the call into a builder or lifecycle "
             "entry point."
         )
+        if isinstance(unsafe_node, ast.Attribute):
+            hint = (
+                "At import, attributes can be read from a project module (`module.name`), "
+                "an enum member, or a compiled `re` pattern constant (`.pattern`, `.flags`, "
+                "`.groups`); read anything else inside a function, or use a literal."
+            )
+        elif (
+            context is not None
+            and path is not None
+            and _calls_local_dataclass(context.root, path, unsafe_node)
+        ):
+            hint = (
+                "A project class can be instantiated at import when it is a plain "
+                "`@dataclass(frozen=True)`: no `__post_init__` or other dunder names, no "
+                "decorated methods such as `@property`, field defaults that are literals "
+                "or `field(default_factory=list)` and the like (not a lambda), and only "
+                "such dataclasses as bases. Otherwise build the instance inside a function."
+            )
     return _diagnostic(
         code="SCAFFOLD_IMPORT_SIDE_EFFECT",
         path=f"{relative}:{unsafe_node.lineno}",
@@ -1563,6 +1597,51 @@ def _import_side_effect_diagnostic(
         },
         severity=DiagnosticSeverity.ERROR,
         tags=_IMPORT_SAFETY_TAGS,
+    )
+
+
+def _calls_local_dataclass(root: Path, path: Path, node: ast.expr | ast.stmt) -> bool:
+    """Whether *node* calls a dataclass defined in *path* or imported from a project module."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+        return False
+    return _defines_dataclass(root, path, node.func.id, follow_import=True)
+
+
+def _defines_dataclass(root: Path, path: Path, name: str, *, follow_import: bool) -> bool:
+    tree = _parsed_module(path)
+    for statement in tree.body if tree is not None else ():
+        if isinstance(statement, ast.ClassDef) and statement.name == name:
+            return any(
+                _expression_root_name(
+                    decorator.func if isinstance(decorator, ast.Call) else decorator
+                )
+                in {"dataclass", "dataclasses"}
+                for decorator in statement.decorator_list
+            )
+        if follow_import and isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                if (alias.asname or alias.name) != name:
+                    continue
+                _local, source = _project_local_import_module_path(
+                    root, importing_path=path, module=statement.module, level=statement.level
+                )
+                return (
+                    source is not None
+                    and source.suffix == ".py"
+                    and _defines_dataclass(root, source, alias.name, follow_import=False)
+                )
+    return False
+
+
+def _is_zone_construction(node: ast.expr | ast.stmt) -> bool:
+    """Whether *node* is itself a `ZoneInfo(...)` call."""
+    if not isinstance(node, ast.Call):
+        return False
+    function = node.func
+    while isinstance(function, ast.Attribute) and function.attr in {"no_cache", "from_file"}:
+        function = function.value
+    return (isinstance(function, ast.Name) and function.id == "ZoneInfo") or (
+        isinstance(function, ast.Attribute) and function.attr == "ZoneInfo"
     )
 
 
@@ -1618,9 +1697,73 @@ def _application_module_paths(root: Path, entry_targets: tuple[str, ...] = ()) -
     # when application source refers to it. A conftest.py inside an application
     # package stays a scan root: package auto-discovery can import it.
     conftests = {root / "conftest.py"} & (paths - entries)
-    paths = (paths - conftests) | entries
-    paths |= _referenced_modules(root, paths, conftests)
+    # A script run with `python -m` (it has an `if __name__ == "__main__":`
+    # block) is skipped the same way while nothing in the application refers
+    # to it. See _referenced_modules for what counts as a reference.
+    scripts = {path for path in paths - entries - conftests if _is_script_module(path)}
+    scripts -= _scripts_named_in_configuration(root, scripts)
+    candidates = conftests | scripts
+    paths = (paths - candidates) | entries
+    paths |= _referenced_modules(root, paths, candidates)
     return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix()))
+
+
+def _is_script_module(path: Path) -> bool:
+    if path.name == "__init__.py" or path.is_symlink() or not path.is_file():
+        return False
+    tree = _parsed_module(path)
+    return tree is not None and any(
+        isinstance(statement, ast.If) and _is_main_guard(statement.test) for statement in tree.body
+    )
+
+
+def _scripts_named_in_configuration(root: Path, scripts: set[Path]) -> set[Path]:
+    """Scripts whose name appears in project configuration Cayu reads targets from."""
+    if not scripts:
+        return set()
+    text = ""
+    for name in ("pyproject.toml", "cayu-cloud.toml"):
+        try:
+            text += (root / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    return {path for path in scripts if path.stem in text}
+
+
+# Names through which source can import a module without naming it in an
+# import statement. Any of them in scanned source keeps every script scanned.
+_DYNAMIC_IMPORT_NAMES = frozenset(
+    {
+        "importlib",
+        "import_module",
+        "__import__",
+        "pkgutil",
+        "walk_packages",
+        "iter_modules",
+        "runpy",
+        "run_module",
+        "find_spec",
+        "spec_from_file_location",
+        "exec",
+        "eval",
+    }
+)
+
+
+def _uses_dynamic_import(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _DYNAMIC_IMPORT_NAMES:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in _DYNAMIC_IMPORT_NAMES:
+            return True
+        if isinstance(node, ast.alias) and node.name.split(".")[0] in _DYNAMIC_IMPORT_NAMES:
+            return True
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in _DYNAMIC_IMPORT_NAMES
+        ):
+            return True
+    return False
 
 
 def _referenced_modules(root: Path, scanned: set[Path], candidates: set[Path]) -> set[Path]:
@@ -1628,16 +1771,20 @@ def _referenced_modules(root: Path, scanned: set[Path], candidates: set[Path]) -
 
     This is wider than the import-time dependency walk on purpose: an import
     inside a function body counts, because the factory body runs during the
-    check, and so does any string that mentions ``conftest`` (importlib). The
-    walk goes through every local module it reaches, not only the candidates,
-    because a helper outside the application packages can import a conftest
-    inside a function. Source it cannot read, or a walk past the module limit,
-    keeps every candidate in the scan.
+    check, and so does any string that mentions ``conftest`` (importlib), or a
+    script's module name. Any dynamic import machinery (``importlib``,
+    ``pkgutil``, ``__import__``, ``exec``) keeps every script in the scan, since
+    it can import one without naming it. The walk goes through every local
+    module it reaches, not only the candidates, because a helper outside the
+    application packages can import a conftest inside a function. Source it
+    cannot read, or a walk past the module limit, keeps every candidate in the
+    scan.
     """
 
     referenced: set[Path] = set()
     pending = list(scanned)
     seen: set[Path] = set()
+    scripts = {candidate for candidate in candidates if candidate.name != "conftest.py"}
     while pending and candidates - referenced:
         path = pending.pop()
         if path in seen:
@@ -1662,13 +1809,18 @@ def _referenced_modules(root: Path, scanned: set[Path], candidates: set[Path]) -
             return set(candidates)
         local = _referenced_local_modules(root, path, tree)
         found = candidates & local
-        if any(
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and "conftest" in node.value
+        strings = [
+            node.value
             for node in ast.walk(tree)
-        ):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        if any("conftest" in value for value in strings):
             found = set(candidates)
+        if scripts and _uses_dynamic_import(tree):
+            found |= scripts
+        found |= {
+            script for script in scripts - found if any(script.stem in value for value in strings)
+        }
         pending.extend((local | found) - seen)
         referenced |= found
     return referenced
@@ -1854,6 +2006,139 @@ def _project_local_import_module_path(
     return is_project_local, None
 
 
+def _imported_module_binding(
+    root: Path,
+    path: Path,
+    node: ast.ImportFrom,
+    name: str,
+    package: Path,
+    trees: Mapping[Path, ast.Module],
+) -> _DeclarativeBinding | None:
+    """Bind ``from package import module`` to that project module's source.
+
+    Python returns the package's own attribute when its initializer binds the
+    name, so the submodule is the binding only when the initializer cannot.
+    """
+    module = f"{node.module}.{name}" if node.module else name
+    _local, target = _project_local_import_module_path(
+        root, importing_path=path, module=module, level=node.level
+    )
+    if target is None or target.suffix != ".py" or target not in trees:
+        return None
+    if package.suffix == ".py" and _module_may_bind_name(package, name):
+        return None
+    return _DeclarativeBinding(node.lineno, kind="module", module_path=target)
+
+
+# Reading these from a compiled pattern returns its source data.
+_PATTERN_ATTRIBUTES = frozenset({"pattern", "flags", "groups", "groupindex"})
+
+
+def _compiled_pattern_call(
+    call: ast.Call,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+) -> bool:
+    function = call.func
+    return (
+        isinstance(function, ast.Attribute)
+        and function.attr == "compile"
+        and isinstance(function.value, ast.Name)
+        and function.value.id not in rebound
+        and imports.get(function.value.id) == ("re", None)
+    )
+
+
+def _module_attribute_is_declarative(
+    attribute: ast.Attribute, proofs: Mapping[str, _DeclarativeBinding]
+) -> bool:
+    """A read of an already-bound name, or source data of a compiled pattern.
+
+    A project module's attribute is a plain dictionary lookup: the module is in
+    the import graph, so every statement that binds the name is proven on its
+    own, and a module ``__getattr__`` hook is itself a finding.
+    """
+    if not isinstance(attribute.value, ast.Name):
+        return False
+    proof = proofs.get(attribute.value.id)
+    if proof is None or proof.line >= attribute.lineno:
+        return False
+    if proof.kind == "pattern":
+        return attribute.attr in _PATTERN_ATTRIBUTES
+    return (
+        proof.kind == "module"
+        and proof.module_path is not None
+        and not attribute.attr.startswith("__")
+        and _module_may_bind_name(proof.module_path, attribute.attr)
+    )
+
+
+def _plain_frozen_dataclass(
+    node: ast.ClassDef,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proven: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """Whether constructing *node* only stores its arguments.
+
+    The generated ``__init__`` of a frozen dataclass assigns each field with
+    ``object.__setattr__`` and calls ``__post_init__`` if one exists. With no
+    dunder names, no decorated methods, no factory but a builtin collection and
+    only plain frozen dataclass bases, nothing else runs, also when a set or
+    dict calls the generated ``__hash__`` or ``__eq__``.
+    """
+    if len(node.decorator_list) != 1 or node.keywords:
+        return False
+    decorator = node.decorator_list[0]
+    if not (
+        isinstance(decorator, ast.Call)
+        and _dataclass_decorator_is_declarative(decorator, imports, rebound, root)
+        and any(
+            keyword.arg == "frozen"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in decorator.keywords
+        )
+    ):
+        return False
+    for base in node.bases:
+        proof = proven.get(base.id) if isinstance(base, ast.Name) else None
+        if proof is None or not proof.plain_frozen_dataclass or proof.line >= node.lineno:
+            return False
+    for statement in node.body:
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            continue
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A decorator can turn a method into a descriptor (`@property`) that the
+            # generated __hash__, __eq__ or __repr__ would run on a field read.
+            if statement.name.startswith("__") or statement.decorator_list:
+                return False
+            continue
+        if isinstance(statement, (ast.AnnAssign, ast.Assign)):
+            # A field named like a hook (`__post_init__: Any = None`) is still a hook.
+            if any(
+                name.startswith("__")
+                for name in _scope_rebound_names([statement], include_imports=True)
+            ):
+                return False
+            value = statement.value
+            if value is None or _declaration_value_is_inert(value, proven):
+                continue
+            if isinstance(value, ast.Call) and _dataclass_field_is_declarative(
+                value, import_bindings=imports, rebound_names=rebound
+            ):
+                # A lambda factory runs its body each time an instance is created.
+                if any(
+                    keyword.arg == "default_factory" and isinstance(keyword.value, ast.Lambda)
+                    for keyword in value.keywords
+                ):
+                    return False
+                continue
+        return False
+    return True
+
+
 def _module_may_bind_name(path: Path, name: str) -> bool:
     tree = _parsed_module(path)
     return tree is not None and any(
@@ -1964,7 +2249,9 @@ def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
 @dataclass(frozen=True)
 class _DeclarativeBinding:
     line: int
-    kind: Literal["class", "model", "table", "enum", "literal", "annotation", "function"] = "class"
+    kind: Literal[
+        "class", "model", "table", "enum", "literal", "annotation", "function", "pattern", "module"
+    ] = "class"
     enum_members: frozenset[str] | None = None
     metadata_shape: Literal["str", "tuple"] | None = None
     # The value of a numeric literal constant, for bounded arithmetic on it.
@@ -1972,6 +2259,11 @@ class _DeclarativeBinding:
     # Pydantic rebinds inherited serializers to undecorated overrides.
     serializer_methods: frozenset[str] = frozenset()
     unproven_method_returns: frozenset[str] = frozenset()
+    # A project module bound by `from package import module` or `import a.b as m`.
+    module_path: Path | None = None
+    # A plain `@dataclass(frozen=True)` whose generated __init__ only stores its
+    # arguments, so constructing one at import runs no application code.
+    plain_frozen_dataclass: bool = False
 
 
 def _is_pydantic_base(
@@ -3012,13 +3304,8 @@ def _unsafe_import_time_expression(
                 return mutation_target
         for attribute in _evaluated_attributes(expression):
             if _enum_value_is_declarative(
-                attribute,
-                {
-                    name: proof
-                    for name, proof in declarative_bases.items()
-                    if name not in class_rebound_names
-                },
-            ):
+                attribute, expression_proofs
+            ) or _module_attribute_is_declarative(attribute, expression_proofs):
                 continue
             root_name = _expression_root_name(attribute)
             if root_name in expression_rebound_names and root_name not in declarative_identities:
@@ -3085,8 +3372,28 @@ def _unsafe_import_time_expression(
                 continue
             if helper_calls is not None and helper_calls(call, expression, class_rebound_names):
                 continue
+            if _plain_dataclass_instance(call, expression_proofs):
+                continue
             return call
     return None
+
+
+def _plain_dataclass_instance(call: ast.Call, proofs: Mapping[str, _DeclarativeBinding]) -> bool:
+    """An instance of a plain frozen dataclass from the project, as module data.
+
+    Its arguments are proven like any other expression; unpacking is refused
+    because iterating an arbitrary object can run its code.
+    """
+    if not isinstance(call.func, ast.Name):
+        return False
+    proof = proofs.get(call.func.id)
+    return (
+        proof is not None
+        and proof.plain_frozen_dataclass
+        and proof.line < call.lineno
+        and not any(isinstance(argument, ast.Starred) for argument in call.args)
+        and all(keyword.arg is not None for keyword in call.keywords)
+    )
 
 
 def _deferred_return_is_declarative(
@@ -3411,6 +3718,19 @@ def _expression_root_name(expression: ast.expr) -> str | None:
     return expression.id if isinstance(expression, ast.Name) else None
 
 
+# Well-known library base classes, reviewed for a plain `type` metaclass and no
+# `__init_subclass__` or `__set_name__` hook, so a subclass runs nothing when it
+# is defined. They are accepted by name (`AsyncBaseTransport`) or as an attribute
+# of the imported package (`httpx.AsyncBaseTransport`).
+_REVIEWED_LIBRARY_BASES = frozenset(
+    {
+        ("httpx", "AsyncBaseTransport"),
+        ("httpx", "BaseTransport"),
+        ("httpx", "Auth"),
+    }
+)
+
+
 # These builtins have no application-owned metaclass or subclass hook. Unknown
 # unbound names are not evidence of safety (nor are calls or local subscriptions).
 _INERT_BUILTIN_BASES = frozenset(
@@ -3439,6 +3759,7 @@ _INERT_METACLASS_BASE_IMPORTS = frozenset(
         _SQLALCHEMY_BASE,
         ("http.server", "ThreadingHTTPServer"),
         ("http.server", "BaseHTTPRequestHandler"),
+        *_REVIEWED_LIBRARY_BASES,
     }
 )
 
@@ -3461,6 +3782,15 @@ def _class_base_is_declarative(
     if name is None or name in rebound_names:
         return False
     binding = import_bindings.get(name)
+    if (
+        binding is not None
+        and binding[1] is None
+        and isinstance(base, ast.Attribute)
+        and isinstance(base.value, ast.Name)
+        and (binding[0], base.attr) in _REVIEWED_LIBRARY_BASES
+        and not _import_binding_is_project_local(project_root, binding)
+    ):
+        return True
     if binding is not None:
         # Only direct imported names enter the model safeguards above. An
         # attribute or subscription rooted at BaseModel is not the same proof.
@@ -3539,6 +3869,10 @@ def _toolspec_metadata_is_inert(
         proof = proofs.get(value.id)
         return proof is not None and proof.kind == "literal" and proof.line < value.lineno
     if isinstance(value, ast.Attribute):
+        if value.attr == "pattern" and isinstance(value.value, ast.Name):
+            # A compiled pattern constant's source string.
+            proof = proofs.get(value.value.id)
+            return proof is not None and proof.kind == "pattern" and proof.line < value.lineno
         return _trusted_symbol(value.value, imports, rebound, root) == (
             "cayu",
             "ToolEffect",
@@ -3792,8 +4126,42 @@ def _project_declaration_proofs(
                         for alias in node.names:
                             name = alias.asname or alias.name
                             proof = imported_proofs.get(alias.name)
+                            if proof is None:
+                                proof = _imported_module_binding(
+                                    root, path, node, alias.name, target, trees
+                                )
                             if name in unique[path] and proof is not None:
                                 proven[name] = replace(proof, line=node.lineno)
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            if alias.asname is None or alias.asname not in unique[path]:
+                                continue
+                            _local, target = _project_local_import_module_path(
+                                root, importing_path=path, module=alias.name, level=0
+                            )
+                            # `import a.b as m` binds `a.b` as an attribute of `a`, which
+                            # a's initializer can rebind after importing the submodule.
+                            parent, _dot, leaf = alias.name.rpartition(".")
+                            _local, package = (
+                                _project_local_import_module_path(
+                                    root, importing_path=path, module=parent, level=0
+                                )
+                                if parent
+                                else (False, None)
+                            )
+                            if (
+                                target is not None
+                                and target.suffix == ".py"
+                                and target in trees
+                                and not (
+                                    package is not None
+                                    and package.suffix == ".py"
+                                    and _module_may_bind_name(package, leaf)
+                                )
+                            ):
+                                proven[alias.asname] = _DeclarativeBinding(
+                                    node.lineno, kind="module", module_path=target
+                                )
                     elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                         target = (
                             node.targets[0]
@@ -3820,6 +4188,10 @@ def _project_declaration_proofs(
                                         metadata_shape=_metadata_shape(value, proven),
                                         number=_bounded_number(value, proven),
                                     )
+                            elif isinstance(value, ast.Call) and _compiled_pattern_call(
+                                value, imports[path], rebounds[path]
+                            ):
+                                proven[target.id] = _DeclarativeBinding(node.lineno, kind="pattern")
                             elif isinstance(
                                 value, (ast.Subscript, ast.BinOp)
                             ) and _pydantic_annotation_is_declarative(
@@ -4105,6 +4477,7 @@ def _class_binding(
         enum_members,
         serializer_methods=serializers,
         unproven_method_returns=unproven_returns,
+        plain_frozen_dataclass=_plain_frozen_dataclass(node, imports, rebound, root, proven),
     )
 
 
@@ -4364,6 +4737,7 @@ def _imported_class_base_is_declarative(
         ("typing", "TypedDict"),
         ("typing_extensions", "NamedTuple"),
         ("typing_extensions", "TypedDict"),
+        *_REVIEWED_LIBRARY_BASES,
     }
 
 
