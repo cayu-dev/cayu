@@ -15,7 +15,7 @@ import httpx
 import pytest
 from tests.connector_broker_support import Answer, FakeBroker, Refusal, Sent
 
-from cayu.connections import ConnectionResponse, Query
+from cayu.connections import CloudConnectionBroker, ConnectionResponse, Query
 from cayu.connectors import github
 from cayu.connectors.github import client as client_module
 
@@ -879,3 +879,176 @@ def test_a_slot_failure_is_worded_by_what_happened_to_the_call() -> None:
     assert "got no answer to GET" in failure(Refusal(502, "upstream_failed"), "GET")
     unsent = failure(Refusal(422, "path_not_allowed"), "POST")
     assert "didn't send POST" in unsent and "may have sent" not in unsent
+
+
+# The login a client writes as, and Cayu Cloud's GitHub App refusals.
+
+_APP_SLOT = {
+    "slot": "github",
+    "connection": "triage-app",
+    "connector": "github-app",
+    "status": "ready",
+    "scopes": ["issues:write", "metadata:read"],
+    "account": {"id": "123456", "name": "cayu-triage[bot]"},
+}
+#: Cayu Cloud's refusal of a call to a repository its GitHub App isn't installed on.
+_NOT_INSTALLED = Refusal(
+    422,
+    "credential_unavailable",
+    f"The GitHub App isn't installed on {REPO}, or can't see it; install it on the "
+    "repository on GitHub.",
+)
+
+
+def test_login_on_cayu_cloud_is_the_slots_account_read_once() -> None:
+    broker = FakeBroker(_answers(Answer()), slots=[{**_APP_SLOT, "slot": "other"}, _APP_SLOT])
+    gh = _gh(broker)
+
+    assert asyncio.run(gh.login()) == "cayu-triage[bot]"
+    assert asyncio.run(gh.login()) == "cayu-triage[bot]"
+    assert broker.listed == 1
+    assert broker.sent == []
+
+
+def test_login_on_cayu_cloud_says_when_the_slot_or_its_account_is_missing() -> None:
+    with pytest.raises(github.GitHubConnectionRefused) as unbound:
+        asyncio.run(_gh(FakeBroker(_answers(Answer()), slots=[])).login())
+    assert unbound.value.code == "connection_unbound"
+    assert (
+        "`cayu cloud connections bind github CONNECTION --application AGENT`, and for a GitHub "
+        "App `--repository OWNER/NAME`"
+    ) in str(unbound.value)
+    assert unbound.value.path == "/v1/agent-connections"
+
+    for account in (None, {"id": "1", "name": ""}):
+        slots = [{**_APP_SLOT, "account": account}]
+        with pytest.raises(ValueError, match="lists no account for the connection of slot github"):
+            asyncio.run(_gh(FakeBroker(_answers(Answer()), slots=slots)).login())
+
+
+def test_login_with_a_token_is_its_owner() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"login": "octocat", "type": "User"})
+
+    gh = github.GitHubClient(
+        github.token_connections("ghp_test", transport=httpx.MockTransport(handler))
+    )
+    assert asyncio.run(gh.login()) == "octocat"
+    assert asyncio.run(gh.read_only_view().login()) == "octocat"
+    assert seen == ["/user"]
+
+
+def test_login_of_an_installation_token_is_the_one_named_or_asked_for() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+
+    transport = httpx.MockTransport(handler)
+    named = github.token_connections("ghs_test", login="github-actions[bot]", transport=transport)
+    assert asyncio.run(github.GitHubClient(named).login()) == "github-actions[bot]"
+    assert seen == []
+
+    unnamed = github.GitHubClient(github.token_connections("ghs_test", transport=transport))
+    with pytest.raises(ValueError, match=r"token_connections\(token, login=\.\.\.\)"):
+        asyncio.run(unnamed.login())
+    assert seen == ["/user"]
+    with pytest.raises(ValueError, match="login, when given"):
+        github.token_connections("ghs_test", login=" ")
+
+
+def test_login_of_a_revoked_token_raises_githubs_refusal() -> None:
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(401, json={"message": "Bad credentials"})
+    )
+    gh = github.GitHubClient(github.token_connections("ghp_revoked", transport=transport))
+    with pytest.raises(github.GitHubPermissionDenied, match="Bad credentials") as raised:
+        asyncio.run(gh.login())
+    assert raised.value.status == 401
+
+
+def test_login_of_a_fake_github_is_whom_it_writes_as() -> None:
+    from cayu.connectors.github.testing import FakeGitHub
+
+    assert asyncio.run(github.GitHubClient(FakeGitHub(login="herald[bot]")).login()) == (
+        "herald[bot]"
+    )
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_an_app_not_installed_on_cayu_cloud_is_raised_unsent_and_not_retried(method: str) -> None:
+    broker = FakeBroker(_answers(_NOT_INSTALLED))
+
+    with pytest.raises(github.GitHubAppNotInstalled) as raised:
+        asyncio.run(_gh(broker).request(method, f"/repos/{REPO}/issues"))
+
+    assert raised.value.repository == REPO
+    assert raised.value.ambiguous is False
+    assert (raised.value.method, raised.value.path) == (method, f"/repos/{REPO}/issues")
+    assert str(raised.value).endswith(f"{method} /repos/{REPO}/issues wasn't carried out.")
+    assert len(broker.sent) == 1
+
+
+def test_an_app_not_installed_on_cayu_cloud_fails_a_graphql_query_unsent() -> None:
+    broker = FakeBroker(_answers(_NOT_INSTALLED))
+
+    with pytest.raises(github.GitHubAppNotInstalled) as raised:
+        asyncio.run(_gh(broker).graphql("{ viewer { login } }", repository=REPO))
+
+    assert (raised.value.repository, raised.value.path) == (REPO, "/graphql")
+    assert len(broker.sent) == 1
+
+
+def test_any_other_unavailable_credential_is_still_retried_for_a_read() -> None:
+    broker = FakeBroker(_answers(Refusal(422, "credential_unavailable", "GitHub 5xx.")))
+
+    with pytest.raises(github.GitHubUnavailable) as raised:
+        asyncio.run(_gh(broker, read_retries=1).get(f"/repos/{REPO}/issues"))
+
+    assert not isinstance(raised.value, github.GitHubAppNotInstalled)
+    assert len(broker.sent) == 2
+
+
+def _listing_broker(handler: Callable[[httpx.Request], httpx.Response]) -> CloudConnectionBroker:
+    return CloudConnectionBroker(
+        url="https://api.example.test/v1/agent-connections",
+        token="cayu_conn_test",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_a_refused_listing_is_refused_and_an_unreachable_one_unavailable() -> None:
+    refused = httpx.Response(
+        401, json={"detail": {"code": "agent_credential_invalid", "message": "No."}}
+    )
+    gh = github.GitHubClient(_listing_broker(lambda _: refused))
+    with pytest.raises(github.GitHubConnectionRefused) as raised:
+        asyncio.run(gh.login())
+    assert raised.value.code == "agent_credential_invalid"
+    assert (raised.value.status, raised.value.ambiguous) == (401, False)
+    assert raised.value.path == "/v1/agent-connections"
+    assert "didn't list the slot github: No." in str(raised.value)
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down", request=request)
+
+    for handler in (unreachable, lambda _: httpx.Response(503)):
+        with pytest.raises(github.GitHubUnavailable) as down:
+            asyncio.run(github.GitHubClient(_listing_broker(handler)).login())
+        assert down.value.ambiguous is False
+
+
+def test_concurrent_first_logins_list_the_slot_once_for_the_client_and_its_views() -> None:
+    broker = FakeBroker(_answers(Answer()), slots=[_APP_SLOT])
+    gh = _gh(broker)
+    view = gh.read_only_view()
+
+    async def both() -> list[str]:
+        return list(await asyncio.gather(gh.login(), view.login(), gh.login()))
+
+    assert asyncio.run(both()) == ["cayu-triage[bot]"] * 3
+    assert broker.listed == 1

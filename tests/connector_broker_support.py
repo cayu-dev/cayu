@@ -55,14 +55,21 @@ Connector = Callable[[Sent], Answer | Refusal]
 
 
 class FakeBroker:
-    def __init__(self, connector: Connector) -> None:
+    """``slots``: what the broker lists as the Agent's slots (``GET``), as Cayu Cloud does."""
+
+    def __init__(self, connector: Connector, *, slots: list[dict[str, Any]] | None = None) -> None:
         self.connector = connector
+        self.slots = slots or []
+        self.listed = 0
         self.sent: list[Sent] = []
         self.client = CloudConnectionBroker(
             url=BROKER, token="cayu_conn_test", transport=httpx.MockTransport(self._handle)
         )
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            self.listed += 1
+            return httpx.Response(200, json={"items": self.slots, "models": []})
         slot = request.url.path.removeprefix("/v1/agent-connections/").removesuffix("/request")
         document = json.loads(request.content)
         sent = Sent(

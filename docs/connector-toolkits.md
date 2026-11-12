@@ -216,9 +216,11 @@ installation and token, for at most 256 repositories, mints once however many ca
 once, replaces a token 5 minutes before it expires, and mints again once when GitHub answers
 401. It calls only a repository's own API (`/repos/{owner}/{name}/...`), `/graphql` and
 `/rate_limit` (with a repository, whose token it uses), the calls Cayu Cloud's GitHub connector
-is to allow. `GitHubClient` doesn't name a repository for `/rate_limit` yet, so it can't read
-that path through an App slot; a token slot answers it. `login()` is the App's `<slug>[bot]`, the
-author of what it writes.
+allows. `GitHubClient` doesn't name a repository for `/rate_limit` yet, so it can't read
+that path through an App slot; a token slot answers it. `await gh.login()` is the login the
+client writes as: an App's `<slug>[bot]`, or a token's owner (`GET /user`). An installation
+token, such as GitHub Actions' `GITHUB_TOKEN`, is no user's: name its login,
+`token_connections(token, login="github-actions[bot]")`.
 
 - **Calls.** `request(method, path)` answers GitHub's response; `get`, `post`, `put`, `patch`
   and `delete` its JSON; `text(path)` a raw file or a job's log. Paths start with `/` and are
@@ -227,10 +229,10 @@ author of what it writes.
   `area/runtime` (`/repos/o/r/labels/area%2Fruntime`) or a file named `C#.md`, goes out
   encoded; a dot or empty segment, also once decoded, a backslash or NUL, raw or encoded, and
   a raw `?` or `#` are refused as `path_invalid` before anything is sent. Cayu Cloud's GitHub
-  connector has to accept the same paths. A call under `/repos/{owner}/{name}/`, or `graphql(...,
+  connector accepts the same paths. A call under `/repos/{owner}/{name}/`, or `graphql(...,
   repository=)`, names its repository in the `x-cayu-github-repository` header. The slot's
   host uses it to pick the credential and drops it, so GitHub never sees it:
-  `token_connections` and `app_connections` do, and Cayu Cloud's GitHub connector has to.
+  `token_connections`, `app_connections` and Cayu Cloud's GitHub connector all do.
 - **Pages.** `list(path)` follows GitHub's next-page links, 100 items a page, and answers
   `Page(items, complete)`: `complete` is false when `max_pages` (default 50) or
   `keep_going(page_items)` stopped it early. `paginate(path)` yields the items one by one.
@@ -246,6 +248,7 @@ author of what it writes.
   it failed has `ambiguous` set: a 5xx, a lost answer, the slot's `upstream_failed` or
   `upstream_response_too_large`, any slot refusal but those made before sending, and any failed
   GraphQL mutation. App not installed, and every other refusal, means the call wasn't sent.
+  `GitHubAppNotInstalled` names the `repository`, locally and on Cayu Cloud, and isn't retried.
 - **Rate limits and retries.** A rate limit (a 429, or a 403 with no requests left, a
   `Retry-After` or a secondary limit) and the broker's `too_many_calls` are waited out and the
   call sent once more when the wait is at most `max_rate_limit_wait_seconds` (60), as is a
@@ -271,8 +274,38 @@ author of what it writes.
 - **Redirects.** A redirect fails the call (a moved repository says so). `text()` follows a
   job log's redirect to GitHub's log storage (`*.actions.githubusercontent.com` and
   `productionresultssa<N>.blob.core.windows.net`) directly, with no credential, and
-  keeps the log's last 5 MiB. On Cayu Cloud that download needs the Agent to reach those hosts,
-  as the broker doesn't follow redirects.
+  keeps the log's last 5 MiB.
+
+### GitHub on Cayu Cloud
+
+An Organization adds its GitHub App as a `github-app` connection, with the App's id as a plain
+field and its private key from the `.pem` GitHub generated, and binds it to the Agent's
+`github` slot with the scopes and repositories the slot may use:
+
+```console
+cayu cloud connections add github-app --name triage-app \
+  --credential app_id=123456 --credential private_key=@app.pem
+cayu cloud connections bind github triage-app --application support-desk \
+  --scope issues:write --scope pull_requests:write --scope contents:read \
+  --repository acme/widgets --repository 'acme-labs/*'
+```
+
+`--repository` takes `OWNER/NAME`, or `OWNER/*` for every repository of an owner the App is
+installed on; a GitHub App binding needs at least one. Each call carries an installation token
+minted for its one repository with exactly the binding's scopes, so the binding, not
+`connections_from_environment(permissions=...)`, decides what the slot may do; a call to a
+repository the binding doesn't name is refused (`path_not_allowed`) before it is sent.
+`await gh.login()` reads the slot's account from the broker's listing, the App's
+`<slug>[bot]`; a Cayu Cloud that lists no account for the slot raises `ValueError`, and an
+unbound slot `GitHubConnectionRefused` (`connection_unbound`). A client reads its slot once:
+after the slot is bound to another connection, create a new `GitHubClient`. A repository the
+App isn't installed on raises `GitHubAppNotInstalled` before anything is sent.
+
+A job's log (`GET /repos/{owner}/{name}/actions/jobs/{id}/logs`) is the one redirect the broker
+follows: `text()` gets the log's last 5 MiB without the Agent reaching GitHub's log storage. A
+run's logs and an artifact are ZIP archives, which the broker never cuts short, so their
+redirect comes back as GitHub sent it: `request("GET", path, redirect="return")` answers it with its
+`location`.
 
 ### Pull request facts
 
@@ -326,10 +359,9 @@ marker, login=...)` files an issue once. Each looks first for an earlier write w
 `updated` or `refused`:
 
 ```python
-app = github.app_connections(app_id, private_key, permissions={"issues": "write"})
-gh = github.GitHubClient(app)
+gh = github.GitHubClient(github.connections_from_environment(permissions={"issues": "write"}))
 marker = github.Marker(f"digests/{digest_id}")
-written = await github.comment_once(gh, repo, 42, text, marker, login=await app.login())
+written = await github.comment_once(gh, repo, 42, text, marker, login=await gh.login())
 ```
 
 - **Format.** The marker is the body's last line, a hidden HTML comment:
@@ -342,9 +374,9 @@ written = await github.comment_once(gh, repo, 42, text, marker, login=await app.
 - **Trust.** Only writes whose author is `login` are read, and only their trailing marker:
   `marker_of(body)` reads it, and `trusted_markers(comments, login=...)` reads a pull request's
   `PullComment`s. Marker text anyone else wrote, or quoted earlier in a trusted body, counts
-  for nothing. Take `login` from the connection, never by hand: off Cayu Cloud an App's is
-  `GitHubAppConnections.login()`, `<slug>[bot]`, which no user can be named, while a user can
-  be named the bare slug, so an App connection refuses a login without `[bot]`. With a token,
+  for nothing. Take `login` from `await gh.login()`, never by hand: an App's is `<slug>[bot]`,
+  which no user can be named, while a user can be named the bare slug, so an App slot, local or
+  a Cayu Cloud `github-app` binding, refuses any login but the App's own `[bot]`. With a token,
   `login` is a person's, and their own hand-written comments are trusted too. Trust is the
   author's: a maintainer who edits the App's comment can change or remove its marker, and
   what they leave is read as written. `legacy=` reads an application's earlier format while
@@ -442,7 +474,7 @@ assert not fake.unanswered
   answers.
 - **Recording.** `requests` holds every `Call`, with its query, headers (the repository header
   included) and body; `writes()` the ones that would change GitHub. A call whose repository
-  header doesn't name its repository is refused, as Cayu Cloud's connector is to refuse it.
+  header doesn't name its repository is refused, as Cayu Cloud's connector refuses it.
 - **GraphQL.** There is no GraphQL engine: `on_graphql(name, answer)` answers the operation
   named `name` (the document's first definition, so not one that starts with a `fragment`) with
   `answer(variables, repository)`, the whole answer with its `data` and `errors`. `read_pull` reads

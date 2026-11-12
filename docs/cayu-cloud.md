@@ -2280,6 +2280,23 @@ arrangement or role in SAP. When the check itself fails, it prints why in words
 again later; a rejected credential or certificate (`auth_failed`, `certificate_rejected`) or a
 host this install doesn't allow (`host_not_allowed`) sets it to `error` until an admin fixes it.
 
+A GitHub App comes as `github-app`: its plain `app_id` (or client id, `Iv...`) and its
+unencrypted `private_key` from a file, the `.pem` GitHub generated. Cloud reads the App with
+the key when it is added, and its scopes are the App's repository permissions
+(`issues:write`, `contents:read`, ...). A binding names the repositories the slot may call with
+`--repository OWNER/NAME`, or `OWNER/*` for every repository of an owner the App is installed
+on; it needs at least one, and no other connector takes them. `check` reads the App with the
+kept key again.
+
+```console
+cayu cloud connections add github-app --name triage-app \
+  --credential app_id=123456 --credential private_key=@~/.keys/triage-app.pem
+cayu cloud connections bind github triage-app --application support-desk \
+  --scope issues:write --scope pull_requests:write --scope contents:read \
+  --repository acme/widgets --repository 'acme-labs/*'
+cayu cloud connections check triage-app
+```
+
 A connector that signs in, such as Slack where the install has its Slack app, takes no
 credential: an admin adds it, and the command prints the link where the connection is approved.
 

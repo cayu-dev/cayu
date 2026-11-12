@@ -34,6 +34,7 @@ from cayu.connectors.github._errors import (
     GitHubError,
     GitHubGraphQLFailed,
     GitHubNotFound,
+    GitHubPermissionDenied,
     GitHubRateLimited,
     GitHubUnavailable,
     GitHubWriteRefused,
@@ -55,7 +56,7 @@ DEFAULT_SLOT = "github"
 API_URL = "https://api.github.com"
 #: The repository (``owner/name``) a call is about: the slot's host picks the credential for
 #: it and drops the header, so GitHub never sees it. ``app_connections`` and
-#: ``token_connections`` drop it; Cayu Cloud's GitHub connector has to as well.
+#: ``token_connections`` drop it; Cayu Cloud's GitHub connector does too.
 REPOSITORY_HEADER = "x-cayu-github-repository"
 API_VERSION = "2022-11-28"
 JSON_MEDIA_TYPE = "application/vnd.github+json"
@@ -63,6 +64,14 @@ JSON_MEDIA_TYPE = "application/vnd.github+json"
 RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
 GRAPHQL_PATH = "/graphql"
 RATE_LIMIT_PATH = "/rate_limit"
+#: Where a token's owner is read: the login a token connection writes as.
+_USER_PATH = "/user"
+#: GitHub's words refusing ``GET /user`` to an installation token, which is no user's.
+_NO_USER = "Resource not accessible by integration"
+#: Cayu Cloud's broker route listing the Agent's slots, which a failed listing names.
+_LISTING_PATH = "/v1/agent-connections"
+#: Cayu Cloud's connector for a GitHub App, whose slots write as the App's ``<slug>[bot]``.
+_APP_CONNECTOR = "github-app"
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_MAX_PAGES = 50
 #: Calls one client has in flight at once, under the broker's eight per Agent.
@@ -88,6 +97,9 @@ _BUSY_SECONDS = 1.0
 _BACKOFF_SECONDS = 0.5
 #: Retried for reads: GitHub, or the slot's credential for the call, couldn't be reached.
 _TRANSIENT_CODES = frozenset({"upstream_failed", "credential_unavailable"})
+#: What Cayu Cloud's broker says in its ``credential_unavailable`` refusal of a call to a
+#: repository the GitHub App isn't installed on.
+_NOT_INSTALLED = "isn't installed on"
 _sleep = asyncio.sleep
 _Bound = TypeVar("_Bound")
 #: A page's items (``GitHubClient.list`` hides the builtin in the class's scope).
@@ -202,6 +214,10 @@ class GitHubClient:
         #: What the write-once helpers last wrote with this client, by what they wrote once.
         self._written_once: OrderedDict[Any, int] = OrderedDict()
         self._refused: list[RefusedWrite] = []
+        #: What this client learns of its slot once (``login``, and ``listed``: the slot as
+        #: Cayu Cloud's broker lists it), shared with a ``read_only_view``; one read at a time.
+        self._known: dict[str, Any] = {}
+        self._learning = _LoopBound(asyncio.Lock)
 
     def __repr__(self) -> str:
         return f"GitHubClient(slot={self._slot!r}, read_only={self._read_only})"
@@ -219,6 +235,27 @@ class GitHubClient:
         """Every write this read-only client refused, oldest first, for a dry run's report."""
 
         return tuple(self._refused)
+
+    async def login(self) -> str:
+        """The login this client's writes are by: the ``login`` to trust in ``comment_once``,
+        ``file_issue_once`` and ``trusted_markers``.
+
+        On Cayu Cloud it is the account of the slot's connection, as the broker lists it: a
+        GitHub App's ``<slug>[bot]``. Off it, a connection client that knows its own login
+        answers it (``GitHubAppConnections.login()``, a fake's ``login``), and any other is a
+        token's, whose owner ``GET /user`` names. Read once per client and its read-only views:
+        after the slot is bound to another connection, a new client reads the new login.
+        """
+
+        login = self._known.get("login")
+        if login is None:
+            if isinstance(self._client, CloudConnectionBroker):
+                login = _account_login(await self._slot_listed(self._client), self._slot)
+            else:
+                async with self._learning.get():
+                    login = self._known.get("login") or await self._own_login()
+            self._known["login"] = login
+        return login
 
     def read_only_view(self) -> GitHubClient:
         """The same slot and settings, refusing writes, with its own ``refused``; both share the
@@ -454,6 +491,93 @@ class GitHubClient:
             )
         return parse_qs(target.query, keep_blank_values=True)
 
+    async def _writes_as_app(self) -> bool:
+        """Whether this slot is a GitHub App's: a local App connection, or a Cayu Cloud slot
+        bound to a GitHub App connection."""
+
+        # Imported here: the credentials module builds on this one.
+        from cayu.connectors.github.credentials import GitHubAppConnections
+
+        if isinstance(self._client, GitHubAppConnections):
+            return True
+        if isinstance(self._client, CloudConnectionBroker):
+            return (await self._slot_listed(self._client)).get("connector") == _APP_CONNECTOR
+        return False
+
+    async def _slot_listed(self, broker: CloudConnectionBroker) -> Mapping[str, Any]:
+        """This client's slot as ``broker``, its connection client, lists it (its
+        ``connector`` and ``account``), read once; ``connection_unbound`` when the Agent has no
+        such slot."""
+
+        async with self._learning.get():
+            listed = self._known.get("listed")
+            if listed is None:
+                listed = self._known["listed"] = await self._read_slot(broker)
+        return listed
+
+    async def _read_slot(self, broker: CloudConnectionBroker) -> Mapping[str, Any]:
+        try:
+            items = await broker.slots()
+        except ConnectionCallError as error:
+            message = f"Cayu Cloud's broker didn't list the slot {self._slot}: {error}" + (
+                f" ({error.code})" if error.code else ""
+            )
+            fields: dict[str, Any] = {
+                "method": "GET",
+                "path": _LISTING_PATH,
+                "status": error.status,
+            }
+            if error.code is None or error.code in _TRANSIENT_CODES:
+                raise GitHubUnavailable(message, **fields) from None
+            raise GitHubConnectionRefused(message, code=error.code, **fields) from None
+        listed = next(
+            (item for item in items if isinstance(item, dict) and item.get("slot") == self._slot),
+            None,
+        )
+        if listed is None:
+            raise GitHubConnectionRefused(
+                f"The slot {self._slot} isn't bound to a connection on Cayu Cloud: bind it with "
+                f"`cayu cloud connections bind {self._slot} CONNECTION --application AGENT`, "
+                "and for a GitHub App `--repository OWNER/NAME`.",
+                code="connection_unbound",
+                method="GET",
+                path=_LISTING_PATH,
+            )
+        return listed
+
+    async def _own_login(self) -> str:
+        """The login of a connection client off Cayu Cloud: its own, else the token's owner."""
+
+        known: Any = getattr(self._client, "login", None)
+        if isinstance(known, str):
+            return known
+        if callable(known):
+            try:
+                return str(await known())
+            except ConnectionCallError as error:
+                raise self._refusal(error, "GET", "/app", write=False) from None
+        try:
+            user = await self.get(_USER_PATH)
+        except GitHubPermissionDenied as denied:
+            # An installation token, such as Actions' GITHUB_TOKEN, is no user's; any other
+            # refusal (a revoked token's 401) is GitHub's own.
+            if denied.status != 403 or _NO_USER not in denied.message:
+                raise
+            raise ValueError(
+                f"GitHub answered {denied.status} to GET {_USER_PATH}: this token is no "
+                "user's, such as an installation token. Name its login: "
+                "token_connections(token, login=...), 'github-actions[bot]' for GitHub "
+                "Actions' GITHUB_TOKEN."
+            ) from None
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login:
+            raise GitHubError(
+                f"GitHub's answer to GET {_USER_PATH} names no login.",
+                method="GET",
+                path=_USER_PATH,
+            )
+        return login
+
     def _check_write(self, method: str, path: str, repository: str | None) -> None:
         if not self._read_only:
             return
@@ -479,6 +603,7 @@ class GitHubClient:
         limit is waited out once, and a failure retried only when ``retry_failures``."""
 
         sent = {**headers, "x-github-api-version": API_VERSION}
+        repository = headers.get(REPOSITORY_HEADER)
         waited = False
         failures = 0
         while True:
@@ -488,6 +613,20 @@ class GitHubClient:
                         self._slot, method, path, query=query, headers=sent, body=body
                     )
             except ConnectionCallError as error:
+                if (
+                    repository is not None
+                    and error.code == "credential_unavailable"
+                    and _NOT_INSTALLED in str(error)
+                ):
+                    # Cayu Cloud's broker refused it before sending, unretried: installing the
+                    # App is what changes the answer.
+                    raise GitHubAppNotInstalled(
+                        f"{error} {method} {path} wasn't carried out.",
+                        repository=repository,
+                        method=method,
+                        path=path,
+                        status=error.status,
+                    ) from None
                 failure = self._refusal(error, method, path, write=not retry_failures)
             except GitHubAppNotInstalled as missing:
                 # Raised while minting the call's token, before the call was sent: it names the
@@ -590,6 +729,20 @@ class GitHubClient:
         raise _LogDownloadFailed(
             f"The log download for GET {path} failed ({failure}).", method="GET", path=path
         )
+
+
+def _account_login(listed: Mapping[str, Any], slot: str) -> str:
+    """The login of the account Cayu Cloud lists for the slot's connection."""
+
+    account = listed.get("account")
+    name = account.get("name") if isinstance(account, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            f"Cayu Cloud lists no account for the connection of slot {slot}, so the login it "
+            "writes as isn't known: its connector names none, or this Cayu Cloud predates "
+            "listing it."
+        )
+    return name.strip()
 
 
 def _limited_or_unavailable(

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from tests.connector_broker_support import FakeBroker, Refusal
 
 from cayu.connections import ConnectionCallError, ConnectionResponse
 from cayu.connectors import github
@@ -209,8 +210,64 @@ def test_an_app_connection_trusts_only_its_bot_login() -> None:
     ).decode()
     app = github.app_connections("1234", pem, permissions={"issues": "write"})
     gh = github.GitHubClient(app)
-    with pytest.raises(ValueError, match=r"GitHubAppConnections\.login\(\)"):
+    with pytest.raises(ValueError, match=r"await gh\.login\(\)"):
         run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login="cayu-herald"))
+
+
+def _cloud_slot(connector: str) -> FakeBroker:
+    """A Cayu Cloud slot bound to a ``connector`` connection whose account is ``HERALD``, and
+    whose calls it refuses."""
+
+    return FakeBroker(
+        lambda _: Refusal(422, "path_not_allowed"),
+        slots=[{"slot": "github", "connector": connector, "account": {"id": "1", "name": HERALD}}],
+    )
+
+
+def test_a_cloud_github_app_slot_trusts_only_its_own_bot_login() -> None:
+    broker = _cloud_slot("github-app")
+    gh = github.GitHubClient(broker.client)
+    for login in ("cayu-herald", SCOUT):
+        with pytest.raises(ValueError, match=r"await gh\.login\(\)"):
+            run(github.file_issue_once(gh, REPO, "t", "b", github.Marker("k"), login=login))
+    assert broker.sent == []
+
+    with pytest.raises(github.GitHubConnectionRefused):
+        run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login=HERALD.upper()))
+    # The connector and the App's own login come from one read of the listing.
+    assert broker.listed == 1
+    assert len(broker.sent) == 1
+
+
+def test_a_local_app_connection_trusts_only_its_own_bot_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ).decode()
+    app = github.app_connections("1234", pem, permissions={"issues": "write"})
+
+    async def own_login() -> str:
+        return HERALD
+
+    monkeypatch.setattr(app, "login", own_login)
+    gh = github.GitHubClient(app)
+    with pytest.raises(ValueError, match=r"not 'cayu-scout\[bot\]'"):
+        run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login=SCOUT))
+
+
+def test_a_slot_not_a_github_apps_trusts_a_users_login() -> None:
+    # Cayu Cloud brokers no GitHub connector but the App's today: "github" stands for any
+    # slot that isn't an App's, which trusts its login as given.
+    broker = _cloud_slot("github")
+    gh = github.GitHubClient(broker.client)
+    with pytest.raises(github.GitHubConnectionRefused) as refused:
+        run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login="octocat"))
+    assert refused.value.code == "path_not_allowed"
+    assert broker.listed == 1
 
 
 # Comment once.

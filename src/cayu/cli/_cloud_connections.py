@@ -7,10 +7,11 @@ admin changes which Agents may use one, rotates its credential or removes it.
 
 Credentials are read from files, never from the command line: `--key-file PATH` for an API key,
 `--credential FIELD=@PATH` for a field kept in a file (a private key) and `--credential
-FIELD=VALUE` only for a field that isn't secret (`account`, `user`, and SAP's `base_url`,
-`token_url`, `client_id`, `oauth_scope`, `sap_client`). No answer ever holds a credential.
-`connections check` asks Cloud to test a connection that can be checked, such as SAP, and
-prints each service's result.
+FIELD=VALUE` only for a field that isn't secret (`account`, `user`, a GitHub App's `app_id`,
+and SAP's `base_url`, `token_url`, `client_id`, `oauth_scope`, `sap_client`). No answer ever
+holds a credential. `connections check` asks Cloud to test a connection that can be checked,
+such as SAP or a GitHub App, and prints each service's result. A GitHub App's binding names
+the repositories its slot may call with `bind --repository OWNER/NAME` (or `OWNER/*`).
 
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
@@ -39,7 +40,16 @@ AGENT_ACTIONS = frozenset({"bound", "bind", "unbind"})
 #: The credential fields that aren't secret, which --credential may give as FIELD=VALUE; every
 #: other field is read from a file (FIELD=@PATH).
 PLAIN_FIELDS = frozenset(
-    {"account", "user", "base_url", "token_url", "client_id", "oauth_scope", "sap_client"}
+    {
+        "account",
+        "user",
+        "app_id",
+        "base_url",
+        "token_url",
+        "client_id",
+        "oauth_scope",
+        "sap_client",
+    }
 )
 #: The credential fields Cayu Cloud's connectors take; an error names only these, since anything
 #: else given as a field name may be a mistyped secret.
@@ -154,10 +164,10 @@ def add_connections_parsers(
         "check",
         help="Test a connection and each service it reaches (admins).",
         description=(
-            "Ask Cloud to test the connection now: that its credential signs in, and, for SAP, "
-            "one small read of each service it holds. Prints each service's result. A rejected "
-            "credential or certificate, or a host the install doesn't allow, sets the "
-            "connection to error."
+            "Ask Cloud to test the connection now: that its credential signs in (a GitHub App's "
+            "key reads the App), and, for SAP, one small read of each service it holds, "
+            "printing each service's result. A rejected credential or certificate, or a host "
+            "the install doesn't allow, sets the connection to error."
         ),
     )
     check.add_argument("name")
@@ -186,14 +196,24 @@ def add_connections_parsers(
         "bind",
         help="Bind one of an Agent's slots to a connection, or its model slot to a model.",
         description=(
-            "Bind the Agent's SLOT to CONNECTION, optionally to fewer of its scopes; or, with "
-            "--model, bind its model slot SLOT to an approved model, which new sessions use."
+            "Bind the Agent's SLOT to CONNECTION, optionally to fewer of its scopes, and for a "
+            "GitHub App to the repositories it may call; or, with --model, bind its model slot "
+            "SLOT to an approved model, which new sessions use."
         ),
     )
     bind.add_argument("slot")
     bind.add_argument("connection", nargs="?")
     bind.add_argument("--application", required=True, help=APPLICATION_HELP)
     bind.add_argument("--scope", action="append", help="A scope the binding uses; repeat.")
+    bind.add_argument(
+        "--repository",
+        action="append",
+        metavar="OWNER/NAME",
+        help=(
+            "A repository a GitHub App binding may call, or OWNER/* for every one of an owner "
+            "the App is installed on; repeat. A GitHub App binding needs at least one."
+        ),
+    )
     bind.add_argument(
         "--model", help="Bind the model slot SLOT to this approved model instead of a connection."
     )
@@ -526,6 +546,8 @@ def _agent_action(
         payload: dict[str, object] = {"connection": arguments.connection}
         if arguments.scope is not None:
             payload["scopes"] = arguments.scope
+        if arguments.repository is not None:
+            payload["repositories"] = arguments.repository
         return client.request("PUT", slot, payload=payload)
     client.request("DELETE", slot)
     return {"application_id": application_id, "slot": arguments.slot, "unbound": True}
@@ -536,8 +558,14 @@ def _model_slot_action(
 ) -> dict[str, Any]:
     slot = f"{_models(application_id)}/{quote(arguments.slot, safe='')}"
     if arguments.connections_command == "bind":
-        if arguments.connection is not None or arguments.scope is not None:
-            raise ValueError("A model slot binds to --model MODEL alone: no CONNECTION or --scope.")
+        if (
+            arguments.connection is not None
+            or arguments.scope is not None
+            or arguments.repository is not None
+        ):
+            raise ValueError(
+                "A model slot binds to --model MODEL alone: no CONNECTION, --scope or --repository."
+            )
         return client.request("PUT", slot, payload={"model": arguments.model})
     client.request("DELETE", slot)
     return {"application_id": application_id, "slot": arguments.slot, "unbound": True}

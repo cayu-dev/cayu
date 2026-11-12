@@ -230,6 +230,11 @@ def test_login_is_the_apps_bot_name() -> None:
     assert len(fake.made("GET", "/app")) == 1
 
 
+def test_a_client_on_an_app_connection_writes_as_its_bot() -> None:
+    fake = FakeGitHub()
+    assert asyncio.run(github.GitHubClient(_app(fake)).login()) == "cayu-helper[bot]"
+
+
 def test_githubs_refusal_of_the_app_names_its_words_and_wait() -> None:
     def limited(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

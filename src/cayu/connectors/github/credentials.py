@@ -63,15 +63,23 @@ def token_connections(
     *,
     slot: str = DEFAULT_SLOT,
     api_url: str = API_URL,
+    login: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> LocalConnections:
     """``slot`` straight to GitHub with ``token`` (a personal access token, or Actions'
-    ``GITHUB_TOKEN``): every call is made in the token owner's name."""
+    ``GITHUB_TOKEN``): every call is made in the token owner's name.
+
+    ``login`` names who that is, for ``GitHubClient.login()``; without it a user's token is
+    asked with ``GET /user``. An installation token, such as Actions' ``GITHUB_TOKEN``, has no
+    user to ask: give its bot's login, ``github-actions[bot]`` for Actions' own."""
 
     if not token.strip():
         raise ValueError("The GitHub token must not be empty.")
+    if login is not None and not login.strip():
+        raise ValueError("login, when given, is the token's GitHub login.")
     return _TokenConnections(
         {slot: LocalSlot(api_url, {"authorization": f"Bearer {token.strip()}"})},
+        login=None if login is None else login.strip(),
         transport=transport,
     )
 
@@ -140,7 +148,18 @@ def connections_from_environment(
 
 
 class _TokenConnections(LocalConnections):
-    """A token's slot, dropping the repository header: GitHub never sees it."""
+    """A token's slot, dropping the repository header: GitHub never sees it. ``login`` is the
+    token's login, when its caller named it."""
+
+    def __init__(
+        self,
+        slots: Mapping[str, LocalSlot],
+        *,
+        login: str | None,
+        transport: httpx.AsyncBaseTransport | None,
+    ) -> None:
+        super().__init__(slots, transport=transport)
+        self.login = login
 
     async def request(
         self,
@@ -192,7 +211,7 @@ class GitHubAppConnections:
     once, replaced ``TOKEN_REFRESH_SECONDS`` before it expires, and dropped and minted again
     once when GitHub answers 401. It calls only a repository's own API
     (``/repos/{owner}/{name}/...``), ``/graphql`` and ``/rate_limit``, as Cayu Cloud's GitHub
-    connector is to; each names the repository whose token it uses. ``GitHubClient`` names none
+    connector does; each names the repository whose token it uses. ``GitHubClient`` names none
     for ``/rate_limit`` yet, so it can't read that path through this slot.
     Neither the private key nor a token is ever in a repr or an error.
     """

@@ -21,7 +21,6 @@ from cayu.connectors.github._errors import (
     GitHubWriteRefused,
 )
 from cayu.connectors.github.client import DEFAULT_MAX_PAGES, GitHubClient
-from cayu.connectors.github.credentials import GitHubAppConnections
 from cayu.connectors.github.pulls import PullComment, _rest_comment
 
 #: The longest body a marked write sends, in UTF-8 bytes: a little under the 262,144 GitHub
@@ -174,8 +173,8 @@ def trusted_markers(
 
     Trust is the comment's author: someone who can edit others' comments on the repository (a
     maintainer) can change or remove a marker in one, and what they leave is read as written.
-    Take ``login`` from the connection, never by hand: an App's is ``<slug>[bot]``, which no
-    user can be named, while a user may be named the slug alone.
+    Take ``login`` from ``await gh.login()``, never by hand: an App's is ``<slug>[bot]``, which
+    no user can be named, while a user may be named the slug alone.
     """
 
     trusted = _login(login)
@@ -238,7 +237,7 @@ async def comment_once(
     read, and the comment is posted again.
     """
 
-    trusted = _trusted_login(gh, login)
+    trusted = await _trusted_login(gh, login)
     path = f"/repos/{repository}/issues/{number}/comments"
     text = with_marker(body, marker)
     query = {} if since is None else {"since": _iso(since)}
@@ -312,7 +311,7 @@ async def file_issue_once(
     keeps the ``number`` it was answered and passes it as ``known``.
     """
 
-    trusted = _trusted_login(gh, login)
+    trusted = await _trusted_login(gh, login)
     labels = tuple(labels)
     path = f"/repos/{repository}/issues"
     target: _Target = (repository.lower(), None, marker.key)
@@ -523,15 +522,17 @@ def _login(login: str) -> str:
     return login.strip().casefold()
 
 
-def _trusted_login(gh: GitHubClient, login: str) -> str:
-    """``login``, checked against what ``gh`` writes as: a GitHub App's login ends in
-    ``[bot]``, and the bare slug may be a user's."""
+async def _trusted_login(gh: GitHubClient, login: str) -> str:
+    """``login``, checked against what ``gh`` writes as: on a GitHub App's slot, exactly the
+    App's own ``<slug>[bot]``, never a user's bare slug nor another App's bot."""
 
     trusted = _login(login)
-    if isinstance(gh._client, GitHubAppConnections) and not trusted.endswith(_BOT_SUFFIX):
+    if await gh._writes_as_app() and (
+        not trusted.endswith(_BOT_SUFFIX) or trusted != _login(await gh.login())
+    ):
         raise ValueError(
-            f"A GitHub App writes as <slug>[bot], not {login!r}: take login from "
-            "GitHubAppConnections.login()."
+            f"This GitHub App slot writes as its own <slug>[bot], not {login!r}: take "
+            "login from `await gh.login()`."
         )
     return trusted
 

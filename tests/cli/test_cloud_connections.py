@@ -230,6 +230,97 @@ def test_bind_and_unbind_an_agents_slot(cloud, capsys: pytest.CaptureFixture[str
     }
 
 
+def test_a_github_app_binding_names_its_repositories(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    slot = f"{_APPS}/support-desk/connections/github"
+    fake = cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            ("PUT", slot): httpx.Response(200, json={"slot": "github"}),
+        }
+    )
+
+    code, _ = _run(
+        [
+            "connections",
+            "bind",
+            "github",
+            "triage-app",
+            "--application",
+            "support-desk",
+            "--scope",
+            "issues:write",
+            "--repository",
+            "acme/widgets",
+            "--repository",
+            "acme-labs/*",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    (put,) = (request for request in fake.requests if request.method == "PUT")
+    assert json.loads(put.content) == {
+        "connection": "triage-app",
+        "scopes": ["issues:write"],
+        "repositories": ["acme/widgets", "acme-labs/*"],
+    }
+
+
+def test_a_model_slot_takes_no_repositories(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = cloud({("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS)})
+
+    code, output = _run(
+        [
+            "connections",
+            "bind",
+            "primary",
+            "--model",
+            "claude-opus",
+            "--repository",
+            "acme/widgets",
+            "--application",
+            "support-desk",
+        ],
+        capsys,
+    )
+
+    assert code == 2
+    assert "--repository" in output["error"]["message"]
+    assert all(request.method == "GET" for request in fake.requests)
+
+
+def test_a_github_app_takes_its_id_plain_and_its_key_from_a_file(
+    cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    pem = tmp_path / "app.pem"
+    pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
+
+    code, output = _run(
+        [
+            "connections",
+            "add",
+            "github-app",
+            "--name",
+            "triage-app",
+            "--credential",
+            "app_id=123456",
+            "--credential",
+            f"private_key=@{pem}",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert json.loads(fake.requests[0].content)["credential"] == {
+        "app_id": "123456",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+    }
+    assert "fake" not in json.dumps(output)
+
+
 def test_a_refused_removal_reports_clouds_reason(cloud, capsys: pytest.CaptureFixture[str]) -> None:
     cloud(
         {

@@ -14,7 +14,7 @@
 policy for their write tools and an argument-review preset ([connector toolkits](../connector-toolkits.md)).
 `cayu.connectors.sap` reads SAP S/4HANA's OData V2 services, with no write tools.
 `cayu.connectors.github` is a client for code on a `github` slot, with local token and GitHub
-App credentials; Cloud's GitHub App connector is still to come.
+App credentials, and on Cloud a `github-app` connection bound with its repositories.
 They take their client as an argument until `ToolContext.connections` exists. Model slots are
 built ([Models](#models)). Connection slot declarations, the manifest document,
 `ToolContext.connections` and MCP through a slot are still proposals.
