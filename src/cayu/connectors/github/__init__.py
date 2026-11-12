@@ -11,7 +11,12 @@ answer a pull request's facts as a ``PullRequestFacts`` record: mergeability, CI
 their workflow run attempts and one ``CheckState``, the reviewer App's check apart, reviews and
 comments. ``comment_once`` and ``file_issue_once`` write once however often a task restarts:
 the body ends with a hidden ``Marker``, looked up first among the caller's own login's writes
-(``trusted_markers`` reads them back). See ``docs/connector-toolkits.md``.
+(``trusted_markers`` reads them back). ``tools(client=None, slot="github")`` answers GitHub to a
+model as ``github_read_pull``, ``github_list_pulls``, ``github_read_issue`` and
+``github_read_job_log``; with ``include_writes=True`` also ``github_comment``,
+``github_rerun_failed_jobs``, ``github_update_branch`` and ``github_merge_pull``, which
+``approval_policy(inner)`` sends for approval and ``review_fields()`` shows by repository,
+number and head commit. See ``docs/connector-toolkits.md``.
 """
 
 from typing import Any as _Any

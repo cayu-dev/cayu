@@ -882,6 +882,11 @@
           "PullState",
           "list_pulls",
           "read_pull"
+        ],
+        "cayu.connectors.github.toolkit": [
+          "approval_policy",
+          "review_fields",
+          "tools"
         ]
       },
       "identities": {},

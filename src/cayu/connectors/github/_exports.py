@@ -42,6 +42,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RefusedWrite": ("cayu.connectors.github.client", "RefusedWrite"),
     "WriteOutcome": ("cayu.connectors.github.markers", "WriteOutcome"),
     "WrittenOnce": ("cayu.connectors.github.markers", "WrittenOnce"),
+    "approval_policy": ("cayu.connectors.github.toolkit", "approval_policy"),
     "app_connections": ("cayu.connectors.github.credentials", "app_connections"),
     "comment_once": ("cayu.connectors.github.markers", "comment_once"),
     "connections_from_environment": (
@@ -56,7 +57,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "marker_of": ("cayu.connectors.github.markers", "marker_of"),
     "plain_text": ("cayu.connectors.github.markers", "plain_text"),
     "read_pull": ("cayu.connectors.github.pulls", "read_pull"),
+    "review_fields": ("cayu.connectors.github.toolkit", "review_fields"),
     "token_connections": ("cayu.connectors.github.credentials", "token_connections"),
+    "tools": ("cayu.connectors.github.toolkit", "tools"),
     "trusted_markers": ("cayu.connectors.github.markers", "trusted_markers"),
     "with_marker": ("cayu.connectors.github.markers", "with_marker"),
 }

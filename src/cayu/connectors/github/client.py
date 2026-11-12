@@ -142,6 +142,11 @@ class RefusedWrite:
     repository: str | None = None
 
 
+class _LogDownloadFailed(GitHubUnavailable):
+    """The direct download of a redirected log failed: the log's host didn't answer or refused
+    it, such as where this process can't reach GitHub's log storage."""
+
+
 class GitHubClient:
     """GitHub through ``slot`` of ``client`` (default: Cayu Cloud's broker).
 
@@ -539,7 +544,7 @@ class GitHubClient:
                 client.stream("GET", location) as response,
             ):
                 if response.status_code != 200:
-                    raise GitHubUnavailable(
+                    raise _LogDownloadFailed(
                         f"The log download for GET {path} answered {response.status_code}.",
                         method="GET",
                         path=path,
@@ -555,7 +560,7 @@ class GitHubClient:
             return bytes(kept).decode("utf-8", "replace")
         # Raised outside the handler, so neither its cause nor its context holds the request,
         # whose URL carries the signature.
-        raise GitHubUnavailable(
+        raise _LogDownloadFailed(
             f"The log download for GET {path} failed ({failure}).", method="GET", path=path
         )
 

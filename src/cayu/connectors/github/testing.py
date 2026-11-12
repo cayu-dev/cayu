@@ -1040,6 +1040,11 @@ def _list_runs(r: _Served) -> ConnectionResponse:
     return r.page(runs[::-1], "workflow_runs")
 
 
+def _get_run(r: _Served) -> ConnectionResponse:
+    run = next((run for run in r.repository.workflow_runs if run.id == int(r.groups[0])), None)
+    return _not_found() if run is None else reply(200, _run_body(r.repository, run))
+
+
 def _rerun(r: _Served) -> ConnectionResponse:
     """A rerun starts the run's next attempt: each job rerun gets a new check run, queued, and
     the one it replaces is listed only with ``filter=all``. ``finish_run`` completes it. A run
@@ -1239,6 +1244,7 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], Callable[[_Served], ConnectionRespons
         ("GET", r"commits/(.+)/check-runs", _list_checks),
         ("GET", r"commits/(.+)/status", _combined_status),
         ("GET", r"actions/runs", _list_runs),
+        ("GET", r"actions/runs/(\d+)", _get_run),
         ("POST", r"actions/runs/(\d+)/rerun", _rerun),
         ("POST", r"actions/runs/(\d+)/rerun-failed-jobs", _rerun),
         ("GET", r"actions/jobs/(\d+)/logs", _job_log),

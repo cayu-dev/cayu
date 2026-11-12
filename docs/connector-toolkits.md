@@ -193,9 +193,10 @@ app.register_agent(spec, tools=sap.tools(slot="sap"))
 
 ## GitHub client
 
-`cayu.connectors.github` is a client for code, such as workflows and task handlers, rather than
-a set of tools. `GitHubClient(client=None, slot="github")` calls GitHub's REST and GraphQL APIs
-through the slot; the same code runs on Cayu Cloud, through the broker, and on a laptop:
+`cayu.connectors.github` is first a client for code, such as workflows and task handlers; its
+tools for a model (below) sit on top of it. `GitHubClient(client=None, slot="github")` calls
+GitHub's REST and GraphQL APIs through the slot; the same code runs on Cayu Cloud, through the
+broker, and on a laptop:
 
 ```python
 from cayu.connectors import github
@@ -400,7 +401,7 @@ assert not fake.unanswered
   `mergeable_state: "behind"` only with `requires_up_to_date=True`, as under branch protection.
   Logins ending in `[bot]` are bots.
 - **Routes.** Pulls (list, read, merge, update-branch, reviews), compare, a commit, a commit's
-  check runs and combined status, workflow runs and their reruns, a job's log (a 302 to a download the fake serves
+  check runs and combined status, workflow runs (listed or read one by one) and their reruns, a job's log (a 302 to a download the fake serves
   through `download_transport`, which `GitHubClient` takes from it), issues (list, create, read,
   edit), comments (list with `since`, create, read, edit), labels, releases and a
   collaborator's permission. Listings page with GitHub's next-page links, `page_size` items a
@@ -437,6 +438,76 @@ assert not fake.unanswered
   the rest from the fake's routes once a test answers its `PullRequestCompare` query, and
   `list_pulls` reads its `PullRequestFacts` query's answer.
 
+## GitHub tools
+
+`github.tools(client=None, slot="github")` answers GitHub to a model, through `GitHubClient`
+and the pull request read model above, so on Cayu Cloud the broker holds the credential. Its
+read tools use a read-only view of the client, so they can't write. The write tools use
+`write_slot` (default: `slot`): bind `slot` to a connection that can only read, and
+`write_slot` to one that can write, as with Snowflake.
+
+```python
+from cayu.approvals import ToolArgumentReview
+from cayu.connectors import github
+
+app.register_agent(
+    spec,
+    tools=github.tools(
+        include_writes=True, repositories=["acme/widgets"], reviewer_app="cayu-reviewer"
+    ),
+    tool_policy=github.approval_policy(),
+)
+review = ToolArgumentReview(github.review_fields())
+```
+
+| Tool | Does | Effect | Needs approval |
+| --- | --- | --- | --- |
+| `github_read_pull` | A pull request's facts (`read_pull`): state, labels, head commit, mergeability, `behind_by`, CI checks (failed ones with their `job_id`, `run_id` and attempt, running ones by name, the `reviewer_app`'s apart; each list at most 30, with its `*_total`), standing reviews, its newest 20 comments and `gaps` | none | No |
+| `github_list_pulls` | Pull requests in a `state` (`open` by default, `closed`, `merged`, `all`), most recently updated first, up to `limit` (20, at most 100), each in brief with its CI state, failed check names and `gaps` (such as reviews older than the 40 read); `complete` is false when there are more | none | No |
+| `github_read_issue` | An issue, or a pull request's conversation: title, state, labels, body and its newest `comments` (20, at most 50) | none | No |
+| `github_read_job_log` | The last `lines` (200, at most 2,000) of a GitHub Actions job's log, by `job_id` | none | No |
+| `github_comment` | Comment on a pull request or issue | external | Yes |
+| `github_rerun_failed_jobs` | Rerun a workflow run's failed jobs, by `run_id`; with `head_sha`, only a run of that commit | external | Yes |
+| `github_update_branch` | Merge the base branch into a pull request's head, only while the head is `head_sha` | external | Yes |
+| `github_merge_pull` | Merge a pull request, only while its head is `head_sha`, with a `merge_method` (`merge`, `squash`, `rebase`; GitHub's default `merge` when absent) | external | Yes |
+
+The write tools come only with `include_writes=True`. `approval_policy(inner)` asks for
+approval before each, naming its target (`Merge acme/widgets#7 at head 1a2b3c4 (squash).`), and
+`review_fields()` shows the approver the repository, the number, the head commit and the merge
+method, the run id and head of a rerun, or the body of a comment.
+
+- **Head guards.** A branch update sends `expected_head_sha` and a merge `sha`, so an approval
+  given for one head commit can't act on a later push: GitHub refuses it, and the tool answers
+  `github_conflict` with advice to read the pull request again. `head_sha` is the full commit.
+  A rerun given `head_sha` reads the run first and refuses one of another commit the same way.
+  A merge GitHub can't make as things stand (a draft, conflicts, required checks or reviews,
+  405) answers `github_not_mergeable`.
+- **Repositories.** The connection is the boundary: the GitHub App's installation and the
+  binding's permissions. `repositories=[...]` also keeps the tools to those repositories: the
+  model's schema lists them, and any other answers `repository_not_allowed` without a call.
+  Names match ignoring case, as on GitHub.
+- **Small answers.** Comment texts are shortened to 2,000 characters (`body_shortened: true`),
+  and a check's name, title and summary to 200, 200 and 500; when the answer wouldn't fit in
+  about 60 KiB, all of these are shortened together, down to 20 characters. An issue's body is
+  cut to 8,000. A pull request's or issue's newest comments are read from the last pages, 25
+  comments a page, however many there are; a page over the slot's answer limit leaves the
+  comments out with a `comments` gap, and the rest of the answer stands. A log keeps its end,
+  at most 40,000 characters and less when its encoded answer wouldn't fit, without colour
+  codes, with `truncated: true` when anything was left out. A log's other control characters
+  are shown as escapes (`\x07`), and a NUL in any of GitHub's text as `\x00`.
+- **Reviews read in full.** `reviews_complete` is false, in a pull request's facts and in each
+  listed one, when older reviews weren't read, so a standing review may be missing; read the
+  pull request with `github_read_pull` before relying on its reviews.
+- **Logs on Cayu Cloud.** A log read needs the Agent to reach GitHub's log storage, as under
+  Redirects above. When the download fails the tool answers `log_unavailable`: don't retry, read
+  the log from the check's `url`.
+- **Plain comments.** `github_comment` posts the model's text through `plain_text` (see Write
+  once): an `@` mentions no one, so it can't start a bot's command, and HTML comment delimiters
+  are removed, so nothing is hidden. The approver sees the model's text before that change.
+  `plain_comments=False` posts it as written, for applications that mean to mention. A comment
+  isn't written once: a model that retries after an `upstream_failed` with `ambiguous: true`
+  should read the conversation first.
+
 ## Errors
 
 A call that fails answers a tool error (`is_error`) whose `structured` holds `error` (a code),
@@ -447,7 +518,7 @@ A call that fails answers a tool error (`is_error`) whose `structured` holds `er
 | `connection_unbound`, `connection_not_ready`, `connection_unavailable`, `credential_invalid` | An admin must bind the slot or reconnect its connection |
 | `scope_not_allowed`, `path_not_allowed`, `method_not_allowed`, `connector_not_brokered` | Not allowed for this Agent; don't retry |
 | `too_many_calls` | Retry after `retry_after_seconds` (the broker's or the connector's `Retry-After`) |
-| `upstream_failed`, `connection_failed`, `upstream_status` (5xx), `upstream_invalid_response` | A temporary failure; retry later (a running statement is read again on its own) |
+| `upstream_failed`, `connection_failed`, `upstream_status` (5xx), `upstream_invalid_response` | A temporary failure; retry later (a running statement is read again on its own). A GitHub write with `ambiguous: true` may have taken effect: read before retrying |
 | `upstream_response_too_large` | Ask for less (with the statement handle when the statement finished) |
 | `result_too_wide` | The columns alone don't fit: select fewer, or give them shorter names |
 | `slack_error` | Slack's own `{"ok": false}` answer, its error in `slack_error` |
@@ -458,6 +529,14 @@ A call that fails answers a tool error (`is_error`) whose `structured` holds `er
 | `sap_error` | SAP refused the read (4xx): its message, `sap_code` and `transaction_id` from a JSON error, or the `status` alone from an HTML or XML page |
 | `query_not_allowed` | The broker refused a query option SAP reads don't take |
 | `row_too_large` | One SAP row alone doesn't fit: select fewer fields or expand less |
+| `github_not_found` | GitHub answered 404: check the repository and number; the connection may not see it |
+| `github_permission_denied` | The connection lacks the permission GitHub names in `accepted_permissions`; an admin must grant it |
+| `github_conflict` | GitHub refused it as things stand, such as a head that moved: read again first |
+| `github_not_mergeable` | GitHub can't merge the pull request now (draft, closed, conflicts, behind, checks or reviews): read it first |
+| `log_unavailable` | A job's log can't be downloaded from here; don't retry, use the check's `url` |
+| `github_app_not_installed` | The GitHub App isn't installed on the repository |
+| `github_error` | Any other GitHub refusal, with GitHub's words and `status` |
+| `repository_not_allowed` | The GitHub tools weren't given this repository |
 | `invalid_arguments`, `not_a_read`, `deadline_too_close` | Fix the call |
 
 An error in the tool's own code still raises, as in any tool.

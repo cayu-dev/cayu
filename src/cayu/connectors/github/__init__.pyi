@@ -57,3 +57,6 @@ from cayu.connectors.github.pulls import PullReview as PullReview
 from cayu.connectors.github.pulls import PullState as PullState
 from cayu.connectors.github.pulls import list_pulls as list_pulls
 from cayu.connectors.github.pulls import read_pull as read_pull
+from cayu.connectors.github.toolkit import approval_policy as approval_policy
+from cayu.connectors.github.toolkit import review_fields as review_fields
+from cayu.connectors.github.toolkit import tools as tools
