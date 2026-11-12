@@ -278,8 +278,9 @@ false when `max_pages` (10) stopped it.
 
 - **Mergeability.** GitHub works `mergeable` out after the first read. An open pull request
   whose `mergeable` is unknown is read again once after `mergeable_wait_seconds` (2); a listing
-  reads its unknown ones again together, 50 a query. Still unknown, it is `None`. A `dirty`
-  merge state is `False`.
+  reads its unknown ones again together, 50 a query, and takes each answer only for the head
+  its record describes: one whose head moved meanwhile stays unknown, with a `mergeable` gap.
+  Still unknown, it is `None`. A `dirty` merge state is `False`.
 - **Checks.** `PullChecks.ci` holds the head's check runs and commit statuses, each a
   `PullCheck` with its `conclusion` and `workflow_run` (a `CheckWorkflowRun`: its id and, from
   `read_pull`, the `attempt` the check ran in; None for a job a rerun of the failed jobs kept
@@ -301,6 +302,72 @@ false when `max_pages` (10) stopped it.
   taken as a missing fact: rate limits, outages and any other GraphQL error still fail.
 - **Logins.** Every login is as REST writes it: GraphQL's bot logins get their `[bot]`, and a
   deleted account is `ghost`.
+
+### Testing with a fake GitHub
+
+`cayu.connectors.github.testing.FakeGitHub` is a connection client that answers from data, so an
+application's tests run the real `GitHubClient`, with its paging, errors, rate limits and
+read-only mode, without GitHub or the network:
+
+```python
+from cayu.connectors.github import GitHubClient
+from cayu.connectors.github.testing import (
+    Call, CheckRun, Comment, CommitStatus, FakeGitHub, Issue, PullRequest, Release, Repository,
+    Review, WorkflowRun, reply,
+)
+
+fake = FakeGitHub(login="my-agent[bot]")
+pull = fake.add_pull("acme/widgets", 7, labels=["ready"], mergeable_unknown_reads=1)
+ci = fake.add_workflow_run("acme/widgets", pull.head_sha, conclusion="failure")
+fake.add_check_run("acme/widgets", pull.head_sha, "tests", run=ci, conclusion="failure")
+gh = GitHubClient(fake)  # or fake.client()
+await gh.post(f"/repos/acme/widgets/actions/runs/{ci.id}/rerun-failed-jobs")
+assert ci.run_attempt == 2
+assert not fake.unanswered
+```
+
+- **Data.** `add_repository`, `add_pull`, `add_issue`, `add_comment`, `add_review`,
+  `add_workflow_run`, `add_check_run`, `add_status`, `add_release` and `set_log` answer plain
+  objects (`Repository`, `PullRequest`, `Issue`, ...) a test may change, such as a pull's `head_sha`
+  after a push. Pulls and issues share their numbers; owner and name match ignoring case. A pull
+  answers `mergeable: null` on its first `mergeable_unknown_reads` reads, and
+  `mergeable_state: "behind"` only with `requires_up_to_date=True`, as under branch protection.
+  Logins ending in `[bot]` are bots.
+- **Routes.** Pulls (list, read, merge, update-branch, reviews), compare, a commit, a commit's
+  check runs and combined status, workflow runs and their reruns, a job's log (a 302 to a download the fake serves
+  through `download_transport`, which `GitHubClient` takes from it), issues (list, create, read,
+  edit), comments (list with `since`, create, edit), labels, releases and a collaborator's
+  permission. Listings page with GitHub's next-page links, `page_size` items a page at most.
+- **Nothing guessed.** A route, query filter, write body field or GraphQL operation the fake
+  doesn't answer raises `NotImplementedError` and is kept in `unanswered`: assert it is empty, as
+  an application may catch the error. `route(method, pattern, handler)` adds a repository route,
+  answered with `reply(status, body)` from the `Call`.
+- **Writes take effect** as GitHub's do, by `login`: a comment or issue appears with its id,
+  `html_url` and time; labels change; an issue closes; a merge closes the pull; an
+  update-branch is accepted with 202, head unchanged; a rerun bumps `run_attempt` and queues new
+  check runs for the jobs it reruns (those it replaced are listed only with `filter=all`), which
+  `finish_run` completes. Refusals answer GitHub's status, text and order, as checked against
+  GitHub, with its `documentation_url` and `status` in the body: a merge of a draft, a closed
+  pull or one with conflicts (405), and one behind under `requires_up_to_date` (405; its text
+  is unverified), then at a stale `sha` (409); an update-branch at a stale
+  `expected_head_sha`, then of a closed or conflicting pull, then of one that isn't behind (422);
+  a rerun of a run still going, or of failed jobs when none failed (403). A collaborator's
+  permission is set on the repository; anyone else's is `read` on a public repository and
+  `none` on a private one, and a login that isn't a user (in `users`, a collaborator or an
+  author) is 404. A closed pull's `mergeable` reads null.
+- **Failures.** `fail(method, path_glob, status=, body=, headers=, times=)`,
+  `rate_limit(..., retry_after=, secondary=)` (reset in wall-clock time, as GitHub's) and
+  `refuse(code, ...)` (the slot's host: `upstream_failed` for no answer, or a refusal such as
+  `scope_not_allowed`) answer the next matching calls; the first fault set up that matches
+  answers.
+- **Recording.** `requests` holds every `Call`, with its query, headers (the repository header
+  included) and body; `writes()` the ones that would change GitHub. A call whose repository
+  header doesn't name its repository is refused, as Cayu Cloud's connector is to refuse it.
+- **GraphQL.** There is no GraphQL engine: `on_graphql(name, answer)` answers the operation
+  named `name` (the document's first definition, so not one that starts with a `fragment`) with
+  `answer(variables, repository)`, the whole answer with its `data` and `errors`. `read_pull` reads
+  the rest from the fake's routes once a test answers its `PullRequestCompare` query, and
+  `list_pulls` reads its `PullRequestFacts` query's answer.
 
 ## Errors
 

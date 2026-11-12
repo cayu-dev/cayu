@@ -790,19 +790,36 @@ def test_unknown_mergeability_in_a_listing_is_read_again_together(waits: list[fl
     broker = _graphql(
         pages,
         mergeable={
-            "p7": {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"},
-            "p9": {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},
+            "p7": {"headRefOid": SHA, "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"},
+            "p9": {"headRefOid": SHA, "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},
         },
     )
     seven, eight, nine = _list(broker).pulls
 
-    assert (seven.mergeable, seven.mergeable_state) == (False, "dirty")
+    assert (seven.mergeable, seven.mergeable_state, seven.gaps) == (False, "dirty", ())
     assert eight.state is github.PullState.MERGED and eight.merged_by == "ana"
     assert eight.mergeable is None and nine.mergeable is None
     assert waits == [github.MERGEABLE_WAIT_SECONDS]
     reread = _queries(broker)[1]["query"]
     assert "p7: pullRequest(number: 7)" in reread and "p9: pullRequest(number: 9)" in reread
     assert "number: 8" not in reread
+
+
+def test_a_mergeable_reread_of_a_moved_head_is_left_out_with_a_gap(waits: list[float]) -> None:
+    unknown = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}
+    moved = "b" * 40
+    broker = _graphql(
+        [{"data": _page([_node(7, **unknown)])}],
+        mergeable={
+            "p7": {"headRefOid": moved, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"}
+        },
+    )
+
+    (pull,) = _list(broker).pulls
+
+    assert (pull.head_sha, pull.mergeable, pull.mergeable_state) == (SHA, None, "unknown")
+    assert [(gap.fact, moved in gap.reason) for gap in pull.gaps] == [("mergeable", True)]
+    assert "headRefOid" in _queries(broker)[1]["query"]
 
 
 def test_the_mergeable_reread_asks_for_at_most_fifty_pulls_a_query(waits: list[float]) -> None:

@@ -267,7 +267,7 @@ class PullComment:
 @dataclass(frozen=True)
 class FactGap:
     """A fact read in part or not at all, and why: ``fact`` is ``checks``, ``workflow_runs``,
-    ``behind_by``, ``head_committed_at``, ``reviews`` or ``comments``."""
+    ``behind_by``, ``head_committed_at``, ``mergeable``, ``reviews`` or ``comments``."""
 
     fact: str
     reason: str
@@ -734,7 +734,8 @@ async def _settled(
     gh: GitHubClient, repository: str, pulls: list[PullRequestFacts], wait: float
 ) -> tuple[PullRequestFacts, ...]:
     """The pull requests, those open whose ``mergeable`` was unknown read again once, up to
-    ``_MERGEABLE_BATCH`` in a query."""
+    ``_MERGEABLE_BATCH`` in a query. The answer is taken only for the head the record
+    describes: a pull request whose head moved since keeps ``mergeable`` unknown, with a gap."""
 
     unsettled = [p.number for p in pulls if p.state is PullState.OPEN and p.mergeable is None]
     if not unsettled or not wait:
@@ -744,7 +745,7 @@ async def _settled(
     found: dict[str, Any] = {}
     for start in range(0, len(unsettled), _MERGEABLE_BATCH):
         fields = " ".join(
-            f"p{number}: pullRequest(number: {number}) {{ mergeable mergeStateStatus }}"
+            f"p{number}: pullRequest(number: {number}) {{ headRefOid mergeable mergeStateStatus }}"
             for number in unsettled[start : start + _MERGEABLE_BATCH]
         )
         answer = await gh.graphql(
@@ -758,7 +759,14 @@ async def _settled(
     settled = []
     for pull in pulls:
         node = found.get(f"p{pull.number}")
-        if node:
+        if node and node.get("headRefOid") != pull.head_sha:
+            moved = FactGap(
+                "mergeable",
+                f"The head moved to {node.get('headRefOid') or 'nothing'} while {pull.head_sha} "
+                "was read; its mergeability wasn't taken.",
+            )
+            pull = replace(pull, gaps=(*pull.gaps, moved))
+        elif node:
             pull = replace(
                 pull,
                 mergeable=_mergeable(

@@ -162,7 +162,7 @@ class CloudConnectionBroker:
                     name: value if isinstance(value, str) else list(value)
                     for name, value in (query or {}).items()
                 },
-                "headers": _checked(path, headers, body),
+                "headers": checked_headers(path, headers, body),
                 "body": base64.b64encode(body).decode(),
             },
         )
@@ -250,7 +250,7 @@ class LocalConnections:
         # nor the hop-by-hop headers of its own connection, as Cayu Cloud's broker drops them.
         sent = {
             name: value
-            for name, value in _checked(path, headers, body).items()
+            for name, value in checked_headers(path, headers, body).items()
             if name not in _HOP_HEADERS
         }
         sent.update({name.lower(): value for name, value in configured.headers.items()})
@@ -306,9 +306,11 @@ def retry_after_seconds(value: str | None) -> float | None:
     return min(max(0.0, (when - datetime.now(UTC)).total_seconds()), MAX_RETRY_AFTER_SECONDS)
 
 
-def _checked(path: str, headers: Mapping[str, str] | None, body: bytes) -> dict[str, str]:
+def checked_headers(path: str, headers: Mapping[str, str] | None, body: bytes) -> dict[str, str]:
     """The request's headers, lowercased, once its path and body are ones the broker sends:
-    refused here as Cayu Cloud's broker refuses them, before anything leaves the process."""
+    refused here as Cayu Cloud's broker refuses them, before anything leaves the process. A
+    connection client of the connectors' own, such as a test's fake, checks them the same
+    way."""
 
     decoded = unquote(path)
     if (

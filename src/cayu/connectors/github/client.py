@@ -149,7 +149,8 @@ class GitHubClient:
     A rate limit is waited out and the call resent once when the wait is at most
     ``max_rate_limit_wait_seconds``; a read that fails with a 5xx or no answer is retried up to
     ``read_retries`` times. ``transport`` is for the one direct download ``text()`` makes when
-    GitHub redirects a log read.
+    GitHub redirects a log read; by default it is the connection client's own
+    ``download_transport``, when it has one, as a test's fake GitHub does.
     """
 
     def __init__(
@@ -180,6 +181,9 @@ class GitHubClient:
         self._read_only = read_only
         self._max_wait = max_rate_limit_wait_seconds
         self._read_retries = read_retries
+        offered = getattr(resolved, "download_transport", None)
+        if transport is None and isinstance(offered, httpx.AsyncBaseTransport):
+            transport = offered
         self._transport = kept_open(transport)
         self._cap = _LoopBound(lambda: asyncio.Semaphore(MAX_CONCURRENT_CALLS))
         self._refused: list[RefusedWrite] = []

@@ -5610,6 +5610,26 @@
         "snowflake"
       ]
     },
+    "cayu.connectors.github.testing": {
+      "defined_in": {
+        "cayu.connectors.github.testing": [
+          "Call",
+          "CheckRun",
+          "Comment",
+          "CommitStatus",
+          "FakeGitHub",
+          "Issue",
+          "PullRequest",
+          "Release",
+          "Repository",
+          "Review",
+          "WorkflowRun",
+          "reply"
+        ]
+      },
+      "identities": {},
+      "present": []
+    },
     "cayu.context.structured_output": {
       "defined_in": {
         "cayu.context.structured_output": [
