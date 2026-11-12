@@ -1,5 +1,22 @@
 # Release notes
 
+## v0.19.1
+
+Upgrade: No additional storage or manifest migration is required from v0.19.0.
+When upgrading from v0.18.0, follow the v0.19.0 migration instructions below.
+
+### Breaking changes
+
+None.
+
+### Fixes
+
+- Keep timed heartbeat reconciliation outside numbered fault-injection traces,
+  so baseline and replay cover the same foreground boundaries.
+- Revalidate current Vertex Claude pricing against the official partner-model
+  pricing page while preserving historical price schedules.
+
+
 ## v0.19.0
 
 Upgrade: Stop all workers, dispatchers, and servers that open the database, take a

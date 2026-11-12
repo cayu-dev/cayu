@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-11-11",
-  "price_book_version": "2026-11-11",
+  "generated_at": "2026-11-12",
+  "price_book_version": "2026-11-12",
   "prices": [
     {
       "aliases": [],
@@ -1739,9 +1739,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-12",
+            "as_of": "2026-11-12",
             "source": "official",
-            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+            "url": "https://cloud.google.com/model-garden/partner-models/pricing"
           }
         }
       ]
@@ -1851,9 +1851,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-12",
+            "as_of": "2026-11-12",
             "source": "official",
-            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+            "url": "https://cloud.google.com/model-garden/partner-models/pricing"
           }
         }
       ]
@@ -1918,9 +1918,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-12",
+            "as_of": "2026-11-12",
             "source": "official",
-            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+            "url": "https://cloud.google.com/model-garden/partner-models/pricing"
           }
         }
       ]
@@ -1988,9 +1988,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-12",
+            "as_of": "2026-11-12",
             "source": "official",
-            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+            "url": "https://cloud.google.com/model-garden/partner-models/pricing"
           }
         }
       ]
@@ -2030,9 +2030,9 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-12",
+            "as_of": "2026-11-12",
             "source": "official",
-            "url": "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing"
+            "url": "https://cloud.google.com/model-garden/partner-models/pricing"
           }
         }
       ]

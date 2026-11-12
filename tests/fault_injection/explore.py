@@ -27,6 +27,7 @@ from tests.fault_injection.harness import (
     runtime_frames,
     session_store,
     task_store,
+    unnumbered_task_heartbeats,
 )
 from tests.fault_injection.invariants import (
     TERMINAL_TASK_STATUSES,
@@ -760,7 +761,8 @@ def _run_isolated(scenario: Scenario, fault: FaultKind | None, point: str | None
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(run_case(scenario, fault, point))
+        with unnumbered_task_heartbeats():
+            result = loop.run_until_complete(run_case(scenario, fault, point))
         for shutdown in (loop.shutdown_asyncgens(), loop.shutdown_default_executor()):
             loop.run_until_complete(_bounded(shutdown, _SHUTDOWN_TIMEOUT_S))
         return result

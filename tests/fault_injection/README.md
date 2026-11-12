@@ -41,7 +41,10 @@ is a boundary plus its occurrence among equal boundaries, such as
 `store.load:enter#3` or, for stream closes, `event:interaction.completed#0`.
 Labels rather than positions keep points stable when an unrelated call moves:
 an added or removed call shifts only the later occurrences of its own boundary.
-Task lease renewals run on a wall-clock timer, so they are not numbered. A fault-free run lists the points; the exploration then
+Task lease renewals run on a wall-clock timer, so the entire renewal, including
+inspection and failure-reconciliation reads in child tasks, is not numbered.
+The real renewal still runs, and simulated process death still rejects its store
+calls. Foreground reads remain numbered. A fault-free run lists the points; the exploration then
 reruns the scenario in a fresh event loop for each point and fault:
 
 | Fault | Injected at | What happens |

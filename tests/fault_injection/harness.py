@@ -42,10 +42,12 @@ import inspect
 import os
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
+from unittest.mock import patch
 
 from tests.runtime.runtime_provider_support import VersionedFakeProvider
 
@@ -54,6 +56,7 @@ from cayu.messages import Message, TextPart, ToolResultPart
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions.memory import InMemorySessionStore
+from cayu.tasks import worker as task_worker
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
@@ -216,6 +219,27 @@ _STORE_CALL_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 # scenario depends on the host's speed. They stay unnumbered to keep every trace
 # deterministic, but a dead app still cannot renew.
 _TIMER_DRIVEN_STORE_METHODS = frozenset({"heartbeat"})
+
+
+@contextmanager
+def unnumbered_task_heartbeats():
+    """Keep the complete timed renewal, including reconciliation, outside the trace.
+
+    The real heartbeat still runs. Child inspection tasks inherit the context,
+    and every store call still rejects simulated process death.
+    """
+
+    run_heartbeat = task_worker.run_durable_lease_heartbeat
+
+    async def unnumbered(*args: Any, **kwargs: Any):
+        token = _STORE_CALL_DEPTH.set(_STORE_CALL_DEPTH.get() + 1)
+        try:
+            return await run_heartbeat(*args, **kwargs)
+        finally:
+            _STORE_CALL_DEPTH.reset(token)
+
+    with patch.object(task_worker, "run_durable_lease_heartbeat", unnumbered):
+        yield
 
 
 def _boundary_method(name: str, method: Callable[..., Awaitable[Any]]):
