@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import json
-import re
 import runpy
 import subprocess
 import sys
@@ -318,24 +317,13 @@ def test_cli_baseline_check_rejects_every_explicit_revision(repository, revision
     assert not result.stdout
 
 
-def _size_policy(root: Path, exceptions=None, budgets=None) -> Path:
-    """Write a policy whose total budgets match the source currently in the worktree."""
-
-    sources = sorted((root / "src/cayu").rglob("*.py"))
-    current = {
-        "public_names": sum(
-            public_name_count(path.read_text(), str(path))
-            for path in sources
-            if path.name == "_exports.py"
-        ),
-    }
+def _size_policy(root: Path, exceptions=None) -> Path:
     path = root / "size-policy.json"
     path.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "default_max_lines": 9999,
-                "total_budgets": current | (budgets or {}),
                 "exceptions": exceptions or {},
             }
         )
@@ -425,9 +413,8 @@ def test_source_size_exception_does_not_follow_an_oversized_replacement(reposito
 
 
 _VALID_POLICY = {
-    "schema_version": 2,
+    "schema_version": 3,
     "default_max_lines": 9999,
-    "total_budgets": {"public_names": 1},
     "exceptions": {},
 }
 
@@ -438,15 +425,12 @@ _VALID_POLICY = {
         [],
         {**_VALID_POLICY, "schema_version": True},
         {**_VALID_POLICY, "schema_version": 1},
+        {**_VALID_POLICY, "schema_version": 2},
         {**_VALID_POLICY, "default_max_lines": True},
         {**_VALID_POLICY, "default_max_lines": 0},
         {**_VALID_POLICY, "exceptions": []},
         {**_VALID_POLICY, "typo": 1},
-        {key: value for key, value in _VALID_POLICY.items() if key != "total_budgets"},
-        {**_VALID_POLICY, "total_budgets": {}},
-        {**_VALID_POLICY, "total_budgets": {"source_python_lines": 7, "public_names": 1}},
-        {**_VALID_POLICY, "total_budgets": {"public_names": True}},
-        {**_VALID_POLICY, "total_budgets": {"public_names": 0}},
+        {key: value for key, value in _VALID_POLICY.items() if key != "default_max_lines"},
     ],
 )
 def test_source_size_guard_rejects_invalid_policy(repository, invalid_policy):
@@ -480,8 +464,7 @@ def test_source_size_guard_rejects_duplicate_policy_keys(repository):
     root, _ = repository
     policy = root / "invalid-policy.json"
     policy.write_text(
-        '{"schema_version":2,"default_max_lines":9999,"total_budgets":{},"exceptions":{},'
-        '"exceptions":{}}'
+        '{"schema_version":3,"default_max_lines":9999,"exceptions":{},"exceptions":{}}'
     )
     with pytest.raises(ValueError, match="Duplicate source-size policy key"):
         check_source_size(root, "HEAD", policy)
@@ -567,33 +550,20 @@ def test_source_size_guard_rejects_an_empty_source_population(repository):
         check_source_size(
             root,
             "HEAD",
-            _size_policy(root, budgets={"public_names": 1}),
+            _size_policy(root),
         )
 
 
-@pytest.mark.parametrize(
-    ("budgets", "failure"),
-    [
-        pytest.param({"public_names": 21}, None, id="within-margin"),
-        pytest.param(
-            {"public_names": 22},
-            "public_names: 1 is more than 20 below the recorded budget of 22; "
-            "lower total_budgets.public_names to 6",
-            id="names-under",
-        ),
-    ],
-)
-def test_public_name_budget_fails_well_below_the_recorded_value(repository, budgets, failure):
+@pytest.mark.parametrize("name_count", [0, 100])
+def test_source_size_guard_reports_public_name_growth_and_reductions(repository, name_count):
     root, _ = repository
-    policy = _size_policy(root, budgets=budgets)
-    if failure is None:
-        assert check_source_size(root, "HEAD", policy)[3] == {
-            "source_python_lines": 7,
-            "public_names": 1,
-        }
-    else:
-        with pytest.raises(ValueError, match=re.escape(failure)):
-            check_source_size(root, "HEAD", policy)
+    policy = _size_policy(root)
+    exports = {f"Name{i}": ("cayu.agents", "Agent") for i in range(name_count)}
+    (root / "src/cayu/_exports.py").write_text(
+        f"EXPORTS = {exports!r}\nPUBLIC_NAMES = sorted(EXPORTS)\n"
+    )
+    _commit_source_fixture(root)
+    assert check_source_size(root, "HEAD", policy)[3]["public_names"] == name_count
 
 
 _TOOLS_EXPORTS = (
@@ -603,14 +573,13 @@ _TOOLS_EXPORTS = (
 )
 
 
-def test_public_name_budget_counts_exports_of_every_package(repository):
+def test_source_size_guard_reports_exports_of_every_package(repository):
     root, _ = repository
     policy = _size_policy(root)
     (root / "src/cayu/tools").mkdir()
     (root / "src/cayu/tools/_exports.py").write_text(_TOOLS_EXPORTS)
     _commit_source_fixture(root)
-    with pytest.raises(ValueError, match="public_names: 3 exceeds the recorded budget of 1"):
-        check_source_size(root, "HEAD", policy)
+    assert check_source_size(root, "HEAD", policy)[3]["public_names"] == 3
 
 
 def test_scoreboard_reads_the_committed_tables_without_running_them(repository):

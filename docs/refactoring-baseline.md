@@ -75,47 +75,6 @@ PR. Malformed policies, duplicate keys and unexplained exceptions fail closed.
 Do not delete comments, compress formatting or move arbitrary lines merely to
 pass the check. Review complete responsibilities and their verification needs.
 
-### Public-name budget
-
-The same check holds one total to the `total_budgets` recorded in the policy
-file: `public_names`, the names declared in the literal `EXPORTS` dict of every
-`_exports.py` under `src/cayu/`. These are the per-package export declarations
-that `docs/public-api-packages.json` lists and the public-API tests check.
-
-The budget is recorded a little above the current total, so that small fixes
-pass without every pull request editing, and conflicting on, the same line of
-the policy file. The check fails when the total is above its budget. A change
-that reaches the ceiling either removes as many names elsewhere or raises the
-budget, with the reason in the pull request. The check also fails when the total
-is more than 20 names below its budget. Its message names the value to record:
-the current total plus the standard headroom of 5 names. Lower the budget in the
-same pull request that removed the names, so the reduction cannot quietly come
-back.
-
-There is no budget on total source lines. The per-file caps above still apply,
-and `scripts/scoreboard.py` still reports the total.
-
-The public-name budget is 4,085, the standard 5 names above the merged total of
-4,080 after `cayu.connectors.github` was added. That package is new public API: a
-GitHub client for code on a connection slot, its typed errors, GraphQL error
-filters and local token and GitHub App credentials, replacing three
-applications' own copies; it removes no names elsewhere.
-
-The public-name budget is 4,099, the standard 5 names above the merged total of
-4,094 after the pull request read model joined `cayu.connectors.github`:
-`read_pull`, `list_pulls`, the `PullRequestFacts` record and its parts (checks,
-check state, workflow runs, reviews, comments, fact gaps) and two constants. It
-replaces the pull request reads of three applications and removes no names
-elsewhere.
-
-The public-name budget is 4,112, the standard 5 names above the merged total of
-4,107 after write-once helpers joined `cayu.connectors.github`: `Marker`,
-`with_marker`, `marker_of`, `trusted_markers`, `comment_once`,
-`file_issue_once`, `plain_text`, their results (`WrittenOnce`, `WriteOutcome`,
-`MarkedComment`), `GitHubLookupIncomplete`, `LegacyReader` and
-`MAX_BODY_BYTES`. They replace three applications' own marker formats and
-lookups and remove no names elsewhere.
-
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
 own delivery evidence. The historical inventory baseline stays unchanged.
@@ -136,10 +95,12 @@ python3 scripts/scoreboard.py --revision <commit>   # any commit or ref
 | `commit` | The measured commit. |
 | `source_python_lines` | Physical lines in every committed `.py` file under `src/cayu/`. Stubs (`.pyi`) are not included. |
 | `test_python_lines` | Physical lines in committed `.py` files under `tests/`. |
-| `public_names` | The same count as the `public_names` budget above. |
+| `public_names` | Names declared in the literal `EXPORTS` dict of every `_exports.py` under `src/cayu/`. These per-package export declarations are listed in `docs/public-api-packages.json` and checked by the public-API tests. |
 | `store_call_budgets` | Every `store_calls` entry in the `BUDGETS` table of `tests/test_overhead_budgets.py`, keyed by its step name. These are the recorded ceilings, which that test holds equal to the measured counts; the scoreboard reads the table and does not run the test. |
 | `schema_revisions` | Entries in `REVISIONS` in `src/cayu/storage/migrations.py`. |
 | `breaking_schema_revisions` | Those entries whose kind is `RevisionKind.BREAKING`. |
+
+Source-line and public-name totals are informational and have no aggregate CI budgets.
 
 Measured runtime numbers, such as per-step latency and benchmark pass rates, are
 not part of the scoreboard; see the workloads below.
