@@ -1,0 +1,450 @@
+"""The generated web-app routes: whoami, settings, overview, task runs and the inbox.
+
+These run without a database, on a stand-in person; `tests/test_http_api.py` checks them
+with this application's own people and metrics.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
+
+from cayu import CayuApp
+from cayu.managed_settings import (
+    ManagedSettings,
+    ManagedSettingsChannel,
+    ManagedSettingsConflict,
+    ManagedSettingsSnapshot,
+)
+from cayu.server import ServerConfig, create_server
+from cayu.server.auth import AuthContext
+from cayu.server.config import OpenAccess
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.worker import run_task_worker
+from domain.organizations import InMemoryMembershipDirectory, Membership
+from domain.sharing import conversation_labels
+from integrations.http.generated import (
+    FixedSetting,
+    Metric,
+    OverviewContext,
+    Person,
+    build_generated_router,
+)
+from integrations.http.generated.task_runs import TaskRun, list_task_runs
+from policies.access import MembershipAccessPolicy
+
+ALICE = Membership("acme", "acme/finance")
+PEOPLE = {
+    "alice": Person(subject="alice", role="admin", may_decide=False, may_change=True),
+    "bob": Person(subject="bob", role="member", may_decide=False, may_change=False),
+}
+
+
+async def _person(request: Request) -> Person:
+    found = PEOPLE.get(request.headers.get("x-person", ""))
+    if found is None:
+        raise HTTPException(401, "Sign in first.")
+    return found
+
+
+async def _metrics(context: OverviewContext) -> list[Metric]:
+    return [Metric(label="Seen by", value=context.person.subject, description=None)]
+
+
+def _fixed() -> list[FixedSetting]:
+    return [
+        FixedSetting(
+            name="region",
+            env_var="TEST_REGION",
+            label="Region",
+            help="Where it runs.",
+            why="Read at start.",
+            current=lambda: "eu",
+        )
+    ]
+
+
+def _routes(app: CayuApp):
+    return build_generated_router(
+        app,
+        person=_person,
+        application="example-agent",
+        overview_metrics=_metrics,
+        fixed_settings=_fixed,
+        agent_name="example-agent",
+        inbox_page="/inbox",
+    )
+
+
+def _client(app: CayuApp, *, server: FastAPI | None = None) -> TestClient:
+    server = server or FastAPI()
+    server.include_router(_routes(app), prefix="/app")
+    return TestClient(server)
+
+
+def _app(**stores: Any) -> CayuApp:
+    directory = InMemoryMembershipDirectory({"alice": [ALICE], "bob": [Membership("globex")]})
+    return CayuApp(
+        session_store=InMemorySessionStore(),
+        resource_access_policy=MembershipAccessPolicy(directory),
+        **stores,
+    )
+
+
+def test_every_route_needs_a_signed_in_person() -> None:
+    with _client(_app(task_store=InMemoryTaskStore())) as client:
+        for path in ("whoami", "settings", "overview", "task-runs", "inbox", "inbox/counts"):
+            assert client.get(f"/app/{path}").status_code == 401, path
+        assert client.post("/app/inbox/item/settle", json={}).status_code == 401
+
+
+def test_whoami_says_who_is_signed_in_and_what_they_may_do() -> None:
+    with _client(_app()) as client:
+        answer = client.get("/app/whoami", headers={"x-person": "alice"}).json()
+    assert answer == {
+        "person": {"subject": "alice", "name": None, "email": None},
+        "role": "admin",
+        "may_decide": False,
+        "may_change": True,
+    }
+
+
+def test_settings_list_cayus_settings_with_their_release_values() -> None:
+    with _client(_app()) as client:
+        view = client.get("/app/settings", headers={"x-person": "bob"}).json()
+    rows = {row["key"]: row for row in view["settings"]}
+    steps = rows["config.run.max_steps"]
+    assert steps["value"] == 1000 and steps["source"] == "default" and steps["kind"] == "int"
+    assert steps["group"] == "Runs"
+    assert steps["change"] == (
+        "cayu cloud settings set --application example-agent config.run.max_steps=1000"
+    )
+    assert steps["reset"] == (
+        "cayu cloud settings unset --application example-agent config.run.max_steps"
+    )
+    unset = rows["config.run.limits.max_tool_calls"]
+    assert unset["value"] is None and unset["error"] is None and unset["group"] == "Run limits"
+    assert rows["config.run.thinking.effort"]["kind"] == "choice"
+    assert "high" in rows["config.run.thinking.effort"]["choices"]
+    assert view["managed"] is False
+    assert view["cloud"] == {"state": None, "status": None}
+    assert view["read_only"] == [
+        {
+            "name": "region",
+            "env_var": "TEST_REGION",
+            "label": "Region",
+            "help": "Where it runs.",
+            "value": "eu",
+            "source": "default",
+            "needs": "redeploy",
+            "why": "Read at start.",
+            "warning": None,
+        }
+    ]
+
+
+class _Cloud(ManagedSettingsChannel):
+    """Cayu Cloud's answer, as a test stands it in."""
+
+    def __init__(self, values: Mapping[str, Any], conflicts=()) -> None:
+        self._snapshot = ManagedSettingsSnapshot(
+            contract="cayu.managed-settings-values/v1",
+            application_id="app",
+            release_id="release",
+            schema_digest="digest",
+            revision=1,
+            valid_until=datetime.now(UTC) + timedelta(minutes=5),
+            values=dict(values),
+            conflicts=tuple(conflicts),
+        )
+
+    @property
+    def release_id(self) -> str:
+        return "release"
+
+    async def read(self) -> ManagedSettingsSnapshot:
+        return self._snapshot
+
+    async def report(self, report: Mapping[str, Any]) -> None:
+        return None
+
+    def read_at_build(self) -> ManagedSettingsSnapshot:
+        return self._snapshot
+
+
+def test_settings_say_which_values_come_from_cayu_cloud_and_which_it_refused() -> None:
+    cloud = _Cloud(
+        {"config.run.max_steps": 40, "config.run.retry_policy.max_attempts": 99},
+        conflicts=[
+            ManagedSettingsConflict(key="config.run.retry_policy.max_attempts", reason="too many"),
+            # Refused outright: Cloud leaves it out of the values it applies.
+            ManagedSettingsConflict(key="config.run.limits.max_tool_calls", reason="out of range"),
+        ],
+    )
+    app = _app(managed_settings=ManagedSettings(cloud))
+    with _client(app) as client:
+        view = client.get("/app/settings", headers={"x-person": "bob"}).json()
+    rows = {row["key"]: row for row in view["settings"]}
+    assert view["managed"] is True
+    assert view["cloud"]["state"] == "applied"
+    assert rows["config.run.max_steps"]["value"] == 40
+    assert rows["config.run.max_steps"]["source"] == "managed"
+    attempts = rows["config.run.retry_policy.max_attempts"]
+    assert attempts["value"] == 5 and attempts["source"] == "default"
+    assert attempts["error"] == "The value set in Cayu Cloud is refused: too many."
+    tool_calls = rows["config.run.limits.max_tool_calls"]
+    assert tool_calls["source"] == "default"
+    assert tool_calls["error"] == "The value set in Cayu Cloud is refused: out of range."
+
+
+def test_the_overview_has_the_agents_metrics_and_cayus_inbox_counts() -> None:
+    app = _app()
+    server = create_server(app, config=ServerConfig(access=OpenAccess()))
+    with _client(app, server=server) as client:
+        answer = client.get("/app/overview", headers={"x-person": "bob"}).json()
+    assert answer["metrics"] == [{"label": "Seen by", "value": "bob", "description": None}]
+    assert answer["inbox"]["total"] == 0 and answer["inbox"]["unavailable"] is None
+    datetime.fromisoformat(answer["as_of"])
+
+
+def test_the_overview_says_when_cayus_inbox_is_closed_to_the_person() -> None:
+    async def operators_only(request: Request) -> AuthContext:
+        raise HTTPException(401, "Operators only.")
+
+    app = _app()
+    server = create_server(app, config=ServerConfig.protected(operators_only))
+    with _client(app, server=server) as client:
+        response = client.get("/app/overview", headers={"x-person": "bob"})
+    assert response.status_code == 200
+    inbox = response.json()["inbox"]
+    assert inbox["by_kind"] == [] and "operators" in inbox["unavailable"]
+
+
+def test_the_overview_keeps_its_metrics_when_cayus_inbox_fails() -> None:
+    server = FastAPI()
+
+    @server.get("/api/inbox/counts")
+    async def broken() -> dict[str, Any]:
+        raise ConnectionError("database down")
+
+    with _client(_app(), server=server) as client:
+        response = client.get("/app/overview", headers={"x-person": "bob"})
+    assert response.status_code == 200
+    answer = response.json()
+    assert answer["metrics"] == [{"label": "Seen by", "value": "bob", "description": None}]
+    assert answer["inbox"]["unavailable"] == "Cayu's inbox answered 500."
+
+
+def _queue(app: CayuApp, client: TestClient, subject: str, membership: Membership, **task: Any) -> str:
+    async def create() -> str:
+        access = await app.access(subject)
+        labels = conversation_labels(subject=subject, membership=membership, sharing="personal")
+        created = await access.tasks.create(TaskCreate(**task), labels=labels)
+        return created.id
+
+    return client.portal.call(create)
+
+
+def test_task_runs_group_the_persons_tasks_by_run() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    with _client(app) as client:
+        first = _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        alone = _queue(app, client, "alice", ALICE, type="report", title="April")
+        _queue(app, client, "bob", Membership("globex"), type="report", title="Globex's own")
+
+        async def work() -> None:
+            async def handler(app, task, worker_id) -> None:
+                if task.id == first:
+                    raise RuntimeError("lost the printer")
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=3)
+
+        client.portal.call(work)
+        runs = client.get("/app/task-runs", headers={"x-person": "alice"}).json()
+
+    by_id = {run["id"]: run for run in runs}
+    assert set(by_id) == {"march", alone}
+    assert by_id["march"]["tasks"] == 2 and by_id["march"]["status"] == "partly_failed"
+    assert by_id["march"]["title"] == "March" and by_id["march"]["ended_at"] is not None
+    assert by_id[alone]["status"] == "completed" and by_id[alone]["tasks"] == 1
+
+
+def test_a_run_with_open_work_beyond_the_window_is_never_reported_ended() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    later = datetime.now(UTC) + timedelta(days=1)
+    with _client(app) as client:
+        # March's first task waits for tomorrow; its second, and April's, finish now.
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"}, available_at=later)
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="April", metadata={"run": "april"})
+
+        async def work() -> list[TaskRun]:
+            async def handler(app, task, worker_id) -> None:
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=2)
+            # Only the newest two tasks fit the window; March's open task is older.
+            return await list_task_runs(app, "alice", window=2)
+
+        runs = {run.id: run for run in client.portal.call(work)}
+    assert runs["march"].status == "scheduled" and runs["march"].ended_at is None
+    assert runs["march"].tasks == 2 and runs["march"].partial is True
+    # Not every task was read, so no run is reported as ended.
+    assert runs["april"].status == "partial" and runs["april"].ended_at is None
+
+
+def test_a_run_whose_open_task_is_missed_is_not_reported_ended() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    later = datetime.now(UTC) + timedelta(days=1)
+    with _client(app) as client:
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"}, available_at=later)
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="April", metadata={"run": "april"})
+
+        async def work() -> list[TaskRun]:
+            async def handler(app, task, worker_id) -> None:
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=2)
+            # From here on, every read of one status misses the open tasks, as a task that
+            # moves from pending to running between two reads would.
+            listed = store.list_tasks
+
+            async def moving(query=None, **kwargs):
+                if query is not None and query.status is not None:
+                    return []
+                return await listed(query, **kwargs)
+
+            store.list_tasks = moving
+            return await list_task_runs(app, "alice", window=2)
+
+        runs = {run.id: run for run in client.portal.call(work)}
+    # March's open task was never read; its finished sibling alone doesn't end the run.
+    assert runs["march"].status == "partial" and runs["march"].ended_at is None
+    assert runs["march"].tasks == 1 and runs["march"].partial is True
+
+
+@pytest.mark.parametrize("limit", [0, 501])
+def test_task_runs_refuse_a_limit_out_of_range(limit: int) -> None:
+    with _client(_app(task_store=InMemoryTaskStore())) as client:
+        response = client.get(f"/app/task-runs?limit={limit}", headers={"x-person": "alice"})
+    assert response.status_code == 422
+
+
+def _cayu_inbox_stand_in(seen: list[tuple[str, str, dict[str, Any]]]) -> FastAPI:
+    """A server whose `/api/inbox` routes record what they were asked, standing in for Cayu's."""
+
+    server = FastAPI()
+    items = {"ours": "example-agent", "theirs": "other-agent", "for-carol": "example-agent"}
+
+    @server.get("/api/inbox")
+    async def listed(request: Request) -> dict[str, Any]:
+        seen.append(("GET", "/inbox", dict(request.query_params)))
+        return {"items": [], "next_cursor": None, "has_more": False, "issues": []}
+
+    @server.get("/api/inbox/counts")
+    async def counted(request: Request) -> dict[str, Any]:
+        seen.append(("GET", "/inbox/counts", dict(request.query_params)))
+        return {"complete": True, "total_count": 0, "counts": {}}
+
+    @server.get("/api/inbox/{item_id}")
+    async def item(item_id: str) -> dict[str, Any]:
+        if item_id == "forbidden":
+            raise HTTPException(
+                403, {"code": "role_forbidden", "message": "Your role can't use this."}
+            )
+        if item_id not in items:
+            raise HTTPException(404, "Pending action not found.")
+        return {"id": item_id, "status": "pending", "agent_name": items[item_id]}
+
+    @server.post("/api/inbox/{item_id}/settle")
+    async def settle(item_id: str, request: Request) -> dict[str, Any]:
+        if item_id == "for-carol":
+            raise HTTPException(403, "Human-review recipient does not match authentication.")
+        seen.append(("POST", f"/inbox/{item_id}/settle", await request.json()))
+        return {"replayed": False, "item": {"id": item_id, "status": "settled"}}
+
+    return server
+
+
+def test_the_inbox_is_cayus_for_this_agent_only() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+    app = _app()
+    with _client(app, server=_cayu_inbox_stand_in(seen)) as client:
+        bob = {"x-person": "bob"}
+        assert client.get("/app/inbox?kind=approval&agent_name=other", headers=bob).status_code == 200
+        assert client.get("/app/inbox/counts?q=invoice", headers=bob).status_code == 200
+        decision = {"decision": "approve", "reason": None}
+        settled = client.post("/app/inbox/ours/settle", json=decision, headers=bob)
+        theirs = client.post("/app/inbox/theirs/settle", json=decision, headers=bob)
+        missing = client.post("/app/inbox/missing/settle", json=decision, headers=bob)
+    assert seen == [
+        ("GET", "/inbox", {"limit": "50", "kind": "approval", "agent_name": "example-agent"}),
+        ("GET", "/inbox/counts", {"q": "invoice", "agent_name": "example-agent"}),
+        ("POST", "/inbox/ours/settle", decision),
+    ]
+    assert settled.json()["item"]["status"] == "settled"
+    assert (theirs.status_code, missing.status_code) == (404, 404)
+
+
+def test_the_inbox_keeps_cayus_reason_unless_it_refuses_the_person_outright() -> None:
+    with _client(_app(), server=_cayu_inbox_stand_in([])) as client:
+        bob = {"x-person": "bob"}
+        decision = {"decision": "approve"}
+        not_theirs = client.post("/app/inbox/for-carol/settle", json=decision, headers=bob)
+        role = client.post("/app/inbox/forbidden/settle", json=decision, headers=bob)
+    assert not_theirs.status_code == 403
+    assert not_theirs.json()["detail"] == "Human-review recipient does not match authentication."
+    assert role.status_code == 403 and "operators" in role.json()["detail"]
+
+
+def test_the_overview_counts_only_this_agents_inbox() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+    with _client(_app(), server=_cayu_inbox_stand_in(seen)) as client:
+        answer = client.get("/app/overview", headers={"x-person": "bob"})
+    assert answer.status_code == 200
+    assert seen == [("GET", "/inbox/counts", {"agent_name": "example-agent"})]
+
+
+def test_the_inbox_says_when_cayu_refuses_the_person() -> None:
+    async def operators_only(request: Request) -> AuthContext:
+        raise HTTPException(401, "Operators only.")
+
+    app = _app()
+    server = create_server(app, config=ServerConfig.protected(operators_only))
+    with _client(app, server=server) as client:
+        bob = {"x-person": "bob"}
+        answers = [
+            client.get("/app/inbox", headers=bob),
+            client.get("/app/inbox/counts", headers=bob),
+            client.post("/app/inbox/any/settle", json={"decision": "approve"}, headers=bob),
+        ]
+    # 403, not Cayu's 401, which the app would take for an expired sign-in.
+    assert [answer.status_code for answer in answers] == [403, 403, 403]
+    assert all("operators" in answer.json()["detail"] for answer in answers)
+
+
+def test_the_inbox_answers_from_cayus_own_routes() -> None:
+    app = _app()
+    server = create_server(app, config=ServerConfig(access=OpenAccess()))
+    with _client(app, server=server) as client:
+        answer = client.get("/app/inbox/counts", headers={"x-person": "bob"})
+    assert answer.status_code == 200 and answer.json()["complete"] is True

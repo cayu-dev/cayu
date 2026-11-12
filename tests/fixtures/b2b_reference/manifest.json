@@ -1,0 +1,444 @@
+{
+  "reference": {
+    "repository": "cayu-tech/cayu-b2b-reference",
+    "commit": "2a39006",
+    "about": "A `cayu new --preset b2b` project changed by hand until it is what the generator should write; each commit after the first is a change the generator should make."
+  },
+  "project": "cayu-b2b-reference",
+  "prefixes": [
+    "web/",
+    "integrations/http/"
+  ],
+  "paths": [
+    "integrations/web.py",
+    "domain/organizations.py",
+    "tests/test_generated_routes.py",
+    "tests/test_http_api.py"
+  ],
+  "excluded_prefixes": [
+    "web/static/"
+  ],
+  "files": {
+    "domain/organizations.py": {
+      "reference_sha256": "b3cc3ebea813e21d59d4efca170940f73396939e34dbdf05f1f6ee1705b232e8",
+      "same": true
+    },
+    "integrations/http/__init__.py": {
+      "reference_sha256": "ae6dd5369a24ee7e1e5c2c6aee0ec098e5005ec761469a683cdfa3b6ed130cae",
+      "deviation": "No inbox_page: without an Inbox page of its own, the Overview links to the Developer dashboard's Inbox. The person docstring says /app/inbox instead of the app's Inbox. No /app/ui router (integrations/web.py). Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). The Settings page's commands name the Cloud application (CAYU_CLOUD_APPLICATION_ID, else the slug `cayu cloud init` makes from the project's name), not the specialist's name (review of #3839)."
+    },
+    "integrations/http/fixed_settings.py": {
+      "reference_sha256": "bf0aa72f9896de69495087332a8d75a21cddef749b7ba003dc3f8715cefb3ec7",
+      "same": true
+    },
+    "integrations/http/generated/__init__.py": {
+      "reference_sha256": "a9ce5bfa133fa1adb44d33fa8aad22bd3a19cab7fc9afae3eac898a21e9a4f44",
+      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840)."
+    },
+    "integrations/http/generated/cayu_api.py": {
+      "reference_sha256": "12a1f7a97847913719a6bc68e61fa8ce44ffc59b65413c97f536120581d25ec3",
+      "deviation": "Holds the closed-inbox and no-answer sentences the Overview and /app/inbox share (review of #3840). Its in-process client returns Cayu's 500 as a response instead of raising the app's exception, so the Overview's fallback runs (review of #3839)."
+    },
+    "integrations/http/generated/inbox.py": {
+      "reference_sha256": "61da01208e2d026b32b02734de27f5888abaa606091700911e1d9bac0caec479",
+      "deviation": "The docstring no longer says the route is for an Inbox imported from the Developer dashboard. Only a 401 or Cayu's role_forbidden becomes the closed-inbox 403; another 403 keeps Cayu's reason. The person dependency is declared once on the router (review of #3840)."
+    },
+    "integrations/http/generated/overview.py": {
+      "reference_sha256": "05ea3c3217d4d135d3b723059b4341a8a296e9bb18bc2ad06786e72209f909b7",
+      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840)."
+    },
+    "integrations/http/generated/settings.py": {
+      "reference_sha256": "82e9b0796e48772fdf774ddff908670b4ed11735e1fb750c9f0a392eda3b8228",
+      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839)."
+    },
+    "integrations/http/generated/task_runs.py": {
+      "reference_sha256": "819e7d268a76ace4bf8792d4c9000c71d8e984fa73499ec6f6370d3eb4c4a127",
+      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839)."
+    },
+    "integrations/http/generated/whoami.py": {
+      "reference_sha256": "7083e16e60669c0f8ca957f9ac31f7de0059d6e3fb853f14cd955adbfda8b357",
+      "same": true
+    },
+    "integrations/http/overview_metrics.py": {
+      "reference_sha256": "e0e716691bbffb025644fc0f91f61c4003b59d3d604736c066e5bfc9eaf3e3fc",
+      "same": true
+    },
+    "tests/test_generated_routes.py": {
+      "reference_sha256": "84ee3465b174180c1ccc7645c6b9a78b8b96f4b722a545a691f5ceb6accb7142",
+      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839)."
+    },
+    "tests/test_http_api.py": {
+      "reference_sha256": "a74e7c077c6ca57065f2c0a0c7bb68df107d23b8fffaa3f3c01b89b2ede6edfc",
+      "deviation": "Serves web/static with serve_web_app as `cayu serve` does, and checks the page at / and at a deep path, its img-src policy, assets, missing assets and unknown /app paths as 404s. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+    },
+    "web/.gitignore": {
+      "reference_sha256": "790e3169bc19b046fe55ba1da6d13b976c28363c8c00462a2195fe5faf260910",
+      "same": true
+    },
+    "web/biome.json": {
+      "reference_sha256": "154dd387935d5cc9575ac3820a7cba92421cbb1f49daf0b358b229ce96661db6",
+      "same": true
+    },
+    "web/index.html": {
+      "reference_sha256": "203705cd7ab3b497c8d64d5f79f9dc919ebc973a405ea7d8f2849c1860d4be33",
+      "deviation": "Carries the page's img-src policy in a <meta> tag, since `cayu serve` sends only frame-ancestors. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+    },
+    "web/package-lock.json": {
+      "reference_sha256": "071b7864fe7dea9377fe48f02c9b78497930abb78f49d31651fcf4093990e147",
+      "deviation": "Without lucide-react, which only the imported Inbox part used."
+    },
+    "web/package.json": {
+      "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+    },
+    "web/scripts/add-licenses.mjs": {
+      "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",
+      "same": true
+    },
+    "web/scripts/check-build.mjs": {
+      "reference_sha256": "5ed85208594e8af82542fc6edb16969d089d638944f9acfef26ea9fe1f40287d",
+      "deviation": "Runs Vite and add-licenses.mjs with the running Node instead of through npx, which spawnSync can't start on Windows, and removes its temporary folder when a step fails or the build is stale (the reference exits inside the try block)."
+    },
+    "web/src/agent/api.ts": {
+      "reference_sha256": "ed1aaa1fe4390cd7a543da1b07a9ff7a9fc08aec2fe09f4c03fb1872d904292d",
+      "deviation": "The conversation list query is marked read: true; unused demoSignOut removed; statusOf has one branch (review of #3841)."
+    },
+    "web/src/agent/conversations.tsx": {
+      "reference_sha256": "fa380b682c42072b9b220b0d2b6790a02a49ced2c745f814dfa382abf97ba165",
+      "deviation": "Creating a conversation and replying invalidate the conversation lists; a failed /app/me shows an error with a retry instead of loading forever; NoOrganization moved to organization.tsx; conversationPath exported (review of #3841)."
+    },
+    "web/src/agent/index.tsx": {
+      "reference_sha256": "4b92b6bad8409859dc707a116eaae51b7c6d71dedbdb36bf99b93a64326068fc",
+      "deviation": "No Inbox area (The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.) The Agent's name is the page title, which `cayu new` writes into both index.html files, so the committed build is the same for every project."
+    },
+    "web/src/agent/markdown.tsx": {
+      "reference_sha256": "8346a8d7e9866f44e8577e2d75a5ef144dfcf03ccbd713e5b1200b08e7d1a6b2",
+      "same": true
+    },
+    "web/src/agent/members.tsx": {
+      "reference_sha256": "ff8708373304fe532298f154836b9e2daf4ead57946131ecb4b22d11c8b9744a",
+      "deviation": "A failed /app/me shows an error with a retry; invalidations use membersQuery's key and whoamiKey (review of #3841)."
+    },
+    "web/src/agent/organization.tsx": {
+      "reference_sha256": "9c84cb94f93f00b3094ff5bf9c1a34b33cbd76cd736e8ba137250478521af25f",
+      "deviation": "Holds membershipBlocker, MembershipFailed and NoOrganization, the gate the pages use when /app/me fails or finds no organization; unused placeOf removed (review of #3841)."
+    },
+    "web/src/agent/overview.tsx": {
+      "reference_sha256": "b10f203db6f6074cbd4d4b81efe46c9bfcddf18e99a9a6908fe2c00e1c4c780c",
+      "deviation": "Its doc comment carries the `THE AGENT'S OWN.` marker the reference left out. Links through conversationPath (review of #3841)."
+    },
+    "web/src/agent/sign-in.tsx": {
+      "reference_sha256": "fb816b0c2cc32eb634ae1b960909889ef50d71086edd9faea7da12202b2c1c92",
+      "same": true
+    },
+    "web/src/api/overview.ts": {
+      "reference_sha256": "c2bc877daeb1d8c7b169e784d7495cfbfe72d4706361cd05c366eb821b9ae6d6",
+      "same": true
+    },
+    "web/src/api/settings.ts": {
+      "reference_sha256": "94bc055041ee8655b83ba08731b6cf1e5ced861cce812d858ac87a82cddecc13",
+      "same": true
+    },
+    "web/src/api/whoami.ts": {
+      "reference_sha256": "2176ad263c5ca926051631f5009a082d98bf9dfbb313c71607b44a2f5916872f",
+      "same": true
+    },
+    "web/src/app/area.ts": {
+      "reference_sha256": "82d57b46ae281d4f881fb4468f5c21fed1796a1159ee62faf6bd8adeb675012a",
+      "deviation": "The comment names src/agent/index.tsx (the reference said areas.ts) and no longer names a private project."
+    },
+    "web/src/app/layout.tsx": {
+      "reference_sha256": "a8e7cf152a89ce1c57b064b9e073d820ca2e109ff3a63c0e981017094241c8e7",
+      "deviation": "The Runtime group links to Cayu's Inbox at /cayu/inbox next to the Developer dashboard. The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead."
+    },
+    "web/src/app/routes.tsx": {
+      "reference_sha256": "bec83f26f132fb94775608490c2803622e21fd055ec1307d86964d488b8878d0",
+      "same": true
+    },
+    "web/src/app/services.tsx": {
+      "reference_sha256": "f5a6419e455a1088ab6835c510b766f1c3a23d0d0862dcd58453d704e85b385a",
+      "same": true
+    },
+    "web/src/app/status-pages.tsx": {
+      "reference_sha256": "0a7e231bfa2f85d2a5a7f382b45f466865dfdebdb546222dc47f5a2fd574a112",
+      "same": true
+    },
+    "web/src/blocks/task-runs.tsx": {
+      "reference_sha256": "0c5d2e7283eb0a0a2bdb3b4d8ea3db1502a397ca64dc987604a2320d0633f56c",
+      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839)."
+    },
+    "web/src/generated/overview/index.tsx": {
+      "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
+      "same": true
+    },
+    "web/src/generated/settings/index.tsx": {
+      "reference_sha256": "27ec9dc65bf76e3c8a538b051286a71da4abcb0fec9c5369aa18689ae999922c",
+      "same": true
+    },
+    "web/src/generated/settings/page.tsx": {
+      "reference_sha256": "63ce0183f60e8391f0269fcca2b9e8881a6fb6749ffb94b6a6f9e2c8eb6ed96f",
+      "deviation": "A comment says the kit's settings rows instead of naming the private kit."
+    },
+    "web/src/kit/shadcn/components/alert.tsx": {
+      "reference_sha256": "d5f89fec55b16abccbde138f856a3e45b2b656e0c58ef62b2f5833c87cc2720c",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/code-block.tsx": {
+      "reference_sha256": "956175a6a9b1854823af38875cf724c2fc3bb54b573a751e762522089bf6ab72",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/dropdown-menu.tsx": {
+      "reference_sha256": "61ebad282ccea12b122c7cedd5def90d0ed1dcb5b8248a561736299852ade79b",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/field.tsx": {
+      "reference_sha256": "d00fb26b413a0486a02c5656e34a8c408a0a3a9ba57cbccad31fc5d414be319e",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/status-badge.tsx": {
+      "reference_sha256": "af8cda5c265eaa643eb6964b82743d615602f1b0bcf5a1f3780767d47136746f",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/timeline.tsx": {
+      "reference_sha256": "622751fa74e4e1c92b11b3fc65c87bbb5efbb217390268f056838c5500f1f439",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/toast.tsx": {
+      "reference_sha256": "47a79ed21290721fc51c8182e3791b9641319374c07d9be450df5dc6896af3a2",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/alert-dialog.tsx": {
+      "reference_sha256": "2ba048a2bf7fd1902d39988cb8951afb83fafce51742d5b0819af98da5a4e809",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/alert.tsx": {
+      "reference_sha256": "367a325b85605dace2a36afbc498d202244ffc53ab5198a6b07db77b744e1d5b",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/avatar.tsx": {
+      "reference_sha256": "8905312972c9687221bb99d0ad23b9e1dde0d7c5f8721bc632a65dbe5acf7e2c",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/badge.tsx": {
+      "reference_sha256": "a882bfd9aa1f431f59705453c47448489aef50728ce4635ee6f58d4db05ac3a7",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/button.tsx": {
+      "reference_sha256": "c3fc3efa5f34631d501717c67e9013ad02e5044a2e06758420ca0dd8ade21c62",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/card.tsx": {
+      "reference_sha256": "68f7d27d3936ae23584f44bb257b4e5a131067a83060d453204d13277439f425",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/checkbox.tsx": {
+      "reference_sha256": "79382f2107acfcbe684d2c25d66158236d885c85cc4fae82e399149ca6d9ca7c",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/dropdown-menu.tsx": {
+      "reference_sha256": "5698642a0a14bac3f5d152dacc7a6901728070345aaf622ba35b122659e73247",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/empty.tsx": {
+      "reference_sha256": "6032d0df10f8835b38a3d5046ff761bc130818618a4c474e88b18f51555dc31d",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/field.tsx": {
+      "reference_sha256": "86afe09f5171ee9d4231078bb736bd9e16327ef0a693c02a6a2db700ff2e8ae2",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/input.tsx": {
+      "reference_sha256": "98b9dc52891a7960171f3104da4ddd0f9ad962bb4bb1a6294ce8f56e890028fd",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/label.tsx": {
+      "reference_sha256": "98c174a8677570f3f4db04dfbf1a3fdbd7453f8ba2b436c3b23c39d8d878e3ac",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/native-select.tsx": {
+      "reference_sha256": "8a2a6a316b7be6ad66b3225e52bc3b497cf897d855b86912d7f94752109deb21",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/separator.tsx": {
+      "reference_sha256": "66a314535402cac2b784a82ee586a5da716b6f0bd628d337c3f1610f7203a0de",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/sheet.tsx": {
+      "reference_sha256": "29ea155b6b7295d87c51428d72af08ec13eef8cbd1cb9a8199c0648509659e7d",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/sidebar.tsx": {
+      "reference_sha256": "d41acebe6e215c833e374cd7c339057c64250d540dab9bde1fc8e9a1dbadb64d",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/skeleton.tsx": {
+      "reference_sha256": "dcb9b6746dc76b69f4d84c9891170359ad1f467f4c2c3315742494f696342660",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/sonner.tsx": {
+      "reference_sha256": "92140b89847464c90166b7c02c04ad0ca32bf4f45ab448cbd0d3a4b970d5c242",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/spinner.tsx": {
+      "reference_sha256": "4cae867365b85568a0a59c14d7661424d049a5e78f94859edcccf8b9fd459388",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/switch.tsx": {
+      "reference_sha256": "39238a4b8f93002926fb0f8a2e4f694513a3cd952f1462ab363ec644d95b8b27",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/table.tsx": {
+      "reference_sha256": "a309515355cd259b3b608845815f1fe4cb11556e9e2c1500bdd4a376c7e4fcb0",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/textarea.tsx": {
+      "reference_sha256": "098b80ea187cdd1db9fa063bf4b8141965886629542ed2fc3e4eede1badf8303",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/toggle-group.tsx": {
+      "reference_sha256": "75e3e73be0731aab5338daf6d5f8466fa8dd58de7a1deb6d4b11402a6d4d1bdb",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/toggle.tsx": {
+      "reference_sha256": "8d5029de500b68c5f2a8dba1da0b16e79bf6464e6e05ab7ef9e0631797318307",
+      "same": true
+    },
+    "web/src/kit/shadcn/components/ui/tooltip.tsx": {
+      "reference_sha256": "1a93e5cb6bdc9f17ea96de01cb930128228c3676875b2168d86c3f73e9eacb4f",
+      "same": true
+    },
+    "web/src/kit/shadcn/data.ts": {
+      "reference_sha256": "83a7ec973d43d6030564f213c33150d4d93099ad24c4cf58ffc4a3c7cf6e5052",
+      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841)."
+    },
+    "web/src/kit/shadcn/hooks/index.tsx": {
+      "reference_sha256": "1641ceaa3daeed1ab5929b0d179d7e37c25a3a297e1e99ae2f47fc9b9e5a10c4",
+      "same": true
+    },
+    "web/src/kit/shadcn/hooks/use-mobile.ts": {
+      "reference_sha256": "ad0936f84f1df79d3697bfbff9c18f8ad58431c1cbaf2359c6a853b0fcc9f28b",
+      "same": true
+    },
+    "web/src/kit/shadcn/icons.ts": {
+      "reference_sha256": "d8651a84439b23fc1e8629d311e4d2dcd79281d23e10342c40b52e30fc5748a6",
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone."
+    },
+    "web/src/kit/shadcn/layouts/app/index.ts": {
+      "reference_sha256": "3a5a27b8aece3f4e0738340be006debb1a04df721255360e3e5944e7778f314d",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/live-settings.tsx": {
+      "reference_sha256": "8190fb4cf90c98e79b06a39778a32c7aa684470a80f8f82c248d1c5aa54028a5",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/nav-shell.tsx": {
+      "reference_sha256": "e46ac0d3814277683743ace5e631e8a963fc120b662a5beaed85d2ae3214b9d0",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/page.tsx": {
+      "reference_sha256": "13fdff170fe697f9670f13569072ac4b71e7ffc2aedcde407e3f1b56fc512a33",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/route-pages.tsx": {
+      "reference_sha256": "36405d5914ad4b58c8c5a04ba5673aac1a9726805be4c2272c5e35ce30c69617",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/router.ts": {
+      "reference_sha256": "89ecb24bc674e8362fd37abd5136a3ad2f93434184546be81ca624b558d8312e",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/settings.tsx": {
+      "reference_sha256": "7b885f322297ea2e6f275149ed945b576e7541fc1504399c85943fa7b23c07c3",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/sidebar-brand.tsx": {
+      "reference_sha256": "7476ef28a54744e3dfce4f97ae23840e4151da8a8c4ecf368fca62ba3fda85d0",
+      "same": true
+    },
+    "web/src/kit/shadcn/layouts/app/status-page.tsx": {
+      "reference_sha256": "3d9e3bb57f12dfe3e93f900808cfcbd692994036457539c8d5a12f0b5f34bb13",
+      "same": true
+    },
+    "web/src/kit/shadcn/lib/format.ts": {
+      "reference_sha256": "68175ead36b2b68efa4a4fa19bcbed31772ad2d68b748d5eca5dd0b309b96218",
+      "same": true
+    },
+    "web/src/kit/shadcn/lib/index.ts": {
+      "reference_sha256": "53a89af6e1520e775b3ae1dae9dc54734ab5afb79c988232e9bb838a4f84f445",
+      "same": true
+    },
+    "web/src/kit/shadcn/lib/utils.ts": {
+      "reference_sha256": "51bbf14cd1f84f49aab2e0dbee420137015d56b6677bb439e83a908cd292cce1",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/action.ts": {
+      "reference_sha256": "f14788974a25a47b0e9cf2065aa313e1f9d2b807c40d32267bdd4c9bc6646c08",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/agent-decision.tsx": {
+      "reference_sha256": "7c06946874261a01f4464d648e64905bd4d1a4bbe4e71d51c7c008c1d182765d",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/async-content.tsx": {
+      "reference_sha256": "5f88ebff7c0be0f57d76798886a99d7c7d9226196644c193648964d33b90fdd2",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/data-table.tsx": {
+      "reference_sha256": "27b5e34065334ca4157abced9f46523357d1eeb7c078e4804ad36a9e19f19000",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/index.ts": {
+      "reference_sha256": "7839e4068f850334d32b77247ebc21543ba8737e3c16d0590625246aa7460d7c",
+      "same": true
+    },
+    "web/src/kit/shadcn/patterns/url-state.ts": {
+      "reference_sha256": "66709c1bafa7340e3d9d43cf0a147e68f76458d5607b2d8f98fad038eacefb50",
+      "same": true
+    },
+    "web/src/kit/shadcn/styles.css": {
+      "reference_sha256": "d13e0007d2f3a9fa447a59956f69e5f7e9e9c8351d762aea0ddd2756041c6241",
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No @source for the ejected dashboard's parts."
+    },
+    "web/src/kit/shadcn/ui.ts": {
+      "reference_sha256": "3b51ff4fbfafd859455dd5f38ab64359add14460b8e664c2f0a790d17d8eb321",
+      "same": true
+    },
+    "web/src/main.tsx": {
+      "reference_sha256": "1ccd124f71fded2eea9a24bb0402273194216c63c3f333d99c9f497b4206273f",
+      "deviation": "The browser router has no /app/ui basename. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+    },
+    "web/third_party/shadcn-ui.LICENSE": {
+      "reference_sha256": "1564074e13439397221ffd522e2e504d56561994a23d371aa5e3ad43e4f5423f",
+      "same": true
+    },
+    "web/tsconfig.base.json": {
+      "reference_sha256": "77d412588912fafd07329be35644386e62c2078c3907bd4e5124036cbc7f9b06",
+      "same": true
+    },
+    "web/tsconfig.json": {
+      "reference_sha256": "505560fc20927ebead0630a69eaa83b57c426fc16b78f26c5dc6de6fb5aa37d2",
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No path maps for the ejected dashboard's parts."
+    },
+    "web/vite.config.ts": {
+      "reference_sha256": "a9d0a487695315f8e32a880eeafebf299719fe67daeec58dae9759a760787075",
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+    }
+  },
+  "not_generated": {
+    "integrations/web.py": "The project no longer serves its pages; `cayu serve` serves web/static at / ([tool.cayu.serve] ui) (#3846).",
+    "web/.npmrc": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/api/inbox.ts": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
+    "web/src/generated/inbox/index.tsx": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
+    "web/src/kit/design/data.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/hooks.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/icons.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/layouts/app/index.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/layouts/app/router.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/lib.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/patterns.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/styles.css": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/ui.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/vite-env.d.ts": "Declares only the kit switch, which the generator doesn't write. The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/tsconfig.design.json": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone."
+  }
+}

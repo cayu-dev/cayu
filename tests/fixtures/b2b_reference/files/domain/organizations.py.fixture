@@ -1,0 +1,61 @@
+"""Organizations, departments and memberships: who belongs where, owned by this application.
+
+Cayu keeps no membership of its own. `policies/access.py` turns the current memberships a
+`MembershipDirectory` reports into Cayu resource-access grants, and Cayu asks again at every
+protected step, so a membership change grants or revokes access at the person's next step. The application's tables hold them
+(`database/memberships.py`); `InMemoryMembershipDirectory` serves tests.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class Membership:
+    organization: str
+    department: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AccessSnapshot:
+    """A person's current memberships, read together with the revision they belong to."""
+
+    memberships: tuple[Membership, ...]
+    revision: int
+
+
+class MembershipDirectory(Protocol):
+    async def current(self, subject: str) -> AccessSnapshot: ...
+
+
+class InMemoryMembershipDirectory:
+    """Memberships kept in memory, for tests and for trying the policy without PostgreSQL."""
+
+    def __init__(
+        self, memberships: dict[str, Iterable[Membership]] | None = None
+    ) -> None:
+        self._memberships = {
+            subject: tuple(items) for subject, items in (memberships or {}).items()
+        }
+        self._revision = 0
+
+    async def current(self, subject: str) -> AccessSnapshot:
+        return AccessSnapshot(self._memberships.get(subject, ()), self._revision)
+
+    def set_memberships(self, subject: str, memberships: Iterable[Membership]) -> None:
+        self._memberships[subject] = tuple(memberships)
+        self._revision += 1
+
+
+def app_role(roles: Iterable[str]) -> Literal["admin", "member"]:
+    """The role the web app shows a person: `admin` when they are an admin of any of their
+    organizations, else `member`.
+
+    It only words the profile menu and hides what they can't do; every change is still
+    checked against the one organization it touches (`role` on that membership).
+    """
+
+    return "admin" if "admin" in roles else "member"

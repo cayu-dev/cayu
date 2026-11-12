@@ -1,0 +1,69 @@
+"""GENERATED. `GET /app/whoami`: who is signed in, and what their role lets them do.
+
+The web app's shell reads it once per page load for the profile menu, and hides actions a
+role can't take (the server refuses them either way). The Agent decides who a request's
+person is and which role they have: it passes a `PersonDependency` to
+`build_generated_router`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
+
+Role = Literal["admin", "developer", "member"]
+
+
+@dataclass(frozen=True, slots=True)
+class Person:
+    """The person behind a request, as the web app shows them.
+
+    `may_decide`: they may decide what waits for a person (approve, answer).
+    `may_change`: they may change the Agent's state or settings, beyond their own work.
+    """
+
+    subject: str
+    role: Role
+    may_decide: bool
+    may_change: bool
+    name: str | None = None
+    email: str | None = None
+
+
+PersonDependency = Callable[[Request], Awaitable[Person]]
+
+
+class PersonView(BaseModel):
+    subject: str
+    name: str | None
+    email: str | None
+
+
+class Whoami(BaseModel):
+    person: PersonView
+    role: Role
+    may_decide: bool
+    may_change: bool
+
+
+def whoami(person: Person) -> Whoami:
+    return Whoami(
+        person=PersonView(subject=person.subject, name=person.name, email=person.email),
+        role=person.role,
+        may_decide=person.may_decide,
+        may_change=person.may_change,
+    )
+
+
+def router(person: PersonDependency) -> APIRouter:
+    routes = APIRouter()
+
+    @routes.get("/whoami")
+    async def get_whoami(signed_in: Person = Depends(person)) -> Whoami:  # noqa: B008
+        return whoami(signed_in)
+
+    return routes

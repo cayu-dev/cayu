@@ -9,12 +9,14 @@ result on every read, listing and background step.
 
 from __future__ import annotations
 
+import html
 from importlib.resources import files as package_files
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
 )
+from cayu.cli.scaffold_app_routes import app_route_files
 from cayu.cli.scaffold_plan import ApplicationPlan
 
 _MODELS_APPEND = '''
@@ -167,7 +169,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +207,17 @@ class InMemoryMembershipDirectory:
     def set_memberships(self, subject: str, memberships: Iterable[Membership]) -> None:
         self._memberships[subject] = tuple(memberships)
         self._revision += 1
+
+
+def app_role(roles: Iterable[str]) -> Literal["admin", "member"]:
+    """The role the web app shows a person: `admin` when they are an admin of any of their
+    organizations, else `member`.
+
+    It only words the profile menu and hides what they can't do; every change is still
+    checked against the one organization it touches (`role` on that membership).
+    """
+
+    return "admin" if "admin" in roles else "member"
 '''
 
 _MEMBERSHIPS_PY = '''"""Memberships in the application's own tables.
@@ -1078,7 +1091,7 @@ def _unavailable(reason: str) -> Authenticate:
     return authenticate
 '''
 
-_HTTP_PY = '''"""The application's HTTP API, which `cayu serve` serves under /app
+_HTTP_PY = '''"""THE AGENT'S OWN. The application's HTTP API, which `cayu serve` serves under /app
 ([tool.cayu.serve] routers in pyproject.toml).
 
 - /app/resources/...: Cayu's scoped routes for conversations, tasks and runs. Each answers
@@ -1088,7 +1101,10 @@ _HTTP_PY = '''"""The application's HTTP API, which `cayu serve` serves under /ap
   and a default: it never grants anything.
 - /app/organizations/{organization}/members: the members, which an organization's admins
   add, move and remove.
-- /app/ui/: the web interface (integrations/web.py).
+- /app/whoami, /app/settings, /app/overview, /app/task-runs and /app/inbox: the routes every
+  Agent's web app reads (integrations/http/generated/), given this application's people and
+  roles (`person` below), its overview metrics (`overview_metrics.py`) and the settings it
+  reads from its environment (`fixed_settings.py`).
 - /app/dev/sign-in and /app/dev/people: the demonstration login and sign-out, served
   only by `cayu serve --dev`.
 """
@@ -1096,6 +1112,7 @@ _HTTP_PY = '''"""The application's HTTP API, which `cayu serve` serves under /ap
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -1113,21 +1130,26 @@ from database.memberships import (
     remove_member,
 )
 from database.session import session
-from domain.organizations import Membership
+from domain.organizations import Membership, app_role
 from domain.sharing import Sharing, conversation_labels
+from integrations.http.fixed_settings import fixed_settings
+from integrations.http.generated import Person, build_generated_router
+from integrations.http.overview_metrics import overview_metrics
 from integrations.sign_in import (
     DEMO_COOKIE,
     DEMO_SUBJECTS,
     DemoSignIn,
     build_authenticate,
 )
-from integrations.web import build_web_router
 
 
 # The length of `memberships.subject`.
 MEMBER_SUBJECT_LENGTH = 200
 # The agent the web interface starts conversations with.
 AGENT_NAME = "__AGENT_NAME__"
+# The Agent's application in Cayu Cloud when Cloud doesn't say (CAYU_CLOUD_APPLICATION_ID):
+# the slug `cayu cloud init` makes from the project's name.
+CLOUD_APPLICATION = "__CLOUD_APPLICATION__"
 
 
 class DemoSignInRequest(BaseModel):
@@ -1148,10 +1170,39 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     authenticate = build_authenticate(development=development)
     router = APIRouter(prefix="/app")
     router.include_router(create_resource_router(app, authenticate=authenticate))
-    router.include_router(build_web_router())
 
     async def signed_in(request: Request) -> str:
         return await authenticate(request)
+
+    async def person(request: Request) -> Person:
+        """The signed-in person for the generated routes. Their role is `admin` when they
+        administer any of their organizations; changing members is still checked per
+        organization.
+
+        They decide Cayu's inbox items through `/app/inbox` only under `cayu serve --dev`,
+        where Cayu's API is open. Deployed, `OPERATOR_ONLY_AUTH` refuses the members Cayu
+        Cloud signs in, so the Agent's operators decide on the Developer dashboard; Cayu
+        refuses or allows either way."""
+
+        subject = await authenticate(request)
+        role = app_role(record.role for record in await _read(memberships_of, subject))
+        return Person(
+            subject=subject,
+            role=role,
+            may_decide=development,
+            may_change=role == "admin",
+        )
+
+    router.include_router(
+        build_generated_router(
+            app,
+            person=person,
+            application=cloud_application(),
+            overview_metrics=overview_metrics,
+            fixed_settings=fixed_settings,
+            agent_name=AGENT_NAME,
+        )
+    )
 
     @router.get("/me")
     async def me(subject: str = Depends(signed_in)) -> dict:
@@ -1248,6 +1299,14 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     return router
 
 
+def cloud_application() -> str:
+    """The application the Settings page's `cayu cloud settings` commands name: the one
+    Cayu Cloud runs this Agent as, else the one `cayu cloud init` would create. Never the
+    specialist's name, which can differ from both."""
+
+    return os.environ.get("CAYU_CLOUD_APPLICATION_ID", "").strip() or CLOUD_APPLICATION
+
+
 def _member(record: MemberRecord) -> dict:
     return {
         "subject": record.subject,
@@ -1311,59 +1370,587 @@ async def _change_members(caller: str, change, **arguments) -> None:
 '''
 
 
-_WEB_PY = """\"\"\"The web interface, served at /app/ui/ from web/static.
+_FIXED_SETTINGS_PY = '''"""THE AGENT'S OWN. The settings this Agent reads from its environment when a process starts.
 
-`web/` holds its source; `npm --prefix web run build` rebuilds web/static, which is committed,
-so running and deploying the application needs no Node. Only the built files are served: the
-page itself and the files its build names in web/static/assets.
-\"\"\"
+The web app's Settings page lists them under "Need a redeploy", next to the managed
+settings Cayu Cloud changes while the Agent runs. Secrets (API keys, the database URL) are
+left out: the page would show their values.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
-
-
-def _static() -> Path:
-    return Path(__file__).resolve().parent.parent / "web" / "static"
+from configuration.settings import (
+    configured_model,
+    configured_provider_choice,
+    configured_sign_in,
+)
+from integrations.http.generated import FixedSetting
 
 
-def build_web_router() -> APIRouter:
-    router = APIRouter(prefix="/ui", include_in_schema=False)
+def fixed_settings() -> tuple[FixedSetting, ...]:
+    return (
+        FixedSetting(
+            name="provider",
+            env_var="CAYU_PROVIDER",
+            label="Model provider",
+            help="The provider the Agent's model calls go to. Unset, the Agent has none.",
+            why="Chosen when each process builds the app; a change needs a redeploy.",
+            current=configured_provider_choice,
+        ),
+        FixedSetting(
+            name="model",
+            env_var="CAYU_MODEL",
+            label="Model",
+            help="The default model, until Cayu Cloud binds the primary model slot.",
+            why="The agent is built with its model when each process starts; a change needs a redeploy.",
+            current=configured_model,
+        ),
+        FixedSetting(
+            name="sign_in",
+            env_var="APP_SIGN_IN",
+            label="Sign-in",
+            help="How people sign in to /app outside `cayu serve --dev`: cloud (Cayu Cloud's sign-in) or oidc (a bearer token).",
+            why="Read when the routes are built; a change needs a redeploy.",
+            current=configured_sign_in,
+        ),
+    )
+'''
 
-    @router.get("")
-    def root() -> RedirectResponse:
-        return RedirectResponse("ui/")
 
-    @router.get("/")
-    def page() -> FileResponse:
-        # Always checked again: it names the current build's hashed files.
-        return FileResponse(
-            _static() / "index.html",
-            headers={
-                "Cache-Control": "no-cache",
-                # Never inside another site's frame, where its buttons could be clicked
-                # for the signed-in person, and no images from elsewhere, which a reply
-                # could use to send what it read to another site.
-                "Content-Security-Policy": "frame-ancestors 'none'; img-src 'self' data:",
-            },
-        )
+_OVERVIEW_METRICS_PY = '''"""THE AGENT'S OWN. The metrics on the web app's Overview, for the signed-in person.
 
-    @router.get("/assets/{name}")
-    def asset(name: str) -> FileResponse:
-        assets = _static() / "assets"
-        if name not in {entry.name for entry in assets.iterdir() if entry.is_file()}:
-            raise HTTPException(404, "Not found.")
-        # Each build names its files by their content, so they never change.
-        return FileResponse(
-            assets / name,
-            headers={"Cache-Control": "public, max-age=31536000, immutable"},
-        )
-
-    return router
+Several organizations share this Agent, so every number counts only what the person may
+see: their organizations and their members from the application's tables, and the
+conversations and tasks Cayu's resource-access policy (`policies/access.py`) lets them read.
+The generated `GET /app/overview` (integrations/http/generated/overview.py) calls
+`overview_metrics`.
 """
+
+from __future__ import annotations
+
+import asyncio
+
+from cayu.sessions import SessionQuery
+from cayu.tasks import TaskQuery
+
+from database.memberships import members_of, memberships_of
+from database.session import session
+from domain.organizations import Membership
+from integrations.http.generated import Metric, OverviewContext
+
+# Tasks counted at most; more shows as this many and a plus.
+TASK_COUNT_LIMIT = 1000
+
+
+async def overview_metrics(context: OverviewContext) -> list[Metric]:
+    subject = context.person.subject
+    organizations, members = await asyncio.to_thread(_people, subject)
+    access = await context.app.access(subject)
+    visible = await access.sessions.list_sessions(SessionQuery(limit=1, include_total_count=True))
+    own = await access.sessions.list_sessions(
+        SessionQuery(limit=1, include_total_count=True, labels={"owner": subject})
+    )
+    tasks = (
+        []
+        if context.app.task_store is None
+        else await access.tasks.list(TaskQuery(limit=TASK_COUNT_LIMIT))
+    )
+    return [
+        Metric(
+            label="Organizations",
+            value=str(len(organizations)),
+            description=", ".join(_where(item) for item in organizations) or "No organization has added you yet.",
+        ),
+        Metric(
+            label="Members",
+            value=str(members),
+            description="People in your organizations, you included.",
+        ),
+        Metric(
+            label="Conversations",
+            value=str(visible.total_count or 0),
+            description=(
+                f"{own.total_count or 0} started by you, the rest shared with your department "
+                "or organization."
+            ),
+        ),
+        Metric(
+            label="Tasks",
+            value=f"{len(tasks)}{'+' if len(tasks) == TASK_COUNT_LIMIT else ''}",
+            description="Background work you can see. This Agent queues none of its own yet.",
+        ),
+    ]
+
+
+def _people(subject: str) -> tuple[list[Membership], int]:
+    """The person's memberships, and how many people their organizations have together."""
+
+    with session() as db:
+        records = memberships_of(db, subject)
+        people = {
+            member.subject
+            for record in records
+            for member in members_of(db, record.organization)
+        }
+    return [Membership(record.organization, record.department) for record in records], len(people)
+
+
+def _where(membership: Membership) -> str:
+    return membership.department or membership.organization
+'''
+
+
+_TEST_GENERATED_ROUTES_PY = '''"""The generated web-app routes: whoami, settings, overview, task runs and the inbox.
+
+These run without a database, on a stand-in person; `tests/test_http_api.py` checks them
+with this application's own people and metrics.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
+
+from cayu import CayuApp
+from cayu.managed_settings import (
+    ManagedSettings,
+    ManagedSettingsChannel,
+    ManagedSettingsConflict,
+    ManagedSettingsSnapshot,
+)
+from cayu.server import ServerConfig, create_server
+from cayu.server.auth import AuthContext
+from cayu.server.config import OpenAccess
+from cayu.sessions import InMemorySessionStore
+from cayu.tasks import InMemoryTaskStore
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.worker import run_task_worker
+from domain.organizations import InMemoryMembershipDirectory, Membership
+from domain.sharing import conversation_labels
+from integrations.http.generated import (
+    FixedSetting,
+    Metric,
+    OverviewContext,
+    Person,
+    build_generated_router,
+)
+from integrations.http.generated.task_runs import TaskRun, list_task_runs
+from policies.access import MembershipAccessPolicy
+
+ALICE = Membership("acme", "acme/finance")
+PEOPLE = {
+    "alice": Person(subject="alice", role="admin", may_decide=False, may_change=True),
+    "bob": Person(subject="bob", role="member", may_decide=False, may_change=False),
+}
+
+
+async def _person(request: Request) -> Person:
+    found = PEOPLE.get(request.headers.get("x-person", ""))
+    if found is None:
+        raise HTTPException(401, "Sign in first.")
+    return found
+
+
+async def _metrics(context: OverviewContext) -> list[Metric]:
+    return [Metric(label="Seen by", value=context.person.subject, description=None)]
+
+
+def _fixed() -> list[FixedSetting]:
+    return [
+        FixedSetting(
+            name="region",
+            env_var="TEST_REGION",
+            label="Region",
+            help="Where it runs.",
+            why="Read at start.",
+            current=lambda: "eu",
+        )
+    ]
+
+
+def _routes(app: CayuApp):
+    return build_generated_router(
+        app,
+        person=_person,
+        application="example-agent",
+        overview_metrics=_metrics,
+        fixed_settings=_fixed,
+        agent_name="example-agent",
+        inbox_page="/inbox",
+    )
+
+
+def _client(app: CayuApp, *, server: FastAPI | None = None) -> TestClient:
+    server = server or FastAPI()
+    server.include_router(_routes(app), prefix="/app")
+    return TestClient(server)
+
+
+def _app(**stores: Any) -> CayuApp:
+    directory = InMemoryMembershipDirectory({"alice": [ALICE], "bob": [Membership("globex")]})
+    return CayuApp(
+        session_store=InMemorySessionStore(),
+        resource_access_policy=MembershipAccessPolicy(directory),
+        **stores,
+    )
+
+
+def test_every_route_needs_a_signed_in_person() -> None:
+    with _client(_app(task_store=InMemoryTaskStore())) as client:
+        for path in ("whoami", "settings", "overview", "task-runs", "inbox", "inbox/counts"):
+            assert client.get(f"/app/{path}").status_code == 401, path
+        assert client.post("/app/inbox/item/settle", json={}).status_code == 401
+
+
+def test_whoami_says_who_is_signed_in_and_what_they_may_do() -> None:
+    with _client(_app()) as client:
+        answer = client.get("/app/whoami", headers={"x-person": "alice"}).json()
+    assert answer == {
+        "person": {"subject": "alice", "name": None, "email": None},
+        "role": "admin",
+        "may_decide": False,
+        "may_change": True,
+    }
+
+
+def test_settings_list_cayus_settings_with_their_release_values() -> None:
+    with _client(_app()) as client:
+        view = client.get("/app/settings", headers={"x-person": "bob"}).json()
+    rows = {row["key"]: row for row in view["settings"]}
+    steps = rows["config.run.max_steps"]
+    assert steps["value"] == 1000 and steps["source"] == "default" and steps["kind"] == "int"
+    assert steps["group"] == "Runs"
+    assert steps["change"] == (
+        "cayu cloud settings set --application example-agent config.run.max_steps=1000"
+    )
+    assert steps["reset"] == (
+        "cayu cloud settings unset --application example-agent config.run.max_steps"
+    )
+    unset = rows["config.run.limits.max_tool_calls"]
+    assert unset["value"] is None and unset["error"] is None and unset["group"] == "Run limits"
+    assert rows["config.run.thinking.effort"]["kind"] == "choice"
+    assert "high" in rows["config.run.thinking.effort"]["choices"]
+    assert view["managed"] is False
+    assert view["cloud"] == {"state": None, "status": None}
+    assert view["read_only"] == [
+        {
+            "name": "region",
+            "env_var": "TEST_REGION",
+            "label": "Region",
+            "help": "Where it runs.",
+            "value": "eu",
+            "source": "default",
+            "needs": "redeploy",
+            "why": "Read at start.",
+            "warning": None,
+        }
+    ]
+
+
+class _Cloud(ManagedSettingsChannel):
+    """Cayu Cloud's answer, as a test stands it in."""
+
+    def __init__(self, values: Mapping[str, Any], conflicts=()) -> None:
+        self._snapshot = ManagedSettingsSnapshot(
+            contract="cayu.managed-settings-values/v1",
+            application_id="app",
+            release_id="release",
+            schema_digest="digest",
+            revision=1,
+            valid_until=datetime.now(UTC) + timedelta(minutes=5),
+            values=dict(values),
+            conflicts=tuple(conflicts),
+        )
+
+    @property
+    def release_id(self) -> str:
+        return "release"
+
+    async def read(self) -> ManagedSettingsSnapshot:
+        return self._snapshot
+
+    async def report(self, report: Mapping[str, Any]) -> None:
+        return None
+
+    def read_at_build(self) -> ManagedSettingsSnapshot:
+        return self._snapshot
+
+
+def test_settings_say_which_values_come_from_cayu_cloud_and_which_it_refused() -> None:
+    cloud = _Cloud(
+        {"config.run.max_steps": 40, "config.run.retry_policy.max_attempts": 99},
+        conflicts=[
+            ManagedSettingsConflict(key="config.run.retry_policy.max_attempts", reason="too many"),
+            # Refused outright: Cloud leaves it out of the values it applies.
+            ManagedSettingsConflict(key="config.run.limits.max_tool_calls", reason="out of range"),
+        ],
+    )
+    app = _app(managed_settings=ManagedSettings(cloud))
+    with _client(app) as client:
+        view = client.get("/app/settings", headers={"x-person": "bob"}).json()
+    rows = {row["key"]: row for row in view["settings"]}
+    assert view["managed"] is True
+    assert view["cloud"]["state"] == "applied"
+    assert rows["config.run.max_steps"]["value"] == 40
+    assert rows["config.run.max_steps"]["source"] == "managed"
+    attempts = rows["config.run.retry_policy.max_attempts"]
+    assert attempts["value"] == 5 and attempts["source"] == "default"
+    assert attempts["error"] == "The value set in Cayu Cloud is refused: too many."
+    tool_calls = rows["config.run.limits.max_tool_calls"]
+    assert tool_calls["source"] == "default"
+    assert tool_calls["error"] == "The value set in Cayu Cloud is refused: out of range."
+
+
+def test_the_overview_has_the_agents_metrics_and_cayus_inbox_counts() -> None:
+    app = _app()
+    server = create_server(app, config=ServerConfig(access=OpenAccess()))
+    with _client(app, server=server) as client:
+        answer = client.get("/app/overview", headers={"x-person": "bob"}).json()
+    assert answer["metrics"] == [{"label": "Seen by", "value": "bob", "description": None}]
+    assert answer["inbox"]["total"] == 0 and answer["inbox"]["unavailable"] is None
+    datetime.fromisoformat(answer["as_of"])
+
+
+def test_the_overview_says_when_cayus_inbox_is_closed_to_the_person() -> None:
+    async def operators_only(request: Request) -> AuthContext:
+        raise HTTPException(401, "Operators only.")
+
+    app = _app()
+    server = create_server(app, config=ServerConfig.protected(operators_only))
+    with _client(app, server=server) as client:
+        response = client.get("/app/overview", headers={"x-person": "bob"})
+    assert response.status_code == 200
+    inbox = response.json()["inbox"]
+    assert inbox["by_kind"] == [] and "operators" in inbox["unavailable"]
+
+
+def test_the_overview_keeps_its_metrics_when_cayus_inbox_fails() -> None:
+    server = FastAPI()
+
+    @server.get("/api/inbox/counts")
+    async def broken() -> dict[str, Any]:
+        raise ConnectionError("database down")
+
+    with _client(_app(), server=server) as client:
+        response = client.get("/app/overview", headers={"x-person": "bob"})
+    assert response.status_code == 200
+    answer = response.json()
+    assert answer["metrics"] == [{"label": "Seen by", "value": "bob", "description": None}]
+    assert answer["inbox"]["unavailable"] == "Cayu's inbox answered 500."
+
+
+def _queue(app: CayuApp, client: TestClient, subject: str, membership: Membership, **task: Any) -> str:
+    async def create() -> str:
+        access = await app.access(subject)
+        labels = conversation_labels(subject=subject, membership=membership, sharing="personal")
+        created = await access.tasks.create(TaskCreate(**task), labels=labels)
+        return created.id
+
+    return client.portal.call(create)
+
+
+def test_task_runs_group_the_persons_tasks_by_run() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    with _client(app) as client:
+        first = _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        alone = _queue(app, client, "alice", ALICE, type="report", title="April")
+        _queue(app, client, "bob", Membership("globex"), type="report", title="Globex's own")
+
+        async def work() -> None:
+            async def handler(app, task, worker_id) -> None:
+                if task.id == first:
+                    raise RuntimeError("lost the printer")
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=3)
+
+        client.portal.call(work)
+        runs = client.get("/app/task-runs", headers={"x-person": "alice"}).json()
+
+    by_id = {run["id"]: run for run in runs}
+    assert set(by_id) == {"march", alone}
+    assert by_id["march"]["tasks"] == 2 and by_id["march"]["status"] == "partly_failed"
+    assert by_id["march"]["title"] == "March" and by_id["march"]["ended_at"] is not None
+    assert by_id[alone]["status"] == "completed" and by_id[alone]["tasks"] == 1
+
+
+def test_a_run_with_open_work_beyond_the_window_is_never_reported_ended() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    later = datetime.now(UTC) + timedelta(days=1)
+    with _client(app) as client:
+        # March's first task waits for tomorrow; its second, and April's, finish now.
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"}, available_at=later)
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="April", metadata={"run": "april"})
+
+        async def work() -> list[TaskRun]:
+            async def handler(app, task, worker_id) -> None:
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=2)
+            # Only the newest two tasks fit the window; March's open task is older.
+            return await list_task_runs(app, "alice", window=2)
+
+        runs = {run.id: run for run in client.portal.call(work)}
+    assert runs["march"].status == "scheduled" and runs["march"].ended_at is None
+    assert runs["march"].tasks == 2 and runs["march"].partial is True
+    # Not every task was read, so no run is reported as ended.
+    assert runs["april"].status == "partial" and runs["april"].ended_at is None
+
+
+def test_a_run_whose_open_task_is_missed_is_not_reported_ended() -> None:
+    store = InMemoryTaskStore()
+    app = _app(task_store=store)
+    later = datetime.now(UTC) + timedelta(days=1)
+    with _client(app) as client:
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"}, available_at=later)
+        _queue(app, client, "alice", ALICE, type="report", title="March", metadata={"run": "march"})
+        _queue(app, client, "alice", ALICE, type="report", title="April", metadata={"run": "april"})
+
+        async def work() -> list[TaskRun]:
+            async def handler(app, task, worker_id) -> None:
+                await store.complete_task(
+                    task.id, {}, worker_id=worker_id, claim_generation=task.claim_generation
+                )
+
+            await run_task_worker(app, store, handler, worker_id="worker", max_tasks=2)
+            # From here on, every read of one status misses the open tasks, as a task that
+            # moves from pending to running between two reads would.
+            listed = store.list_tasks
+
+            async def moving(query=None, **kwargs):
+                if query is not None and query.status is not None:
+                    return []
+                return await listed(query, **kwargs)
+
+            store.list_tasks = moving
+            return await list_task_runs(app, "alice", window=2)
+
+        runs = {run.id: run for run in client.portal.call(work)}
+    # March's open task was never read; its finished sibling alone doesn't end the run.
+    assert runs["march"].status == "partial" and runs["march"].ended_at is None
+    assert runs["march"].tasks == 1 and runs["march"].partial is True
+
+
+@pytest.mark.parametrize("limit", [0, 501])
+def test_task_runs_refuse_a_limit_out_of_range(limit: int) -> None:
+    with _client(_app(task_store=InMemoryTaskStore())) as client:
+        response = client.get(f"/app/task-runs?limit={limit}", headers={"x-person": "alice"})
+    assert response.status_code == 422
+
+
+def _cayu_inbox_stand_in(seen: list[tuple[str, str, dict[str, Any]]]) -> FastAPI:
+    """A server whose `/api/inbox` routes record what they were asked, standing in for Cayu's."""
+
+    server = FastAPI()
+    items = {"ours": "example-agent", "theirs": "other-agent", "for-carol": "example-agent"}
+
+    @server.get("/api/inbox")
+    async def listed(request: Request) -> dict[str, Any]:
+        seen.append(("GET", "/inbox", dict(request.query_params)))
+        return {"items": [], "next_cursor": None, "has_more": False, "issues": []}
+
+    @server.get("/api/inbox/counts")
+    async def counted(request: Request) -> dict[str, Any]:
+        seen.append(("GET", "/inbox/counts", dict(request.query_params)))
+        return {"complete": True, "total_count": 0, "counts": {}}
+
+    @server.get("/api/inbox/{item_id}")
+    async def item(item_id: str) -> dict[str, Any]:
+        if item_id == "forbidden":
+            raise HTTPException(
+                403, {"code": "role_forbidden", "message": "Your role can't use this."}
+            )
+        if item_id not in items:
+            raise HTTPException(404, "Pending action not found.")
+        return {"id": item_id, "status": "pending", "agent_name": items[item_id]}
+
+    @server.post("/api/inbox/{item_id}/settle")
+    async def settle(item_id: str, request: Request) -> dict[str, Any]:
+        if item_id == "for-carol":
+            raise HTTPException(403, "Human-review recipient does not match authentication.")
+        seen.append(("POST", f"/inbox/{item_id}/settle", await request.json()))
+        return {"replayed": False, "item": {"id": item_id, "status": "settled"}}
+
+    return server
+
+
+def test_the_inbox_is_cayus_for_this_agent_only() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+    app = _app()
+    with _client(app, server=_cayu_inbox_stand_in(seen)) as client:
+        bob = {"x-person": "bob"}
+        assert client.get("/app/inbox?kind=approval&agent_name=other", headers=bob).status_code == 200
+        assert client.get("/app/inbox/counts?q=invoice", headers=bob).status_code == 200
+        decision = {"decision": "approve", "reason": None}
+        settled = client.post("/app/inbox/ours/settle", json=decision, headers=bob)
+        theirs = client.post("/app/inbox/theirs/settle", json=decision, headers=bob)
+        missing = client.post("/app/inbox/missing/settle", json=decision, headers=bob)
+    assert seen == [
+        ("GET", "/inbox", {"limit": "50", "kind": "approval", "agent_name": "example-agent"}),
+        ("GET", "/inbox/counts", {"q": "invoice", "agent_name": "example-agent"}),
+        ("POST", "/inbox/ours/settle", decision),
+    ]
+    assert settled.json()["item"]["status"] == "settled"
+    assert (theirs.status_code, missing.status_code) == (404, 404)
+
+
+def test_the_inbox_keeps_cayus_reason_unless_it_refuses_the_person_outright() -> None:
+    with _client(_app(), server=_cayu_inbox_stand_in([])) as client:
+        bob = {"x-person": "bob"}
+        decision = {"decision": "approve"}
+        not_theirs = client.post("/app/inbox/for-carol/settle", json=decision, headers=bob)
+        role = client.post("/app/inbox/forbidden/settle", json=decision, headers=bob)
+    assert not_theirs.status_code == 403
+    assert not_theirs.json()["detail"] == "Human-review recipient does not match authentication."
+    assert role.status_code == 403 and "operators" in role.json()["detail"]
+
+
+def test_the_overview_counts_only_this_agents_inbox() -> None:
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+    with _client(_app(), server=_cayu_inbox_stand_in(seen)) as client:
+        answer = client.get("/app/overview", headers={"x-person": "bob"})
+    assert answer.status_code == 200
+    assert seen == [("GET", "/inbox/counts", {"agent_name": "example-agent"})]
+
+
+def test_the_inbox_says_when_cayu_refuses_the_person() -> None:
+    async def operators_only(request: Request) -> AuthContext:
+        raise HTTPException(401, "Operators only.")
+
+    app = _app()
+    server = create_server(app, config=ServerConfig.protected(operators_only))
+    with _client(app, server=server) as client:
+        bob = {"x-person": "bob"}
+        answers = [
+            client.get("/app/inbox", headers=bob),
+            client.get("/app/inbox/counts", headers=bob),
+            client.post("/app/inbox/any/settle", json={"decision": "approve"}, headers=bob),
+        ]
+    # 403, not Cayu's 401, which the app would take for an expired sign-in.
+    assert [answer.status_code for answer in answers] == [403, 403, 403]
+    assert all("operators" in answer.json()["detail"] for answer in answers)
+
+
+def test_the_inbox_answers_from_cayus_own_routes() -> None:
+    app = _app()
+    server = create_server(app, config=ServerConfig(access=OpenAccess()))
+    with _client(app, server=server) as client:
+        answer = client.get("/app/inbox/counts", headers={"x-person": "bob"})
+    assert answer.status_code == 200 and answer.json()["complete"] is True
+'''
 
 
 _TEST_HTTP_API_PY = '''"""The application's HTTP API: sign-in, scoped conversations and member management.
@@ -1376,12 +1963,15 @@ from __future__ import annotations
 
 import re
 
+from pathlib import Path
+
 from alembic import command
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_app_database import ALEMBIC, requires_postgres
 
 from cayu import CayuApp
+from cayu.server import serve_web_app
 from cayu.sessions import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
@@ -1395,11 +1985,15 @@ from policies.access import MembershipAccessPolicy
 
 ALICE = Membership("acme", "acme/finance")
 IDENTITY = SessionIdentity(provider_name="fake", model="fake")
+# The built web app, `[tool.cayu.serve] ui` in pyproject.toml.
+WEB = Path(__file__).resolve().parents[1] / "web" / "static"
 
 
 def _client(app: CayuApp, *, development: bool = True) -> TestClient:
     server = FastAPI()
     server.include_router(build_router(app, development=development))
+    # As `cayu serve` serves it: last, for every path no route answers.
+    serve_web_app(server, WEB)
     return TestClient(server)
 
 
@@ -1466,29 +2060,34 @@ def test_without_development_there_is_no_demonstration_login(monkeypatch) -> Non
         assert client.post("/app/resources/sessions/query", json={}).status_code == 503
 
 
-def test_the_web_interface_is_served_with_only_its_built_files() -> None:
+def test_the_web_app_is_served_at_the_root_with_only_its_built_files() -> None:
     app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
     with _client(app) as client:
-        page = client.get("/app/ui/")
+        page = client.get("/")
         assert page.status_code == 200
         assert page.headers["cache-control"] == "no-cache"
-        assert (
-            page.headers["content-security-policy"]
-            == "frame-ancestors 'none'; img-src 'self' data:"
-        )
-        (script,) = re.findall(r'src="\\./(assets/[^"]+\\.js)"', page.text)
-        asset = client.get(f"/app/ui/{script}")
+        assert page.headers["content-security-policy"] == "frame-ancestors 'none'"
+        # No images from elsewhere, which a reply could use to send what it read to
+        # another site.
+        assert "img-src 'self' data:" in page.text
+        (script,) = re.findall(r'src="/(assets/[^"]+\\.js)"', page.text)
+        asset = client.get(f"/{script}")
         assert asset.status_code == 200
         assert "immutable" in asset.headers["cache-control"]
-        assert client.get("/app/ui/assets/missing.js").status_code == 404
-        assert client.get("/app/ui/assets/..%2Findex.html").status_code == 404
+        assert client.get("/assets/missing.js").status_code == 404
+        assert client.get("/assets/nested/missing.js").status_code == 404
+        # The app routes in the browser: its pages answer with the page itself.
+        deep = client.get("/conversations/some-id")
+        assert deep.status_code == 200 and deep.text == page.text
+        # The API's own paths are never the page.
+        assert client.get("/app/no-such-route").status_code == 404
         # Its demonstration picker lists the seeded people only under `cayu serve --dev`.
         assert "alice" in client.get("/app/dev/people").json()
         _sign_in(client, "alice")
         assert client.delete("/app/dev/sign-in").status_code == 204
         assert client.post("/app/resources/sessions/query", json={}).status_code == 401
     with _client(app, development=False) as client:
-        assert client.get("/app/ui/").status_code == 200
+        assert client.get("/").status_code == 200
         assert client.get("/app/dev/people").status_code == 404
 
 
@@ -1599,6 +2198,54 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
 
         _sign_in(client, "carol")
         assert client.get(f"/app/resources/sessions/{shared}").status_code == 404
+
+
+@requires_postgres
+def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> None:
+    command.upgrade(ALEMBIC, "head")
+    with session() as db:
+        seed(db)
+        db.commit()
+    app = _app(DatabaseMembershipDirectory())
+    with _client(app) as client:
+        assert client.get("/app/whoami").status_code == 401
+        _start(client, app, "personal")
+        _start(client, app, "department")
+
+        # An admin of any of their organizations is `admin`; others are members. Under
+        # `cayu serve --dev`, Cayu's inbox is open, so they may decide in the app's Inbox.
+        _sign_in(client, "alice")
+        alice = client.get("/app/whoami").json()
+        assert (alice["role"], alice["may_change"], alice["may_decide"]) == ("admin", True, True)
+        metrics = {
+            item["label"]: item["value"]
+            for item in client.get("/app/overview").json()["metrics"]
+        }
+        assert metrics == {
+            "Organizations": "1",
+            "Members": "3",
+            "Conversations": "2",
+            "Tasks": "0",
+        }
+
+        _sign_in(client, "carol")
+        carol = client.get("/app/whoami").json()
+        assert (carol["role"], carol["may_change"]) == ("member", False)
+        conversations = next(
+            item
+            for item in client.get("/app/overview").json()["metrics"]
+            if item["label"] == "Conversations"
+        )
+        # Carol sees Alice's department conversation, not her personal one.
+        assert conversations["value"] == "1"
+        assert conversations["description"].startswith("0 started by you")
+
+        _sign_in(client, "dave")
+        metrics = {
+            item["label"]: item["value"]
+            for item in client.get("/app/overview").json()["metrics"]
+        }
+        assert (metrics["Members"], metrics["Conversations"]) == ("1", "0")
 '''
 
 _TEST_BACKGROUND_REVOCATION_PY = '''"""Removing a member stops their background work at its next step, also after a restart."""
@@ -1754,8 +2401,9 @@ who belongs where; Cayu enforces it.
 | `policies/access.py` | Turning a person's current memberships into Cayu resource-access grants |
 | `domain/sharing.py` | The labels a new conversation is created with: personal, department or organization |
 | `integrations/sign_in.py` | The one place a request becomes a verified person |
-| `integrations/http.py` | The API `cayu serve` serves under `/app` (`[tool.cayu.serve] routers`) |
-| `web/`, `integrations/web.py` | The web interface at `/app/ui/`: its source and the committed build in `web/static` |
+| `integrations/http/` | The API `cayu serve` serves under `/app` (`[tool.cayu.serve] routers`) |
+| `integrations/http/generated/` | The routes every Agent's web app reads: `/app/whoami`, `/app/settings`, `/app/overview`, `/app/task-runs`, `/app/inbox` |
+| `web/` | The web app at `/`: its source, and the committed build in `web/static` that `cayu serve` serves (`[tool.cayu.serve] ui`; see "The web app" below) |
 
 - Start a conversation through `await app.access(subject)` with the labels
   `conversation_labels(...)` returns for the signed-in person. Never take a subject, an
@@ -1780,22 +2428,57 @@ who belongs where; Cayu enforces it.
   that sign-in gives each person. Until one is configured, the API answers 503.
 - An organization a client shows as active is only a filter and a default for new
   conversations (`POST /app/conversation-labels`); it never grants anything.
-- The web interface calls only `/app`. After changing `web/src`, run `npm --prefix web ci`
+- The web app calls only `/app`. After changing `web/src`, run `npm --prefix web ci`
   and `npm --prefix web run build`, and commit `web/static`; running and deploying need no
-  Node. `npm --prefix web run dev` reloads it live against `cayu serve --dev`.
+  Node. `npm --prefix web run check:build` fails when `web/static` isn't the build of
+  `web/src`. `npm --prefix web run dev` reloads it live against `cayu serve --dev`.
 - With `CAYU_DATABASE_URL` set, `uv run --no-sync cayu storage migrate`, `uv run --no-sync
   alembic upgrade head` and `uv run --no-sync python -m operations.demo_seed` give a
   development database two demonstration organizations; `uv run --no-sync cayu serve --dev`
-  then serves the interface at http://127.0.0.1:8000/app/ui/. `uv run --no-sync cayu guide
+  then serves the app at http://127.0.0.1:8000/. `uv run --no-sync cayu guide
   b2b` walks through it.
   `tests/test_organizations.py`, `tests/test_http_api.py` and
   `tests/test_background_revocation.py` show each rule.
+
+## The web app
+
+`web/` is one React app, served at `/` and calling only `/app`. Each file says in its
+first doc comment whether it is `GENERATED.` (the generator owns it and may rewrite it) or
+`THE AGENT'S OWN.` (yours).
+
+| Path | What it is | Whose |
+| --- | --- | --- |
+| `web/src/main.tsx`, `web/src/app/` | The shell: browser routes at `/`, the area pattern, the layout with its navigation and profile menu, the status pages, the API requester | Generated |
+| `web/src/api/` | Typed clients for the generated routes: `whoami`, `settings`, `overview` | Generated |
+| `web/src/generated/` | The Overview and Settings areas | Generated |
+| `web/src/blocks/task-runs.tsx` | TaskRuns: an Agent's Cayu tasks, one row per run (`GET /app/task-runs`). This Agent queues no tasks yet, so no area uses it | A Cayu building block |
+| `web/src/agent/` | This Agent's own areas (Conversations, Members), its Overview sections, its sign-in page for `cayu serve --dev`, and `index.tsx`, which lists its areas | The Agent's |
+| `web/src/kit/shadcn/` | The component kit: stock shadcn (Base UI, base-nova) and the parts built from it | Generated |
+| `integrations/http/generated/` | The routes the generated pages read | Generated |
+| `integrations/http/overview_metrics.py`, `fixed_settings.py` | This Agent's Overview metrics and the settings it reads at start-up | The Agent's |
+
+The app imports every component from `@kit/...`; `tsconfig.json` and `vite.config.ts` point
+`@kit` at `src/kit/shadcn`. Another kit is a folder next to it with the same entries; point
+both at it, and no page changes.
+
+The navigation's Runtime group links to Cayu's Inbox (`/cayu/inbox`), where approvals and
+questions are decided, and to the Developer dashboard (`/cayu/`); the Overview's "Waiting for
+a person" links there too. Both are for the Agent's operators: deployed, `OPERATOR_ONLY_AUTH`
+refuses the people Cayu Cloud signs in as members. `/app/inbox` serves this Agent's inbox as
+the signed-in person, for an Inbox page of the app's own.
 """
 
 
-def _web_files() -> dict[str, str]:
-    """The web interface for `web/`: its source, which a project rebuilds with
-    `npm --prefix web run build`, and the built files in `web/static` it serves."""
+# The page's title in the template, and in its build: the app shows it as the Agent's name.
+_WEB_TITLE = "<title>Agent</title>"
+
+
+def _web_files(name: str) -> dict[str, str]:
+    """The web app for `web/`: its source, which a project rebuilds with
+    `npm --prefix web run build`, and the built files in `web/static` it serves.
+
+    Both pages are titled with the project's name. Vite copies the title as it is, and the
+    page isn't named by its content, so a fresh build still matches `web/static`."""
 
     found: dict[str, str] = {}
 
@@ -1807,6 +2490,11 @@ def _web_files() -> dict[str, str]:
                 found[f"web/{prefix}{child.name}"] = child.read_text(encoding="utf-8")
 
     walk(package_files("cayu.cli").joinpath("templates", "b2b_web"), "")
+    title = f"<title>{html.escape(name)}</title>"
+    for page in ("web/index.html", "web/static/index.html"):
+        if found[page].count(_WEB_TITLE) != 1:
+            raise RuntimeError(f"{page} in the b2b web template has no {_WEB_TITLE}")
+        found[page] = found[page].replace(_WEB_TITLE, title)
     return found
 
 
@@ -1814,9 +2502,10 @@ def _web_files() -> dict[str, str]:
 _AGENTS_ROWS = {
     "| A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from "
     "the served `client.js`. Do not poll on a fixed timer. | `cayu guide app-ui` |": (
-        "| A web UI for the organizations' people | `web/`, served at `/app/ui/`, calling only "
-        "`/app`. Not `client.js`: it calls the operator API, which people signed in as members "
-        "can't use. | `cayu guide b2b` |"
+        "| A web UI for the organizations' people | `web/`, served at `/`, calling only "
+        "`/app`: add an area in `web/src/agent/` and list it in `web/src/agent/index.tsx`; leave "
+        '`GENERATED.` files to the generator (README "The web app"). Not `client.js`: it calls '
+        "the operator API, which people signed in as members can't use. | `cayu guide b2b` |"
     ),
     "| A public or multi-user product | `cayu new NAME --preset service` | "
     "`cayu guide references#server` |": (
@@ -1837,6 +2526,19 @@ _B2B_MULTI_USER = (
     "authorizes each request with `app.access(subject)`; do not add product routes over raw\n"
     "Cayu routes."
 )
+
+
+def _cloud_application(name: str) -> str:
+    """The application slug `cayu cloud init` makes from the project's name, or the name
+    itself when it makes none (init then asks for another name)."""
+
+    from cayu.cli._cloud_api import CloudApiError
+    from cayu.cli._cloud_project import _application_slug
+
+    try:
+        return _application_slug(name)
+    except CloudApiError:
+        return name
 
 
 def _agents_md(agents: str) -> str:
@@ -1886,6 +2588,9 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         )
         + _GUIDANCE,
         "AGENTS.md": _agents_md(files["AGENTS.md"]) + _GUIDANCE,
+        # Installed packages and build output of web/ and of a Developer dashboard ejected
+        # with `cayu dashboard eject`, which writes no .gitignore of its own.
+        ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
         "app.py": app,
         "database/models.py": models + _MODELS_APPEND,
         "migrations/versions/0002_organizations.py": _MIGRATION,
@@ -1903,15 +2608,21 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "pyproject.toml": files["pyproject.toml"].replace(
             f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"\n',
             f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET}"\n'
-            'routers = ["integrations.http:build_router"]\n',
+            'routers = ["integrations.http:build_router"]\n'
+            'ui = "web/static"\n',
         ),
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
         "migrations/versions/0003_membership_roles.py": _ROLES_MIGRATION,
         "integrations/sign_in.py": _SIGN_IN_PY,
-        "integrations/http.py": _HTTP_PY.replace("__AGENT_NAME__", plan.agent_name),
-        "integrations/web.py": _WEB_PY,
-        **_web_files(),
+        "integrations/http/__init__.py": _HTTP_PY.replace(
+            "__AGENT_NAME__", plan.agent_name
+        ).replace("__CLOUD_APPLICATION__", _cloud_application(plan.name)),
+        **app_route_files(),
+        "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
+        "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
+        **_web_files(plan.name),
         "tests/test_http_api.py": _TEST_HTTP_API_PY,
+        "tests/test_generated_routes.py": _TEST_GENERATED_ROUTES_PY,
         "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(
             "__AGENT_NAME__", plan.agent_name
         ),

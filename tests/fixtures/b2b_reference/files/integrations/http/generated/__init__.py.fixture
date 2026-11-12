@@ -1,0 +1,83 @@
+"""GENERATED. The routes every Agent's web app reads, under /app, next to the Agent's own.
+
+- `GET /app/whoami`: who is signed in and what their role allows (`whoami`);
+- `GET /app/settings`: the Agent's managed settings (`settings`);
+- `GET /app/overview`: the Agent's metrics and Cayu's inbox counts (`overview`);
+- `GET /app/task-runs`: the Agent's Cayu tasks, one row per run (`task_runs`);
+- `/app/inbox`: Cayu's inbox for this Agent, read and settled as the person (`inbox`).
+
+The Agent supplies what only it knows, as arguments to `build_generated_router`: who a
+request's person is and their role, its overview metrics, the settings it reads from its
+environment, and how its tasks group into runs. Each module's `router` is usable on its
+own, for an Agent that wants some of these routes and not others.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+
+from cayu import CayuApp
+from fastapi import APIRouter
+
+from integrations.http.generated import inbox, overview, settings, task_runs, whoami
+from integrations.http.generated.overview import Metric, OverviewContext, OverviewMetrics
+from integrations.http.generated.settings import FixedSetting
+from integrations.http.generated.task_runs import RunKey, RunTitle
+from integrations.http.generated.whoami import Person, PersonDependency
+
+
+def build_generated_router(
+    app: CayuApp,
+    *,
+    person: PersonDependency,
+    application: str,
+    overview_metrics: OverviewMetrics,
+    fixed_settings: Callable[[], Sequence[FixedSetting]] | None = None,
+    run_key: RunKey | None = None,
+    run_title: RunTitle | None = None,
+    agent_name: str | None = None,
+    inbox_page: str | None = None,
+) -> APIRouter:
+    """The generated routes, relative to /app. ``application`` is the Agent's name in Cayu
+    Cloud, for the `cayu cloud settings` commands the Settings page shows.
+
+    ``agent_name`` is the Agent's specialist in Cayu; with it, `/app/inbox` serves its
+    inbox and the Overview counts only its items. ``inbox_page`` is where the Overview sends a person to decide what waits: the
+    app's own Inbox (for example `/inbox`), or by default the Developer dashboard's."""
+
+    routes = APIRouter()
+    routes.include_router(whoami.router(person))
+    routes.include_router(
+        settings.router(app, person=person, application=application, fixed=fixed_settings or tuple)
+    )
+    routes.include_router(
+        overview.router(
+            app,
+            person=person,
+            metrics=overview_metrics,
+            inbox_page=inbox_page or overview.INBOX_PAGE,
+            agent_name=agent_name,
+        )
+    )
+    if agent_name is not None:
+        routes.include_router(inbox.router(person=person, agent_name=agent_name))
+    routes.include_router(
+        task_runs.router(
+            app,
+            person=person,
+            run_key=run_key or task_runs.default_run_key,
+            run_title=run_title or task_runs.default_run_title,
+        )
+    )
+    return routes
+
+
+__all__ = [
+    "FixedSetting",
+    "Metric",
+    "OverviewContext",
+    "OverviewMetrics",
+    "Person",
+    "PersonDependency",
+    "build_generated_router",
+]

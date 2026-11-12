@@ -1,0 +1,276 @@
+"""THE AGENT'S OWN. The application's HTTP API, which `cayu serve` serves under /app
+([tool.cayu.serve] routers in pyproject.toml).
+
+- /app/resources/...: Cayu's scoped routes for conversations, tasks and runs. Each answers
+  only what the signed-in person may see; a foreign ID looks missing.
+- /app/me and /app/conversation-labels: who is signed in, their memberships, and the labels a
+  new conversation they share takes. The active organization a client shows is only a filter
+  and a default: it never grants anything.
+- /app/organizations/{organization}/members: the members, which an organization's admins
+  add, move and remove.
+- /app/whoami, /app/settings, /app/overview, /app/task-runs and /app/inbox: the routes every
+  Agent's web app reads (integrations/http/generated/), given this application's people and
+  roles (`person` below), its overview metrics (`overview_metrics.py`) and the settings it
+  reads from its environment (`fixed_settings.py`).
+- /app/dev/sign-in and /app/dev/people: the demonstration login and sign-out, served
+  only by `cayu serve --dev`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
+
+from cayu import CayuApp
+from cayu.server.resource_access import create_resource_router
+from database.memberships import (
+    MemberRecord,
+    add_member,
+    admins_of,
+    members_of,
+    memberships_of,
+    remove_member,
+)
+from database.session import session
+from domain.organizations import Membership, app_role
+from domain.sharing import Sharing, conversation_labels
+from integrations.http.fixed_settings import fixed_settings
+from integrations.http.generated import Person, build_generated_router
+from integrations.http.overview_metrics import overview_metrics
+from integrations.sign_in import (
+    DEMO_COOKIE,
+    DEMO_SUBJECTS,
+    DemoSignIn,
+    build_authenticate,
+)
+
+
+# The length of `memberships.subject`.
+MEMBER_SUBJECT_LENGTH = 200
+# The agent the web interface starts conversations with.
+AGENT_NAME = "cayu-b2b-reference"
+# The Agent's application in Cayu Cloud when Cloud doesn't say (CAYU_CLOUD_APPLICATION_ID):
+# the slug `cayu cloud init` makes from the project's name.
+CLOUD_APPLICATION = "cayu-b2b-reference"
+
+
+class DemoSignInRequest(BaseModel):
+    subject: str
+
+
+class LabelsRequest(BaseModel):
+    organization: str
+    sharing: Sharing
+
+
+class MemberRequest(BaseModel):
+    department: str | None = None
+    role: Literal["member", "admin"] = "member"
+
+
+def build_router(app: CayuApp, *, development: bool) -> APIRouter:
+    authenticate = build_authenticate(development=development)
+    router = APIRouter(prefix="/app")
+    router.include_router(create_resource_router(app, authenticate=authenticate))
+
+    async def signed_in(request: Request) -> str:
+        return await authenticate(request)
+
+    async def person(request: Request) -> Person:
+        """The signed-in person for the generated routes. Their role is `admin` when they
+        administer any of their organizations; changing members is still checked per
+        organization.
+
+        They decide Cayu's inbox items through `/app/inbox` only under `cayu serve --dev`,
+        where Cayu's API is open. Deployed, `OPERATOR_ONLY_AUTH` refuses the members Cayu
+        Cloud signs in, so the Agent's operators decide on the Developer dashboard; Cayu
+        refuses or allows either way."""
+
+        subject = await authenticate(request)
+        role = app_role(record.role for record in await _read(memberships_of, subject))
+        return Person(
+            subject=subject,
+            role=role,
+            may_decide=development,
+            may_change=role == "admin",
+        )
+
+    router.include_router(
+        build_generated_router(
+            app,
+            person=person,
+            application=cloud_application(),
+            overview_metrics=overview_metrics,
+            fixed_settings=fixed_settings,
+            agent_name=AGENT_NAME,
+        )
+    )
+
+    @router.get("/me")
+    async def me(subject: str = Depends(signed_in)) -> dict:
+        records = await _read(memberships_of, subject)
+        return {
+            "subject": subject,
+            "agent_name": AGENT_NAME,
+            "memberships": [_member(item) for item in records],
+        }
+
+    @router.post("/conversation-labels")
+    async def labels(body: LabelsRequest, subject: str = Depends(signed_in)) -> dict:
+        record = await _membership(subject, body.organization)
+        if record is None:
+            raise HTTPException(403, "You aren't a member of that organization.")
+        membership = Membership(record.organization, record.department)
+        try:
+            return conversation_labels(
+                subject=subject, membership=membership, sharing=body.sharing
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @router.get("/organizations/{organization}/members")
+    async def members(
+        organization: str, subject: str = Depends(signed_in)
+    ) -> list[dict]:
+        if await _membership(subject, organization) is None:
+            raise HTTPException(404, "Organization unavailable.")
+        return [_member(item) for item in await _read(members_of, organization)]
+
+    # A member ID is the identity provider's opaque subject, which may contain '/'.
+    @router.put("/organizations/{organization}/members/{member:path}")
+    async def put_member(
+        organization: str,
+        member: str,
+        body: MemberRequest,
+        subject: str = Depends(signed_in),
+    ) -> dict:
+        await _require_admin(subject, organization)
+        _require_subject(member)
+        try:
+            await _change_members(
+                subject,
+                add_member,
+                subject=member,
+                organization=organization,
+                department=body.department,
+                role=body.role,
+            )
+        except IntegrityError:
+            raise HTTPException(
+                422, "The department must be one of this organization's."
+            ) from None
+        return {"subject": member, "organization": organization, **body.model_dump()}
+
+    @router.delete(
+        "/organizations/{organization}/members/{member:path}", status_code=204
+    )
+    async def delete_member(
+        organization: str, member: str, subject: str = Depends(signed_in)
+    ) -> Response:
+        await _require_admin(subject, organization)
+        _require_subject(member)
+        await _change_members(
+            subject,
+            remove_member,
+            subject=member,
+            organization=organization,
+        )
+        return Response(status_code=204)
+
+    if isinstance(authenticate, DemoSignIn):
+        demo = authenticate
+
+        @router.get("/dev/people")
+        async def demo_people() -> list[str]:
+            return sorted(DEMO_SUBJECTS)
+
+        @router.post("/dev/sign-in", status_code=204)
+        async def demo_sign_in(body: DemoSignInRequest) -> Response:
+            response = Response(status_code=204)
+            response.set_cookie(
+                DEMO_COOKIE, demo.cookie(body.subject), httponly=True, samesite="strict"
+            )
+            return response
+
+        @router.delete("/dev/sign-in", status_code=204)
+        async def demo_sign_out() -> Response:
+            response = Response(status_code=204)
+            response.delete_cookie(DEMO_COOKIE, httponly=True, samesite="strict")
+            return response
+
+    return router
+
+
+def cloud_application() -> str:
+    """The application the Settings page's `cayu cloud settings` commands name: the one
+    Cayu Cloud runs this Agent as, else the one `cayu cloud init` would create. Never the
+    specialist's name, which can differ from both."""
+
+    return os.environ.get("CAYU_CLOUD_APPLICATION_ID", "").strip() or CLOUD_APPLICATION
+
+
+def _member(record: MemberRecord) -> dict:
+    return {
+        "subject": record.subject,
+        "organization": record.organization,
+        "department": record.department,
+        "role": record.role,
+    }
+
+
+async def _membership(subject: str, organization: str) -> MemberRecord | None:
+    records = await _read(memberships_of, subject)
+    return next((item for item in records if item.organization == organization), None)
+
+
+async def _require_admin(subject: str, organization: str) -> None:
+    record = await _membership(subject, organization)
+    if record is None:
+        raise HTTPException(404, "Organization unavailable.")
+    if record.role != "admin":
+        raise HTTPException(403, "Only the organization's admins manage its members.")
+
+
+async def _read(query, value):
+    def read():
+        with session() as db:
+            return query(db, value)
+
+    return await asyncio.to_thread(read)
+
+
+def _require_subject(member: str) -> None:
+    if not member or member != member.strip() or len(member) > MEMBER_SUBJECT_LENGTH:
+        raise HTTPException(
+            422,
+            f"A member is a non-blank ID of at most {MEMBER_SUBJECT_LENGTH} characters.",
+        )
+    # A URL can't carry these segments as they are: clients resolve them first.
+    if {".", ".."} & set(member.split("/")):
+        raise HTTPException(422, "A member ID has no '.' or '..' path segments.")
+
+
+async def _change_members(caller: str, change, **arguments) -> None:
+    """Change the organization's members while its admins' rows are locked, so the caller
+    is still an admin when it happens and at least one admin remains afterwards."""
+
+    organization = arguments["organization"]
+
+    def write() -> None:
+        with session() as db:
+            if caller not in admins_of(db, organization, lock=True):
+                raise HTTPException(
+                    403, "Only the organization's admins manage its members."
+                )
+            change(db, **arguments)
+            if not admins_of(db, organization):
+                db.rollback()
+                raise HTTPException(409, "An organization keeps at least one admin.")
+            db.commit()
+
+    await asyncio.to_thread(write)

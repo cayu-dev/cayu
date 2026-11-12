@@ -1,0 +1,207 @@
+"""GENERATED. `GET /app/task-runs`: the Agent's Cayu tasks, one row per run of its work.
+
+The TaskRuns block in the web app lists these. A run is every task that did one piece of
+the Agent's work: when a worker is lost and the work runs again as a new task, both tasks
+are the same run. The Agent says which run a task belongs to with `run_key` (by default the
+`run` its metadata names, else the task itself) and how a run is titled with `run_title`.
+
+Tasks are read as the signed-in person (`await app.access(subject)`), so the list holds
+only the tasks Cayu's resource-access policy lets them see.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
+from typing import Literal
+
+from cayu import CayuApp
+from cayu.tasks import Task, TaskOrder, TaskQuery, TaskStatus
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+
+from integrations.http.generated.whoami import Person, PersonDependency
+
+# How many of the newest tasks a listing groups.
+TASK_WINDOW = 1000
+# How many open tasks of one status a listing reads, the most one task query returns.
+OPEN_TASK_READ = 1000
+
+RunStatus = Literal[
+    "queued",
+    "scheduled",
+    "running",
+    "paused",
+    "needs_attention",
+    "completed",
+    "partly_failed",
+    "failed",
+    # Every task read has ended, but not all of the run's tasks could be read, so it may
+    # still have open work: never reported as ended.
+    "partial",
+]
+_WAITING = {
+    TaskStatus.PENDING,
+    TaskStatus.WAITING_DEPENDENCIES,
+    TaskStatus.WAITING_GROUP,
+}
+_ACTIVE = {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+_HELD = {TaskStatus.PAUSED, TaskStatus.BLOCKED}
+_FAILED = {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.DEPENDENCY_SKIPPED}
+# Every status of a task that hasn't ended.
+_OPEN = (*_WAITING, *_ACTIVE, *_HELD, TaskStatus.NEEDS_ATTENTION)
+
+RunKey = Callable[[Task], str]
+RunTitle = Callable[[Sequence[Task]], str]
+
+
+def default_run_key(task: Task) -> str:
+    run = (task.metadata or {}).get("run")
+    return run if isinstance(run, str) and run else task.id
+
+
+def default_run_title(tasks: Sequence[Task]) -> str:
+    first = tasks[0]
+    return first.title or first.type
+
+
+class TaskRun(BaseModel):
+    id: str
+    title: str
+    task_type: str
+    status: RunStatus
+    started_at: str
+    ended_at: str | None
+    # Every task of the run, and every restart a worker gave one.
+    attempts: int
+    tasks: int
+    # Not every task of the run could be read: `tasks`, `attempts` and `started_at` may
+    # leave out older ones, and a status that would say it ended is `partial` instead.
+    partial: bool = False
+
+
+def run_status(tasks: Sequence[Task], now: datetime) -> RunStatus:
+    """What a run's tasks (oldest first) add up to: open while any task is."""
+
+    statuses = [task.status for task in tasks]
+    if any(status in _ACTIVE for status in statuses):
+        return "running"
+    if any(status is TaskStatus.NEEDS_ATTENTION for status in statuses):
+        return "needs_attention"
+    if any(status in _HELD for status in statuses):
+        return "paused"
+    waiting = [task for task in tasks if task.status in _WAITING]
+    if waiting:
+        later = all(task.available_at is not None and task.available_at > now for task in waiting)
+        return "scheduled" if later else "queued"
+    # Every task has ended.
+    if all(status is TaskStatus.COMPLETED for status in statuses):
+        return "completed"
+    if all(status in _FAILED for status in statuses):
+        return "failed"
+    return "partly_failed"
+
+
+def run_row(
+    key: str, tasks: Sequence[Task], title: RunTitle, now: datetime, *, partial: bool = False
+) -> TaskRun:
+    first = tasks[0]
+    status = run_status(tasks, now)
+    if partial and status in ("completed", "partly_failed", "failed"):
+        # A task it didn't read may still be open.
+        status = "partial"
+    # Tasks that overlap may end in another order than they started: the run ends with the last.
+    completed = [task.completed_at for task in tasks if task.completed_at is not None]
+    ended = max(completed, default=None) if status in ("completed", "partly_failed", "failed") else None
+    return TaskRun(
+        id=key,
+        title=title(tasks),
+        task_type=first.type,
+        status=status,
+        started_at=_iso(first.started_at or first.created_at),
+        ended_at=None if ended is None else _iso(ended),
+        attempts=len(tasks) + sum(task.restart_count for task in tasks),
+        tasks=len(tasks),
+        partial=partial,
+    )
+
+
+async def list_task_runs(
+    app: CayuApp,
+    subject: str,
+    *,
+    task_type: str | None = None,
+    limit: int = 50,
+    run_key: RunKey = default_run_key,
+    run_title: RunTitle = default_run_title,
+    now: datetime | None = None,
+    window: int = TASK_WINDOW,
+) -> list[TaskRun]:
+    """The newest runs first, of the tasks ``subject`` may see.
+
+    It reads the newest ``window`` tasks; when that is all of them, every run is complete.
+    When there are more, it also reads the open tasks of each status, so a run whose open
+    task is older than the window still shows it as open. Those reads aren't one snapshot
+    (a task can change status between them, and the task store has no cursor to read a
+    status's tasks past one page), so then no run is reported as ended: a run whose tasks
+    read have all ended says ``partial``, and every run sets ``partial``."""
+
+    now = now or datetime.now(UTC)
+    if app.task_store is None:
+        # An Agent without a task store has no tasks.
+        return []
+    access = await app.access(subject)
+    tasks = list(
+        await access.tasks.list(
+            TaskQuery(type=task_type, order_by=TaskOrder.CREATED_AT_DESC, limit=window)
+        )
+    )
+    partial = len(tasks) >= window
+    if partial:
+        seen = {task.id for task in tasks}
+        for status in _OPEN:
+            for task in await access.tasks.list(
+                TaskQuery(
+                    type=task_type,
+                    status=status,
+                    order_by=TaskOrder.CREATED_AT_ASC,
+                    limit=OPEN_TASK_READ,
+                )
+            ):
+                if task.id not in seen:
+                    seen.add(task.id)
+                    tasks.append(task)
+    groups: dict[str, list[Task]] = {}
+    for task in sorted(tasks, key=lambda item: item.created_at):
+        groups.setdefault(run_key(task), []).append(task)
+    rows = [
+        run_row(key, items, run_title, now, partial=partial) for key, items in groups.items()
+    ]
+    rows.sort(key=lambda row: row.started_at, reverse=True)
+    return rows[:limit]
+
+
+def router(
+    app: CayuApp,
+    *,
+    person: PersonDependency,
+    run_key: RunKey = default_run_key,
+    run_title: RunTitle = default_run_title,
+) -> APIRouter:
+    routes = APIRouter()
+
+    @routes.get("/task-runs")
+    async def get_task_runs(
+        signed_in: Person = Depends(person),  # noqa: B008
+        type: str | None = Query(default=None, min_length=1, max_length=200),  # noqa: A002
+        limit: int = Query(default=50, ge=1, le=500),
+    ) -> list[TaskRun]:
+        return await list_task_runs(
+            app, signed_in.subject, task_type=type, limit=limit, run_key=run_key, run_title=run_title
+        )
+
+    return routes
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat()

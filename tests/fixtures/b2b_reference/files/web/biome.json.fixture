@@ -1,0 +1,8 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.16/schema.json",
+  "vcs": { "enabled": false },
+  "files": { "ignoreUnknown": true, "includes": ["src/**", "scripts/**", "!src/kit/**", "!**/*.css"] },
+  "formatter": { "enabled": false },
+  "assist": { "actions": { "source": { "organizeImports": "off" } } },
+  "linter": { "enabled": true, "rules": { "recommended": true } }
+}

@@ -922,7 +922,7 @@ def test_b2b_guide_runs_the_generated_application(capsys) -> None:
     for statement in (
         "cayu new acme-desk --preset b2b",
         "uv run --no-sync python -m operations.demo_seed",
-        "http://127.0.0.1:8000/app/ui/",
+        "http://127.0.0.1:8000/`",
         "npm --prefix web run build",
         "`APP_SIGN_IN`",
         "`OPERATOR_ONLY_AUTH`",

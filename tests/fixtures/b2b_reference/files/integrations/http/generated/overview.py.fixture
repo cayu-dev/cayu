@@ -1,0 +1,162 @@
+"""GENERATED. `GET /app/overview`: the Agent's metrics and what waits for a person in Cayu's inbox.
+
+- `metrics` come from the Agent's `OverviewMetrics` hook, the one function it writes for
+  this page. It gets the signed-in person, so an Agent that several people or
+  organizations share counts only what that person may see.
+- `inbox` counts the items waiting in Cayu's inbox by kind, read from Cayu's own route
+  (`GET /api/inbox/counts`) in this process as the person (`cayu_api`), so the counts are
+  the ones `cayu inbox list` and the Developer dashboard show them. When Cayu doesn't let
+  the person read the inbox, or can't count it, `unavailable` says so instead of a total.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import httpx
+from cayu import CayuApp
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
+
+from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
+from integrations.http.generated.whoami import Person, PersonDependency
+
+logger = logging.getLogger(__name__)
+
+INBOX_KINDS = {
+    "approval": "Approvals",
+    "question": "Questions",
+    "recovery": "Interrupted sessions",
+    "knowledge": "Knowledge proposals",
+}
+# Where a person decides inbox items by default: the Developer dashboard's Inbox. An app
+# with its own Inbox passes its path instead (`router(inbox_page=...)`).
+INBOX_PAGE = "/cayu/inbox"
+
+
+@dataclass(frozen=True, slots=True)
+class Metric:
+    label: str
+    value: str
+    description: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OverviewContext:
+    """What the Agent's metrics hook gets: its app, the person, and their request."""
+
+    app: CayuApp
+    person: Person
+    request: Request
+
+
+OverviewMetrics = Callable[[OverviewContext], Awaitable[Sequence[Metric]]]
+
+
+class MetricView(BaseModel):
+    label: str
+    value: str
+    description: str | None
+
+
+class InboxKind(BaseModel):
+    kind: str
+    label: str
+    count: int
+    # Where to decide them: an app path, or the Developer dashboard's (`/cayu/...`).
+    to: str | None
+
+
+class InboxView(BaseModel):
+    total: int
+    by_kind: list[InboxKind]
+    # What the empty table says.
+    empty: str
+    # Why there are no counts: the inbox isn't open to this person, or couldn't be counted.
+    unavailable: str | None
+
+
+class OverviewView(BaseModel):
+    as_of: str
+    metrics: list[MetricView]
+    inbox: InboxView
+
+
+async def inbox_counts(
+    request: Request, *, inbox_page: str = INBOX_PAGE, agent_name: str | None = None
+) -> InboxView:
+    """Cayu's inbox counts, as the person behind ``request`` may read them, of the agent
+    named ``agent_name`` (every agent's without one). Each kind links to ``inbox_page``
+    filtered to it."""
+
+    params = {} if agent_name is None else {"agent_name": agent_name}
+    try:
+        async with cayu_api_client(request) as client:
+            response = await client.get("/inbox/counts", params=params)
+    except httpx.HTTPError as exc:
+        logger.warning("%s %s", INBOX_SILENT, type(exc).__name__)
+        return _unavailable(INBOX_SILENT)
+    if response.status_code in (401, 403):
+        return _unavailable(INBOX_CLOSED)
+    if response.status_code >= 400:
+        return _unavailable(f"Cayu's inbox answered {response.status_code}.")
+    answer = response.json()
+    if not answer.get("complete"):
+        reason = answer.get("unavailable_reason")
+        return _unavailable(
+            "Cayu shows you only part of the inbox, so it gives no totals."
+            if reason == "access_limited"
+            else "Cayu couldn't count the whole inbox just now."
+        )
+    counts = answer.get("counts") or {}
+    by_kind = [
+        InboxKind(
+            kind=kind, label=label, count=counts.get(kind, 0), to=f"{inbox_page}?kind={kind}"
+        )
+        for kind, label in INBOX_KINDS.items()
+        if counts.get(kind)
+    ]
+    return InboxView(
+        total=answer.get("total_count") or 0,
+        by_kind=by_kind,
+        empty="No approval, question, interrupted session or knowledge proposal is waiting.",
+        unavailable=None,
+    )
+
+
+def _unavailable(reason: str) -> InboxView:
+    return InboxView(total=0, by_kind=[], empty=reason, unavailable=reason)
+
+
+def router(
+    app: CayuApp,
+    *,
+    person: PersonDependency,
+    metrics: OverviewMetrics,
+    inbox_page: str = INBOX_PAGE,
+    agent_name: str | None = None,
+) -> APIRouter:
+    """`GET /overview`, relative to /app. With ``agent_name``, the inbox counts are that
+    agent's, as `/app/inbox` lists them."""
+
+    routes = APIRouter()
+
+    @routes.get("/overview")
+    async def get_overview(
+        request: Request,
+        signed_in: Person = Depends(person),  # noqa: B008
+    ) -> OverviewView:
+        found = await metrics(OverviewContext(app=app, person=signed_in, request=request))
+        return OverviewView(
+            as_of=datetime.now(UTC).isoformat(),
+            metrics=[
+                MetricView(label=item.label, value=item.value, description=item.description)
+                for item in found
+            ],
+            inbox=await inbox_counts(request, inbox_page=inbox_page, agent_name=agent_name),
+        )
+
+    return routes

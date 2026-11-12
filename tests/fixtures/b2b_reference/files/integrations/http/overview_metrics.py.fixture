@@ -1,0 +1,80 @@
+"""THE AGENT'S OWN. The metrics on the web app's Overview, for the signed-in person.
+
+Several organizations share this Agent, so every number counts only what the person may
+see: their organizations and their members from the application's tables, and the
+conversations and tasks Cayu's resource-access policy (`policies/access.py`) lets them read.
+The generated `GET /app/overview` (integrations/http/generated/overview.py) calls
+`overview_metrics`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from cayu.sessions import SessionQuery
+from cayu.tasks import TaskQuery
+
+from database.memberships import members_of, memberships_of
+from database.session import session
+from domain.organizations import Membership
+from integrations.http.generated import Metric, OverviewContext
+
+# Tasks counted at most; more shows as this many and a plus.
+TASK_COUNT_LIMIT = 1000
+
+
+async def overview_metrics(context: OverviewContext) -> list[Metric]:
+    subject = context.person.subject
+    organizations, members = await asyncio.to_thread(_people, subject)
+    access = await context.app.access(subject)
+    visible = await access.sessions.list_sessions(SessionQuery(limit=1, include_total_count=True))
+    own = await access.sessions.list_sessions(
+        SessionQuery(limit=1, include_total_count=True, labels={"owner": subject})
+    )
+    tasks = (
+        []
+        if context.app.task_store is None
+        else await access.tasks.list(TaskQuery(limit=TASK_COUNT_LIMIT))
+    )
+    return [
+        Metric(
+            label="Organizations",
+            value=str(len(organizations)),
+            description=", ".join(_where(item) for item in organizations) or "No organization has added you yet.",
+        ),
+        Metric(
+            label="Members",
+            value=str(members),
+            description="People in your organizations, you included.",
+        ),
+        Metric(
+            label="Conversations",
+            value=str(visible.total_count or 0),
+            description=(
+                f"{own.total_count or 0} started by you, the rest shared with your department "
+                "or organization."
+            ),
+        ),
+        Metric(
+            label="Tasks",
+            value=f"{len(tasks)}{'+' if len(tasks) == TASK_COUNT_LIMIT else ''}",
+            description="Background work you can see. This Agent queues none of its own yet.",
+        ),
+    ]
+
+
+def _people(subject: str) -> tuple[list[Membership], int]:
+    """The person's memberships, and how many people their organizations have together."""
+
+    with session() as db:
+        records = memberships_of(db, subject)
+        people = {
+            member.subject
+            for record in records
+            for member in members_of(db, record.organization)
+        }
+    return [Membership(record.organization, record.department) for record in records], len(people)
+
+
+def _where(membership: Membership) -> str:
+    return membership.department or membership.organization

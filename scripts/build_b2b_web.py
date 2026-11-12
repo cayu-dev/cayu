@@ -2,14 +2,14 @@
 
 The interface's source lives in the package so `cayu new --preset b2b` can copy it, which means
 its installed packages must never land there. This builds in a temporary copy and writes back
-only `static/`. With `--check` it also lints and typechecks, and fails when the committed build
-differs from the source.
+only `static/`. With `--check` it lints and typechecks instead, and runs the interface's own
+`npm run check:build`, the check a generated project runs, which fails when the committed build
+differs from a fresh build of the source.
 """
 
 from __future__ import annotations
 
 import argparse
-import filecmp
 import shutil
 import subprocess
 import sys
@@ -18,21 +18,6 @@ from pathlib import Path
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "src" / "cayu" / "cli" / "templates" / "b2b_web"
 BUILT = "static"
-
-
-def _differences(left: Path, right: Path, prefix: Path) -> list[str]:
-    comparison = filecmp.dircmp(left, right)
-    names = (
-        comparison.left_only
-        + comparison.right_only
-        + comparison.common_funny
-        + comparison.funny_files
-    )
-    _, mismatched, errors = filecmp.cmpfiles(left, right, comparison.common_files, shallow=False)
-    found = [str(prefix / name) for name in names + mismatched + errors]
-    for name in comparison.common_dirs:
-        found += _differences(left / name, right / name, prefix / name)
-    return found
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,30 +31,30 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copytree(
             TEMPLATE,
             work,
-            # Installed packages anywhere, and the previous build at the top.
+            # Installed packages anywhere; the previous build only for `check:build` to compare.
             ignore=lambda directory, names: {
                 name
                 for name in names
-                if name == "node_modules" or (Path(directory) == TEMPLATE and name == BUILT)
+                if name == "node_modules"
+                or (not args.check and Path(directory) == TEMPLATE and name == BUILT)
             },
         )
         steps: list[list[str]] = [["ci", "--no-audit", "--no-fund"]]
         if args.check:
+            steps += [["run", "lint"], ["run", "typecheck"], ["run", "check:build"]]
+        else:
             # The build typechecks too.
-            steps.append(["run", "lint"])
-        steps.append(["run", "build"])
+            steps.append(["run", "build"])
         for step in steps:
-            subprocess.run(["npm", *step], cwd=work, check=True)
-        if args.check:
-            stale = _differences(TEMPLATE / BUILT, work / BUILT, Path(BUILT))
-            if stale:
-                print(
-                    "The committed B2B web build differs from its source; run "
-                    "`python scripts/build_b2b_web.py` and commit the result:\n  "
-                    + "\n  ".join(stale),
-                    file=sys.stderr,
-                )
+            if subprocess.run(["npm", *step], cwd=work, check=False).returncode != 0:
+                if step == ["run", "check:build"]:
+                    print(
+                        "The committed B2B web build differs from its source; run "
+                        "`python scripts/build_b2b_web.py` and commit the result.",
+                        file=sys.stderr,
+                    )
                 return 1
+        if args.check:
             return 0
         shutil.rmtree(TEMPLATE / BUILT, ignore_errors=True)
         shutil.copytree(work / BUILT, TEMPLATE / BUILT)

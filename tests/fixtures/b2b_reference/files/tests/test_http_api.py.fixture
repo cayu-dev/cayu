@@ -1,0 +1,293 @@
+"""The application's HTTP API: sign-in, scoped conversations and member management.
+
+The sign-in and conversation tests run without a database; member management reads and
+writes the application's tables (`CAYU_TEST_POSTGRES_DSN`).
+"""
+
+from __future__ import annotations
+
+import re
+
+from pathlib import Path
+
+from alembic import command
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from test_app_database import ALEMBIC, requires_postgres
+
+from cayu import CayuApp
+from cayu.server import serve_web_app
+from cayu.sessions import InMemorySessionStore
+from cayu.sessions.records import SessionIdentity
+from cayu.sessions.requests import RunRequest
+from database.memberships import DatabaseMembershipDirectory
+from database.session import session
+from domain.organizations import InMemoryMembershipDirectory, Membership
+from domain.sharing import conversation_labels
+from integrations.http import AGENT_NAME, build_router
+from operations.demo_seed import seed
+from policies.access import MembershipAccessPolicy
+
+ALICE = Membership("acme", "acme/finance")
+IDENTITY = SessionIdentity(provider_name="fake", model="fake")
+# The built web app, `[tool.cayu.serve] ui` in pyproject.toml.
+WEB = Path(__file__).resolve().parents[1] / "web" / "static"
+
+
+def _client(app: CayuApp, *, development: bool = True) -> TestClient:
+    server = FastAPI()
+    server.include_router(build_router(app, development=development))
+    # As `cayu serve` serves it: last, for every path no route answers.
+    serve_web_app(server, WEB)
+    return TestClient(server)
+
+
+def _app(directory) -> CayuApp:
+    return CayuApp(
+        session_store=InMemorySessionStore(),
+        resource_access_policy=MembershipAccessPolicy(directory),
+    )
+
+
+def _sign_in(client: TestClient, subject: str) -> None:
+    client.cookies.clear()
+    assert client.post("/app/dev/sign-in", json={"subject": subject}).status_code == 204
+
+
+def _start(client: TestClient, app: CayuApp, sharing: str) -> str:
+    async def create() -> str:
+        access = await app.access("alice")
+        labels = conversation_labels(subject="alice", membership=ALICE, sharing=sharing)
+        created = await access.sessions.create(
+            RunRequest(agent_name="assistant", messages=[], labels=labels),
+            identity=IDENTITY,
+        )
+        return created.id
+
+    return client.portal.call(create)
+
+
+def _listed(client: TestClient) -> set[str]:
+    response = client.post("/app/resources/sessions/query", json={})
+    assert response.status_code == 200, response.text
+    return {item["id"] for item in response.json()["sessions"]}
+
+
+def test_the_demonstration_login_signs_in_only_its_people() -> None:
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app) as client:
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+        assert (
+            client.post("/app/dev/sign-in", json={"subject": "mallory"}).status_code
+            == 404
+        )
+        client.cookies.set("demo_session", "alice.forged")
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+        _sign_in(client, "alice")
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 200
+
+
+def test_without_development_there_is_no_demonstration_login(monkeypatch) -> None:
+    for name in (
+        "APP_SIGN_IN",
+        "CAYU_PROXY_IDENTITY_ISSUER",
+        "CAYU_PROXY_IDENTITY_AUDIENCE",
+        "CAYU_PROXY_IDENTITY_JWKS_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app, development=False) as client:
+        assert (
+            client.post("/app/dev/sign-in", json={"subject": "alice"}).status_code
+            == 404
+        )
+        # Until a production sign-in is configured, nobody gets in.
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 503
+
+
+def test_the_web_app_is_served_at_the_root_with_only_its_built_files() -> None:
+    app = _app(InMemoryMembershipDirectory({"alice": [ALICE]}))
+    with _client(app) as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assert page.headers["cache-control"] == "no-cache"
+        assert page.headers["content-security-policy"] == "frame-ancestors 'none'"
+        # No images from elsewhere, which a reply could use to send what it read to
+        # another site.
+        assert "img-src 'self' data:" in page.text
+        (script,) = re.findall(r'src="/(assets/[^"]+\.js)"', page.text)
+        asset = client.get(f"/{script}")
+        assert asset.status_code == 200
+        assert "immutable" in asset.headers["cache-control"]
+        assert client.get("/assets/missing.js").status_code == 404
+        assert client.get("/assets/nested/missing.js").status_code == 404
+        # The app routes in the browser: its pages answer with the page itself.
+        deep = client.get("/conversations/some-id")
+        assert deep.status_code == 200 and deep.text == page.text
+        # The API's own paths are never the page.
+        assert client.get("/app/no-such-route").status_code == 404
+        # Its demonstration picker lists the seeded people only under `cayu serve --dev`.
+        assert "alice" in client.get("/app/dev/people").json()
+        _sign_in(client, "alice")
+        assert client.delete("/app/dev/sign-in").status_code == 204
+        assert client.post("/app/resources/sessions/query", json={}).status_code == 401
+    with _client(app, development=False) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/app/dev/people").status_code == 404
+
+
+def test_conversations_over_http_show_each_person_only_their_own() -> None:
+    directory = InMemoryMembershipDirectory(
+        {
+            "alice": [ALICE],
+            "carol": [Membership("acme", "acme/finance")],
+            "bob": [Membership("acme", "acme/legal")],
+            "dave": [Membership("globex", "globex/support")],
+        }
+    )
+    app = _app(directory)
+    with _client(app) as client:
+        personal = _start(client, app, "personal")
+        department = _start(client, app, "department")
+        _sign_in(client, "carol")
+        assert _listed(client) == {department}
+        _sign_in(client, "bob")
+        assert _listed(client) == set()
+        _sign_in(client, "dave")
+        assert client.get(f"/app/resources/sessions/{department}").status_code == 404
+        _sign_in(client, "alice")
+        assert _listed(client) == {personal, department}
+
+
+@requires_postgres
+def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
+    database,
+) -> None:
+    command.upgrade(ALEMBIC, "head")
+    with session() as db:
+        seed(db)
+        db.commit()
+    app = _app(DatabaseMembershipDirectory())
+    with _client(app) as client:
+        shared = _start(client, app, "department")
+
+        _sign_in(client, "carol")
+        me = client.get("/app/me").json()
+        assert me["agent_name"] == AGENT_NAME
+        assert me["memberships"] == [
+            {
+                "subject": "carol",
+                "organization": "acme",
+                "department": "acme/finance",
+                "role": "member",
+            }
+        ]
+        labels = client.post(
+            "/app/conversation-labels",
+            json={"organization": "acme", "sharing": "department"},
+        ).json()
+        assert labels["department"] == "acme/finance"
+        assert labels["owner"] == "carol"
+        assert (
+            client.post(
+                "/app/conversation-labels",
+                json={"organization": "globex", "sharing": "organization"},
+            ).status_code
+            == 403
+        )
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 200
+        # A member reads the member list but doesn't change it.
+        assert len(client.get("/app/organizations/acme/members").json()) == 3
+        assert client.delete("/app/organizations/acme/members/bob").status_code == 403
+
+        _sign_in(client, "dave")
+        assert client.get("/app/organizations/acme/members").status_code == 404
+        assert client.delete("/app/organizations/acme/members/carol").status_code == 404
+
+        _sign_in(client, "alice")
+        moved = client.put(
+            "/app/organizations/acme/members/bob",
+            json={"department": "globex/support"},
+        )
+        assert moved.status_code == 422
+        too_long = "x" * 201
+        assert (
+            client.delete(f"/app/organizations/acme/members/{too_long}").status_code
+            == 422
+        )
+        # A '..' segment, which a browser would resolve to another member, is refused.
+        dotted = "/app/organizations/acme/members/staff/%2E%2E/bob"
+        assert client.delete(dotted).status_code == 422
+        # Acme's only admin can't leave it without one.
+        assert (
+            client.put(
+                "/app/organizations/acme/members/alice",
+                json={"department": "acme/finance", "role": "member"},
+            ).status_code
+            == 409
+        )
+        assert client.delete("/app/organizations/acme/members/alice").status_code == 409
+        # An identity provider's subject may contain '/'.
+        assert (
+            client.put(
+                "/app/organizations/acme/members/staff/erin",
+                json={"department": "acme/legal"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete("/app/organizations/acme/members/staff/erin").status_code
+            == 204
+        )
+        assert client.delete("/app/organizations/acme/members/carol").status_code == 204
+
+        _sign_in(client, "carol")
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 404
+
+
+@requires_postgres
+def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> None:
+    command.upgrade(ALEMBIC, "head")
+    with session() as db:
+        seed(db)
+        db.commit()
+    app = _app(DatabaseMembershipDirectory())
+    with _client(app) as client:
+        assert client.get("/app/whoami").status_code == 401
+        _start(client, app, "personal")
+        _start(client, app, "department")
+
+        # An admin of any of their organizations is `admin`; others are members. Under
+        # `cayu serve --dev`, Cayu's inbox is open, so they may decide in the app's Inbox.
+        _sign_in(client, "alice")
+        alice = client.get("/app/whoami").json()
+        assert (alice["role"], alice["may_change"], alice["may_decide"]) == ("admin", True, True)
+        metrics = {
+            item["label"]: item["value"]
+            for item in client.get("/app/overview").json()["metrics"]
+        }
+        assert metrics == {
+            "Organizations": "1",
+            "Members": "3",
+            "Conversations": "2",
+            "Tasks": "0",
+        }
+
+        _sign_in(client, "carol")
+        carol = client.get("/app/whoami").json()
+        assert (carol["role"], carol["may_change"]) == ("member", False)
+        conversations = next(
+            item
+            for item in client.get("/app/overview").json()["metrics"]
+            if item["label"] == "Conversations"
+        )
+        # Carol sees Alice's department conversation, not her personal one.
+        assert conversations["value"] == "1"
+        assert conversations["description"].startswith("0 started by you")
+
+        _sign_in(client, "dave")
+        metrics = {
+            item["label"]: item["value"]
+            for item in client.get("/app/overview").json()["metrics"]
+        }
+        assert (metrics["Members"], metrics["Conversations"]) == ("1", "0")

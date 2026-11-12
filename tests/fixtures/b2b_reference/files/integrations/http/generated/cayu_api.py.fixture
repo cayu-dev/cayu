@@ -1,0 +1,54 @@
+"""GENERATED. Cayu's own API on this server, called in-process as the person behind a request.
+
+What Cayu already serves (the inbox, its counts) is read through its own route instead of
+being reimplemented: the request goes to this same server under `/api` without leaving the
+process, with the person's credentials (Cayu Cloud's identity header, a cookie, or the
+operator login), so Cayu checks them and applies its own rules, as on its dashboard.
+"""
+
+from __future__ import annotations
+
+import os
+
+import httpx
+from fastapi import Request
+
+# Where `cayu serve` serves Cayu's API.
+CAYU_API_PATH = "/api"
+# What the app says when Cayu doesn't let the person use its inbox, or doesn't answer.
+INBOX_CLOSED = (
+    "Cayu's inbox is open to this Agent's operators, not to you: they decide what waits on "
+    "the Developer dashboard."
+)
+INBOX_SILENT = "Cayu's inbox didn't answer."
+# What says who the person is, and where their request came from (Cayu refuses a
+# cross-origin write from a signed-in browser).
+FORWARDED_HEADERS = (
+    "authorization",
+    "x-cayu-identity",
+    "cookie",
+    "host",
+    "origin",
+    "referer",
+    "sec-fetch-site",
+)
+
+
+def cayu_api_client(request: Request, *, timeout: float = 30.0) -> httpx.AsyncClient:
+    """An HTTP client for Cayu's API on this server, as the person who sent ``request``.
+
+    Close it after use (``async with``).
+    """
+
+    names = set(FORWARDED_HEADERS)
+    configured = os.environ.get("CAYU_PROXY_IDENTITY_HEADER", "").strip().lower()
+    if configured:
+        names.add(configured)
+    return httpx.AsyncClient(
+        # Cayu's own 500 comes back as a response, as it would over the network, so the
+        # routes' handling of a failed answer runs instead of the exception escaping.
+        transport=httpx.ASGITransport(app=request.app, raise_app_exceptions=False),
+        base_url=f"{request.url.scheme}://{request.url.netloc}{CAYU_API_PATH}",
+        headers={name: value for name, value in request.headers.items() if name.lower() in names},
+        timeout=timeout,
+    )

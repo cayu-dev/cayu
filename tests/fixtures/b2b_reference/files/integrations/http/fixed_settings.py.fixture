@@ -1,0 +1,44 @@
+"""THE AGENT'S OWN. The settings this Agent reads from its environment when a process starts.
+
+The web app's Settings page lists them under "Need a redeploy", next to the managed
+settings Cayu Cloud changes while the Agent runs. Secrets (API keys, the database URL) are
+left out: the page would show their values.
+"""
+
+from __future__ import annotations
+
+from configuration.settings import (
+    configured_model,
+    configured_provider_choice,
+    configured_sign_in,
+)
+from integrations.http.generated import FixedSetting
+
+
+def fixed_settings() -> tuple[FixedSetting, ...]:
+    return (
+        FixedSetting(
+            name="provider",
+            env_var="CAYU_PROVIDER",
+            label="Model provider",
+            help="The provider the Agent's model calls go to. Unset, the Agent has none.",
+            why="Chosen when each process builds the app; a change needs a redeploy.",
+            current=configured_provider_choice,
+        ),
+        FixedSetting(
+            name="model",
+            env_var="CAYU_MODEL",
+            label="Model",
+            help="The default model, until Cayu Cloud binds the primary model slot.",
+            why="The agent is built with its model when each process starts; a change needs a redeploy.",
+            current=configured_model,
+        ),
+        FixedSetting(
+            name="sign_in",
+            env_var="APP_SIGN_IN",
+            label="Sign-in",
+            help="How people sign in to /app outside `cayu serve --dev`: cloud (Cayu Cloud's sign-in) or oidc (a bearer token).",
+            why="Read when the routes are built; a change needs a redeploy.",
+            current=configured_sign_in,
+        ),
+    )

@@ -1,0 +1,256 @@
+"""GENERATED. `GET /app/settings`: the Agent's managed settings, and the ones that need a redeploy.
+
+Every setting the application declares (`CayuApp.managed_settings()`: Cayu's own run
+limits and retries, budget limits, and the Agent's `app.*` settings) with its value, where
+the value comes from (set in Cayu Cloud, or the release's default), when a change applies,
+and the `cayu cloud settings` commands that change it. A change is made in Cayu Cloud,
+which checks the person's role and keeps who changed what; the web app shows the settings
+and can't change them itself yet.
+
+`read_only` lists what the Agent reads once when a process starts, from its environment
+(`FixedSetting`): changing one needs a redeploy. The Agent names them.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from cayu import CayuApp
+from cayu.managed_settings import ManagedSetting
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from integrations.http.generated.whoami import PersonDependency
+
+Value = bool | int | float | str | None
+Kind = Literal["bool", "int", "number", "choice", "text"]
+
+# Where a setting is listed, by the start of its key; the first match wins.
+GROUPS = (
+    ("config.run.limits.", "Run limits"),
+    ("config.run.retry_policy.", "Model calls"),
+    ("config.run.thinking.", "Model calls"),
+    ("config.", "Runs"),
+    ("budget.", "Budgets"),
+    ("app.", "This Agent"),
+    ("agent.", "Agents"),
+    ("provider.", "Providers"),
+    ("environment.", "Environments"),
+)
+APPLIES = {
+    "live": "Right away, without a restart.",
+    "next_session": "Sessions that start after the change.",
+    "restart": "After the Agent next restarts.",
+}
+KINDS: dict[str, Kind] = {
+    "bool": "bool",
+    "int": "int",
+    "number": "number",
+    "enum": "choice",
+    "string": "text",
+    "secret_ref": "text",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FixedSetting:
+    """A setting the Agent reads from its environment when a process starts."""
+
+    name: str
+    label: str
+    help: str
+    # Why a change needs a redeploy.
+    why: str
+    env_var: str | None = None
+    # The value in effect, as the code that uses it reads it.
+    current: Callable[[], Value] | None = None
+    # A check on the value in effect: a warning, or None.
+    warn: Callable[[Value], str | None] | None = None
+
+
+class LiveSettingRow(BaseModel):
+    name: str
+    key: str
+    env_var: str | None
+    group: str
+    label: str
+    help: str
+    applies: str
+    kind: Kind
+    choices: list[str]
+    minimum: int | float | None
+    maximum: int | float | None
+    blankOk: bool  # noqa: N815 (the web app's field name)
+    # None when the setting has no value (an unset limit).
+    value: Value
+    # managed (set in Cayu Cloud) or default (the release's value).
+    source: Literal["managed", "default"]
+    environment: str | None
+    default: Value
+    note: str
+    error: str | None
+    change: str
+    reset: str
+
+
+class FixedSettingRow(BaseModel):
+    name: str
+    env_var: str | None
+    label: str
+    help: str
+    value: Value
+    source: str | None
+    needs: str
+    why: str
+    warning: str | None
+
+
+class CloudState(BaseModel):
+    # applied, stale (past its validity) or unreported (never read); None outside Cloud.
+    state: str | None
+    # What the last read did: ready, unavailable, schema_missing; None outside Cloud.
+    status: str | None
+
+
+class SettingsView(BaseModel):
+    settings: list[LiveSettingRow]
+    read_only: list[FixedSettingRow]
+    managed: bool
+    cloud: CloudState
+    history: str
+
+
+def settings_view(
+    app: CayuApp, *, application: str, fixed: Sequence[FixedSetting] = ()
+) -> SettingsView:
+    controller = app.managed_settings_controller
+    cloud = CloudState(
+        state=None if controller is None else controller.state(),
+        status=None if controller is None else controller.status,
+    )
+    return SettingsView(
+        settings=[_live(app, setting, cloud, application) for setting in app.managed_settings()],
+        read_only=[_fixed(setting) for setting in fixed],
+        managed=controller is not None,
+        cloud=cloud,
+        history=(
+            f"cayu cloud settings list --application {shlex.quote(application)} "
+            "shows each value and where it comes from"
+        ),
+    )
+
+
+def router(
+    app: CayuApp,
+    *,
+    person: PersonDependency,
+    application: str,
+    fixed: Callable[[], Sequence[FixedSetting]],
+) -> APIRouter:
+    # Only a signed-in person reads them; any role may.
+    routes = APIRouter(dependencies=[Depends(person)])
+
+    @routes.get("/settings")
+    async def get_settings() -> SettingsView:
+        return settings_view(app, application=application, fixed=fixed())
+
+    return routes
+
+
+def _live(
+    app: CayuApp, setting: ManagedSetting, cloud: CloudState, application: str
+) -> LiveSettingRow:
+    controller = app.managed_settings_controller
+    snapshot = None
+    if controller is not None:
+        # A restart setting applies the value read when the app was built.
+        snapshot = controller.build_snapshot if setting.applies == "restart" else controller.snapshot
+    value = app.managed_setting_value(setting.key)
+    error = None
+    source: Literal["managed", "default"] = "default"
+    if snapshot is not None:
+        # A refused value can be missing from `values`: Cloud reports it only as a conflict.
+        reason = next(
+            (item.reason for item in snapshot.conflicts if item.key == setting.key), None
+        )
+        if reason is not None:
+            error = f"The value set in Cayu Cloud is refused: {reason}."
+        elif setting.key in snapshot.values:
+            if snapshot.values[setting.key] == value:
+                source = "managed"
+            else:
+                error = "The value set in Cayu Cloud is refused."
+    quoted = shlex.quote(application)
+    shown = "VALUE" if value is None and setting.default is None else json.dumps(
+        value if value is not None else setting.default
+    )
+    return LiveSettingRow(
+        name=setting.key,
+        key=setting.key,
+        env_var=None,
+        group=next((label for prefix, label in GROUPS if setting.key.startswith(prefix)), "Other"),
+        label=setting.label,
+        help=setting.description or "",
+        applies=APPLIES[setting.applies],
+        kind=KINDS[setting.type],
+        choices=[choice.value for choice in setting.choices or ()],
+        minimum=setting.minimum,
+        maximum=setting.maximum,
+        blankOk=setting.default is None,
+        value=value,
+        source=source,
+        environment=None,
+        default=setting.default,
+        note=_note(setting, source, cloud),
+        error=error,
+        change=f"cayu cloud settings set --application {quoted} "
+        + shlex.quote(f"{setting.key}={shown}"),
+        reset=f"cayu cloud settings unset --application {quoted} {shlex.quote(setting.key)}",
+    )
+
+
+def _note(setting: ManagedSetting, source: str, cloud: CloudState) -> str:
+    if cloud.state == "unreported":
+        why = " (Cloud has no schema for this release yet)" if cloud.status == "schema_missing" else ""
+        return (
+            f"Cayu Cloud's settings couldn't be read{why}, so {setting.key} as set there, if it "
+            "is, doesn't apply yet; this is the value without it."
+        )
+    stale = (
+        " Cayu Cloud hasn't answered for over five minutes; this is its last value."
+        if cloud.state == "stale"
+        else ""
+    )
+    if source == "managed":
+        return f"Set in Cayu Cloud as {setting.key}.{stale}"
+    if setting.default is None:
+        return f"Not set in the release; set {setting.key} in Cayu Cloud to set it.{stale}"
+    return f"The release's value; set {setting.key} in Cayu Cloud to change it.{stale}"
+
+
+def _fixed(setting: FixedSetting) -> FixedSettingRow:
+    problem = None
+    value: Any = None
+    if setting.current is not None:
+        try:
+            value = setting.current()
+        except (RuntimeError, ValueError) as exc:
+            problem = str(exc)
+    return FixedSettingRow(
+        name=setting.name,
+        env_var=setting.env_var,
+        label=setting.label,
+        help=setting.help,
+        value=value,
+        source=None
+        if setting.env_var is None
+        else ("environment" if os.environ.get(setting.env_var, "").strip() else "default"),
+        needs="redeploy" if setting.env_var else "not a setting yet",
+        why=setting.why,
+        warning=problem or (setting.warn(value) if setting.warn else None),
+    )
