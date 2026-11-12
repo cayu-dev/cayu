@@ -16,8 +16,8 @@ class GitHubError(RuntimeError):
     """A GitHub call that failed: the request (``method``, ``path``), GitHub's ``status`` and
     ``message``, its ``x-github-request-id`` and the ``codes`` of its ``errors[]``.
 
-    ``ambiguous`` is true when a write may have taken effect before it failed (a 5xx or a lost
-    answer): don't resend it unless resending is safe.
+    ``ambiguous`` is true when a write may have taken effect before it failed (a 5xx, a lost or
+    oversized answer, a failed mutation): don't resend it unless resending is safe.
     """
 
     def __init__(
@@ -82,7 +82,7 @@ class GitHubWriteRefused(GitHubError):
 
 class GitHubGraphQLFailed(GitHubError):
     """A GraphQL answer with errors the caller didn't accept, or with no ``data``; ``data`` is
-    whatever GitHub did answer."""
+    whatever GitHub did answer. Always ``ambiguous`` for a mutation."""
 
     def __init__(
         self,
@@ -98,8 +98,9 @@ class GitHubGraphQLFailed(GitHubError):
 
 
 class GitHubConnectionRefused(GitHubError):
-    """The slot or its host refused to send the call; ``code`` names why (``scope_not_allowed``,
-    ``connection_unbound``, ...)."""
+    """The slot or its host refused the call; ``code`` names why (``scope_not_allowed``,
+    ``connection_unbound``, ...). ``ambiguous`` for a write it refused after GitHub may have
+    carried it out (``upstream_response_too_large``)."""
 
     def __init__(self, message: str, *, code: str, **kwargs: Any) -> None:
         super().__init__(message, **kwargs)

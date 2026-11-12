@@ -444,3 +444,29 @@ def test_review_fields_show_the_channel_and_the_text() -> None:
         "slack_update_message": ("channel", "ts", "text"),
     }
     ToolArgumentReview(fields, binding_key=b"k" * 32)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [Refusal(502, "upstream_failed"), Refusal(502, "upstream_response_too_large")],
+)
+def test_a_post_that_may_have_run_is_ambiguous_and_never_advised_to_retry(
+    refusal: Refusal,
+) -> None:
+    broker = FakeBroker(lambda _: refusal)
+    tools = _tools(broker)
+    result = _run(tools["slack_post_message"], channel="C1", text="Deployed.")
+
+    assert result.is_error and result.structured is not None
+    assert result.structured["error"] == refusal.code
+    assert result.structured["ambiguous"] is True
+    assert "may have taken effect" in result.structured["advice"]
+    assert "read the channel's latest messages" in result.structured["advice"]
+    assert "retry later" not in result.content
+
+    read = _run(tools["slack_list_channels"])
+    assert read.structured is not None and "ambiguous" not in read.structured
+
+    refused = FakeBroker(lambda _: Refusal(422, "scope_not_allowed"))
+    unsent = _run(_tools(refused)["slack_post_message"], channel="C1", text="Deployed.")
+    assert unsent.structured is not None and "ambiguous" not in unsent.structured

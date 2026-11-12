@@ -84,12 +84,23 @@ def invalid_arguments(message: str) -> ToolResult:
 
 
 def call_error_result(
-    error: ConnectionCallError, slot: str, advice: Mapping[str, str] | None = None
+    error: ConnectionCallError,
+    slot: str,
+    advice: Mapping[str, str] | None = None,
+    *,
+    write: bool = False,
+    check: str = "check whether it did",
 ) -> ToolResult:
     """A call the client or broker refused, as a tool error naming its code and what to do;
-    ``advice`` gives a toolkit's own words for some codes."""
+    ``advice`` gives a toolkit's own words for some codes.
+
+    A ``write`` whose failure is ``ambiguous`` (the connector may have carried it out) is never
+    advised to be retried: its result says ``ambiguous`` and to ``check`` first, in the
+    toolkit's words for how (``"read the channel's latest messages"``)."""
 
     code = error.code
+    if write and error.ambiguous:
+        return ambiguous_write_result(code or "connection_failed", str(error), check)
     if code is None:
         return error_result(
             "connection_failed", str(error), TEMPORARY, retry_after_seconds=error.retry_after
@@ -104,6 +115,15 @@ def call_error_result(
     else:
         said = "The call was refused; don't retry it unchanged."
     return error_result(code, str(error), said, retry_after_seconds=error.retry_after)
+
+
+def ambiguous_write_result(code: str, message: str, check: str) -> ToolResult:
+    """A write that may have taken effect before it failed: never advised to be retried before
+    ``check``, in the toolkit's words for how."""
+
+    return error_result(
+        code, message, f"It may have taken effect; {check} before retrying.", ambiguous=True
+    )
 
 
 def rate_limited_result(message: str, retry_after: float | None) -> ToolResult:

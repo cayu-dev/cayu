@@ -14,7 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from cayu.connections import ConnectionResponse
+from cayu.connections import ConnectionCallError, ConnectionResponse
 from cayu.connectors import github
 from cayu.connectors.github import markers as markers_module
 from cayu.connectors.github.testing import Call, FakeGitHub, reply
@@ -653,3 +653,21 @@ def test_an_issue_whose_answer_was_lost_is_found_not_filed_again(fakes: Fakes) -
     filed = _file(fake)
     assert (filed.outcome, filed.number) == (github.WriteOutcome.CREATED, _filed(fake)[0].number)
     assert len(fake.writes()) == 1
+
+
+def test_a_comment_answered_too_large_after_it_landed_is_looked_up_not_resent(
+    fakes: Fakes, waits: list[float]
+) -> None:
+    fake = fakes()
+
+    def landed_then_too_large(call: Call, groups: Any) -> ConnectionResponse:
+        fake.add_comment(REPO, int(groups[0]), call.json()["body"], author=fake.login)
+        raise ConnectionCallError(
+            "The connector's answer is over 5242880 bytes.", code="upstream_response_too_large"
+        )
+
+    fake.route("POST", r"issues/(\d+)/comments", landed_then_too_large)
+    written = _comment_once(fake)
+    assert (written.outcome, written.id) == (github.WriteOutcome.CREATED, _comments(fake)[0].id)
+    assert len(fake.writes()) == 1
+    assert waits == [1.0]

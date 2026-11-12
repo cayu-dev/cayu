@@ -203,7 +203,13 @@ class _Statement:
                 self._settings.slot, method, path, query=query, headers=_HEADERS, body=body
             )
 
-    async def run(self, statement: str, request: str, context: Mapping[str, str]) -> ToolResult:
+    async def run(
+        self, statement: str, request: str, context: Mapping[str, str], *, write: bool
+    ) -> ToolResult:
+        """The statement's bounded answer. A ``write`` whose submission may have reached
+        Snowflake fails ``ambiguous``: a retry of the same call is deduplicated by its request
+        ID, but a new call would run it again."""
+
         body = {
             "statement": statement,
             # Snowflake stops the statement itself shortly after the tool would cancel it.
@@ -221,7 +227,12 @@ class _Statement:
         except TimeoutError:
             return _timed_out(self._budget, None, cancelled=False)
         except ConnectionCallError as error:
-            return _common.call_error_result(error, self._settings.slot)
+            return _common.call_error_result(
+                error,
+                self._settings.slot,
+                write=write,
+                check="query what the statement changes, or the query history",
+            )
         if response.status != 202:
             return await self._result(response, None)
         handle = _handle(_common.json_body(response) or {})
@@ -550,7 +561,7 @@ class _SnowflakeTool(Tool):
                 "The run's deadline leaves no time to run a statement.",
             )
         return await _Statement(self._settings, client, budget).run(
-            statement, _request_id(ctx.idempotency_key), context
+            statement, _request_id(ctx.idempotency_key), context, write=not reads
         )
 
 

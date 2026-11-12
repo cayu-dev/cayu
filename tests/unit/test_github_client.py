@@ -775,3 +775,107 @@ def test_listings_page_through_links_naming_their_owner_by_id() -> None:
         broker = _owner_paged(path, other)
         with pytest.raises(github.GitHubError, match="isn't the same listing"):
             asyncio.run(_gh(broker).list(path))
+
+
+_COMMENTS = f"/repos/{REPO}/issues/1/comments"
+
+
+@pytest.mark.parametrize(
+    ("failure", "error", "ambiguous"),
+    [
+        (Answer(status=500), github.GitHubUnavailable, True),
+        (Answer(status=502), github.GitHubUnavailable, True),
+        (Refusal(502, "upstream_failed"), github.GitHubUnavailable, True),
+        (Refusal(502, "upstream_response_too_large"), github.GitHubConnectionRefused, True),
+        (Refusal(502, "a_code_this_release_doesnt_know"), github.GitHubConnectionRefused, True),
+        (Refusal(422, "scope_not_allowed"), github.GitHubConnectionRefused, False),
+        (Refusal(409, "connection_not_ready"), github.GitHubConnectionRefused, False),
+        (
+            Refusal(429, "too_many_calls", headers={"retry-after": "2"}),
+            github.GitHubRateLimited,
+            False,
+        ),
+        (Refusal(429, "too_many_calls"), github.GitHubRateLimited, False),
+        (Answer(status=429, headers={"retry-after": "5"}), github.GitHubRateLimited, False),
+        (Answer(status=409, body={"message": "Conflict"}), github.GitHubConflict, False),
+    ],
+)
+def test_without_rate_limit_waits_a_failed_write_is_sent_once_and_ambiguous_when_it_may_have_run(
+    failure: Answer | Refusal, error: type[github.GitHubError], ambiguous: bool
+) -> None:
+    broker = FakeBroker(_answers(failure, Answer(status=201, body={"id": 1})))
+    gh = _gh(broker, max_rate_limit_wait_seconds=0)
+    with pytest.raises(error) as raised:
+        asyncio.run(gh.post(_COMMENTS, json={"body": "x"}))
+    assert type(raised.value) is error
+    assert raised.value.ambiguous is ambiguous
+    assert len(broker.sent) == 1
+
+
+def test_without_rate_limit_waits_a_write_github_refused_unexecuted_is_resent_once(
+    waits: list[float],
+) -> None:
+    past = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(time.time()) - 5)}
+    for limited in (Answer(status=429, headers={"retry-after": "0"}), Answer(403, headers=past)):
+        broker = FakeBroker(_answers(limited, Answer(status=201, body={"id": 1})))
+        gh = _gh(broker, max_rate_limit_wait_seconds=0)
+        assert asyncio.run(gh.post(_COMMENTS, json={"body": "x"})) == {"id": 1}
+        assert len(broker.sent) == 2
+
+        twice = FakeBroker(_answers(limited))
+        with pytest.raises(github.GitHubRateLimited):
+            asyncio.run(_gh(twice, max_rate_limit_wait_seconds=0).post(_COMMENTS, json={}))
+        assert len(twice.sent) == 2
+    assert waits == [0.0] * 4
+
+
+def test_an_answer_too_large_for_a_read_is_refused_unambiguous_and_not_retried() -> None:
+    broker = FakeBroker(_answers(Refusal(502, "upstream_response_too_large")))
+    with pytest.raises(
+        github.GitHubConnectionRefused, match="GET .* was answered too large"
+    ) as raised:
+        asyncio.run(_gh(broker).get(f"/repos/{REPO}/pulls"))
+    assert (raised.value.code, raised.value.ambiguous) == ("upstream_response_too_large", False)
+    assert len(broker.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        Answer(body={"data": None, "errors": [{"message": "Something went wrong"}]}),
+        Answer(body={"errors": [{"type": "INTERNAL", "message": "Timeout"}]}),
+        Answer(body=b"<html>busy</html>"),
+    ],
+)
+def test_a_failed_mutation_is_ambiguous_even_without_data_and_a_query_isnt(answer: Answer) -> None:
+    mutation = FakeBroker(_answers(answer))
+    with pytest.raises(github.GitHubGraphQLFailed) as raised:
+        asyncio.run(
+            _gh(mutation, max_rate_limit_wait_seconds=0).graphql(
+                "mutation { markPullRequestReadyForReview(input: {}) { clientMutationId } }",
+                repository=REPO,
+            )
+        )
+    assert raised.value.ambiguous is True
+    assert len(mutation.sent) == 1
+
+    query = FakeBroker(_answers(answer))
+    with pytest.raises(github.GitHubGraphQLFailed) as raised:
+        asyncio.run(_gh(query, read_retries=0).graphql("{ viewer { login } }", repository=REPO))
+    assert raised.value.ambiguous is False
+
+
+def test_a_slot_failure_is_worded_by_what_happened_to_the_call() -> None:
+    def failure(refusal: Refusal, method: str) -> str:
+        broker = FakeBroker(_answers(refusal))
+        with pytest.raises(github.GitHubError) as raised:
+            asyncio.run(_gh(broker, read_retries=0).request(method, f"/repos/{REPO}/pulls"))
+        return str(raised.value)
+
+    too_large = Refusal(502, "upstream_response_too_large")
+    assert f"POST /repos/{REPO}/pulls" in failure(too_large, "POST")
+    assert "may have sent POST" in failure(too_large, "POST")
+    assert f"GET /repos/{REPO}/pulls was answered too large" in failure(too_large, "GET")
+    assert "got no answer to GET" in failure(Refusal(502, "upstream_failed"), "GET")
+    unsent = failure(Refusal(422, "path_not_allowed"), "POST")
+    assert "didn't send POST" in unsent and "may have sent" not in unsent

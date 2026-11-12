@@ -264,14 +264,31 @@ class GitHubAppConnections:
                 code="path_not_allowed",
             )
         repository = self._repository(named, path)
-        token = await self._token(repository)
+        token = await self._call_token(repository)
         response = await self._send(method, path, query, sent, body, token)
         if response.status == 401:
             self._drop(repository, token)
             response = await self._send(
-                method, path, query, sent, body, await self._token(repository)
+                method, path, query, sent, body, await self._call_token(repository)
             )
         return response
+
+    async def _call_token(self, repository: str) -> str:
+        """The call's token. Minting it happens before the call is sent (or after GitHub
+        refused it unexecuted, 401): a failure that would read as one GitHub may have carried
+        out is ``credential_unavailable``, which says it wasn't."""
+
+        try:
+            return await self._token(repository)
+        except ConnectionCallError as error:
+            if not error.ambiguous:
+                raise
+            raise ConnectionCallError(
+                f"No installation token for {repository}: {error}",
+                code="credential_unavailable",
+                status=error.status,
+                retry_after=error.retry_after,
+            ) from None
 
     async def login(self) -> str:
         """The App's bot login, ``<slug>[bot]``: the author of every comment it writes."""

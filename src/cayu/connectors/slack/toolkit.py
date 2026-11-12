@@ -148,7 +148,14 @@ class _SlackTool(Tool):
                     body=json.dumps(body, ensure_ascii=False).encode(),
                 )
         except ConnectionCallError as error:
-            raise _SlackError(_common.call_error_result(error, self._slot)) from None
+            raise _SlackError(
+                _common.call_error_result(
+                    error,
+                    self._slot,
+                    write=body is not None,
+                    check="read the channel's latest messages",
+                )
+            ) from None
         return _answer(method, response)
 
 

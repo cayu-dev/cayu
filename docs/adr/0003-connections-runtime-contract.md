@@ -85,15 +85,31 @@ has it today).
   every environment it runs in shares. This is a new wiring path beside `vault` and `proxy`,
   and it's the main structural choice to review. Until then, tools construct a client
   themselves.
-- **Errors.** `ConnectionCallError`, raised only when the request wasn't sent, with the
-  broker's `code`, HTTP `status` and `retry_after` (seconds, from the broker's `Retry-After`):
-  `agent_credential_invalid`, `connection_unbound`, `connection_unavailable`,
-  `connection_not_ready`, `connector_not_brokered`, `credential_invalid`, `scope_not_allowed`,
+- **Errors.** `ConnectionCallError`, raised when the call failed without the connector's
+  answer, with the broker's `code`, HTTP `status` and `retry_after` (seconds, from the broker's
+  `Retry-After`). Codes refused before sending, or after the connector refused the call
+  unexecuted (a 401 its credential couldn't be renewed for), so the connector never carried
+  it out: `agent_credential_invalid`, `connection_unbound`, `connection_unavailable`,
+  `connection_not_ready`, `connector_not_brokered`, `credential_invalid`,
+  `credential_unavailable` (the call's credential couldn't be had), `scope_not_allowed`,
   `path_not_allowed`, `path_invalid`, `method_not_allowed`, `headers_invalid`, `body_too_large`,
-  `request_too_large`, `too_many_calls`, `upstream_failed`, `upstream_response_too_large`. The
-  client refuses `path_invalid`, `headers_invalid` and `body_too_large` itself, before sending.
-  The connector's own status is the answer's, whatever it is. A bound connection that fails
-  never falls back to another credential.
+  `request_too_large`, `too_many_calls` (and the request and connector checks
+  `invalid_request`, `body_invalid`, `slot_invalid`, `body_not_allowed`, `header_not_allowed`,
+  `query_not_allowed`, `host_not_allowed`, `auth_failed`, `token_url_unreachable`). Codes that
+  may follow the connector's carrying it out, so `ambiguous` is true: no code (the broker
+  unreachable, or its answer lost or malformed), `upstream_failed` (also the broker's timeout),
+  `upstream_response_too_large` (the connector answered more than 5 MiB), and any code not
+  listed above. A write that fails `ambiguous` is never sent again before the caller has
+  checked whether it took effect. The client refuses `path_invalid`, `headers_invalid` and
+  `body_too_large` itself, before sending. The connector's own status is the answer's, whatever
+  it is. A bound connection that fails never falls back to another credential.
+- **Refusing after sending.** An upstream may refuse a connector's answer after the call
+  (`check_answer`, such as Slack's `scope_not_allowed` for email addresses) only for a call
+  without an effect. Upstreams don't refuse a write after sending it, except with the
+  may-follow codes above, so a caller with a write-once or durable write can trust a refusal
+  with any other code to mean the write wasn't done. Cayu Cloud's GitHub upstream is held to
+  this: its `check_answer` never refuses a call that isn't a `GET`, or does so only with a code
+  outside the before-sending list.
 - **`CloudConnectionBroker`.** Configured from `CAYU_CONNECTIONS_URL`, the broker's base URL
   (`<api>/v1/agent-connections`), and `CAYU_CONNECTIONS_TOKEN`, a credential Cloud issues each
   Agent for the broker alone, so a leaked attention token can't use the Agent's connections and
@@ -104,7 +120,7 @@ has it today).
 - **`LocalConnections`.** For laptops and tests: each slot is a `LocalSlot(base_url, headers)`
   the application gives, so the same tool code runs locally with the developer's own
   credential. It refuses the paths the broker refuses and any path that would leave the slot's
-  host.
+  host, and an answer over 5 MiB with `upstream_response_too_large`, as the broker does.
 
 ## MCP through a slot
 

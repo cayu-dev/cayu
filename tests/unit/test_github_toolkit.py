@@ -797,3 +797,66 @@ def test_cayu_check_sees_the_github_write_tools_guarded() -> None:
         {},
     )
     assert described(AllowAllToolPolicy())[1] == dict.fromkeys(WRITES, "EXTERNAL_TOOL_UNGUARDED")
+
+
+def _write_calls(fake: FakeGitHub) -> dict[str, tuple[str, str, dict[str, Any]]]:
+    """Each write tool's call on pull 7 (and its failed run): method, path and arguments."""
+
+    pull = fake.add_pull(REPO, 7)
+    run = fake.add_workflow_run(REPO, pull.head_sha, conclusion="failure")
+    head = {"number": 7, "head_sha": pull.head_sha}
+    return {
+        "github_comment": ("POST", f"/repos/{REPO}/issues/7/comments", {"number": 7, "body": "hi"}),
+        "github_rerun_failed_jobs": (
+            "POST",
+            f"/repos/{REPO}/actions/runs/{run.id}/rerun-failed-jobs",
+            {"run_id": run.id},
+        ),
+        "github_update_branch": ("PUT", f"/repos/{REPO}/pulls/7/update-branch", head),
+        "github_merge_pull": ("PUT", f"/repos/{REPO}/pulls/7/merge", head),
+    }
+
+
+_CHECKS = {
+    "github_comment": "read the pull request's or issue's latest comments",
+    "github_rerun_failed_jobs": "read the run's attempts",
+    "github_update_branch": "read the pull request's head",
+    "github_merge_pull": "read whether the pull request was merged",
+}
+
+
+@pytest.mark.parametrize("tool", WRITES)
+@pytest.mark.parametrize("failure", ["upstream_response_too_large", "upstream_failed", "502"])
+def test_a_write_that_may_have_run_says_how_to_check_and_never_to_retry_later(
+    tool: str, failure: str
+) -> None:
+    fake = _fake()
+    method, path, args = _write_calls(fake)[tool]
+    if failure == "502":
+        fake.fail(method, path, status=502)
+    else:
+        fake.refuse(failure, method, path)
+    error = _error(_run(_tools(fake)[tool], repository=REPO, **args))
+
+    assert error["error"] == ("upstream_failed" if failure == "502" else failure)
+    assert error["ambiguous"] is True
+    assert error["advice"] == f"It may have taken effect; {_CHECKS[tool]} before retrying."
+    assert "retry later" not in error["advice"]
+    assert len(fake.writes()) == 1
+    assert not fake.unanswered
+
+
+@pytest.mark.parametrize("tool", WRITES)
+def test_a_write_refused_before_sending_and_a_read_are_never_ambiguous(tool: str) -> None:
+    fake = _fake()
+    method, path, args = _write_calls(fake)[tool]
+    fake.refuse("scope_not_allowed", method, path)
+    refused = _error(_run(_tools(fake)[tool], repository=REPO, **args))
+    fake.refuse("upstream_response_too_large", "GET", f"/repos/{REPO}/issues/7")
+    read = _error(_run(_tools(fake)["github_read_issue"], repository=REPO, number=7))
+
+    assert refused["error"] == "scope_not_allowed" and "ambiguous" not in refused
+    assert "don't retry" in refused["advice"]
+    assert read["error"] == "upstream_response_too_large" and "ambiguous" not in read
+    assert "ask for less" in read["advice"]
+    assert not fake.unanswered

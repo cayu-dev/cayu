@@ -54,11 +54,52 @@ class ConnectionResponse:
         return next((value for key, value in self.headers if key == name.lower()), None)
 
 
-class ConnectionCallError(Exception):
-    """The request wasn't sent through the slot; ``code`` names why, when the host said.
+#: The codes a slot's host refuses a call with before the connector carries it out: the call
+#: never reached the connector, or the connector refused it unexecuted (a 401 its credential
+#: couldn't be renewed for). Cayu Cloud's broker refuses with these before forwarding, as the
+#: clients here do before sending. ``scope_not_allowed`` also refuses a read's answer once it
+#: has come (Slack's email addresses), never a write's: a host refuses a call with an effect
+#: after sending it only with a code not in this set.
+_REFUSED_BEFORE_SENDING = frozenset(
+    {
+        "agent_credential_invalid",
+        "auth_failed",
+        "body_invalid",
+        "body_not_allowed",
+        "body_too_large",
+        "connection_not_ready",
+        "connection_unavailable",
+        "connection_unbound",
+        "connector_not_brokered",
+        "credential_invalid",
+        "credential_unavailable",
+        "header_not_allowed",
+        "headers_invalid",
+        "host_not_allowed",
+        "invalid_request",
+        "method_not_allowed",
+        "path_invalid",
+        "path_not_allowed",
+        "query_not_allowed",
+        "request_too_large",
+        "scope_not_allowed",
+        "slot_invalid",
+        "token_url_unreachable",
+        "too_many_calls",
+    }
+)
 
-    ``retry_after`` is how many seconds the host asked the caller to wait before trying again
-    (its ``Retry-After``), when it said.
+
+class ConnectionCallError(Exception):
+    """The call through the slot failed without the connector's answer; ``code`` names why,
+    when the host said.
+
+    ``ambiguous`` is true when the connector may have carried the call out all the same: no
+    answer from the host (no ``code``), ``upstream_failed``, ``upstream_response_too_large``
+    (the connector answered, too much), or any code but those a host refuses with before
+    sending. A write that fails ambiguous mustn't be sent again before checking whether it
+    took effect. ``retry_after`` is how many seconds the host asked the caller to wait before
+    trying again (its ``Retry-After``), when it said.
     """
 
     def __init__(
@@ -73,6 +114,10 @@ class ConnectionCallError(Exception):
         self.code = code
         self.status = status
         self.retry_after = retry_after
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.code not in _REFUSED_BEFORE_SENDING
 
 
 class ConnectionClient(Protocol):
@@ -254,6 +299,9 @@ class LocalConnections:
             if name not in _HOP_HEADERS
         }
         sent.update({name.lower(): value for name, value in configured.headers.items()})
+        # Uncompressed, as the broker asks: the size limit then holds as the answer arrives,
+        # and no small compressed chunk inflates past it in memory.
+        sent["accept-encoding"] = "identity"
         url = httpx.URL(configured.base_url.rstrip("/") + path)
         if url.host != httpx.URL(configured.base_url).host:
             raise ConnectionCallError(
@@ -265,17 +313,18 @@ class LocalConnections:
             for each in ([value] if isinstance(value, str) else value)
         ]
         try:
-            async with httpx.AsyncClient(
-                transport=self._transport, timeout=self._timeout
-            ) as client:
-                response = await client.request(
+            async with (
+                httpx.AsyncClient(transport=self._transport, timeout=self._timeout) as client,
+                client.stream(
                     method.upper(),
                     url,
                     params=params,
                     headers=sent,
                     content=body,
                     follow_redirects=False,
-                )
+                ) as response,
+            ):
+                answered = await _bounded_body(response)
         except httpx.HTTPError as exc:
             raise ConnectionCallError(
                 f"The slot {slot}'s host is unreachable ({type(exc).__name__}).",
@@ -284,8 +333,24 @@ class LocalConnections:
         return ConnectionResponse(
             status=response.status_code,
             headers=tuple((name.lower(), value) for name, value in response.headers.multi_items()),
-            body=response.content,
+            body=answered,
         )
+
+
+async def _bounded_body(response: httpx.Response) -> bytes:
+    """The answer's body, refused (``upstream_response_too_large``) once it passes
+    ``MAX_BODY_BYTES``, as Cayu Cloud's broker refuses it: the connector has answered, so a
+    write it carried out is ambiguous."""
+
+    received = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(received) + len(chunk) > MAX_BODY_BYTES:
+            raise ConnectionCallError(
+                f"The connector's answer is over {MAX_BODY_BYTES} bytes.",
+                code="upstream_response_too_large",
+            )
+        received.extend(chunk)
+    return bytes(received)
 
 
 def retry_after_seconds(value: str | None) -> float | None:

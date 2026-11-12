@@ -29,6 +29,7 @@ from cayu.connections import (
 )
 from cayu.connections.client import kept_open
 from cayu.connectors.github._errors import (
+    GitHubAppNotInstalled,
     GitHubConnectionRefused,
     GitHubError,
     GitHubGraphQLFailed,
@@ -85,7 +86,8 @@ _LIMIT_WAIT_SECONDS = 60.0
 #: The wait after the broker's own ``too_many_calls`` when it names no time.
 _BUSY_SECONDS = 1.0
 _BACKOFF_SECONDS = 0.5
-_TRANSIENT_CODES = frozenset({"upstream_failed"})
+#: Retried for reads: GitHub, or the slot's credential for the call, couldn't be reached.
+_TRANSIENT_CODES = frozenset({"upstream_failed", "credential_unavailable"})
 _sleep = asyncio.sleep
 _Bound = TypeVar("_Bound")
 #: A page's items (``GitHubClient.list`` hides the builtin in the class's scope).
@@ -154,9 +156,11 @@ class GitHubClient:
     ``read_only=True`` refuses every write before sending it and records it in ``refused``.
     A rate limit is waited out and the call resent once when the wait is at most
     ``max_rate_limit_wait_seconds``; a read that fails with a 5xx or no answer is retried up to
-    ``read_retries`` times. ``transport`` is for the one direct download ``text()`` makes when
-    GitHub redirects a log read; by default it is the connection client's own
-    ``download_transport``, when it has one, as a test's fake GitHub does.
+    ``read_retries`` times. A write is sent again only after GitHub refused it unexecuted (that
+    rate limit, or a 401 an App slot renews its token for), at most once for each; one that
+    fails after it may have reached GitHub is raised with ``ambiguous`` set. ``transport`` is for the one direct
+    download ``text()`` makes when GitHub redirects a log read; by default it is the connection
+    client's own ``download_transport``, when it has one, as a test's fake GitHub does.
     """
 
     def __init__(
@@ -356,8 +360,9 @@ class GitHubClient:
         partial answer. A null ``repository`` raises ``GitHubNotFound``, unless ``accept``
         took its error. An answer whose errors are a rate limit (``RATE_LIMITED``, in a 200) is
         waited out and sent once more like a REST call's, else raises ``GitHubRateLimited``;
-        a mutation is sent again only when none of it ran (no ``data``), and otherwise fails
-        with ``ambiguous`` set.
+        a mutation is sent again only when none of it ran (no ``data``). Any other failure of a
+        mutation is ``ambiguous``: GitHub answers errors, or no ``data``, after part of one ran,
+        as when it times out.
         """
 
         repository = _checked_repository(repository)
@@ -483,7 +488,18 @@ class GitHubClient:
                         self._slot, method, path, query=query, headers=sent, body=body
                     )
             except ConnectionCallError as error:
-                failure = self._refusal(error, method, path, ambiguous=not retry_failures)
+                failure = self._refusal(error, method, path, write=not retry_failures)
+            except GitHubAppNotInstalled as missing:
+                # Raised while minting the call's token, before the call was sent: it names the
+                # call, not the App's own.
+                raise GitHubAppNotInstalled(
+                    f"{missing.message} {method} {path} wasn't carried out.",
+                    repository=missing.repository,
+                    method=method,
+                    path=path,
+                    status=missing.status,
+                    request_id=missing.request_id,
+                ) from None
             else:
                 response = GitHubResponse(answer.status, answer.headers, answer.body)
                 failure = _limited_or_unavailable(
@@ -509,12 +525,23 @@ class GitHubClient:
             raise failure
 
     def _refusal(
-        self, error: ConnectionCallError, method: str, path: str, *, ambiguous: bool
+        self, error: ConnectionCallError, method: str, path: str, *, write: bool
     ) -> GitHubError:
+        """The typed error for a call the slot failed: ambiguous for a write that may have
+        reached GitHub (``ConnectionCallError.ambiguous``)."""
+
         code = error.code
-        message = f"The slot {self._slot} didn't send {method} {path}: {error}" + (
-            f" ({code})" if code else ""
-        )
+        ambiguous = write and error.ambiguous
+        call = f"{method} {path}"
+        if ambiguous:
+            what = f"The slot {self._slot} may have sent {call}"
+        elif not error.ambiguous:
+            what = f"The slot {self._slot} didn't send {call}"
+        elif code == "upstream_response_too_large":
+            what = f"{call} was answered too large for the slot {self._slot}"
+        else:
+            what = f"The slot {self._slot} got no answer to {call}"
+        message = f"{what}: {error}" + (f" ({code})" if code else "")
         if code == "too_many_calls":
             return GitHubRateLimited(
                 message,
@@ -529,7 +556,7 @@ class GitHubClient:
                 message, method=method, path=path, status=error.status, ambiguous=ambiguous
             )
         return GitHubConnectionRefused(
-            message, code=code, method=method, path=path, status=error.status
+            message, code=code, method=method, path=path, status=error.status, ambiguous=ambiguous
         )
 
     async def _download(self, location: str, path: str) -> str:
@@ -635,7 +662,11 @@ def _graphql_answer(
         answer = None
     if not isinstance(answer, dict):
         raise GitHubGraphQLFailed(
-            "GitHub's GraphQL answer isn't a JSON object.", errors=(), data=None, **fields
+            "GitHub's GraphQL answer isn't a JSON object.",
+            errors=(),
+            data=None,
+            ambiguous=mutation,
+            **fields,
         )
     data = answer.get("data") if isinstance(answer.get("data"), dict) else None
     errors = graphql_errors(answer.get("errors"))
@@ -669,7 +700,7 @@ def _graphql_answer(
             error_text("GitHub's GraphQL answer has errors", said or "no data", request_id),
             errors=errors,
             data=data,
-            ambiguous=mutation and data is not None,
+            ambiguous=mutation,
             **fields,
         )
     # No error is left unaccepted here, so every one of them was accepted.

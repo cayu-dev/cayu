@@ -15,9 +15,10 @@ Model slots are the models an application declares by name (``CayuApp.require_mo
 the Organization binds per Agent in Cayu Cloud: ``ModelSlots`` reads the bindings from the broker
 and a new session resolves its agent's slot when it starts.
 
-The connector's status is the answer's, whatever it is; ``ConnectionCallError`` is raised only
-when the request couldn't be sent: the slot is unbound, the host refused to send it, or the
-connector couldn't be reached.
+The connector's status is the answer's, whatever it is; ``ConnectionCallError`` is raised when
+the call failed without one: the slot is unbound, the host refused to send it, or the
+connector couldn't be reached or answered too much. ``ConnectionCallError.ambiguous`` says
+whether the connector may have carried the call out all the same.
 """
 
 from typing import Any as _Any

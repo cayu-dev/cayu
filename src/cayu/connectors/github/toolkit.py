@@ -207,6 +207,8 @@ class _GitHubTool(Tool):
     PROPERTIES: ClassVar[dict[str, Any]]
     REQUIRED: ClassVar[tuple[str, ...]]
     EFFECT: ClassVar[ToolEffect] = ToolEffect.NONE
+    #: How to tell whether a write that failed ambiguous took effect.
+    CHECK: ClassVar[str] = "check whether it did"
 
     def __init__(
         self, gh: GitHubClient | None, allowed: dict[str, str] | None, reviewer_app: str | None
@@ -243,7 +245,7 @@ class _GitHubTool(Tool):
         except _InvalidArguments as error:
             return _common.invalid_arguments(str(error))
         except GitHubError as error:
-            return _error_result(error, self._gh.slot)
+            return _error_result(error, self._gh.slot, self.CHECK)
 
     async def _run(self, gh: GitHubClient, repository: str, args: dict[str, Any]) -> ToolResult:
         raise NotImplementedError
@@ -270,10 +272,20 @@ class _GitHubTool(Tool):
         return found
 
 
-def _error_result(error: GitHubError, slot: str) -> ToolResult:
-    """A failed GitHub call as the model reads it: its code, GitHub's words and what to do."""
+def _error_result(error: GitHubError, slot: str, check: str) -> ToolResult:
+    """A failed GitHub call as the model reads it: its code, GitHub's words and what to do. A
+    write that may have taken effect (``ambiguous``) is advised to ``check`` first, never to
+    retry."""
 
     message = error.message
+    if error.ambiguous:
+        if isinstance(error, GitHubConnectionRefused):
+            code = error.code
+        elif isinstance(error, GitHubUnavailable):
+            code = "upstream_failed"
+        else:
+            code = "github_error"
+        return _common.ambiguous_write_result(code, message, check)
     if isinstance(error, GitHubRateLimited):
         return _common.rate_limited_result(message, error.retry_after)
     if isinstance(error, GitHubConnectionRefused):
@@ -306,13 +318,6 @@ def _error_result(error: GitHubError, slot: str) -> ToolResult:
             codes=list(error.codes) or None,
         )
     if isinstance(error, GitHubUnavailable):
-        if error.ambiguous:
-            return _common.error_result(
-                "upstream_failed",
-                message,
-                "It may have taken effect; read before retrying.",
-                ambiguous=True,
-            )
         return _common.error_result("upstream_failed", message, _common.TEMPORARY)
     return _common.error_result("github_error", message, status=error.status)
 
@@ -737,6 +742,7 @@ class _Comment(_GitHubTool):
     }
     REQUIRED = ("number", "body")
     EFFECT = ToolEffect.EXTERNAL
+    CHECK = "read the pull request's or issue's latest comments"
 
     def __init__(self, *settings: Any, plain: bool) -> None:
         super().__init__(*settings)
@@ -775,6 +781,7 @@ class _RerunFailedJobs(_GitHubTool):
     }
     REQUIRED = ("run_id",)
     EFFECT = ToolEffect.EXTERNAL
+    CHECK = "read the run's attempts"
 
     async def _run(self, gh: GitHubClient, repository: str, args: dict[str, Any]) -> ToolResult:
         run_id = _number(args, "run_id")
@@ -805,6 +812,7 @@ class _UpdateBranch(_GitHubTool):
     PROPERTIES = {"number": _NUMBER, "head_sha": _HEAD_SHA}
     REQUIRED = ("number", "head_sha")
     EFFECT = ToolEffect.EXTERNAL
+    CHECK = "read the pull request's head"
 
     async def _run(self, gh: GitHubClient, repository: str, args: dict[str, Any]) -> ToolResult:
         number = _number(args)
@@ -831,6 +839,7 @@ class _MergePull(_GitHubTool):
     }
     REQUIRED = ("number", "head_sha")
     EFFECT = ToolEffect.EXTERNAL
+    CHECK = "read whether the pull request was merged"
 
     async def _run(self, gh: GitHubClient, repository: str, args: dict[str, Any]) -> ToolResult:
         number = _number(args)

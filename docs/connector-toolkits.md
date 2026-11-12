@@ -238,13 +238,20 @@ author of what it writes.
   `GitHubPermissionDenied` (with `accepted_permissions`), `GitHubConflict` (409, 422),
   `GitHubRateLimited` (with `retry_after`, `secondary`), `GitHubUnavailable`,
   `GitHubConnectionRefused` (the broker's `code`), `GitHubAppNotInstalled`,
-  `GitHubWriteRefused` and `GitHubGraphQLFailed`.
+  `GitHubWriteRefused` and `GitHubGraphQLFailed`. A write that may have reached GitHub before
+  it failed has `ambiguous` set: a 5xx, a lost answer, the slot's `upstream_failed` or
+  `upstream_response_too_large`, any slot refusal but those made before sending, and any failed
+  GraphQL mutation. App not installed, and every other refusal, means the call wasn't sent.
 - **Rate limits and retries.** A rate limit (a 429, or a 403 with no requests left, a
   `Retry-After` or a secondary limit) and the broker's `too_many_calls` are waited out and the
   call sent once more when the wait is at most `max_rate_limit_wait_seconds` (60), as is a
   GraphQL answer whose errors are `RATE_LIMITED`; GitHub
-  didn't act on a limited call, so a write is resent too. A 5xx or a lost answer is retried
-  (`read_retries`, 2) only for reads and GraphQL queries; a write raises with `ambiguous` set.
+  didn't act on a limited call, so a write is resent too. An App slot also resends a call once
+  with a new token after a 401. Each extra send of a write follows a refusal GitHub answered
+  unexecuted (a rate limit or a 401), at most once for each cause; no other write is resent.
+  A token the App couldn't mint fails `credential_unavailable`: the call wasn't sent. A 5xx or a lost answer is
+  retried (`read_retries`, 2) only for reads and GraphQL queries; a write raises with
+  `ambiguous` set.
   One client has at most 6 calls in flight.
 - **GraphQL.** `graphql(query, variables, repository=...)` fails on any error in the answer,
   with GitHub's `data` and `errors`, unless `accept` takes it: accepted errors come back in
@@ -505,20 +512,26 @@ method, the run id and head of a rerun, or the body of a comment.
   once): an `@` mentions no one, so it can't start a bot's command, and HTML comment delimiters
   are removed, so nothing is hidden. The approver sees the model's text before that change.
   `plain_comments=False` posts it as written, for applications that mean to mention. A comment
-  isn't written once: a model that retries after an `upstream_failed` with `ambiguous: true`
-  should read the conversation first.
+  isn't written once: a failure with `ambiguous: true` advises reading the latest comments
+  before retrying (see Errors).
 
 ## Errors
 
 A call that fails answers a tool error (`is_error`) whose `structured` holds `error` (a code),
-`message`, and `advice` where there is something to do:
+`message`, and `advice` where there is something to do. A write (a Slack post or update, a
+Snowflake statement that isn't a read, any GitHub write tool) whose failure may have followed
+the connector's carrying it out (no code, `upstream_failed`, `upstream_response_too_large`, any
+code not refused before sending, a GitHub 5xx) also holds `ambiguous: true`, and its advice is to check whether it took
+effect before retrying, in the tool's words (a GitHub comment: read the latest comments; a
+rerun: read the run's attempts; a branch update: read the pull request's head; a merge: read
+whether it was merged), whatever the table below says for its code:
 
 | Code | Advice |
 | --- | --- |
 | `connection_unbound`, `connection_not_ready`, `connection_unavailable`, `credential_invalid` | An admin must bind the slot or reconnect its connection |
 | `scope_not_allowed`, `path_not_allowed`, `method_not_allowed`, `connector_not_brokered` | Not allowed for this Agent; don't retry |
 | `too_many_calls` | Retry after `retry_after_seconds` (the broker's or the connector's `Retry-After`) |
-| `upstream_failed`, `connection_failed`, `upstream_status` (5xx), `upstream_invalid_response` | A temporary failure; retry later (a running statement is read again on its own). A GitHub write with `ambiguous: true` may have taken effect: read before retrying |
+| `upstream_failed`, `connection_failed`, `upstream_status` (5xx), `upstream_invalid_response` | A temporary failure; retry later (a running statement is read again on its own), unless `ambiguous: true` |
 | `upstream_response_too_large` | Ask for less (with the statement handle when the statement finished) |
 | `result_too_wide` | The columns alone don't fit: select fewer, or give them shorter names |
 | `slack_error` | Slack's own `{"ok": false}` answer, its error in `slack_error` |

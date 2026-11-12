@@ -439,3 +439,84 @@ def test_the_client_cant_read_the_rate_limit_through_an_app_slot_yet() -> None:
     with pytest.raises(github.GitHubConnectionRefused, match="doesn't send for it yet") as raised:
         asyncio.run(gh.get("/rate_limit"))
     assert raised.value.code == "path_not_allowed"
+
+
+def test_an_app_not_installed_names_the_unsent_write_and_isnt_ambiguous() -> None:
+    fake = FakeGitHub(installed=False)
+    gh = github.GitHubClient(_app(fake), max_rate_limit_wait_seconds=0)
+    path = f"/repos/{REPO}/issues/1/comments"
+    with pytest.raises(github.GitHubAppNotInstalled, match="wasn't carried out") as raised:
+        asyncio.run(gh.post(path, json={"body": "x"}))
+    assert (raised.value.method, raised.value.path) == ("POST", path)
+    assert (raised.value.repository, raised.value.ambiguous) == (REPO, False)
+    assert fake.made("POST", path) == []
+
+
+def test_an_app_slot_resends_a_write_once_after_a_401_and_never_again() -> None:
+    fake = FakeGitHub(refuse_tokens=10)
+    gh = github.GitHubClient(_app(fake), max_rate_limit_wait_seconds=0)
+    path = f"/repos/{REPO}/issues/1/comments"
+    with pytest.raises(github.GitHubPermissionDenied) as raised:
+        asyncio.run(gh.post(path, json={"body": "x"}))
+    assert raised.value.ambiguous is False
+    assert len(fake.made("POST", path)) == 2
+
+
+def test_a_token_slots_write_answered_over_5_mib_is_ambiguous() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=b"x" * (6 * 1024 * 1024))
+
+    gh = github.GitHubClient(
+        github.token_connections("ghp_test", transport=httpx.MockTransport(handler))
+    )
+    with pytest.raises(github.GitHubConnectionRefused) as raised:
+        asyncio.run(gh.post(f"/repos/{REPO}/issues/1/comments", json={"body": "x"}))
+    assert (raised.value.code, raised.value.ambiguous) == ("upstream_response_too_large", True)
+
+
+def test_a_write_sent_again_only_after_each_unexecuted_refusal_its_token_needed() -> None:
+    path = f"/repos/{REPO}/issues/1/comments"
+    mints: list[int] = []
+    writes = iter([401, 401, 201])
+
+    def github_host(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 42})
+        if request.url.path.endswith("/access_tokens"):
+            mints.append(1)
+            if len(mints) == 2:
+                return httpx.Response(
+                    429, json={"message": "slow down"}, headers={"retry-after": "0"}
+                )
+            expires = datetime.fromtimestamp(NOW + 3600, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return httpx.Response(201, json={"token": f"ghs_{len(mints)}", "expires_at": expires})
+        sent.append(request.headers["authorization"])
+        return httpx.Response(next(writes), json={"id": 1})
+
+    sent: list[str] = []
+    transport = httpx.MockTransport(github_host)
+    app = github.app_connections("1234", PRIVATE_KEY, permissions=PERMISSIONS, transport=transport)
+    gh = github.GitHubClient(app, max_rate_limit_wait_seconds=0)
+    # 401 (unexecuted), its new token rate-limited with no wait left (unsent), 401, then done:
+    # three sends, each after one GitHub refused unexecuted.
+    assert asyncio.run(gh.post(path, json={"body": "x"})) == {"id": 1}
+    assert sent == ["Bearer ghs_1", "Bearer ghs_3", "Bearer ghs_4"]
+
+
+def test_a_failed_mint_before_a_write_says_it_wasnt_sent() -> None:
+    path = f"/repos/{REPO}/issues/1/comments"
+
+    def github_host(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 42})
+        return httpx.Response(503, json={"message": "Unavailable"})
+
+    transport = httpx.MockTransport(github_host)
+    app = github.app_connections("1234", PRIVATE_KEY, permissions=PERMISSIONS, transport=transport)
+    with pytest.raises(ConnectionCallError) as caught:
+        asyncio.run(app.request("github", "POST", path, headers={"x-cayu-github-repository": REPO}))
+    assert (caught.value.code, caught.value.ambiguous) == ("credential_unavailable", False)
+
+    with pytest.raises(github.GitHubUnavailable, match="didn't send POST") as raised:
+        asyncio.run(github.GitHubClient(app).post(path, json={"body": "x"}))
+    assert raised.value.ambiguous is False

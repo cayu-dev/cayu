@@ -591,3 +591,16 @@ def test_approval_policy_asks_before_execute_and_leaves_the_rest_to_inner() -> N
 def test_review_fields_show_the_sql() -> None:
     assert snowflake.review_fields() == {"snowflake_execute": ("statement", "database", "schema")}
     ToolArgumentReview(snowflake.review_fields(), binding_key=b"k" * 32)
+
+
+def test_a_write_statement_that_may_have_run_is_ambiguous_and_a_query_isnt() -> None:
+    broker = FakeBroker(lambda _: Refusal(502, "upstream_failed"))
+    tools = _tools(broker)
+    written = _run(tools["snowflake_execute"], statement="delete from t")
+
+    assert written.structured is not None
+    assert written.structured["ambiguous"] is True
+    assert "may have taken effect" in written.structured["advice"]
+
+    read = _run(tools["snowflake_query"], statement="select 1")
+    assert read.structured is not None and "ambiguous" not in read.structured

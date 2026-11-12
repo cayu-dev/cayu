@@ -242,3 +242,63 @@ def test_a_local_slot_never_takes_the_applications_host_header() -> None:
     asyncio.run(local.request("crm", "GET", "/", headers={"Host": "attacker.example"}))
 
     assert sent[0].headers["host"] == "api.acme.test"
+
+
+@pytest.mark.parametrize(
+    ("code", "ambiguous"),
+    [
+        # Refused before the connector carried the call out.
+        ("agent_credential_invalid", False),
+        ("connection_unbound", False),
+        ("connection_unavailable", False),
+        ("connection_not_ready", False),
+        ("connector_not_brokered", False),
+        ("credential_invalid", False),
+        ("scope_not_allowed", False),
+        ("path_not_allowed", False),
+        ("path_invalid", False),
+        ("method_not_allowed", False),
+        ("headers_invalid", False),
+        ("body_too_large", False),
+        ("request_too_large", False),
+        ("too_many_calls", False),
+        # May follow the connector's carrying it out.
+        (None, True),
+        ("upstream_failed", True),
+        ("upstream_response_too_large", True),
+        ("a_code_this_release_doesnt_know", True),
+    ],
+)
+def test_only_a_refusal_made_before_sending_is_unambiguous(
+    code: str | None, ambiguous: bool
+) -> None:
+    assert ConnectionCallError("Failed.", code=code).ambiguous is ambiguous
+
+
+def test_a_local_answer_over_the_brokers_limit_is_refused_as_too_large() -> None:
+    def host(request: httpx.Request) -> httpx.Response:
+        size = MAX_BODY_BYTES + (1 if request.url.path == "/large" else 0)
+        return httpx.Response(201, content=b"x" * size)
+
+    local = LocalConnections(
+        {"crm": LocalSlot("https://api.acme.test")}, transport=httpx.MockTransport(host)
+    )
+    assert len(asyncio.run(local.request("crm", "POST", "/fits")).body) == MAX_BODY_BYTES
+    with pytest.raises(ConnectionCallError) as caught:
+        asyncio.run(local.request("crm", "POST", "/large"))
+    assert caught.value.code == "upstream_response_too_large"
+    assert caught.value.ambiguous is True
+
+
+def test_a_local_slot_asks_for_an_uncompressed_answer_whatever_the_application_asks() -> None:
+    sent: list[httpx.Request] = []
+
+    def host(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200)
+
+    local = LocalConnections(
+        {"crm": LocalSlot("https://api.acme.test")}, transport=httpx.MockTransport(host)
+    )
+    asyncio.run(local.request("crm", "GET", "/v1", headers={"Accept-Encoding": "gzip"}))
+    assert sent[0].headers["accept-encoding"] == "identity"
