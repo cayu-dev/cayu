@@ -2,9 +2,12 @@
 
 EXPORTS: dict[str, tuple[str, str]] = {
     "API_URL": ("cayu.connectors.github.client", "API_URL"),
+    "CheckState": ("cayu.connectors.github.pulls", "CheckState"),
+    "CheckWorkflowRun": ("cayu.connectors.github.pulls", "CheckWorkflowRun"),
     "DEFAULT_MAX_PAGES": ("cayu.connectors.github.client", "DEFAULT_MAX_PAGES"),
     "DEFAULT_SLOT": ("cayu.connectors.github.client", "DEFAULT_SLOT"),
     "ErrorFilter": ("cayu.connectors.github._graphql", "ErrorFilter"),
+    "FactGap": ("cayu.connectors.github.pulls", "FactGap"),
     "GitHubAppConnections": ("cayu.connectors.github.credentials", "GitHubAppConnections"),
     "GitHubAppNotInstalled": ("cayu.connectors.github._errors", "GitHubAppNotInstalled"),
     "GitHubClient": ("cayu.connectors.github.client", "GitHubClient"),
@@ -20,7 +23,16 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "GitHubWriteRefused": ("cayu.connectors.github._errors", "GitHubWriteRefused"),
     "GraphQLAnswer": ("cayu.connectors.github._graphql", "GraphQLAnswer"),
     "GraphQLError": ("cayu.connectors.github._graphql", "GraphQLError"),
+    "MERGEABLE_WAIT_SECONDS": ("cayu.connectors.github.pulls", "MERGEABLE_WAIT_SECONDS"),
+    "PASSING_CONCLUSIONS": ("cayu.connectors.github.pulls", "PASSING_CONCLUSIONS"),
     "Page": ("cayu.connectors.github.client", "Page"),
+    "PullCheck": ("cayu.connectors.github.pulls", "PullCheck"),
+    "PullChecks": ("cayu.connectors.github.pulls", "PullChecks"),
+    "PullComment": ("cayu.connectors.github.pulls", "PullComment"),
+    "PullRequestFacts": ("cayu.connectors.github.pulls", "PullRequestFacts"),
+    "PullRequestList": ("cayu.connectors.github.pulls", "PullRequestList"),
+    "PullReview": ("cayu.connectors.github.pulls", "PullReview"),
+    "PullState": ("cayu.connectors.github.pulls", "PullState"),
     "REPOSITORY_HEADER": ("cayu.connectors.github.client", "REPOSITORY_HEADER"),
     "RefusedWrite": ("cayu.connectors.github.client", "RefusedWrite"),
     "app_connections": ("cayu.connectors.github.credentials", "app_connections"),
@@ -31,6 +43,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "errors_under": ("cayu.connectors.github._graphql", "errors_under"),
     "forbidden_under": ("cayu.connectors.github._graphql", "forbidden_under"),
     "is_mutation": ("cayu.connectors.github._graphql", "is_mutation"),
+    "list_pulls": ("cayu.connectors.github.pulls", "list_pulls"),
+    "read_pull": ("cayu.connectors.github.pulls", "read_pull"),
     "token_connections": ("cayu.connectors.github.credentials", "token_connections"),
 }
 

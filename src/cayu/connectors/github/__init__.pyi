@@ -30,3 +30,17 @@ from cayu.connectors.github.credentials import (
     connections_from_environment as connections_from_environment,
 )
 from cayu.connectors.github.credentials import token_connections as token_connections
+from cayu.connectors.github.pulls import MERGEABLE_WAIT_SECONDS as MERGEABLE_WAIT_SECONDS
+from cayu.connectors.github.pulls import PASSING_CONCLUSIONS as PASSING_CONCLUSIONS
+from cayu.connectors.github.pulls import CheckState as CheckState
+from cayu.connectors.github.pulls import CheckWorkflowRun as CheckWorkflowRun
+from cayu.connectors.github.pulls import FactGap as FactGap
+from cayu.connectors.github.pulls import PullCheck as PullCheck
+from cayu.connectors.github.pulls import PullChecks as PullChecks
+from cayu.connectors.github.pulls import PullComment as PullComment
+from cayu.connectors.github.pulls import PullRequestFacts as PullRequestFacts
+from cayu.connectors.github.pulls import PullRequestList as PullRequestList
+from cayu.connectors.github.pulls import PullReview as PullReview
+from cayu.connectors.github.pulls import PullState as PullState
+from cayu.connectors.github.pulls import list_pulls as list_pulls
+from cayu.connectors.github.pulls import read_pull as read_pull

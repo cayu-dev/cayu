@@ -855,6 +855,20 @@
           "app_connections",
           "connections_from_environment",
           "token_connections"
+        ],
+        "cayu.connectors.github.pulls": [
+          "CheckState",
+          "CheckWorkflowRun",
+          "FactGap",
+          "PullCheck",
+          "PullChecks",
+          "PullComment",
+          "PullRequestFacts",
+          "PullRequestList",
+          "PullReview",
+          "PullState",
+          "list_pulls",
+          "read_pull"
         ]
       },
       "identities": {},
@@ -863,6 +877,8 @@
         "DEFAULT_MAX_PAGES",
         "DEFAULT_SLOT",
         "ErrorFilter",
+        "MERGEABLE_WAIT_SECONDS",
+        "PASSING_CONCLUSIONS",
         "REPOSITORY_HEADER"
       ]
     },

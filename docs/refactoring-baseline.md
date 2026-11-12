@@ -101,6 +101,13 @@ GitHub client for code on a connection slot, its typed errors, GraphQL error
 filters and local token and GitHub App credentials, replacing three
 applications' own copies; it removes no names elsewhere.
 
+The public-name budget is 4,099, the standard 5 names above the merged total of
+4,094 after the pull request read model joined `cayu.connectors.github`:
+`read_pull`, `list_pulls`, the `PullRequestFacts` record and its parts (checks,
+check state, workflow runs, reviews, comments, fact gaps) and two constants. It
+replaces the pull request reads of three applications and removes no names
+elsewhere.
+
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
 own delivery evidence. The historical inventory baseline stays unchanged.

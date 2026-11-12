@@ -260,6 +260,48 @@ author of what it writes.
   keeps the log's last 5 MiB. On Cayu Cloud that download needs the Agent to reach those hosts,
   as the broker doesn't follow redirects.
 
+### Pull request facts
+
+`read_pull(gh, repository, number)` answers one pull request as a `PullRequestFacts` record,
+through REST `GET`s and one GraphQL query, so a read-only client reads it: state (`open`,
+`closed`, `merged`), draft, labels, author, base, head branch and commit and when it was
+committed, its people and times, `behind_by` and `ahead_by` (GraphQL's compare of the base with
+`refs/pull/N/head`, which carries no files and works for a fork; left out with a gap if that
+ref has moved off the record's head), `mergeable` and GitHub's
+`mergeable_state`, `checks`, `reviews` (every one, oldest first) and `comments`
+(`comments=False` skips them). `latest_reviews` is each reviewer's standing review as GitHub
+decides it: their latest approval, request for changes or dismissal; a later comment-only
+review leaves it standing. `list_pulls(gh, repository, states=..., updated_since=...)` answers
+many through GraphQL, 20 a page, as the same record without `behind_by`, `ahead_by`, comments,
+review bodies, check summaries, workflow names or run attempts; `PullRequestList.complete` is
+false when `max_pages` (10) stopped it.
+
+- **Mergeability.** GitHub works `mergeable` out after the first read. An open pull request
+  whose `mergeable` is unknown is read again once after `mergeable_wait_seconds` (2); a listing
+  reads its unknown ones again together, 50 a query. Still unknown, it is `None`. A `dirty`
+  merge state is `False`.
+- **Checks.** `PullChecks.ci` holds the head's check runs and commit statuses, each a
+  `PullCheck` with its `conclusion` and `workflow_run` (a `CheckWorkflowRun`: its id and, from
+  `read_pull`, the `attempt` the check ran in; None for a job a rerun of the failed jobs kept
+  from an earlier attempt). `reviewer_app="cayu-reviewer"` puts the check runs that App made in
+  `PullChecks.reviewer`, whatever they are named: a workflow job with the same name stays CI.
+  `PullChecks.state`, over CI only, is `failed` when a finished check concluded other than
+  `success`, `neutral` or `skipped`, even if some weren't read; else `unknown` when some weren't
+  read; else `none` with no checks (green or a wait is the caller's rule); else `running` while
+  one hasn't finished; else `green`. `action_required` (waiting on a person) and `stale` (a
+  check GitHub gave up on) are failures too: read `conclusion` before rerunning one. `failed`,
+  `running` and `failed_names` list them.
+- **Partial answers.** A fact this credential can't read (403) or GitHub can't find (404),
+  among the compare, the head commit, check runs, workflow runs and statuses, is left out with
+  a `FactGap(fact, reason)` in `gaps`, and the rest stands; so is one read in part, and any
+  fact, reviews and comments included, whose answer is over the slot's 5 MiB. In a listing, a
+  check the credential can't see (GraphQL's `FORBIDDEN` on the check or the rollup) makes only
+  that pull request's checks incomplete; one on a check's workflow run (no `actions: read`)
+  leaves the check read and adds a `workflow_runs` gap. Only `NOT_FOUND` and `FORBIDDEN` are
+  taken as a missing fact: rate limits, outages and any other GraphQL error still fail.
+- **Logins.** Every login is as REST writes it: GraphQL's bot logins get their `[bot]`, and a
+  deleted account is `ghost`.
+
 ## Errors
 
 A call that fails answers a tool error (`is_error`) whose `structured` holds `error` (a code),

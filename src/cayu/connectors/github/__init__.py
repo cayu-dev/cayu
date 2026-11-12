@@ -6,7 +6,10 @@ links, GraphQL answers whose errors the caller may accept (``forbidden_under``,
 ``errors_under``), and a read-only mode for dry runs that refuses every write before it leaves
 and lists it in ``refused``. On Cayu Cloud the broker attaches the credential; off it,
 ``connections_from_environment(permissions=...)`` reads ``GITHUB_TOKEN`` or a GitHub App's id
-and private key (``token_connections``, ``app_connections``). See ``docs/connector-toolkits.md``.
+and private key (``token_connections``, ``app_connections``). ``read_pull`` and ``list_pulls``
+answer a pull request's facts as a ``PullRequestFacts`` record: mergeability, CI checks with
+their workflow run attempts and one ``CheckState``, the reviewer App's check apart, reviews and
+comments. See ``docs/connector-toolkits.md``.
 """
 
 from typing import Any as _Any

@@ -2,7 +2,7 @@
   "schema_version": 2,
   "default_max_lines": 9999,
   "total_budgets": {
-    "public_names": 4085
+    "public_names": 4099
   },
   "exceptions": {
     "src/cayu/tools/_browser_guest.py": {
