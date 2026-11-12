@@ -75,10 +75,12 @@ from cayu.cli._cloud_private_state import write_private_json as _write_private_j
 from cayu.cli._cloud_project import (
     CloudSourceInputsError,
     ResolvedCloudProject,
+    check_project_manifest,
     initialize_project,
     is_application_slug,
     resolve_project,
     schedule_input_json,
+    schedule_option,
 )
 from cayu.cli._cloud_release_sbom import SbomDownloadError, download_release_sbom, render_sbom
 from cayu.cli._cloud_release_source import (
@@ -98,6 +100,7 @@ from cayu.cli._cloud_releases import (
     with_last_request_at,
 )
 from cayu.cli._cloud_sandboxes import add_sandboxes_parser, sandboxes_command
+from cayu.cli._cloud_schedules import DEFAULT_SCHEDULE_TIMEZONE
 from cayu.cli._cloud_service_check import (
     OperatorCheckFailedError,
     add_service_check_arguments,
@@ -1130,14 +1133,49 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "Generate cayu-cloud.toml from a Python Agent project. For a `cayu serve` web "
             "process, also add the cayu server extra and the environment Developer "
             "dashboard auth target to pyproject.toml when they are missing; an existing "
-            "auth target is never replaced."
+            "auth target is never replaced. With --check, write nothing and say whether the "
+            "existing cayu-cloud.toml is valid, as `cayu cloud deploy` would read it, without "
+            "a login or an upload."
         ),
     )
     initialize.add_argument("path", nargs="?", default=Path("."), type=Path)
     initialize.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing cayu-cloud.toml.",
+        help=(
+            "Replace an existing cayu-cloud.toml. What init doesn't generate is kept: home, "
+            "[env], [storage], [webhooks], [operator_check], [[schedules]] and "
+            "[session_replacement]; the result names what was kept and any generated field "
+            "it wrote differently."
+        ),
+    )
+    initialize.add_argument(
+        "--schedule",
+        action="append",
+        default=[],
+        metavar="NAME=EXPRESSION=COMMAND",
+        help=(
+            "Add a [[schedules]] entry (repeatable), for example "
+            "'digest=cron(0 8 * * ? *)=python -m agent digest'. With --force, one with the "
+            "name of a kept schedule replaces it."
+        ),
+    )
+    initialize.add_argument(
+        "--schedule-timezone",
+        metavar="ZONE",
+        help=(
+            "The IANA time zone the --schedule cron() expressions are read in, such as "
+            "America/Los_Angeles, so they fire at the same local time all year (default UTC)."
+        ),
+    )
+    initialize.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Write nothing: check the existing cayu-cloud.toml with the deploy's own loader "
+            "and Cloud's schedule rules, and run the deploy check's file checks. It doesn't "
+            "boot the project; `cayu check --deploy` does."
+        ),
     )
 
     deploy = commands.add_parser(
@@ -1450,10 +1488,18 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     schedule = commands.add_parser(
         "schedule",
-        help="Run an Agent schedule now.",
-        description="Operate the Agent's [[schedules]] outside their expressions.",
+        help="List an Agent's schedules, or run one now.",
+        description="Read the Agent's [[schedules]], or operate them outside their expressions.",
     )
     schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True)
+    schedule_list = schedule_commands.add_parser(
+        "list",
+        description=(
+            "List the schedules of the Agent's selected release: each one's name, "
+            "expression, the time zone it is read in (UTC unless it sets one) and command."
+        ),
+    )
+    schedule_list.add_argument("--application", required=True)
     schedule_run = schedule_commands.add_parser(
         "run",
         description=(
@@ -1872,6 +1918,76 @@ def _require_selected_baseline(
     )
 
 
+def _check_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
+    """`cayu cloud init --check`: the existing manifest as `cayu cloud deploy` reads it."""
+
+    if arguments.force or arguments.schedule or arguments.schedule_timezone is not None:
+        raise CloudCommandError(
+            "invalid_input",
+            "--check writes nothing, so it takes no --force, --schedule or --schedule-timezone.",
+        )
+    from cayu.cli._cloud_deploy_check import run_cloud_deploy_check
+
+    project = check_project_manifest(arguments.path)
+    manifest = project.manifest
+    assert project.root is not None
+    result: dict[str, Any] = {
+        "manifest": str(project.manifest_path),
+        "valid": True,
+        "application": manifest.application,
+        "name": manifest.name,
+        "processes": [
+            name
+            for name, process in (("web", manifest.web), ("worker", manifest.worker))
+            if process is not None
+        ],
+        "schedules": [
+            {
+                "name": item.name,
+                "expression": item.expression,
+                "timezone": item.timezone or DEFAULT_SCHEDULE_TIMEZONE,
+                "command": item.command,
+            }
+            for item in manifest.schedules
+        ],
+    }
+    # The deploy's own local check, without booting the project: booting opens its stores,
+    # which can create them, and --check writes nothing.
+    check = run_cloud_deploy_check(
+        project.root,
+        serves_web=manifest.web is not None,
+        web_command=None if manifest.web is None else manifest.web.command,
+        boot_service=False,
+    )
+    if check.status != "not_applicable":
+        result["deploy_check"] = check.public_dict()
+    if check.status == "failed":
+        raise CloudCommandError(
+            "deploy_check_failed",
+            "cayu-cloud.toml is valid, but the local deploy check found what would stop the "
+            "deploy: " + "; ".join(f"{item.code}: {item.message}" for item in check.blocking),
+        )
+    return {"operation": "init.check", "result": result}
+
+
+def _raise_unsupported_schedule_timezone(exc: CloudApiError) -> None:
+    """Explain an HTTP 422 from a Cloud that predates a schedule's `timezone`."""
+
+    if any(
+        _SCHEDULE_TIMEZONE_FIELD.fullmatch(location) and kind == "extra_forbidden"
+        for location, kind in exc.rejected_fields
+    ):
+        raise CloudCommandError(
+            "schedule_timezone_unsupported",
+            "This Cayu Cloud runs schedules in UTC only, so it rejected a [[schedules]] "
+            "timezone in cayu-cloud.toml; nothing was deployed. Deploy to a Cayu Cloud that "
+            "takes schedule time zones, or remove timezone and write the expression in UTC.",
+        ) from exc
+
+
+_SCHEDULE_TIMEZONE_FIELD = re.compile(r"body\.manifest\.runtime\.schedules\.\d+\.timezone")
+
+
 def _raise_unsupported_database(exc: CloudApiError) -> None:
     """Explain an HTTP 422 from a Cloud that predates `[database] migrate`."""
 
@@ -2211,8 +2327,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             f"{arguments.command}` doesn't. Sign in to an Organization with `cayu cloud login "
             "--organization ORG_ID` or switch with `cayu cloud organizations use ORG_ID`.",
         )
+    if arguments.command == "init" and arguments.check:
+        return _check_manifest(arguments)
     if arguments.command == "init":
-        initialized = initialize_project(arguments.path, force=arguments.force)
+        initialized = initialize_project(
+            arguments.path,
+            force=arguments.force,
+            schedules=tuple(schedule_option(value) for value in arguments.schedule),
+            schedule_timezone=arguments.schedule_timezone,
+        )
         result: dict[str, Any] = {
             "application": initialized.application,
             "manifest": str(initialized.manifest_path),
@@ -2226,8 +2349,25 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             result["serve"] = initialized.serve
         if initialized.runtime == "web" and initialized.worker_command is not None:
             result["worker"] = {"command": initialized.worker_command}
-        if initialized.notes:
-            result["notes"] = list(initialized.notes)
+        if initialized.schedules:
+            result["schedules"] = list(initialized.schedules)
+        notes = list(initialized.notes)
+        if initialized.kept:
+            result["kept"] = list(initialized.kept)
+            notes.append(
+                "Kept from the replaced cayu-cloud.toml, which init doesn't generate: "
+                + ", ".join(initialized.kept)
+                + "."
+            )
+        if initialized.replaced:
+            result["replaced"] = list(initialized.replaced)
+            notes.append(
+                "Replaced fields init generates that the old cayu-cloud.toml set differently: "
+                + ", ".join(initialized.replaced)
+                + ". Set them again by hand if they were deliberate."
+            )
+        if notes:
+            result["notes"] = notes
         from cayu.cli._cloud_deploy_check import init_deploy_check_notice, run_cloud_deploy_check
 
         check = run_cloud_deploy_check(
@@ -3086,6 +3226,7 @@ def _deploy(
         )
     except CloudApiError as exc:
         _raise_unsupported_database(exc)
+        _raise_unsupported_schedule_timezone(exc)
         if staging:
             _raise_candidate_refusal(exc)
             if exc.status_code == 422:
@@ -4746,6 +4887,8 @@ def _schedule(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     application_id = _application_id(client, arguments.application)
+    if arguments.schedule_command == "list":
+        return {"operation": "schedule.list", "result": _schedules(client, application_id)}
     name = quote(arguments.name, safe="")
     payload = None if arguments.input is None else {"input": arguments.input}
     result = _unsupported_when_missing(
@@ -4765,6 +4908,32 @@ def _schedule(
         "This Cayu Cloud can't run a schedule on demand yet.",
     )
     return {"operation": "schedule.run", "result": result}
+
+
+def _schedules(client: CloudApiClient, application_id: str) -> dict[str, Any]:
+    """The selected release's schedules, as its manifest declares them."""
+
+    path = f"/v1/applications/{quote(application_id, safe='')}"
+    selected = client.request("GET", path).get("current_deployment_id")
+    if not isinstance(selected, str) or not selected:
+        return {"application": application_id, "release": None, "items": []}
+    release = client.request("GET", f"{path}/deployments/{quote(selected, safe='')}")
+    manifest = release.get("manifest")
+    runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
+    declared = runtime.get("schedules") if isinstance(runtime, dict) else None
+    items = [
+        {
+            "name": item.get("name"),
+            "expression": item.get("expression"),
+            # A Cloud that predates schedule time zones runs every schedule in UTC.
+            "timezone": item.get("timezone") or DEFAULT_SCHEDULE_TIMEZONE,
+            "command": item.get("command"),
+            **({} if item.get("input") is None else {"input": item["input"]}),
+        }
+        for item in (declared if isinstance(declared, list) else [])
+        if isinstance(item, dict)
+    ]
+    return {"application": application_id, "release": selected, "items": items}
 
 
 def _schedule_input(value: str) -> object:

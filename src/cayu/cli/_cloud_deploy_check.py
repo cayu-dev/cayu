@@ -105,6 +105,7 @@ def run_cloud_deploy_check(
     *,
     serves_web: bool,
     web_command: str | None = None,
+    boot_service: bool = True,
 ) -> CloudDeployCheck:
     """Check locally that the web process Cayu Cloud starts can start.
 
@@ -122,6 +123,10 @@ def run_cloud_deploy_check(
     booted here (for example because its dependencies aren't installed in this
     environment) is reported as `unavailable`, not as a failure, since Cloud builds
     the release in its own environment.
+
+    ``boot_service=False`` leaves that boot out, for a check that must write nothing: booting
+    opens the project's stores, which can create them. A public service is then `skipped`
+    once the file checks pass, with the command that runs the rest.
     """
 
     root = root.resolve()
@@ -148,6 +153,16 @@ def run_cloud_deploy_check(
         if serve_reason is not None:
             return CloudDeployCheck(status="unavailable", reason=serve_reason)
         return CloudDeployCheck(status="passed")
+    if not boot_service:
+        if serve_blocking:
+            return CloudDeployCheck(status="failed", blocking=serve_blocking)
+        return CloudDeployCheck(
+            status="skipped",
+            reason=(
+                "The public service check boots the project, which can create its stores, so "
+                f"it wasn't run here. Run `{DEPLOY_CHECK_COMMAND}` for it; the deploy runs it too."
+            ),
+        )
     service = _run_public_service_check(root)
     blocking = serve_blocking + service.blocking
     if blocking:

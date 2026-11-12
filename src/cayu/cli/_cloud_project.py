@@ -30,6 +30,11 @@ from cayu._operator_credentials import (
     OPERATOR_USERNAME_VARIABLE,
 )
 from cayu.cli._cloud_api import CloudApiError
+from cayu.cli._cloud_schedules import (
+    UTC_NAMES,
+    check_schedule_expression,
+    check_schedule_timezone,
+)
 from cayu.cli._cloud_session_replacement import (
     CloudApprovalReplacementConsent,
     render_session_replacement,
@@ -217,6 +222,8 @@ class CloudSchedule:
     memory_mb: int | None = None
     # Each run's `CAYU_SCHEDULE_INPUT` (compact JSON); None: the schedule declares none.
     input: object = field(default=None, hash=False)
+    # The IANA zone a cron() expression is read in; None: UTC.
+    timezone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -702,6 +709,7 @@ class CloudProjectManifest:
                         expression=str(item["expression"]),
                         **_process_resources(item),
                         input=item.get("input"),
+                        timezone=item.get("timezone"),
                     )
                     for item in schedules
                 ),
@@ -818,6 +826,12 @@ class CloudProjectManifest:
                 or len(schedule.expression) > 256
             ):
                 raise CloudApiError("manifest_invalid", "Runtime schedule is invalid.")
+            # Cloud's own rules, so a deploy isn't uploaded only to be refused for them.
+            check_schedule_expression(schedule.expression)
+            if schedule.timezone is not None:
+                check_schedule_timezone(
+                    schedule.timezone, expression=schedule.expression, name=schedule.name
+                )
             if schedule.input is not None:
                 schedule_input_json(schedule.input)
         if len(set(item.name for item in self.schedules)) != len(self.schedules):
@@ -884,6 +898,13 @@ class CloudProjectManifest:
                     ),
                     # Omitted without one, so the manifest (and its digest) stays as before.
                     **({} if item.input is None else {"input": item.input}),
+                    # Omitted for UTC, Cloud's default, so a Cloud that predates time zones
+                    # takes every manifest that doesn't need one.
+                    **(
+                        {}
+                        if item.timezone is None or item.timezone in UTC_NAMES
+                        else {"timezone": item.timezone}
+                    ),
                 }
                 for item in self.schedules
             ],
@@ -962,10 +983,159 @@ class InitializedCloudProject:
     worker_command: str | None = None
     notes: tuple[str, ...] = ()
     database_migrate: str | None = None
+    # The schedules the manifest declares, by name: kept by --force and given with --schedule.
+    schedules: tuple[str, ...] = ()
+    # What --force carried over from the replaced manifest (`home`, `[env]`, `[[schedules]]`,
+    # ...), and the fields of it that init generates which it replaced with other values.
+    kept: tuple[str, ...] = ()
+    replaced: tuple[str, ...] = ()
 
 
-def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudProject:
-    """Create a small deployment descriptor from conventional Python project metadata."""
+# What init never writes, so --force carries it over from the manifest it replaces, in the
+# order it is written back. `[session_replacement]` is carried over on its own.
+_KEPT_TOP_LEVEL = ("home",)
+_KEPT_TABLES = ("env", "storage", "webhooks", "operator_check", "schedules")
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _toml_key(key: str) -> str:
+    return key if _BARE_KEY.fullmatch(key) else _toml_value(key)
+
+
+def _toml_value(value: object) -> str:
+    """``value`` as a one-line TOML value; TypeError for one TOML can't hold (or a date)."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        # repr() writes inf, -inf and nan as TOML spells them.
+        return repr(value)
+    if isinstance(value, str):
+        # JSON's escapes are TOML's, apart from DEL, which TOML wants escaped too.
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        return (
+            "{ "
+            + ", ".join(
+                f"{_toml_key(str(key))} = {_toml_value(item)}" for key, item in value.items()
+            )
+            + " }"
+        )
+    raise TypeError(f"{type(value).__name__} can't be written back")
+
+
+def _toml_table(header: str, table: object) -> str:
+    if not isinstance(table, dict):
+        raise TypeError("not a table")
+    return f"\n{header}\n" + "".join(
+        f"{_toml_key(str(key))} = {_toml_value(value)}\n" for key, value in table.items()
+    )
+
+
+def _render_kept(kept: dict[str, object]) -> str:
+    """The tables --force carries over, written back so they read exactly as before."""
+
+    parts: list[str] = []
+    for key in _KEPT_TABLES:
+        # `schedules = []` declares none, and none written back reads the same.
+        if key not in kept or kept[key] == []:
+            continue
+        value = kept[key]
+        label = "[[schedules]]" if key == "schedules" else f"[{key}]"
+        try:
+            if key == "schedules":
+                if not isinstance(value, list):
+                    raise TypeError("not an array of tables")
+                rendered = "".join(_toml_table("[[schedules]]", item) for item in value)
+            else:
+                rendered = _toml_table(f"[{key}]", value)
+            unchanged = tomllib.loads(rendered).get(key) == value
+        except (TypeError, ValueError, tomllib.TOMLDecodeError):
+            unchanged = False
+        if not unchanged:
+            raise CloudApiError(
+                "manifest_invalid",
+                f"cayu-cloud.toml's {label} holds a value `cayu cloud init --force` can't write "
+                "back as it is (such as a date or time), so it would be lost. Move it out of the "
+                "manifest, or edit cayu-cloud.toml by hand instead.",
+            )
+        parts.append(rendered)
+    return "".join(parts)
+
+
+def _kept_from(existing: dict[str, object]) -> dict[str, object]:
+    kept = {key: existing[key] for key in (*_KEPT_TOP_LEVEL, *_KEPT_TABLES) if key in existing}
+    if "schedules" in kept and not (
+        isinstance(kept["schedules"], list)
+        and all(isinstance(item, dict) for item in kept["schedules"])
+    ):
+        raise CloudApiError(
+            "manifest_invalid",
+            "cayu-cloud.toml's schedules must be an array of tables ([[schedules]]) for "
+            "`cayu cloud init --force` to keep them.",
+        )
+    for key in _KEPT_TABLES:
+        if key != "schedules" and key in kept and not isinstance(kept[key], dict):
+            raise CloudApiError(
+                "manifest_invalid",
+                f"cayu-cloud.toml's {key} must be a table ([{key}]) for "
+                "`cayu cloud init --force` to keep it.",
+            )
+    return kept
+
+
+def _replaced_fields(existing: dict[str, object], generated: dict[str, object]) -> tuple[str, ...]:
+    """The fields of the old manifest that init generates and now writes differently."""
+
+    replaced: list[str] = []
+    for key, old in existing.items():
+        if key in (*_KEPT_TOP_LEVEL, *_KEPT_TABLES, "session_replacement"):
+            continue
+        new = generated.get(key)
+        if isinstance(old, dict) and isinstance(new, dict):
+            before, after = cast("dict[str, object]", old), cast("dict[str, object]", new)
+            replaced.extend(
+                f"{key}.{field}" for field, value in before.items() if after.get(field) != value
+            )
+        elif old != new:
+            replaced.append(key)
+    return tuple(replaced)
+
+
+def schedule_option(value: str) -> CloudSchedule:
+    """One `cayu cloud init --schedule NAME=EXPRESSION=COMMAND`, checked as the manifest is."""
+
+    name, separator, rest = value.partition("=")
+    expression, separator_two, command = rest.partition("=")
+    if not (
+        separator and separator_two and name.strip() and expression.strip() and command.strip()
+    ):
+        raise CloudApiError(
+            "invalid_input",
+            "--schedule takes NAME=EXPRESSION=COMMAND, for example "
+            "'digest=cron(0 8 * * ? *)=python -m agent digest'.",
+        )
+    return CloudSchedule(name=name.strip(), command=command.strip(), expression=expression.strip())
+
+
+def initialize_project(
+    path: Path,
+    *,
+    force: bool = False,
+    schedules: tuple[CloudSchedule, ...] = (),
+    schedule_timezone: str | None = None,
+) -> InitializedCloudProject:
+    """Create a small deployment descriptor from conventional Python project metadata.
+
+    ``schedules`` are written as `[[schedules]]`, each in ``schedule_timezone`` when one is
+    given. With ``force``, what init never generates (`home`, `[env]`, `[storage]`,
+    `[webhooks]`, `[operator_check]`, `[[schedules]]` and `[session_replacement]`) is kept from
+    the manifest it replaces; a schedule given again by name replaces the kept one.
+    """
 
     root = path.expanduser().resolve()
     pyproject_path = root / "pyproject.toml"
@@ -981,18 +1151,46 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
             "cayu-cloud.toml already exists; pass --force to replace it.",
         )
     preserved_consent = None
+    existing: dict[str, object] = {}
+    kept: dict[str, object] = {}
+    carried: list[str] = []
     if manifest_path.exists():
-        # Force regenerates the descriptor, but cannot silently erase standing consent.
+        # Force regenerates the descriptor, but cannot silently erase standing consent or
+        # the tables written by hand that init never generates.
         try:
             existing = tomllib.loads(manifest_path.read_text())
         except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
             raise CloudApiError(
                 "manifest_invalid",
-                "Cannot read existing cayu-cloud.toml to preserve session replacement consent; "
-                "repair the file or explicitly remove it before running init again.",
+                "Cannot read existing cayu-cloud.toml to keep what init doesn't generate "
+                "([[schedules]], [env], session replacement consent and the rest); repair the "
+                "file or explicitly remove it before running init again.",
             ) from exc
         if "session_replacement" in existing:
             preserved_consent = session_replacement(existing["session_replacement"])
+        kept = _kept_from(existing)
+        carried = _kept_labels(kept)
+        if preserved_consent is not None:
+            carried.append("[session_replacement]")
+    given = {item.name for item in schedules}
+    if len(given) != len(schedules):
+        raise CloudApiError("invalid_input", "Each --schedule needs a name of its own.")
+    if schedule_timezone is not None and not schedules:
+        raise CloudApiError("invalid_input", "--schedule-timezone applies to --schedule.")
+    if schedules:
+        kept_schedules = cast("list[dict[str, object]]", kept.get("schedules", []))
+        kept["schedules"] = [
+            *(item for item in kept_schedules if item.get("name") not in given),
+            *(
+                {
+                    "name": item.name,
+                    "expression": item.expression,
+                    "command": item.command,
+                    **({} if schedule_timezone is None else {"timezone": schedule_timezone}),
+                }
+                for item in schedules
+            ),
+        ]
     try:
         payload = tomllib.loads(pyproject_path.read_text())
         project = payload["project"]
@@ -1073,10 +1271,22 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         worker_command=worker_command,
         sign_in=sign_in,
         database_migrate=database_migrate,
+        home=cast("str | None", kept.get("home")),
     )
+    replaced = _replaced_fields(existing, tomllib.loads(content)) if existing else ()
+    content += _render_kept(kept)
     if preserved_consent is not None:
         content += render_session_replacement(preserved_consent)
-    CloudProjectManifest.loads(content)
+    try:
+        manifest = CloudProjectManifest.loads(content)
+    except CloudApiError as exc:
+        if not kept and not schedules:
+            raise
+        written = [*carried, *(["--schedule"] if schedules else [])]
+        raise CloudApiError(
+            exc.category,
+            f"{exc} (in the manifest init would write, with {', '.join(written)})",
+        ) from exc
     if writes_auth_module:
         assert serve_setup is not None and serve_setup.auth_module is not None
         module_path = root / serve_setup.auth_module.path
@@ -1117,7 +1327,18 @@ def initialize_project(path: Path, *, force: bool = False) -> InitializedCloudPr
         worker_command=worker_command,
         notes=tuple(notes),
         database_migrate=database_migrate,
+        schedules=tuple(item.name for item in manifest.schedules),
+        kept=tuple(carried),
+        replaced=replaced,
     )
+
+
+def _kept_labels(kept: dict[str, object]) -> list[str]:
+    return [
+        key if key in _KEPT_TOP_LEVEL else "[[schedules]]" if key == "schedules" else f"[{key}]"
+        for key in (*_KEPT_TOP_LEVEL, *_KEPT_TABLES)
+        if key in kept
+    ]
 
 
 def _init_sign_in_mode(setup: ServeSetupPlan) -> str:
@@ -1286,6 +1507,7 @@ def _render_initial_manifest(
     worker_command: str | None,
     sign_in: str,
     database_migrate: str | None,
+    home: str | None = None,
 ) -> str:
     entrypoint = web_command if web_command is not None else worker_command
     values = [
@@ -1301,6 +1523,8 @@ def _render_initial_manifest(
         'environment = "python"',
         'compatibility = "cayu>=0.1,<1"',
         'policy_version = "cayu-egress-v1"',
+        # Kept by --force: init itself can't know a page of the project's own.
+        *(() if home is None else (f"home = {_toml_value(home)}",)),
         "",
     ]
     if web_command is not None:
@@ -1394,6 +1618,25 @@ def resolve_project(
         repository=repository,
         revision=revision,
     )
+
+
+def check_project_manifest(path: Path) -> ResolvedCloudProject:
+    """Read ``path``'s cayu-cloud.toml exactly as `cayu cloud deploy` reads a local source.
+
+    The same loader and the same checks, Cloud's schedule rules included, and the same source
+    bundle, built here and never uploaded: no login, no network. A refusal is the
+    `CloudApiError` the deploy would raise before it uploads anything.
+    """
+
+    root = path.expanduser().resolve()
+    if not root.is_dir():
+        raise CloudApiError("source_invalid", f"Not a project directory: {root}")
+    if not (root / _ROOT_MANIFEST).exists():
+        raise CloudApiError(
+            "manifest_unavailable",
+            f"No cayu-cloud.toml in {root}; `cayu cloud init` writes one.",
+        )
+    return resolve_project(str(root), manifest_path=None, revision=None)
 
 
 def _validate_source_manifest_path(manifest: CloudProjectManifest, path: Path) -> None:

@@ -260,6 +260,34 @@ timetable as [`[[schedules]]`](#schedules). A project with neither
 gets a worker that runs its only console script, or `python -m PACKAGE`.
 `result.worker.command` reports a worker written next to `[web]`.
 
+`--schedule NAME=EXPRESSION=COMMAND` (repeatable) writes a [`[[schedules]]`](#schedules)
+entry, and `--schedule-timezone ZONE` sets the time zone of every one given, for example:
+
+```bash
+cayu cloud init . \
+  --schedule 'morning=cron(0 8 ? * MON-FRI *)=python -m herald digest --slot morning' \
+  --schedule 'evening=cron(0 17 ? * MON-FRI *)=python -m herald digest --slot evening' \
+  --schedule-timezone America/Los_Angeles
+```
+
+`--force` replaces an existing `cayu-cloud.toml` but keeps what init never writes:
+`home`, `[env]`, `[storage]`, `[webhooks]`, `[operator_check]`, `[[schedules]]` and
+`[session_replacement]`. A `--schedule` with the name of a kept schedule replaces it.
+`result.kept` names what it kept, and `result.replaced` the fields init generates that
+the old file set to something else (a hand-raised `cpu_millis`, an `idle_timeout_seconds`
+under `[web]`), so they can be set again; both are repeated in `result.notes`. A kept
+value TOML can't write back as it was read (a date or time) stops init with
+`manifest_invalid` before anything is written.
+
+`cayu cloud init --check` writes nothing. It reads the existing `cayu-cloud.toml` the way
+`cayu cloud deploy` reads a local source, with the same loader and Cloud's own
+[schedule rules](#schedules), builds the same source bundle without uploading it, and runs
+the deploy check's file checks on the `cayu serve` command, with no login. It doesn't boot the
+project, which opens (and can create) its stores, so for a public service its `deploy_check` is
+`skipped` and names `cayu check --deploy --fail-on warning --json`, which the deploy also runs. It answers `operation` `init.check` with the
+processes and schedules it read (each schedule's `timezone`, UTC unless it sets one), or
+the error the deploy would stop with, such as `manifest_invalid`, before uploading anything.
+
 Outside `--dev`, the `cayu serve` command needs the `server` extra of `cayu` and a
 `[tool.cayu.serve].auth` target, so init checks `pyproject.toml` first:
 
@@ -440,7 +468,8 @@ Reading an asleep Agent wakes its web process.
 
 ### Schedules
 
-`expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC:
+`expression` uses Amazon EventBridge Scheduler's syntax and is evaluated in UTC, or in
+the schedule's `timezone`:
 
 - `rate(VALUE UNIT)` with a unit of `minute`, `hour` or `day` for a value of 1
   and `minutes`, `hours` or `days` otherwise, such as `rate(15 minutes)` or
@@ -457,6 +486,33 @@ meaning as a five-field UTC cron: a minute rate that divides an hour, an hour
 rate that divides a day, `rate(1 day)`, or a `cron()` without `L`, `W`, `#`, a
 year limit, or a stepped day of the week. Each run's output is in
 `cayu cloud service logs --process schedule:NAME` ([reading logs](#reading-an-agents-logs)).
+`cayu cloud deploy` and `cayu cloud init --check` apply these rules before anything is
+uploaded.
+
+`timezone` names the IANA time zone a `cron()` expression is read in, so a schedule
+fires at the same local time all year, across daylight-saving changes. Without one it
+is UTC. A `rate()` expression counts an interval rather than a time of day, so it takes
+no time zone, and an unknown zone is refused. A zoned schedule also can't run in an hour a
+daylight-saving change skips or repeats in its zone (1 AM and 2 AM in `America/Los_Angeles`,
+2 AM in `Europe/Paris`): EventBridge runs a repeated time once where Kubernetes runs it twice,
+so Cloud refuses those, and the error names the hours. An hourly schedule in such a zone is
+written in UTC:
+
+```toml
+[[schedules]]
+name = "morning"
+command = "python -m herald digest --slot morning"
+expression = "cron(0 8 ? * MON-FRI *)"  # 8:00 AM Pacific, winter and summer
+timezone = "America/Los_Angeles"
+```
+
+A schedule without `timezone`, or with `timezone = "UTC"`, sends the same manifest as
+before. A Cayu Cloud that predates schedule time zones refuses any other with
+`schedule_timezone_unsupported`; nothing is deployed.
+
+`cayu cloud schedule list --application AGENT` lists the schedules of the Agent's
+selected release: each one's `name`, `expression`, `timezone` (`UTC` when it sets none)
+and `command`, and its `input` when it has one.
 
 A schedule can carry a JSON `input`, a table, array, string, number or boolean
 of at most 4096 bytes as compact JSON once escaped (quotes and backslashes take
