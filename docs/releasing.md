@@ -63,6 +63,11 @@ If PyPI succeeds but GitHub release creation fails, rerun only the failed job.
 After release, give the development branch a distinct development version. Leave
 release notes unchanged until preparation of the next release.
 
+The scheduled/manual `Main scaffold against latest release` workflow generates a
+project from `main` and runs its tests against the latest PyPI Cayu in an isolated
+environment. It reports scaffold/release drift without gating publication: new
+scaffold APIs can make it fail until their matching release is published.
+
 CI retains the shared wheel and source archives for three days so package checks,
 approval, and publication consume the same bytes. Complete approval within that
 window or rebuild and revalidate the release. Routine test and MCP diagnostics

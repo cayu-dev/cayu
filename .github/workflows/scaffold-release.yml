@@ -1,0 +1,38 @@
+name: Main scaffold against latest release
+
+# This is a drift signal, not a publication prerequisite: new scaffold APIs can
+# deliberately precede their release. A failure stays visible until publication.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scaffold-release:
+    name: Main scaffold against latest PyPI Cayu
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Scaffold with main
+        run: |
+          uv sync --frozen --python 3.13
+          uv run --no-sync cayu new release-proof --dir "$RUNNER_TEMP" --provider neutral --execution none
+      - name: Install the latest release in an isolated environment
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/release-runtime"
+          uv pip install --python "$RUNNER_TEMP/release-runtime/bin/python" --default-index https://pypi.org/simple 'cayu[postgres,server]' pytest
+      - name: Verify installed origin and run the generated tests
+        working-directory: ${{ runner.temp }}/release-proof
+        env:
+          PYTHONPATH: ""
+        run: |
+          "$RUNNER_TEMP/release-runtime/bin/python" -c 'import cayu, importlib.metadata; from pathlib import Path; path = Path(cayu.__file__).resolve(); assert "site-packages" in path.parts, path; print(importlib.metadata.version("cayu"), path)'
+          "$RUNNER_TEMP/release-runtime/bin/python" -m pytest -q

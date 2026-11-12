@@ -309,6 +309,8 @@ def test_retirement_cannot_archive_revision_changed_after_authorization(attribut
 
 
 def test_postgres_kept_attribution_and_retirement_through_http(postgres_dsn):
+    from uuid import uuid4
+
     import httpx
 
     from cayu.storage import PostgresKnowledgeStore
@@ -316,11 +318,19 @@ def test_postgres_kept_attribution_and_retirement_through_http(postgres_dsn):
 
     async def scenario():
         scope = KnowledgeAccessScope.privileged()
+        # The native fixture shares its database across this module. Keep this
+        # HTTP listing scoped to the entry owned by this test.
+        namespace = "retirement-" + uuid4().hex
         store = PostgresKnowledgeStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
         app = CayuApp(knowledge_store=store, knowledge_access_scope=scope, enable_logging=False)
         try:
             await store.create_entry(
-                KnowledgeEntry(id="reviewed", text="Durable", status=KnowledgeStatus.PENDING),
+                KnowledgeEntry(
+                    id="reviewed",
+                    text="Durable",
+                    status=KnowledgeStatus.PENDING,
+                    namespace=namespace,
+                ),
                 access_scope=scope,
             )
             server = create_server(app, config=ServerConfig.local_development())
@@ -331,9 +341,10 @@ def test_postgres_kept_attribution_and_retirement_through_http(postgres_dsn):
                     "/api/knowledge/reviewed/approve", headers={"Idempotency-Key": "kept-pg"}
                 )
                 assert approval.status_code == 200, approval.text
-                listing = await client.get("/api/knowledge")
+                listing = await client.get("/api/knowledge", params={"namespace": namespace})
                 assert listing.status_code == 200, listing.text
-                row = listing.json()["entries"][0]
+                [row] = listing.json()["entries"]
+                assert row["entry_id"] == "reviewed"
                 assert row["revision"] == 2
                 assert row["kept_at"] is not None
                 assert row["kept_by_kind"] == "reviewer"
@@ -346,7 +357,9 @@ def test_postgres_kept_attribution_and_retirement_through_http(postgres_dsn):
                 )
                 assert retired.status_code == 200, retired.text
                 assert retired.json()["revision"] == 3
-                assert (await client.get("/api/knowledge")).json()["entries"] == []
+                assert (await client.get("/api/knowledge", params={"namespace": namespace})).json()[
+                    "entries"
+                ] == []
                 replay = await client.post(
                     "/api/knowledge/reviewed/retire", json={"expected_revision": 2}
                 )

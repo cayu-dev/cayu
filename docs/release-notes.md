@@ -1,5 +1,96 @@
 # Release notes
 
+## v0.19.0
+
+Upgrade: Stop all workers, dispatchers, and servers that open the database, take a
+restorable backup, and run `cayu storage migrate --acknowledge-breaking 145
+--acknowledge-breaking 146` before restarting. Storage revision advances from 144
+to 148 and the compatibility floor from 144 to 146. App manifest schema advances
+from 17 to 18; regenerate persisted manifests, evaluation baselines, and snapshots.
+Server contract remains 90. Older binaries must not reopen migrated stores.
+Before using the new Cloud approval-replacement CLI behavior, ensure the Cloud
+installation has the corresponding source-consent support deployed.
+
+### Breaking changes
+
+- Storage revision 145 extends durable terminal decisions to failed and
+  interrupted runs. Revision 146 binds task-group execution obligations to the
+  claim generation that started them. Acknowledge both revisions when upgrading
+  from v0.18.0. Rollback requires restoring the pre-upgrade backup. Revision 147
+  adds PostgreSQL event-sequence reservations; revision 148 pins the search path
+  of their database functions. Both apply through the same migration.
+  PostgreSQL migration requires backup evidence or an explicit backup waiver.
+- App manifest schema 18 declares model slots and each agent's slot. Schema 17
+  manifests no longer parse; record persisted manifests again with this release.
+
+### Deprecations
+
+- Replace `cayu.managed_settings.model_setting()` with
+  `CayuApp.require_model(slot, default=...)` and `register_agent(..., model_slot=...)`.
+  Existing declarations continue through the documented deprecation window.
+- `ModelPolicyController`, `CayuApp(model_policy=...)`, and
+  `CAYU_MODEL_POLICY_CONFIG` are deprecated in favor of Cloud-bound model slots
+  and are scheduled for removal in the next release.
+
+### Changes
+
+- Generated projects declare model slots and close owned resources if app
+  construction fails. `cayu.runtime.close_on_failure` is available in the package,
+  allowing current scaffolds to use a released dependency.
+- Static tool exposure narrows its configured allow-list to each run's ceiling,
+  including an empty ceiling, while still rejecting unregistered configuration.
+- Workers refuse single-worker abandoned-task recovery under known multiple or
+  invalid supervised process metadata. Select one worker process explicitly.
+- `cayu check --deploy` includes the Cloud serve-preflight findings for the local
+  web command and preserves source checks before loading custom authentication.
+  Source checks include parent packages and the exact raw import target.
+  Scheduling documentation distinguishes managed schedules from restartable
+  ordinary delayed jobs.
+- Declare exact agent/tool approval pauses that the serving Cloud release may
+  discard during replacement. Explicit session choices keep their protection;
+  the CLI preserves declarations during forced initialization and distinguishes
+  confirmed publication effects from unknown policy provenance. This requires
+  the corresponding Cloud source-consent support.
+- Filter Cloud service logs by structured event names and field values, with
+  newest-match search and cursor-safe follow behavior.
+- Bind an Agent's model slots through Cayu Cloud and manage bindings with the CLI.
+  New sessions resolve current approved bindings; resumed sessions retain their
+  selected model. A missing binding without a default, or an unapproved bound
+  model, refuses new sessions.
+- Add Slack and Snowflake connector toolkits and read-only SAP S/4HANA tools;
+  connect Slack through the Cloud sign-in flow.
+- Preserve cancellation and cleanup ownership across nested workers, model and
+  tool streams, workspace teardown, and recovery. Settle failed and interrupted
+  runs from durable terminal decisions and reconcile orphaned sessions at startup.
+  Forwarded cancellation is delivered once across nested task handlers, and
+  settlement/cancellation checks cover every Runtime module.
+- Prevent cross-session PostgreSQL event cursors from skipping late commits.
+  Fence task-group settlement to claim generations and reconcile task holds
+  during worker heartbeats.
+- Enforce aggregate source/export and session-store budgets, retain latest tool
+  attachments, and group usage pricing by the effective price. Improve expired
+  approval, exhausted model-retry, and proposal-outcome diagnostics.
+- Tighten Git/workspace recovery and command validation, preserve executable
+  modes, and disable repository hooks for index commands. Download release SBOMs
+  with the CLI, inspect retained copy archives, and follow Cloud deployment retries.
+- Preserve recovery checkpoints and execution acknowledgements during worker
+  draining. Keep recoverable tasks queued across nested shutdown refusals and
+  continuation fences, and honor operator pauses and cancellations at settlement.
+- Keep retry leases alive through final settlement, bound stalled handoffs by
+  their deadlines, and preserve model retry budgets across overflow recovery.
+  Reconcile attested lost executions without inactivity grace and isolate expired
+  schedules from unrelated queued work.
+- Preserve completion after copy-back and keep partial-transfer retry budgets
+  stable. Recover deferred Docker bindings and avoid repeating disposal after
+  retirement checkpoint failures.
+- Pin Git directory traversal against symlink escapes, support long filenames in
+  conditional replacement, reject incomplete revisions for growing files, and
+  release bulk-read locks when their event loop shuts down.
+- Scrub credential byte variants and persisted before-stop continuations; reject
+  encoded credential-bearing bodies. Correct decoded partial-response ranges and
+  attribute same-model cross-provider fallback to the correct model slot.
+- Refresh the bundled model catalog.
+
 ## v0.18.0
 
 Upgrade: Stop all workers, dispatchers, and servers that open the database, take a
