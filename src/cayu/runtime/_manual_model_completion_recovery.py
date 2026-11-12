@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -20,7 +21,6 @@ from cayu.events import (
     EventType,
     event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
-    runtime_payload_authority_paths,
 )
 from cayu.execution_units import ModelAttemptIdentity
 from cayu.runtime import _runtime_records as runtime_records
@@ -38,7 +38,10 @@ from cayu.runtime._model_completion_contracts import (
     ModelCompletionManualRecoveryRequired,
     model_completion_recovery_context_from_stage,
 )
-from cayu.runtime._outcome_decision_settlement import bind_owed_terminal_to_run_operation
+from cayu.runtime._outcome_decision_settlement import (
+    owed_terminal_install,
+    prepare_owed_terminal,
+)
 from cayu.runtime._recovery_claims import _IncompleteRecoveryClaim
 from cayu.runtime._recovery_ownership import RecoveryOwnership
 from cayu.runtime._run_limits import RunLimitController
@@ -55,7 +58,6 @@ from cayu.sessions._invocation_terminal_decision import (
     InvocationTerminalDecision,
     InvocationTerminalOutcome,
     build_invocation_terminal_decision,
-    build_owed_invocation_terminal_decision,
     checkpoint_with_invocation_terminal_decision,
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_event_id,
@@ -78,7 +80,6 @@ from cayu.sessions._model_stage_rules import (
 )
 from cayu.sessions._paired_writes import (
     owed_decision_from_install_mutation,
-    owed_decision_install_mutation,
 )
 from cayu.sessions._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
@@ -379,10 +380,7 @@ class ManualModelCompletionRecovery:
                 )
             ).hexdigest()
         )
-        owned_terminal_event_id = None
-        owned_terminal_payload = None
-        owned_payload_authority: tuple[str, ...] = ()
-        owned_nested_payload_authority: tuple[tuple[str, ...], ...] = ()
+        owned_terminal = None
         if invocation_context is not None:
             # Freeze the same publication-safe payload that the claimed recovery
             # would otherwise publish later. Raw/public manual recovery cannot
@@ -404,19 +402,14 @@ class ManualModelCompletionRecovery:
                 terminal_event = event_with_runtime_payload_authority(
                     terminal_event, "interruption_request_id"
                 )
-            prepared_terminal = self._event_writer.prepare(terminal_event)
-            owned_terminal_payload = prepared_terminal.payload
-            owned_payload_authority, owned_nested_payload_authority = (
-                runtime_payload_authority_paths(prepared_terminal)
-            )
-            owned_terminal_event_id = invocation_terminal_event_id(
+            owned_terminal = prepare_owed_terminal(
+                checkpoint=checkpoint,
+                session=session,
                 outcome=InvocationTerminalOutcome(request.terminal_status.value),
-                session_id=session.id,
-                session_instance_id=session.instance_id,
-                run_epoch=session.run_epoch,
                 interaction_id=interaction_id,
-                source_id=recovery_event_id,
-                event_kind="session",
+                interaction_event_id=recovery_event_id,
+                terminal_event=terminal_event,
+                publication_safe_event=self._event_writer.prepare,
             )
             if prior is not None and _session_run_operation_from_checkpoint(checkpoint) is None:
                 # Terminal publication transfers/clears the live run marker.
@@ -442,19 +435,20 @@ class ManualModelCompletionRecovery:
                 )
                 operation_id = original.terminal_payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
                 if operation_id is not None:
-                    owned_terminal_payload[SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation_id
-                    owned_terminal_event_id = original.terminal_event_id
-            owned_terminal_event_id, owned_terminal_payload = bind_owed_terminal_to_run_operation(
-                checkpoint=checkpoint,
-                terminal_event_id=owned_terminal_event_id,
-                terminal_payload=owned_terminal_payload,
-            )
+                    owned_terminal = replace(
+                        owned_terminal,
+                        event_id=original.terminal_event_id,
+                        payload={
+                            **owned_terminal.payload,
+                            SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: operation_id,
+                        },
+                    )
 
         async def require_owned_outcome(
             current_checkpoint: dict[str, Any] | None,
             transition: InteractionTransitionSpec | None = None,
         ) -> None:
-            if owned_terminal_payload is None:
+            if owned_terminal is None:
                 return
             owed = invocation_terminal_decision_from_checkpoint(current_checkpoint) or (
                 settled_invocation_terminal_decision_from_checkpoint(current_checkpoint)
@@ -470,10 +464,11 @@ class ManualModelCompletionRecovery:
                 or owed.interaction_id != interaction_id
                 or owed.interaction_event_id != expected_event_id
                 or owed.outcome.value != request.terminal_status.value
-                or owed.terminal_event_id != owned_terminal_event_id
-                or owed.terminal_payload != owned_terminal_payload
-                or (owed.terminal_payload_authority or ()) != owned_payload_authority
-                or (owed.terminal_nested_payload_authority or ()) != owned_nested_payload_authority
+                or owed.terminal_event_id != owned_terminal.event_id
+                or owed.terminal_payload != owned_terminal.payload
+                or (owed.terminal_payload_authority or ()) != owned_terminal.payload_authority
+                or (owed.terminal_nested_payload_authority or ())
+                != owned_terminal.nested_payload_authority
                 or owed.turn_completed_payload
                 != {
                     "status": request.terminal_status.value,
@@ -641,31 +636,22 @@ class ManualModelCompletionRecovery:
             )
         recovery_event = self._event_writer.prepare(recovery_event)
         checkpoint_mutation = None
-        if owned_terminal_payload is not None:
-            assert owned_terminal_event_id is not None
-            outcome = InvocationTerminalOutcome(request.terminal_status.value)
-            owed = build_owed_invocation_terminal_decision(
-                outcome=outcome,
-                session_id=current.id,
-                session_instance_id=current.instance_id,
-                run_epoch=current.run_epoch,
-                profile_interaction_id=active_profile.interaction_id,
-                interaction_id=interaction_id,
-                execution_profile_fingerprint=active_profile.profile.fingerprint,
-                interaction_event_id=recovery_event.id,
-                terminal_event_id=owned_terminal_event_id,
-                observed_at=recovery_event.timestamp,
-                terminal_payload=owned_terminal_payload,
-                terminal_payload_authority=owned_payload_authority or None,
-                terminal_nested_payload_authority=owned_nested_payload_authority or None,
+        if owned_terminal is not None:
+            _, checkpoint_mutation = owed_terminal_install(
+                session=current,
+                active_profile=active_profile,
+                outcome=InvocationTerminalOutcome(request.terminal_status.value),
+                interaction_event=recovery_event,
+                terminal=owned_terminal,
                 # Recovery knows the outcome, not the lost turn's duration or
                 # counters. Do not fabricate usage for its recovered summary.
                 turn_completed_payload={
                     "status": request.terminal_status.value,
                     "interaction_ids": [interaction_id],
                 },
+                task_id=None,
+                task_result_payload=None,
             )
-            checkpoint_mutation = owed_decision_install_mutation(owed)
         transition_spec = InteractionTransitionSpec(
             event=recovery_event,
             from_statuses=(current.status,),

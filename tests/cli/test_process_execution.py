@@ -967,24 +967,7 @@ while True:
             deadline = time.monotonic() + 5
             while _descendant_running(pid) and time.monotonic() < deadline:
                 await asyncio.sleep(0.02)
-            if _descendant_running(pid):
-                # Preserve the failed process identity so CI distinguishes a
-                # surviving group member from a reused PID or delayed reaping.
-                diagnostics = {
-                    "descendant_pid": pid,
-                    "worker_pids": list(outcome.pids),
-                    "worker_returncodes": [child.returncode for child in children],
-                    "forced_shutdown": outcome.forced_shutdown,
-                }
-                try:
-                    diagnostics["descendant_pgid"] = os.getpgid(pid)
-                except ProcessLookupError:
-                    diagnostics["descendant_pgid"] = "exited during diagnostics"
-                try:
-                    diagnostics["proc_stat"] = Path(f"/proc/{pid}/stat").read_text()
-                except (OSError, UnicodeError) as exc:
-                    diagnostics["proc_stat"] = type(exc).__name__
-                pytest.fail("descendant survived supervisor cleanup: " + json.dumps(diagnostics))
+            assert not _descendant_running(pid), "descendant survived supervisor cleanup"
         finally:
             for child in children:
                 with contextlib.suppress(ProcessLookupError):

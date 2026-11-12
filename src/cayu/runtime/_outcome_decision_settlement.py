@@ -12,6 +12,7 @@ fence release settles it once the session event is durable.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from cayu.runtime._session_finalization import SessionFinalization
     from cayu.runtime._session_outcome_publication import SessionOutcomeContext
     from cayu.runtime.tool_completion import ToolCompletionResult
+    from cayu.sessions._execution_profile_checkpoint import ActiveInvocationExecutionProfile
     from cayu.sessions.records import Session
 
 
@@ -166,6 +168,82 @@ def bind_owed_terminal_to_run_operation(
     return terminal_event_id, payload
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedOwedTerminal:
+    """Publication-safe terminal material with its exact run-operation binding."""
+
+    event_id: str
+    payload: dict[str, Any]
+    payload_authority: tuple[str, ...]
+    nested_payload_authority: tuple[tuple[str, ...], ...]
+
+
+def prepare_owed_terminal(
+    *,
+    checkpoint: dict[str, Any] | None,
+    session: Session,
+    outcome: InvocationTerminalOutcome,
+    interaction_id: str,
+    interaction_event_id: str,
+    terminal_event: Event,
+    publication_safe_event: Callable[[Event], Event],
+) -> PreparedOwedTerminal:
+    """Freeze the payload, provenance and identity before committing an outcome."""
+
+    template = publication_safe_event(terminal_event)
+    payload_authority, nested_payload_authority = runtime_payload_authority_paths(template)
+    event_id = invocation_terminal_event_id(
+        outcome=outcome,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+        run_epoch=session.run_epoch,
+        interaction_id=interaction_id,
+        source_id=interaction_event_id,
+        event_kind="session",
+    )
+    event_id, payload = bind_owed_terminal_to_run_operation(
+        checkpoint=checkpoint,
+        terminal_event_id=event_id,
+        terminal_payload=template.payload,
+    )
+    return PreparedOwedTerminal(event_id, payload, payload_authority, nested_payload_authority)
+
+
+def owed_terminal_install(
+    *,
+    session: Session,
+    active_profile: ActiveInvocationExecutionProfile,
+    outcome: InvocationTerminalOutcome,
+    interaction_event: Event,
+    terminal: PreparedOwedTerminal,
+    turn_completed_payload: dict[str, Any],
+    task_id: str | None,
+    task_result_payload: dict[str, Any] | None,
+) -> tuple[InvocationTerminalDecision, dict[str, Any]]:
+    """Build the exact terminal decision and its atomic installation mutation."""
+
+    assert interaction_event.interaction_id is not None
+    decision = build_owed_invocation_terminal_decision(
+        outcome=outcome,
+        session_id=session.id,
+        session_instance_id=session.instance_id,
+        run_epoch=session.run_epoch,
+        profile_interaction_id=active_profile.interaction_id,
+        interaction_id=interaction_event.interaction_id,
+        execution_profile_fingerprint=active_profile.profile.fingerprint,
+        interaction_event_id=interaction_event.id,
+        terminal_event_id=terminal.event_id,
+        observed_at=interaction_event.timestamp,
+        terminal_payload=terminal.payload,
+        turn_completed_payload=turn_completed_payload,
+        task_id=task_id,
+        task_result_payload=task_result_payload,
+        terminal_payload_authority=terminal.payload_authority or None,
+        terminal_nested_payload_authority=terminal.nested_payload_authority or None,
+    )
+    return decision, owed_decision_install_mutation(decision)
+
+
 async def owed_decision_install(
     *,
     checkpoint: dict[str, Any] | None,
@@ -179,25 +257,15 @@ async def owed_decision_install(
     outcome = owed.outcome
     session = context.state.session
     active_profile = context.invocation_context.active_profile
-    # The decision is durable before its events are, so it holds only what their
-    # publication would store: the payload after secret redaction.
-    terminal_template = session_finalization.publication_safe_event(owed.terminal_event)
-    terminal_payload = dict(terminal_template.payload)
-    payload_authority, nested_payload_authority = runtime_payload_authority_paths(terminal_template)
     assert interaction_event.interaction_id is not None
-    terminal_event_id = invocation_terminal_event_id(
-        outcome=outcome,
-        session_id=session.id,
-        session_instance_id=session.instance_id,
-        run_epoch=session.run_epoch,
-        interaction_id=interaction_event.interaction_id,
-        source_id=interaction_event.id,
-        event_kind="session",
-    )
-    terminal_event_id, terminal_payload = bind_owed_terminal_to_run_operation(
+    terminal = prepare_owed_terminal(
         checkpoint=checkpoint,
-        terminal_event_id=terminal_event_id,
-        terminal_payload=terminal_payload,
+        session=session,
+        outcome=outcome,
+        interaction_id=interaction_event.interaction_id,
+        interaction_event_id=interaction_event.id,
+        terminal_event=owed.terminal_event,
+        publication_safe_event=session_finalization.publication_safe_event,
     )
     turn_completed_payload = owed.turn_completed_payload
     if turn_completed_payload is None:
@@ -218,26 +286,18 @@ async def owed_decision_install(
         and context.invocation_context.work_attempt is None
         else None
     )
-    decision = build_owed_invocation_terminal_decision(
+    decision, mutation = owed_terminal_install(
+        session=session,
+        active_profile=active_profile,
         outcome=outcome,
-        session_id=session.id,
-        session_instance_id=session.instance_id,
-        run_epoch=session.run_epoch,
-        profile_interaction_id=active_profile.interaction_id,
-        interaction_id=interaction_event.interaction_id,
-        execution_profile_fingerprint=active_profile.profile.fingerprint,
-        interaction_event_id=interaction_event.id,
-        terminal_event_id=terminal_event_id,
-        observed_at=interaction_event.timestamp,
-        terminal_payload=terminal_payload,
+        interaction_event=interaction_event,
+        terminal=terminal,
         turn_completed_payload=turn_completed_payload,
         task_id=task_id,
         task_result_payload=None if task_id is None else completed_task_result(context),
-        terminal_payload_authority=payload_authority or None,
-        terminal_nested_payload_authority=nested_payload_authority or None,
     )
     context.state.outcome_decision = decision
-    return owed_decision_install_mutation(decision)
+    return mutation
 
 
 def checkpoint_with_completion_decision(
