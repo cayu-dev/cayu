@@ -95,6 +95,12 @@ back.
 There is no budget on total source lines. The per-file caps above still apply,
 and `scripts/scoreboard.py` still reports the total.
 
+The public-name budget is 4,085, the standard 5 names above the merged total of
+4,080 after `cayu.connectors.github` was added. That package is new public API: a
+GitHub client for code on a connection slot, its typed errors, GraphQL error
+filters and local token and GitHub App credentials, replacing three
+applications' own copies; it removes no names elsewhere.
+
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
 own delivery evidence. The historical inventory baseline stays unchanged.

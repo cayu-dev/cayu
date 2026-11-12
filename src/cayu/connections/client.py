@@ -105,7 +105,7 @@ class CloudConnectionBroker:
             raise ValueError("The connection broker token must not be empty.")
         self._url = url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {token}"}
-        self._transport = _kept_open(transport)
+        self._transport = kept_open(transport)
         self._timeout = timeout_seconds
 
     def __repr__(self) -> str:
@@ -227,7 +227,7 @@ class LocalConnections:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._slots = dict(slots)
-        self._transport = _kept_open(transport)
+        self._transport = kept_open(transport)
         self._timeout = timeout_seconds
 
     async def request(
@@ -361,5 +361,8 @@ class _KeptOpen(httpx.AsyncBaseTransport):
         return None
 
 
-def _kept_open(transport: httpx.AsyncBaseTransport | None) -> httpx.AsyncBaseTransport | None:
+def kept_open(transport: httpx.AsyncBaseTransport | None) -> httpx.AsyncBaseTransport | None:
+    """An application's transport, shared by each call's client and closed only by its owner;
+    the connectors' own direct calls keep it open the same way."""
+
     return None if transport is None else _KeptOpen(transport)

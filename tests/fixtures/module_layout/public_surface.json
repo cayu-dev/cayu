@@ -823,6 +823,49 @@
         "URL_ENVIRONMENT"
       ]
     },
+    "cayu.connectors.github": {
+      "defined_in": {
+        "cayu.connectors.github._errors": [
+          "GitHubAppNotInstalled",
+          "GitHubConflict",
+          "GitHubConnectionRefused",
+          "GitHubError",
+          "GitHubGraphQLFailed",
+          "GitHubNotFound",
+          "GitHubPermissionDenied",
+          "GitHubRateLimited",
+          "GitHubUnavailable",
+          "GitHubWriteRefused"
+        ],
+        "cayu.connectors.github._graphql": [
+          "GraphQLAnswer",
+          "GraphQLError",
+          "errors_under",
+          "forbidden_under",
+          "is_mutation"
+        ],
+        "cayu.connectors.github.client": [
+          "GitHubClient",
+          "GitHubResponse",
+          "Page",
+          "RefusedWrite"
+        ],
+        "cayu.connectors.github.credentials": [
+          "GitHubAppConnections",
+          "app_connections",
+          "connections_from_environment",
+          "token_connections"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "API_URL",
+        "DEFAULT_MAX_PAGES",
+        "DEFAULT_SLOT",
+        "ErrorFilter",
+        "REPOSITORY_HEADER"
+      ]
+    },
     "cayu.connectors.sap": {
       "defined_in": {
         "cayu.connectors.sap.toolkit": [
@@ -5545,6 +5588,7 @@
       "defined_in": {},
       "identities": {},
       "present": [
+        "github",
         "sap",
         "slack",
         "snowflake"

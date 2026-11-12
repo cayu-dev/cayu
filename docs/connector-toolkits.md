@@ -1,4 +1,4 @@
-# Connector toolkits: Slack, Snowflake and SAP
+# Connector toolkits: Slack, Snowflake, SAP and GitHub
 
 `cayu.connectors` has ready tools for an application's connections. Each toolkit calls its
 connector through a connection slot ([Connections in the Runtime](adr/0003-connections-runtime-contract.md)),
@@ -188,6 +188,77 @@ app.register_agent(spec, tools=sap.tools(slot="sap"))
   `expansion_incomplete` as above) and `next_skip` at the first row left out. An answer
   over the broker's 5 MiB fails with `upstream_response_too_large`: ask for a smaller `top`, or
   fewer fields or expansions.
+
+## GitHub client
+
+`cayu.connectors.github` is a client for code, such as workflows and task handlers, rather than
+a set of tools. `GitHubClient(client=None, slot="github")` calls GitHub's REST and GraphQL APIs
+through the slot; the same code runs on Cayu Cloud, through the broker, and on a laptop:
+
+```python
+from cayu.connectors import github
+
+gh = github.GitHubClient(github.connections_from_environment(permissions={"issues": "write"}))
+pulls = await gh.list(f"/repos/{repo}/pulls", query={"state": "open"})
+await gh.post(f"/repos/{repo}/issues/{pulls.items[0]['number']}/comments", json={"body": text})
+```
+
+`connections_from_environment(permissions=...)` answers the broker on Cayu Cloud. Off it, it
+answers `GITHUB_TOKEN` as `token_connections(token)`, or a GitHub App from `GITHUB_APP_ID` and
+`GITHUB_APP_PRIVATE_KEY` as `app_connections(app_id, private_key, permissions=...)`; both set is
+an error, as they sign in different names. The App signs an RS256 token with its key, and mints
+an installation token for each call's one repository with exactly `permissions`, as a binding
+fixes a slot's scopes on Cayu Cloud: no call asks for more. It keeps each repository's
+installation and token, for at most 256 repositories, mints once however many calls miss at
+once, replaces a token 5 minutes before it expires, and mints again once when GitHub answers
+401. It calls only a repository's own API (`/repos/{owner}/{name}/...`), `/graphql` and
+`/rate_limit` (with a repository, whose token it uses), the calls Cayu Cloud's GitHub connector
+is to allow. `GitHubClient` doesn't name a repository for `/rate_limit` yet, so it can't read
+that path through an App slot; a token slot answers it. `login()` is the App's `<slug>[bot]`, the
+author of what it writes.
+
+- **Calls.** `request(method, path)` answers GitHub's response; `get`, `post`, `put`, `patch`
+  and `delete` its JSON; `text(path)` a raw file or a job's log. Paths start with `/` and are
+  percent-encoded where needed (a branch keeps its `/`; a `%` is literal unless it starts an
+  escape such as `%2F`). A call under `/repos/{owner}/{name}/`, or `graphql(...,
+  repository=)`, names its repository in the `x-cayu-github-repository` header. The slot's
+  host uses it to pick the credential and drops it, so GitHub never sees it:
+  `token_connections` and `app_connections` do, and Cayu Cloud's GitHub connector has to.
+- **Pages.** `list(path)` follows GitHub's next-page links, 100 items a page, and answers
+  `Page(items, complete)`: `complete` is false when `max_pages` (default 50) or
+  `keep_going(page_items)` stopped it early. `paginate(path)` yields the items one by one.
+  `item_key` reads listings wrapped in an object (`check_runs`). A link is followed only to the
+  same listing on the slot's API (GitHub's links may name its owner, repository or team by
+  id), keeping the path asked for, and never to a page already read.
+- **Errors.** Each failure is a `GitHubError` with `method`, `path`, `status`, GitHub's
+  `message` and `errors[]` text, `codes` and `request_id`: `GitHubNotFound`,
+  `GitHubPermissionDenied` (with `accepted_permissions`), `GitHubConflict` (409, 422),
+  `GitHubRateLimited` (with `retry_after`, `secondary`), `GitHubUnavailable`,
+  `GitHubConnectionRefused` (the broker's `code`), `GitHubAppNotInstalled`,
+  `GitHubWriteRefused` and `GitHubGraphQLFailed`.
+- **Rate limits and retries.** A rate limit (a 429, or a 403 with no requests left, a
+  `Retry-After` or a secondary limit) and the broker's `too_many_calls` are waited out and the
+  call sent once more when the wait is at most `max_rate_limit_wait_seconds` (60), as is a
+  GraphQL answer whose errors are `RATE_LIMITED`; GitHub
+  didn't act on a limited call, so a write is resent too. A 5xx or a lost answer is retried
+  (`read_retries`, 2) only for reads and GraphQL queries; a write raises with `ambiguous` set.
+  One client has at most 6 calls in flight.
+- **GraphQL.** `graphql(query, variables, repository=...)` fails on any error in the answer,
+  with GitHub's `data` and `errors`, unless `accept` takes it: accepted errors come back in
+  `GraphQLAnswer.accepted` beside the `data`. `forbidden_under("statusCheckRollup")` reads a
+  pull whose one check run the credential can't see; `errors_under(*path, types=...)` accepts
+  by path. A null `repository` raises `GitHubNotFound`, unless `accept` took its
+  `NOT_FOUND`. GitHub Enterprise Server's GraphQL API (`/api/graphql`) isn't reachable through
+  a slot rooted at `/api/v3` yet.
+- **Read-only mode.** `GitHubClient(..., read_only=True)` or `read_only_view()` refuses every
+  method but `GET` and `HEAD`, and any GraphQL document with a `mutation`, before it leaves,
+  and lists each in `refused` for a dry run's report. For a hard guarantee, bind a second slot
+  to read scopes.
+- **Redirects.** A redirect fails the call (a moved repository says so). `text()` follows a
+  job log's redirect to GitHub's log storage (`*.actions.githubusercontent.com` and
+  `productionresultssa<N>.blob.core.windows.net`) directly, with no credential, and
+  keeps the log's last 5 MiB. On Cayu Cloud that download needs the Agent to reach those hosts,
+  as the broker doesn't follow redirects.
 
 ## Errors
 
