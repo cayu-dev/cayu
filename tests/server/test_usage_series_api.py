@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from tests.core.test_cloud_reporting import _app, _start
 
 from cayu.server import ServerConfig, create_server
+from cayu.sessions.records import SessionStatus
 
 
 def test_counts_filter_current_specialist_and_return_start_buckets():
@@ -87,6 +88,7 @@ def test_all_current_session_filters_and_histogram_share_one_counts_traversal(mo
 
         monkeypatch.setattr(store, "list_sessions", observed)
         now = datetime.now(UTC)
+        since = now - timedelta(hours=24)
         filters = {
             "agent_name": "writer",
             "provider_name": "not-the-provider",
@@ -99,7 +101,7 @@ def test_all_current_session_filters_and_histogram_share_one_counts_traversal(mo
                 "/api/sessions/overview/counts",
                 params={
                     name: value,
-                    "since": (now - timedelta(hours=24)).isoformat(),
+                    "since": since.isoformat(),
                     "until": (now + timedelta(seconds=1)).isoformat(),
                     "bucket_unit": "hour",
                 },
@@ -109,7 +111,22 @@ def test_all_current_session_filters_and_histogram_share_one_counts_traversal(mo
             expected = 1 if name == "agent_name" else 0
             assert int(body["total_count"]) == expected
             assert sum(int(b["total_count"]) for b in body["series"]["buckets"]) == expected
-            assert len(calls) == 1
+            # The filter and the histogram share one listing of the window. The
+            # only other listings are the bounded reads of older sessions that
+            # may still be running: the running statuses before and after the
+            # interrupted ones. The store applies the filter to each.
+            assert all(getattr(query, name) == value for query in calls)
+            window = [query for query in calls if query.status is None]
+            assert len(window) == 1
+            assert window[0].created_since == since
+            older = [query for query in calls if query.status is not None]
+            running = [SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING]
+            assert [query.status for query in older] == [
+                *running,
+                SessionStatus.INTERRUPTED,
+                *running,
+            ]
+            assert all(query.created_before == since for query in older)
 
 
 def test_custom_store_must_advertise_series_and_cannot_omit_requested_projection():

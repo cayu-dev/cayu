@@ -1595,16 +1595,24 @@ async def list_sessions(
                 f"SELECT COUNT(*) FROM {session_source_sql} {plan.filter_where_sql}",
                 plan.filter_params,
             ).fetchone()[0]
+        # Order and cut the page by ID first, then read only its rows. Sorting
+        # whole rows would copy every session's invocation and metadata into
+        # the sort, which costs seconds on a store with thousands of sessions.
         rows = connection.execute(
             f"""
             SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
                    causal_budget_id, runtime_name, runtime_version, environment_name,
                    status, created_at, updated_at, last_activity_at, run_epoch,
                    invocation_json, metadata_json
-            FROM {session_source_sql}
-            {plan.page_where_sql}
+            FROM cayu_sessions
+            WHERE id IN (
+                SELECT cayu_sessions.id
+                FROM {session_source_sql}
+                {plan.page_where_sql}
+                ORDER BY {plan.order_sql}
+                {plan.pagination_sql}
+            )
             ORDER BY {plan.order_sql}
-            {plan.pagination_sql}
             """,
             plan.page_params,
         ).fetchall()

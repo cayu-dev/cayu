@@ -42,10 +42,12 @@ from cayu.sessions._label_filter_syntax import parse_label_filters, parse_label_
 from cayu.sessions._run_identity import is_eval_trial, session_run_id
 from cayu.sessions.checkpoints import BROWSER_CONTROLS_CHECKPOINT_KEY
 from cayu.sessions.overview import (
+    SessionCostCache,
     SessionOverviewFacts,
     SessionOverviewReader,
     SessionOverviewStatus,
     SessionOverviewUnavailable,
+    SessionUsageCache,
     gather_in_order,
 )
 from cayu.sessions.queries import SessionAggregateFilter
@@ -71,6 +73,11 @@ class SessionOverviewService:
         self.project_session = project_session
         self.redact = redact
         self.artifact_stores = artifact_stores
+        # The service reads one store with one price book for its lifetime, so
+        # a page sums usage and prices cost only for sessions whose events
+        # changed since an earlier page read them.
+        self._cost_cache = SessionCostCache()
+        self._usage_cache = SessionUsageCache()
 
     async def read(
         self,
@@ -79,7 +86,12 @@ class SessionOverviewService:
         selection: SessionOverviewSelection | None = None,
     ) -> tuple[list[Session], list[SessionOverviewResponse]]:
         selection = SessionOverviewSelection() if selection is None else selection
-        facts = await SessionOverviewReader(self.store, pricing=self.pricing).read_listed(sessions)
+        facts = await SessionOverviewReader(
+            self.store,
+            pricing=self.pricing,
+            cost_cache=self._cost_cache,
+            usage_cache=self._usage_cache,
+        ).read_listed(sessions)
         selected: list[SessionOverviewFacts] = []
         for fact in facts:
             session = fact.session

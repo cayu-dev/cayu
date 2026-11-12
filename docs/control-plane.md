@@ -485,16 +485,22 @@ Repeated `ids` parameters select up to 200 public session IDs, preserving first
 occurrence order and omitting missing sessions. IDs cannot be combined with
 listing filters or nondefault pagination. Include `overview` to fetch the same
 facts for detail views without making separate status and usage requests.
+The server keeps each session's usage summary and estimated cost while that
+session's usage-bearing events stay the same, so a later page reads events only
+for the sessions that changed.
 
 `GET /api/sessions/overview/counts` returns all-scope `running_now`,
 `total_count`, `failed`, and `counts_by_state`. The creation window is
 `[since, until)`, defaulting to the last 24 hours. `running_now` includes older
 running sessions before `until`. Evaluation trials and fork-lineage sessions
-are excluded unless `include_eval=true` or `include_forks=true`. Counts traverse
-all pages before the fixed upper creation boundary, stopping before enriching
-newer rows; they never use the old capped `/sessions/summary` result. Each store
-page of 200 sessions is enriched with the overview's page reads, so counts cost a
-fixed number of store reads per page, not per session. Both reads
+are excluded unless `include_eval=true` or `include_forks=true`. Counts read
+only the sessions that can change them: every session created in the window, by
+creation time, and the older sessions that are pending, running or interrupting,
+interrupted waiting on a subagent, or that recorded usage-bearing events in the
+window. They never page through older history or use the old capped
+`/sessions/summary` result. Each page of 200 sessions is enriched with the
+overview's page reads, so counts cost a fixed number of store reads per page, not
+per session. Both reads
 are available to members and use `Cache-Control: private, no-store`.
 The response also includes `tokens` (`input`, `output`, `cached`),
 `tokens_complete`, and `cost` using the ordinary overview amount/currency/complete

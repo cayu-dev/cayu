@@ -51,3 +51,24 @@ checkpoint, then compares direct event decoding with the former cache strategy
 across 100 nested event rows. It is not an end-to-end application benchmark.
 Re-profile the actual multi-session workload to determine remaining SQL, copying,
 or model bottlenecks.
+
+## Developer dashboard reads at deployment size
+
+`scripts/benchmark_session_overview_reads.py` builds a SQLite store shaped like a
+busy deployment, 8,000 sessions over 60 days with five model steps, four tool
+calls, a transcript and a checkpoint each, and times Home's 24-hour
+`GET /api/sessions/overview/counts` and a 100-row
+`GET /api/sessions?include=overview` page through the real server:
+
+```sh
+uv run python scripts/benchmark_session_overview_reads.py
+uv run python scripts/benchmark_session_overview_reads.py --keep /tmp/sessions.db
+uv run python scripts/benchmark_session_overview_reads.py --store /tmp/sessions.db
+```
+
+A few template sessions run through the real runtime; their rows are then copied
+with new IDs, incarnations, sequences and times, so the store builds in seconds.
+`tests/server/test_session_overview_scale.py` runs the same build in CI and fails
+if either read slows past its bound. Session listings sort and cut a page by ID
+before reading its rows, so a page reads 100 wide rows rather than sorting every
+session's invocation and metadata.

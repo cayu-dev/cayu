@@ -3143,7 +3143,8 @@ def test_sqlite_session_cursor_paginates_equal_sort_values_without_gaps(
     session_queries = asyncio.run(run())
 
     assert session_queries
-    assert all(query.count("id ASC") == 1 for query in session_queries)
+    # A listing orders its IDs, then its rows, each with one ID tiebreak.
+    assert all(query.count("id ASC") == query.count("ORDER BY") == 2 for query in session_queries)
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])

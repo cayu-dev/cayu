@@ -244,19 +244,25 @@ def test_counts_stop_at_upper_creation_boundary_before_enrichment(monkeypatch):
         enriched = []
 
         async def growing_pages(query=None):
+            if query.status is not None:
+                # The bounded reads of older sessions that may still be running.
+                assert query.created_before == inside.created_at
+                return await original(query)
             calls.append(query.cursor)
             assert query.order_by is SessionOrder.CREATED_AT_ASC
             assert len(calls) <= 2, "must not chase sessions created beyond until"
-            page = await original(query.model_copy(update={"limit": 2}))
-            if query.cursor is not None:
-                return page.model_copy(
-                    update={
-                        "next_cursor": encode_session_cursor(
-                            page.sessions[-1], SessionOrder.CREATED_AT_ASC
-                        )
-                    }
-                )
-            return page
+            # Model a store whose creation listing runs past ``until`` and always
+            # offers another page: counts must stop at the boundary on their own.
+            page = await original(query.model_copy(update={"limit": 2, "created_before": None}))
+            return page.model_copy(
+                update={
+                    "next_cursor": encode_session_cursor(
+                        page.sessions[-1], SessionOrder.CREATED_AT_ASC
+                    )
+                    if page.sessions
+                    else None
+                }
+            )
 
         async def bounded_load(session_id):
             enriched.append(session_id)
@@ -285,7 +291,8 @@ def test_counts_stop_at_upper_creation_boundary_before_enrichment(monkeypatch):
             assert response.json()["total_count"] == "1"
             assert response.json()["running_now"] == "1"
             assert set(enriched) == {"older-running", "inside"}
-            assert len(calls) == 2
+            # The first page already holds ``boundary``, so no second page is read.
+            assert len(calls) == 1
 
     asyncio.run(scenario())
 

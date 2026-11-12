@@ -338,9 +338,19 @@ def test_counts_require_positive_unforked_lineage(session_store_case, names, mon
                 loaded = await original_page(session_ids)
                 return {key: without_ancestry(session) for key, session in loaded.items()}
 
+            original_list = store.list_sessions
+
+            async def missing_listed_ancestry(query=None):
+                listed = await original_list(query)
+                return listed.model_copy(
+                    update={"sessions": [without_ancestry(row) for row in listed.sessions]}
+                )
+
             monkeypatch.setattr(store, "load", missing_ancestry)
-            # Counts load a store page of sessions with one read.
+            # Counts load a store page of sessions with one read, and count the
+            # window's sessions as the creation listing returns them.
             monkeypatch.setattr(store, "load_sessions", missing_page_ancestry)
+            monkeypatch.setattr(store, "list_sessions", missing_listed_ancestry)
             async with _client(app) as client:
                 response = await client.get(PATH)
                 assert response.status_code == 200, response.text

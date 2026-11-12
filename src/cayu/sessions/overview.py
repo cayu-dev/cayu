@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -27,7 +27,7 @@ from cayu._time_buckets import (
 )
 from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
-from cayu.budgets.usage import AggregateCount, SessionUsageSummary
+from cayu.budgets.usage import USAGE_BEARING_EVENT_TYPES, AggregateCount, SessionUsageSummary
 from cayu.releases import recorded_release_identity
 from cayu.sessions._foreground_child_checkpoint import (
     MAX_FOREGROUND_CHAIN_DEPTH,
@@ -58,6 +58,7 @@ from cayu.sessions.records import PendingActionKind, Session, SessionLineage, Se
 from cayu.sessions.summaries import SessionStepCounts
 
 if TYPE_CHECKING:
+    from cayu.events import EventType
     from cayu.sessions.store import SessionStore
     from cayu.sessions.summaries import SessionOutcome
 
@@ -70,6 +71,12 @@ _PENDING_ACTION_STATUSES = frozenset(
 # sequences instead of one per session in turn. It stays below the default
 # PostgreSQL pool of 5 so an open dashboard can't hold every connection.
 OVERVIEW_READ_CONCURRENCY = 4
+
+# Sessions per counts page, and event heads per read when finding older usage.
+_COUNT_PAGE = 200
+_USAGE_HEAD_PAGE = 5000
+_MIN_USAGE_RANGE = timedelta(milliseconds=1)
+_UNFILTERED = session_query_from_aggregate_filter(SessionAggregateFilter())
 
 _T = TypeVar("_T")
 _NO_STEPS = SessionStepCounts()
@@ -198,10 +205,33 @@ class SessionOverviewCounts:
         return sum(self.counts_by_state.values())
 
 
-_CostKey = tuple[str, str, int, int, str]
+_Totals = TypeVar("_Totals", SessionCostTotals, SessionUsageSummary)
 
 
-class SessionCostCache:
+class _SessionTotalsCache(Generic[_Totals]):
+    """Per-session totals keyed by what they were computed from, least recently used first."""
+
+    def __init__(self, *, max_sessions: int = 4096) -> None:
+        if type(max_sessions) is not int or max_sessions < 1:
+            raise ValueError("max_sessions must be a positive integer.")
+        self._max_sessions = max_sessions
+        self._totals: OrderedDict[tuple[Any, ...], _Totals | None] = OrderedDict()
+
+    def _get(self, key: tuple[Any, ...]) -> tuple[bool, _Totals | None]:
+        if key not in self._totals:
+            return False, None
+        self._totals.move_to_end(key)
+        totals = self._totals[key]
+        return True, None if totals is None else totals.model_copy(deep=True)
+
+    def _put(self, key: tuple[Any, ...], totals: _Totals | None) -> None:
+        self._totals[key] = None if totals is None else totals.model_copy(deep=True)
+        self._totals.move_to_end(key)
+        while len(self._totals) > self._max_sessions:
+            self._totals.popitem(last=False)
+
+
+class SessionCostCache(_SessionTotalsCache[SessionCostTotals]):
     """Sessions' cost totals, reused while their cost-bearing events stay the same.
 
     A total is reused for the same session incarnation, the same count and
@@ -211,24 +241,14 @@ class SessionCostCache:
     totals, dropping the least recently used.
     """
 
-    def __init__(self, *, max_sessions: int = 4096) -> None:
-        if type(max_sessions) is not int or max_sessions < 1:
-            raise ValueError("max_sessions must be a positive integer.")
-        self._max_sessions = max_sessions
-        self._totals: OrderedDict[_CostKey, SessionCostTotals | None] = OrderedDict()
 
-    def _get(self, key: _CostKey) -> tuple[bool, SessionCostTotals | None]:
-        if key not in self._totals:
-            return False, None
-        self._totals.move_to_end(key)
-        totals = self._totals[key]
-        return True, None if totals is None else totals.model_copy(deep=True)
+class SessionUsageCache(_SessionTotalsCache[SessionUsageSummary]):
+    """Sessions' usage summaries, reused while their usage-bearing events stay the same.
 
-    def _put(self, key: _CostKey, totals: SessionCostTotals | None) -> None:
-        self._totals[key] = None if totals is None else totals.model_copy(deep=True)
-        self._totals.move_to_end(key)
-        while len(self._totals) > self._max_sessions:
-            self._totals.popitem(last=False)
+    The rule ``SessionCostCache`` follows, for the events usage accounting
+    reads: a summary is reused for the same session incarnation and the same
+    count and latest sequence of its usage-bearing events.
+    """
 
 
 class SessionOverviewReader:
@@ -237,7 +257,8 @@ class SessionOverviewReader:
     With ``token_usage=False`` a summary carries only its step counts, which the
     store counts without reading events, and ``usage`` is ``None``. With a
     ``cost_cache``, a page prices only the sessions whose cost-bearing events
-    changed since the cache last priced them.
+    changed since the cache last priced them; with a ``usage_cache``, it sums
+    usage only for the sessions whose usage-bearing events changed.
     """
 
     def __init__(
@@ -247,15 +268,19 @@ class SessionOverviewReader:
         pricing: PriceBook | None = None,
         token_usage: bool = True,
         cost_cache: SessionCostCache | None = None,
+        usage_cache: SessionUsageCache | None = None,
     ) -> None:
         if type(token_usage) is not bool:
             raise TypeError("token_usage must be a bool.")
         if cost_cache is not None and type(cost_cache) is not SessionCostCache:
             raise TypeError("cost_cache must be a SessionCostCache.")
+        if usage_cache is not None and type(usage_cache) is not SessionUsageCache:
+            raise TypeError("usage_cache must be a SessionUsageCache.")
         self._store = store
         self._pricing = pricing
         self._token_usage = token_usage
         self._cost_cache = cost_cache
+        self._usage_cache = usage_cache
         # Whether a parent's retained wait names a child, by both incarnations.
         self._retained_waits: dict[tuple[str, str | None, str, str | None], bool] = {}
         self._loaded: dict[str, Session | None] = {}
@@ -415,17 +440,15 @@ class SessionOverviewReader:
     async def _read(self, sessions: list[Session]) -> tuple[SessionOverviewFacts, ...]:
         if not sessions:
             return ()
-        query = EventQuery(session_ids=tuple(session.id for session in sessions))
         if self._token_usage:
-            usage = await self._store.read_usage_accounting(query, by_session=True)
-            usage_by_session = {summary.session_id: summary for summary in usage.session_summaries}
+            usage_by_session = await self._usages(sessions)
             steps = {
                 session_id: SessionStepCounts(summary.model_steps, summary.tool_calls)
                 for session_id, summary in usage_by_session.items()
             }
         else:
             usage_by_session = {}
-            steps = await self._store.count_session_steps(query.session_ids)
+            steps = await self._store.count_session_steps(tuple(session.id for session in sessions))
         cost_by_session = await self._costs(sessions)
         # Every read below covers the whole page, so a page costs the same
         # number of store reads however many sessions it holds.
@@ -480,21 +503,59 @@ class SessionOverviewReader:
         current = await self._current(sessions)
         return tuple(run for run in runs if run.session.id in current)
 
+    async def _usages(self, sessions: Sequence[Session]) -> dict[str, SessionUsageSummary]:
+        """Each session's usage summary; sessions without usage-bearing events are absent."""
+
+        async def read(session_ids: tuple[str, ...]) -> dict[str, SessionUsageSummary]:
+            usage = await self._store.read_usage_accounting(
+                EventQuery(session_ids=session_ids), by_session=True
+            )
+            return {summary.session_id: summary for summary in usage.session_summaries}
+
+        return await self._cached_totals(
+            sessions, self._usage_cache, USAGE_BEARING_EVENT_TYPES, (), read
+        )
+
     async def _costs(self, sessions: Sequence[Session]) -> dict[str, SessionCostTotals]:
         """Each session's cost totals; sessions without cost-bearing events are absent."""
 
         pricing = self._pricing
         if pricing is None:
             return {}
-        session_ids = tuple(session.id for session in sessions)
-        cache = self._cost_cache
-        costs: dict[str, SessionCostTotals] = {}
-        keys: dict[str, _CostKey] = {}
-        if cache is not None:
-            from cayu.runtime._cost_accounting import COST_EVENT_TYPES
+        from cayu.runtime._cost_accounting import COST_EVENT_TYPES
 
-            positions = await self._store.summarize_event_positions(session_ids, COST_EVENT_TYPES)
-            prices = _price_book_digest(pricing)
+        async def read(session_ids: tuple[str, ...]) -> dict[str, SessionCostTotals]:
+            cost = await self._store.read_cost_accounting(
+                EventQuery(session_ids=session_ids), pricing, by_session=True
+            )
+            return {totals.session_id: totals for totals in cost.session_totals}
+
+        return await self._cached_totals(
+            sessions, self._cost_cache, COST_EVENT_TYPES, (_price_book_digest(pricing),), read
+        )
+
+    async def _cached_totals(
+        self,
+        sessions: Sequence[Session],
+        cache: _SessionTotalsCache[_Totals] | None,
+        event_types: Sequence[EventType],
+        basis: tuple[str, ...],
+        read: Callable[[tuple[str, ...]], Awaitable[dict[str, _Totals]]],
+    ) -> dict[str, _Totals]:
+        """Per-session totals, read again only for sessions whose ``event_types`` changed.
+
+        A cached total is keyed by the session's incarnation, the count and latest
+        sequence of its events of ``event_types``, and ``basis`` (what else the
+        total depends on). It is kept only when those events were the same before
+        and after it was read, so a total counts exactly the events its key names.
+        """
+
+        session_ids = tuple(session.id for session in sessions)
+        totals: dict[str, _Totals] = {}
+        keys: dict[str, tuple[Any, ...]] = {}
+        unread = session_ids
+        if cache is not None:
+            positions = await self._store.summarize_event_positions(session_ids, event_types)
             for session in sessions:
                 position = positions.get(session.id)
                 if position is None:
@@ -504,41 +565,31 @@ class SessionOverviewReader:
                     session.instance_id,
                     position.count,
                     position.last_sequence,
-                    prices,
+                    *basis,
                 )
-                found, totals = cache._get(key)
+                found, cached = cache._get(key)
                 if not found:
                     keys[session.id] = key
-                elif totals is not None:
-                    costs[session.id] = totals
-            unpriced = tuple(
+                elif cached is not None:
+                    totals[session.id] = cached
+            unread = tuple(
                 session_id
                 for session_id in session_ids
                 if session_id in keys or session_id not in positions
             )
-        else:
-            unpriced = session_ids
-        if unpriced:
-            cost = await self._store.read_cost_accounting(
-                EventQuery(session_ids=unpriced), pricing, by_session=True
-            )
-            priced = {totals.session_id: totals for totals in cost.session_totals}
-            costs.update(priced)
+        if unread:
+            fresh = await read(unread)
+            totals.update(fresh)
             if cache is not None and keys:
-                from cayu.runtime._cost_accounting import COST_EVENT_TYPES
-
-                # A total is kept only for a session whose cost-bearing events
-                # were the same before and after it was priced, so the totals
-                # count exactly the events its key names.
-                after = await self._store.summarize_event_positions(tuple(keys), COST_EVENT_TYPES)
+                after = await self._store.summarize_event_positions(tuple(keys), event_types)
                 for session_id, key in keys.items():
                     position = after.get(session_id)
                     if (
                         position is not None
                         and (position.count, position.last_sequence) == key[2:4]
                     ):
-                        cache._put(key, priced.get(session_id))
-        return costs
+                        cache._put(key, fresh.get(session_id))
+        return totals
 
     async def _load_many(self, session_ids: Iterable[str]) -> None:
         """Cache every session not yet loaded for this page with one store read."""
@@ -769,8 +820,11 @@ class SessionOverviewReader:
         """Complete current-read counts, not a cross-store atomic snapshot.
 
         The window counts sessions created in [since, until); running_now also
-        includes older running sessions. Pages are followed through the upper
-        creation boundary. Mutable update times never paginate this population.
+        includes older running sessions, and usage includes older sessions'
+        usage in the window. Only those sessions are read: the window's, by
+        creation time, and the older sessions that are running, waiting on a
+        subagent, or recorded usage in the window. Mutable update times never
+        select this population.
         """
         until = datetime.now(UTC) if until is None else until
         since = until - timedelta(days=1) if since is None else since
@@ -784,145 +838,266 @@ class SessionOverviewReader:
             else SessionAggregateFilter.model_validate(filters.model_dump())
         )
         filter_query = session_query_from_aggregate_filter(filters)
-        buckets = () if series is None else time_buckets(since, until, series)
-        starts = tuple(bucket.start_at for bucket in buckets)
-        start_counts = [0 for _ in buckets]
-        failed_counts = [0 for _ in buckets]
-        counts = dict.fromkeys(SessionOverviewStatus, 0)
-        input_tokens = output_tokens = cached_tokens = 0
-        tokens_complete = True
-        cost = None if self._pricing is None else Decimal(0)
-        cost_complete = True
-        running = 0
+        tally = _CountTally(
+            since,
+            until,
+            () if series is None else time_buckets(since, until, series),
+            priced=self._pricing is not None,
+        )
+        seen: set[str] = set()
         cursor = None
         cursors: set[str] = set()
-        seen: set[str] = set()
+        window = filter_query.model_copy(
+            update={
+                "created_since": since,
+                "created_before": until,
+                "limit": _COUNT_PAGE,
+                "order_by": SessionOrder.CREATED_AT_ASC,
+            }
+        )
         while True:
-            page = await self._store.list_sessions(
-                filter_query.model_copy(
-                    update={"limit": 200, "cursor": cursor, "order_by": SessionOrder.CREATED_AT_ASC}
-                )
-            )
-            eligible = [session for session in page.sessions if session.created_at < until]
-            reached_until = len(eligible) != len(page.sessions)
-            expected = {session.id: session.instance_id for session in eligible}
+            page = await self._store.list_sessions(window.model_copy(update={"cursor": cursor}))
+            # A listed row is as new as the listing, and every read below is made
+            # after it, so the window's rows are counted as listed.
             self._loaded.clear()
-            # Each read below covers the whole store page, so counting costs a
-            # fixed number of reads per 200 sessions.
-            await self._load_many(expected)
-            selected: list[Session] = []
-            for session_id, instance_id in expected.items():
-                session = self._loaded.get(session_id)
-                if (
-                    session is None
-                    or session.instance_id != instance_id
-                    or not _session_matches(session, filter_query)
-                ):
-                    continue
-                identity = session_run_id(session)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                if session.created_at >= until:
-                    continue
-                if not include_eval and is_eval_trial(session):
-                    continue
-                selected.append(session)
-            if not include_forks and selected:
-                lineages = await resolve_fork_lineages_async(selected, self._parents)
-                selected = [
-                    session
-                    for session, lineage in zip(selected, lineages, strict=True)
-                    if not lineage.forked
-                ]
-            states = await self._states(selected)
-            # Pending and lineage joins may outlive this incarnation. Match
-            # the full overview selection fence before including its facts.
-            current = await self._current(selected, filter_query)
-            counted: list[Session] = []
-            for session, (state, _) in zip(selected, states, strict=True):
-                if session.id not in current:
-                    continue
-                counted.append(session)
-                if not state.complete:
-                    raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
-                if state.status is SessionOverviewStatus.RUNNING:
-                    running += 1
-                if session.created_at >= since:
-                    counts[state.status] += 1
-                    if buckets:
-                        index = bucket_index(starts, session.created_at)
-                        start_counts[index] += 1
-                        failed_counts[index] += int(state.status is SessionOverviewStatus.FAILED)
-            if counted:
-                accounting_query = EventQuery(
-                    session_ids=tuple(session.id for session in counted), since=since, until=until
-                )
-                try:
-                    usage = await self._store.read_usage_accounting(accounting_query)
-                    summary = revalidate_model_input(usage.summary, SessionUsageSummary)
-                    if not isinstance(summary, SessionUsageSummary):
-                        raise TypeError("Invalid accounting summary.")
-                    priced = (
-                        None
-                        if self._pricing is None
-                        else await self._store.read_cost_accounting(accounting_query, self._pricing)
-                    )
-                    totals = (
-                        None
-                        if priced is None
-                        else revalidate_model_input(priced.totals, SessionCostTotals)
-                    )
-                    if totals is not None and not isinstance(totals, SessionCostTotals):
-                        raise TypeError("Invalid accounting totals.")
-                except (TypeError, ValueError):
-                    raise SessionOverviewUnavailable(
-                        "Session accounting evidence is invalid."
-                    ) from None
-                # The selection and accounting are separate snapshots. A replacement
-                # must not donate consumption to the selected incarnation.
-                if len(await self._current(counted, filter_query)) != len(counted):
-                    raise SessionOverviewUnavailable("Session changed during accounting.")
-                input_tokens += summary.usage.input_tokens
-                output_tokens += summary.usage.output_tokens
-                cached_tokens += summary.usage.cache.read_tokens
-                tokens_complete = tokens_complete and summary.unmeasured_model_attempts == 0
-                if totals is not None:
-                    assert cost is not None
-                    cost = add_cost_amounts(cost, totals.total_cost)
-                    cost_complete = cost_complete and (
-                        totals.unpriced_model_steps == 0 and totals.unpriced_auxiliary_attempts == 0
-                    )
-            if reached_until or page.next_cursor is None:
+            self._loaded.update((session.id, session) for session in page.sessions)
+            await self._count_page(
+                page.sessions,
+                filter_query,
+                tally,
+                seen,
+                include_eval=include_eval,
+                include_forks=include_forks,
+            )
+            # Rows come oldest first, so a row from ``until`` on means the window
+            # is done even if a store's cursor goes on; newer rows are never read.
+            if (
+                page.next_cursor is None
+                or not page.sessions
+                or page.sessions[-1].created_at >= until
+            ):
                 break
             if page.next_cursor in cursors:
                 raise SessionOverviewUnavailable("Session paging did not advance.")
             cursors.add(page.next_cursor)
             cursor = page.next_cursor
-        return SessionOverviewCounts(
-            since,
-            until,
-            running,
-            counts,
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            tokens_complete,
-            cost,
-            cost_complete,
-            None
-            if series is None
-            else SessionStartSeries(
-                unit=series.unit,
-                timezone=series.timezone,
-                buckets=tuple(
-                    SessionStartBucket(
-                        start_at=b.start_at, end_at=b.end_at, total_count=count, failed=failed
-                    )
-                    for b, count, failed in zip(buckets, start_counts, failed_counts, strict=True)
-                ),
+        older = list(await self._older_count_candidates(filter_query, since, until))
+        for offset in range(0, len(older), _COUNT_PAGE):
+            self._loaded.clear()
+            ids = older[offset : offset + _COUNT_PAGE]
+            await self._load_many(ids)
+            await self._count_page(
+                [
+                    session
+                    for session_id in ids
+                    if (session := self._loaded.get(session_id)) is not None
+                    # The window's own sessions come from its creation listing.
+                    and session.created_at < since
+                ],
+                filter_query,
+                tally,
+                seen,
+                include_eval=include_eval,
+                include_forks=include_forks,
+            )
+        return tally.result(series)
+
+    async def _older_count_candidates(
+        self, filter_query: SessionQuery, since: datetime, until: datetime
+    ) -> tuple[str, ...]:
+        """Sessions created before the window that counts may still include.
+
+        Older sessions add to counts in only two ways: as running now, and with
+        usage in the window. A run is running while its row is pending, running
+        or interrupting, or while it is interrupted waiting on a subagent, which
+        is a delegated pending action. Usage in the window is an event of a
+        usage-bearing type with a timestamp in it. Each read pages by something
+        that cannot change during the request, so a row's update cannot move it
+        out of a scan, and each is bounded by what it finds, not by history.
+        """
+
+        candidates: dict[str, None] = {}
+        older = filter_query.model_copy(
+            update={
+                "created_before": since,
+                "limit": _COUNT_PAGE,
+                "order_by": SessionOrder.CREATED_AT_ASC,
+            }
+        )
+        await self._list_running(older, candidates)
+        async for page in self._list_pages(
+            older.model_copy(update={"status": SessionStatus.INTERRUPTED})
+        ):
+            candidates.update(dict.fromkeys(await self._delegating(page)))
+        # A run can move between running and waiting on a subagent while the
+        # reads above run; listing the running rows again finds one that left
+        # the interrupted scan's reach after the first listing.
+        await self._list_running(older, candidates)
+        await self._usage_sessions(since, until, candidates)
+        return tuple(candidates)
+
+    async def _list_running(self, query: SessionQuery, candidates: dict[str, None]) -> None:
+        for status in (SessionStatus.PENDING, SessionStatus.RUNNING, SessionStatus.INTERRUPTING):
+            async for page in self._list_pages(query.model_copy(update={"status": status})):
+                candidates.update(dict.fromkeys(session.id for session in page))
+
+    async def _list_pages(self, query: SessionQuery) -> AsyncIterator[list[Session]]:
+        cursor = None
+        cursors: set[str] = set()
+        while True:
+            page = await self._store.list_sessions(query.model_copy(update={"cursor": cursor}))
+            yield page.sessions
+            if page.next_cursor is None:
+                return
+            if page.next_cursor in cursors:
+                raise SessionOverviewUnavailable("Session paging did not advance.")
+            cursors.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    async def _delegating(self, sessions: Sequence[Session]) -> list[str]:
+        """The interrupted sessions that may be waiting on a subagent.
+
+        A pending-action read pages by mutable activity time, so when one needs
+        more than a page, every session of this listing page is kept and
+        ``_count_page`` reads each one's pending actions itself. Sessions the
+        read cannot judge are kept too, so their counts fail closed.
+        """
+
+        if not sessions:
+            return []
+        session_ids = tuple(session.id for session in sessions)
+        page = await self._store.query_pending_actions_for_sessions(
+            session_ids,
+            PendingActionQuery(
+                statuses=frozenset({SessionStatus.INTERRUPTED}),
+                kind=PendingActionKind.DELEGATED_ACTION,
+                limit=200,
+                max_result_bytes=MAX_PENDING_ACTION_RESULT_BYTES,
             ),
         )
+        if page.has_more:
+            return list(session_ids)
+        return [
+            *(action.session.id for action in page.actions),
+            *(issue.session_id for issue in page.issues),
+        ]
+
+    async def _usage_sessions(
+        self, since: datetime, until: datetime, candidates: dict[str, None]
+    ) -> None:
+        """Add the sessions with a usage-bearing event in [since, until).
+
+        Each read covers a time range in one statement, with no sequence cursor:
+        a cross-session sequence cursor can hide committed events behind an open
+        writer, but one statement sees every event committed before it. A range
+        that fills a read is split in half and read again. A range too short to
+        split, where many events share an instant, is read by the store's usage
+        accounting instead, which reads every event of the range in one stable
+        snapshot and names each session it found.
+        """
+
+        ranges = [(since, until)]
+        while ranges:
+            start, end = ranges.pop()
+            heads = await self._store.query_event_heads(
+                EventQuery(
+                    event_types=USAGE_BEARING_EVENT_TYPES,
+                    since=start,
+                    until=end,
+                    limit=_USAGE_HEAD_PAGE,
+                )
+            )
+            if len(heads) < _USAGE_HEAD_PAGE:
+                candidates.update(dict.fromkeys(head.session_id for head in heads))
+                continue
+            middle = start + (end - start) / 2
+            if end - start > _MIN_USAGE_RANGE and start < middle < end:
+                ranges.extend(((start, middle), (middle, end)))
+                continue
+            usage = await self._store.read_usage_accounting(
+                EventQuery(since=start, until=end), by_session=True
+            )
+            candidates.update(
+                dict.fromkeys(summary.session_id for summary in usage.session_summaries)
+            )
+
+    async def _count_page(
+        self,
+        sessions: Sequence[Session],
+        filter_query: SessionQuery,
+        tally: _CountTally,
+        seen: set[str],
+        *,
+        include_eval: bool,
+        include_forks: bool,
+    ) -> None:
+        """Add one page of sessions, already read into ``_loaded``, to the tally.
+
+        Each read below covers the whole page, so counting costs a fixed number
+        of reads per page.
+        """
+
+        since, until = tally.since, tally.until
+        # Without a filter every current row matches, so the fences below need
+        # only each session's incarnation, not its whole row.
+        fence = None if filter_query == _UNFILTERED else filter_query
+        selected: list[Session] = []
+        for session in sessions:
+            if not _session_matches(session, filter_query) or session.created_at >= until:
+                continue
+            identity = session_run_id(session)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if not include_eval and is_eval_trial(session):
+                continue
+            selected.append(session)
+        if not include_forks and selected:
+            lineages = await resolve_fork_lineages_async(selected, self._parents)
+            selected = [
+                session
+                for session, lineage in zip(selected, lineages, strict=True)
+                if not lineage.forked
+            ]
+        states = await self._states(selected)
+        # Pending and lineage joins may outlive this incarnation. Match
+        # the full overview selection fence before including its facts.
+        current = await self._current(selected, fence)
+        counted: list[Session] = []
+        for session, (state, _) in zip(selected, states, strict=True):
+            if session.id not in current:
+                continue
+            counted.append(session)
+            if not state.complete:
+                raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
+            tally.add_state(session, state.status)
+        if not counted:
+            return
+        accounting_query = EventQuery(
+            session_ids=tuple(session.id for session in counted), since=since, until=until
+        )
+        try:
+            usage = await self._store.read_usage_accounting(accounting_query)
+            summary = revalidate_model_input(usage.summary, SessionUsageSummary)
+            if not isinstance(summary, SessionUsageSummary):
+                raise TypeError("Invalid accounting summary.")
+            priced = (
+                None
+                if self._pricing is None
+                else await self._store.read_cost_accounting(accounting_query, self._pricing)
+            )
+            totals = (
+                None if priced is None else revalidate_model_input(priced.totals, SessionCostTotals)
+            )
+            if totals is not None and not isinstance(totals, SessionCostTotals):
+                raise TypeError("Invalid accounting totals.")
+        except (TypeError, ValueError):
+            raise SessionOverviewUnavailable("Session accounting evidence is invalid.") from None
+        # The selection and accounting are separate snapshots. A replacement
+        # must not donate consumption to the selected incarnation.
+        if len(await self._current(counted, fence)) != len(counted):
+            raise SessionOverviewUnavailable("Session changed during accounting.")
+        tally.add_usage(summary, totals)
 
     async def _pending(self, session: Session) -> _PendingEvidence:
         collected = _PendingCollector((session,))
@@ -956,6 +1131,81 @@ class SessionOverviewReader:
             matched = _wait_matches(await self._store.load_checkpoint(parent.id), parent, child)
             self._retained_waits[key] = matched
         return matched
+
+
+class _CountTally:
+    """What ``counts`` adds up across its pages."""
+
+    def __init__(
+        self,
+        since: datetime,
+        until: datetime,
+        buckets: Sequence[TimeBucket],
+        *,
+        priced: bool,
+    ) -> None:
+        self.since = since
+        self.until = until
+        self._buckets = tuple(buckets)
+        self._starts = tuple(bucket.start_at for bucket in self._buckets)
+        self._start_counts = [0 for _ in self._buckets]
+        self._failed_counts = [0 for _ in self._buckets]
+        self._states = dict.fromkeys(SessionOverviewStatus, 0)
+        self._running = 0
+        self._input_tokens = self._output_tokens = self._cached_tokens = 0
+        self._tokens_complete = True
+        self._cost: Decimal | None = Decimal(0) if priced else None
+        self._cost_complete = True
+
+    def add_state(self, session: Session, status: SessionOverviewStatus) -> None:
+        if status is SessionOverviewStatus.RUNNING:
+            self._running += 1
+        if self.since <= session.created_at < self.until:
+            self._states[status] += 1
+            if self._buckets:
+                index = bucket_index(self._starts, session.created_at)
+                self._start_counts[index] += 1
+                self._failed_counts[index] += int(status is SessionOverviewStatus.FAILED)
+
+    def add_usage(self, summary: SessionUsageSummary, totals: SessionCostTotals | None) -> None:
+        self._input_tokens += summary.usage.input_tokens
+        self._output_tokens += summary.usage.output_tokens
+        self._cached_tokens += summary.usage.cache.read_tokens
+        self._tokens_complete = self._tokens_complete and summary.unmeasured_model_attempts == 0
+        if totals is not None:
+            assert self._cost is not None
+            self._cost = add_cost_amounts(self._cost, totals.total_cost)
+            self._cost_complete = self._cost_complete and (
+                totals.unpriced_model_steps == 0 and totals.unpriced_auxiliary_attempts == 0
+            )
+
+    def result(self, series: TimeSeriesSpec | None) -> SessionOverviewCounts:
+        return SessionOverviewCounts(
+            self.since,
+            self.until,
+            self._running,
+            self._states,
+            self._input_tokens,
+            self._output_tokens,
+            self._cached_tokens,
+            self._tokens_complete,
+            self._cost,
+            self._cost_complete,
+            None
+            if series is None
+            else SessionStartSeries(
+                unit=series.unit,
+                timezone=series.timezone,
+                buckets=tuple(
+                    SessionStartBucket(
+                        start_at=b.start_at, end_at=b.end_at, total_count=count, failed=failed
+                    )
+                    for b, count, failed in zip(
+                        self._buckets, self._start_counts, self._failed_counts, strict=True
+                    )
+                ),
+            ),
+        )
 
 
 class _PendingCollector:
