@@ -9,6 +9,7 @@ Release's schema.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
@@ -33,6 +34,7 @@ from cayu.managed_settings import (
     MAX_KEY_LENGTH,
     MAX_REASON_LENGTH,
     ManagedSetting,
+    ManagedSettingReading,
     ManagedSettings,
     agent_setting_defaults,
     managed_settings_schema_document,
@@ -47,6 +49,8 @@ from cayu.runtime._application_run_defaults import (
 from cayu.runtime._execution_profile_admission import model_finalization_material
 from cayu.runtime.application_lifecycle import _admitted_entrance
 from cayu.sessions.requests import RunRequest
+
+logger = logging.getLogger("cayu.managed_settings")
 
 if TYPE_CHECKING:
     from cayu.agents import AgentSpec
@@ -301,6 +305,7 @@ class ManagedSettingsEntrances:
     # Effective configs this process has used, newest first, so a session admitted
     # under an earlier one can still be matched to its execution profile.
     _managed_config_history: tuple[CayuConfig, ...] = ()
+    _managed_environment_warned: frozenset[tuple[str, str]] = frozenset()
 
     @property
     def managed_settings_controller(self) -> ManagedSettings | None:
@@ -452,21 +457,88 @@ class ManagedSettingsEntrances:
         return managed
 
     def managed_setting_value(self: CayuApp, key: str) -> Any:
-        """A declared setting's value: Cloud's when it is set and valid, else the default.
+        """A declared setting's value: Cloud's when it is set and valid, else the value of
+        the setting's ``env`` variable when it is set and valid, else the default.
 
         ``restart`` settings return the value read when the app was built;
         ``next_session`` and ``live`` ones the latest snapshot's. Read a
         ``next_session`` setting when a session starts. A ``secret_ref`` value is
-        the name of an environment variable, never its content.
+        the name of an environment variable, never its content. A ``list`` setting
+        returns a tuple of its items and a ``map`` setting a dict.
         """
+
+        return self.read_managed_setting(key).value
+
+    def read_managed_setting(self: CayuApp, key: str) -> ManagedSettingReading:
+        """A declared setting's value now and where it comes from: Cloud, the
+        environment or the code's default (see ``managed_setting_value``)."""
 
         setting = next((item for item in self.managed_settings() if item.key == key), None)
         if setting is None:
             raise KeyError(f"No managed setting is declared as {key!r}.")
-        value = self._managed_value(setting)
-        if value is None or self._managed_refusal(setting, value) is not None:
-            return setting.default
-        return value
+        return self._read_managed_setting(setting)
+
+    def read_managed_settings(self: CayuApp) -> tuple[ManagedSettingReading, ...]:
+        """Every declared setting's value and where it comes from, sorted by key."""
+
+        return tuple(self._read_managed_setting(item) for item in self.managed_settings())
+
+    def _read_managed_setting(self: CayuApp, setting: ManagedSetting) -> ManagedSettingReading:
+        refused: list[str] = []
+        cloud = self._managed_values(restart=setting.applies == "restart").get(setting.key)
+        if cloud is not None:
+            try:
+                value = setting.validate_value(cloud)
+            except ValueError as exc:
+                refused.append(f"Cayu Cloud's value: {_reason(exc)}")
+            else:
+                reason = self._managed_refusal(setting, value)
+                if reason is None:
+                    return ManagedSettingReading(
+                        key=setting.key,
+                        value=setting.read_value(value),
+                        source="cloud",
+                        env=setting.env,
+                    )
+                refused.append(f"Cayu Cloud's value: {reason}")
+        raw = None if setting.env is None else os.environ.get(setting.env)
+        if raw is not None:
+            try:
+                value = setting.parse_text(raw)
+            except ValueError as exc:
+                reason = f"{setting.env}: {_reason(exc)}"
+                refused.append(reason)
+                self._warn_managed_environment(setting.key, raw, reason)
+            else:
+                # The same checks as Cloud's value, such as a secret_ref's variable being set.
+                reason = None if value is None else self._managed_refusal(setting, value)
+                if reason is not None:
+                    reason = f"{setting.env}: {reason}"
+                    refused.append(reason)
+                    self._warn_managed_environment(setting.key, raw, reason)
+                elif value is not None:
+                    return ManagedSettingReading(
+                        key=setting.key,
+                        value=setting.read_value(value),
+                        source="environment",
+                        env=setting.env,
+                        refused="; ".join(refused) or None,
+                    )
+        return ManagedSettingReading(
+            key=setting.key,
+            value=setting.read_value(setting.default),
+            source="default",
+            env=setting.env,
+            refused="; ".join(refused) or None,
+        )
+
+    def _warn_managed_environment(self: CayuApp, key: str, raw: str, reason: str) -> None:
+        """Say once per value that an environment variable was ignored."""
+
+        if (key, raw) in self._managed_environment_warned:
+            return
+        self._managed_environment_warned = self._managed_environment_warned | {(key, raw)}
+        logger.warning("Ignoring the environment's value for %s: %s", key, reason)
 
     def _managed_refusal(self: CayuApp, setting: ManagedSetting, value: Any) -> str | None:
         """Why this process does not apply a value, or None when it does."""

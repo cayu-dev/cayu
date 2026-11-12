@@ -21,7 +21,9 @@ from cayu.managed_settings import (
     MAX_MANAGED_SETTINGS,
     ManagedSetting,
     ManagedSettingsLimitExceeded,
+    list_setting,
     managed_settings_schema_document,
+    map_setting,
     model_setting,
     provider_option_setting,
     settings_digest,
@@ -359,7 +361,15 @@ def test_documented_json_schemas_validate_what_the_runtime_emits():
         AgentSpec(name="reviewer", model="m"),
         settings=[model_setting(), thinking_effort_setting()],
     )
-    app.declare_settings([ManagedSetting(key="search_key", type="secret_ref", label="Key")])
+    app.declare_settings(
+        [
+            ManagedSetting(key="search_key", type="secret_ref", label="Key"),
+            list_setting("repositories", label="Repositories", item_pattern="[a-z]+/[a-z]+"),
+            map_setting(
+                "modes", label="Modes", item_choices=["a", "b"], value_choices=["x"], env="MODES"
+            ),
+        ]
+    )
     validator = Draft202012Validator(
         schemas["urn:cayu:managed-settings-schema/v1"], registry=registry
     )
@@ -372,6 +382,9 @@ def test_documented_json_schemas_validate_what_the_runtime_emits():
     descriptor = Draft202012Validator(schemas["urn:cayu:managed-setting/v1"], registry=registry)
     platform = {"key": "sign_in", "owner": "platform", "type": "bool", "default": False}
     descriptor.validate({**platform, "applies": "restart", "label": "Sign-in"})
+    for wrong in ({"format": "list"}, {"item_pattern": "x"}):
+        with pytest.raises(Exception, match="is not valid|should not be valid|was expected"):
+            descriptor.validate({**platform, "applies": "restart", "label": "S", **wrong})
     with pytest.raises(Exception, match="does not match"):
         single = app.managed_settings_schema()
         single["settings"][0] = {**single["settings"][0], "key": "sign_in"}

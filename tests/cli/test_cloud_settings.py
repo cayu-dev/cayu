@@ -471,3 +471,83 @@ def test_a_change_whose_answer_isnt_the_document_still_names_the_operation(
     assert code == 2
     assert output["error"]["category"] == "api_response_invalid"
     assert output["error"]["operation_id"] == "op_lost"
+
+
+def _list_document(effective: object) -> dict[str, Any]:
+    entry = _setting("agent", "app.repositories", effective, source="cloud")
+    entry["descriptor"] = {
+        **entry["descriptor"],
+        "format": "list",
+        "item_pattern": "[a-z-]+/[a-z0-9-]+",
+        "max_length": 4096,
+        "admin_only": False,
+    }
+    modes = _setting("agent", "app.merge_modes", None)
+    modes["descriptor"] = {
+        **modes["descriptor"],
+        "format": "map",
+        "value_choices": [{"value": "auto", "label": "Auto"}],
+        "max_length": 4096,
+    }
+    return _document(settings=[entry, modes, _setting("platform", "web.sleep", 900)])
+
+
+def test_set_checks_a_list_settings_items_and_sends_its_text(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("GET", _SETTINGS): httpx.Response(200, json=_list_document("o/a")),
+            ("PUT", _SETTINGS): httpx.Response(200, json=_list_document("o/a,o/b")),
+        }
+    )
+
+    code, _ = _json(["set", 'app.repositories=["o/a", " o/b"]', "app.merge_modes=o/a=auto"], capsys)
+
+    assert code == 0
+    (body,) = fake.sent("PUT")
+    assert body["set"]["agent"] == {  # type: ignore[index]
+        "app.repositories": "o/a,o/b",
+        "app.merge_modes": "o/a=auto",
+    }
+
+
+@pytest.mark.parametrize(
+    ("assignment", "message"),
+    [
+        ("app.repositories=o/a,Not A Repo", "agent:app.repositories: item 'Not A Repo' does not"),
+        ("app.merge_modes=o/a=manual", "the value in 'o/a=manual' is not one of auto"),
+        ('app.repositories={"o/a": "x"}', "expected a list"),
+    ],
+)
+def test_set_names_an_item_that_does_not_fit_and_changes_nothing(
+    cloud, capsys: pytest.CaptureFixture[str], assignment: str, message: str
+) -> None:
+    fake = cloud({("GET", _SETTINGS): httpx.Response(200, json=_list_document("o/a"))})
+
+    code, output = _json(["set", assignment], capsys)
+
+    assert code == 2
+    assert output["error"]["category"] == "setting_value_invalid"
+    assert message in output["error"]["message"]
+    assert "Nothing was changed." in output["error"]["message"]
+    assert fake.sent("PUT") == []
+
+
+def test_list_shortens_a_long_value_between_items_and_prints_it_whole_below(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repositories = ",".join(f"cayu-tech/repository-{index}" for index in range(39))
+    cloud({("GET", _SETTINGS): httpx.Response(200, json=_list_document(repositories))})
+
+    code, out, _ = _text(["list"], capsys)
+
+    assert code == 0
+    row = next(line for line in out.splitlines() if line.startswith("app.repositories"))
+    assert "cayu-tech/repository-0, ... (+38 more)" in row
+    below = out.split("agent:app.repositories:\n", 1)[1].split("\n\n", 1)[0]
+    lines = below.splitlines()
+    assert all(line.startswith("  ") and len(line) <= 100 for line in lines)
+    assert "".join(line.strip() for line in lines) == repositories
+    # A short value isn't repeated below the table.
+    assert "platform:web.sleep:" not in out

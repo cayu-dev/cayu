@@ -19012,7 +19012,7 @@
     },
     "ManagedSetting": {
       "additionalProperties": false,
-      "description": "One setting descriptor (``docs/managed-settings.md``, section 1).\n\nParts declare settings with a key relative to themselves (``\"max_steps\"``);\nregistration puts the part's namespace in front (``\"agent.reviewer.max_steps\"``)\nand sets ``owner``. ``default`` is the code's value, or ``None`` when unset.",
+      "description": "One setting descriptor (``docs/managed-settings.md``, section 1).\n\nParts declare settings with a key relative to themselves (``\"max_steps\"``);\nregistration puts the part's namespace in front (``\"agent.reviewer.max_steps\"``)\nand sets ``owner``. ``default`` is the code's value, or ``None`` when unset.\n\nA ``string`` setting with ``format=\"list\"`` holds strings, each matching\n``item_pattern`` or one of ``item_choices``; with ``format=\"map\"`` it maps such\nstrings to values matching ``value_pattern`` or one of ``value_choices``\n(``list_setting`` and ``map_setting`` declare them). The value is text, items\nseparated by commas (``owner/a,owner/b``; ``owner/a=approve,owner/b=auto``), which\nis how Cloud stores it; the application reads a tuple or a dict.\n\n``env`` names an environment variable whose value applies when Cloud has none\n(a local run, a test), read by the setting's own type.",
       "properties": {
         "applies": {
           "default": "next_session",
@@ -19060,6 +19060,59 @@
           ],
           "title": "Description"
         },
+        "env": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Env"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "list",
+                "map"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Format"
+        },
+        "item_choices": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/ManagedSettingChoice"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Item Choices"
+        },
+        "item_pattern": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Item Pattern"
+        },
         "key": {
           "maxLength": 128,
           "minLength": 1,
@@ -19071,6 +19124,19 @@
           "minLength": 1,
           "title": "Label",
           "type": "string"
+        },
+        "max_items": {
+          "anyOf": [
+            {
+              "maximum": 500.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Max Items"
         },
         "max_length": {
           "anyOf": [
@@ -19123,6 +19189,33 @@
           ],
           "title": "Type",
           "type": "string"
+        },
+        "value_choices": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/components/schemas/ManagedSettingChoice"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value Choices"
+        },
+        "value_pattern": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value Pattern"
         }
       },
       "required": [

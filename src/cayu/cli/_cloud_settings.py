@@ -43,6 +43,8 @@ _REASON_LIMIT = 500
 _ALLOWED_LIMIT = 2048
 _ERRORS_LIMIT = 100
 _CELL_LIMIT = 60
+# The most of a value `list` prints below the table; Cloud's string settings hold 4096.
+_FULL_VALUE_LIMIT = 8192
 
 
 class CloudSettingsError(CloudApiError):
@@ -152,7 +154,7 @@ def settings_command(
             raise CloudApiError(
                 "setting_repeated", f"{namespace}:{key} is assigned more than once."
             )
-        changes[namespace][key] = value
+        changes[namespace][key] = _checked_value(document, namespace, key, value)
     payload: dict[str, object] = {
         "clear": {namespace: [] for namespace in NAMESPACES},
         "operation_id": operation_id,
@@ -312,6 +314,42 @@ def _resolve(document: Mapping[str, Any], reference: tuple[str | None, str]) -> 
     raise CloudApiError("setting_unknown", message)
 
 
+def _descriptor(document: Mapping[str, Any], namespace: str, key: str) -> dict[str, Any] | None:
+    for entry in document.get("settings", []):
+        if not isinstance(entry, dict) or entry.get("namespace") != namespace:
+            continue
+        descriptor = entry.get("descriptor")
+        if isinstance(descriptor, dict) and descriptor.get("key") == key:
+            return descriptor
+    return None
+
+
+def _checked_value(document: Mapping[str, Any], namespace: str, key: str, value: object) -> object:
+    """A list or map setting's value, checked item by item and sent as its text.
+
+    Only a descriptor that carries ``format`` can be checked here; Cloud judges the rest.
+    A list may be given as text (``a,b``) or JSON (``["a","b"]``), a map as text
+    (``a=x,b=y``) or a JSON object.
+    """
+
+    descriptor = _descriptor(document, namespace, key)
+    if descriptor is None or descriptor.get("format") not in {"list", "map"} or value is None:
+        return value
+    from cayu.managed_settings import ManagedSetting
+
+    try:
+        setting = ManagedSetting.from_descriptor(descriptor)
+    except ValueError:
+        return value
+    try:
+        return setting.validate_value(value)
+    except ValueError as exc:
+        raise CloudApiError(
+            "setting_value_invalid",
+            f"{namespace}:{key}: {_cell(str(exc), limit=_REASON_LIMIT)}. Nothing was changed.",
+        ) from None
+
+
 def _settings_error(error: CloudApiError, *, operation_id: str | None = None) -> CloudApiError:
     """Cloud's refusal of a settings write, saying what Cloud said about each setting."""
 
@@ -393,6 +431,8 @@ def render_settings(output: Mapping[str, Any]) -> str:
         lines.append("Agent settings: waiting for the Release to start.")
     rows: list[tuple[str, ...]] = []
     notes: list[str] = []
+    # Values too long for the table, printed whole after it.
+    long_values: list[tuple[str, str]] = []
     for entry in document["settings"]:
         if not isinstance(entry, dict):
             continue
@@ -409,20 +449,19 @@ def render_settings(output: Mapping[str, Any]) -> str:
             reasons = reports.get("refused_reasons")
             for reason in reasons[:3] if isinstance(reasons, list) else []:
                 notes.append(f"{key} refused: {_cell(reason, limit=200)}")
-        rows.append(
-            (
-                key,
-                _cell(entry.get("namespace")),
-                _value_cell(entry.get("effective")),
-                _cell(entry.get("source")),
-                status,
-            )
-        )
+        namespace = _cell(entry.get("namespace"))
+        value = _value_cell(entry.get("effective"))
+        full = _value_cell(entry.get("effective"), limit=_FULL_VALUE_LIMIT)
+        if value != full:
+            long_values.append((f"{namespace}:{key}", full))
+        rows.append((key, namespace, value, _cell(entry.get("source")), status))
     lines.append("")
     if rows:
         lines.extend(_table(("SETTING", "NAMESPACE", "VALUE", "SOURCE", "STATUS"), rows))
     else:
         lines.append("No settings.")
+    for name, text in long_values:
+        lines.extend(["", f"{name}:", *_wrapped(text)])
     if notes:
         lines.extend(["", *notes])
     conflicts = document.get("conflicts")
@@ -469,15 +508,46 @@ def _count(value: object) -> int:
 
 
 def _value_cell(value: object, *, limit: int = _CELL_LIMIT) -> str:
+    """A value for the terminal. Text with comma-separated items, such as a list or map
+    setting's, is shortened between items, never in the middle of one."""
+
     if value is None:
         return "-"
     if isinstance(value, str):
-        return _cell(value, limit=limit)
+        text = _cell(value, limit=len(value) + 1)
+        if len(text) <= limit or "," not in text:
+            return _cell(text, limit=limit)
+        items = text.split(",")
+        kept: list[str] = []
+        for item in items:
+            more = f", ... (+{len(items) - len(kept) - 1} more)"
+            if len(",".join([*kept, item])) + len(more) > limit:
+                break
+            kept.append(item)
+        if not kept:
+            return _cell(text, limit=limit)
+        return ",".join(kept) + f", ... (+{len(items) - len(kept)} more)"
     try:
         text = json.dumps(value, sort_keys=True, separators=(",", ":"))
     except (TypeError, ValueError):
         return "?"
     return _cell(text, limit=limit)
+
+
+def _wrapped(text: str, *, width: int = 96) -> list[str]:
+    """Indented lines of at most about ``width`` characters, broken after a comma."""
+
+    lines: list[str] = []
+    line = ""
+    for item in text.split(","):
+        piece = item if not line else "," + item
+        if line and len(line) + len(piece) > width:
+            lines.append("  " + line + ",")
+            line = item
+        else:
+            line += piece
+    lines.append("  " + line)
+    return lines
 
 
 def _cell(value: object, *, limit: int = _CELL_LIMIT) -> str:

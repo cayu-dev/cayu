@@ -14144,6 +14144,16 @@ export type ListSessionsResponse = {
  * Parts declare settings with a key relative to themselves (``"max_steps"``);
  * registration puts the part's namespace in front (``"agent.reviewer.max_steps"``)
  * and sets ``owner``. ``default`` is the code's value, or ``None`` when unset.
+ *
+ * A ``string`` setting with ``format="list"`` holds strings, each matching
+ * ``item_pattern`` or one of ``item_choices``; with ``format="map"`` it maps such
+ * strings to values matching ``value_pattern`` or one of ``value_choices``
+ * (``list_setting`` and ``map_setting`` declare them). The value is text, items
+ * separated by commas (``owner/a,owner/b``; ``owner/a=approve,owner/b=auto``), which
+ * is how Cloud stores it; the application reads a tuple or a dict.
+ *
+ * ``env`` names an environment variable whose value applies when Cloud has none
+ * (a local run, a test), read by the setting's own type.
  */
 export type ManagedSetting = {
     /**
@@ -14163,6 +14173,22 @@ export type ManagedSetting = {
      */
     description?: string | null;
     /**
+     * Env
+     */
+    env?: string | null;
+    /**
+     * Format
+     */
+    format?: 'list' | 'map' | null;
+    /**
+     * Item Choices
+     */
+    item_choices?: Array<ManagedSettingChoice> | null;
+    /**
+     * Item Pattern
+     */
+    item_pattern?: string | null;
+    /**
      * Key
      */
     key: string;
@@ -14170,6 +14196,10 @@ export type ManagedSetting = {
      * Label
      */
     label: string;
+    /**
+     * Max Items
+     */
+    max_items?: number | null;
     /**
      * Max Length
      */
@@ -14190,6 +14220,14 @@ export type ManagedSetting = {
      * Type
      */
     type: 'bool' | 'int' | 'number' | 'string' | 'enum' | 'secret_ref';
+    /**
+     * Value Choices
+     */
+    value_choices?: Array<ManagedSettingChoice> | null;
+    /**
+     * Value Pattern
+     */
+    value_pattern?: string | null;
 };
 
 /**

@@ -44,6 +44,94 @@ app.register_agent(
 )
 ```
 
+### Lists and maps
+
+`list_setting` declares a list of strings, and `map_setting` a map from strings
+to strings. Each item (a map's key) must match `item_pattern` or be one of
+`item_choices`; a map's values must match `value_pattern` or be one of
+`value_choices`. `max_items` caps the count and `max_length` (4096 unless given)
+the length of the whole value. Patterns are Python regular expressions that must
+match the whole item.
+
+```python
+from cayu.managed_settings import list_setting, map_setting
+
+REPOSITORY = r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+"
+
+app.declare_settings(
+    [
+        list_setting(
+            "repositories",
+            label="Repositories",
+            item_pattern=REPOSITORY,
+            max_items=100,
+            applies="live",
+        ),
+        map_setting(
+            "merge_modes",
+            label="Merge modes",
+            item_pattern=REPOSITORY,
+            value_choices=("report", "approve", "auto"),
+            default={"cayu-tech/cayu": "report"},
+            applies="live",
+        ),
+    ]
+)
+
+app.managed_setting_value("app.repositories")  # ("cayu-tech/cayu", "cayu-tech/cayu-cloud")
+app.managed_setting_value("app.merge_modes")  # {"cayu-tech/cayu": "approve"}
+```
+
+Both are `string` settings with a `format` (`list` or `map`), so a Cloud that
+doesn't know `format` still takes them. The value is written and stored as text, items separated by commas or line breaks
+and a map's entries as `KEY=VALUE`: `cayu-tech/cayu,cayu-tech/cayu-cloud` and
+`cayu-tech/cayu=approve,cayu-tech/cayu-cloud=auto`. Spaces around items are
+dropped, a repeated list item counts once, and a repeated map key is refused, so
+items can't contain a comma or a line break and a map's keys can't contain `=`.
+The application reads a tuple for a list and a dict for a map, empty when there is
+no value. A value with an item that doesn't fit is refused with a reason that
+names the item; `ManagedSetting.validate_value` gives the check and the stored
+text, and `read_value` the tuple or dict.
+
+### A value from the environment
+
+`ManagedSetting(env="NAME")` names an environment variable whose value applies
+when Cloud has none, so a setting declared once works on Cayu Cloud and on a
+laptop or in a test. The text is read by the setting's type
+(`ManagedSetting.parse_text`): a `bool` takes `true`/`false`, `1`/`0`, `yes`/`no`
+or `on`/`off` in any case, an `int` or `number` a number, a list or map its
+comma-separated text. Blank text counts as unset, except for `string`, `list`
+and `map` settings, where it is the empty value. A variable whose text doesn't fit
+is ignored with a warning, and the default applies.
+
+```python
+list_setting("repositories", label="Repositories", item_pattern=REPOSITORY,
+             env="SHEPHERD_REPOSITORIES")
+ManagedSetting(key="introduce", type="bool", label="Introduce first",
+               default=True, env="SHEPHERD_INTRODUCE")
+```
+
+The order is Cloud's value, then the environment's, then the code's default. The
+descriptor names the variable (`env`), but Cloud shows the code's default as the
+Release's value even where the variable is set on the Agent, so on Cloud set the
+value in Cloud rather than in the environment. The settings Cayu applies to an
+agent itself (`model`, `thinking.effort`, `provider_options.*`) can't take `env`.
+
+### Reading a value and its source
+
+`app.read_managed_setting(key)` returns a `ManagedSettingReading`: the `value`
+`managed_setting_value` would return, its `source` (`"cloud"`, `"environment"`
+or `"default"`), the `env` variable it reads, and `refused`, why a value from
+Cloud or the environment wasn't used when one was there.
+`app.read_managed_settings()` returns one for every declared setting, sorted by
+key, which is what a project's `status` command prints:
+
+```python
+for reading in app.read_managed_settings():
+    if reading.key.startswith("app."):
+        print(reading.key, reading.value, reading.source, reading.refused or "")
+```
+
 Presets and factories that register a part for you pass `settings` through
 (`WebBridgeProfile.register_agent`, `register_coding_environment`) and never
 declare settings of their own on the part's behalf.
@@ -197,7 +285,9 @@ the Agent's id is the `application` slug in its `cayu-cloud.toml`, and
   environment variable that isn't set.
 - The application reads its own settings with
   `app.managed_setting_value("app.search_key")`: Cloud's value when it is set and
-  usable, else the default. A `restart` setting returns the value read at build.
+  usable, else the setting's `env` variable when it is set and valid, else the
+  default. A `restart` setting returns the value read at build.
+  `app.read_managed_setting(key)` also says where the value came from.
 
 When Cloud can't be reached, the last good snapshot stays in use. When it never
 got one, the code's defaults apply. When Cloud has no schema for the Release yet
@@ -256,11 +346,33 @@ shape for platform settings, which may also carry `admin_only`, `locked` and
     "applies": {"enum": ["restart", "next_session", "live"]},
     "label": {"type": "string", "minLength": 1, "maxLength": 80},
     "description": {"type": "string", "maxLength": 500},
+    "format": {"enum": ["list", "map"]},
+    "item_pattern": {"type": "string", "minLength": 1, "maxLength": 500},
+    "item_choices": {"$ref": "#/properties/choices"},
+    "value_pattern": {"type": "string", "minLength": 1, "maxLength": 500},
+    "value_choices": {"$ref": "#/properties/choices"},
+    "max_items": {"type": "integer", "minimum": 1, "maximum": 500},
+    "env": {"type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$"},
     "admin_only": {"type": "boolean"},
     "locked": {"type": "boolean"},
     "locked_reason": {"type": "string"}
   },
   "allOf": [
+    {
+      "if": {"required": ["format"]},
+      "then": {"properties": {"type": {"const": "string"}}},
+      "else": {
+        "not": {
+          "anyOf": [
+            {"required": ["item_pattern"]},
+            {"required": ["item_choices"]},
+            {"required": ["value_pattern"]},
+            {"required": ["value_choices"]},
+            {"required": ["max_items"]}
+          ]
+        }
+      }
+    },
     {
       "if": {"properties": {"type": {"const": "bool"}}},
       "then": {"properties": {"default": {"type": ["boolean", "null"]}}}
@@ -306,6 +418,19 @@ single segment, such as `sign_in`. Rules the schema can't express: `minimum` and
 `max_length` characters, one of the `choices`); enum choice values are distinct;
 a key is unique within its namespace. A `secret_ref` value is the name of an
 environment variable on the Agent, never a secret value.
+
+A list or map setting is a `string` setting with `format` (`list` or `map`); a
+reader that doesn't know `format` treats it as plain text, so a Cloud or Release
+without it still takes the setting and its value. Its value is the items joined
+with commas, a map's entries as `KEY=VALUE`, and each item (a map's key) matches
+`item_pattern` or is one of `item_choices`, each map value matches
+`value_pattern` or is one of `value_choices`, at most `max_items` of them.
+`item_pattern` and `item_choices` (and `value_pattern` and `value_choices`) are
+not given together, and the `value_` fields only with `map`. Patterns are Python
+regular expressions matched against the whole item. Cayu's
+`ManagedSetting.from_descriptor(descriptor).validate_value(value)` is the check,
+naming the items that don't fit. `env` names the environment variable whose
+value the Agent uses when Cloud has none; Cloud only shows it.
 
 ### Release schema: `cayu.managed-settings-schema/v1`
 

@@ -26,6 +26,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from typing import Annotated, Any, Literal, get_args
@@ -58,8 +59,17 @@ MAX_LABEL_LENGTH = 80
 MAX_DESCRIPTION_LENGTH = 500
 MAX_STRING_LENGTH = 4096
 MAX_CHOICES = 100
+MAX_ITEMS = 500
+MAX_PATTERN_LENGTH = 500
 
 ManagedSettingType = Literal["bool", "int", "number", "string", "enum", "secret_ref"]
+# A list or map setting is a v1 ``string`` setting whose ``format`` says how to read its
+# text: the items joined with commas, a map's as KEY=VALUE.
+ManagedSettingFormat = Literal["list", "map"]
+_ITEM_SEPARATORS = re.compile(r"[,\n]")
+_TRUE_WORDS = frozenset({"true", "1", "yes", "on"})
+_FALSE_WORDS = frozenset({"false", "0", "no", "off"})
+_INT_TEXT = re.compile(r"[+-]?[0-9]+")
 ManagedSettingApplies = Literal["restart", "next_session", "live"]
 ManagedSettingValue = Annotated[
     StrictBool | StrictInt | StrictFloat | StrictStr | None,
@@ -91,12 +101,52 @@ def _absent(value: object) -> bool:
     return value is None
 
 
+def _choice_tuple(value: object) -> object:
+    """Choices written as strings, (value, label) pairs or ``ManagedSettingChoice``."""
+
+    if value is None or isinstance(value, str | bytes) or not isinstance(value, Iterable):
+        return value
+    choices: list[object] = []
+    for item in value:
+        if isinstance(item, str):
+            choices.append({"value": item, "label": item})
+        elif isinstance(item, tuple) and len(item) == 2:
+            choices.append({"value": item[0], "label": item[1]})
+        else:
+            choices.append(item)
+    return tuple(choices)
+
+
+def _refuse_separators(items: Iterable[str], noun: str, *, extra: str = "") -> None:
+    bad = [item for item in items if _ITEM_SEPARATORS.search(item) or (extra and extra in item)]
+    if bad:
+        forbidden = "a comma or a line break" + (f" or {extra!r}" if extra else "")
+        raise ValueError(f"{noun} {_quoted(bad)} can't contain {forbidden}.")
+
+
+def _quoted(items: Sequence[str]) -> str:
+    shown = [repr(item) for item in items[:5]]
+    if len(items) > 5:
+        return ", ".join(shown) + f" and {len(items) - 5} more"
+    return shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+
+
 class ManagedSetting(BaseModel):
     """One setting descriptor (``docs/managed-settings.md``, section 1).
 
     Parts declare settings with a key relative to themselves (``"max_steps"``);
     registration puts the part's namespace in front (``"agent.reviewer.max_steps"``)
     and sets ``owner``. ``default`` is the code's value, or ``None`` when unset.
+
+    A ``string`` setting with ``format="list"`` holds strings, each matching
+    ``item_pattern`` or one of ``item_choices``; with ``format="map"`` it maps such
+    strings to values matching ``value_pattern`` or one of ``value_choices``
+    (``list_setting`` and ``map_setting`` declare them). The value is text, items
+    separated by commas (``owner/a,owner/b``; ``owner/a=approve,owner/b=auto``), which
+    is how Cloud stores it; the application reads a tuple or a dict.
+
+    ``env`` names an environment variable whose value applies when Cloud has none
+    (a local run, a test), read by the setting's own type.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -118,6 +168,44 @@ class ManagedSetting(BaseModel):
         default=None, ge=1, le=MAX_STRING_LENGTH, exclude_if=_absent
     )
     choices: tuple[ManagedSettingChoice, ...] | None = Field(default=None, exclude_if=_absent)
+    format: ManagedSettingFormat | None = Field(default=None, exclude_if=_absent)
+    item_pattern: StrictStr | None = Field(
+        default=None, min_length=1, max_length=MAX_PATTERN_LENGTH, exclude_if=_absent
+    )
+    item_choices: tuple[ManagedSettingChoice, ...] | None = Field(default=None, exclude_if=_absent)
+    value_pattern: StrictStr | None = Field(
+        default=None, min_length=1, max_length=MAX_PATTERN_LENGTH, exclude_if=_absent
+    )
+    value_choices: tuple[ManagedSettingChoice, ...] | None = Field(default=None, exclude_if=_absent)
+    max_items: StrictInt | None = Field(default=None, ge=1, le=MAX_ITEMS, exclude_if=_absent)
+    env: StrictStr | None = Field(default=None, exclude_if=_absent)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _read_list_and_map_input(cls, data: Any) -> Any:
+        """Choices written as plain strings, and a list or map default written as a
+        Python list or dict."""
+
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        for name in ("item_choices", "value_choices"):
+            if name in data:
+                data[name] = _choice_tuple(data[name])
+        default = data.get("default")
+        if data.get("format") == "list" and isinstance(default, list | tuple):
+            if not all(isinstance(item, str) for item in default):
+                raise ValueError("a list setting's items are strings.")
+            # Checked before joining, so an item can't turn into two.
+            _refuse_separators(default, "list item")
+            data["default"] = ",".join(default)
+        elif data.get("format") == "map" and isinstance(default, Mapping):
+            if not all(isinstance(k, str) and isinstance(v, str) for k, v in default.items()):
+                raise ValueError("a map setting's keys and values are strings.")
+            _refuse_separators(default, "map key", extra="=")
+            _refuse_separators(default.values(), "map value")
+            data["default"] = ",".join(f"{k}={v}" for k, v in default.items())
+        return data
 
     @model_validator(mode="after")
     def _validate_shape(self) -> ManagedSetting:
@@ -141,15 +229,59 @@ class ManagedSetting(BaseModel):
             raise ValueError("max_length is required for string settings and only for them.")
         if (self.type == "enum") != (self.choices is not None):
             raise ValueError("choices are required for enum settings and only for them.")
-        if self.choices is not None:
-            if not 1 <= len(self.choices) <= MAX_CHOICES:
-                raise ValueError(f"enum settings need 1 to {MAX_CHOICES} choices.")
-            values = [choice.value for choice in self.choices]
+        self._validate_items()
+        for name, choices in (
+            ("enum settings", self.choices),
+            ("item_choices", self.item_choices),
+            ("value_choices", self.value_choices),
+        ):
+            if choices is None:
+                continue
+            if not 1 <= len(choices) <= MAX_CHOICES:
+                raise ValueError(f"{name} need 1 to {MAX_CHOICES} choices.")
+            values = [choice.value for choice in choices]
             if len(set(values)) != len(values):
-                raise ValueError("enum choices must have distinct values.")
+                raise ValueError(f"{name} must have distinct choice values.")
+        if self.env is not None and not SECRET_REF_PATTERN.fullmatch(self.env):
+            raise ValueError("env must name an environment variable, such as APP_REPOSITORIES.")
         if self.default is not None:
-            self.validate_value(self.default)
+            # A list or map default is kept in its canonical text, the form Cloud stores.
+            object.__setattr__(self, "default", self.validate_value(self.default))
         return self
+
+    def _validate_items(self) -> None:
+        item_fields = (self.item_pattern, self.item_choices, self.max_items)
+        value_fields = (self.value_pattern, self.value_choices)
+        if self.format is None:
+            if any(field is not None for field in (*item_fields, *value_fields)):
+                raise ValueError("item and value rules apply only to list and map settings.")
+            return
+        if self.type != "string":
+            raise ValueError("format applies only to string settings.")
+        if self.item_pattern is not None and self.item_choices is not None:
+            raise ValueError("give items a pattern or choices, not both.")
+        if self.format == "list" and any(field is not None for field in value_fields):
+            raise ValueError("value_pattern and value_choices apply only to map settings.")
+        if self.value_pattern is not None and self.value_choices is not None:
+            raise ValueError("give map values a pattern or choices, not both.")
+        for pattern in (self.item_pattern, self.value_pattern):
+            if pattern is None:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"pattern {pattern!r} doesn't compile: {exc}") from None
+        if (
+            self.format == "map"
+            and self.item_choices is not None
+            and any("=" in choice.value for choice in self.item_choices)
+        ):
+            raise ValueError("a map's key choices can't contain '='.")
+        for choices in (self.item_choices, self.value_choices):
+            if choices is not None and any(
+                _ITEM_SEPARATORS.search(choice.value) for choice in choices
+            ):
+                raise ValueError("item choices can't contain a comma or a line break.")
 
     def validate_value(self, value: object) -> ManagedSettingValue:
         """Return ``value`` if it is valid for this setting, else raise ``ValueError``."""
@@ -168,6 +300,8 @@ class ManagedSetting(BaseModel):
             if not isinstance(value, int | float) or type(value) is bool or not isfinite(value):
                 raise ValueError("expected a finite number")
             return self._within_bounds(value)
+        if self.format is not None:
+            return self._text_value(value)
         if type(value) is not str:
             raise ValueError("expected a string")
         if self.type == "string":
@@ -191,10 +325,195 @@ class ManagedSetting(BaseModel):
             raise ValueError(f"greater than the maximum {self.maximum}")
         return value
 
+    def _entries(self, value: object) -> list[tuple[str, str | None]]:
+        """A list or map value's entries, from its text, a list or a dict."""
+
+        if isinstance(value, str):
+            items = [item.strip() for item in _ITEM_SEPARATORS.split(value)]
+            items = [item for item in items if item]
+            if self.format == "list":
+                return [(item, None) for item in items]
+            entries: list[tuple[str, str | None]] = []
+            for item in items:
+                key, separator, mapped = item.partition("=")
+                if not separator:
+                    raise ValueError(f"{item!r} isn't KEY=VALUE")
+                entries.append((key.strip(), mapped.strip()))
+            return entries
+        if self.format == "list" and isinstance(value, list | tuple):
+            items = [item for item in value if type(item) is str]
+            if len(items) != len(value):
+                raise ValueError("expected a list of strings")
+            return [(item.strip(), None) for item in items]
+        if self.format == "map" and isinstance(value, Mapping):
+            pairs = [
+                (key, mapped)
+                for key, mapped in value.items()
+                if type(key) is str and type(mapped) is str
+            ]
+            if len(pairs) != len(value):
+                raise ValueError("expected a map of strings to strings")
+            return [(key.strip(), mapped.strip()) for key, mapped in pairs]
+        raise ValueError("expected a list" if self.format == "list" else "expected a map")
+
+    def _text_value(self, value: object) -> str:
+        entries = self._entries(value)
+        for key, mapped in entries:
+            if not key or _ITEM_SEPARATORS.search(key) or (mapped is not None and "=" in key):
+                raise ValueError(f"{key!r} isn't an item: items are non-empty, without commas")
+            if mapped is not None and (not mapped or _ITEM_SEPARATORS.search(mapped)):
+                raise ValueError(f"{key!r} has no value")
+        keys = [key for key, _ in entries]
+        if self.format == "list":
+            # A repeated item adds nothing; keep the first.
+            entries = [(key, None) for key in dict.fromkeys(keys)]
+        else:
+            repeated = sorted(key for key, count in Counter(keys).items() if count > 1)
+            if repeated:
+                raise ValueError(f"{_quoted(repeated)} listed more than once")
+        noun = "item" if self.format == "list" else "key"
+        bad = self._unmatched([key for key, _ in entries], self.item_pattern, self.item_choices)
+        if bad:
+            raise ValueError(self._refusal(noun, bad, self.item_pattern, self.item_choices))
+        if self.format == "map":
+            bad = self._unmatched(
+                [mapped for _, mapped in entries if mapped is not None],
+                self.value_pattern,
+                self.value_choices,
+            )
+            if bad:
+                wrong = [f"{k}={v}" for k, v in entries if v in bad]
+                raise ValueError(
+                    self._refusal("value in", wrong, self.value_pattern, self.value_choices)
+                )
+        if self.max_items is not None and len(entries) > self.max_items:
+            raise ValueError(f"more than {self.max_items} items")
+        text = ",".join(key if mapped is None else f"{key}={mapped}" for key, mapped in entries)
+        assert self.max_length is not None
+        if len(text) > self.max_length:
+            raise ValueError(f"longer than {self.max_length} characters")
+        return text
+
+    @staticmethod
+    def _unmatched(
+        values: Sequence[str],
+        pattern: str | None,
+        choices: tuple[ManagedSettingChoice, ...] | None,
+    ) -> list[str]:
+        if pattern is not None:
+            compiled = re.compile(pattern)
+            return [value for value in values if not compiled.fullmatch(value)]
+        if choices is not None:
+            allowed = {choice.value for choice in choices}
+            return [value for value in values if value not in allowed]
+        return []
+
+    @staticmethod
+    def _refusal(
+        noun: str,
+        bad: Sequence[str],
+        pattern: str | None,
+        choices: tuple[ManagedSettingChoice, ...] | None,
+    ) -> str:
+        """Name the items that don't fit, and the rule they break."""
+
+        plural = len(bad) > 1
+        named = f"{noun}{'s' if plural else ''} {_quoted(bad)}"
+        if noun == "value in":
+            named = f"the value{'s' if plural else ''} in {_quoted(bad)}"
+        if pattern is not None:
+            return f"{named} {'do' if plural else 'does'} not match {pattern}"
+        assert choices is not None
+        allowed = ", ".join(choice.value for choice in choices)
+        if len(allowed) > 80:
+            allowed = allowed[:77] + "..."
+        return f"{named} {'are' if plural else 'is'} not one of {allowed}"
+
+    def read_value(self, value: object) -> Any:
+        """The value as the application uses it: a tuple of items for a list, a dict for
+        a map (empty when there is no value), the value itself otherwise. ``value`` is
+        first checked as by ``validate_value``."""
+
+        checked = self.validate_value(value)
+        if self.format is None:
+            return checked
+        entries = [] if checked is None else self._entries(checked)
+        if self.format == "list":
+            return tuple(key for key, _ in entries)
+        return {key: mapped for key, mapped in entries}
+
+    def parse_text(self, text: str) -> ManagedSettingValue:
+        """Read text, such as an environment variable's, by this setting's type.
+
+        A ``bool`` takes true/false, 1/0, yes/no or on/off in any case; an ``int`` or
+        ``number`` a number; a list or map its comma-separated text. Blank text is no
+        value (``None``) except for ``string``, ``list`` and ``map`` settings, where it
+        is the empty value. Raises ``ValueError`` when the text doesn't fit.
+        """
+
+        if type(text) is not str:
+            raise ValueError("expected text")
+        stripped = text.strip()
+        if not stripped and self.type != "string":
+            return None
+        if self.type == "bool":
+            word = stripped.lower()
+            if word in _TRUE_WORDS or word in _FALSE_WORDS:
+                return word in _TRUE_WORDS
+            raise ValueError("expected true or false (also 1/0, yes/no, on/off)")
+        if self.type == "int":
+            if not _INT_TEXT.fullmatch(stripped):
+                raise ValueError("expected an integer")
+            return self.validate_value(int(stripped))
+        if self.type == "number":
+            if _INT_TEXT.fullmatch(stripped):
+                return self.validate_value(int(stripped))
+            try:
+                number = float(stripped)
+            except ValueError:
+                raise ValueError("expected a finite number") from None
+            return self.validate_value(number)
+        if self.type == "string" and self.format is None:
+            return self.validate_value(text)
+        return self.validate_value(stripped)
+
+    @classmethod
+    def from_descriptor(cls, descriptor: Mapping[str, Any]) -> ManagedSetting:
+        """A setting from a published descriptor, such as one Cloud returns.
+
+        Fields this version doesn't know (Cloud's ``admin_only``, say) are ignored, as
+        the contract says readers do. Raises ``ValueError`` when it isn't a valid
+        descriptor.
+        """
+
+        known = set(cls.model_fields)
+        return cls.model_validate({k: v for k, v in descriptor.items() if k in known})
+
     def descriptor(self) -> dict[str, Any]:
         """Return the contract's JSON descriptor."""
 
         return self.model_dump(mode="json")
+
+
+ManagedSettingSource = Literal["cloud", "environment", "default"]
+
+
+@dataclass(frozen=True)
+class ManagedSettingReading:
+    """A setting's value as the application reads it now, and where it came from.
+
+    ``source`` is ``"cloud"`` (a value set in Cayu Cloud), ``"environment"`` (the
+    setting's ``env`` variable, used when Cloud has no value) or ``"default"`` (the
+    code's default, which Cloud shows as the Release's value). ``value`` is what
+    ``CayuApp.managed_setting_value`` returns. ``refused`` says why a value from Cloud
+    or the environment wasn't used, when one was there.
+    """
+
+    key: str
+    value: Any
+    source: ManagedSettingSource
+    env: str | None = None
+    refused: str | None = None
 
 
 def _choices(values: Iterable[str | tuple[str, str] | ManagedSettingChoice]) -> tuple:
@@ -299,6 +618,88 @@ def provider_option_setting(
     )
 
 
+_Choices = Iterable[str | tuple[str, str] | ManagedSettingChoice]
+
+
+def list_setting(
+    key: str,
+    *,
+    label: str,
+    item_pattern: str | None = None,
+    item_choices: _Choices | None = None,
+    max_items: int | None = None,
+    max_length: int = MAX_STRING_LENGTH,
+    default: Iterable[str] | str | None = None,
+    applies: ManagedSettingApplies = "next_session",
+    description: str | None = None,
+    env: str | None = None,
+) -> ManagedSetting:
+    """Declare a list of strings, each matching ``item_pattern`` or one of ``item_choices``.
+
+    The application reads a tuple. In Cloud the value is text, the items separated by
+    commas (``owner/a,owner/b``).
+    """
+
+    return ManagedSetting.model_validate(
+        {
+            "key": key,
+            "type": "string",
+            "format": "list",
+            "label": label,
+            "item_pattern": item_pattern,
+            "item_choices": None if item_choices is None else _choices(item_choices),
+            "max_items": max_items,
+            "max_length": max_length,
+            "default": default if default is None or isinstance(default, str) else tuple(default),
+            "applies": applies,
+            "description": description,
+            "env": env,
+        }
+    )
+
+
+def map_setting(
+    key: str,
+    *,
+    label: str,
+    item_pattern: str | None = None,
+    item_choices: _Choices | None = None,
+    value_pattern: str | None = None,
+    value_choices: _Choices | None = None,
+    max_items: int | None = None,
+    max_length: int = MAX_STRING_LENGTH,
+    default: Mapping[str, str] | str | None = None,
+    applies: ManagedSettingApplies = "next_session",
+    description: str | None = None,
+    env: str | None = None,
+) -> ManagedSetting:
+    """Declare a map from strings (``item_pattern`` or ``item_choices``) to strings
+    (``value_pattern`` or ``value_choices``).
+
+    The application reads a dict. In Cloud the value is text, the entries ``KEY=VALUE``
+    separated by commas (``owner/a=approve,owner/b=auto``).
+    """
+
+    return ManagedSetting.model_validate(
+        {
+            "key": key,
+            "type": "string",
+            "format": "map",
+            "label": label,
+            "item_pattern": item_pattern,
+            "item_choices": None if item_choices is None else _choices(item_choices),
+            "value_pattern": value_pattern,
+            "value_choices": None if value_choices is None else _choices(value_choices),
+            "max_items": max_items,
+            "max_length": max_length,
+            "default": default if default is None or isinstance(default, str) else dict(default),
+            "applies": applies,
+            "description": description,
+            "env": env,
+        }
+    )
+
+
 def namespace_segment(name: str, *, part: str) -> str:
     """Return ``name`` if it can be one segment of a setting key."""
 
@@ -362,6 +763,10 @@ def agent_setting_defaults(
     defaults: dict[str, Any] = {}
     for setting in settings:
         key = setting.key
+        if setting.env is not None and (
+            key == "model" or key.startswith(("thinking.", "provider_options."))
+        ):
+            raise ValueError(f"An agent's {key!r} setting can't take env: Cayu applies it.")
         if key == "model":
             if setting.type not in {"string", "enum"} or setting.applies == "live":
                 raise ValueError(
@@ -380,7 +785,7 @@ def agent_setting_defaults(
             defaults[key] = thinking_effort
         elif key.startswith("provider_options."):
             name = key.removeprefix("provider_options.")
-            if "." in name or setting.type == "secret_ref":
+            if "." in name or setting.type == "secret_ref" or setting.format is not None:
                 raise ValueError(f"{key!r} must name one scalar provider option.")
             value = provider_options.get(name)
             defaults[key] = value if type(value) in {bool, int, float, str} else None
@@ -908,6 +1313,9 @@ __all__ = [
     "ManagedSetting",
     "ManagedSettingApplies",
     "ManagedSettingChoice",
+    "ManagedSettingFormat",
+    "ManagedSettingReading",
+    "ManagedSettingSource",
     "ManagedSettingType",
     "ManagedSettingValue",
     "ManagedSettings",
@@ -917,7 +1325,9 @@ __all__ = [
     "ManagedSettingsSchemaMissing",
     "ManagedSettingsSnapshot",
     "ManagedSettingsUnavailable",
+    "list_setting",
     "managed_settings_schema_document",
+    "map_setting",
     "model_setting",
     "provider_option_setting",
     "settings_digest",

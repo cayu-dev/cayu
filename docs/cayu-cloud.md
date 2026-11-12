@@ -2461,7 +2461,9 @@ one of its settings can print `--application` with that value and the command wo
 shown.
 
 `list` shows each setting's effective value, its source (`release` or `cloud`) and
-its status (`applied`, `applying`, `conflict` or `refused`). For an Agent setting it
+its status (`applied`, `applying`, `conflict` or `refused`). A value too long for the
+table is shortened between items (`owner/a, ... (+38 more)`) and printed whole
+below it. For an Agent setting it
 also shows how many of the Agent's processes adopted it, and lists the reasons a
 process refused one. Values Cloud keeps but can't apply to the selected Release, for
 example a setting the Release no longer declares, are listed as conflicts.
@@ -2470,7 +2472,13 @@ example a setting the Release no longer declares, are listed as conflicts.
 all of them apply or none does. A value is read as JSON when it parses as JSON and as
 a string otherwise, so `60` is a number, `true` a boolean,
 `'{"cpu_millis": 512, "memory_mb": 1024}'` an object and `always_on` a string; write
-`'"60"'` to send the string `60`. The command reads the current settings first to
+`'"60"'` to send the string `60`. A list or map setting (see
+[managed settings](managed-settings.md#lists-and-maps)) takes its text:
+`app.repositories=owner/a,owner/b` or `app.merge_modes=owner/a=approve`. When
+Cloud's settings carry the descriptor's `format`, `set` also takes a JSON list or
+object for one, and checks every item before it writes anything, naming any item
+that doesn't fit. Otherwise the Agent refuses a bad value when it reads it, and
+`list` shows the reason. The command reads the current settings first to
 find each key's namespace and the revision to write against. A key that both
 namespaces have needs a prefix, `platform:KEY` or `agent:KEY`, and a prefixed key is
 sent as written, which also reaches an Agent setting before the Release has
