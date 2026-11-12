@@ -155,6 +155,18 @@ def test_an_issue_is_created_labelled_and_closed() -> None:
     assert [(item["number"], "pull_request" in item) for item in still_open] == [(1, True)]
 
 
+def test_a_label_with_a_slash_is_removed_by_its_encoded_name() -> None:
+    fake = _fake()
+    fake.add_issue(REPO, 1, author=BOT)
+    gh = fake.client()
+
+    run(gh.post(f"/repos/{REPO}/issues/1/labels", json={"labels": ["area/runtime", "ci"]}))
+    run(gh.delete(f"/repos/{REPO}/issues/1/labels/area%2Fruntime"))
+
+    assert fake.requests[-1].path == f"/repos/{REPO}/issues/1/labels/area%2Fruntime"
+    assert fake.repositories[REPO].issues[1].labels == ["ci"]
+
+
 def test_issues_are_listed_by_their_creator_ignoring_case() -> None:
     fake = _fake()
     fake.add_issue(REPO, 1, author=BOT)

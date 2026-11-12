@@ -223,7 +223,11 @@ author of what it writes.
 - **Calls.** `request(method, path)` answers GitHub's response; `get`, `post`, `put`, `patch`
   and `delete` its JSON; `text(path)` a raw file or a job's log. Paths start with `/` and are
   percent-encoded where needed (a branch keeps its `/`; a `%` is literal unless it starts an
-  escape such as `%2F`). A call under `/repos/{owner}/{name}/`, or `graphql(...,
+  escape such as `%2F`). A `/`, `?` or `#` inside one segment, as in a label named
+  `area/runtime` (`/repos/o/r/labels/area%2Fruntime`) or a file named `C#.md`, goes out
+  encoded; a dot or empty segment, also once decoded, a backslash or NUL, raw or encoded, and
+  a raw `?` or `#` are refused as `path_invalid` before anything is sent. Cayu Cloud's GitHub
+  connector has to accept the same paths. A call under `/repos/{owner}/{name}/`, or `graphql(...,
   repository=)`, names its repository in the `x-cayu-github-repository` header. The slot's
   host uses it to pick the credential and drops it, so GitHub never sees it:
   `token_connections` and `app_connections` do, and Cayu Cloud's GitHub connector has to.

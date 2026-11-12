@@ -23,7 +23,6 @@ DEFAULT_TIMEOUT_SECONDS = 70.0
 MAX_BODY_BYTES = 5 * 1024 * 1024
 #: The longest wait a ``Retry-After`` is read as; a longer one is clamped to it.
 MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
-_ENCODED_SEPARATOR = re.compile(r"%(2f|5c)", re.IGNORECASE)
 _HOP_HEADERS = frozenset(
     {
         "connection",
@@ -372,22 +371,26 @@ def retry_after_seconds(value: str | None) -> float | None:
 
 
 def checked_headers(path: str, headers: Mapping[str, str] | None, body: bytes) -> dict[str, str]:
-    """The request's headers, lowercased, once its path and body are ones the broker sends:
-    refused here as Cayu Cloud's broker refuses them, before anything leaves the process. A
-    connection client of the connectors' own, such as a test's fake, checks them the same
-    way."""
+    """The request's headers, lowercased, once its path and body are ones the broker sends,
+    before anything leaves the process. A connection client of the connectors' own, such as a
+    test's fake, checks them the same way.
+
+    A ``/``, ``?`` or ``#`` inside one segment is sent percent-encoded (``%2F``, ``%3F``,
+    ``%23``), as GitHub's label names need. What could change which resource a path names
+    is refused: a dot or empty segment, also once decoded (``a%2F..%2Fb``), a backslash or NUL
+    raw or encoded, and a raw ``?`` or ``#``."""
 
     decoded = unquote(path)
     if (
         not path.startswith("/")
-        or "//" in path
+        or "//" in decoded
         or any(segment in {".", ".."} for segment in decoded.split("/"))
-        or any(character in decoded for character in "?#\\\x00")
-        or _ENCODED_SEPARATOR.search(path)
+        or any(character in decoded for character in "\\\x00")
+        or any(character in path for character in "?#")
     ):
         raise ConnectionCallError(
-            "A path starts with /, has no . or .. segment, empty segment, encoded separator, "
-            "backslash or query.",
+            "A path starts with /, has no . or .. segment or empty segment (also once "
+            "decoded), no backslash or NUL, and no raw ? or #: encode one inside a segment.",
             code="path_invalid",
         )
     if len(body) > MAX_BODY_BYTES:

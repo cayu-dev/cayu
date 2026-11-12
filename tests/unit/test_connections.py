@@ -149,7 +149,21 @@ def test_local_connections_send_straight_to_the_slots_host() -> None:
 
 @pytest.mark.parametrize(
     "path",
-    ["@evil.test/x", ".evil.test/x", "/v1/../admin", "/v1/%2e%2e/admin", "//evil.test/x", "/a%2fb"],
+    [
+        "@evil.test/x",
+        ".evil.test/x",
+        "/v1/../admin",
+        "/v1/%2e%2e/admin",
+        "/v1/a%2F..%2Fadmin",
+        "//evil.test/x",
+        "/%2Fevil.test/x",
+        "/v1/a%2F%2Fb",
+        "/a%5cb",
+        "/a\\b",
+        "/a%00b",
+        "/a?b",
+        "/a#b",
+    ],
 )
 def test_a_path_that_could_leave_the_host_is_refused_before_anything_is_sent(path: str) -> None:
     sent: list[httpx.Request] = []
@@ -170,6 +184,36 @@ def test_a_path_that_could_leave_the_host_is_refused_before_anything_is_sent(pat
             asyncio.run(client.request("crm", "GET", path))
         assert caught.value.code == "path_invalid"
     assert sent == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/repos/acme/widgets/labels/area%2Fruntime",
+        "/repos/acme/widgets/contents/docs/C%23.md",
+        "/repos/acme/widgets/contents/why%3F.md",
+    ],
+)
+def test_a_slash_hash_or_question_mark_inside_a_segment_is_sent_still_encoded(path: str) -> None:
+    sent: list[httpx.Request] = []
+
+    def host(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if request.url.host == "api.example.test":
+            return httpx.Response(200, json={"status": 204, "headers": [], "body": ""})
+        return httpx.Response(204)
+
+    local = LocalConnections(
+        {"crm": LocalSlot("https://api.acme.test")}, transport=httpx.MockTransport(host)
+    )
+    broker = CloudConnectionBroker(
+        url=BROKER, token="cayu_conn_x", transport=httpx.MockTransport(host)
+    )
+    for client in (local, broker):
+        assert asyncio.run(client.request("crm", "DELETE", path)).status == 204
+
+    assert sent[0].url.raw_path.decode() == path
+    assert json.loads(sent[1].content)["path"] == path
 
 
 def test_headers_twice_and_an_oversized_body_are_refused_before_sending() -> None:
