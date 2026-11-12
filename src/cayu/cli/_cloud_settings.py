@@ -30,6 +30,7 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_diagnostics import safe_text
+from cayu.cli._cloud_reference import APPLICATION_HELP
 
 NAMESPACES = ("platform", "agent")
 # Platform keys can be a single word (`sign_in`); Agent keys are dotted and namespaced by
@@ -110,7 +111,7 @@ def add_settings_parser(
     )
     unsetter.add_argument("key", metavar="KEY")
     for parser in (listing, setter, unsetter):
-        parser.add_argument("--application", required=True)
+        parser.add_argument("--application", required=True, help=APPLICATION_HELP)
         parser.add_argument(
             "--json",
             action="store_true",

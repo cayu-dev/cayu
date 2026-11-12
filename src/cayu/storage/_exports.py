@@ -1,6 +1,8 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "AgentReadError": ("cayu.storage.agent_readers", "AgentReadError"),
+    "AgentReaders": ("cayu.storage.agent_readers", "AgentReaders"),
     "ApplicationStores": ("cayu.storage.application", "ApplicationStores"),
     "ArtifactRetentionPolicy": ("cayu.storage.retention", "ArtifactRetentionPolicy"),
     "BUILTIN_KNOWLEDGE_KINDS": ("cayu.knowledge.records", "BUILTIN_KNOWLEDGE_KINDS"),
@@ -400,6 +402,9 @@ EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "open_agent_snapshot_store": ("cayu.storage.application", "open_agent_snapshot_store"),
     "open_application_stores": ("cayu.storage.application", "open_application_stores"),
+    "TaskListRequest": ("cayu.storage.agent_readers", "TaskListRequest"),
+    "open_cloud_agent_readers": ("cayu.storage.agent_readers", "open_cloud_agent_readers"),
+    "open_store_agent_readers": ("cayu.storage.agent_readers", "open_store_agent_readers"),
     "prepare_knowledge_activation_request": (
         "cayu.knowledge.activation_contracts",
         "prepare_knowledge_activation_request",
@@ -421,6 +426,8 @@ EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 PUBLIC_NAMES = [
+    "AgentReadError",
+    "AgentReaders",
     "ApplicationStores",
     "ArtifactRetentionPolicy",
     "BUILTIN_KNOWLEDGE_KINDS",
@@ -610,6 +617,9 @@ PUBLIC_NAMES = [
     "knowledge_chunk_embedding_identity",
     "open_agent_snapshot_store",
     "open_application_stores",
+    "TaskListRequest",
+    "open_cloud_agent_readers",
+    "open_store_agent_readers",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",
     "prepare_knowledge_publication",

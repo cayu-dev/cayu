@@ -53,8 +53,9 @@ def add_read_target_options(parser: argparse.ArgumentParser, *, allow_store: boo
         "--application",
         metavar="NAME",
         help=(
-            "Read the Cayu Cloud Agent with this slug or name through its own Cayu API, "
-            "signed in as `cayu cloud` is."
+            "Read this Cayu Cloud Agent through its own Cayu API, signed in as `cayu cloud` "
+            "is: its id (the `application` slug in cayu-cloud.toml, CAYU_CLOUD_APPLICATION_ID "
+            "on Cloud) or its name."
         ),
     )
     parser.add_argument(

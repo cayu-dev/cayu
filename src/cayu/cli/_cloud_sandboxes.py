@@ -39,6 +39,7 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_releases import _when, add_output_argument, render_failure
 from cayu.cli._cloud_service_logs import log_time
 from cayu.cli._cloud_settings import _cell, _table
@@ -206,7 +207,7 @@ def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
         (showing, render_sandbox),
         (archives, render_archives),
     ):
-        parser.add_argument("--application", required=True)
+        parser.add_argument("--application", required=True, help=APPLICATION_HELP)
         add_output_argument(parser, render, failure=render_failure)
 
 

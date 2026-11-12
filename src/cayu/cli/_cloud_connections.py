@@ -24,15 +24,14 @@ the slot's default.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import quote
 
+from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_settings import _table
-
-if TYPE_CHECKING:
-    from cayu.cli._cloud_api import CloudApiClient
 
 _CONNECTIONS = "/v1/connections"
 #: The `connections` actions on one Agent's slots, which name the Agent with --application.
@@ -52,6 +51,16 @@ KNOWN_FIELDS = PLAIN_FIELDS | {
     "client_key",
     "ca_bundle",
 }
+
+
+#: Cloud's always-mounted answer to whether its connections are on (`{"enabled": bool}`).
+CONNECTIONS_STATUS = "/v1/connections-status"
+CONNECTIONS_DISABLED = "connections_disabled"
+CONNECTIONS_DISABLED_MESSAGE = "Connections are turned off in this Cayu Cloud installation."
+CONNECTIONS_UNAVAILABLE = (
+    "This Cayu Cloud doesn't serve connections: they're turned off in this installation, or "
+    "it predates them. `cayu cloud platform` shows which revision it runs."
+)
 
 
 class CredentialArgumentError(ValueError):
@@ -172,7 +181,7 @@ def add_connections_parsers(
             "`cayu cloud connections bind`."
         ),
     )
-    bound.add_argument("--application", required=True, help="The Agent.")
+    bound.add_argument("--application", required=True, help=APPLICATION_HELP)
     bind = actions.add_parser(
         "bind",
         help="Bind one of an Agent's slots to a connection, or its model slot to a model.",
@@ -183,7 +192,7 @@ def add_connections_parsers(
     )
     bind.add_argument("slot")
     bind.add_argument("connection", nargs="?")
-    bind.add_argument("--application", required=True, help="The Agent.")
+    bind.add_argument("--application", required=True, help=APPLICATION_HELP)
     bind.add_argument("--scope", action="append", help="A scope the binding uses; repeat.")
     bind.add_argument(
         "--model", help="Bind the model slot SLOT to this approved model instead of a connection."
@@ -198,7 +207,7 @@ def add_connections_parsers(
         ),
     )
     unbind.add_argument("slot")
-    unbind.add_argument("--application", required=True, help="The Agent.")
+    unbind.add_argument("--application", required=True, help=APPLICATION_HELP)
     unbind.add_argument(
         "--model", action="store_true", help="Unbind the model slot SLOT, not a connection slot."
     )
@@ -223,7 +232,7 @@ def add_models_parser(commands: argparse._SubParsersAction[argparse.ArgumentPars
             "the slot; then the approved models it can be bound to."
         ),
     )
-    listed.add_argument("--application", required=True, help="The Agent.")
+    listed.add_argument("--application", required=True, help=APPLICATION_HELP)
     listed.add_argument(
         "--json", action="store_true", help="Print the JSON envelope instead of a table."
     )
@@ -367,8 +376,13 @@ def models_command(
 ) -> dict[str, Any]:
     """Run one `models` action on the Agent ``application_id``."""
 
-    result = client.request("GET", _models(application_id))
-    return {"operation": f"models.{arguments.models_command}", "result": result}
+    return _connections_served(
+        client,
+        lambda: {
+            "operation": f"models.{arguments.models_command}",
+            "result": client.request("GET", _models(application_id)),
+        },
+    )
 
 
 def _models(application_id: str) -> str:
@@ -376,7 +390,10 @@ def _models(application_id: str) -> str:
 
 
 def connectors_command(client: CloudApiClient) -> dict[str, Any]:
-    return {"operation": "connectors.list", "result": client.request("GET", "/v1/connectors")}
+    return _connections_served(
+        client,
+        lambda: {"operation": "connectors.list", "result": client.request("GET", "/v1/connectors")},
+    )
 
 
 def connections_command(
@@ -389,6 +406,71 @@ def connections_command(
     """Run one `connections` action. The caller resolves the Agents it names: the Agent actions'
     --application as ``application_id``, and `add` and `agents`' --agent values as ``agents``."""
 
+    return _connections_served(
+        client,
+        lambda: _connections_action(
+            arguments, client=client, application_id=application_id, agents=agents
+        ),
+    )
+
+
+def _connections_served(
+    client: CloudApiClient, request: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
+    """Answer ``request``, saying in words when this Cayu Cloud serves no connections.
+
+    An install with connections turned off doesn't mount their routes, so they answer a
+    bare 404: no code, only FastAPI's "Not Found". The always-mounted
+    ``GET /v1/connections-status`` then says whether connections are off; a Cloud without
+    it is older, and either off or from before connections. A refusal with one of Cloud's
+    own codes, such as ``connection_not_found`` for a name it doesn't have, is passed on.
+    """
+
+    try:
+        return request()
+    except CloudApiError as exc:
+        if not _route_missing(exc):
+            raise
+        enabled = _connections_enabled(client)
+        if enabled is None:
+            raise _command_error("connections_unavailable", CONNECTIONS_UNAVAILABLE) from None
+        if not enabled:
+            raise _command_error(CONNECTIONS_DISABLED, CONNECTIONS_DISABLED_MESSAGE) from None
+        raise
+
+
+def _route_missing(exc: CloudApiError) -> bool:
+    return exc.status_code == 405 or (
+        exc.status_code == 404 and exc.code is None and exc.detail in {None, "Not Found"}
+    )
+
+
+def _connections_enabled(client: CloudApiClient) -> bool | None:
+    """Whether this Cloud has connections on, or None when it doesn't say (an older one)."""
+
+    try:
+        status = client.request("GET", CONNECTIONS_STATUS)
+    except CloudApiError as exc:
+        if _route_missing(exc):
+            return None
+        raise
+    enabled = status.get("enabled") if isinstance(status, dict) else None
+    return enabled if isinstance(enabled, bool) else None
+
+
+def _command_error(category: str, message: str) -> Exception:
+    from cayu.cli.cloud import CloudCommandError
+
+    return CloudCommandError(category, message)
+
+
+def _connections_action(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    application_id: str | None,
+    agents: list[str] | None,
+) -> dict[str, Any]:
     action = arguments.connections_command
     if action == "list":
         result = client.request("GET", _CONNECTIONS)

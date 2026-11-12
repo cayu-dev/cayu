@@ -27,6 +27,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_releases import add_output_argument, render_failure
 from cayu.cli._cloud_settings import _cell
 
@@ -61,7 +62,7 @@ def add_activity_parser(commands: argparse._SubParsersAction[argparse.ArgumentPa
             "the page size the next read asks for."
         ),
     )
-    status.add_argument("--application", required=True, help="The Agent's slug or name.")
+    status.add_argument("--application", required=True, help=APPLICATION_HELP)
     add_output_argument(status, render_status, failure=render_failure)
 
 

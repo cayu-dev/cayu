@@ -157,6 +157,11 @@ values from Cloud and reports what the process applied. It is on only in Cloud:
 the code's defaults apply and nothing polls. To supply your own channel, pass
 `CayuApp(managed_settings=ManagedSettings(channel))`.
 
+An app that shows people how to change a setting from the CLI can print
+`cayu cloud settings set --application "$CAYU_CLOUD_APPLICATION_ID" KEY=VALUE`:
+the Agent's id is the `application` slug in its `cayu-cloud.toml`, and
+`--application` takes it as well as the Agent's name.
+
 - When the application is built, it reads Cloud's values once (5-second
   timeout). `restart` settings come from that read for the life of the process:
   config fields and budget amounts in the `CayuApp` constructor, an agent's

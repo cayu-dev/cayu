@@ -602,3 +602,117 @@ def test_check_says_why_the_check_itself_failed_and_what_to_do(
     assert heading == f"erp: {status}"
     unchanged = " The connection's status is unchanged; try again later."
     assert explained == said + (unchanged if check_error.endswith("_unreachable") else "")
+
+
+_MISSING = httpx.Response(404, json={"detail": "Not Found"})
+_STATUS = ("GET", "/v1/connections-status")
+_OFF = httpx.Response(
+    200,
+    json={
+        "enabled": False,
+        "message": "Connections are turned off in this Cayu Cloud installation. "
+        "Its operator turns them on.",
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "route"),
+    [
+        (["connectors"], ("GET", "/v1/connectors")),
+        (["connections", "list"], ("GET", "/v1/connections")),
+        (["connections", "show", "team-anthropic"], ("GET", "/v1/connections/team-anthropic")),
+    ],
+)
+def test_connections_turned_off_are_named_in_words(
+    cloud, capsys: pytest.CaptureFixture[str], arguments: list[str], route: tuple[str, str]
+) -> None:
+    cloud({route: _MISSING, _STATUS: _OFF})
+
+    code, output = _run(arguments, capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "connections_disabled"
+    assert output["error"]["message"] == (
+        "Connections are turned off in this Cayu Cloud installation."
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "route"),
+    [
+        (
+            ["connections", "bound", "--application", "support-desk"],
+            ("GET", f"{_APPS}/support-desk/connections"),
+        ),
+        (
+            ["models", "list", "--application", "support-desk"],
+            ("GET", f"{_APPS}/support-desk/models"),
+        ),
+    ],
+)
+def test_an_agents_slots_on_a_cloud_with_connections_off(
+    cloud, capsys: pytest.CaptureFixture[str], arguments: list[str], route: tuple[str, str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            route: _MISSING,
+            _STATUS: _OFF,
+        }
+    )
+
+    code, output = _run([*arguments, "--json"] if arguments[0] == "models" else arguments, capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "connections_disabled"
+
+
+def test_an_older_cloud_without_the_status_route_says_what_that_can_mean(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({("GET", "/v1/connections"): _MISSING, _STATUS: _MISSING})
+
+    code, output = _run(["connections", "list"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "connections_unavailable"
+    assert "turned off in this installation, or it predates them" in output["error"]["message"]
+
+
+def test_a_bare_404_with_connections_on_is_passed_on(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", "/v1/connections"): _MISSING,
+            _STATUS: httpx.Response(200, json={"enabled": True, "message": ""}),
+        }
+    )
+
+    code, output = _run(["connections", "list"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "api_request_rejected"
+    assert "404" in output["error"]["message"]
+
+
+def test_a_missing_connection_is_still_reported_as_missing(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("GET", "/v1/connections/absent"): httpx.Response(
+                404,
+                json={
+                    "detail": {"code": "connection_not_found", "message": "No connection absent."}
+                },
+            )
+        }
+    )
+
+    code, output = _run(["connections", "show", "absent"], capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "connection_not_found"
+    assert not any(request.url.path == "/v1/connections-status" for request in fake.requests)

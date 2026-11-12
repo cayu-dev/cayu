@@ -1565,6 +1565,45 @@ my-agent` reads the Agent's sessions the same way; see
 [Session inspection](session-inspection.md#sessions-of-a-cloud-agent). `cayu task wait
 TASK_ID --application my-agent` waits for one of its tasks to end.
 
+`cayu task show` and `cayu task wait` print one field of the task with `--field PATH`, a
+dotted path into the task as `--json` shows it under `task` (a number picks a list item).
+The value is printed as JSON; add `--raw` to print a text value as plain text, such as a
+Markdown brief a task returned:
+
+```console
+cayu task show TASK_ID --application cayu-herald --field result.markdown --raw
+```
+
+A path the task doesn't have fails and names the first part that is missing.
+
+### Reading a deployed Agent from the project's own commands
+
+A project's own commands can read the deployed Agent through the same sign-in, with no
+routes or client of their own. `cayu.storage.open_cloud_agent_readers(APPLICATION)` returns
+read-only task and session readers for the Cloud Agent, and
+`cayu.storage.open_store_agent_readers(target)` the same readers for a local store, so one
+command reads either:
+
+```python
+from cayu.storage import TaskListRequest, open_cloud_agent_readers
+from cayu.tasks.records import TaskStatus
+
+async with open_cloud_agent_readers("cayu-herald") as agent:
+    rows = await agent.tasks.list_tasks(
+        TaskListRequest(type="digest", status=TaskStatus.COMPLETED, limit=1)
+    )
+    digest = await agent.tasks.load_task(rows[0]["id"]) if rows else None
+```
+
+`agent.tasks.list_tasks` lists newest-updated first without results, and `load_task`
+returns one task with its `result`, in the shape of the Cayu server's task API (what
+`cayu task show --json` prints under `task`). `agent.sessions` reads sessions as `cayu session
+--application` does, for example `query_events(EventQuery(...))` and
+`query_transcript(TranscriptQuery(...))`. The open function takes `context=` for
+`--context`, `timeout_seconds=` and `wake_timeout_seconds=`; a read that can't be answered
+raises `cayu.storage.AgentReadError`, whose `category` is one of those above. The readers
+only read.
+
 ## Reading an Agent's logs
 
 `cayu cloud service logs --application AGENT` prints the output of the Agent's web process,
@@ -2209,7 +2248,7 @@ cayu cloud connections remove warehouse
 
 Credentials come from files: `--key-file` for an API key and `--credential FIELD=@PATH` for
 any other field; `--credential FIELD=VALUE` is refused except for the fields that aren't secret
-(`account`, `user`). `--agent` and `--application` take an Agent's slug or name. No result
+(`account`, `user`). `--agent` and `--application` take an Agent's id or name. No result
 prints a credential. Developers and admins add connections and bind them to an Agent's slots; a
 developer names the Agents a new connection is for with `--agent`, and an admin who names none
 makes it available to every Agent. Only an admin changes which Agents may use one (`agents`),
@@ -2258,6 +2297,14 @@ new one, to finish a pending connection, retry one in error or reconnect a ready
 prints the JSON envelope instead, with the link as the result's `authorization_url`. A connection
 that signed in shows the account it connected, for Slack the workspace, as `account` (`id` and
 `name`) in `list` and `show`.
+
+An install with connections turned off doesn't serve their routes. When `cayu cloud
+connectors`, `cayu cloud connections` or `cayu cloud models` gets a plain HTTP 404, it asks
+Cloud's `GET /v1/connections-status` whether connections are on: when they are off, the
+command fails with `connections_disabled` and says "Connections are turned off in this Cayu
+Cloud installation." A Cayu Cloud without that route is older; the command then fails with
+`connections_unavailable` and says connections are turned off there or it predates them.
+`cayu cloud platform` shows which revision the install runs.
 
 ### Model slots
 
@@ -2406,6 +2453,12 @@ cayu cloud settings set web.sleep=always_on --application my-agent
 cayu cloud settings set web.sleep=3600 agent.reviewer.max_steps=60 --application my-agent
 cayu cloud settings unset web.sleep --application my-agent
 ```
+
+`--application`, here and in every `cayu cloud` command, takes the Agent's id or its
+name. The id is the `application` slug in its `cayu-cloud.toml`, and Cloud gives it to the
+Agent's processes as `CAYU_CLOUD_APPLICATION_ID`, so an app that shows the command to change
+one of its settings can print `--application` with that value and the command works as
+shown.
 
 `list` shows each setting's effective value, its source (`release` or `cloud`) and
 its status (`applied`, `applying`, `conflict` or `refused`). For an Agent setting it

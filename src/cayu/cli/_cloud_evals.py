@@ -35,6 +35,7 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound, cloud_agent_api
 from cayu.cli._cloud_api import CloudApiError
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_releases import add_output_argument
 from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import note, terminal_safe
@@ -1405,7 +1406,7 @@ def _count(number: object, noun: str) -> str:
 
 
 def _add_application_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--application", required=True, help="The Agent's slug or name.")
+    parser.add_argument("--application", required=True, help=APPLICATION_HELP)
 
 
 def _positive_count(value: str) -> int:

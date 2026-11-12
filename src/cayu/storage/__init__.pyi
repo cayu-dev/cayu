@@ -222,6 +222,11 @@ from cayu.knowledge.search import KnowledgeListResult as KnowledgeListResult
 from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
 from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
+from cayu.storage.agent_readers import AgentReadError as AgentReadError
+from cayu.storage.agent_readers import AgentReaders as AgentReaders
+from cayu.storage.agent_readers import TaskListRequest as TaskListRequest
+from cayu.storage.agent_readers import open_cloud_agent_readers as open_cloud_agent_readers
+from cayu.storage.agent_readers import open_store_agent_readers as open_store_agent_readers
 from cayu.storage.agent_snapshots_postgres import (
     PostgresAgentSnapshotStore as PostgresAgentSnapshotStore,
 )
@@ -393,6 +398,8 @@ __all__ = [
     "RETENTION_ARTIFACT_SCOPES",
     "RETENTION_TERMINAL_EVAL_RUN_STATUSES",
     "RETENTION_TERMINAL_SESSION_STATUSES",
+    "AgentReadError",
+    "AgentReaders",
     "ApplicationStores",
     "ArtifactRetentionPolicy",
     "BrowserRecordingStore",
@@ -513,6 +520,7 @@ __all__ = [
     "StorageRetentionPolicy",
     "StorageRetentionReport",
     "StorageRetentionTarget",
+    "TaskListRequest",
     "WorkspaceRetentionPolicy",
     "assess_knowledge_revision_transition",
     "configured_database_url",
@@ -521,6 +529,8 @@ __all__ = [
     "knowledge_chunk_embedding_identity",
     "open_agent_snapshot_store",
     "open_application_stores",
+    "open_cloud_agent_readers",
+    "open_store_agent_readers",
     "prepare_knowledge_activation_request",
     "prepare_knowledge_maintenance_decision",
     "prepare_knowledge_publication",

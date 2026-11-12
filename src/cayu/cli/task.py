@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import time
 from enum import StrEnum
 from pathlib import Path
@@ -273,6 +274,7 @@ def add_task_parser(subparsers: Any) -> None:
     show_parser.add_argument("task_id")
     add_read_target_options(show_parser)
     add_output_options(show_parser, formats=("table", "json"), default="table")
+    _add_field_options(show_parser)
 
     wait_parser = commands.add_parser(
         "wait",
@@ -303,6 +305,27 @@ def add_task_parser(subparsers: Any) -> None:
     )
     add_read_target_options(wait_parser)
     add_output_options(wait_parser, formats=("table", "json"), default="table")
+    _add_field_options(wait_parser)
+
+
+def _add_field_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--field",
+        metavar="PATH",
+        help=(
+            "Print only this field of the task, a dotted path into the task as `--json` shows "
+            "it under `task`, such as `result.markdown` or `result.items.0.title` (a number "
+            "picks a list item). Printed as JSON unless --raw is given."
+        ),
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help=(
+            "With --field, print a text value as plain text instead of a JSON string; other "
+            "values are still printed as JSON. On a terminal, control characters are escaped."
+        ),
+    )
 
 
 def run_task(args: argparse.Namespace) -> int:
@@ -310,6 +333,9 @@ def run_task(args: argparse.Namespace) -> int:
         from cayu.cli._control_plane_actions import run_action
 
         return run_action(args)
+    if getattr(args, "raw", False) and args.field is None:
+        print("error: --raw prints one field; add --field PATH.", file=sys.stderr)
+        return 2
     return run_read_command(
         args,
         _run_task_command,
@@ -471,7 +497,14 @@ async def _wait_for_task(args: argparse.Namespace, reader: TaskReader) -> int:
     outcome = task["status"] if task["status"] in _TERMINAL_EXIT_CODES else _TIMED_OUT
     payload = await _task_payload(reader, task)
     payload["wait"] = {"task_id": args.task_id, "outcome": outcome}
-    _render_task(args, payload)
+    try:
+        _render_task(args, payload)
+    except TaskFieldMissing as exc:
+        # A task that didn't complete often has no result yet: say so, and still exit with
+        # how it ended, so a script can tell a failed or running task from a read error.
+        if outcome == "completed":
+            raise
+        note(str(exc))
     if outcome == _TIMED_OUT:
         note(
             f"Task {task['id']} is still {task['status']} after waiting "
@@ -534,10 +567,57 @@ async def _task_timing(
 
 
 def _render_task(args: argparse.Namespace, payload: dict[str, Any]) -> None:
-    if args.output_format == "json":
+    field = getattr(args, "field", None)
+    if field is not None:
+        _print_field(task_field(payload["task"], field), raw=args.raw)
+    elif args.output_format == "json":
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
         _print_task(payload)
+
+
+class TaskFieldMissing(ValueError):
+    """The task has no value at a `--field` path."""
+
+
+def task_field(task: dict[str, Any], path: str) -> object:
+    """The value at the dotted ``path`` in ``task``; a number part picks a list item.
+
+    Raises `TaskFieldMissing` naming the first part the task doesn't have, and `ValueError`
+    for a path that isn't one.
+    """
+
+    parts = path.split(".")
+    if not path or any(not part for part in parts):
+        raise ValueError(f"--field must be a dotted path such as result.markdown, not {path!r}.")
+    value: object = task
+    for index, part in enumerate(parts):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            where = ".".join(parts[:index]) or "the task"
+            if isinstance(value, list):
+                kind = f" ({where} is a list of {len(value)} items)"
+            elif value is None:
+                kind = f" ({where} is null)"
+            elif not isinstance(value, dict):
+                kind = f" ({where} is not an object)"
+            else:
+                kind = ""
+            raise TaskFieldMissing(
+                f"Task {task.get('id')} has no field {path}: {where} has no {part!r}{kind}."
+            )
+    return value
+
+
+def _print_field(value: object, *, raw: bool) -> None:
+    if raw and isinstance(value, str):
+        # Plain text for a pipe or a file; escaped on a terminal, as remote text always is.
+        print(terminal_safe(value, keep_lines=True) if sys.stdout.isatty() else value)
+    else:
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
 def cancellation_summary(task: dict[str, Any]) -> dict[str, Any] | None:

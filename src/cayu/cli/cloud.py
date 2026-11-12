@@ -82,6 +82,7 @@ from cayu.cli._cloud_project import (
     schedule_input_json,
     schedule_option,
 )
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_release_sbom import SbomDownloadError, download_release_sbom, render_sbom
 from cayu.cli._cloud_release_source import (
     SourceDownloadError,
@@ -1097,7 +1098,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         metavar="APPLICATION",
         help="The Agent's slug or name; the same as --application.",
     )
-    application_show.add_argument("--application", help="The Agent's slug or name.")
+    application_show.add_argument("--application", help=APPLICATION_HELP)
     _add_release_output_argument(application_show, render_application)
 
     context = commands.add_parser(
@@ -1247,7 +1248,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "created and selected, its source revision and Cayu runtime."
         ),
     )
-    deployment_list.add_argument("--application", required=True)
+    deployment_list.add_argument("--application", required=True, help=APPLICATION_HELP)
     deployment_list.add_argument(
         "--limit",
         type=release_limit,
@@ -1291,7 +1292,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
                 help="The Agent the release belongs to; a dep_... id finds it on its own.",
             )
         else:
-            operation.add_argument("--application", required=True)
+            operation.add_argument("--application", required=True, help=APPLICATION_HELP)
         if action == "retry":
             operation.add_argument("--idempotency-key")
             _add_acknowledge_breaking_argument(operation)
@@ -1343,7 +1344,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description="Select an earlier immutable release and recreate the Agent service.",
     )
     rollback.add_argument("deployment_id")
-    rollback.add_argument("--application", required=True)
+    rollback.add_argument("--application", required=True, help=APPLICATION_HELP)
     rollback.add_argument(
         "--wait",
         action="store_true",
@@ -1367,13 +1368,13 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "list",
         description="List retained runtime artifacts for an Agent application.",
     )
-    runtime_list.add_argument("--application", required=True)
+    runtime_list.add_argument("--application", required=True, help=APPLICATION_HELP)
     runtime_status = runtime_commands.add_parser(
         "status",
         description="Show one retained runtime artifact and its lifecycle state.",
     )
     runtime_status.add_argument("artifact_id")
-    runtime_status.add_argument("--application", required=True)
+    runtime_status.add_argument("--application", required=True, help=APPLICATION_HELP)
 
     service = commands.add_parser(
         "service",
@@ -1424,7 +1425,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     }
     for action, description in service_descriptions.items():
         operation = service_commands.add_parser(action, description=description)
-        operation.add_argument("--application", required=True)
+        operation.add_argument("--application", required=True, help=APPLICATION_HELP)
         if action == "logs":
             add_service_logs_arguments(operation)
         if action == "database":
@@ -1453,7 +1454,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "list",
         description="List environment variables without revealing secret values.",
     )
-    environment_list.add_argument("--application", required=True)
+    environment_list.add_argument("--application", required=True, help=APPLICATION_HELP)
     environment_set = environment_commands.add_parser(
         "set",
         description=(
@@ -1465,7 +1466,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     environment_set.add_argument("assignments", nargs="+", metavar="assignment")
-    environment_set.add_argument("--application", required=True)
+    environment_set.add_argument("--application", required=True, help=APPLICATION_HELP)
     environment_set.add_argument("--secret", action="store_true")
     environment_set.add_argument(
         "--value-file",
@@ -1484,7 +1485,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     environment_unset.add_argument("names", nargs="+", metavar="name")
-    environment_unset.add_argument("--application", required=True)
+    environment_unset.add_argument("--application", required=True, help=APPLICATION_HELP)
 
     schedule = commands.add_parser(
         "schedule",
@@ -1508,7 +1509,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     schedule_run.add_argument("name", help="The schedule's name in cayu-cloud.toml.")
-    schedule_run.add_argument("--application", required=True)
+    schedule_run.add_argument("--application", required=True, help=APPLICATION_HELP)
     schedule_run.add_argument(
         "--input",
         type=_schedule_input,

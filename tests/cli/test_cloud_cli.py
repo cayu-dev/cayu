@@ -4575,6 +4575,18 @@ def test_an_exact_slug_resolves_its_agent_before_display_name_matches() -> None:
     assert ambiguous.value.category == "application_ambiguous"
 
 
+def test_the_id_an_agent_reads_from_its_environment_names_it_in_application() -> None:
+    # Cloud gives an Agent its id as CAYU_CLOUD_APPLICATION_ID; that is the `application` slug
+    # of its cayu-cloud.toml, so an app can print `--application $CAYU_CLOUD_APPLICATION_ID`
+    # however its display name was written.
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            return {"items": [{"id": "cayu-b2b-reference", "name": "Acme Reference Desk"}]}
+
+    assert cloud_cli._application_id(Client(), "cayu-b2b-reference") == "cayu-b2b-reference"
+    assert cloud_cli._application_id(Client(), "Acme Reference Desk") == "cayu-b2b-reference"
+
+
 def test_deploy_to_an_archived_slug_reports_the_archived_code() -> None:
     class Client:
         def __init__(self) -> None:

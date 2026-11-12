@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._output import add_output_options, print_table, terminal_safe
 from cayu.cli._read_targets import ReadTarget, _positive_seconds, run_read_command
 
@@ -35,7 +36,7 @@ def add_usage_parser(subparsers: Any) -> None:
         )
         target = command.add_mutually_exclusive_group(required=True)
         target.add_argument("--server-url", help="Running local or deployed Cayu server mount URL.")
-        target.add_argument("--application", help="Cayu Cloud Agent slug or name.")
+        target.add_argument("--application", help=APPLICATION_HELP)
         command.set_defaults(sqlite=None, postgres=None)
         command.add_argument(
             "--authorization-env",

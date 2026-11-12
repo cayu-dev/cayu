@@ -19,6 +19,7 @@ from cayu.cli._cloud_agent_api import (
     open_cloud_agent_api,
 )
 from cayu.cli._cloud_private_state import write_private_json
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._json_inputs import json_object_file
 from cayu.cli._output import add_output_options, output_destination, terminal_safe
 from cayu.cli._read_targets import _positive_seconds
@@ -40,7 +41,7 @@ def add_action_target_options(
     target.add_argument(
         "--server-url", help=f"Running server mount URL (default: {DEFAULT_SERVER_URL})."
     )
-    target.add_argument("--application", help="Cayu Cloud Agent name or slug.")
+    target.add_argument("--application", help=APPLICATION_HELP)
     parser.add_argument("--context", type=Path, help="Cloud context file (with --application).")
     parser.add_argument(
         "--authorization-env",

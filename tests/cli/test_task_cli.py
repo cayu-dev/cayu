@@ -825,3 +825,140 @@ def test_wait_with_no_wait_fails_at_once_on_a_sleeping_agent() -> None:
     with pytest.raises(CayuApiError, match="is starting"):
         asyncio.run(_wait_for_task(args, Reader()))  # type: ignore[arg-type]
     assert reads == ["t"]
+
+
+def test_field_prints_one_value_and_raw_prints_text_as_is(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out = _run(capsys, "show", "done", "--sqlite", str(database), "--field", "result")
+    assert code == 0
+    assert out == {"findings": 3}
+
+    code, out = _run(
+        capsys, "show", "done", "--sqlite", str(database), "--field", "result.findings", "--raw"
+    )
+    assert code == 0
+    # Only text is printed bare; a number stays JSON.
+    assert out == "3\n"
+
+    assert (
+        main(["task", "show", "done", "--sqlite", str(database), "--field", "result.digest"]) == 1
+    )
+    assert "Task done has no field result.digest: result has no 'digest'." in (
+        capsys.readouterr().err
+    )
+
+
+def test_field_errors_are_json_with_json_output(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out = _run(
+        capsys, "show", "stopped", "--sqlite", str(database), "--field", "result.x", "--json"
+    )
+
+    assert code == 1
+    assert out["error"]["message"] == (
+        "Task stopped has no field result.x: result has no 'x' (result is null)."
+    )
+
+
+def test_wait_field_keeps_the_outcome_exit_code(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A cancelled task has no result: the field error is a note, and the exit says how it ended.
+    code = main(["task", "wait", "stopped", "--sqlite", str(database), "--field", "result.x"])
+    err = capsys.readouterr().err
+    assert code == 4
+    assert "Task stopped has no field result.x" in err
+    # A completed task missing the field is still an error.
+    assert (
+        main(["task", "wait", "done", "--sqlite", str(database), "--field", "result.digest"]) == 1
+    )
+    capsys.readouterr()
+
+
+def test_raw_needs_a_field(database: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["task", "show", "done", "--sqlite", str(database), "--raw"]) == 2
+    assert "--raw prints one field; add --field PATH." in capsys.readouterr().err
+
+
+def test_application_field_raw_prints_a_deployed_tasks_markdown(
+    cloud: FakeCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    brief = '# Brief\n\n- "quoted" item\n'
+    cloud.tasks = [_api_task("digest-1", "completed", result={"markdown": brief, "items": [1]})]
+
+    code, out = _run(
+        capsys,
+        "show",
+        "digest-1",
+        "--application",
+        "bug-hunter",
+        "--field",
+        "result.markdown",
+        "--raw",
+    )
+
+    assert code == 0
+    assert out == brief + "\n"
+    code, out = _run(
+        capsys, "show", "digest-1", "--application", "bug-hunter", "--field", "result.items.0"
+    )
+    assert (code, out) == (0, "1\n")
+
+
+def test_a_project_command_reads_a_deployed_agents_tasks_through_the_public_readers(
+    cloud: FakeCloud,
+) -> None:
+    from cayu.storage import TaskListRequest, open_cloud_agent_readers
+    from cayu.tasks.records import TaskStatus
+
+    cloud.tasks = [
+        _api_task("digest-2", "running"),
+        _api_task("digest-1", "completed", result={"markdown": "# Brief"}),
+    ]
+
+    async def last_digest() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        async with open_cloud_agent_readers("bug-hunter") as agent:
+            assert agent.source == {"kind": "cayu_cloud", "application": "bug-hunter"}
+            rows = await agent.tasks.list_tasks(TaskListRequest(status=TaskStatus.COMPLETED))
+            task = await agent.tasks.load_task(rows[0]["id"])
+            assert task is not None
+            return task, rows
+
+    task, rows = asyncio.run(last_digest())
+
+    assert [row["id"] for row in rows] == ["digest-1"]
+    assert task["result"] == {"markdown": "# Brief"}
+    expected = "Basic " + base64.b64encode(b"operator:operator-password-canary").decode()
+    assert all(auth == expected for path, auth in cloud.requests if path.startswith("/cayu/api/"))
+
+
+def test_the_public_readers_fail_with_a_category_when_the_agent_cant_be_read(
+    cloud: FakeCloud,
+) -> None:
+    from cayu.storage import AgentReadError, open_cloud_agent_readers
+
+    cloud.service.update(status="stopped")
+
+    with pytest.raises(AgentReadError) as raised:
+        open_cloud_agent_readers("bug-hunter")
+    assert raised.value.category == "not_serving"
+
+
+def test_the_public_readers_read_a_local_store_the_same_way(database: Path) -> None:
+    from cayu.storage import TaskListRequest, open_store_agent_readers
+    from cayu.storage.targets import SessionStoreBackend, SessionStoreTarget
+
+    async def read() -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        target = SessionStoreTarget(backend=SessionStoreBackend.SQLITE, sqlite_path=database)
+        async with open_store_agent_readers(target) as agent:
+            return (
+                await agent.tasks.list_tasks(TaskListRequest(type="scan")),
+                await agent.tasks.load_task("done"),
+            )
+
+    rows, task = asyncio.run(read())
+
+    assert {row["id"] for row in rows} == {"done", "stopped"}
+    assert task is not None and task["result"] == {"findings": 3}

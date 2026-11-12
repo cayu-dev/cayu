@@ -41,6 +41,7 @@ from cayu._data_volume import (
     DataVolumeEntry,
     DataVolumeListing,
 )
+from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_releases import add_output_argument, render_failure
 from cayu.cli._cloud_settings import _cell, _table
 from cayu.cli._output import terminal_safe
@@ -120,7 +121,7 @@ def add_data_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser
     download.add_argument("--force", action="store_true", help="Replace an existing file.")
     add_output_argument(download, render_download)
     for parser in (listing, entry, cat, download):
-        parser.add_argument("--application", required=True)
+        parser.add_argument("--application", required=True, help=APPLICATION_HELP)
 
 
 def data_command(
