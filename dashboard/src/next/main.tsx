@@ -9,10 +9,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { createHashHistory, RouterProvider } from "@tanstack/react-router"
 import { StrictMode, useMemo, useState } from "react"
 import { createRoot } from "react-dom/client"
+import { ServerContractProvider } from "@/components/dashboard/server-contract"
+import { ViewerProvider } from "@/components/dashboard/viewer"
+import type { AppInfoResponse } from "@/lib/generated/server-api"
 import { createDashboardRouter } from "./app/routes"
 import { ServicesProvider } from "./app/services"
 import { createMockApi } from "./mock/api"
 import { installLegacyApi } from "./mock/legacy"
+import { CONTRACT } from "./mock/legacy/contract"
 
 const api = createMockApi()
 // Today's unchanged pages call /api through fetch; answer them from the same seed.
@@ -62,10 +66,21 @@ function App() {
     }),
     [seedId, appTitles],
   )
+  // The production shell mounts pages only after its contract and identity gates pass;
+  // stand in for both with the fake server's contract and an open local deployment's viewer.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the viewer follows the seed.
+  const viewer = useMemo<AppInfoResponse>(() => {
+    const { app } = api.records()
+    return { name: app.name, runtime_version: app.runtime_version, full_access: true, role: null }
+  }, [seedId])
   return (
     <QueryClientProvider client={queryClient}>
       <ServicesProvider value={services}>
-        <RouterProvider router={router} />
+        <ServerContractProvider contract={CONTRACT}>
+          <ViewerProvider value={viewer}>
+            <RouterProvider router={router} />
+          </ViewerProvider>
+        </ServerContractProvider>
       </ServicesProvider>
     </QueryClientProvider>
   )

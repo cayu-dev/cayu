@@ -708,12 +708,18 @@ def _run_general_shard(runner: LocalCiRunner, shard: int) -> None:
     )
 
 
-def _install_playwright_chromium(runner: LocalCiRunner) -> None:
-    playwright_command = ["uv", "run", "--no-sync", "playwright", "install"]
+def _install_playwright_chromium(
+    runner: LocalCiRunner,
+    *,
+    launcher: tuple[str, ...] = ("uv", "run", "--no-sync"),
+    label: str = "Install Playwright Chromium",
+    cwd: Path | None = None,
+) -> None:
+    playwright_command = [*launcher, "playwright", "install"]
     if platform.system() == "Linux":
         playwright_command.append("--with-deps")
     playwright_command.append("chromium")
-    runner.run("Install Playwright Chromium", tuple(playwright_command))
+    runner.run(label, tuple(playwright_command), cwd=cwd)
 
 
 def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
@@ -892,6 +898,11 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
         ("Dashboard package build", ("run", "build:package")),
     ):
         runner.run(label, ("npm", *npm_args), cwd=dashboard)
+    # The prototype (the design reference) opens every page in a browser.
+    _install_playwright_chromium(
+        runner, launcher=("npx",), label="Dashboard prototype browser", cwd=dashboard
+    )
+    runner.run("Dashboard prototype pages", ("npm", "run", "test:prototype"), cwd=dashboard)
     runner.run("B2B web interface", ("python3", "scripts/build_b2b_web.py", "--check"))
     # The browser client served by mount_cayu is plain JavaScript outside the
     # dashboard package; its behavior tests need only Node's built-in runner.

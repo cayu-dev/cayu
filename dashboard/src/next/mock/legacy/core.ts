@@ -11,6 +11,7 @@ import type {
   EnvironmentSummary,
   EnvironmentsPage,
   OperationalSnapshot,
+  PendingActionsPage,
   SessionsSummary,
   SystemDiagnostics,
   Task,
@@ -1731,9 +1732,22 @@ function artifactContent(request: LegacyRequest, context: LegacyContext): Respon
   })
 }
 
+/** The Inbox's child actions: no seed delegates tool calls, so the page is always empty. */
+function pendingActions(): PendingActionsPage {
+  return {
+    actions: [],
+    issues: [],
+    has_more: false,
+    next_cursor: null,
+    total_count: 0,
+    inspected_candidate_count: 0,
+  }
+}
+
 // ---------------------------------------------------------------------------------------
 
 export const coreRoutes: LegacyRoute[] = [
+  { method: "GET", path: "/pending-actions", handle: pendingActions },
   { method: "GET", path: "/system/diagnostics", handle: systemDiagnostics },
   { method: "GET", path: "/environments", handle: environments },
   { method: "GET", path: "/artifacts", handle: listArtifacts },
