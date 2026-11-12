@@ -256,10 +256,17 @@ function phrase(name: string, n: number, display: ToolDisplay | undefined): stri
   return n > 1 ? `${verb} ${n} times` : verb
 }
 
-/** "Read 9 files, searched 10 times, listed files": one phrase per tool, in first-use order. */
+/** Cayu's own tools, such as structured-output submission; their results show elsewhere. */
+const internalTool = (name: string) => name.startsWith("__cayu_")
+
+/**
+ * "Read 9 files, searched 10 times, listed files": one phrase per tool, in first-use order.
+ * Cayu's internal tools are left out; the expanded steps and Trace still list them.
+ */
 export function workSummary(tools: ToolUse[], displays: ToolDisplays = {}): string {
   const counts = new Map<string, number>()
-  for (const t of tools) counts.set(t.name, (counts.get(t.name) ?? 0) + 1)
+  for (const t of tools)
+    if (!internalTool(t.name)) counts.set(t.name, (counts.get(t.name) ?? 0) + 1)
   return upperFirst(
     [...counts].map(([name, n]) => phrase(name, n, toolDisplay(name, displays))).join(", "),
   )

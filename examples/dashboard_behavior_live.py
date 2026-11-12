@@ -3894,7 +3894,10 @@ async def _exercise_session_observation(
     await expect(detail.locator("pre").filter(has_text=model_completed_event_id)).to_be_visible()
     await page.get_by_role("tab", name="Conversation", exact=True).click()
 
+    # The conversation's role and thinking filters live in the session's More actions menu.
+    session_menu = page.get_by_role("button", name="More actions", exact=True)
     transcript_role_filter = page.get_by_label("Message role", exact=True)
+    await session_menu.click()
     await transcript_role_filter.select_option("assistant")
     await expect(page).to_have_url(re.compile(r"[?&]transcript_role=assistant(?:&|$)"))
     await page.reload(wait_until="networkidle")
@@ -3902,7 +3905,10 @@ async def _exercise_session_observation(
     await expect(page).to_have_url(
         re.compile(rf"[?&]event_id={re.escape(model_completed_event_id)}(?:&|$)")
     )
+    await expect(page.get_by_text("Showing assistant messages", exact=True)).to_be_visible()
+    await session_menu.click()
     await expect(transcript_role_filter).to_have_value("assistant")
+    await page.keyboard.press("Escape")
     await expect(
         page.get_by_text("dashboard transcript assistant marker", exact=True)
     ).to_be_visible()
@@ -3914,15 +3920,20 @@ async def _exercise_session_observation(
     await expect(thinking_payload).to_be_visible()
 
     include_thinking = page.get_by_label("Include thinking")
+    await session_menu.click()
     await include_thinking.uncheck()
     await expect(page).to_have_url(re.compile(r"[?&]include_thinking=false(?:&|$)"))
+    await page.keyboard.press("Escape")
     await expect(thinking_payload).to_have_count(0)
     await expect(
         page.get_by_text("dashboard transcript assistant marker", exact=True)
     ).to_be_visible()
 
     await page.go_back()
+    if await include_thinking.count() == 0:
+        await session_menu.click()
     await expect(include_thinking).to_be_checked()
+    await page.keyboard.press("Escape")
     await page.get_by_role("button", name="Thought it through", exact=True).click()
     await expect(thinking_payload).to_be_visible()
 

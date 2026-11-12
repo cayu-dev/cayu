@@ -38,6 +38,7 @@ import {
 } from "@/lib/session-detail-search"
 import { clearSessionDraft, readSessionDraft, writeSessionDraft } from "@/lib/session-draft"
 import {
+  hasTranscriptHistoryFilters,
   initialFilteredPageNavigation,
   navigateToNewerPage,
   navigateToOlderPage,
@@ -191,6 +192,9 @@ export function SessionPage({
     { ...transcriptHistoryQuery(filters), include_thinking: true },
   )
   const olderPage = transcript.data ? olderTranscriptPage(transcript.data.offset, 100) : undefined
+  // Paging controls appear only when there's another page to load or new activity to show.
+  const showLatest = navigation.current !== null || newActivity
+  const filtered = hasTranscriptHistoryFilters(filters)
   const inbox = useInbox({ session_id: sessionId }, !!services.prototype)
   const relations = useSessionRelations(sessionId, detail.data?.parent_session_id)
   const specialists = useSpecialists()
@@ -687,6 +691,46 @@ export function SessionPage({
                     }}
                   />
                 )}
+                {conversation && (
+                  <div className="mt-1 space-y-2 border-t border-border px-2 pt-2 pb-1.5">
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Message role</span>
+                      <select
+                        aria-label="Message role"
+                        value={filters.role}
+                        onChange={(event) =>
+                          setSearch({
+                            // Cleared filters no longer pick Conversation, so name it.
+                            view: "conversation",
+                            transcript_role: validateSessionHistorySearch({
+                              transcript_role: event.target.value,
+                            }).transcript_role,
+                          })
+                        }
+                        className={selectClassName}
+                      >
+                        <option value="all">All roles</option>
+                        <option value="user">User</option>
+                        <option value="assistant">Assistant</option>
+                        <option value="system">System</option>
+                        <option value="tool">Tool</option>
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={filters.includeThinking}
+                        onChange={(event) =>
+                          setSearch({
+                            view: "conversation",
+                            include_thinking: event.target.checked ? undefined : false,
+                          })
+                        }
+                      />
+                      Include thinking
+                    </label>
+                  </div>
+                )}
               </ActionsMenu>
             </>
           }
@@ -898,82 +942,77 @@ export function SessionPage({
                   <p className="mb-4 text-xs text-muted-foreground">Message title unavailable</p>
                 )}
 
-                <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
-                  <label>
-                    <span className="sr-only">Message role</span>
-                    <select
-                      aria-label="Message role"
-                      value={filters.role}
-                      onChange={(event) =>
+                {filtered && (
+                  <p className="mb-4 flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+                    <span>{filterSummary(filters)}</span>
+                    <button
+                      type="button"
+                      className="underline-offset-2 hover:text-foreground hover:underline"
+                      onClick={() =>
                         setSearch({
-                          transcript_role: validateSessionHistorySearch({
-                            transcript_role: event.target.value,
-                          }).transcript_role,
+                          view: "conversation",
+                          transcript_role: undefined,
+                          include_thinking: undefined,
                         })
                       }
-                      className={selectClassName}
                     >
-                      <option value="all">All roles</option>
-                      <option value="user">User</option>
-                      <option value="assistant">Assistant</option>
-                      <option value="system">System</option>
-                      <option value="tool">Tool</option>
-                    </select>
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <input
-                      type="checkbox"
-                      checked={filters.includeThinking}
-                      onChange={(event) =>
-                        setSearch({ include_thinking: event.target.checked ? undefined : false })
-                      }
-                    />
-                    Include thinking
-                  </label>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={olderPage === undefined || transcript.isFetching}
-                    onClick={() => {
-                      if (olderPage)
-                        setHistory({
-                          filterKey,
-                          navigation: navigateToOlderPage(navigation, olderPage),
-                        })
-                    }}
-                  >
-                    Older messages
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!navigation.newer.length || transcript.isFetching}
-                    onClick={() =>
-                      setHistory({ filterKey, navigation: navigateToNewerPage(navigation) })
-                    }
-                  >
-                    Newer messages
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={navigation.current === null && pinned && !newActivity}
-                    onClick={() => {
-                      setHistory(initialFilteredPageNavigation(filterKey, null))
-                      setPinned(true)
-                      setNewActivity(false)
-                      if (navigation.current === null) void transcript.refetch()
-                    }}
-                  >
-                    Latest messages
-                  </Button>
-                  {newActivity && <span role="status">New activity is available.</span>}
-                  <span className="text-xs text-muted-foreground">
-                    {transcript.data
-                      ? `${transcript.data.messages.length} of ${transcript.data.total_messages} shown`
-                      : "Loading messages…"}
-                  </span>
-                </div>
+                      Show everything
+                    </button>
+                  </p>
+                )}
+                {(olderPage !== undefined || navigation.newer.length > 0 || showLatest) && (
+                  <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
+                    {olderPage !== undefined && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={transcript.isFetching}
+                        onClick={() =>
+                          setHistory({
+                            filterKey,
+                            navigation: navigateToOlderPage(navigation, olderPage),
+                          })
+                        }
+                      >
+                        Older messages
+                      </Button>
+                    )}
+                    {navigation.newer.length > 0 && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={transcript.isFetching}
+                        onClick={() =>
+                          setHistory({ filterKey, navigation: navigateToNewerPage(navigation) })
+                        }
+                      >
+                        Newer messages
+                      </Button>
+                    )}
+                    {showLatest && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setHistory(initialFilteredPageNavigation(filterKey, null))
+                          setPinned(true)
+                          setNewActivity(false)
+                          if (navigation.current === null) void transcript.refetch()
+                        }}
+                      >
+                        Latest messages
+                      </Button>
+                    )}
+                    {newActivity && <span role="status">New activity is available.</span>}
+                    {transcript.data &&
+                      transcript.data.messages.length < transcript.data.total_messages && (
+                        <span className="text-xs text-muted-foreground">
+                          {transcript.data.messages.length} of {transcript.data.total_messages}{" "}
+                          shown
+                        </span>
+                      )}
+                  </div>
+                )}
                 {transcript.error && <ErrorState error={transcript.error} />}
                 {runtimeState.error && <ErrorState error={runtimeState.error} />}
                 {runtimeState.data?.provider_operation.allowed_resolutions?.length ? (
@@ -1441,4 +1480,9 @@ function MenuItem({
       {label}
     </button>
   )
+}
+
+/** "Showing user messages, without thinking": what the conversation's menu filters hide. */
+function filterSummary(filters: { role: string; includeThinking: boolean }): string {
+  return `Showing ${filters.role} messages${filters.includeThinking ? "" : ", without thinking"}`
 }

@@ -393,9 +393,11 @@ def test_added_filter_controls_follow_prototype_field_geometry(width, area):
             path = {
                 "inbox": "inbox",
                 "trace": "sessions/visual-session?view=trace&log=1",
-                "conversation": "sessions/visual-session",
+                "conversation": "sessions/visual-session?view=conversation",
             }[area]
             await page.goto(f"{base}/cayu/{path}")
+            if area == "conversation":
+                await page.get_by_role("button", name="More actions", exact=True).click()
             label = {"inbox": "Search Inbox", "trace": "Event ID", "conversation": "Message role"}[
                 area
             ]

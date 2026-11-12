@@ -186,6 +186,31 @@ test("workSummary phrases each tool from its display label, or its name", () => 
   assert.equal(workSummary([t("query"), t("query")]), "Used query 2 times")
 })
 
+test("workSummary leaves out Cayu's internal tools", () => {
+  const t = (name) => ({ name })
+  const displays = {
+    list_files: { verb: "Listed files" },
+    read_file: { verb: "Read", noun: "file" },
+    search_text: { verb: "Searched" },
+  }
+  assert.equal(
+    workSummary(
+      [
+        t("list_files"),
+        t("read_file"),
+        t("search_text"),
+        t("read_file"),
+        t("search_text"),
+        t("search_text"),
+        t("__cayu_submit_structured_output"),
+      ],
+      displays,
+    ),
+    "Listed files, read 2 files, searched 3 times",
+  )
+  assert.equal(workSummary([t("__cayu_submit_structured_output")], displays), "")
+})
+
 test("stepLabel uses the display verb and the first string argument", () => {
   const tool = { name: "read_file", args: { path: "src/app.py" } }
   assert.deepEqual(stepLabel(tool, { read_file: { verb: "Read", noun: "file" } }), {

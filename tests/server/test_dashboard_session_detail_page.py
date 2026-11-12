@@ -64,10 +64,25 @@ def test_detail_bounded_latest_history_and_role_filters():
             await expect(page.get_by_text("message-10001", exact=True)).to_have_count(0)
             await page.get_by_role("button", name="Latest messages", exact=True).click()
             await expect(page.get_by_text("message-10001", exact=True)).to_be_visible()
+            await expect(
+                page.get_by_role("button", name="Latest messages", exact=True)
+            ).to_have_count(0)
+            await expect(
+                page.get_by_role("button", name="Newer messages", exact=True)
+            ).to_have_count(0)
+            await page.get_by_role("button", name="More actions", exact=True).click()
             await page.get_by_label("Message role", exact=True).select_option("user")
             await expect(page.get_by_text("message-10000", exact=True)).to_be_visible()
             await expect(page.get_by_text("message-10001", exact=True)).to_have_count(0)
             await expect(page.get_by_role("tab", name="Overview", exact=True)).to_have_count(0)
+            # A filter-only deep link opens Conversation; clearing it stays there.
+            await page.goto(f"{base}/cayu/sessions/long-conversation?transcript_role=user")
+            await expect(page.get_by_text("message-10000", exact=True)).to_be_visible()
+            await page.get_by_role("button", name="Show everything", exact=True).click()
+            await expect(page.get_by_text("message-10001", exact=True)).to_be_visible()
+            await expect(
+                page.get_by_role("tab", name="Conversation", exact=True)
+            ).to_have_attribute("aria-selected", "true")
 
     asyncio.run(run())
 
@@ -1673,7 +1688,9 @@ def test_detail_user_file_parts_survive_paging_and_role_filter(role):
         async with search_browser(runtime=runtime) as (page, base, _, _, _):
             await page.goto(f"{base}/cayu/sessions/files?view=conversation")
             if role == "user":
+                await page.get_by_role("button", name="More actions", exact=True).click()
                 await page.get_by_label("Message role", exact=True).select_option("user")
+                await page.keyboard.press("Escape")
             await page.get_by_role("button", name="Older messages", exact=True).click()
             await expect(page.locator("pre").filter(has_text="first-file.pdf")).to_be_visible()
             await expect(
@@ -2064,22 +2081,22 @@ def test_detail_returning_to_bottom_reconciles_deferred_terminal_answer():
                 await page.goto(f"{base}/cayu/sessions/deferred-tail?view=conversation")
                 await expect(page.get_by_text("history-34", exact=False)).to_be_visible()
                 scroller = page.locator("div.overflow-y-auto").filter(
-                    has=page.get_by_label("Message role", exact=True)
+                    has=page.get_by_text("history-34", exact=False)
                 )
-                await expect(
-                    page.get_by_role("button", name="Latest messages", exact=True)
-                ).to_be_disabled()
+                latest = page.get_by_role("button", name="Latest messages", exact=True)
+                # Everything is loaded, so there's nothing for the paging controls to offer.
+                await expect(latest).to_have_count(0)
+                await expect(page.get_by_text(" shown", exact=False)).to_have_count(0)
                 await scroller.evaluate(
                     "node => { node.scrollTop = 0; node.dispatchEvent(new Event('scroll', { bubbles: true })); }"
                 )
-                await expect(
-                    page.get_by_role("button", name="Latest messages", exact=True)
-                ).to_be_enabled()
+                await expect(latest).to_have_count(0)
                 release.set()
                 await asyncio.wait_for(running, 15)
                 await expect(
                     page.get_by_text("New activity is available.", exact=True)
                 ).to_be_visible()
+                await expect(latest).to_be_visible()
                 await expect(page.get_by_text("Deferred final answer", exact=True)).to_have_count(0)
                 await scroller.evaluate(
                     "node => { node.scrollTop = node.scrollHeight; node.dispatchEvent(new Event('scroll', { bubbles: true })); }"

@@ -194,9 +194,8 @@ function WorkBlock({
   const running = block.tools.find((t) => t.running)
   const label = running
     ? PENDING[pending].block(running.name)
-    : block.tools.length
-      ? workSummary(block.tools, displays)
-      : "Thought it through"
+    : // A block of only Cayu's internal tools reads like one with no tools.
+      workSummary(block.tools, displays) || "Thought it through"
   return (
     <div>
       <div className="flex max-w-full items-center gap-2">
