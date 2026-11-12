@@ -215,7 +215,10 @@ class _GitHubTool(Tool):
     ) -> None:
         repository: dict[str, Any] = {"type": "string", "description": "owner/name."}
         if allowed is not None:
-            repository["enum"] = sorted(allowed.values())
+            # Named in the description, not as an enum: arguments are checked against
+            # the schema before the tool runs, an enum compares case, and GitHub's
+            # repository names don't.
+            repository["description"] += " One of: " + ", ".join(sorted(allowed.values())) + "."
         super().__init__(
             ToolSpec(
                 name=self.NAME,

@@ -30,6 +30,7 @@ from cayu.tools import (
     ToolPolicyDecision,
     ToolResult,
 )
+from cayu.tools.gateway import tool_argument_validation_error
 
 REPO = "acme/widgets"
 BOT = "cayu-shepherd[bot]"
@@ -437,7 +438,14 @@ def test_tools_act_only_on_the_repositories_they_were_given() -> None:
     allowed = _run(tools["github_read_issue"], repository="ACME/widgets", number=1)
     malformed = _run(tools["github_read_issue"], repository="widgets", number=1)
 
-    assert tools["github_comment"].schema["properties"]["repository"]["enum"] == ["Acme/Widgets"]
+    # The schema names the repositories without an enum: a call's arguments are checked
+    # against it before the tool runs, and that check would compare case.
+    schema = tools["github_read_issue"].schema
+    assert schema["properties"]["repository"]["description"] == "owner/name. One of: Acme/Widgets."
+    assert "enum" not in schema["properties"]["repository"]
+    assert (
+        tool_argument_validation_error({"repository": "ACME/widgets", "number": 1}, schema) is None
+    )
     error = _error(refused)
     assert error["error"] == "repository_not_allowed"
     assert "Acme/Widgets" in error["advice"]
