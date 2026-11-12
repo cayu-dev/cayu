@@ -279,7 +279,10 @@ GraphQLAnswerer = Callable[[Mapping[str, Any], str], Mapping[str, Any]]
 class FakeGitHub:
     """GitHub in memory, behind a connection slot: give it where a ``ConnectionClient`` goes,
     or take ``client()``. Writes are by ``login``; listings answer ``page_size`` items a page
-    at most, with GitHub's next-page links, so a test of paging needs only a few items."""
+    at most, with GitHub's next-page links, so a test of paging needs only a few items.
+    ``listing_lag`` leaves an issue or comment out of the issues and comments listings until
+    it is that old by ``clock``, as GitHub's listings show a new one seconds late; reading it
+    directly finds it at once."""
 
     def __init__(
         self,
@@ -288,6 +291,7 @@ class FakeGitHub:
         slot: str = DEFAULT_SLOT,
         page_size: int = MAX_PER_PAGE,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        listing_lag: timedelta = timedelta(0),
     ) -> None:
         if page_size < 1:
             raise ValueError("page_size is at least 1.")
@@ -295,6 +299,7 @@ class FakeGitHub:
         self.slot = slot
         self.page_size = page_size
         self.clock = clock
+        self.listing_lag = listing_lag
         #: Each repository by its lowercased ``owner/name``.
         self.repositories: dict[str, Repository] = {}
         #: Logins that are GitHub users besides the fake's own, collaborators and authors.
@@ -318,6 +323,11 @@ class FakeGitHub:
         """A ``GitHubClient`` on this fake; ``GitHubClient(fake)`` is the same."""
 
         return GitHubClient(self, self.slot, **settings)
+
+    def listed(self, created_at: datetime) -> bool:
+        """Whether an item made at ``created_at`` shows in listings yet (``listing_lag``)."""
+
+        return self.clock() - created_at >= self.listing_lag
 
     def writes(self) -> list[Call]:
         """Every call that would change something on GitHub, oldest first."""
@@ -733,6 +743,7 @@ def _comment_body(repository: Repository, number: int, comment: Comment) -> dict
         "body": comment.body,
         "user": _user(comment.author),
         "html_url": f"{_html(repository, 'issues', number)}#issuecomment-{comment.id}",
+        "issue_url": f"{API_URL}/repos/{repository.full_name}/issues/{number}",
         "created_at": _iso(comment.created_at),
         "updated_at": _iso(comment.updated_at),
     }
@@ -1077,8 +1088,9 @@ def _list_issues(r: _Served) -> ConnectionResponse:
         for issue in r.repository.issues.values()
         if state in ("all", issue.state)
         and all(label in issue.labels for label in wanted)
-        and query.get("creator", issue.author) == issue.author
+        and query.get("creator", issue.author).casefold() == issue.author.casefold()
         and (since is None or (issue.updated_at or issue.created_at) >= since)
+        and r.fake.listed(issue.created_at)
     ]
     return r.page([_issue_body(r.repository, issue) for issue in _sorted(r, issues)])
 
@@ -1111,7 +1123,7 @@ def _list_comments(r: _Served) -> ConnectionResponse:
     comments = [
         _comment_body(r.repository, issue.number, comment)
         for comment in issue.comments
-        if since is None or comment.updated_at >= since
+        if (since is None or comment.updated_at >= since) and r.fake.listed(comment.created_at)
     ]
     return r.page(comments)
 
@@ -1126,6 +1138,14 @@ def _create_comment(r: _Served) -> ConnectionResponse:
     comment = r.fake.add_comment(r.repository.full_name, issue.number, body, author=r.fake.login)
     issue.updated_at = comment.created_at
     return reply(201, _comment_body(r.repository, issue.number, comment))
+
+
+def _get_comment(r: _Served) -> ConnectionResponse:
+    for issue in r.repository.issues.values():
+        for comment in issue.comments:
+            if comment.id == int(r.groups[0]):
+                return reply(200, _comment_body(r.repository, issue.number, comment))
+    return _not_found()
 
 
 def _edit_comment(r: _Served) -> ConnectionResponse:
@@ -1228,6 +1248,7 @@ _ROUTES: tuple[tuple[str, re.Pattern[str], Callable[[_Served], ConnectionRespons
         ("PATCH", r"issues/(\d+)", _edit_issue),
         ("GET", r"issues/(\d+)/comments", _list_comments),
         ("POST", r"issues/(\d+)/comments", _create_comment),
+        ("GET", r"issues/comments/(\d+)", _get_comment),
         ("PATCH", r"issues/comments/(\d+)", _edit_comment),
         ("POST", r"issues/(\d+)/labels", _labels),
         ("PUT", r"issues/(\d+)/labels", _labels),

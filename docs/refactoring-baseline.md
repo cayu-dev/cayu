@@ -108,6 +108,14 @@ check state, workflow runs, reviews, comments, fact gaps) and two constants. It
 replaces the pull request reads of three applications and removes no names
 elsewhere.
 
+The public-name budget is 4,112, the standard 5 names above the merged total of
+4,107 after write-once helpers joined `cayu.connectors.github`: `Marker`,
+`with_marker`, `marker_of`, `trusted_markers`, `comment_once`,
+`file_issue_once`, `plain_text`, their results (`WrittenOnce`, `WriteOutcome`,
+`MarkedComment`), `GitHubLookupIncomplete`, `LegacyReader` and
+`MAX_BODY_BYTES`. They replace three applications' own marker formats and
+lookups and remove no names elsewhere.
+
 This check covers production source only. Test-suite organization, the
 combined storage assessment and broader milestone qualification retain their
 own delivery evidence. The historical inventory baseline stays unchanged.

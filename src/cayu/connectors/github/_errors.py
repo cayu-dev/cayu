@@ -114,6 +114,11 @@ class GitHubAppNotInstalled(GitHubError):
         self.repository = repository
 
 
+class GitHubLookupIncomplete(GitHubError):
+    """A write-once lookup that stopped at its page limit without finding its marker: nothing
+    was written, as the marker may be on a page not read."""
+
+
 def response_error(
     response: ConnectionResponse, method: str, path: str, *, ambiguous: bool = False
 ) -> GitHubError:

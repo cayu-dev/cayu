@@ -8,6 +8,7 @@ import json as json_module
 import re
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -186,6 +187,11 @@ class GitHubClient:
             transport = offered
         self._transport = kept_open(transport)
         self._cap = _LoopBound(lambda: asyncio.Semaphore(MAX_CONCURRENT_CALLS))
+        #: The write-once helpers' locks, by what they write once, so this client's own
+        #: coroutines take turns; shared with a ``read_only_view``.
+        self._write_once: _LoopBound[dict[Any, Any]] = _LoopBound(dict)
+        #: What the write-once helpers last wrote with this client, by what they wrote once.
+        self._written_once: OrderedDict[Any, int] = OrderedDict()
         self._refused: list[RefusedWrite] = []
 
     def __repr__(self) -> str:

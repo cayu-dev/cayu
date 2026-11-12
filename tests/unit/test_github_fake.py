@@ -155,6 +155,45 @@ def test_an_issue_is_created_labelled_and_closed() -> None:
     assert [(item["number"], "pull_request" in item) for item in still_open] == [(1, True)]
 
 
+def test_issues_are_listed_by_their_creator_ignoring_case() -> None:
+    fake = _fake()
+    fake.add_issue(REPO, 1, author=BOT)
+    fake.add_issue(REPO, 2, author="octocat")
+    gh = fake.client()
+
+    def created_by(login: str) -> list[int]:
+        query = {"state": "all", "creator": login}
+        return [item["number"] for item in run(gh.list(f"/repos/{REPO}/issues", query=query)).items]
+
+    assert created_by(BOT) == [1]
+    assert created_by(BOT.upper()) == [1]
+    assert created_by("someone-else") == []
+    assert not fake.unanswered
+
+
+def test_listings_show_a_new_item_only_after_the_listing_lag() -> None:
+    now = [datetime(2026, 11, 12, 9, tzinfo=UTC)]
+    fake = FakeGitHub(login=BOT, clock=lambda: now[0], listing_lag=timedelta(seconds=5))
+    fake.add_repository(REPO)
+    gh = fake.client()
+    issue = run(gh.post(f"/repos/{REPO}/issues", json={"title": "New"}))
+    comment = run(gh.post(f"/repos/{REPO}/issues/1/comments", json={"body": "Hi"}))
+
+    def listed() -> tuple[list[int], list[int]]:
+        issues = run(gh.list(f"/repos/{REPO}/issues", query={"state": "all"})).items
+        comments = run(gh.list(f"/repos/{REPO}/issues/1/comments")).items
+        return [item["number"] for item in issues], [item["id"] for item in comments]
+
+    assert listed() == ([], [])
+    # A direct read finds both at once.
+    assert run(gh.get(f"/repos/{REPO}/issues/{issue['number']}"))["number"] == 1
+    read = run(gh.get(f"/repos/{REPO}/issues/comments/{comment['id']}"))
+    assert read["issue_url"].endswith(f"/repos/{REPO}/issues/1")
+    now[0] += timedelta(seconds=5)
+    assert listed() == ([1], [comment["id"]])
+    assert not fake.unanswered
+
+
 def test_an_invalid_write_is_refused_as_github_does() -> None:
     fake = _fake()
     fake.add_issue(REPO, 1)

@@ -831,6 +831,7 @@
           "GitHubConnectionRefused",
           "GitHubError",
           "GitHubGraphQLFailed",
+          "GitHubLookupIncomplete",
           "GitHubNotFound",
           "GitHubPermissionDenied",
           "GitHubRateLimited",
@@ -856,6 +857,18 @@
           "connections_from_environment",
           "token_connections"
         ],
+        "cayu.connectors.github.markers": [
+          "MarkedComment",
+          "Marker",
+          "WriteOutcome",
+          "WrittenOnce",
+          "comment_once",
+          "file_issue_once",
+          "marker_of",
+          "plain_text",
+          "trusted_markers",
+          "with_marker"
+        ],
         "cayu.connectors.github.pulls": [
           "CheckState",
           "CheckWorkflowRun",
@@ -877,6 +890,8 @@
         "DEFAULT_MAX_PAGES",
         "DEFAULT_SLOT",
         "ErrorFilter",
+        "LegacyReader",
+        "MAX_BODY_BYTES",
         "MERGEABLE_WAIT_SECONDS",
         "PASSING_CONCLUSIONS",
         "REPOSITORY_HEADER"

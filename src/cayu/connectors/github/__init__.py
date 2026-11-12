@@ -9,7 +9,9 @@ and lists it in ``refused``. On Cayu Cloud the broker attaches the credential; o
 and private key (``token_connections``, ``app_connections``). ``read_pull`` and ``list_pulls``
 answer a pull request's facts as a ``PullRequestFacts`` record: mergeability, CI checks with
 their workflow run attempts and one ``CheckState``, the reviewer App's check apart, reviews and
-comments. See ``docs/connector-toolkits.md``.
+comments. ``comment_once`` and ``file_issue_once`` write once however often a task restarts:
+the body ends with a hidden ``Marker``, looked up first among the caller's own login's writes
+(``trusted_markers`` reads them back). See ``docs/connector-toolkits.md``.
 """
 
 from typing import Any as _Any

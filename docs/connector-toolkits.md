@@ -303,6 +303,70 @@ false when `max_pages` (10) stopped it.
 - **Logins.** Every login is as REST writes it: GraphQL's bot logins get their `[bot]`, and a
   deleted account is `ghost`.
 
+### Write once
+
+`comment_once(gh, repository, number, body, marker, login=...)` comments on an issue or pull
+request once however often a task restarts, and `file_issue_once(gh, repository, title, body,
+marker, login=...)` files an issue once. Each looks first for an earlier write with the same
+`Marker(key, data)` and answers a `WrittenOnce` whose `outcome` is `created`, `found`,
+`updated` or `refused`:
+
+```python
+app = github.app_connections(app_id, private_key, permissions={"issues": "write"})
+gh = github.GitHubClient(app)
+marker = github.Marker(f"digests/{digest_id}")
+written = await github.comment_once(gh, repo, 42, text, marker, login=await app.login())
+```
+
+- **Format.** The marker is the body's last line, a hidden HTML comment:
+  `<!-- cayu-marker v1 KEY {"sha":"..."} -->`. A key is letters, digits and `. _ : / = + -`,
+  never `--`; data is a JSON object whose strings spell `-`, `<`, `>`, `!` and `&` as `\u00XX`,
+  so no value can end the comment early. `with_marker(body, marker)` appends it and keeps the
+  whole within `MAX_BODY_BYTES` (262,000 bytes of UTF-8, under the 262,144 GitHub takes,
+  whatever its refusal says about 65,536 characters), cutting the body between characters,
+  never the marker.
+- **Trust.** Only writes whose author is `login` are read, and only their trailing marker:
+  `marker_of(body)` reads it, and `trusted_markers(comments, login=...)` reads a pull request's
+  `PullComment`s. Marker text anyone else wrote, or quoted earlier in a trusted body, counts
+  for nothing. Take `login` from the connection, never by hand: off Cayu Cloud an App's is
+  `GitHubAppConnections.login()`, `<slug>[bot]`, which no user can be named, while a user can
+  be named the bare slug, so an App connection refuses a login without `[bot]`. With a token,
+  `login` is a person's, and their own hand-written comments are trusted too. Trust is the
+  author's: a maintainer who edits the App's comment can change or remove its marker, and
+  what they leave is read as written. `legacy=` reads an application's earlier format while
+  it moves to this one.
+- **Lookups.** Comments come from the thread's listing, and issues from the repository's
+  issues listing filtered to those `login` created, open and closed, the author checked again
+  on each. As the listing may not show a new write yet, a call also reads directly the write
+  named by `known=` (the `id` of a comment, or `number` of an issue, an earlier call
+  answered) and the one this client last made for the marker; each counts when it is still
+  there (not deleted or moved to another repository), `login`'s, with the key. Of all the
+  matches, the earliest is taken, whatever its labels, and the rest are `duplicates`. `labels` only tag a new
+  issue; `labelled` says whether the issue found or filed has them all (GitHub drops labels
+  the writer can't set). `since=` reads only comments updated since then, so use it only when
+  the marked comment can't be older, as for a key naming its own day. A listing that reaches
+  `max_pages` (50) without finding the marker raises `GitHubLookupIncomplete` and writes
+  nothing. A found comment is left, or with `update=True` edited in place when its body
+  differs.
+- **Listings lag.** GitHub's listings show a just-written item seconds late: an issue has
+  taken 3 seconds to appear in its creator's listing and 15 in the whole repository's. A
+  repeat through the same client finds its write directly, and `known=` covers a new process
+  that kept the answer, so an application that may run the same write again within seconds
+  of a restart stores the `id` or `number` it was answered and passes it. A new process
+  without it, within about 15 seconds of another's write, can write again; the duplicate is
+  then reported in `duplicates` by every later call.
+- **Races and retries.** One client's writes of the same marker take turns. Writers in other
+  processes can both write; every later call then answers the earliest, and the others in
+  `duplicates` (comments' ids, issues' numbers), which are reported and never deleted. A write
+  whose answer was lost is never resent: the listing is read again after 1, 2, 4, 8 and 5
+  seconds, and not found by then, its `ambiguous` error is raised. A read-only client looks
+  up, and its refused write answers `refused`. Inline review comments and reviews aren't
+  covered.
+- **Model text.** `plain_text(text, limit=...)`, for any text a model wrote into a body, puts
+  a zero-width space after each `@`, so it mentions no one (a mention can start a bot's
+  command) while an address still reads as written, and removes the HTML comment delimiters
+  `<!--` and `-->`, so a comment's text shows instead of hiding. Other HTML is left as it is.
+
 ### Testing with a fake GitHub
 
 `cayu.connectors.github.testing.FakeGitHub` is a connection client that answers from data, so an
@@ -336,8 +400,10 @@ assert not fake.unanswered
 - **Routes.** Pulls (list, read, merge, update-branch, reviews), compare, a commit, a commit's
   check runs and combined status, workflow runs and their reruns, a job's log (a 302 to a download the fake serves
   through `download_transport`, which `GitHubClient` takes from it), issues (list, create, read,
-  edit), comments (list with `since`, create, edit), labels, releases and a collaborator's
-  permission. Listings page with GitHub's next-page links, `page_size` items a page at most.
+  edit), comments (list with `since`, create, read, edit), labels, releases and a
+  collaborator's permission. Listings page with GitHub's next-page links, `page_size` items a
+  page at most. `listing_lag` leaves a new issue or comment out of listings until it is that
+  old by `clock`, as GitHub's listings show one seconds late; a direct read finds it at once.
 - **Nothing guessed.** A route, query filter, write body field or GraphQL operation the fake
   doesn't answer raises `NotImplementedError` and is kept in `unanswered`: assert it is empty, as
   an application may catch the error. `route(method, pattern, handler)` adds a repository route,

@@ -5,6 +5,7 @@ from cayu.connectors.github._errors import GitHubConflict as GitHubConflict
 from cayu.connectors.github._errors import GitHubConnectionRefused as GitHubConnectionRefused
 from cayu.connectors.github._errors import GitHubError as GitHubError
 from cayu.connectors.github._errors import GitHubGraphQLFailed as GitHubGraphQLFailed
+from cayu.connectors.github._errors import GitHubLookupIncomplete as GitHubLookupIncomplete
 from cayu.connectors.github._errors import GitHubNotFound as GitHubNotFound
 from cayu.connectors.github._errors import GitHubPermissionDenied as GitHubPermissionDenied
 from cayu.connectors.github._errors import GitHubRateLimited as GitHubRateLimited
@@ -30,6 +31,18 @@ from cayu.connectors.github.credentials import (
     connections_from_environment as connections_from_environment,
 )
 from cayu.connectors.github.credentials import token_connections as token_connections
+from cayu.connectors.github.markers import MAX_BODY_BYTES as MAX_BODY_BYTES
+from cayu.connectors.github.markers import LegacyReader as LegacyReader
+from cayu.connectors.github.markers import MarkedComment as MarkedComment
+from cayu.connectors.github.markers import Marker as Marker
+from cayu.connectors.github.markers import WriteOutcome as WriteOutcome
+from cayu.connectors.github.markers import WrittenOnce as WrittenOnce
+from cayu.connectors.github.markers import comment_once as comment_once
+from cayu.connectors.github.markers import file_issue_once as file_issue_once
+from cayu.connectors.github.markers import marker_of as marker_of
+from cayu.connectors.github.markers import plain_text as plain_text
+from cayu.connectors.github.markers import trusted_markers as trusted_markers
+from cayu.connectors.github.markers import with_marker as with_marker
 from cayu.connectors.github.pulls import MERGEABLE_WAIT_SECONDS as MERGEABLE_WAIT_SECONDS
 from cayu.connectors.github.pulls import PASSING_CONCLUSIONS as PASSING_CONCLUSIONS
 from cayu.connectors.github.pulls import CheckState as CheckState
