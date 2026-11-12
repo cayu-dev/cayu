@@ -23,6 +23,24 @@ from cayu.tasks.memory import InMemoryTaskStore
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_runtime_resume_fence_in_task_group_preserves_the_continuation(backend, grouped, tmp_path):
+    current = _run_fenced_continuation(backend, tmp_path, grouped=grouped, cleanup_error=None)
+    assert (current.status, current.worker_id, current.error) == (
+        TaskStatus.RUNNING,
+        None,
+        None,
+    ), "A runtime resume fence wrapped by TaskGroup destroyed the continuation"
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_cleanup_failure_beside_a_resume_fence_fails_the_task(backend, tmp_path):
+    current = _run_fenced_continuation(
+        backend, tmp_path, grouped=True, cleanup_error=RuntimeError("cleanup broke")
+    )
+    assert current.status is TaskStatus.FAILED
+    assert current.error is not None and current.error["error"] == "ExceptionGroup"
+
+
+def _run_fenced_continuation(backend, tmp_path, *, grouped, cleanup_error):
     async def scenario():
         store = (
             InMemoryTaskStore()
@@ -64,6 +82,10 @@ def test_runtime_resume_fence_in_task_group_preserves_the_continuation(backend, 
                             pass
                     except SessionRunFenced as error:
                         observed.append(error)
+                        if cleanup_error is not None:
+                            raise ExceptionGroup(
+                                "continuation failed", [error, cleanup_error]
+                            ) from None
                         raise
 
                 if grouped:
@@ -91,18 +113,15 @@ def test_runtime_resume_fence_in_task_group_preserves_the_continuation(backend, 
             assert "Resume expected run epoch" in str(observed[0])
             current = await store.load_task("job")
             assert current is not None
-            assert (current.status, current.worker_id, current.error) == (
-                TaskStatus.RUNNING,
-                None,
-                None,
-            ), "A runtime resume fence wrapped by TaskGroup destroyed the continuation"
-            reclaimed = await store.claim_interrupted_task_continuation(
-                "retry-owner", TaskQuery(type="job"), handoff_id=str(uuid4())
-            )
-            assert reclaimed.task is not None and reclaimed.task.id == "job"
+            if cleanup_error is None:
+                reclaimed = await store.claim_interrupted_task_continuation(
+                    "retry-owner", TaskQuery(type="job"), handoff_id=str(uuid4())
+                )
+                assert reclaimed.task is not None and reclaimed.task.id == "job"
+            return current
         finally:
             await app.aclose()
             if backend == "sqlite":
                 await store.close()
 
-    asyncio.run(scenario())
+    return asyncio.run(scenario())

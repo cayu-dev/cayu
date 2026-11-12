@@ -1783,10 +1783,7 @@ async def _handle_with_heartbeat_owned(
                             "Task handler shutdown failed after heartbeat authority loss.",
                             [heartbeat_failure, exc],
                         ) from None
-                if recover_interrupted_authority_loss and exception_tree_contains(
-                    exc,
-                    (SessionRunFenced, TaskClaimLost),
-                ):
+                if recover_interrupted_authority_loss and _is_authority_loss(exc):
                     interrupted_authority_loss = True
                 else:
                     pending_runtime_task_failure = (
@@ -6178,11 +6175,20 @@ def _is_stopped(stop: asyncio.Event | None) -> bool:
     return worker_stop_requested(stop)
 
 
-def _is_shutdown_refusal(error: BaseException) -> bool:
+def _every_failure_is(
+    error: BaseException, exception_types: tuple[type[BaseException], ...]
+) -> bool:
+    # A group that also holds any other handler or cleanup failure is that failure.
     failures = exception_tree_leaves(error)
-    return bool(failures) and all(
-        isinstance(failure, ApplicationAdmissionsSealed) for failure in failures
-    )
+    return bool(failures) and all(isinstance(failure, exception_types) for failure in failures)
+
+
+def _is_authority_loss(error: BaseException) -> bool:
+    return _every_failure_is(error, (SessionRunFenced, TaskClaimLost))
+
+
+def _is_shutdown_refusal(error: BaseException) -> bool:
+    return _every_failure_is(error, (ApplicationAdmissionsSealed,))
 
 
 async def _settle_task_refused_by_shutdown(
