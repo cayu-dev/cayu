@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -346,3 +347,112 @@ def test_a_maintained_service_serves_hosted_webhooks_it_mounted(
         assert "call app.host_external_waits(...) before create_agent_service" in (
             capsys.readouterr().err
         )
+
+
+def _web_build(project: Path, directory: str = "web/static") -> Path:
+    static = project / directory
+    (static / "assets").mkdir(parents=True)
+    (static / "index.html").write_text("<!doctype html><title>app</title>", encoding="utf-8")
+    (static / "assets" / "index-abc.js").write_text("1", encoding="utf-8")
+    return static
+
+
+def test_serve_serves_the_projects_web_app_at_the_root_behind_every_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    launched: dict[str, Any],
+) -> None:
+    project = _project(tmp_path, 'routers = ["project_routes:build_router"]\nui = "web/static"\n')
+    _web_build(project)
+    monkeypatch.chdir(project)
+
+    assert main(["serve", "--dev"]) == 0
+
+    client = TestClient(launched["server"])
+    assert client.get("/conversations/some-id").text == "<!doctype html><title>app</title>"
+    assert "immutable" in client.get("/assets/index-abc.js").headers["cache-control"]
+    assert client.get("/assets/missing.js").status_code == 404
+    # The project's routes and Cayu's still answer, and their unknown paths are 404s.
+    assert client.get("/app/hello").json()["app"] == "CayuApp"
+    assert client.get("/app/missing").status_code == 404
+    assert client.get("/api/missing").status_code == 404
+    assert "Web app: http://127.0.0.1:8000/" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("ui", "build", "message"),
+    [
+        ('"web/static"', False, "web/static doesn't exist"),
+        ('""', False, "ui must be the path of a directory"),
+        ("3", False, "ui must be the path of a directory"),
+        ('"."', True, "has no index.html"),
+    ],
+)
+def test_serve_refuses_a_web_app_it_cant_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    launched: dict[str, Any],
+    ui: str,
+    build: bool,
+    message: str,
+) -> None:
+    project = _project(tmp_path, f"ui = {ui}\n")
+    if build:
+        _web_build(project)
+    monkeypatch.chdir(project)
+
+    assert main(["serve", "--dev"]) != 0
+
+    assert "server" not in launched
+    assert message in capsys.readouterr().err
+
+
+def test_serve_refuses_a_web_app_that_shadows_the_projects_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    launched: dict[str, Any],
+) -> None:
+    project = _project(tmp_path, 'routers = ["project_routes:build_router"]\nui = "web/static"\n')
+    (_web_build(project) / "app").mkdir()
+    monkeypatch.chdir(project)
+
+    assert main(["serve", "--dev"]) != 0
+
+    assert "has /app, which the server's own routes answer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("ui", "layout", "code"),
+    [
+        ('"web/static"', "built", None),
+        ('"web/static"', "none", "SERVE_UI_MISSING"),
+        ('"web/static"', "no page", "SERVE_UI_MISSING"),
+        ('"web/static"', "api folder", "SERVE_UI_SHADOWS_ROUTES"),
+        ("[]", "none", "SERVE_UI_INVALID"),
+    ],
+)
+def test_cayu_check_checks_the_web_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    ui: str,
+    layout: str,
+    code: str | None,
+) -> None:
+    project = _project(tmp_path, f"ui = {ui}\n")
+    if layout != "none":
+        static = _web_build(project)
+        if layout == "no page":
+            (static / "index.html").unlink()
+        if layout == "api folder":
+            (static / "api").mkdir()
+    monkeypatch.chdir(project)
+
+    main(["check", "--json"])
+
+    found = {item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]}
+    ui_codes = {item for item in found if item.startswith("SERVE_UI_")}
+    assert ui_codes == (set() if code is None else {code})

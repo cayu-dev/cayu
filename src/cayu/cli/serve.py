@@ -51,6 +51,8 @@ class _ServeSettings:
     # The project's own routes: `module:function` targets, each called with the app and
     # `development=` and returning a FastAPI router served next to Cayu's routes.
     routers: tuple[str, ...] = ()
+    # The project's built web app, served at / for every path no route answers.
+    ui: Path | None = None
     # `RequestTimingConfig` fields the project sets, such as `long_request_seconds`.
     request_timing: tuple[tuple[str, Any], ...] = ()
 
@@ -164,6 +166,11 @@ def _resolve_serve_project(
         raise ServeError(
             "[tool.cayu.serve].routers is for projects served by their factory; a "
             "maintained public service declares its product routes in its service_factory."
+        )
+    if project.service_target is not None and settings.ui is not None:
+        raise ServeError(
+            "[tool.cayu.serve].ui is for projects served by their factory; a maintained "
+            "public service serves its own pages."
         )
     if project.service_target is None and not args.dev and auth_target is None:
         raise ServeError(
@@ -316,6 +323,14 @@ def _build_serve_app(
             project_context=project_control_plane,
         )
         _include_project_routers(server, app, settings.routers, development=args.dev)
+        if settings.ui is not None:
+            # Last, so every route above answers first.
+            from cayu.server.web_app import WebAppError, serve_web_app
+
+            try:
+                serve_web_app(server, settings.ui)
+            except WebAppError as exc:
+                raise ServeError(f"[tool.cayu.serve].ui: {exc}") from exc
         hosting = app._external_wait_hosting
         if hosting is not None and hosting.delivery_path is not None:
             print(f"External-wait delivery: POST {hosting.delivery_path}/{{source}}")
@@ -325,6 +340,8 @@ def _build_serve_app(
         )
         if settings.routers:
             print("Project routes: " + ", ".join(settings.routers))
+        if settings.ui is not None:
+            print(f"Web app: {_control_plane_url(args.host, args.port, '/')}")
     return server
 
 
@@ -516,6 +533,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
         "startup_recovery_statuses",
         "recovery_inactive_after_seconds",
         "routers",
+        "ui",
         "long_request_seconds",
     }
     if unexpected:
@@ -582,6 +600,12 @@ def _serve_settings(root: Path) -> _ServeSettings:
             f"{discovered.pyproject}: [tool.cayu.serve].routers must be a non-empty array "
             "of MODULE:FUNCTION strings."
         )
+    ui = configured.get("ui")
+    if ui is not None and (not isinstance(ui, str) or not ui.strip()):
+        raise ServeError(
+            f"{discovered.pyproject}: [tool.cayu.serve].ui must be the path of a directory "
+            'holding a built web app, such as "web/static".'
+        )
     request_timing: tuple[tuple[str, Any], ...] = ()
     if "long_request_seconds" in configured:
         long_request = configured["long_request_seconds"]
@@ -606,6 +630,7 @@ def _serve_settings(root: Path) -> _ServeSettings:
         startup_recovery_statuses=statuses,
         recovery_inactive_after_seconds=inactivity,
         routers=tuple(target.strip() for target in routers or ()),
+        ui=None if ui is None else (root / ui.strip()),
         request_timing=request_timing,
     )
 

@@ -458,7 +458,16 @@ with the app and `development=` (whether `--dev` is set) and serves the
 callers, since the Developer dashboard's target doesn't cover them. Each route must start
 with a fixed path segment that isn't one of Cayu's own (such as `/api` or `/cayu`), so a
 parameter or catch-all can't answer for Cayu's paths; the b2b preset serves its API under
-`/app` this way. Use `mount_cayu(..., path="/cayu")` when an
+`/app` this way. A project with its own pages serves their build at `/` with
+`[tool.cayu.serve] ui = "web/static"`: every `GET` that no route answers gets a file of
+that directory (files under `assets/` cached for a year) or its `index.html`, so a page
+the app routes in the browser opens on a reload or a link. Paths under Cayu's prefixes,
+the project's own (`/app`) and `/.cayu` (Cayu Cloud's router) are never the page: an
+unknown one is still a 404, as is a missing file under `assets/`. `cayu check` reports a
+`ui` directory that is missing, has no `index.html`, or holds a file or folder named like
+one of those prefixes; `cayu serve` refuses to start with one. An application that builds
+its own server calls `cayu.server.web_app.serve_web_app(server, directory)` last, after
+its other routes. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires
 `AuthenticatedAccess(...)` on any public listener. Do not substitute client-IP
 or forwarded-header checks for authentication. Put authentication/authorization

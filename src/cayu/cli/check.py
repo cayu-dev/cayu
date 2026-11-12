@@ -94,6 +94,12 @@ def _run_check(args: argparse.Namespace) -> int:
     try:
         project = resolve_project(args.target, command="cayu check")
         report = check_project(project, tags=requested_tags, deploy_only=args.deploy)
+        report = _with_diagnostics(
+            report,
+            filter_findings(
+                serve_ui_findings(project.root), tags=requested_tags, deploy_only=args.deploy
+            ),
+        )
         if (
             args.deploy
             and (not requested_tags or "deploy" in requested_tags)
@@ -110,6 +116,59 @@ def _run_check(args: argparse.Namespace) -> int:
         _render_invocation_error(message, as_json=args.output_format == "json")
         return 2
     return _render_report(args, report)
+
+
+def serve_ui_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
+    """Check `[tool.cayu.serve] ui`, the built web app `cayu serve` serves at `/`: a
+    directory with an `index.html`, and nothing at its top level that Cayu's own routes
+    answer. `cayu serve` also refuses one that shadows the project's routes."""
+
+    from cayu._web_app_files import RESERVED_PREFIXES, WebAppError, check_web_app_directory
+    from cayu.cli.project import discover_cayu_project_configuration
+
+    discovered = discover_cayu_project_configuration(discovery_keys=("factory",), start=root)
+    serve = None if discovered is None else discovered.config.get("serve")
+    if not isinstance(serve, dict) or "ui" not in serve:
+        return ()
+    ui = serve["ui"]
+
+    def finding(code: str, message: str, hint: str) -> ProjectDiagnostic:
+        return ProjectDiagnostic(
+            code=code,
+            severity=DiagnosticSeverity.ERROR,
+            subject="cayu serve",
+            path="pyproject.toml:[tool.cayu.serve].ui",
+            message=message,
+            hint=hint,
+            tags=("deploy",),
+            documentation_anchor="cayu guide references#server",
+            verification_command="cayu serve --dev",
+        )
+
+    if not isinstance(ui, str) or not ui.strip():
+        return (
+            finding(
+                "SERVE_UI_INVALID",
+                "[tool.cayu.serve].ui must be the path of a directory holding a built web app.",
+                'Set it to the build\'s output directory, such as ui = "web/static".',
+            ),
+        )
+    # Cayu's API and Developer dashboard, Cayu Cloud's router, and the browser client.
+    reserved = (*RESERVED_PREFIXES, "/client.js", "/client.d.ts")
+    try:
+        check_web_app_directory(root / ui.strip(), reserved)
+    except WebAppError as exc:
+        missing = exc.reason == "missing"
+        return (
+            finding(
+                "SERVE_UI_MISSING" if missing else "SERVE_UI_SHADOWS_ROUTES",
+                str(exc),
+                "Build the web app and commit its output, which a deployment serves as it is."
+                if missing
+                else "Rename that file or folder; Cayu's own routes always answer first.",
+            ),
+        )
+    return ()
 
 
 def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
