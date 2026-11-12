@@ -325,7 +325,7 @@ def _build_serve_app(
         _include_project_routers(server, app, settings.routers, development=args.dev)
         if settings.ui is not None:
             # Last, so every route above answers first.
-            from cayu.server.web_app import WebAppError, serve_web_app
+            from cayu.server import WebAppError, serve_web_app
 
             try:
                 serve_web_app(server, settings.ui)

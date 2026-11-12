@@ -11,8 +11,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from cayu import CayuApp
-from cayu.server import ServerConfig, create_server
-from cayu.server.web_app import WebAppError, serve_web_app
+from cayu.server import ServerConfig, WebAppError, create_server, serve_web_app
 
 PAGE = '<!doctype html><script type="module" src="/assets/index-abc123.js"></script>'
 

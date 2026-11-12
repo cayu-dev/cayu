@@ -137,6 +137,7 @@ try:
     )
     from cayu.server.sse import event_to_sse_data
     from cayu.server.static import DashboardStaticFiles
+    from cayu.server.web_app import WebAppError, serve_web_app
 except ModuleNotFoundError as exc:
     # Only remap to the optional-dependency hint when one of the server extra's
     # packages is absent. A deeper/unrelated missing module (a corrupt install,
@@ -202,12 +203,14 @@ __all__ = [
     "ServerLifecycleConfig",
     "ServiceIdentityStoreKind",
     "ServiceMode",
+    "WebAppError",
     "create_agent_service",
     "create_router",
     "create_server",
     "event_to_sse_data",
     "mount_cayu",
     "mount_dashboard",
+    "serve_web_app",
 ]
 
 logger = logging.getLogger(__name__)

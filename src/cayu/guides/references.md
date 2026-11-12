@@ -466,7 +466,7 @@ the project's own (`/app`) and `/.cayu` (Cayu Cloud's router) are never the page
 unknown one is still a 404, as is a missing file under `assets/`. `cayu check` reports a
 `ui` directory that is missing, has no `index.html`, or holds a file or folder named like
 one of those prefixes; `cayu serve` refuses to start with one. An application that builds
-its own server calls `cayu.server.web_app.serve_web_app(server, directory)` last, after
+its own server calls `cayu.server.serve_web_app(server, directory)` last, after
 its other routes. Use `mount_cayu(..., path="/cayu")` when an
 existing FastAPI product owns the host server; that mount requires
 `AuthenticatedAccess(...)` on any public listener. Do not substitute client-IP
