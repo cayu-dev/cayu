@@ -49,8 +49,9 @@ cayu cloud service status --application my-agent
 - `connectors` and `connections list|show|add|authorize|check|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
-- `admin system-agents` to list [the install's system Agents](#the-installs-system-agents), and
-  `admin runtime-record show|forget-migration` to read
+- `admin system-agents` to list [the install's system Agents](#the-installs-system-agents),
+  `admin arena-enrollments` to list [Arena case enrollments](#arena-case-enrollments) with each
+  Agent's corpus schema, and `admin runtime-record show|forget-migration` to read
   [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, as a
   signed-in Cayu platform administrator; and
 - `evidence list|show|verify` for local content-free command records.
@@ -2259,6 +2260,45 @@ differ, the output adds a `warnings` entry saying so and naming the `service res
 that applies the current setting. `admin system-agents` says `not system until restarted` for
 such an Agent. A Cloud from before `recorded_system` leaves it out and reports the recorded
 value as `system`, and no warning is given.
+
+## Arena case enrollments
+
+Arena's case service, which serves an install's Evals > Cases, keeps its enrollments in its own
+ledger. A Cayu platform administrator lists every one of them, across Organizations, with the
+eval corpus schema each enrolled Agent declares:
+
+```console
+cayu cloud admin arena-enrollments
+cayu cloud admin arena-enrollments --below-schema 6
+cayu cloud admin arena-enrollments --json
+```
+
+Each row is one enrolled Arena agent: its Organization, the Cloud Agent it is bound to
+(`unbound` when none), the Git commit it was enrolled from when Arena recorded one, its
+enrollment (`#sequence` and fingerprint), the lowest corpus schema it declares, and where that
+schema came from:
+
+- `recorded`: Arena recorded it when the Agent enrolled;
+- `current_release`: the enrollment predates that, so Cloud read the corpora the bound Agent's
+  current Release declares under `[tool.cayu.improvement]` and each file's `schema_version`;
+- `unknown`: neither, with the reason in brackets, such as `not_bound` or
+  `source_not_uploaded` (a Release built from a connected repository).
+
+`--below-schema N` keeps the rows whose shown schema is below `N`, with their source, and says
+how many rows show no schema (unknown, or no corpus declared) and so aren't listed. Cayu 0.16.3
+and later read only corpus schema 6, so `--below-schema 6` lists the Agents an Arena on a newer
+Cayu would refuse with `declaration_invalid` at their next enrollment, until they re-export their
+corpora. With `--json`, `result.items` holds Cloud's rows (`agent_id`, `organization_id`,
+`application_id`, `bound`, `enrollment`, `arena_error` and `corpus_schema` with `source`,
+`version`, `corpora`, `release` and `reason`); with `--below-schema`, `result` also has
+`below_schema` and `without_schema`, the count left out.
+
+Cloud reads them with the install's Arena inventory token, which can do nothing else in Arena.
+Without it the command exits `2` with `arena_inventory_not_configured`, and the message names
+the setting; `arena_inventory_unconfigured` means the Arena service has no token of its own, and
+`arena_inventory_refused` that the two differ. Cloud refuses anyone but a platform administrator
+(`platform_admin_required`), and a Cloud that doesn't list them yet gives
+`arena_enrollments_unsupported`.
 
 ## An Agent's runtime record
 

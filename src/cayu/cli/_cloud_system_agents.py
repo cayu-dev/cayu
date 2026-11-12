@@ -29,6 +29,10 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_arena_enrollments import (
+    add_arena_enrollments_parser,
+    arena_enrollments_command,
+)
 from cayu.cli._cloud_releases import add_output_argument
 from cayu.cli._cloud_runtime_record import add_runtime_record_parser, runtime_record_command
 from cayu.cli._cloud_settings import _cell, _table
@@ -45,12 +49,13 @@ def add_admin_parser(
 
     admin = commands.add_parser(
         "admin",
-        help="Read the install's own configuration and any Agent's runtime record (Cayu "
-        "platform administrators).",
+        help="Read the install's own configuration, its Arena case enrollments and any Agent's "
+        "runtime record (Cayu platform administrators).",
         description=(
-            "Read how this Cayu Cloud install is configured, and read or correct any "
-            "Organization's Agent's runtime record. Needs a signed-in Cayu platform "
-            "administrator (`cayu cloud login`); an Organization admin or an API key can't."
+            "Read how this Cayu Cloud install is configured, list its Arena case enrollments "
+            "across Organizations, and read or correct any Organization's Agent's runtime "
+            "record. Needs a signed-in Cayu platform administrator (`cayu cloud login`); an "
+            "Organization admin or an API key can't."
         ),
     )
     actions = admin.add_subparsers(dest="admin_command", required=True)
@@ -66,6 +71,7 @@ def add_admin_parser(
         ),
     )
     add_output_argument(system_agents, render_system_agents)
+    add_arena_enrollments_parser(actions)
     add_runtime_record_parser(actions, application=application)
 
 
@@ -79,6 +85,8 @@ def admin_command(
 
     if arguments.admin_command == "system-agents":
         return {"operation": "admin.system-agents", "result": _system_agents(client)}
+    if arguments.admin_command == "arena-enrollments":
+        return arena_enrollments_command(arguments, client=client)
     if arguments.admin_command == "runtime-record":
         return runtime_record_command(
             arguments, client=client, recovery_arguments=recovery_arguments

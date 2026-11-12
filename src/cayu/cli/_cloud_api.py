@@ -132,6 +132,13 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "service_not_running"),
         (502, "agent_unreachable"),
         (503, "operator_credentials_unavailable"),
+        # `cayu cloud admin arena-enrollments`: why Cloud couldn't list Arena's enrollments;
+        # each message names the setting to fix.
+        (502, "arena_inventory_refused"),
+        (503, "arena_inventory_not_configured"),
+        (503, "arena_inventory_unavailable"),
+        (503, "arena_inventory_unconfigured"),
+        (503, "arena_inventory_unsupported"),
         (504, "operator_check_timeout"),
         # `cayu cloud service database`: why Cloud has no database health for the Agent.
         (404, "agent_database_not_found"),
