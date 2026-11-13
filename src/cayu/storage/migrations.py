@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from cayu.storage._task_index_schema import TASK_INDEX_REVISION
+
 # Prefix for every Cayu-owned table, so Cayu state never collides with an app's own
 # tables in a shared database (ADR 0001, Decision 5).
 TABLE_PREFIX = "cayu_"
@@ -632,6 +634,12 @@ REVISIONS: tuple[Revision, ...] = (
     # Older binaries ignore the table and record no time for keys they add.
     # Session stores require it.
     Revision(revision=150, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # Task lists filter, sort, page and count in SQL: cayu_tasks gains a generated
+    # is_internal column and list indexes, and triggers keep cayu_task_counts and
+    # the cayu_task_prerequisites edges in step with every writer, older binaries
+    # included. The migration counts and copies existing tasks. Task stores
+    # require it.
+    Revision(revision=TASK_INDEX_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

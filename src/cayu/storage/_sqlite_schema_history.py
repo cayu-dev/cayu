@@ -34,6 +34,11 @@ from cayu.storage._task_group_schema import (
     SQLITE_TASK_GROUP_DDL,
     SQLITE_TASK_GROUP_QUIESCENCE_DDL,
 )
+from cayu.storage._task_index_schema import (
+    SQLITE_TASK_INDEX_COLUMNS,
+    SQLITE_TASK_INDEX_DDL,
+    TASK_INDEX_REVISION,
+)
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
 from cayu.storage._usage_event_schema import SQLITE_USAGE_EVENTS_DDL
@@ -789,6 +794,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
         key_id TEXT PRIMARY KEY,
         first_used_at TEXT NOT NULL
     );""",
+    # Task list indexes, trigger-maintained status counts and prerequisite edges.
+    TASK_INDEX_REVISION: SQLITE_TASK_INDEX_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL
@@ -4694,6 +4701,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
     76: (("cayu_tasks", "interrupted_handoff_id", "TEXT"),),
+    TASK_INDEX_REVISION: SQLITE_TASK_INDEX_COLUMNS,
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -85,6 +85,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
+from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._cancellation import (
@@ -309,7 +310,16 @@ from cayu.tasks.handoff import (
     prepare_parked_handoff_page,
     require_parked_continuation_trigger,
 )
-from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
+from cayu.tasks.index import (
+    TaskCountsCheck,
+    TaskIndexPredicate,
+    TaskIndexQuery,
+    TaskIndexResult,
+    TaskSearchMatch,
+    compare_task_counts,
+    require_task_identities,
+    require_unbounded_task_counts,
+)
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -410,7 +420,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 146
+_SQLITE_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 
 
@@ -556,6 +566,7 @@ class SQLiteTaskStore(TaskStore):
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_native_task_index: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
     supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
@@ -615,6 +626,16 @@ class SQLiteTaskStore(TaskStore):
             self._initialize_schema()
             if diagnostic_source_missing:
                 self._connection.execute("PRAGMA query_only = ON")
+            from cayu.storage._sqlite_task_index import TaskReadConnections
+
+            # Task reads use their own read-only connections, so they never wait
+            # behind the writer. A private in-memory database shares the writer.
+            self._task_readers = TaskReadConnections(
+                None if str(effective_db_path) == ":memory:" else effective_db_path,
+                self._connect_read_only,
+                writer_lock=self._lock,
+                writer=self._connection,
+            )
         except BaseException:
             self._connection.close()
             raise
@@ -4203,13 +4224,30 @@ class SQLiteTaskStore(TaskStore):
 
             _access_bounds = await current_data_bounds("tasks")
         task_id = require_clean_nonblank(task_id, "task_id")
-        async with self._lock:
-            task = self._load_task_unlocked(task_id)
-            if _access_bounds is not None:
-                from cayu.tasks.access import require_read
 
-                require_read(task, _access_bounds)
-            return task
+        def read(connection: sqlite3.Connection) -> Task | None:
+            row = connection.execute("SELECT * FROM cayu_tasks WHERE id = ?", (task_id,)).fetchone()
+            return None if row is None else sqlite_records.task_from_row(row)
+
+        task = await self._task_readers.run(read)
+        if _access_bounds is not None:
+            from cayu.tasks.access import require_read
+
+            require_read(task, _access_bounds)
+        return task
+
+    async def load_tasks(self, task_ids: Sequence[str]) -> list[Task]:
+        from cayu.resource_access import current_data_bounds
+        from cayu.storage._sqlite_task_index import load_tasks
+
+        identities = require_task_identities(task_ids)
+        return await load_tasks(self, identities, await current_data_bounds("tasks"))
+
+    async def check_task_counts(self) -> TaskCountsCheck:
+        from cayu.storage._sqlite_task_index import task_counts
+
+        await require_unbounded_task_counts()
+        return compare_task_counts(*await task_counts(self))
 
     async def load_active_attached_task_worker(
         self,
@@ -4288,8 +4326,8 @@ class SQLiteTaskStore(TaskStore):
         order_sql = sqlite_records.task_order_sql(query.order_by)
         params.extend([query.limit, query.offset])
 
-        async with self._lock:
-            rows = self._connection.execute(
+        def read(connection: sqlite3.Connection) -> list[Task]:
+            rows = connection.execute(
                 f"""
                 SELECT *
                 FROM cayu_tasks
@@ -4300,6 +4338,8 @@ class SQLiteTaskStore(TaskStore):
                 params,
             ).fetchall()
             return [sqlite_records.task_from_row(row) for row in rows]
+
+        return await self._task_readers.run(read)
 
     def _task_list_clauses(self, query: TaskQuery, access_bounds) -> tuple[list[str], list[object]]:
         """The WHERE clauses ``list_tasks`` and ``latest_tasks`` select tasks with."""
@@ -4834,11 +4874,15 @@ class SQLiteTaskStore(TaskStore):
                 raise
 
     async def query_task_index(
-        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+        self,
+        query: TaskIndexQuery,
+        *,
+        matches: TaskIndexPredicate | None = None,
+        search: TaskSearchMatch | None = None,
     ) -> TaskIndexResult:
         from cayu.storage._sqlite_task_index import query_index
 
-        return await query_index(self, query, matches=matches)
+        return await query_index(self, query, matches=matches, search=search)
 
     async def aggregate_operational_snapshot(
         self,
@@ -7501,6 +7545,7 @@ class SQLiteTaskStore(TaskStore):
                 raise
 
     async def close(self) -> None:
+        await self._task_readers.close()
         async with self._lock:
             self._connection.close()
 

@@ -46453,6 +46453,92 @@
         "title": "TaskCancelBody",
         "type": "object"
       },
+      "TaskCountDifference": {
+        "additionalProperties": false,
+        "description": "One count where the stored task counts and a recount disagree.",
+        "properties": {
+          "assigned_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assigned Agent Name"
+          },
+          "internal": {
+            "title": "Internal",
+            "type": "boolean"
+          },
+          "recounted": {
+            "title": "Recounted",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "stored": {
+            "title": "Stored",
+            "type": "integer"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "internal",
+          "status",
+          "type",
+          "assigned_agent_name",
+          "stored",
+          "recounted"
+        ],
+        "title": "TaskCountDifference",
+        "type": "object"
+      },
+      "TaskCountsCheck": {
+        "additionalProperties": false,
+        "description": "The stored task counts by status, compared with a recount of every task.",
+        "properties": {
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "By Status",
+            "type": "object"
+          },
+          "differences": {
+            "items": {
+              "$ref": "#/components/schemas/TaskCountDifference"
+            },
+            "title": "Differences",
+            "type": "array"
+          },
+          "matches": {
+            "title": "Matches",
+            "type": "boolean"
+          },
+          "recounted_by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Recounted By Status",
+            "type": "object"
+          }
+        },
+        "required": [
+          "by_status",
+          "recounted_by_status",
+          "differences",
+          "matches"
+        ],
+        "title": "TaskCountsCheck",
+        "type": "object"
+      },
       "TaskCreationResponse": {
         "properties": {
           "task_id": {
@@ -63387,7 +63473,7 @@
     },
     "/api/tasks": {
       "get": {
-        "description": "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a top-level value of the task's input or metadata as the task detail shows it; numbers match by value and booleans as true or false. The response carries a weak `ETag`; a matching `If-None-Match` returns `304` without a body.",
+        "description": "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a top-level value of the task's input or metadata as the task detail shows it; numbers match by value and booleans as true or false; `ids` alone returns those tasks' details. It has a weak `ETag`; a matching `If-None-Match` returns `304`.",
         "operationId": "list_tasks_api_tasks_get",
         "parameters": [
           {
@@ -63633,6 +63719,25 @@
               "title": "Offset",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "ids",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ids"
+            }
           }
         ],
         "responses": {
@@ -63649,6 +63754,12 @@
                     },
                     {
                       "$ref": "#/components/schemas/ApiTaskIndex"
+                    },
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/ApiTaskDetail"
+                      },
+                      "type": "array"
                     }
                   ],
                   "title": "Response List Tasks Api Tasks Get"
@@ -63708,6 +63819,25 @@
           }
         },
         "summary": "Create Task"
+      }
+    },
+    "/api/tasks/counts/check": {
+      "get": {
+        "description": "Compare the stored task counts that `include=counts` serves with a recount of every task. `cayu task counts --recompute` reads it.",
+        "operationId": "check_task_counts_api_tasks_counts_check_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCountsCheck"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Check Task Counts"
       }
     },
     "/api/tasks/latest": {

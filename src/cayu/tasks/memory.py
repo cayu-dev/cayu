@@ -290,7 +290,12 @@ from cayu.tasks.handoff import (
     prepare_parked_handoff_page,
     require_parked_continuation_trigger,
 )
-from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
+from cayu.tasks.index import (
+    TaskIndexPredicate,
+    TaskIndexQuery,
+    TaskIndexResult,
+    TaskSearchMatch,
+)
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -515,6 +520,7 @@ class InMemoryTaskStore(TaskStore):
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_native_task_index: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
     supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
@@ -3126,11 +3132,15 @@ class InMemoryTaskStore(TaskStore):
             return result
 
     async def query_task_index(
-        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+        self,
+        query: TaskIndexQuery,
+        *,
+        matches: TaskIndexPredicate | None = None,
+        search: TaskSearchMatch | None = None,
     ) -> TaskIndexResult:
         from cayu.tasks._memory_index import query_index
 
-        return await query_index(self, query, matches=matches)
+        return await query_index(self, query, matches=matches, search=search)
 
     async def aggregate_operational_snapshot(
         self,

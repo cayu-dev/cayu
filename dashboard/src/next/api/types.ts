@@ -229,6 +229,8 @@ export type Api = {
   taskDependents(id: string, cursor?: string, signal?: AbortSignal): Promise<ApiTaskIndex>
   /** `GET /api/tasks/{id}`. */
   task(id: string, signal?: AbortSignal): Promise<TaskInfo>
+  /** `GET /api/tasks?ids=…`: each listed task that exists, in order; at most 100 ids. */
+  tasksByIds(ids: string[], signal?: AbortSignal): Promise<TaskInfo[]>
   /** `GET /api/tasks/{id}/schedule/events`; empty for tasks without a schedule. */
   taskScheduleEvents(
     id: string,

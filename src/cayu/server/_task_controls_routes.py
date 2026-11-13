@@ -8,10 +8,12 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 from fastapi import HTTPException, Query
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
+from cayu._resource_access_errors import ResourceAccessDenied
 from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._task_index import read_task_index
 from cayu.server.auth import AuthContext
 from cayu.server.contracts import ApiTaskDetail, ApiTaskIndex
+from cayu.tasks.index import TaskCountsCheck
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.scheduling import TaskScheduleConflict
 
@@ -82,6 +84,26 @@ def register_task_controls_routes(
                 409, "Task cancellation conflicts with its current lifecycle."
             ) from None
         return serialize_task(cayu_app, task)
+
+    @router.get(
+        "/tasks/counts/check",
+        response_model=TaskCountsCheck,
+        dependencies=protected,
+        description=(
+            "Compare the stored task counts that `include=counts` serves with a recount "
+            "of every task. `cayu task counts --recompute` reads it."
+        ),
+    )
+    async def check_task_counts():
+        store = cayu_app.task_store
+        if store is None:
+            raise HTTPException(501, "Task store is not configured.")
+        try:
+            return await store.check_task_counts()
+        except NotImplementedError:
+            raise HTTPException(501, "This task store keeps no task counts.") from None
+        except ResourceAccessDenied:
+            raise HTTPException(403, "Task counts cover every task.") from None
 
     @router.get("/tasks/{task_id}/dependents", response_model=ApiTaskIndex, dependencies=protected)
     async def dependents(

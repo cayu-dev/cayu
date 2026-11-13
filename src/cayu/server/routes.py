@@ -246,7 +246,7 @@ from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server._task_controls_routes import register_task_controls_routes
 from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
-from cayu.server._task_index import TaskValueFilters, read_task_index
+from cayu.server._task_index import TaskValueFilters, read_task_index, read_tasks_by_ids
 from cayu.server._task_latest_routes import register_task_latest_route
 from cayu.server.auth import (
     AuthContext,
@@ -9430,14 +9430,14 @@ def create_router(
 
     @router.get(
         "/tasks",
-        response_model=list[ApiTaskListItem] | ApiTaskIndex,
+        response_model=list[ApiTaskListItem] | ApiTaskIndex | list[ApiTaskDetail],
         dependencies=protected,
         responses={304: {"description": "The list still matches `If-None-Match`."}},
         description=(
             "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a "
             "top-level value of the task's input or metadata as the task detail shows it; "
-            "numbers match by value and booleans as true or false. The response carries a "
-            "weak `ETag`; a matching `If-None-Match` returns `304` without a body."
+            "numbers match by value and booleans as true or false; `ids` alone returns those "
+            "tasks' details. It has a weak `ETag`; a matching `If-None-Match` returns `304`."
         ),
     )
     async def list_tasks(
@@ -9460,8 +9460,11 @@ def create_router(
         order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC,
         limit: int = 50,
         offset: int = 0,
+        ids: Annotated[list[str] | None, Query()] = None,
     ):
         response.headers["Cache-Control"] = "private, no-store"
+        if ids is not None:
+            return await read_tasks_by_ids(cayu_app, http_request, response, ids)
         values = TaskValueFilters.parse(input_filter, metadata_filter)
         if task_store is None:
             if include == "counts":

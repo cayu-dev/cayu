@@ -30569,6 +30569,92 @@
       "title": "TaskCancelBody",
       "type": "object"
     },
+    "TaskCountDifference": {
+      "additionalProperties": false,
+      "description": "One count where the stored task counts and a recount disagree.",
+      "properties": {
+        "assigned_agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assigned Agent Name"
+        },
+        "internal": {
+          "title": "Internal",
+          "type": "boolean"
+        },
+        "recounted": {
+          "title": "Recounted",
+          "type": "integer"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "stored": {
+          "title": "Stored",
+          "type": "integer"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "internal",
+        "status",
+        "type",
+        "assigned_agent_name",
+        "stored",
+        "recounted"
+      ],
+      "title": "TaskCountDifference",
+      "type": "object"
+    },
+    "TaskCountsCheck": {
+      "additionalProperties": false,
+      "description": "The stored task counts by status, compared with a recount of every task.",
+      "properties": {
+        "by_status": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "By Status",
+          "type": "object"
+        },
+        "differences": {
+          "items": {
+            "$ref": "#/components/schemas/TaskCountDifference"
+          },
+          "title": "Differences",
+          "type": "array"
+        },
+        "matches": {
+          "title": "Matches",
+          "type": "boolean"
+        },
+        "recounted_by_status": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Recounted By Status",
+          "type": "object"
+        }
+      },
+      "required": [
+        "by_status",
+        "recounted_by_status",
+        "differences",
+        "matches"
+      ],
+      "title": "TaskCountsCheck",
+      "type": "object"
+    },
     "TaskCreationResponse": {
       "properties": {
         "task_id": {
@@ -42628,6 +42714,25 @@
           },
           {
             "in": "query",
+            "name": "ids",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ids"
+            }
+          },
+          {
+            "in": "query",
             "name": "include",
             "required": false,
             "schema": {
@@ -42855,6 +42960,12 @@
                   },
                   {
                     "$ref": "#/components/schemas/ApiTaskIndex"
+                  },
+                  {
+                    "items": {
+                      "$ref": "#/components/schemas/ApiTaskDetail"
+                    },
+                    "type": "array"
                   }
                 ],
                 "title": "Response List Tasks Api Tasks Get"
@@ -42896,6 +43007,24 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tasks/counts/check": {
+      "get": {
+        "operation_id": "check_task_counts_api_tasks_counts_check_get",
+        "parameters": [],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/TaskCountsCheck"
               }
             }
           }

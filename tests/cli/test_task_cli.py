@@ -1065,3 +1065,32 @@ def test_the_public_readers_read_a_local_store_the_same_way(database: Path) -> N
     assert task is not None and task["result"] == {"findings": 3}
     with pytest.raises(ValueError, match="type or types"):
         TaskListRequest(type="scan", types=("review",))
+
+
+def test_counts_show_stored_counts_and_recompute_finds_drift(
+    database: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sqlite3
+
+    code, out = _run(capsys, "counts", "--sqlite", str(database), "--json")
+    assert code == 0
+    assert out["by_status"]["completed"] == 1
+    assert out["by_status"]["cancelled"] == 1
+    assert "matches" not in out
+
+    code, out = _run(capsys, "counts", "--sqlite", str(database), "--recompute", "--json")
+    assert code == 0
+    assert out["matches"] is True and out["differences"] == []
+    assert out["recounted_by_status"] == out["by_status"]
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "UPDATE cayu_task_counts SET task_count = task_count + 2 WHERE status = 'completed'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    code, out = _run(capsys, "counts", "--sqlite", str(database), "--recompute")
+    assert code == 1
+    assert "completed" in out and "scan" in out and "hunter" in out

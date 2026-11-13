@@ -40,6 +40,10 @@ export const fetchTaskDependents = (id: string, cursor?: string, signal?: AbortS
     `/tasks/${encodeURIComponent(id)}/dependents${taskQueryString({ limit: 50, cursor })}`,
     { signal },
   )
+/** The most ids one `GET /tasks?ids=` request reads. */
+export const TASK_BATCH_MAX = 100
+export const fetchTasksByIds = (ids: string[], signal?: AbortSignal) =>
+  read<ApiTaskDetail[]>(`/tasks${taskQueryString({ ids })}`, { signal })
 export const createDeclaredTask = (body: DeclaredTaskCreateBody) =>
   read<TaskCreationResponse>("/tasks", { method: "POST", body: JSON.stringify(body) })
 export const readTaskReplay = (id: string, signal?: AbortSignal) =>

@@ -31,7 +31,13 @@ import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import { fetchSessionRecovery } from "@/lib/session-recovery"
 import { json } from "./http"
 import { overviewForDisplay } from "./overview"
-import { createDeclaredTask, fetchTaskDependents, fetchTaskIndex, taskQueryString } from "./tasks"
+import {
+  createDeclaredTask,
+  fetchTaskDependents,
+  fetchTaskIndex,
+  fetchTasksByIds,
+  taskQueryString,
+} from "./tasks"
 import type { Api, InboxPage, SessionOverview, TaskScheduleEvent } from "./types"
 
 /**
@@ -77,6 +83,7 @@ export const realApi: Api = {
   events: (id, q, signal) => fetchSessionEvents(id, q, signal),
   tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
   task: (id, signal) => json(`/tasks/${encodeURIComponent(id)}`, { signal }),
+  tasksByIds: fetchTasksByIds,
   taskIndex: fetchTaskIndex,
   taskList: (query, signal) => json(`/tasks${taskQueryString(query)}`, { signal }),
   taskDependents: fetchTaskDependents,

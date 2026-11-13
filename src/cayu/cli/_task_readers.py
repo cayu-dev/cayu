@@ -25,6 +25,7 @@ from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord
 from cayu.sessions.store import SessionStore
+from cayu.tasks.index import TaskCountsCheck
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus, task_error_code, task_error_summary
 from cayu.tasks.store import TaskStore
@@ -92,6 +93,10 @@ class TaskReader(Protocol):
         """The newest finished tasks (``TaskStore.latest_tasks``), as task details."""
         ...
 
+    async def check_task_counts(self) -> dict[str, Any]:
+        """``TaskStore.check_task_counts`` as JSON (``TaskCountsCheck``)."""
+        ...
+
     async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         """The sessions run under the task, oldest first: at most ``MAX_TASK_SESSIONS``,
         and whether more were left out. ``None`` when the source can't list them."""
@@ -139,6 +144,9 @@ class StoreTaskReader:
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         task = await self._store.load_task(task_id)
         return None if task is None else task_projection(task, detail=True)
+
+    async def check_task_counts(self) -> dict[str, Any]:
+        return (await self._store.check_task_counts()).model_dump(mode="json")
 
     async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
         tasks = await self._store.latest_tasks(
@@ -236,6 +244,22 @@ class ApiTaskReader:
                 "`GET /tasks/latest`.",
             ) from None
         return self._task_list(body)
+
+    async def check_task_counts(self) -> dict[str, Any]:
+        try:
+            body = self._api.get("/tasks/counts/check", resource="tasks")
+        except CayuApiNotFound:
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} can't check task counts; its Cayu predates "
+                "`GET /tasks/counts/check`.",
+            ) from None
+        try:
+            return TaskCountsCheck.model_validate(body).model_dump(mode="json")
+        except ValueError:
+            raise CayuApiError(
+                "not_cayu", f"{self._api.description} returned invalid task counts."
+            ) from None
 
     def _task_list(self, body: object) -> list[dict[str, Any]]:
         if not isinstance(body, list) or not all(_is_task_row(row) for row in body):

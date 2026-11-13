@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from decimal import Decimal
 from threading import Lock
@@ -102,7 +102,14 @@ from cayu.tasks.handoff import (
     TaskInterruptedHandoffReceipt,
     TaskInterruptedHandoffRequest,
 )
-from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
+from cayu.tasks.index import (
+    TaskCountsCheck,
+    TaskIndexPredicate,
+    TaskIndexQuery,
+    TaskIndexResult,
+    TaskSearchMatch,
+    require_task_identities,
+)
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -322,6 +329,8 @@ class TaskStore(ABC):
     supports_verified_task_worker: ClassVar[bool] = False
     supports_local_execution_attempts: ClassVar[bool] = False
     supports_session_closure_deletion: ClassVar[bool] = False
+    #: ``query_task_index`` applies every filter itself when called without ``matches``.
+    supports_native_task_index: ClassVar[bool] = False
     supports_session_closure_claims: ClassVar[bool] = False
     # Retention-purpose closure claims and both monotonic epoch methods.
     # Deletion-only closure support does not imply this capability.
@@ -1071,16 +1080,50 @@ class TaskStore(ABC):
         raise NotImplementedError("This TaskStore does not support session task closure deletion.")
 
     async def query_task_index(
-        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+        self,
+        query: TaskIndexQuery,
+        *,
+        matches: TaskIndexPredicate | None = None,
+        search: TaskSearchMatch | None = None,
     ) -> TaskIndexResult:
         """Page and count authorized tasks in one read snapshot.
 
         Trusted operator read; model execution remains outside this surface.
-        Visit all eligible records; apply the caller's public search predicate
-        before counts and pagination. Preserve resource access bounds. A partial
-        or failed traversal must never return successful counts.
+        With ``matches``, visit all eligible records and apply the caller's
+        public search predicate before counts and pagination; the type, session,
+        parent and agent filters are then left to that predicate. Without it (a
+        store that sets ``supports_native_task_index``), every filter applies to
+        stored values, ``filters.q`` matches stored search text ignoring case, and
+        ``search``, when given, decides each task whose stored text could match.
+        Preserve resource access bounds. A partial or failed traversal must never
+        return successful counts.
         """
         raise NotImplementedError("Task index snapshots are unavailable.")
+
+    async def check_task_counts(self) -> TaskCountsCheck:
+        """Compare the stored task counts with a recount of every task.
+
+        Stores that keep counts for ``query_task_index`` override this; it reads
+        every task, so callers with resource access bounds are refused.
+        """
+        raise NotImplementedError("This TaskStore keeps no task counts.")
+
+    async def load_tasks(self, task_ids: Sequence[str]) -> list[Task]:
+        """The tasks among ``task_ids`` this caller can read, in that order, each once.
+
+        Missing and hidden tasks are left out. Stores may override this with one read.
+        """
+        from cayu._resource_access_errors import ResourceAccessDenied
+
+        tasks: list[Task] = []
+        for task_id in dict.fromkeys(require_task_identities(task_ids)):
+            try:
+                task = await self.load_task(task_id)
+            except ResourceAccessDenied:
+                continue
+            if task is not None:
+                tasks.append(task)
+        return tasks
 
     async def aggregate_operational_snapshot(
         self,

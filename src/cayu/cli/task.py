@@ -319,6 +319,22 @@ def add_task_parser(subparsers: Any) -> None:
     add_read_target_options(latest_parser)
     add_output_options(latest_parser, formats=("table", "json"), default="table")
 
+    counts_parser = commands.add_parser(
+        "counts",
+        help="Show stored task counts by status, and check them against a recount.",
+        description=(
+            "Show the task counts by status that the task list's status chips read. With "
+            "--recompute, recount every task and compare; exits 1 when they differ."
+        ),
+    )
+    counts_parser.add_argument(
+        "--recompute",
+        action="store_true",
+        help="Recount every task and compare with the stored counts.",
+    )
+    add_read_target_options(counts_parser)
+    add_output_options(counts_parser, formats=("table", "json"), default="table")
+
     show_parser = commands.add_parser(
         "show",
         help="Show one task with its result, cancellation and retry series.",
@@ -435,6 +451,8 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
             return await _list_tasks(args, reader)
         if args.task_command == "latest":
             return await _latest_tasks(args, reader)
+        if args.task_command == "counts":
+            return await _task_counts(args, reader)
         if args.task_command == "wait":
             return await _wait_for_task(args, reader)
         return await _show_task(args, reader)
@@ -544,6 +562,46 @@ async def _latest_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
             [{column: task.get(column) for column in columns} for task in payload["tasks"]],
         )
     return 0
+
+
+async def _task_counts(args: argparse.Namespace, reader: TaskReader) -> int:
+    check = await reader.check_task_counts()
+    payload: dict[str, Any] = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "source": reader.source,
+        "by_status": check["by_status"],
+    }
+    if args.recompute:
+        payload.update(
+            recounted_by_status=check["recounted_by_status"],
+            differences=check["differences"],
+            matches=check["matches"],
+        )
+    if args.output_format == "json":
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        rows = [
+            {
+                "status": status,
+                "count": count,
+                **(
+                    {"recounted": check["recounted_by_status"].get(status, 0)}
+                    if args.recompute
+                    else {}
+                ),
+            }
+            for status, count in check["by_status"].items()
+        ]
+        print_table(("status", "count", *(("recounted",) if args.recompute else ())), rows)
+        if args.recompute:
+            if check["matches"]:
+                print("The stored counts match a recount.")
+            else:
+                print_table(
+                    ("internal", "status", "type", "assigned_agent_name", "stored", "recounted"),
+                    check["differences"],
+                )
+    return 0 if not args.recompute or check["matches"] else 1
 
 
 async def _show_task(args: argparse.Namespace, reader: TaskReader) -> int:

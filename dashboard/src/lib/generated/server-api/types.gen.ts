@@ -23244,6 +23244,66 @@ export type TaskCancelBody = {
 };
 
 /**
+ * TaskCountDifference
+ *
+ * One count where the stored task counts and a recount disagree.
+ */
+export type TaskCountDifference = {
+    /**
+     * Assigned Agent Name
+     */
+    assigned_agent_name: string | null;
+    /**
+     * Internal
+     */
+    internal: boolean;
+    /**
+     * Recounted
+     */
+    recounted: number;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Stored
+     */
+    stored: number;
+    /**
+     * Type
+     */
+    type: string;
+};
+
+/**
+ * TaskCountsCheck
+ *
+ * The stored task counts by status, compared with a recount of every task.
+ */
+export type TaskCountsCheck = {
+    /**
+     * By Status
+     */
+    by_status: {
+        [key: string]: number;
+    };
+    /**
+     * Differences
+     */
+    differences: Array<TaskCountDifference>;
+    /**
+     * Matches
+     */
+    matches: boolean;
+    /**
+     * Recounted By Status
+     */
+    recounted_by_status: {
+        [key: string]: number;
+    };
+};
+
+/**
  * TaskCreationResponse
  */
 export type TaskCreationResponse = {
@@ -32554,6 +32614,10 @@ export type ListTasksApiTasksGetData = {
          * Offset
          */
         offset?: number;
+        /**
+         * Ids
+         */
+        ids?: Array<string> | null;
     };
     url: '/api/tasks';
 };
@@ -32573,7 +32637,7 @@ export type ListTasksApiTasksGetResponses = {
      *
      * Successful Response
      */
-    200: Array<ApiTaskListItem> | ApiTaskIndex;
+    200: Array<ApiTaskListItem> | ApiTaskIndex | Array<ApiTaskDetail>;
 };
 
 export type ListTasksApiTasksGetResponse = ListTasksApiTasksGetResponses[keyof ListTasksApiTasksGetResponses];
@@ -32602,6 +32666,22 @@ export type CreateTaskApiTasksPostResponses = {
 };
 
 export type CreateTaskApiTasksPostResponse = CreateTaskApiTasksPostResponses[keyof CreateTaskApiTasksPostResponses];
+
+export type CheckTaskCountsApiTasksCountsCheckGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/tasks/counts/check';
+};
+
+export type CheckTaskCountsApiTasksCountsCheckGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskCountsCheck;
+};
+
+export type CheckTaskCountsApiTasksCountsCheckGetResponse = CheckTaskCountsApiTasksCountsCheckGetResponses[keyof CheckTaskCountsApiTasksCountsCheckGetResponses];
 
 export type LatestTasksApiTasksLatestGetData = {
     body?: never;

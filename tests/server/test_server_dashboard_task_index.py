@@ -281,6 +281,8 @@ def test_http_cancel_retains_live_worker_ownership_until_handler_drains(
 def test_sqlite_http_index_cancellation_keeps_connection_fenced(
     monkeypatch, tmp_path, sqlite_task_store
 ):
+    """A cancelled index read keeps its read connection until its worker leaves it,
+    and never holds up the store's writer."""
     import threading
 
     import httpx
@@ -300,7 +302,8 @@ def test_sqlite_http_index_cancellation_keeps_connection_fenced(
             redact = app.redact_json
 
             def pause_projection(value):
-                if value == "barrier-row":
+                # The search decides each candidate in the read's worker thread.
+                if value == "visible" and threading.current_thread() is not threading.main_thread():
                     loop.call_soon_threadsafe(entered.set)
                     if not release.wait(5):
                         raise TimeoutError("test projection barrier timed out")
@@ -310,31 +313,29 @@ def test_sqlite_http_index_cancellation_keeps_connection_fenced(
             read = asyncio.create_task(
                 client.get("/api/tasks", params={"include": "counts", "q": "visible"})
             )
-            competing = None
             try:
                 await asyncio.wait_for(entered.wait(), 5)
                 read.cancel()
                 await asyncio.sleep(0)
                 read.cancel()
                 assert read.cancelling() == 2
-                competing = asyncio.create_task(
-                    store.create_task(TaskCreate(task_id="later", type="report"))
+                # The writer is free while the read's worker still holds its connection.
+                await asyncio.wait_for(
+                    store.create_task(TaskCreate(task_id="later", type="report")), 5
                 )
                 await asyncio.sleep(0.02)
                 assert not read.done()
-                assert not competing.done()
                 release.set()
                 with pytest.raises(asyncio.CancelledError):
                     await read
                 assert read.cancelled() and read.cancelling() == 2
-                await asyncio.wait_for(competing, 5)
                 assert (await store.load_task("barrier-row")).status.value == "pending"
                 assert (await store.load_task("later")).status.value == "pending"
+                after = await client.get("/api/tasks", params={"include": "counts"})
+                assert after.json()["total_count"] == "2"
             finally:
                 release.set()
-                await asyncio.gather(
-                    read, *([] if competing is None else [competing]), return_exceptions=True
-                )
+                await asyncio.gather(read, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -831,3 +832,59 @@ def test_custom_task_list_refuses_unbounded_or_shifted_partial_results(mode):
         assert response.status_code == 503, response.text
         assert "items" not in response.json()
         assert store.calls <= (16 if mode == "scan_budget" else 2)
+
+
+def test_tasks_by_ids_and_counts_check(tmp_path, sqlite_task_store):
+    import httpx
+
+    async def scenario():
+        store = sqlite_task_store(tmp_path / "batch.sqlite")
+        for identity in ("first", "second", "third"):
+            await store.create_task(TaskCreate(task_id=identity, type="report", title=identity))
+        app = CayuApp(task_store=store, enable_logging=False)
+        server = create_server(app, config=ServerConfig.local_development())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server), base_url="http://test"
+        ) as client:
+            response = await client.get(
+                "/api/tasks", params=[("ids", "third"), ("ids", "missing"), ("ids", "first")]
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert [task["id"] for task in body] == ["third", "first"]
+            assert "input" in body[0] and "invocation" in body[0]
+            assert response.headers["etag"]
+            mixed = await client.get("/api/tasks", params={"ids": "first", "limit": 5})
+            assert mixed.status_code == 422
+            too_many = await client.get("/api/tasks", params=[("ids", f"t{n}") for n in range(101)])
+            assert too_many.status_code == 422
+            check = await client.get("/api/tasks/counts/check")
+            assert check.status_code == 200
+            assert check.json()["matches"] is True
+            assert check.json()["by_status"]["pending"] == 3
+
+    asyncio.run(scenario())
+
+
+def test_task_search_matches_text_that_casefolds_either_way(tmp_path, sqlite_task_store):
+    """A needle that casefolds to ASCII, and stored text that does, both still match."""
+    import httpx
+
+    async def scenario():
+        store = sqlite_task_store(tmp_path / "casefold.sqlite")
+        await store.create_task(TaskCreate(task_id="grass", type="report", title="Grass report"))
+        await store.create_task(TaskCreate(task_id="street", type="report", title="Hauptstraße"))
+        await store.create_task(TaskCreate(task_id="other", type="report", title="Unrelated"))
+        app = CayuApp(task_store=store, enable_logging=False)
+        server = create_server(app, config=ServerConfig.local_development())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server), base_url="http://test"
+        ) as client:
+            for needle, expected in (("ß", {"grass", "street"}), ("STRASSE", {"street"})):
+                page = (
+                    await client.get("/api/tasks", params={"include": "counts", "q": needle})
+                ).json()
+                assert {task["id"] for task in page["items"]} == expected, needle
+                assert page["total_count"] == str(len(expected))
+
+    asyncio.run(scenario())

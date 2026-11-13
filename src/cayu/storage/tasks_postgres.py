@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import suppress
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -16,6 +16,7 @@ from cayu._resource_store_surface import model_store_surface
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope
+from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
     prepare_continuation_expectation,
@@ -195,7 +196,16 @@ from cayu.tasks.handoff import (
     prepare_parked_handoff_page,
     require_parked_continuation_trigger,
 )
-from cayu.tasks.index import TaskIndexPredicate, TaskIndexQuery, TaskIndexResult
+from cayu.tasks.index import (
+    TaskCountsCheck,
+    TaskIndexPredicate,
+    TaskIndexQuery,
+    TaskIndexResult,
+    TaskSearchMatch,
+    compare_task_counts,
+    require_task_identities,
+    require_unbounded_task_counts,
+)
 from cayu.tasks.queries import (
     TaskAggregateFilter,
     TaskOperationalSnapshot,
@@ -287,7 +297,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 146
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
@@ -442,6 +452,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_verified_task_worker: ClassVar[bool] = True
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
+    supports_native_task_index: ClassVar[bool] = True
     supports_session_closure_claims: ClassVar[bool] = True
     supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
@@ -2378,11 +2389,28 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         return result
 
     async def query_task_index(
-        self, query: TaskIndexQuery, *, matches: TaskIndexPredicate
+        self,
+        query: TaskIndexQuery,
+        *,
+        matches: TaskIndexPredicate | None = None,
+        search: TaskSearchMatch | None = None,
     ) -> TaskIndexResult:
         from cayu.storage._postgres_task_index import query_index
 
-        return await query_index(self, query, matches=matches)
+        return await query_index(self, query, matches=matches, search=search)
+
+    async def load_tasks(self, task_ids: Sequence[str]) -> list[Task]:
+        from cayu.resource_access import current_data_bounds
+        from cayu.storage._postgres_task_index import load_tasks
+
+        identities = require_task_identities(task_ids)
+        return await load_tasks(self, identities, await current_data_bounds("tasks"))
+
+    async def check_task_counts(self) -> TaskCountsCheck:
+        from cayu.storage._postgres_task_index import task_counts
+
+        await require_unbounded_task_counts()
+        return compare_task_counts(*await task_counts(self))
 
     async def aggregate_operational_snapshot(
         self,

@@ -1,7 +1,9 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query"
+import { ApiClientError } from "@/lib/api"
 import type { TaskStatus, TaskStatusCounts } from "@/lib/generated/server-api"
 import { activityPollInterval } from "@/lib/polling"
-import type { TaskIndexQuery } from "../api/tasks"
+import { TASK_BATCH_MAX, type TaskIndexQuery } from "../api/tasks"
+import type { Api, TaskInfo } from "../api/types"
 import { useApi, useServices } from "./services"
 import { taskGroupStatuses, taskTypeFilter } from "./task-index-model"
 import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
@@ -86,20 +88,7 @@ export function useTaskLinks(ids: string[], enabled = true, observe = false) {
     queryKey: ["tasks", "links", ids],
     refetchInterval: observe ? TASK_POLL_MS : false,
     enabled: enabled && ids.length > 0,
-    queryFn: async ({ signal }) => {
-      const rows = [],
-        issues: { id: string; error: unknown }[] = []
-      for (const id of [...new Set(ids)]) {
-        signal.throwIfAborted()
-        try {
-          rows.push(await api.task(id, signal))
-        } catch (error) {
-          signal.throwIfAborted()
-          issues.push({ id, error })
-        }
-      }
-      return { rows, issues }
-    },
+    queryFn: ({ signal }) => readTasks(api, ids, signal),
   })
 }
 export function useTaskAttempts(id: string, enabled: boolean, limit: number) {
@@ -113,19 +102,32 @@ export function useTaskAttempts(id: string, enabled: boolean, limit: number) {
       const rows = [first],
         seen = new Set([first.id])
       let incomplete = false
-      for (const direction of ["predecessor_task_id", "successor_task_id"] as const) {
-        let current = first
-        while (current.retry_series?.[direction]) {
-          const next = current.retry_series[direction]!
+      // Each step reads the next attempt in both directions with one request.
+      let ends: Partial<Record<RetryDirection, TaskInfo>> = {
+        predecessor_task_id: first,
+        successor_task_id: first,
+      }
+      while (Object.keys(ends).length) {
+        const wanted = new Map<string, RetryDirection>()
+        for (const [direction, task] of Object.entries(ends) as [RetryDirection, TaskInfo][]) {
+          const next = task.retry_series?.[direction]
+          if (!next) continue
           if (seen.has(next)) throw new Error("Retry history contains a repeated task identity.")
-          if (rows.length >= limit) {
-            incomplete = true
-            break
-          }
-          signal.throwIfAborted()
-          current = await api.task(next, signal)
-          seen.add(next)
-          rows.push(current)
+          wanted.set(next, direction)
+        }
+        if (!wanted.size) break
+        if (rows.length + wanted.size > limit) {
+          incomplete = true
+          break
+        }
+        const { rows: found, issues } = await readTasks(api, [...wanted.keys()], signal)
+        const [missing] = issues
+        if (missing) throw missing.error
+        ends = {}
+        for (const task of found) {
+          seen.add(task.id)
+          rows.push(task)
+          ends[wanted.get(task.id)!] = task
         }
       }
       return {
@@ -134,4 +136,43 @@ export function useTaskAttempts(id: string, enabled: boolean, limit: number) {
       }
     },
   })
+}
+
+type RetryDirection = "predecessor_task_id" | "successor_task_id"
+
+/** Each task in `ids` with one `tasks?ids=` request per 100, and an issue for each missing one. */
+export async function readTasks(api: Api, ids: string[], signal: AbortSignal) {
+  const wanted = [...new Set(ids)]
+  const rows: TaskInfo[] = []
+  for (let start = 0; start < wanted.length; start += TASK_BATCH_MAX) {
+    signal.throwIfAborted()
+    const batch = wanted.slice(start, start + TASK_BATCH_MAX)
+    const found = await api.tasksByIds(batch, signal)
+    if (found.some((task) => !batch.includes(task.id)))
+      return readTasksOneByOne(api, wanted, signal)
+    rows.push(...found)
+  }
+  const byId = new Map(rows.map((task) => [task.id, task]))
+  return {
+    rows: wanted.flatMap((id) => byId.get(id) ?? []),
+    issues: wanted
+      .filter((id) => !byId.has(id))
+      .map((id) => ({ id, error: new ApiClientError(`Task not found: ${id}`, 404) as unknown })),
+  }
+}
+
+// A server that predates `ids` ignores it and lists other tasks.
+async function readTasksOneByOne(api: Api, ids: string[], signal: AbortSignal) {
+  const rows: TaskInfo[] = [],
+    issues: { id: string; error: unknown }[] = []
+  for (const id of ids) {
+    signal.throwIfAborted()
+    try {
+      rows.push(await api.task(id, signal))
+    } catch (error) {
+      signal.throwIfAborted()
+      issues.push({ id, error })
+    }
+  }
+  return { rows, issues }
 }

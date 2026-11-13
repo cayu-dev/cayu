@@ -1364,7 +1364,8 @@ def _add_column_if_missing(
     connection: sqlite3.Connection, table: str, column: str, decl: str
 ) -> None:
     """Idempotently ``ALTER TABLE ... ADD COLUMN`` (SQLite lacks IF NOT EXISTS)."""
-    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    # table_xinfo also lists generated columns, which table_info leaves out.
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_xinfo({table})")}
     if column not in existing:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 

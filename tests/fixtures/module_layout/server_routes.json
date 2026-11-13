@@ -81,6 +81,7 @@
   "POST /api/tasks name=create_task class=_BoundedControlPlaneRequestRoute POST=create_task_api_tasks_post",
   "POST /api/tasks/{task_id}/replay name=replay_task class=_BoundedControlPlaneRequestRoute POST=replay_task_api_tasks__task_id__replay_post",
   "POST /api/tasks/{task_id}/cancel name=cancel_task class=_BoundedControlPlaneRequestRoute POST=cancel_task_api_tasks__task_id__cancel_post",
+  "GET /api/tasks/counts/check name=check_task_counts class=_BoundedControlPlaneRequestRoute GET=check_task_counts_api_tasks_counts_check_get",
   "GET /api/tasks/{task_id}/dependents name=dependents class=_BoundedControlPlaneRequestRoute GET=dependents_api_tasks__task_id__dependents_get",
   "POST /api/tasks/{task_id}/scrub-error name=scrub_task_error class=_BoundedControlPlaneRequestRoute POST=scrub_task_error_api_tasks__task_id__scrub_error_post",
   "POST /api/tasks/scrub-errors name=scrub_task_errors class=_BoundedControlPlaneRequestRoute POST=scrub_task_errors_api_tasks_scrub_errors_post",

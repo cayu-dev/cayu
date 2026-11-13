@@ -626,6 +626,16 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
       }
     },
     task: async (id) => wait(taskInfo(tasksContext, id)),
+    tasksByIds: async (ids) =>
+      wait(
+        [...new Set(ids)].flatMap((id) => {
+          try {
+            return [taskInfo(tasksContext, id)]
+          } catch {
+            return []
+          }
+        }),
+      ),
     taskScheduleEvents: async (id, afterSequence) =>
       wait(
         scheduleEvents(tasksContext, id)

@@ -825,6 +825,39 @@ specialist (`assigned_agent_name`), session, parent, public text search and
 types before counting and paging. Search matches public redacted text, never
 private input, result, metadata or a secret removed from the displayed fields.
 
+Since storage revision 151, SQLite and PostgreSQL filter, sort, page and count
+the index in SQL instead of reading every task. `cayu_tasks` has a generated
+`is_internal` column and indexes on `(updated_at DESC, id)` with and without the
+internal flag, status, type and agent in front. `cayu_task_counts` holds task
+counts by internal flag, status, type and assigned agent, and
+`cayu_task_prerequisites` holds one row per prerequisite, indexed both ways, for
+`GET /api/tasks/{id}/dependents`. Triggers on `cayu_tasks` keep both in the same
+transaction as every task write, older binaries' included. SQLite's triggers
+update the counts; PostgreSQL's append to `cayu_task_count_changes`, which index
+reads fold into the counts, so concurrent writers never lock shared count rows.
+Counts come from the table when the only filters are the internal flag, types and
+agent and the caller has no resource access bounds; otherwise one grouped query
+over the matching tasks. The list indexes also carry the other filter columns, so
+a filtered page reads only the rows it returns. A text search reads only the
+search columns of the tasks whose stored text could match (on SQLite from one
+covering index), decides each against its public redacted text, and decodes only
+the page. A generated `search_folds` column marks tasks whose text holds a
+character that casefolds to ASCII (such as `ß`), which a search always decides. A filter value or search needle that
+redaction could change, and the `input`/`metadata` value filters, keep the
+previous read that visits every task. SQLite task reads use read-only
+connections and never wait for the store's writer. Task stores require revision
+151; run `cayu storage migrate` before starting the upgraded application.
+
+`cayu task counts` shows the stored counts by status, and `cayu task counts
+--recompute` compares them with a recount of every task and exits 1 when they
+differ. Against an Agent it reads `GET /api/tasks/counts/check`, which needs
+access to every task.
+
+`GET /api/tasks?ids=…` (repeated, at most 100) returns the detail of each listed
+task that exists and is visible, in the order given, with no other parameter. The
+task page reads a task's prerequisites and parent, and each step of its retry
+chain, with it.
+
 Follow `next_cursor` with the same filters; do not send `offset` with
 `include=counts`. These are keyset pages, not offsets disguised as cursors.
 Each response has fresh counts and an observation time; pages do not retain a

@@ -43,6 +43,7 @@ from cayu.storage._task_group_schema import (
     POSTGRES_TASK_GROUP_DDL,
     POSTGRES_TASK_GROUP_QUIESCENCE_DDL,
 )
+from cayu.storage._task_index_schema import POSTGRES_TASK_INDEX_DDL, TASK_INDEX_REVISION
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
 from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
@@ -1011,6 +1012,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         first_used_at TIMESTAMPTZ NOT NULL
     )""",
     ),
+    # Task list indexes, trigger-maintained status counts and prerequisite edges.
+    TASK_INDEX_REVISION: POSTGRES_TASK_INDEX_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
