@@ -135,7 +135,8 @@ the 15-minute expiry measured from the authenticated issuance time. Every page
 rechecks current authorization.
 
 The key is `inbox_cursor_key`, an optional 32-byte key passed to `create_server`,
-`mount_cayu` or `create_router`. Without one, each server generates a key of its
+`mount_cayu` or `create_router`; a person's own inbox on `create_resource_router` uses
+the same key. Without one, each server generates a key of its
 own when it starts, so its sealed cursors stop working when it restarts and don't
 work on another worker. When several workers serve an inbox with an access rule,
 give them the same key, kept in the install's secret store, so a cursor works on
@@ -473,6 +474,71 @@ When the application configures a [human-review policy](human-review.md), approv
 denying and answering also need its `review_reference`, issued to the same person,
 exactly as `POST /api/tool-approvals/resolve` and `POST /api/user-input/resolve` do.
 
+### A person's own inbox
+
+An application whose own users decide (the b2b preset's customers) shouldn't open
+`/api` to them: the rule above scopes the items, not the session routes beside them.
+Give them their inbox through the [resource access policy](resource-access.md)
+instead. `(await app.access(subject)).inbox` is a `ScopedInboxAccess`: the approvals
+and questions of sessions that subject may continue, the rule
+`ScopedCayuAccess.resume` uses (the session's stored resource binding names the
+subject under the policy's authority, and the subject's current decision covers the
+session's labels for `execute`). In b2b that is the conversation's owner.
+
+```python
+inbox = (await app.access("alice")).inbox
+page = await inbox.list()                     # list(kind=None, session_id=None, cursor=None, limit=50)
+counts = await inbox.counts()
+state = await inbox.get(page.items[0].id)
+await inbox.settle(page.items[0].id, InboxSettleRequest(decision="approve"), tenant="acme")
+view = await inbox.review(session_id, "approvals")
+```
+
+It lists from the person's own waiting sessions, so it counts exactly
+(`source_incomplete` when a session couldn't be read or the scan ran out). Its
+`next_cursor` is sealed like a limited caller's on `/api`, since the store's position
+names a private session id: it opens only for the same person and filters, for 15
+minutes, and any other cursor gets 422. It uses the deployment's `inbox_cursor_key`
+(below): the one `create_server`, `mount_cayu` or `create_router` was given for the app,
+or, for a resource router served without them, `create_resource_router(...,
+inbox_cursor_key=...)`. Without one, each process makes its own key, so with several
+replicas a cursor works only on the one that issued it. Reads and
+settles use the same inbox code as `/api`, with the subject as `decided_by` and the
+continuation run under the session's stored binding, so revoking the person's access
+stops it. A person approves or denies the call as the agent proposed it, or answers
+a question; changing the call is an operator's decision, as on `/api`, where changed
+arguments need a `full_access` role. Knowledge proposals and recovery items stay with
+operators and are never listed. So `arguments`, `approval_revision`, `dismiss`,
+`keep`, `drop`, `task_worker_id`, `task_handoff_id`, `task_continuation` and
+`profile_adoption` raise `InboxRefused` (422). An item the person can't see raises
+`ResourceAccessDenied`.
+
+`create_resource_router(..., inbox=True)` serves it under the router's prefix on the
+paths and bodies of `/api`: `GET /inbox`, `GET /inbox/counts`, `GET /inbox/{item_id}`,
+`POST /inbox/{item_id}/settle`, `GET /sessions/{id}/human-review?purpose=` and
+`POST /sessions/{id}/human-review/long-field`. A hidden, foreign or absent item gets
+404 `Resource unavailable.`; a refused settle gets the same 409 `InboxConflict` as
+`/api`; the operator-only fields get 422; a review reference issued to someone else
+gets 403. When `authenticate` returns a `ProductPrincipal` (with `principal_subject=`
+naming its subject), its `tenant_id` is the decider's tenant. Because the app's own
+sign-in names the person, this works under
+`cayu serve --dev` too, where `/api` has no caller and records no decider.
+
+For operators or Cloud members who do use `/api`, `cayu.server.inbox.resource_access_rule(app)`
+is the same rule as an `InboxAccess`. `cayu serve` takes a rule factory, called with
+the app:
+
+```toml
+[tool.cayu.serve]
+auth = "cayu.server.environment_auth:OPERATOR_ONLY_AUTH"
+inbox_access = "cayu.server.inbox:resource_access_rule"
+```
+
+Under `--dev` there is no authenticated caller, so the rule isn't applied, and
+`cayu serve` says so; `cayu serve --identity-proxy` shows it as a signed-in person.
+`cayu check` reports `SERVE_INBOX_ACCESS_UNRESOLVABLE` for a target that doesn't load
+or isn't callable.
+
 ## One record, three places
 
 The inbox doesn't keep a copy. Settling an item claims the same pending approval or
@@ -505,6 +571,7 @@ $ cayu inbox dismiss inbox_... --reason "The run ended on Oct 25."
 $ cayu inbox approve --session invoice-7 --reason "Checked."
 $ cayu inbox answer inbox_... "Week of 17 November"
 $ cayu inbox answer --session auditor-visit --option 1
+$ cayu inbox list --as alice
 ```
 
 `dismiss` takes recovery items, approvals and questions, as described above.
@@ -515,6 +582,9 @@ continues the session in this process like an approval does. A question asked un
 the demonstration provider (`cayu session start --scripted-tool-call ask_user=...`)
 continues with its canned replies, since the local inbox registers it as
 `cayu serve --dev` does.
+Locally, `--as SUBJECT` reads and decides through
+`app.access(SUBJECT).inbox`, so a developer sees exactly what alice sees and her
+decisions are recorded as hers; the application needs a resource access policy.
 
 `list` reads the inbox page by page until every item is listed, then prints them
 oldest first, so a large inbox is listed whole. `--limit N` (1 to 200) lists one page

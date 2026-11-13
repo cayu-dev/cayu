@@ -31,7 +31,7 @@ from cayu.cli._serve_readiness import (
     server_extra_state,
 )
 from cayu.cli._targets import TargetResolutionError, load_target
-from cayu.cli.check import check_project
+from cayu.cli.check import check_project, serve_identity_proxy_findings
 from cayu.cli.project import (
     ProjectError,
     _project_import_roots,
@@ -43,6 +43,7 @@ from cayu.cli.scaffold_check import check_declared_scaffold_source, import_block
 from cayu.cli.serve import (
     ServeError,
     parse_serve_arguments,
+    require_identity_proxy_for_person_options,
     require_loopback_dev_host,
     serve_auth_target,
 )
@@ -145,6 +146,8 @@ def run_cloud_deploy_check(
     if checks_serve:
         assert web_command is not None
         serve_blocking, serve_reason = check_serve_can_start(root, web_command)
+        # Every `cayu serve` reads [tool.cayu.serve.identity_proxy] and refuses a bad one.
+        serve_blocking += serve_identity_proxy_findings(root)
     if "service_factory" not in configuration.config:
         if not checks_serve:
             return CloudDeployCheck(status="not_applicable")
@@ -263,6 +266,7 @@ def check_serve_can_start(
             )
     try:
         arguments = parse_serve_arguments(shlex.split(web_command)[2:])
+        require_identity_proxy_for_person_options(arguments)
     except (ServeError, ValueError) as exc:
         findings.append(
             _serve_diagnostic(
@@ -284,6 +288,24 @@ def check_serve_can_start(
         )
     if arguments.dev:
         findings.append(_dev_finding(arguments.host))
+        return tuple(findings), None
+    if arguments.identity_proxy:
+        findings.append(
+            _serve_diagnostic(
+                "SERVE_IDENTITY_PROXY_MODE",
+                path=_WEB_COMMAND_PATH,
+                message=(
+                    "`cayu serve --identity-proxy` signs requests in as any person with a "
+                    "key of its own, for local development; it refuses non-loopback hosts "
+                    "and the proxy identity variables Cayu Cloud sets."
+                ),
+                hint=(
+                    "Remove --identity-proxy (and --as, --org, --role, --name and --email) "
+                    "from the [web] command in cayu-cloud.toml; Cayu Cloud's router signs "
+                    "people in."
+                ),
+            )
+        )
         return tuple(findings), None
     auth = serve_auth_state(document)
     reason: str | None = None

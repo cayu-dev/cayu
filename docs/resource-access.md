@@ -183,7 +183,16 @@ server.include_router(create_resource_router(app, authenticate=authenticate))
 The router exposes session queries/records/mutations, tasks, graph/group reads,
 event export, usage, supervision events, run/resume/fork streams, and configured
 artifact operations.
-Supply `knowledge_scope` to enable knowledge read/search routes. Artifact store
+Supply `knowledge_scope` to enable knowledge read/search routes, and `inbox=True`
+to serve the person's own inbox (`ScopedCayuAccess.inbox`) on the paths of `/api`'s
+inbox and human-review routes; see [the inbox](inbox.md#a-persons-own-inbox).
+`authenticate` may return a `ProductPrincipal`, such as a product dependency's,
+with `principal_subject=`, which says which subject the policy resolves for it. The
+policy sees only that string, so `lambda principal: principal.subject_id` is right
+only when subject ids are unique across tenants; otherwise return a subject that
+names the tenant, or raise `HTTPException` for a tenant the app doesn't serve. A
+principal without `principal_subject` raises `TypeError` instead of losing its
+tenant. Artifact store
 aliases and environments are host configuration, never client-selected backend
 credentials. Keep the packaged Developer dashboard behind its own separate access policy.
 Application membership/RBAC and HTTP ingress rate limits are separate concerns.

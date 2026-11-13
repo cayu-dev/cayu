@@ -487,7 +487,18 @@ adds, refuses an invalid one with 401, and sends requests without it to a
 fallback such as the Developer dashboard login. `environment_auth:OPERATOR_BASIC_AUTH` turns
 it on when `CAYU_PROXY_IDENTITY_ISSUER`, `CAYU_PROXY_IDENTITY_AUDIENCE` and
 `CAYU_PROXY_IDENTITY_JWKS_URL` are set; on the Developer dashboard a `member` may only
-read and decide.
+read and decide. To see that path locally, run `uv run cayu serve --identity-proxy
+--as alice`: it serves with the project's real auth (never with `--dev`, and only on
+loopback), signs each request in as a chosen person with a key held in the process,
+and serves a person picker at `/.cayu/sign-in`. `X-Cayu-Dev-Person: alice` or
+`X-Cayu-Dev-Person: sub=bob&org=acme&role=developer` picks the person for one request.
+`create_resource_router(..., inbox=True)` gives an application's own users their
+inbox (the approvals and questions of sessions they may continue) without opening
+`/api`, and `[tool.cayu.serve] inbox_access = "cayu.server.inbox:resource_access_rule"`
+applies the same rule on `/api`; `cayu inbox list --as alice` shows what alice sees.
+`[tool.cayu.serve.identity_proxy]` lists the people and the default, and
+`cayu.server.development_identity.DevelopmentIdentityProxy` mints the same tokens in
+tests.
 
 ## advanced-runtime
 

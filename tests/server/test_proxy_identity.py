@@ -612,14 +612,24 @@ def test_product_dependency_takes_the_person_from_the_identity_and_checks_roles(
     admins_only = auth.product_dependency(roles=("admin",))
 
     @app.get("/reports")
-    async def reports(principal: ProductPrincipal = Depends(admins_only)) -> dict[str, str]:  # noqa: B008
+    async def reports(principal: ProductPrincipal = Depends(admins_only)) -> dict[str, str | None]:  # noqa: B008
         return principal.model_dump()
 
     client = TestClient(app)
 
     allowed = client.get("/reports", headers=_as(_token(signing_key, role="admin")))
     assert allowed.status_code == 200
-    assert allowed.json() == {"tenant_id": "org-1", "subject_id": "person-1"}
+    # The token's name and email are the principal's display profile.
+    assert allowed.json() == {
+        "tenant_id": "org-1",
+        "subject_id": "person-1",
+        "name": "Ada Lovelace",
+        "email": "ada@example.com",
+    }
+    bare = client.get(
+        "/reports", headers=_as(_token(signing_key, role="admin", remove=("name", "email")))
+    )
+    assert (bare.json()["name"], bare.json()["email"]) == (None, None)
     assert (
         client.get("/reports", headers=_as(_token(signing_key, role="member"))).status_code == 403
     )

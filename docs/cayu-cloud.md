@@ -1951,6 +1951,11 @@ admins = auth.product_dependency(roles=("admin",))
 async def close_month(principal: Annotated[ProductPrincipal, Depends(admins)]) -> None: ...
 ```
 
+`principal.name` and `principal.email` are the person's name and email when Cloud
+has them, for display only. Cloud's `org` is the Organization the Agent was created
+in, not the person's own, so an app with customers of its own keeps their
+membership in its own tables.
+
 An app with a login of its own needs no change: it never reads the header. The
 header's format and the server's checks are in the
 [runtime contracts](runtime-contracts.md#trusted-proxy-identity).
@@ -2096,9 +2101,11 @@ and don't need `cayu[server]` installed locally:
 | --- | --- |
 | `SERVE_SERVER_EXTRA_MISSING` | `[project].dependencies` has no `cayu` requirement with the `server` extra or an extra that includes its dependencies (`all`, `server-settings`, or `oidc`). |
 | `SERVE_LOCK_MISSING_SERVER_EXTRA` | `pyproject.toml` declares server dependencies through one of those extras but `uv.lock` doesn't; Cloud installs from `uv.lock`. Run `uv lock`. |
-| `SERVE_COMMAND_INVALID` | `cayu serve` would reject the web command's arguments, for example `--dev` with `--auth`, an unknown option, or an unclosed quote. |
+| `SERVE_COMMAND_INVALID` | `cayu serve` would reject the web command's arguments, for example `--dev` with `--auth`, `--as` without `--identity-proxy`, an unknown option, or an unclosed quote. |
 | `SERVE_RELOAD_MODE` | The web command passes development-only `--reload`. Remove it before deploying; Cloud must not run the file watcher or restart on source edits. |
 | `SERVE_DEV_MODE` | The web command passes `--dev`. `cayu serve` refuses it on a non-loopback host such as `0.0.0.0`, and on loopback it is unauthenticated and unreachable from Cloud. |
+| `SERVE_IDENTITY_PROXY_MODE` | The web command passes `--identity-proxy`, the local development sign-in. Cayu Cloud's router signs people in; `cayu serve` would also refuse the proxy identity variables Cloud sets. |
+| `SERVE_IDENTITY_PROXY_INVALID` | `[tool.cayu.serve.identity_proxy]` is malformed. Every `cayu serve` reads it, with or without `--identity-proxy`, so the web process would exit at startup. |
 | `SERVE_AUTH_MISSING` | Neither `--auth` nor `[tool.cayu.serve].auth` names a target and there is no `service_factory`, or `[tool.cayu.serve].auth` is not a non-empty string (which `cayu serve` rejects even with `--auth`). |
 | `SERVE_AUTH_TARGET_UNRESOLVABLE` | The effective target's project module or attribute doesn't exist, it isn't callable, or it is the ready-made target and the declared runtime may not ship it: the `cayu` requirement allows 0.8.1 or older, or the `[tool.uv.sources]` entry for `cayu` isn't an uploaded path source inside the project that contains the module. The message names which. |
 | `SERVE_AUTH_WITH_SERVICE_FACTORY` | A public service also sets `[tool.cayu.serve].auth` or `--auth`, which `cayu serve` rejects. |

@@ -21498,7 +21498,8 @@ relative to the API path, which `create_server` and `mount_cayu` give the rule.
 
 A product reads the person from the same `AuthContext`, or uses
 `ProxyIdentityAuth.product_dependency(roles=...)` for `AuthenticatedProductAccess`:
-`org` is the tenant and `sub` the subject, a request without the header gets 401
+`org` is the tenant and `sub` the subject (`name` and `email`, when sent, are the
+principal's display-only `name` and `email`), a request without the header gets 401
 (the fallback is for the control plane), and a role outside `roles` gets 403.
 
 The proxy must remove any `X-Cayu-Identity` a client sent before adding its own,

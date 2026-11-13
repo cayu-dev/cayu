@@ -314,7 +314,7 @@ def test_reload_worker_closes_context_after_startup_failure(tmp_path, monkeypatc
         if cleanup_fails:
             raise cleanup
 
-    def build(*_args):
+    def build(*_args, **_kwargs):
         raise primary
 
     monkeypatch.setattr(
@@ -365,7 +365,7 @@ def test_reload_worker_preserves_delivered_cancellation_and_closes_context(tmp_p
             "serve_project_control_plane",
             lambda *a, **kw: SimpleNamespace(close=close),
         )
-        monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a: inner)
+        monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a, **kw: inner)
         server = reload_cli.create_reload_app()
         task = asyncio.create_task(server({"type": "lifespan"}, receive, None))
         await entered.wait()
@@ -676,7 +676,7 @@ def test_reload_worker_closes_bootstrap_resources_when_server_setup_fails(
         "serve_project_control_plane",
         lambda *a, **kw: SimpleNamespace(close=close),
     )
-    monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a: object())
+    monkeypatch.setattr(reload_cli, "_build_serve_app", lambda *a, **kw: object())
     monkeypatch.setattr(uvicorn.Server, "run", start)
     server = reload_cli._ReloadServer(uvicorn.Config("unused:app", log_config=None))
     cwd = Path.cwd()

@@ -218,6 +218,7 @@ class LocalInbox:
         | None = None,
         wait_seconds: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        scoped: bool = False,
     ) -> None:
         self._wait_seconds = wait_seconds
         self._monotonic = monotonic
@@ -238,20 +239,39 @@ class LocalInbox:
 
         identity = AuthContext(subject=reviewer)
         api = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
-        api.include_router(
-            create_router(
-                cayu_app=app,
-                session_store=app.session_store,
-                task_store=app.task_store,
-                knowledge_store=app.knowledge_store,
-                knowledge_access_scope=app.knowledge_access_scope,
-                knowledge_review_namespace=app.knowledge_review_namespace,
-                knowledge_review_labels=app.knowledge_review_labels,
-                auth=lambda _request: identity,
-                openapi_url=None,
-                continuation_loop_policy_provider=continuation_loop_policies,
+        if scoped:
+            # `--as`: the reviewer's own inbox, `app.access(reviewer).inbox`, served on the
+            # same paths, so the commands read and settle only what that person may.
+            from cayu.server.resource_access import create_resource_router
+
+            if app.resource_access_policy is None:
+                raise InboxClientError(
+                    "no_resource_access",
+                    "--as reads a person's inbox through the application's resource access "
+                    "policy, and this application has none.",
+                )
+
+            async def person(_request: Any) -> str:
+                return reviewer
+
+            api.include_router(
+                create_resource_router(app, authenticate=person, prefix="/api", inbox=True)
             )
-        )
+        else:
+            api.include_router(
+                create_router(
+                    cayu_app=app,
+                    session_store=app.session_store,
+                    task_store=app.task_store,
+                    knowledge_store=app.knowledge_store,
+                    knowledge_access_scope=app.knowledge_access_scope,
+                    knowledge_review_namespace=app.knowledge_review_namespace,
+                    knowledge_review_labels=app.knowledge_review_labels,
+                    auth=lambda _request: identity,
+                    openapi_url=None,
+                    continuation_loop_policy_provider=continuation_loop_policies,
+                )
+            )
         self._http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api), base_url="http://cayu.local"
         )

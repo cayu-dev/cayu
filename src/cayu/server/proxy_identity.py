@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_MAX_LIFETIME_SECONDS",
     "DEFAULT_PROXY_IDENTITY_HEADER",
+    "DEVELOPMENT_IDENTITY_ISSUER",
     "PROXY_IDENTITY_AUDIENCE_VARIABLE",
     "PROXY_IDENTITY_HEADER_VARIABLE",
     "PROXY_IDENTITY_ISSUER_VARIABLE",
@@ -87,6 +88,10 @@ _REQUIRED_VARIABLES: Final = (
 )
 
 DEFAULT_PROXY_IDENTITY_HEADER: Final = "X-Cayu-Identity"
+#: The issuer of ``cayu.server.development_identity``'s in-process proxy. The
+#: ``.invalid`` name never resolves, so only a proxy registered in this process
+#: can be trusted under it.
+DEVELOPMENT_IDENTITY_ISSUER: Final = "https://identity-proxy.cayu.invalid"
 #: The JWS header ``typ`` a proxy identity carries, so no other token from the
 #: same keys (a sign-in code, an API token) is accepted in its place.
 PROXY_IDENTITY_TOKEN_TYPE: Final = "cayu-proxy-identity+jwt"
@@ -500,6 +505,11 @@ class ProxyIdentityAuth:
         that is missing or holds an unusable value raises
         ``AuthConfigurationError`` naming it, never its value. Other keyword
         arguments go to the constructor; ``environ`` replaces ``os.environ``.
+
+        An issuer of ``https://identity-proxy.cayu.invalid`` names the development
+        identity proxy (``cayu.server.development_identity``): its keys are read in
+        memory from the proxy registered in this process, as ``cayu serve
+        --identity-proxy`` does, and without one this raises ``AuthConfigurationError``.
         """
 
         source: Mapping[str, str] = os.environ if environ is None else environ
@@ -511,6 +521,15 @@ class ProxyIdentityAuth:
         audience = _value(source, PROXY_IDENTITY_AUDIENCE_VARIABLE)
         jwks_url = _value(source, PROXY_IDENTITY_JWKS_URL_VARIABLE)
         header = _value(source, PROXY_IDENTITY_HEADER_VARIABLE) or DEFAULT_PROXY_IDENTITY_HEADER
+        if issuer == DEVELOPMENT_IDENTITY_ISSUER:
+            return cls(
+                issuer=issuer,
+                audience=audience,
+                header=header,
+                fallback=fallback,
+                signing_keys=_development_signing_keys(audience, jwks_url, header),
+                **options,
+            )
         allow_insecure_loopback = options.get("allow_insecure_loopback", False)
         if type(allow_insecure_loopback) is not bool:
             raise ValueError("`allow_insecure_loopback` must be a boolean.")
@@ -622,7 +641,8 @@ class ProxyIdentityAuth:
         """Return a product auth dependency for people the proxy signed in.
 
         The Organization (``org``) is the tenant and the person (``sub``) the
-        subject. Only a proxy identity is accepted, never ``fallback``: a request
+        subject; the token's ``name`` and ``email``, when sent, are the principal's
+        display ``name`` and ``email``. Only a proxy identity is accepted, never ``fallback``: a request
         without the header gets 401, and a person whose role is not in ``roles``
         (default: every accepted role) gets 403.
         """
@@ -638,7 +658,12 @@ class ProxyIdentityAuth:
             if context.claims.get("role") not in allowed:
                 raise _role_forbidden()
             try:
-                return ProductPrincipal(tenant_id=context.tenant or "", subject_id=context.subject)
+                return ProductPrincipal(
+                    tenant_id=context.tenant or "",
+                    subject_id=context.subject,
+                    name=context.claims.get("name"),
+                    email=context.claims.get("email"),
+                )
             except ValidationError:
                 raise _invalid_identity() from None
 
@@ -671,6 +696,24 @@ class ProxyIdentityAuth:
             tenant=context.tenant,
             claims={**context.claims, "role": self.fallback_role},
         )
+
+
+def _development_signing_keys(audience: str, jwks_url: str, header: str) -> OidcSigningKeys:
+    from cayu.server.development_identity import registered_development_identity
+
+    proxy = registered_development_identity()
+    if proxy is None:
+        raise AuthConfigurationError(
+            f"{PROXY_IDENTITY_ISSUER_VARIABLE} names the development identity proxy, which "
+            "only `cayu serve --identity-proxy` runs. Unset the CAYU_PROXY_IDENTITY_* "
+            "variables, or set them to your sign-in proxy's."
+        )
+    if (proxy.audience, proxy.jwks_url, proxy.header) != (audience, jwks_url, header):
+        raise AuthConfigurationError(
+            "The CAYU_PROXY_IDENTITY_* variables don't match the development identity "
+            "proxy running in this process."
+        )
+    return proxy.signing_keys()
 
 
 def _cross_origin_write(request: HTTPConnection, expected_origin: str | None = None) -> bool:

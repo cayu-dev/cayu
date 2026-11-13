@@ -769,6 +769,8 @@ class OidcBearerAuth:
         *,
         tenant_claim: ClaimPath | None = None,
         subject_claim: ClaimPath | None = None,
+        name_claim: ClaimPath | None = "name",
+        email_claim: ClaimPath | None = "email",
     ) -> Callable[[Request], Awaitable[ProductPrincipal]]:
         """Return a product auth dependency for ``AuthenticatedProductAccess``.
 
@@ -776,6 +778,10 @@ class OidcBearerAuth:
         (or the verifier's own ``tenant_claim``) and ``subject_claim`` (or the
         verifier's). A token without a usable tenant claim is rejected with 401;
         there is no default tenant. Both values must be non-blank strings.
+
+        ``name_claim`` and ``email_claim`` (``name`` and ``email`` by default; ``None``
+        to leave one out) fill the principal's display ``name`` and ``email``. A
+        missing or unusable value is ``None`` and never refuses the token.
         """
 
         tenant_path = (
@@ -793,6 +799,10 @@ class OidcBearerAuth:
             if subject_claim is not None
             else self.subject_claim
         )
+        name_path = None if name_claim is None else _require_claim_path(name_claim, "name_claim")
+        email_path = (
+            None if email_claim is None else _require_claim_path(email_claim, "email_claim")
+        )
 
         async def authenticate(request: Request) -> ProductPrincipal:
             claims = await self.verify_request(request)
@@ -801,7 +811,12 @@ class OidcBearerAuth:
             if not _valid_identity(tenant) or not _valid_identity(subject):
                 raise self._http_error(self._reject("token tenant or subject claim is missing"))
             try:
-                return ProductPrincipal(tenant_id=tenant, subject_id=subject)
+                return ProductPrincipal(
+                    tenant_id=tenant,
+                    subject_id=subject,
+                    name=None if name_path is None else _claim(claims, name_path),
+                    email=None if email_path is None else _claim(claims, email_path),
+                )
             except ValidationError:
                 raise self._http_error(
                     self._reject("token tenant or subject claim is invalid")

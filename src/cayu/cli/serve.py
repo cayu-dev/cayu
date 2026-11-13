@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import dataclasses
 import importlib
 import inspect
 import math
+import os
+import secrets
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +18,11 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
+from cayu._development_people import (
+    DEVELOPMENT_ROLES,
+    DevelopmentPerson,
+    parse_identity_proxy_table,
+)
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     OPERATOR_PASSWORD_VARIABLE,
@@ -43,6 +51,26 @@ class ServeError(ValueError):
     """The configured server process cannot be started safely."""
 
 
+# `cayu.server.proxy_identity`'s variables, named here so parsing needs no server extra.
+_PROXY_IDENTITY_VARIABLES = (
+    "CAYU_PROXY_IDENTITY_ISSUER",
+    "CAYU_PROXY_IDENTITY_AUDIENCE",
+    "CAYU_PROXY_IDENTITY_JWKS_URL",
+    "CAYU_PROXY_IDENTITY_HEADER",
+)
+_IDENTITY_PERSON_OPTIONS = (
+    ("identity_org", "--org", "org"),
+    ("identity_role", "--role", "role"),
+    ("identity_name", "--name", "name"),
+    ("identity_email", "--email", "email"),
+)
+#: Every option that describes the `--identity-proxy` person, in the order reload passes them.
+_IDENTITY_OPTIONS = (
+    ("identity_as", "--as"),
+    *((attribute, option) for attribute, option, _ in _IDENTITY_PERSON_OPTIONS),
+)
+
+
 @dataclass(frozen=True)
 class _ServeSettings:
     auth_target: str | None = None
@@ -60,6 +88,12 @@ class _ServeSettings:
     ui: Path | None = None
     # `RequestTimingConfig` fields the project sets, such as `long_request_seconds`.
     request_timing: tuple[tuple[str, Any], ...] = ()
+    # A `module:function` target called with the app and returning the
+    # `cayu.server.inbox.InboxAccess` rule `create_server` applies on every inbox route.
+    inbox_access: str | None = None
+    # `[tool.cayu.serve.identity_proxy]`: who `--identity-proxy` can sign in as.
+    identity_people: tuple[DevelopmentPerson, ...] = ()
+    identity_default: str | None = None
 
 
 def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -142,6 +176,33 @@ def add_serve_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="MODULE:ATTRIBUTE",
         help="Override [tool.cayu.serve].auth with a protected auth dependency target.",
     )
+    identity = parser.add_argument_group(
+        "development identity proxy",
+        "Sign requests in as a chosen person, as Cayu Cloud's router does, with a key "
+        "that lives only in this process. Loopback only; serves with the project's real "
+        "auth, so the app takes its deployed sign-in path. Pick a person at "
+        "/.cayu/sign-in or per request with an X-Cayu-Dev-Person header.",
+    )
+    identity.add_argument(
+        "--identity-proxy",
+        action="store_true",
+        help="Run the development identity proxy in front of the server. Not with --dev.",
+    )
+    identity.add_argument(
+        "--as",
+        dest="identity_as",
+        metavar="SUBJECT",
+        help="The person signed in until another is picked; overrides "
+        "[tool.cayu.serve.identity_proxy].default.",
+    )
+    identity.add_argument(
+        "--org", dest="identity_org", metavar="ORG", help="The --as person's org."
+    )
+    identity.add_argument(
+        "--role", dest="identity_role", choices=DEVELOPMENT_ROLES, help="The --as person's role."
+    )
+    identity.add_argument("--name", dest="identity_name", metavar="NAME", help="Their name.")
+    identity.add_argument("--email", dest="identity_email", metavar="EMAIL", help="Their email.")
 
 
 def _resolve_serve_project(
@@ -149,8 +210,11 @@ def _resolve_serve_project(
 ) -> tuple[CayuProject, _ServeSettings]:
     if args.dev:
         require_loopback_dev_host(args.host)
+    _check_identity_proxy_arguments(args)
     project = resolve_project(command="cayu serve", suggest_explicit_target=False, start=start)
     settings = _serve_settings(project.root)
+    if args.identity_proxy:
+        identity_proxy_default(args, settings)
     auth_target = serve_auth_target(args, settings.auth_target)
     if args.price_book is not None:
         # Resolve before project_context changes the working directory or reload spawns.
@@ -171,6 +235,11 @@ def _resolve_serve_project(
         raise ServeError(
             "[tool.cayu.serve].routers is for projects served by their factory; a "
             "maintained public service declares its product routes in its service_factory."
+        )
+    if project.service_target is not None and settings.inbox_access is not None:
+        raise ServeError(
+            "[tool.cayu.serve].inbox_access is for projects served by their factory; a "
+            "maintained public service passes inbox_access in its service_factory."
         )
     if project.service_target is not None and settings.ui is not None:
         raise ServeError(
@@ -218,8 +287,14 @@ def _build_serve_app(
     project: CayuProject,
     settings: _ServeSettings,
     project_control_plane: ProjectControlPlaneContext,
+    *,
+    identity_proxy: Any,
 ):
-    """Assemble either supported server with the same access and lifecycle policy."""
+    """Assemble either supported server with the same access and lifecycle policy.
+
+    ``identity_proxy`` is what ``start_serve_identity_proxy(args)`` returned, before
+    any project code was imported.
+    """
     server_module = importlib.import_module("cayu.server")
     service_mode = "development" if args.dev else "production"
     auth_target = serve_auth_target(args, settings.auth_target)
@@ -272,6 +347,8 @@ def _build_serve_app(
                 "create_agent_service(...), which then mounts the delivery route."
             )
         server = service.asgi_app
+        if identity_proxy is not None:
+            server = _with_identity_proxy(server, identity_proxy, args, settings)
         print(
             "Cayu product service: "
             f"{_service_endpoint_url(args.host, args.port, service.manifest.product_api_path)}"
@@ -283,6 +360,18 @@ def _build_serve_app(
         )
     else:
         auth = None if args.dev else _load_auth(auth_target)
+        if identity_proxy is not None:
+            from cayu.server.proxy_identity import ProxyIdentityAuth
+
+            if not isinstance(auth, ProxyIdentityAuth):
+                print(
+                    f"warning: --identity-proxy changes nothing for /api: its auth target "
+                    f"{auth_target} isn't a ProxyIdentityAuth. Use "
+                    '"cayu.server.environment_auth:OPERATOR_ONLY_AUTH" or '
+                    "ProxyIdentityAuth.from_environment(...) to trust it.",
+                    file=sys.stderr,
+                    flush=True,
+                )
         price_book = args.price_book or settings.price_book
         runtime_config = {}
         if price_book is not None:
@@ -328,6 +417,7 @@ def _build_serve_app(
             app,
             config=config,
             project_context=project_control_plane,
+            inbox_access=_load_inbox_access(settings.inbox_access, app, development=args.dev),
         )
         _include_project_routers(server, app, settings.routers, development=args.dev, auth=auth)
         if settings.ui is not None:
@@ -338,6 +428,8 @@ def _build_serve_app(
                 serve_web_app(server, settings.ui)
             except WebAppError as exc:
                 raise ServeError(f"[tool.cayu.serve].ui: {exc}") from exc
+        if identity_proxy is not None:
+            server = _with_identity_proxy(server, identity_proxy, args, settings)
         hosting = app._external_wait_hosting
         if hosting is not None and hosting.delivery_path is not None:
             print(f"External-wait delivery: POST {hosting.delivery_path}/{{source}}")
@@ -374,6 +466,13 @@ def register_demo_provider(app: Any) -> bool:
 def request_log_covers(server: Any) -> bool:
     """Whether Cayu's request log has a line for every request ``server`` answers."""
 
+    # Only --identity-proxy imports this module, and then it wraps ``server``.
+    development_identity = sys.modules.get("cayu.server.development_identity")
+    if development_identity is not None and isinstance(
+        server, development_identity.DevelopmentIdentityMiddleware
+    ):
+        # Its sign-in pages aside, every request reaches the server it wraps.
+        server = server.app
     return getattr(getattr(server, "state", None), "cayu_request_log_covers_server", False) is True
 
 
@@ -513,6 +612,9 @@ def run_serve(args: argparse.Namespace) -> int:
     exit_code = 0
     try:
         project, settings = _resolve_serve_project(args)
+        if args.identity_proxy:
+            # Before --reload spawns, so every worker keeps the same login.
+            _ensure_operator_login()
         try:
             uvicorn = importlib.import_module("uvicorn")
         except ModuleNotFoundError as exc:
@@ -528,8 +630,15 @@ def run_serve(args: argparse.Namespace) -> int:
         else:
             with project_context(project.root):
                 try:
+                    identity_proxy = start_serve_identity_proxy(args)
                     project_control_plane = serve_project_control_plane(args, project)
-                    server = _build_serve_app(args, project, settings, project_control_plane)
+                    server = _build_serve_app(
+                        args,
+                        project,
+                        settings,
+                        project_control_plane,
+                        identity_proxy=identity_proxy,
+                    )
                 except SystemExit as exc:
                     status = exc.code if type(exc.code) is int else 1
                     raise ServeError(
@@ -555,20 +664,160 @@ def run_serve(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _is_loopback_bind_host(host: str) -> bool:
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return host.casefold() == "localhost"
+
+
 def require_loopback_dev_host(host: str) -> None:
     """Refuse `--dev` on any host but loopback, as `cayu serve` does."""
 
-    try:
-        is_loopback = ip_address(host).is_loopback
-    except ValueError:
-        is_loopback = host.casefold() == "localhost"
-    if not is_loopback:
+    if not _is_loopback_bind_host(host):
         raise ServeError(
             "Refusing to expose an unauthenticated API and Developer dashboard on a "
             "non-loopback host. "
             "Use --dev with a loopback host such as 127.0.0.1 or ::1, or configure "
             "authentication before binding publicly."
         )
+
+
+def require_identity_proxy_for_person_options(args: argparse.Namespace) -> None:
+    """Refuse `--as`, `--org`, `--role`, `--name` and `--email` without `--identity-proxy`."""
+
+    if args.identity_proxy:
+        return
+    person_options = [
+        option for attribute, option in _IDENTITY_OPTIONS if getattr(args, attribute) is not None
+    ]
+    if person_options:
+        raise ServeError(f"{', '.join(person_options)} only apply with --identity-proxy.")
+
+
+def _check_identity_proxy_arguments(args: argparse.Namespace) -> None:
+    require_identity_proxy_for_person_options(args)
+    if not args.identity_proxy:
+        return
+    if args.dev:
+        raise ServeError(
+            "--identity-proxy can't be combined with --dev: it serves with the project's "
+            "real auth, so the app takes its deployed sign-in path."
+        )
+    if not _is_loopback_bind_host(args.host):
+        raise ServeError(
+            "Refusing to run the development identity proxy on a non-loopback host: "
+            "anyone who can reach it could sign in as anybody. Use a loopback host such "
+            "as 127.0.0.1 or ::1."
+        )
+    already = [name for name in _PROXY_IDENTITY_VARIABLES if os.environ.get(name, "").strip()]
+    if already:
+        raise ServeError(
+            f"--identity-proxy sets the proxy identity variables itself, but "
+            f"{', '.join(already)} {'is' if len(already) == 1 else 'are'} already set. "
+            "Unset them, or serve without --identity-proxy to trust that proxy."
+        )
+
+
+def identity_proxy_default(
+    args: argparse.Namespace, settings: _ServeSettings
+) -> DevelopmentPerson | None:
+    """The person `--identity-proxy` signs in until another is picked.
+
+    `--as` over `[tool.cayu.serve.identity_proxy].default`; `--org`, `--role`,
+    `--name` and `--email` replace that person's fields.
+    """
+
+    subject = args.identity_as if args.identity_as is not None else settings.identity_default
+    changes = {
+        field: getattr(args, attribute)
+        for attribute, _, field in _IDENTITY_PERSON_OPTIONS
+        if getattr(args, attribute) is not None
+    }
+    if subject is None:
+        if changes:
+            raise ServeError(
+                "--org, --role, --name and --email describe the --as person; pass --as."
+            )
+        return None
+    base = next((person for person in settings.identity_people if person.subject == subject), None)
+    try:
+        if base is None:
+            return DevelopmentPerson(subject=subject, **changes)
+        return dataclasses.replace(base, **changes)
+    except ValueError as exc:
+        raise ServeError(f"--identity-proxy person: {exc}") from None
+
+
+def _ensure_operator_login() -> None:
+    """Set a random Developer dashboard login for this process when none is set."""
+
+    generated = {}
+    for name, value in (
+        (OPERATOR_USERNAME_VARIABLE, "operator"),
+        (OPERATOR_PASSWORD_VARIABLE, secrets.token_urlsafe(18)),
+    ):
+        if not os.environ.get(name, "").strip():
+            os.environ[name] = generated[name] = value
+    if OPERATOR_PASSWORD_VARIABLE in generated:
+        print(
+            "Developer dashboard login for this process: "
+            f"{os.environ[OPERATOR_USERNAME_VARIABLE]} / {os.environ[OPERATOR_PASSWORD_VARIABLE]}",
+            flush=True,
+        )
+    elif generated:
+        # Never print a password this process didn't make.
+        print(
+            "Developer dashboard username for this process: "
+            f"{os.environ[OPERATOR_USERNAME_VARIABLE]}",
+            flush=True,
+        )
+
+
+def start_serve_identity_proxy(args: argparse.Namespace) -> Any:
+    """With `--identity-proxy`, register a new development identity proxy and name it in
+    this process's environment; otherwise ``None``.
+
+    Call it before anything imports project code, eval targets included, so
+    `ProxyIdentityAuth.from_environment()` in the project, or in
+    `cayu.server.environment_auth` (whose ready-made targets are built on import),
+    trusts it. Each process makes its own key: a `--reload` worker gets a new one.
+    """
+
+    if not args.identity_proxy:
+        return None
+    from cayu.server.development_identity import DevelopmentIdentityProxy
+
+    proxy = DevelopmentIdentityProxy()
+    proxy.register()
+    os.environ.update(proxy.environment())
+    return proxy
+
+
+def _with_identity_proxy(
+    server: Any, proxy: Any, args: argparse.Namespace, settings: _ServeSettings
+) -> Any:
+    """``server`` behind the development identity proxy, as behind Cayu Cloud's router.
+
+    It wraps the assembled ASGI app rather than adding middleware, which a
+    maintained service has already built by the time it is returned.
+    """
+
+    default = identity_proxy_default(args, settings)
+    people = list(settings.identity_people)
+    if default is not None:
+        people = [default, *(person for person in people if person.subject != default.subject)]
+    wrapped = proxy.middleware(server, people=people, default=default)
+    who = (
+        f"signed in as {default.subject} ({default.role} in {default.org}) until another is picked"
+        if default is not None
+        else "nobody is signed in until a person is picked"
+    )
+    print(
+        "Development identity proxy: "
+        f"{_service_endpoint_url(args.host, args.port, '/.cayu/sign-in')}; {who}"
+    )
+    return wrapped
 
 
 def _serve_settings(root: Path) -> _ServeSettings:
@@ -592,6 +841,8 @@ def _serve_settings(root: Path) -> _ServeSettings:
         "routers",
         "ui",
         "long_request_seconds",
+        "identity_proxy",
+        "inbox_access",
     }
     if unexpected:
         raise ServeError(
@@ -681,7 +932,25 @@ def _serve_settings(root: Path) -> _ServeSettings:
             )
         else:
             request_timing = (("long_request_seconds", float(long_request)),)
+    inbox_access = configured.get("inbox_access")
+    if inbox_access is not None and (not isinstance(inbox_access, str) or not inbox_access.strip()):
+        raise ServeError(
+            f"{discovered.pyproject}: [tool.cayu.serve].inbox_access must be a "
+            "MODULE:FUNCTION string."
+        )
+    identity_people: tuple[DevelopmentPerson, ...] = ()
+    identity_default: str | None = None
+    if "identity_proxy" in configured:
+        try:
+            identity_people, identity_default = parse_identity_proxy_table(
+                configured["identity_proxy"]
+            )
+        except ValueError as exc:
+            raise ServeError(f"{discovered.pyproject}: {exc}") from None
     return _ServeSettings(
+        inbox_access=None if inbox_access is None else inbox_access.strip(),
+        identity_people=identity_people,
+        identity_default=identity_default,
         auth_target=None if auth is None else auth.strip(),
         price_book=None if price_book is None else (root / price_book).resolve(),
         startup_recovery_statuses=statuses,
@@ -690,6 +959,42 @@ def _serve_settings(root: Path) -> _ServeSettings:
         ui=None if ui is None else (root / ui.strip()),
         request_timing=request_timing,
     )
+
+
+def _load_inbox_access(target: str | None, app: Any, *, development: bool) -> Any:
+    """The `InboxAccess` rule `[tool.cayu.serve].inbox_access` builds for `app`.
+
+    Under `--dev` there is no auth, so no caller to apply a rule to: it isn't
+    loaded, and serve says so.
+    """
+
+    if target is None:
+        return None
+    if development:
+        print(
+            f"note: [tool.cayu.serve].inbox_access ({target}) isn't applied under --dev, "
+            "which has no authenticated caller. Run `cayu serve --identity-proxy` to see "
+            "the inbox as a signed-in person.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+    try:
+        build = load_target(target, label="Serve inbox access target", normalize_errors=True)
+    except TargetResolutionError as exc:
+        raise ServeError(str(exc)) from exc
+    if not callable(build):
+        raise ServeError(f"Serve inbox access target {target} must be callable.")
+    try:
+        rule = build(app)
+    except ValueError as exc:
+        raise ServeError(f"Serve inbox access target {target}: {exc}") from exc
+    if not callable(rule):
+        raise ServeError(
+            f"Serve inbox access target {target} must return an InboxAccess rule, a "
+            "function of (AuthContext, InboxItemScope) returning an awaitable bool."
+        )
+    return rule
 
 
 def _load_auth(target: str | None) -> Any:

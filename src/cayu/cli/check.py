@@ -110,11 +110,25 @@ def _run_check(args: argparse.Namespace) -> int:
         report = _with_diagnostics(
             report,
             filter_findings(
-                (*serve_ui_findings(project.root), *dashboard_parts_findings(project.root)),
+                (
+                    *serve_ui_findings(project.root),
+                    *serve_identity_proxy_findings(project.root),
+                    *dashboard_parts_findings(project.root),
+                ),
                 tags=requested_tags,
                 deploy_only=args.deploy,
             ),
         )
+        if not import_blocking_findings(report.diagnostics):
+            # Resolving the target imports project code; keep the source-safety stop.
+            report = _with_diagnostics(
+                report,
+                filter_findings(
+                    serve_inbox_access_findings(project.root),
+                    tags=requested_tags,
+                    deploy_only=args.deploy,
+                ),
+            )
         if (
             args.deploy
             and (not requested_tags or "deploy" in requested_tags)
@@ -184,6 +198,94 @@ def serve_ui_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
             ),
         )
     return ()
+
+
+def serve_identity_proxy_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
+    """Check `[tool.cayu.serve.identity_proxy]`, the people `cayu serve --identity-proxy`
+    signs in as: every person has a subject and a known role and only known keys, and
+    `default` names one of them. `cayu serve` refuses the table otherwise, even with
+    `--dev` or without `--identity-proxy`, so a deployment would not start."""
+
+    from cayu._development_people import parse_identity_proxy_table
+    from cayu.cli.project import discover_cayu_project_configuration
+
+    discovered = discover_cayu_project_configuration(discovery_keys=("factory",), start=root)
+    serve = None if discovered is None else discovered.config.get("serve")
+    if not isinstance(serve, dict) or "identity_proxy" not in serve:
+        return ()
+    try:
+        parse_identity_proxy_table(serve["identity_proxy"])
+    except ValueError as exc:
+        return (
+            ProjectDiagnostic(
+                code="SERVE_IDENTITY_PROXY_INVALID",
+                severity=DiagnosticSeverity.ERROR,
+                subject="cayu serve",
+                path="pyproject.toml:[tool.cayu.serve.identity_proxy]",
+                message=f"`cayu serve` refuses this table: {exc}",
+                hint=(
+                    "Give each [[tool.cayu.serve.identity_proxy.people]] a subject and "
+                    "optionally org, role (admin, developer or member), name and email."
+                ),
+                # Every `cayu serve` reads the table, so a deployed one refuses it too.
+                tags=("configuration", "deploy"),
+                documentation_anchor="cayu guide references#server",
+                verification_command="cayu serve --identity-proxy",
+            ),
+        )
+    return ()
+
+
+def serve_inbox_access_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
+    """Check `[tool.cayu.serve] inbox_access`: a `module:function` target that loads and
+    is callable."""
+
+    from cayu.cli._targets import TargetResolutionError, load_target
+    from cayu.cli.project import discover_cayu_project_configuration, project_context
+
+    discovered = discover_cayu_project_configuration(discovery_keys=("factory",), start=root)
+    serve = None if discovered is None else discovered.config.get("serve")
+    if not isinstance(serve, dict) or "inbox_access" not in serve:
+        return ()
+    target = serve["inbox_access"]
+
+    # Auth needs no check here: outside --dev, `cayu serve` refuses to start without
+    # it, whether it comes from [tool.cayu.serve].auth, --auth or --identity-proxy,
+    # and the auth checks report that; under --dev serve skips the rule and says so.
+    unresolvable = None
+    if not isinstance(target, str) or not target.strip():
+        unresolvable = "it must be a MODULE:FUNCTION string"
+    else:
+        try:
+            with project_context(root):
+                built = load_target(
+                    target.strip(), label="Serve inbox access target", normalize_errors=True
+                )
+        except TargetResolutionError as exc:
+            unresolvable = str(exc)
+        except (Exception, SystemExit) as exc:
+            unresolvable = f"importing it raised {type(exc).__name__}: {exc}"
+        else:
+            if not callable(built):
+                unresolvable = f"{target} is not callable"
+    if unresolvable is None:
+        return ()
+    return (
+        ProjectDiagnostic(
+            code="SERVE_INBOX_ACCESS_UNRESOLVABLE",
+            severity=DiagnosticSeverity.ERROR,
+            subject="cayu serve",
+            path="pyproject.toml:[tool.cayu.serve].inbox_access",
+            message=f"`cayu serve` cannot load [tool.cayu.serve].inbox_access: {unresolvable}.",
+            hint=(
+                "Point it at a function that takes the app and returns an InboxAccess rule, "
+                'such as "cayu.server.inbox:resource_access_rule".'
+            ),
+            tags=("configuration",),
+            documentation_anchor="cayu guide references#server",
+            verification_command="cayu serve --identity-proxy",
+        ),
+    )
 
 
 def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:

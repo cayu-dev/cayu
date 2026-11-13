@@ -2858,13 +2858,13 @@
     "InboxCursorSeal.seal"
   ],
   "cayu.server._inbox_routes:_KNOWLEDGE_SCAN_PAGES": [
-    "register_inbox_routes.<locals>.knowledge_items"
+    "inbox_operations.<locals>.knowledge_items"
   ],
   "cayu.server._inbox_routes:_PENDING_SCAN_LIMIT": [
-    "register_inbox_routes.<locals>.inbox_counts.<locals>.read_page",
-    "register_inbox_routes.<locals>.knowledge_items",
-    "register_inbox_routes.<locals>.resolve_session_item",
-    "register_inbox_routes.<locals>.round_call_reference"
+    "inbox_operations.<locals>.counts.<locals>.read_page",
+    "inbox_operations.<locals>.knowledge_items",
+    "inbox_operations.<locals>.resolve_session_item",
+    "inbox_operations.<locals>.round_call_reference"
   ],
   "cayu.server._judge_calibration_routes:_candidate_judge_route_relation": [
     "register_judge_calibration_routes.<locals>._preview_judge_calibration_definition"

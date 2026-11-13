@@ -209,7 +209,7 @@ from cayu.server._http_json import (
     _PreparsedPrivateJsonBody,
 )
 from cayu.server._inbox_access import InboxAccessGate
-from cayu.server._inbox_cursor import InboxCursorSeal
+from cayu.server._inbox_cursor import InboxCursorSeal, share_inbox_cursor_seal
 from cayu.server._inbox_routes import register_inbox_routes
 from cayu.server._judge_calibration_routes import register_judge_calibration_routes
 from cayu.server._kept_knowledge import (
@@ -4874,8 +4874,8 @@ def create_router(
     # One decision point for who may see and settle approvals, questions, recovery
     # items and knowledge proposals, on every route that lists or settles them.
     inbox_gate = InboxAccessGate(cayu_app, cayu_app._runtime_session_store, inbox_access)
-    # Seals the scan positions of callers that rule limits; see _inbox_cursor.
-    inbox_cursor = InboxCursorSeal(inbox_cursor_key)
+    # Seals the scan positions of callers that rule limits, and the app's member inbox's.
+    inbox_cursor = share_inbox_cursor_seal(cayu_app, InboxCursorSeal(inbox_cursor_key))
     register_task_controls_routes(
         bounded_control_plane_router,
         cayu_app=cayu_app,

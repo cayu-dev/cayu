@@ -269,8 +269,87 @@ the control plane `admin` and `developer` use every route, and `member` may only
 read and decide (approvals, questions, inbox items and knowledge proposals);
 pass `control_plane_roles=ControlPlaneRoles(...)` to change which roles do which.
 The fallback acts as `admin`. `auth.product_dependency(roles=...)` gives a
-product the person as a `ProductPrincipal`. The header format and every check
+product the person as a `ProductPrincipal`, with the token's `name` and `email`
+as its display `name` and `email`. `create_resource_router(authenticate=...)`
+accepts that dependency with `principal_subject=`, which maps the principal to the
+subject its resource access policy resolves (see
+[resource access](resource-access.md#product-http-integration)). The header format and every check
 are in the [runtime contracts](runtime-contracts.md#trusted-proxy-identity).
+
+### Sign in as a person locally
+
+`cayu serve --identity-proxy` runs a development stand-in for Cayu Cloud's router in
+front of the server, so the app takes its deployed sign-in path on your machine:
+
+```bash
+cayu serve --identity-proxy --as alice --org acme --role member --name "Alice Example"
+```
+
+It loads the project's real `[tool.cayu.serve].auth` (or `--auth`), serves it with
+`ServerConfig.protected`, and calls the project's routers with `development=False`.
+It makes an ES256 key that lives only in this process, sets the
+`CAYU_PROXY_IDENTITY_*` variables to an issuer that never resolves
+(`https://identity-proxy.cayu.invalid`), and registers the proxy before it imports
+any project code (eval targets included), so
+`ProxyIdentityAuth.from_environment()` (in `environment_auth` or the project's own
+code) trusts it. Copied to a deployment, those variables fail at startup: only a
+registered proxy is trusted under that issuer. If `CAYU_OPERATOR_USERNAME` or
+`CAYU_OPERATOR_PASSWORD` is unset, it sets a random one for this process and prints it;
+a password you set yourself is never printed.
+
+Each request is signed in as:
+
+- the person an `X-Cayu-Dev-Person` header names: a subject, or
+  `sub=bob&org=acme&role=developer&name=Bob&email=bob@example.com`;
+- otherwise the person picked at `/.cayu/sign-in`, kept in a `cayu-dev-person` cookie
+  (a cookie that names nobody is ignored);
+- otherwise the `--as` person, or the table's `default`.
+
+`/.cayu/sign-out` signs out, even from the default person, until someone is picked
+again. The token's `origin` is the request's own, so cross-origin writes are refused
+as they are deployed. A client-sent `X-Cayu-Identity` is always removed, and the
+header and cookie never reach the app.
+
+The people to pick from can be listed in `pyproject.toml`. Every `cayu serve` reads the
+table, so `cayu check`, including `--deploy`, reports a person without a subject, an
+unknown role or key, or a `default` that names nobody:
+
+```toml
+[tool.cayu.serve.identity_proxy]
+default = "alice"
+
+[[tool.cayu.serve.identity_proxy.people]]
+subject = "alice"
+org = "acme"
+role = "member"
+name = "Alice Example"
+email = "alice@example.com"
+```
+
+`--identity-proxy` refuses `--dev`, a non-loopback `--host`, and a process where the
+`CAYU_PROXY_IDENTITY_*` variables are already set. It signs requests in only when
+their `Host` is a loopback name, so a page that rebinds its own name to 127.0.0.1
+can't act as anyone. Any process on the machine can still pick a person, the same
+trust `--dev` has. If the auth target isn't a `ProxyIdentityAuth`, it warns that the
+proxy changes nothing for `/api`. With `--reload`, each worker makes its own key.
+
+In tests, `cayu.server.development_identity.DevelopmentIdentityProxy` mints the same
+tokens without a server:
+
+```python
+from cayu.server import ProxyIdentityAuth
+from cayu.server.development_identity import DevelopmentIdentityProxy
+
+proxy = DevelopmentIdentityProxy()
+auth = ProxyIdentityAuth(
+    issuer=proxy.issuer, audience=proxy.audience, signing_keys=proxy.signing_keys()
+)
+client.get("/app/whoami", headers=proxy.headers("alice", org="acme", name="Alice"))
+```
+
+`proxy.middleware(app, people=..., default=...)` puts it in front of any ASGI app,
+and `proxy.register()` makes `ProxyIdentityAuth.from_environment(environ=proxy.environment())`
+trust it.
 
 The command also assembles project identity, release identity, and durable
 Evals storage before it constructs the server. It reads `[project].name`,
@@ -473,7 +552,12 @@ operator_access = AuthenticatedAccess(dependency=operators)
 `subject_id` come only from the verified token. A token without a non-blank
 string tenant claim is rejected with 401; there is no default tenant. Pass
 `tenant_claim=` to `product_dependency()` to use a different claim than the
-verifier's own. `cayu check --deploy` treats this like any other
+verifier's own. The principal's optional `name` and `email` come from the
+`name` and `email` claims (`name_claim=` and `email_claim=` choose others, `None`
+leaves one out); they are for display only, are left out of `repr`, and a value
+that is too long or holds control or bidirectional characters is `None` rather than a refused
+token. Nothing in Cayu keys on them: operation fingerprints, receipts and
+decisions use `tenant_id` and `subject_id`. `cayu check --deploy` treats this like any other
 `AuthenticatedProductAccess` and `AuthenticatedAccess`. Keep the two policies
 distinct, here with a scope; a separate audience also works. A customer token
 must not be able to reach the Developer dashboard.

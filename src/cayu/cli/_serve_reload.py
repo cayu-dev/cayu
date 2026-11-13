@@ -18,12 +18,14 @@ from uvicorn.supervisors.watchfilesreload import WatchFilesReload
 
 from cayu.cli.project import project_context
 from cayu.cli.serve import (
+    _IDENTITY_OPTIONS,
     _build_serve_app,
     _resolve_serve_project,
     parse_serve_arguments,
     request_log_covers,
     serve_project_control_plane,
     serve_uvicorn_options,
+    start_serve_identity_proxy,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +51,11 @@ def run_reload(uvicorn: Any, args: argparse.Namespace, root: Path) -> None:
         arguments.extend(("--auth", args.auth))
     if args.price_book is not None:
         arguments.extend(("--price-book", str(args.price_book)))
+    if args.identity_proxy:
+        arguments.append("--identity-proxy")
+        for attribute, option in _IDENTITY_OPTIONS:
+            if getattr(args, attribute) is not None:
+                arguments.extend((option, getattr(args, attribute)))
     previous = os.environ.get(_RELOAD_ENV)
     os.environ[_RELOAD_ENV] = json.dumps({"root": str(root), "arguments": arguments})
     try:
@@ -121,8 +128,11 @@ class _ReloadApp:
         try:
             project, settings = _resolve_serve_project(args, start=root)
             self._scope.enter_context(project_context(project.root))
+            identity_proxy = start_serve_identity_proxy(args)
             self._context = serve_project_control_plane(args, project)
-            self._server = _build_serve_app(args, project, settings, self._context)
+            self._server = _build_serve_app(
+                args, project, settings, self._context, identity_proxy=identity_proxy
+            )
         except BaseException as primary:
             try:
                 self.close_sync()

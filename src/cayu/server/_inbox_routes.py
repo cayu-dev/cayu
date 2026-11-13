@@ -592,20 +592,33 @@ def _pending_state(item: InboxItem) -> InboxItemState:
     )
 
 
-def register_inbox_routes(
-    router: APIRouter,
-    bounded_router: APIRouter,
+@dataclass(frozen=True, slots=True)
+class InboxOperations:
+    """The inbox's list, count, read and settle, for one store and access gate.
+
+    The control plane's inbox routes call them, and so does the scoped inbox of
+    ``cayu.server.scoped_inbox``. Each takes the verified caller (``None`` under
+    open local access) and raises ``HTTPException`` as the routes answer.
+    """
+
+    page: Callable[..., Awaitable[InboxPage]]
+    counts: Callable[..., Awaitable[InboxCounts]]
+    state: Callable[[str, AuthContext | None], Awaitable[InboxItemState]]
+    settle: Callable[[str, InboxSettleRequest, AuthContext | None], Awaitable[InboxSettleResponse]]
+    pending_item: Callable[[InboxItemKind, PendingActionRecord], InboxItem]
+
+
+def inbox_operations(
     *,
     cayu_app: Any,
     session_store: SessionStore,
     knowledge_review_workflow: Callable[[], KnowledgeReviewWorkflow] | None,
     continuation_loop_policies: Callable[[str], Awaitable[tuple[LoopPolicy, ...]]],
-    optional_auth_context: Depends,
     inbox_gate: InboxAccessGate,
     inbox_cursor: InboxCursorSeal,
     control_plane_roles: ControlPlaneRoles | None = None,
-) -> None:
-    """Register the inbox list, read and settle routes.
+) -> InboxOperations:
+    """Build the inbox's operations over ``cayu_app``'s sessions and knowledge.
 
     ``control_plane_roles`` says which callers have full access; without it, every
     caller has.
@@ -619,8 +632,6 @@ def register_inbox_routes(
         _serialize_session_base,
         _serialize_session_cursor,
     )
-
-    inbox_auth_context = cast("AuthContext | None", optional_auth_context)
 
     def pending_item(kind: InboxItemKind, action: PendingActionRecord) -> InboxItem:
         assert action.attention_id is not None
@@ -1605,35 +1616,6 @@ def register_inbox_routes(
                 return known[0], (workflow, locator)
         raise HTTPException(status_code=404, detail=_NOT_FOUND, headers=_NO_STORE)
 
-    @router.get(
-        "/inbox",
-        response_model=InboxPage,
-        responses={
-            409: {"model": ApiErrorResponse},
-            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
-            422: {"model": ApiErrorResponse, "description": "Unprocessable Content"},
-        },
-        description=(
-            "List what is waiting on a person: approvals, questions and recovery items "
-            "from this agent's sessions, then knowledge proposals on their own pages. A "
-            "configured inbox access rule hides items the caller may not see and settle, "
-            "here and on every other route that lists or settles them. Follow "
-            "`next_cursor` until it is null."
-        ),
-    )
-    async def list_inbox(
-        response: Response,
-        limit: Annotated[int, Query(ge=1, le=200)] = 50,
-        cursor: Annotated[str | None, Query(min_length=1, max_length=8192)] = None,
-        session_id: Annotated[str | None, Query(max_length=4096)] = None,
-        agent_name: Annotated[str | None, Query(max_length=4096)] = None,
-        kind: InboxItemKind | None = None,
-        q: Annotated[str | None, Query(max_length=4096)] = None,
-        auth_context: AuthContext | None = inbox_auth_context,
-    ) -> InboxPage:
-        response.headers.update(_NO_STORE)
-        return await inbox_page(auth_context, limit, cursor, session_id, agent_name, kind, q)
-
     async def inbox_page(
         auth_context: AuthContext | None,
         limit: int,
@@ -1705,27 +1687,12 @@ def register_inbox_routes(
             issues=issues,
         )
 
-    @router.get(
-        "/inbox/counts",
-        response_model=InboxCounts,
-        responses={
-            409: {"model": ApiErrorResponse},
-            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
-        },
-        description=(
-            "Count every pending inbox kind independently of list page size. "
-            "Limited callers receive unavailable counts, never hidden totals. "
-            "Reads bounded source pages to exhaustion; source issues yield unavailable counts."
-        ),
-    )
-    async def inbox_counts(
-        response: Response,
-        session_id: Annotated[str | None, Query(max_length=4096)] = None,
-        agent_name: Annotated[str | None, Query(max_length=4096)] = None,
-        q: Annotated[str | None, Query(max_length=4096)] = None,
-        auth_context: AuthContext | None = inbox_auth_context,
+    async def counts(
+        auth_context: AuthContext | None,
+        session_id: str | None = None,
+        agent_name: str | None = None,
+        q: str | None = None,
     ) -> InboxCounts:
-        response.headers.update(_NO_STORE)
         session_id = _clean_optional_query_value(session_id, "session_id")
         agent_name = _clean_optional_query_value(agent_name, "agent_name")
         q = _clean_optional_query_value(q, "q")
@@ -1739,49 +1706,13 @@ def register_inbox_routes(
 
         return await count_inbox(read_page)
 
-    @router.get(
-        "/inbox/{item_id}",
-        response_model=InboxItemState,
-        responses={404: {"model": ApiErrorResponse}},
-        description=(
-            "Read one item's current state: the item while it is pending, and who "
-            "settled it, how and when once it is settled, wherever that happened."
-        ),
-    )
-    async def get_inbox_item(
-        item_id: ItemIdPath,
-        response: Response,
-        auth_context: AuthContext | None = inbox_auth_context,
-    ) -> InboxItemState:
-        response.headers.update(_NO_STORE)
+    async def item_state(item_id: str, auth_context: AuthContext | None) -> InboxItemState:
         state, _source = await visible_item(item_id, auth_context)
         return state
 
-    @bounded_router.post(
-        "/inbox/{item_id}/settle",
-        response_model=InboxSettleResponse,
-        responses={
-            400: {"model": ApiErrorResponse},
-            403: {"model": ApiErrorResponse},
-            404: {"model": ApiErrorResponse},
-            409: {"model": InboxConflictResponse},
-        },
-        description=(
-            "Settle one item as the authenticated caller: approve (optionally with "
-            "changed arguments) or deny an approval, answer a question, keep or drop a "
-            "knowledge proposal. Returns once the Runtime durably accepted the decision; "
-            "the agent carries on in the background. Repeating the exact decision returns "
-            "the recorded settlement with `replayed: true`. Any other settle of a settled, "
-            "replaced or expired item gets 409 with the item's current state."
-        ),
-    )
-    async def settle_inbox_item(
-        item_id: ItemIdPath,
-        body: InboxSettleRequest,
-        response: Response,
-        auth_context: AuthContext | None = inbox_auth_context,
+    async def settle(
+        item_id: str, body: InboxSettleRequest, auth_context: AuthContext | None
     ) -> InboxSettleResponse:
-        response.headers.update(_NO_STORE)
         try:
             state, source = await visible_item(item_id, auth_context)
         except HTTPException as exc:
@@ -1861,3 +1792,122 @@ def register_inbox_routes(
         ):
             raise _state_conflict(shown)
         return InboxSettleResponse(replayed=True, item=shown)
+
+    return InboxOperations(
+        page=inbox_page,
+        counts=counts,
+        state=item_state,
+        settle=settle,
+        pending_item=pending_item,
+    )
+
+
+def register_inbox_routes(
+    router: APIRouter,
+    bounded_router: APIRouter,
+    *,
+    optional_auth_context: Depends,
+    **options: Any,
+) -> InboxOperations:
+    """Register the inbox list, read and settle routes over ``inbox_operations(**options)``."""
+
+    operations = inbox_operations(**options)
+    inbox_auth_context = cast("AuthContext | None", optional_auth_context)
+
+    @router.get(
+        "/inbox",
+        response_model=InboxPage,
+        responses={
+            409: {"model": ApiErrorResponse},
+            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
+            422: {"model": ApiErrorResponse, "description": "Unprocessable Content"},
+        },
+        description=(
+            "List what is waiting on a person: approvals, questions and recovery items "
+            "from this agent's sessions, then knowledge proposals on their own pages. A "
+            "configured inbox access rule hides items the caller may not see and settle, "
+            "here and on every other route that lists or settles them. Follow "
+            "`next_cursor` until it is null."
+        ),
+    )
+    async def list_inbox(
+        response: Response,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1, max_length=8192)] = None,
+        session_id: Annotated[str | None, Query(max_length=4096)] = None,
+        agent_name: Annotated[str | None, Query(max_length=4096)] = None,
+        kind: InboxItemKind | None = None,
+        q: Annotated[str | None, Query(max_length=4096)] = None,
+        auth_context: AuthContext | None = inbox_auth_context,
+    ) -> InboxPage:
+        response.headers.update(_NO_STORE)
+        return await operations.page(auth_context, limit, cursor, session_id, agent_name, kind, q)
+
+    @router.get(
+        "/inbox/counts",
+        response_model=InboxCounts,
+        responses={
+            409: {"model": ApiErrorResponse},
+            413: {"model": ApiErrorResponse, "description": "Content Too Large"},
+        },
+        description=(
+            "Count every pending inbox kind independently of list page size. "
+            "Limited callers receive unavailable counts, never hidden totals. "
+            "Reads bounded source pages to exhaustion; source issues yield unavailable counts."
+        ),
+    )
+    async def inbox_counts(
+        response: Response,
+        session_id: Annotated[str | None, Query(max_length=4096)] = None,
+        agent_name: Annotated[str | None, Query(max_length=4096)] = None,
+        q: Annotated[str | None, Query(max_length=4096)] = None,
+        auth_context: AuthContext | None = inbox_auth_context,
+    ) -> InboxCounts:
+        response.headers.update(_NO_STORE)
+        return await operations.counts(auth_context, session_id, agent_name, q)
+
+    @router.get(
+        "/inbox/{item_id}",
+        response_model=InboxItemState,
+        responses={404: {"model": ApiErrorResponse}},
+        description=(
+            "Read one item's current state: the item while it is pending, and who "
+            "settled it, how and when once it is settled, wherever that happened."
+        ),
+    )
+    async def get_inbox_item(
+        item_id: ItemIdPath,
+        response: Response,
+        auth_context: AuthContext | None = inbox_auth_context,
+    ) -> InboxItemState:
+        response.headers.update(_NO_STORE)
+        return await operations.state(item_id, auth_context)
+
+    @bounded_router.post(
+        "/inbox/{item_id}/settle",
+        response_model=InboxSettleResponse,
+        responses={
+            400: {"model": ApiErrorResponse},
+            403: {"model": ApiErrorResponse},
+            404: {"model": ApiErrorResponse},
+            409: {"model": InboxConflictResponse},
+        },
+        description=(
+            "Settle one item as the authenticated caller: approve (optionally with "
+            "changed arguments) or deny an approval, answer a question, keep or drop a "
+            "knowledge proposal. Returns once the Runtime durably accepted the decision; "
+            "the agent carries on in the background. Repeating the exact decision returns "
+            "the recorded settlement with `replayed: true`. Any other settle of a settled, "
+            "replaced or expired item gets 409 with the item's current state."
+        ),
+    )
+    async def settle_inbox_item(
+        item_id: ItemIdPath,
+        body: InboxSettleRequest,
+        response: Response,
+        auth_context: AuthContext | None = inbox_auth_context,
+    ) -> InboxSettleResponse:
+        response.headers.update(_NO_STORE)
+        return await operations.settle(item_id, body, auth_context)
+
+    return operations

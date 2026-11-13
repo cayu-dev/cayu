@@ -12,11 +12,13 @@ import asyncio
 import hashlib
 import inspect
 import json
+import unicodedata
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import aclosing
 from typing import (
     TYPE_CHECKING,
     Any,
+    Final,
     Literal,
     Never,
     Protocol,
@@ -104,6 +106,8 @@ _MAX_PUBLIC_RESULT_UTF8_BYTES = MAX_PUBLIC_RESULT_CHARS * 4
 _PUBLIC_RESULT_CAPTURE_BYTES = _MAX_PUBLIC_RESULT_UTF8_BYTES + len(REDACTED_SECRET.encode("utf-8"))
 _PUBLIC_RESULT_SOURCE_CHARS_PER_CHUNK = 4096
 MAX_PRODUCT_IDENTITY_CHARS = 512
+MAX_PRODUCT_NAME_CHARS = 256
+MAX_PRODUCT_EMAIL_CHARS = 320
 MAX_PRODUCT_REQUEST_BYTES = 1024 * 1024
 PRODUCT_EXECUTION_LEASE_SECONDS = 120
 PRODUCT_EXECUTION_HEARTBEAT_SECONDS = 30
@@ -335,17 +339,55 @@ async def _bounded_product_json_body(
 
 
 class ProductPrincipal(BaseModel):
-    """Trusted product identity resolved by server-side authentication."""
+    """Trusted product identity resolved by server-side authentication.
+
+    ``tenant_id`` and ``subject_id`` are the identity. ``name`` and ``email`` are the
+    person's display name and address when the sign-in has them: display only, never
+    a key for access, idempotency, receipts or decisions, and left out of ``repr``. A
+    value that isn't a non-blank string, is too long (a name over 256 characters, an
+    email over 320) or holds control characters becomes ``None``, so a bad profile
+    never refuses a sign-in.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     tenant_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
     subject_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    name: str | None = Field(default=None, repr=False)
+    email: str | None = Field(default=None, repr=False)
 
     @field_validator("tenant_id", "subject_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("name", "email", mode="before")
+    @classmethod
+    def display_only(cls, value: Any, info) -> str | None:
+        limit = MAX_PRODUCT_NAME_CHARS if info.field_name == "name" else MAX_PRODUCT_EMAIL_CHARS
+        return _product_display_text(value, limit)
+
+
+#: Bidirectional marks, embeddings, overrides and isolates, which can show a name or
+#: email in another order than it was sent. Other format characters, such as the
+#: zero-width joiners some names are written with, are kept.
+_BIDI_CONTROLS: Final = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+
+
+def _product_display_text(value: Any, limit: int) -> str | None:
+    """``value`` when it is a usable display string of at most ``limit`` characters,
+    else ``None``."""
+
+    if type(value) is not str or not value.strip() or len(value) > limit:
+        return None
+    if any(
+        character in _BIDI_CONTROLS or unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+        for character in value
+    ):
+        return None
+    return value
 
 
 ProductAuthResult = ProductPrincipal | Mapping[str, str]
@@ -3123,6 +3165,8 @@ def _product_auth_dependency(
                 return ProductPrincipal(
                     tenant_id=result.tenant_id,
                     subject_id=result.subject_id,
+                    name=result.name,
+                    email=result.email,
                 )
             except (AttributeError, TypeError, ValueError):
                 raise TypeError("Product authentication returned an invalid principal.") from None

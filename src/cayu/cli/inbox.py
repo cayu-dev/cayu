@@ -357,6 +357,16 @@ def _add_target_options(parser: argparse.ArgumentParser) -> None:
             "(default: local:<your user name>). A Cloud Agent records your login."
         ),
     )
+    where.add_argument(
+        "--as",
+        dest="as_subject",
+        metavar="SUBJECT",
+        help=(
+            "Locally, read and decide as this person through the application's resource "
+            "access policy (`app.access(SUBJECT).inbox`): only the approvals and questions "
+            "of sessions they may continue, recorded as decided by them."
+        ),
+    )
     add_output_options(parser, formats=("json", "table"), default="table")
 
 
@@ -383,6 +393,13 @@ async def _run(args: argparse.Namespace) -> int:
             _check_reason(reason)
         if args.application is not None and args.reviewer is not None:
             raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
+        if args.as_subject is not None and (
+            args.application is not None or args.reviewer is not None
+        ):
+            raise ValueError(
+                "--as reads the local application as that person; it can't be combined with "
+                "--application or --reviewer."
+            )
         if args.inbox_command == "answer":
             _answer_arguments(args)
         if args.inbox_command != "list" and (args.item_id is None) == (args.session is None):
@@ -438,7 +455,8 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
         deciding = args.inbox_command in _CONTINUING
         local: LocalInbox | None = None
         try:
-            reviewer = args.reviewer or _local_reviewer()
+            as_subject = args.as_subject
+            reviewer = as_subject or args.reviewer or _local_reviewer()
             if deciding:
                 # A decision runs the agent here, so start what a server starts first;
                 # closing the app stops it.
@@ -455,6 +473,7 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
                 if service is None
                 else service._continuation_loop_policies,
                 wait_seconds=args.wait_seconds if deciding else None,
+                scoped=as_subject is not None,
             )
             yield local
         finally:

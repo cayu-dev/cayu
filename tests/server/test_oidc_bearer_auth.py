@@ -837,7 +837,7 @@ def test_product_dependency_maps_tenant_claim_and_fails_closed(
     app = FastAPI()
 
     @app.get("/me")
-    async def me(principal: ProductPrincipal = Depends(dependency)) -> dict[str, str]:  # noqa: B008
+    async def me(principal: ProductPrincipal = Depends(dependency)) -> dict[str, str | None]:  # noqa: B008
         return principal.model_dump()
 
     client = TestClient(app)
@@ -847,7 +847,12 @@ def test_product_dependency_maps_tenant_claim_and_fails_closed(
 
     ok = call(_token(rsa_key, {"org": {"id": "tenant-a"}}))
     assert ok.status_code == 200
-    assert ok.json() == {"tenant_id": "tenant-a", "subject_id": "user-1"}
+    assert ok.json() == {
+        "tenant_id": "tenant-a",
+        "subject_id": "user-1",
+        "name": None,
+        "email": None,
+    }
     for claims in ({}, {"org": {"id": ""}}, {"org": {"id": 7}}, {"org": "tenant-a"}):
         rejected = call(_token(rsa_key, claims))
         assert rejected.status_code == 401
@@ -861,6 +866,27 @@ def test_product_dependency_maps_tenant_claim_and_fails_closed(
         resolve_product(namespaced, _token(rsa_key, {"https://example.com/tenant": "t-9"}))
     )
     assert principal == ProductPrincipal(tenant_id="t-9", subject_id="user-1")
+
+
+def test_product_dependency_reads_name_and_email_for_display(rsa_key: rsa.RSAPrivateKey) -> None:
+    issuer = FakeIssuer()
+    issuer.add_rsa("key-1", rsa_key)
+    auth = _auth(issuer, tenant_claim="org")
+    token = _token(rsa_key, {"org": "t-1", "name": "Ada", "email": "ada@example.com", "nick": "A"})
+
+    principal = asyncio.run(resolve_product(auth.product_dependency(), token))
+    assert (principal.name, principal.email) == ("Ada", "ada@example.com")
+    renamed = auth.product_dependency(name_claim="nick", email_claim=None)
+    principal = asyncio.run(resolve_product(renamed, token))
+    assert (principal.name, principal.email) == ("A", None)
+    # An unusable profile is left out; the token is still accepted.
+    principal = asyncio.run(
+        resolve_product(
+            auth.product_dependency(),
+            _token(rsa_key, {"org": "t-1", "name": "x" * 257, "email": ["a@b.example"]}),
+        )
+    )
+    assert (principal.subject_id, principal.name, principal.email) == ("user-1", None, None)
 
 
 async def resolve_product(dependency: Any, token: str) -> ProductPrincipal:

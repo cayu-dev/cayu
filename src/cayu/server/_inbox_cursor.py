@@ -23,6 +23,7 @@ import binascii
 import json
 import os
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -42,6 +43,7 @@ SealedPurpose = Literal[
     "kept-knowledge",
     "pending-knowledge",
     "archived-knowledge",
+    "member-inbox",
 ]
 
 _LIFETIME_SECONDS = 900
@@ -62,6 +64,9 @@ _PURPOSES: dict[SealedPurpose, tuple[str, Callable[[str], object]]] = {
     "knowledge": ("cayu.inbox.knowledge.v1", decode_knowledge_list_cursor),
     "actions": ("cayu.inbox.actions.v1", decode_session_cursor),
     "pending-actions": ("cayu.pending-actions.v1", decode_session_cursor),
+    # A session-store position among one person's waiting sessions (``ScopedInboxAccess``),
+    # in whatever form the store gives it, since it names a private session id.
+    "member-inbox": ("cayu.inbox.member.v1", str),
 }
 
 
@@ -119,3 +124,33 @@ class InboxCursorSeal:
             elif purpose in {"kept-knowledge", "pending-knowledge", "archived-knowledge"}:
                 detail = "Invalid or expired knowledge cursor. Restart the knowledge listing."
             raise HTTPException(status_code=422, detail=detail, headers=_NO_STORE) from None
+
+
+#: The seal each app's member inbox (``ScopedInboxAccess``) uses, for the app's lifetime,
+#: so a page's cursor opens on the next request, which gets a new ``ScopedInboxAccess``.
+_APP_SEALS: weakref.WeakKeyDictionary[Any, InboxCursorSeal] = weakref.WeakKeyDictionary()
+
+
+def share_inbox_cursor_seal(app: Any, seal: InboxCursorSeal) -> InboxCursorSeal:
+    """Have ``app``'s member inbox seal with ``seal`` when it holds a configured key.
+
+    Returns ``seal``, for the caller's own use.
+
+    ``create_router`` passes its own, so the deployment's ``inbox_cursor_key`` reaches
+    the member inbox too; the last configured key given for an app is used. A seal
+    without a configured key never replaces one that has it.
+    """
+
+    current = _APP_SEALS.get(app)
+    if seal.configured or current is None:
+        _APP_SEALS[app] = seal
+    return seal
+
+
+def app_inbox_cursor_seal(app: Any) -> InboxCursorSeal:
+    """``app``'s member inbox seal: a configured one shared with it, or one of its own."""
+
+    seal = _APP_SEALS.get(app)
+    if seal is None:
+        seal = _APP_SEALS.setdefault(app, InboxCursorSeal(None))
+    return seal

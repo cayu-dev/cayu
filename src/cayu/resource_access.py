@@ -282,6 +282,55 @@ class ScopedCayuAccess:
         self.__app = app
         self.__binding = binding
 
+    @property
+    def subject(self) -> str:
+        """The subject the host authenticated and the policy admitted."""
+
+        return self.__binding.subject
+
+    @property
+    def inbox(self):
+        """This subject's inbox: the approvals and questions it may decide.
+
+        A ``cayu.server.scoped_inbox.ScopedInboxAccess``, which needs the server extra.
+        The subject may decide an item when it may continue the item's session, as
+        ``resume`` requires.
+        """
+
+        try:
+            from cayu.server.scoped_inbox import ScopedInboxAccess
+        except ModuleNotFoundError as exc:
+            if (exc.name or "").partition(".")[0] not in {"fastapi", "starlette", "pydantic"}:
+                raise
+            raise RuntimeError(
+                'The scoped inbox needs the server extra. Install it with: pip install "cayu[server]"'
+            ) from exc
+        return ScopedInboxAccess(self.__app, self)
+
+    async def require_continuation(self, session):
+        """Refuse with ``ResourceAccessDenied`` unless this subject may continue ``session``.
+
+        Its stored resource binding must name this subject under the same authority,
+        and the subject's current decision must cover its labels for ``execute``. A
+        controller's overlay fork continues only through that controller. Returns the
+        stored binding, which the continuation runs under.
+        """
+
+        from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
+
+        if fork_overlay_record_from_metadata(session.metadata) is not None:
+            raise ResourceAccessDenied()
+        stored_binding = session.invocation.resource_access
+        if stored_binding is None or (stored_binding.authority, stored_binding.subject) != (
+            self.__binding.authority,
+            self.__binding.subject,
+        ):
+            raise ResourceAccessDenied()
+        bounds = await effective_bounds(self.__binding, self.__app.resource_access_policy)
+        if not bounds.matches(session.labels, "execute"):
+            raise ResourceAccessDenied()
+        return stored_binding
+
     async def _current(self, kind="sessions"):
         return (
             await effective_bounds(self.__binding, self.__app.resource_access_policy, kind)
@@ -362,20 +411,7 @@ class ScopedCayuAccess:
         private_id = await self.__app._resolve_public_session_id(request.session_id)
         request = request.model_copy(update={"session_id": private_id})
         session = await self.sessions.load(private_id)
-        from cayu.sessions.fork_overlays import fork_overlay_record_from_metadata
-
-        if fork_overlay_record_from_metadata(session.metadata) is not None:
-            # A controller's overlay fork continues only through that controller.
-            raise ResourceAccessDenied()
-        stored_binding = session.invocation.resource_access
-        if stored_binding is None or (stored_binding.authority, stored_binding.subject) != (
-            self.__binding.authority,
-            self.__binding.subject,
-        ):
-            raise ResourceAccessDenied()
-        bounds = await effective_bounds(self.__binding, self.__app.resource_access_policy)
-        if not bounds.matches(session.labels, "execute"):
-            raise ResourceAccessDenied()
+        stored_binding = await self.require_continuation(session)
         async with aclosing(
             guard_stream(
                 self.__app.resume(request),

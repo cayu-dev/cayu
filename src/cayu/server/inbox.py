@@ -382,6 +382,22 @@ class InboxItemScope(_InboxModel):
 InboxAccess = Callable[[AuthContext, InboxItemScope], Awaitable[bool]]
 
 
+def resource_access_rule(app: Any) -> InboxAccess:
+    """The scoped inbox's rule as an ``InboxAccess``, for ``/api``.
+
+    A caller may see and settle an approval or question when it may continue the
+    item's session under ``app.resource_access_policy``, as
+    ``(await app.access(subject)).inbox`` lists them; knowledge proposals and
+    recovery items are hidden from every caller it limits. Called as
+    ``resource_access_rule(app)``, it is a ``[tool.cayu.serve] inbox_access``
+    target: ``"cayu.server.inbox:resource_access_rule"``.
+    """
+
+    from cayu.server.scoped_inbox import resource_access_rule as build
+
+    return build(app)
+
+
 __all__ = [
     "INBOX_DECISIONS",
     "InboxAccess",
@@ -402,4 +418,5 @@ __all__ = [
     "InboxSettleResponse",
     "InboxSettledDecision",
     "InboxSettlement",
+    "resource_access_rule",
 ]
