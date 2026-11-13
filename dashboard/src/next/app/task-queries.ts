@@ -3,7 +3,7 @@ import type { TaskStatus, TaskStatusCounts } from "@/lib/generated/server-api"
 import { activityPollInterval } from "@/lib/polling"
 import type { TaskIndexQuery } from "../api/tasks"
 import { useApi, useServices } from "./services"
-import { taskGroupStatuses } from "./task-index-model"
+import { taskGroupStatuses, taskTypeFilter } from "./task-index-model"
 import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
 
 // Foreground observation refreshes only the explicitly loaded window. React Query owns
@@ -22,7 +22,7 @@ export type TaskFilters = {
 export function taskFiltersQuery(search: TaskFilters): TaskIndexQuery {
   return {
     q: search.q,
-    type: search.type,
+    ...taskTypeFilter(search.type),
     assigned_agent_name: search.assigned_agent_name ?? search.agent,
     session_id: search.session_id,
     include_internal: search.cayu === "1",

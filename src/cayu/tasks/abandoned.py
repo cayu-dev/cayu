@@ -288,6 +288,7 @@ def fenced_task_scan_query(query: TaskQuery | None = None) -> TaskQuery:
     query = copy_task_query(query)
     return TaskQuery(
         type=query.type,
+        types=query.types,
         parent_task_id=query.parent_task_id,
         assigned_agent_name=query.assigned_agent_name,
         has_work_contract=query.has_work_contract,

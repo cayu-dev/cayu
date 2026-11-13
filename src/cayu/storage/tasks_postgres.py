@@ -206,7 +206,9 @@ from cayu.tasks.queries import (
     _task_matches_claim_filter,
     copy_task_aggregate_filter,
     copy_task_query,
+    latest_tasks_key_path,
     task_query_from_aggregate_filter,
+    task_query_types,
 )
 from cayu.tasks.records import (
     Task,
@@ -1760,12 +1762,40 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
 
             _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
+        clauses, params = self._task_list_clauses(query, _access_bounds)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = pg_support.task_order_sql(query.order_by)
+        params.extend([query.limit, query.offset])
+
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            # Interpolations are trusted: TASK_COLUMNS is a constant, order_sql is an
+            # enum-derived literal, where_sql is hard-coded clauses; values bind via %s.
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT {pg_support.TASK_COLUMNS}
+                    FROM cayu_tasks
+                    {where_sql}
+                    ORDER BY {order_sql}, id ASC
+                    LIMIT %s OFFSET %s
+                    """,
+                ),
+                params,
+            )
+            rows = await cur.fetchall()
+            return [pg_support.task_from_row(row) for row in rows]
+
+    def _task_list_clauses(self, query: TaskQuery, access_bounds) -> tuple[list[str], list[object]]:
+        """The WHERE clauses ``list_tasks`` and ``latest_tasks`` select tasks with."""
+
         clauses: list[str] = []
         params: list[object] = []
-        if _access_bounds is not None:
+        if access_bounds is not None:
             from cayu.tasks.access import sql_predicate
 
-            access_sql, access_params = sql_predicate(_access_bounds, postgres=True)
+            access_sql, access_params = sql_predicate(access_bounds, postgres=True)
             clauses.append(access_sql)
             params.extend(access_params)
 
@@ -1791,9 +1821,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         if query.status is not None:
             clauses.append("status = %s")
             params.append(str(query.status))
-        if query.type is not None:
-            clauses.append("type = %s")
-            params.append(query.type)
+        types = task_query_types(query)
+        if types is not None:
+            clauses.append(f"type IN ({', '.join(['%s'] * len(types))})")
+            params.extend(types)
         if query.session_id is not None:
             clauses.append("session_id = %s")
             params.append(query.session_id)
@@ -1828,27 +1859,52 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     str(TaskStatus.CLAIMED),
                 ]
             )
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_sql = pg_support.task_order_sql(query.order_by)
+        return clauses, params
+
+    async def latest_tasks(
+        self, query: TaskQuery | None = None, *, by: str | None = None, _access_bounds=None
+    ) -> list[Task]:
+        path = None if by is None else latest_tasks_key_path(by)
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
+        query = copy_task_query(query)
+        clauses, params = self._task_list_clauses(query, _access_bounds)
+        clauses.append("completed_at IS NOT NULL")
+        if path is None:
+            sql = f"""
+                SELECT {pg_support.TASK_COLUMNS}
+                FROM cayu_tasks
+                WHERE {" AND ".join(clauses)}
+                ORDER BY completed_at DESC, id ASC
+                LIMIT %s OFFSET %s
+            """
+        else:
+            # One row per distinct string at the path: the newest by completion.
+            clauses.append("jsonb_typeof(input #> %s::text[]) = 'string'")
+            params = [list(path), *params, list(path)]
+            sql = f"""
+                SELECT {pg_support.TASK_COLUMNS}
+                FROM (
+                    SELECT DISTINCT ON (latest_key) {pg_support.TASK_COLUMNS}
+                    FROM (
+                        SELECT {pg_support.TASK_COLUMNS}, input #>> %s::text[] AS latest_key
+                        FROM cayu_tasks
+                        WHERE {" AND ".join(clauses)}
+                    ) AS keyed
+                    ORDER BY latest_key, completed_at DESC, id ASC
+                ) AS latest
+                ORDER BY completed_at DESC, id ASC
+                LIMIT %s OFFSET %s
+            """
         params.extend([query.limit, query.offset])
 
         await self._ensure_ready()
         async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
-            # Interpolations are trusted: TASK_COLUMNS is a constant, order_sql is an
-            # enum-derived literal, where_sql is hard-coded clauses; values bind via %s.
-            await cur.execute(
-                cast(
-                    "LiteralString",
-                    f"""
-                    SELECT {pg_support.TASK_COLUMNS}
-                    FROM cayu_tasks
-                    {where_sql}
-                    ORDER BY {order_sql}, id ASC
-                    LIMIT %s OFFSET %s
-                    """,
-                ),
-                params,
-            )
+            # Interpolations are trusted: TASK_COLUMNS is a constant and the clauses are
+            # hard-coded; values, the input path included, bind via %s.
+            await cur.execute(cast("LiteralString", sql), params)
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
 
@@ -6033,9 +6089,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             clauses.append(
                 "work_contract IS NOT NULL" if query.has_work_contract else "work_contract IS NULL"
             )
-        if query.type is not None:
-            clauses.append("type = %s")
-            params.append(query.type)
+        types = task_query_types(query)
+        if types is not None:
+            clauses.append(f"type IN ({', '.join(['%s'] * len(types))})")
+            params.extend(types)
         if query.session_id is not None:
             clauses.append("session_id = %s")
             params.append(query.session_id)

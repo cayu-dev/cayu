@@ -304,6 +304,8 @@ from cayu.tasks.queries import (
     _work_attempt_discovery_query,
     copy_task_aggregate_filter,
     copy_task_query,
+    latest_tasks_key_path,
+    select_latest_tasks,
     task_query_from_aggregate_filter,
 )
 from cayu.tasks.records import (
@@ -2694,24 +2696,42 @@ class InMemoryTaskStore(TaskStore):
             _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
         async with self._lock:
-            from cayu.tasks.abandoned import is_fenced_after_worker_loss
-            from cayu.tasks.access import visible
-
-            fenced_now = self._ownership_clock()
-            tasks = [
-                task
-                for task in self._tasks.values()
-                if _task_matches(task, query)
-                and (
-                    query.fenced_after_worker_loss is None
-                    or is_fenced_after_worker_loss(task, fenced_now)
-                    is query.fenced_after_worker_loss
-                )
-                and (_access_bounds is None or visible(task, _access_bounds))
-            ]
+            tasks = self._matching_tasks_unlocked(query, _access_bounds)
             tasks = _sort_tasks(tasks, query.order_by)
             page = tasks[query.offset : query.offset + query.limit]
             return [task.model_copy(deep=True) for task in page]
+
+    async def latest_tasks(
+        self, query: TaskQuery | None = None, *, by: str | None = None, _access_bounds=None
+    ) -> list[Task]:
+        path = None if by is None else latest_tasks_key_path(by)
+        query = copy_task_query(query)
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
+        async with self._lock:
+            matching = self._matching_tasks_unlocked(query, _access_bounds)
+            page = select_latest_tasks(matching, query, path)
+            return [task.model_copy(deep=True) for task in page]
+
+    def _matching_tasks_unlocked(self, query: TaskQuery, access_bounds) -> list[Task]:
+        """The tasks ``list_tasks`` and ``latest_tasks`` select from, before ordering."""
+
+        from cayu.tasks.abandoned import is_fenced_after_worker_loss
+        from cayu.tasks.access import visible
+
+        fenced_now = self._ownership_clock()
+        return [
+            task
+            for task in self._tasks.values()
+            if _task_matches(task, query)
+            and (
+                query.fenced_after_worker_loss is None
+                or is_fenced_after_worker_loss(task, fenced_now) is query.fenced_after_worker_loss
+            )
+            and (access_bounds is None or visible(task, access_bounds))
+        ]
 
     async def claim_session_closure(
         self, claim: TaskSessionClosureClaim

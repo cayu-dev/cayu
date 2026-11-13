@@ -183,6 +183,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/sessions/{session_id}/usage",
             "/task-types",
             "/tasks",
+            "/tasks/latest",
             "/tasks/{task_id}",
             "/tasks/{task_id}/replay",
             "/tasks/{task_id}/schedule/events",

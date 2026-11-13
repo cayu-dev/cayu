@@ -235,6 +235,8 @@ from cayu.tasks.handoff import (
 from cayu.tasks.index import TaskIndexQuery as TaskIndexQuery
 from cayu.tasks.index import TaskIndexResult as TaskIndexResult
 from cayu.tasks.memory import InMemoryTaskStore as InMemoryTaskStore
+from cayu.tasks.once import TaskOnce as TaskOnce
+from cayu.tasks.once import create_task_once as create_task_once
 from cayu.tasks.operations import TaskCreationConflict as TaskCreationConflict
 from cayu.tasks.operations import TaskCreationOperation as TaskCreationOperation
 from cayu.tasks.operations import TaskCreationResultDeleted as TaskCreationResultDeleted

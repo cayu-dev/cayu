@@ -28,6 +28,7 @@ from cayu.cli._task_readers import (
     MAX_TASK_PAGE,
     MAX_TASK_SESSIONS,
     ApiTaskReader,
+    TaskLatestRequest,
     TaskListRequest,
     TaskReader,
     open_store_task_reader,
@@ -39,6 +40,7 @@ from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEventType,
     TaskRetryCancellationReconciliationEventType,
 )
+from cayu.tasks.queries import latest_tasks_key_path, task_input_key
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.restart import WORKER_LOSS_FENCE_CODES
 
@@ -244,7 +246,18 @@ def add_task_parser(subparsers: Any) -> None:
     list_parser.add_argument(
         "--status", choices=tuple(item.value for item in TaskStatus), help="Only this status."
     )
-    list_parser.add_argument("--type", help="Only tasks of this exact type.")
+    list_parser.add_argument(
+        "--type",
+        action="extend",
+        dest="types",
+        default=[],
+        type=_task_types_argument,
+        metavar="TYPE",
+        help=(
+            "Only tasks of this exact type. Repeat --type or separate types with commas "
+            "for tasks of any of several types."
+        ),
+    )
     list_parser.add_argument("--agent", help="Only tasks assigned to this agent.")
     list_parser.add_argument("--session", metavar="SESSION_ID", help="Only this session's tasks.")
     list_parser.add_argument(
@@ -261,6 +274,50 @@ def add_task_parser(subparsers: Any) -> None:
     )
     add_read_target_options(list_parser)
     add_output_options(list_parser, formats=("table", "json", "jsonl"), default="table")
+
+    latest_parser = commands.add_parser(
+        "latest",
+        help="Show the newest completed task of a type, or the newest per input key.",
+        description=(
+            "Show the newest tasks that finished with --status (default: completed), newest "
+            "first by completion time, with their input and result. With --by input.KEY, "
+            "show the newest task for each distinct value of that input field, such as "
+            "--by input.repository; tasks whose field is missing or isn't text are left out. "
+            "The store or server picks them in one read."
+        ),
+    )
+    latest_parser.add_argument(
+        "--type",
+        action="extend",
+        dest="types",
+        default=[],
+        type=_task_types_argument,
+        metavar="TYPE",
+        help="Only tasks of this type. Repeat --type or separate types with commas.",
+    )
+    latest_parser.add_argument(
+        "--status",
+        choices=(*_FINISHED_STATUSES, "any"),
+        default=TaskStatus.COMPLETED.value,
+        help="Only tasks that finished this way, or any (default: completed).",
+    )
+    latest_parser.add_argument(
+        "--by",
+        metavar="input.KEY",
+        type=_latest_by_argument,
+        help="The newest task per distinct value of this input field.",
+    )
+    latest_parser.add_argument("--agent", help="Only tasks assigned to this agent.")
+    latest_parser.add_argument(
+        "--limit",
+        type=_page_limit,
+        help=(
+            f"How many tasks (or keys, with --by), 1-{MAX_TASK_PAGE - 1} "
+            "(default: 1, or 50 with --by)."
+        ),
+    )
+    add_read_target_options(latest_parser)
+    add_output_options(latest_parser, formats=("table", "json"), default="table")
 
     show_parser = commands.add_parser(
         "show",
@@ -328,6 +385,29 @@ def _add_field_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_FINISHED_STATUSES = (
+    TaskStatus.COMPLETED.value,
+    TaskStatus.FAILED.value,
+    TaskStatus.CANCELLED.value,
+    TaskStatus.DEPENDENCY_SKIPPED.value,
+)
+
+
+def _latest_by_argument(value: str) -> str:
+    try:
+        latest_tasks_key_path(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
+def _task_types_argument(value: str) -> list[str]:
+    types = [item.strip() for item in value.split(",")]
+    if not all(types):
+        raise argparse.ArgumentTypeError("task types are non-empty, separated by commas")
+    return types
+
+
 def run_task(args: argparse.Namespace) -> int:
     if args.task_command in _ACTIONS:
         from cayu.cli._control_plane_actions import run_action
@@ -353,6 +433,8 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
     try:
         if args.task_command == "list":
             return await _list_tasks(args, reader)
+        if args.task_command == "latest":
+            return await _latest_tasks(args, reader)
         if args.task_command == "wait":
             return await _wait_for_task(args, reader)
         return await _show_task(args, reader)
@@ -390,7 +472,7 @@ async def _list_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
     rows = await reader.list_tasks(
         TaskListRequest(
             status=None if args.status is None else TaskStatus(args.status),
-            type=args.type,
+            types=tuple(dict.fromkeys(args.types)),
             agent=args.agent,
             session_id=args.session,
             parent_task_id=args.parent,
@@ -424,6 +506,43 @@ async def _list_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
         )
         if has_more:
             print(f"More tasks follow; add --offset {payload['next_offset']}.")
+    return 0
+
+
+async def _latest_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
+    limit = args.limit or (1 if args.by is None else 50)
+    rows = await reader.latest_tasks(
+        TaskLatestRequest(
+            types=tuple(dict.fromkeys(args.types)),
+            status=None if args.status == "any" else TaskStatus(args.status),
+            by=args.by,
+            agent=args.agent,
+            limit=limit,
+        )
+    )
+    path = None if args.by is None else latest_tasks_key_path(args.by)
+    tasks = [
+        {**row, "key": task_input_key(row.get("input"), path)} if path is not None else row
+        for row in rows
+    ]
+    payload = _redact_sensitive(
+        {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "source": reader.source,
+            "by": args.by,
+            "tasks": tasks,
+        }
+    )
+    if args.output_format == "json":
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    elif not payload["tasks"]:
+        print("No finished tasks match.")
+    else:
+        columns = ("id", "type", *(("key",) if path is not None else ()), "status", "completed_at")
+        print_table(
+            columns,
+            [{column: task.get(column) for column in columns} for task in payload["tasks"]],
+        )
     return 0
 
 

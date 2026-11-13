@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -1247,3 +1248,139 @@ async def assert_claim_generation_increments_conformance(
     )
     assert parked.worker_id is None
     assert parked.claim_generation == contracted.claim_generation + 1
+
+
+async def assert_task_types_latest_and_once_conformance(store: TaskStore) -> None:
+    """Several task types in one query, the latest finished tasks, and queue-once keys."""
+
+    from cayu.tasks.once import create_task_once
+
+    async def finish(task_type: str, *, failed: bool = False, result: dict | None = None):
+        claimed = await store.claim_task("conformance", TaskQuery(type=task_type))
+        assert claimed is not None
+        if failed:
+            return await store.fail_task(
+                claimed.id,
+                {"message": "failed"},
+                worker_id="conformance",
+                claim_generation=claimed.claim_generation,
+            )
+        return await store.complete_task(
+            claimed.id,
+            result or {},
+            worker_id="conformance",
+            claim_generation=claimed.claim_generation,
+        )
+
+    # Several types: list and claim match any of them, in the usual claim order.
+    for task_id, task_type in (("t-a", "alpha"), ("t-b", "beta"), ("t-g", "gamma")):
+        await store.create_task(TaskCreate(task_id=task_id, type=task_type))
+    listed = await store.list_tasks(TaskQuery(types=("alpha", "beta")))
+    assert {task.id for task in listed} == {"t-a", "t-b"}
+    first = await store.claim_task("several", TaskQuery(types=("beta", "alpha")))
+    second = await store.claim_task("several", TaskQuery(types=("beta", "alpha")))
+    assert [first.id if first else None, second.id if second else None] == ["t-a", "t-b"]
+    assert await store.claim_task("several", TaskQuery(types=("beta", "alpha"))) is None
+
+    # The latest finished task, and the latest per input key.
+    for index, (repository, failed) in enumerate(
+        (("o/a", False), ("o/b", False), ("o/a", False), ("o/c", True), (7, False))
+    ):
+        task_input = {"repository": repository}
+        await store.create_task(TaskCreate(task_id=f"pass-{index}", type="pass", input=task_input))
+        await finish("pass", failed=failed, result={"n": index})
+    await store.create_task(
+        TaskCreate(task_id="pass-open", type="pass", input={"repository": "o/d"})
+    )
+
+    completed = TaskQuery(type="pass", status=TaskStatus.COMPLETED)
+    latest = await store.latest_task(completed)
+    assert latest is not None and latest.id == "pass-4" and latest.result == {"n": 4}
+    assert [task.id for task in await store.latest_tasks(TaskQuery(type="pass", limit=2))] == [
+        "pass-4",
+        "pass-3",
+    ]
+    by_repository = await store.latest_tasks(completed, by="input.repository")
+    assert [(task.id, task.input["repository"]) for task in by_repository] == [
+        ("pass-2", "o/a"),
+        ("pass-1", "o/b"),
+    ]
+    any_status = await store.latest_tasks(TaskQuery(type="pass"), by="input.repository")
+    assert [task.id for task in any_status] == ["pass-3", "pass-2", "pass-1"]
+    paged = await store.latest_tasks(
+        TaskQuery(type="pass", limit=1, offset=1), by="input.repository"
+    )
+    assert [task.id for task in paged] == ["pass-2"]
+    assert await store.latest_tasks(TaskQuery(type="pass"), by="input.missing") == []
+    assert await store.latest_task(TaskQuery(type="none")) is None
+    for wrong in ("result.repository", "input.items.0", "input.items.-1", "input.-"):
+        with pytest.raises(ValueError, match="field of the task's input"):
+            await store.latest_tasks(TaskQuery(type="pass"), by=wrong)
+
+    # Queue once per key: one task however often it is asked for, also when callers race.
+    racing = await asyncio.gather(
+        *(create_task_once(store, TaskCreate(type="digest", retry_key="slot-am")) for _ in range(3))
+    )
+    assert sum(item.created for item in racing) == 1
+    assert len({item.task.id for item in racing if item.task is not None}) == 1
+    done = await finish("digest")
+    again = await create_task_once(store, TaskCreate(type="digest", retry_key="slot-am"))
+    assert (again.created, again.task.id if again.task else None) == (False, done.id)
+    assert again.task is not None and again.task.status is TaskStatus.COMPLETED
+
+    # A failed key stays failed with one attempt; with more, the next call queues again.
+    await create_task_once(store, TaskCreate(type="digest", retry_key="slot-pm"))
+    failed = await finish("digest", failed=True)
+    stays = await create_task_once(store, TaskCreate(type="digest", retry_key="slot-pm"))
+    assert (stays.created, stays.task.id if stays.task else None) == (False, failed.id)
+
+    await create_task_once(store, TaskCreate(type="digest", retry_key="slot-x"), attempts=2)
+    await finish("digest", failed=True)
+    requeued = await asyncio.gather(
+        *(
+            create_task_once(store, TaskCreate(type="digest", retry_key="slot-x"), attempts=2)
+            for _ in range(3)
+        )
+    )
+    assert sum(item.created for item in requeued) == 1
+    [new_id] = {item.task.id for item in requeued if item.task is not None}
+    await finish("digest", failed=True)
+    # A later call keeps the key's budget whatever attempts it passes.
+    last = await create_task_once(store, TaskCreate(type="digest", retry_key="slot-x"))
+    assert (last.created, last.task.id if last.task else None) == (False, new_id)
+    assert last.key is not None and last.key.attempts == 2
+
+    await create_task_once(store, TaskCreate(type="digest", retry_key="slot-y"), attempts=3)
+    await finish("digest", failed=True)
+    retried = await create_task_once(store, TaskCreate(type="digest", retry_key="slot-y"))
+    assert retried.created and retried.key is not None and retried.key.attempts == 2
+    with pytest.raises(ValueError, match="leave task_id unset"):
+        await create_task_once(store, TaskCreate(task_id="mine", type="digest", retry_key="k"))
+
+    # A caller that read the key before others queued attempts 1 and 2 collides on
+    # attempt 1's ID; it gets the key's current task back, not an error.
+    late = TaskCreate(type="digest-late", retry_key="slot-z")
+    await create_task_once(store, late, attempts=2)
+    await finish("digest-late", failed=True)
+    current = await create_task_once(store, late)
+    assert current.created and current.task is not None
+    delayed = await create_task_once(cast("TaskStore", _StaleKeyRead(store)), late)
+    assert (delayed.created, delayed.task.id if delayed.task else None) == (False, current.task.id)
+    assert delayed.key is not None and delayed.key.attempts == 2
+
+
+class _StaleKeyRead:
+    """A store whose first retry-key read is from before any task was queued for it."""
+
+    def __init__(self, store: TaskStore) -> None:
+        self._store = store
+        self._stale = True
+
+    def __getattr__(self, name: str):
+        return getattr(self._store, name)
+
+    async def load_task_retry_key(self, retry_key: str):
+        if self._stale:
+            self._stale = False
+            return None
+        return await self._store.load_task_retry_key(retry_key)

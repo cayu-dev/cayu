@@ -1595,8 +1595,8 @@ async with open_cloud_agent_readers("cayu-herald") as agent:
     digest = await agent.tasks.load_task(rows[0]["id"]) if rows else None
 ```
 
-`agent.tasks.list_tasks` lists newest-updated first without results, and `load_task`
-returns one task with its `result`, in the shape of the Cayu server's task API (what
+`agent.tasks.list_tasks` lists newest-updated first without results (`TaskListRequest`
+takes `type` for one task type or `types` for several), and `load_task` returns one task with its `result`, in the shape of the Cayu server's task API (what
 `cayu task show --json` prints under `task`). `agent.sessions` reads sessions as `cayu session
 --application` does, for example `query_events(EventQuery(...))` and
 `query_transcript(TranscriptQuery(...))`. The open function takes `context=` for

@@ -27,6 +27,7 @@ from tests.core.task_store_conformance import (
     assert_task_claim_lost_conformance,
     assert_task_contract_queue_filter_conformance,
     assert_task_session_invocation_binding_conformance,
+    assert_task_types_latest_and_once_conformance,
     assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
@@ -83,6 +84,34 @@ def test_task_stores_filter_contract_queues(store_factory: StoreFactory, sqlite_
             await assert_task_contract_queue_filter_conformance(store)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_factory", [InMemoryTaskStore, SQLiteTaskStore])
+def test_task_stores_match_several_types_read_latest_and_queue_once(
+    store_factory: StoreFactory, sqlite_resources
+) -> None:
+    async def scenario() -> None:
+        async with sqlite_resources as resources:
+            store = _make_store(store_factory, resources.root)
+            if store_factory is SQLiteTaskStore:
+                resources.own(store)
+            await assert_task_types_latest_and_once_conformance(store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"type": "a", "types": ("b",)}, "not both"),
+        ({"types": ()}, "1 to 50"),
+        ({"types": ("a", "a")}, "repeat"),
+        ({"types": ("a", " ")}, "types"),
+    ],
+)
+def test_task_query_types_are_checked(fields, message) -> None:
+    with pytest.raises(ValidationError, match=message):
+        TaskQuery(**fields)
 
 
 @pytest.mark.parametrize("value", [0, 1, "true", "false", [], {}])

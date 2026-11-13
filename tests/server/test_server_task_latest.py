@@ -1,0 +1,103 @@
+"""`GET /api/tasks/latest` and several task types on `GET /api/tasks`."""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+
+import asyncio
+
+from fastapi.testclient import TestClient
+from tests.server.server_test_support import _LOCAL_SERVER_CONFIG
+
+from cayu.applications import CayuApp
+from cayu.server import create_server
+from cayu.tasks.creation import TaskCreate
+from cayu.tasks.memory import InMemoryTaskStore
+from cayu.tasks.queries import TaskQuery
+
+
+def _client() -> TestClient:
+    store = InMemoryTaskStore()
+
+    async def seed() -> None:
+        for index, repository in enumerate(("o/a", "o/b", "o/a")):
+            await store.create_task(
+                TaskCreate(task_id=f"pass-{index}", type="pass", input={"repository": repository})
+            )
+            claimed = await store.claim_task("worker", TaskQuery(type="pass"))
+            assert claimed is not None
+            await store.complete_task(
+                claimed.id,
+                {"pass": index},
+                worker_id="worker",
+                claim_generation=claimed.claim_generation,
+            )
+        await store.create_task(TaskCreate(task_id="recheck-1", type="recheck"))
+        await store.create_task(TaskCreate(task_id="other-1", type="other"))
+
+    asyncio.run(seed())
+    return TestClient(create_server(CayuApp(task_store=store), config=_LOCAL_SERVER_CONFIG))
+
+
+def test_latest_returns_the_newest_finished_tasks_with_their_results() -> None:
+    client = _client()
+
+    latest = client.get("/api/tasks/latest", params={"type": "pass", "status": "completed"})
+    assert latest.status_code == 200
+    assert latest.headers["Cache-Control"] == "private, no-store"
+    assert [(task["id"], task["result"]) for task in latest.json()] == [
+        ("pass-2", {"pass": 2}),
+        ("pass-1", {"pass": 1}),
+        ("pass-0", {"pass": 0}),
+    ]
+
+    grouped = client.get("/api/tasks/latest", params={"type": "pass", "by": "input.repository"})
+    assert [task["id"] for task in grouped.json()] == ["pass-2", "pass-1"]
+
+    one = client.get("/api/tasks/latest", params={"types": ["pass", "recheck"], "limit": 1})
+    assert [task["id"] for task in one.json()] == ["pass-2"]
+
+    assert client.get("/api/tasks/latest", params={"by": "result.x"}).status_code == 422
+    assert client.get("/api/tasks/latest", params={"type": "a", "types": ["b"]}).status_code == 422
+    # A task named `latest` is still readable by id elsewhere; this route answers first.
+    assert client.get("/api/tasks/pass-1").json()["id"] == "pass-1"
+
+
+def test_task_list_filters_by_several_types() -> None:
+    client = _client()
+
+    assert client.get("/api/tasks", params={"type": "a", "types": ["b"]}).status_code == 422
+    listed = client.get("/api/tasks", params={"types": ["recheck", "other"]})
+    assert listed.status_code == 200
+    assert sorted(task["id"] for task in listed.json()) == ["other-1", "recheck-1"]
+
+    counted = client.get("/api/tasks", params={"types": ["recheck", "other"], "include": "counts"})
+    assert counted.status_code == 200
+    assert sorted(task["id"] for task in counted.json()["items"]) == ["other-1", "recheck-1"]
+
+
+def test_latest_selectors_match_the_public_projection_not_hidden_values() -> None:
+    from cayu.vaults.redaction import SecretRedactor
+
+    secret = "acct-secret-9f3a"
+    store = InMemoryTaskStore()
+
+    async def seed() -> None:
+        await store.create_task(TaskCreate(task_id="t1", type="pass", assigned_agent_name=secret))
+        claimed = await store.claim_task("worker", TaskQuery(type="pass"))
+        assert claimed is not None
+        await store.complete_task(
+            claimed.id, {}, worker_id="worker", claim_generation=claimed.claim_generation
+        )
+
+    asyncio.run(seed())
+    app = CayuApp(task_store=store, secret_redactor=SecretRedactor(secret))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    # Guessing the hidden name confirms nothing, as on `GET /api/tasks`.
+    for guess in (secret, "acct-secret-wrong"):
+        assert client.get("/api/tasks/latest", params={"assigned_agent_name": guess}).json() == []
+    assert [task["id"] for task in client.get("/api/tasks/latest").json()] == ["t1"]

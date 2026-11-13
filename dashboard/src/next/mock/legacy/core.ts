@@ -895,8 +895,10 @@ function taskDetail(context: LegacyContext, task: TaskItem): TaskInfo {
 function taskMatches(task: Task, query: URLSearchParams): boolean {
   const q = query.get("q")?.toLowerCase()
   const exact = ["status", "type", "session_id", "parent_task_id", "assigned_agent_name"] as const
+  const types = query.getAll("types")
   return (
     exact.every((key) => !query.get(key) || task[key] === query.get(key)) &&
+    (!types.length || types.includes(task.type)) &&
     (!q ||
       [task.id, task.type, task.title, task.status, task.session_id, task.assigned_agent_name]
         .join(" ")

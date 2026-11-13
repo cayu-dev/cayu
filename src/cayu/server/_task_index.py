@@ -152,7 +152,7 @@ async def read_task_index(
         if values and not values.matches(task, redact or (lambda value, _field: value)):
             return False
         if needle is None and not any(
-            getattr(query, field) is not None for field in filtered_fields
+            getattr(query, field) is not None for field in (*filtered_fields, "types")
         ):
             return True
         projected = serialize(app, task)
@@ -160,6 +160,8 @@ async def read_task_index(
             expected = getattr(query, field)
             if expected is not None and projected.get(field) != expected:
                 return False
+        if query.types is not None and projected.get("type") not in query.types:
+            return False
         if needle is None:
             return True
         return any(
@@ -173,7 +175,9 @@ async def read_task_index(
                 # These selectors refer to the public projection, not raw store
                 # values. Preserve native scope/order while matching them only
                 # through the predicate above. Native SDK queries stay raw.
-                filters=query.model_copy(update={field: None for field in filtered_fields}),
+                filters=query.model_copy(
+                    update={field: None for field in (*filtered_fields, "types")}
+                ),
                 include_internal=include_internal,
                 prerequisite_task_id=prerequisite_task_id,
                 after=after,
@@ -226,6 +230,7 @@ async def _read_bare_task_items(
         update={
             "q": None,
             "type": None,
+            "types": None,
             "session_id": None,
             "parent_task_id": None,
             "assigned_agent_name": None,

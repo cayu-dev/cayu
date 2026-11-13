@@ -776,8 +776,9 @@ a page cap; only `items` is bounded by `limit` (maximum 1,000). `total_count`
 includes the selected `status` and repeated `statuses` filters, while the twelve
 `counts_by_status` entries ignore status selection so all chips remain useful.
 Counts use the existing exact aggregate decimal-string representation.
-Both honor type, specialist (`assigned_agent_name`), session, parent, public text
-search and `include_internal`. Pass `include_internal=false` to exclude `cayu.*`
+Both honor type (one `type`, or repeated `types` for any of several),
+specialist (`assigned_agent_name`), session, parent, public text search and
+`include_internal`. Pass `include_internal=false` to exclude `cayu.*`
 types before counting and paging. Search matches public redacted text, never
 private input, result, metadata or a secret removed from the displayed fields.
 
@@ -812,9 +813,18 @@ after the first `=` is the value. Cursors stay bound to these filters too.
 The contract's `task_value_filters` surface says the server supports them; a
 server without it ignores the parameters, so `client.js` refuses to send them
 there.
+
 Every task list response carries a weak `ETag`; send it back as `If-None-Match`
 and an unchanged list answers `304` with no body. `client.js`'s `watchTasks`
 does both, so a page that shows tasks follows them without a timer of its own.
+
+`GET /api/tasks/latest` returns the newest finished task details, results
+included, newest first by `completed_at`: `type` or repeated `types`, `status`,
+`session_id`, `parent_task_id`, `assigned_agent_name`, `limit` (default 50,
+maximum 1,000) and `offset`. With `by=input.KEY` it returns the newest task for
+each distinct text value of that input field, and `limit` and `offset` page the
+keys. It reads the store natively (`TaskStore.latest_tasks`), applies resource
+access bounds, and returns 501 for a store that can't.
 
 `GET /api/tasks/{task_id}/dependents` returns the same bounded envelope for tasks
 whose authoritative prerequisites contain that task. It includes internal task
@@ -852,6 +862,7 @@ cayu task resume TASK_ID
 cayu task cancel TASK_ID --reason "Wrong input"
 cayu task replay TASK_ID --operation-id report-2026-10-29-again --json
 cayu task list --server-url http://127.0.0.1:8000 --json
+cayu task latest --type report --server-url http://127.0.0.1:8000 --json
 cayu task wait TASK_ID --server-url http://127.0.0.1:8000 --json
 ```
 

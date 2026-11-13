@@ -321,7 +321,9 @@ from cayu.tasks.queries import (
     _work_attempt_discovery_query,
     copy_task_aggregate_filter,
     copy_task_query,
+    latest_tasks_key_path,
     task_query_from_aggregate_filter,
+    task_query_types,
 )
 from cayu.tasks.records import (
     Task,
@@ -4281,12 +4283,33 @@ class SQLiteTaskStore(TaskStore):
 
             _access_bounds = await current_data_bounds("tasks")
         query = copy_task_query(query)
+        clauses, params = self._task_list_clauses(query, _access_bounds)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = sqlite_records.task_order_sql(query.order_by)
+        params.extend([query.limit, query.offset])
+
+        async with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT *
+                FROM cayu_tasks
+                {where_sql}
+                ORDER BY {order_sql}, id ASC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+            return [sqlite_records.task_from_row(row) for row in rows]
+
+    def _task_list_clauses(self, query: TaskQuery, access_bounds) -> tuple[list[str], list[object]]:
+        """The WHERE clauses ``list_tasks`` and ``latest_tasks`` select tasks with."""
+
         clauses: list[str] = []
         params: list[object] = []
-        if _access_bounds is not None:
+        if access_bounds is not None:
             from cayu.tasks.access import sql_predicate
 
-            access_sql, access_params = sql_predicate(_access_bounds, postgres=False)
+            access_sql, access_params = sql_predicate(access_bounds, postgres=False)
             clauses.append(access_sql)
             params.extend(access_params)
 
@@ -4312,9 +4335,10 @@ class SQLiteTaskStore(TaskStore):
         if query.status is not None:
             clauses.append("status = ?")
             params.append(str(query.status))
-        if query.type is not None:
-            clauses.append("type = ?")
-            params.append(query.type)
+        types = task_query_types(query)
+        if types is not None:
+            clauses.append(f"type IN ({', '.join(['?'] * len(types))})")
+            params.extend(types)
         if query.session_id is not None:
             clauses.append("session_id = ?")
             params.append(query.session_id)
@@ -4352,21 +4376,47 @@ class SQLiteTaskStore(TaskStore):
                     str(TaskStatus.CLAIMED),
                 ]
             )
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_sql = sqlite_records.task_order_sql(query.order_by)
-        params.extend([query.limit, query.offset])
+        return clauses, params
 
-        async with self._lock:
-            rows = self._connection.execute(
-                f"""
-                SELECT *
-                FROM cayu_tasks
-                {where_sql}
-                ORDER BY {order_sql}, id ASC
+    async def latest_tasks(
+        self, query: TaskQuery | None = None, *, by: str | None = None, _access_bounds=None
+    ) -> list[Task]:
+        path = None if by is None else latest_tasks_key_path(by)
+        if _access_bounds is None:
+            from cayu.resource_access import current_data_bounds
+
+            _access_bounds = await current_data_bounds("tasks")
+        query = copy_task_query(query)
+        clauses, params = self._task_list_clauses(query, _access_bounds)
+        clauses.append("completed_at IS NOT NULL")
+        if path is None:
+            sql = f"""
+                SELECT * FROM cayu_tasks
+                WHERE {" AND ".join(clauses)}
+                ORDER BY completed_at DESC, id ASC
                 LIMIT ? OFFSET ?
-                """,
-                params,
-            ).fetchall()
+            """
+        else:
+            # One row per distinct string at the path: the newest by completion.
+            json_path = "$" + "".join(f'."{segment}"' for segment in path)
+            clauses.append("json_type(input_json, ?) = 'text'")
+            params = [json_path, *params, json_path]
+            sql = f"""
+                SELECT * FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY json_extract(input_json, ?)
+                        ORDER BY completed_at DESC, id ASC
+                    ) AS cayu_latest_rank
+                    FROM cayu_tasks
+                    WHERE {" AND ".join(clauses)}
+                )
+                WHERE cayu_latest_rank = 1
+                ORDER BY completed_at DESC, id ASC
+                LIMIT ? OFFSET ?
+            """
+        params.extend([query.limit, query.offset])
+        async with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
             return [sqlite_records.task_from_row(row) for row in rows]
 
     def _current_retention_floor_unlocked(self, session_id: str) -> tuple[str, int] | None:
@@ -7928,9 +7978,10 @@ class SQLiteTaskStore(TaskStore):
                 if query.has_work_contract
                 else "work_contract_json IS NULL"
             )
-        if query.type is not None:
-            clauses.append("type = ?")
-            params.append(query.type)
+        types = task_query_types(query)
+        if types is not None:
+            clauses.append(f"type IN ({', '.join(['?'] * len(types))})")
+            params.extend(types)
         if query.session_id is not None:
             clauses.append("session_id = ?")
             params.append(query.session_id)

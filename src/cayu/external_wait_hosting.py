@@ -61,7 +61,7 @@ from cayu.sessions.external_waits import (
 )
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.parked_continuation import attempt_is_live
-from cayu.tasks.queries import TaskQuery
+from cayu.tasks.queries import TaskQuery, task_query_types
 from cayu.tasks.scheduling import TaskSchedulePolicy
 from cayu.tasks.worker import complete_managed_task
 
@@ -665,7 +665,9 @@ def claims_hosted_tasks(query: TaskQuery | None) -> bool:
             "has_work_contract",
         }
     )
-    return query.type in {None, EXTERNAL_WAIT_TASK_TYPE, EXTERNAL_WAIT_SERVICE_TASK_TYPE} and all(
+    types = task_query_types(query)
+    hosted = {EXTERNAL_WAIT_TASK_TYPE, EXTERNAL_WAIT_SERVICE_TASK_TYPE}
+    return (types is None or not hosted.isdisjoint(types)) and all(
         value is None for value in narrowed.values()
     )
 

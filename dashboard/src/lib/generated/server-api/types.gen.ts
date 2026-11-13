@@ -32510,6 +32510,10 @@ export type ListTasksApiTasksGetData = {
          */
         type?: string | null;
         /**
+         * Types
+         */
+        types?: Array<string> | null;
+        /**
          * Session Id
          */
         session_id?: string | null;
@@ -32586,6 +32590,72 @@ export type CreateTaskApiTasksPostResponses = {
 };
 
 export type CreateTaskApiTasksPostResponse = CreateTaskApiTasksPostResponses[keyof CreateTaskApiTasksPostResponses];
+
+export type LatestTasksApiTasksLatestGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Type
+         */
+        type?: string | null;
+        /**
+         * Types
+         */
+        types?: Array<string> | null;
+        /**
+         * Status
+         */
+        status?: TaskStatus | null;
+        /**
+         * By
+         *
+         * A field of the task's input, such as input.repository: the newest task for each distinct string value of it.
+         */
+        by?: string | null;
+        /**
+         * Session Id
+         */
+        session_id?: string | null;
+        /**
+         * Parent Task Id
+         */
+        parent_task_id?: string | null;
+        /**
+         * Assigned Agent Name
+         */
+        assigned_agent_name?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Offset
+         */
+        offset?: number;
+    };
+    url: '/api/tasks/latest';
+};
+
+export type LatestTasksApiTasksLatestGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type LatestTasksApiTasksLatestGetError = LatestTasksApiTasksLatestGetErrors[keyof LatestTasksApiTasksLatestGetErrors];
+
+export type LatestTasksApiTasksLatestGetResponses = {
+    /**
+     * Response Latest Tasks Api Tasks Latest Get
+     *
+     * Successful Response
+     */
+    200: Array<ApiTaskDetail>;
+};
+
+export type LatestTasksApiTasksLatestGetResponse = LatestTasksApiTasksLatestGetResponses[keyof LatestTasksApiTasksLatestGetResponses];
 
 export type CancelScheduledTaskApiTasksScheduleCancelPostData = {
     body: TaskScheduleCancelRequest;

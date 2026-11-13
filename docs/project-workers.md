@@ -280,9 +280,24 @@ the project's configured or canonical store), read-only, or reads a Cayu Cloud A
 ```bash
 cayu task list --status running
 cayu task list --application my-agent --type scan --limit 20
+cayu task list --type pass,recheck
 cayu task show TASK_ID --json
+cayu task latest --type digest --json
+cayu task latest --type pass --by input.repository --json
 cayu task wait TASK_ID --application my-agent --wait-seconds 3600
 ```
+
+`--type` takes several types, repeated or separated by commas. A Cayu server older
+than `types` on `GET /api/tasks` would list every type, so the CLI refuses its answer
+and says to list one type at a time.
+
+`latest` shows the newest task that completed (`--status failed`, `cancelled`,
+`dependency_skipped` or `any` for others), newest first by completion time, with its
+input and result. `--by input.KEY` shows the newest task for each distinct value of
+that input field, such as each repository a pass ran for, with the value as `key`;
+tasks whose field is missing or isn't text are left out. `--limit` is the number of
+tasks, or of keys with `--by` (default 1, or 50 with `--by`). The store or server
+answers in one read (`TaskStore.latest_tasks`, `GET /api/tasks/latest`).
 
 `list` prints the newest-updated tasks first with their status, the reason for it, the
 assigned agent, the retry attempt and the worker holding the claim; add `--offset` for

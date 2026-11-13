@@ -110,6 +110,7 @@ from cayu.tasks.queries import (
     _ensure_claim_query_supported,
     _task_matches_claim_filter,
     copy_task_query,
+    task_query_types,
 )
 from cayu.tasks.records import (
     Task,
@@ -361,7 +362,7 @@ class TaskStore(ABC):
                     {
                         (
                             "" if query.status is None else query.status.value,
-                            "" if query.type is None else query.type,
+                            ",".join(sorted(task_query_types(query) or ())),
                             "" if query.parent_task_id is None else query.parent_task_id,
                             (
                                 "all"
@@ -988,6 +989,33 @@ class TaskStore(ABC):
         self, query: TaskQuery | None = None, *, _access_bounds=None
     ) -> list[Task]:
         """List tasks for dashboards, queues, and orchestration."""
+
+    async def latest_tasks(
+        self, query: TaskQuery | None = None, *, by: str | None = None, _access_bounds=None
+    ) -> list[Task]:
+        """The newest finished tasks matching ``query``, by completion time.
+
+        Only tasks with a ``completed_at`` count (completed, failed, cancelled or skipped);
+        pass ``status=TaskStatus.COMPLETED`` for completed ones. With ``by`` (a field of
+        the input, such as ``"input.repository"``), one task per distinct string value of
+        that field: the newest for each, newest first. Tasks whose field is missing or
+        not a string are left out. ``query.limit`` and ``query.offset`` page the result
+        (the keys, with ``by``); ``query.order_by`` doesn't apply. Built-in stores answer
+        with one native read.
+        """
+
+        raise NotImplementedError("This TaskStore does not support latest-task reads.")
+
+    async def latest_task(self, query: TaskQuery | None = None) -> Task | None:
+        """The newest finished task matching ``query``, or ``None``; see ``latest_tasks``.
+
+        ``latest_task(TaskQuery(type="digest", status=TaskStatus.COMPLETED))`` is the last
+        completed digest.
+        """
+
+        page = copy_task_query(query).model_copy(update={"limit": 1, "offset": 0})
+        tasks = await self.latest_tasks(page)
+        return tasks[0] if tasks else None
 
     async def load_session_retention_epoch(self, session_id: str) -> tuple[str, int] | None:
         """Read the current incarnation before verifying its replacement in the session store."""

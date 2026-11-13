@@ -14,6 +14,7 @@ import { json as read } from "./http"
 export type TaskIndexQuery = {
   q?: string
   type?: string
+  types?: string[]
   assigned_agent_name?: string
   parent_task_id?: string
   session_id?: string

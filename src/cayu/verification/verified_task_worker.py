@@ -317,6 +317,10 @@ class VerifiedTaskWorker:
             or selected.status not in {None, TaskStatus.PENDING}
         ):
             raise ValueError("VerifiedTaskWorker accepts queue scope filters, not display filters.")
+        if selected.types is not None:
+            if len(selected.types) > 1:
+                raise ValueError("VerifiedTaskWorker claims one task type; give type, not types.")
+            selected = selected.model_copy(update={"type": selected.types[0], "types": None})
         self.app = app
         self._completion = app._verified_completion
         self.store = app.task_store

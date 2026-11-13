@@ -42,6 +42,7 @@ from tests.core.task_store_conformance import (
     assert_task_claim_lost_conformance,
     assert_task_contract_queue_filter_conformance,
     assert_task_session_invocation_binding_conformance,
+    assert_task_types_latest_and_once_conformance,
     assert_worker_terminalization_generation_conformance,
 )
 from tests.core.task_terminalization_conformance import (
@@ -288,6 +289,18 @@ def test_postgres_filters_contract_queues(postgres_dsn):
         store = _new_store(postgres_dsn)
         try:
             await assert_task_contract_queue_filter_conformance(store)
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_postgres_matches_several_types_reads_latest_and_queues_once(postgres_dsn):
+    async def scenario():
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await assert_task_types_latest_and_once_conformance(store)
         finally:
             await store.close()
 

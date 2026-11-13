@@ -7072,7 +7072,8 @@ A task is not a PM-specific object. It is a generic work item that can represent
 - `create_task(TaskCreate(...))`
 - `create_running_task(TaskCreate(session_id=...), session_invocation=...)`
 - `load_task(task_id)`
-- `list_tasks(TaskQuery(...))`
+- `list_tasks(TaskQuery(...))`; `TaskQuery(types=(...))` matches any of several types
+- `latest_task(TaskQuery(...))` and `latest_tasks(TaskQuery(...), by="input.KEY")`: the newest finished tasks by `completed_at`, or the newest per input field
 - `start_task(task_id, session_id=..., session_invocation=...)`
 - `attach_task(task_id, session_id=..., session_invocation=..., worker_id=..., claim_generation=...)`
 - `pause_task(task_id, reason=..., payload=...)`

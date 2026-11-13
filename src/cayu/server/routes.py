@@ -247,6 +247,7 @@ from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server._task_controls_routes import register_task_controls_routes
 from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
 from cayu.server._task_index import TaskValueFilters, read_task_index
+from cayu.server._task_latest_routes import register_task_latest_route
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -9448,6 +9449,7 @@ def create_router(
         status: TaskStatus | None = None,
         statuses: Annotated[list[TaskStatus] | None, Query()] = None,
         task_type: str | None = Query(default=None, alias="type"),
+        types: Annotated[list[str] | None, Query()] = None,
         session_id: str | None = None,
         parent_task_id: str | None = None,
         assigned_agent_name: str | None = None,
@@ -9468,6 +9470,7 @@ def create_router(
                 q=q,
                 status=status,
                 type=task_type,
+                types=None if not types else tuple(types),
                 session_id=session_id,
                 parent_task_id=parent_task_id,
                 assigned_agent_name=assigned_agent_name,
@@ -9476,7 +9479,7 @@ def create_router(
                 offset=offset,
             )
         except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+            raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
         if cursor is not None and include is None:
             raise HTTPException(422, "Task cursors require include=counts.")
         if (
@@ -9484,6 +9487,7 @@ def create_router(
             or q is not None
             or not include_internal
             or statuses
+            or types
             or values
             or any(
                 value is not None
@@ -9614,6 +9618,10 @@ def create_router(
         dependencies=protected,
         response_model=ApiTaskScheduleReceipt,
         route_class_override=_task_schedule_route_class(auth),
+    )
+
+    register_task_latest_route(
+        router, cayu_app=cayu_app, protected=protected, serialize_task=_serialize_task_detail
     )
 
     @router.get(

@@ -42,12 +42,35 @@ class TaskListRequest:
     """Filters and one page of a newest-updated-first task list."""
 
     status: TaskStatus | None = None
+    # One task type; give ``type`` or ``types``, not both.
     type: str | None = None
+    # Tasks of any of these types; empty, with no ``type``, means every type.
+    types: tuple[str, ...] = ()
     agent: str | None = None
     session_id: str | None = None
     parent_task_id: str | None = None
     limit: int = 50
     offset: int = 0
+
+    def __post_init__(self) -> None:
+        if self.type is not None and self.types:
+            raise ValueError("Give type or types, not both.")
+
+    @property
+    def matched_types(self) -> tuple[str, ...]:
+        """The task types listed; empty means every type."""
+        return self.types or (() if self.type is None else (self.type,))
+
+
+@dataclass(frozen=True)
+class TaskLatestRequest:
+    """The newest finished tasks, or with ``by`` the newest per input key."""
+
+    types: tuple[str, ...] = ()
+    status: TaskStatus | None = TaskStatus.COMPLETED
+    by: str | None = None
+    agent: str | None = None
+    limit: int = 1
 
 
 class TaskReader(Protocol):
@@ -63,6 +86,10 @@ class TaskReader(Protocol):
 
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         """The task's detail, with its result, or ``None`` when there is no such task."""
+        ...
+
+    async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
+        """The newest finished tasks (``TaskStore.latest_tasks``), as task details."""
         ...
 
     async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
@@ -98,7 +125,7 @@ class StoreTaskReader:
         tasks = await self._store.list_tasks(
             TaskQuery(
                 status=request.status,
-                type=request.type,
+                types=request.matched_types or None,
                 assigned_agent_name=request.agent,
                 session_id=request.session_id,
                 parent_task_id=request.parent_task_id,
@@ -112,6 +139,18 @@ class StoreTaskReader:
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         task = await self._store.load_task(task_id)
         return None if task is None else task_projection(task, detail=True)
+
+    async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
+        tasks = await self._store.latest_tasks(
+            TaskQuery(
+                types=request.types or None,
+                status=request.status,
+                assigned_agent_name=request.agent,
+                limit=request.limit,
+            ),
+            by=request.by,
+        )
+        return [task_projection(task, detail=True) for task in tasks]
 
     async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         if self._sessions is None:
@@ -150,11 +189,12 @@ class ApiTaskReader:
         self.source = source
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
-        query = {
+        types = request.matched_types
+        query: dict[str, str | list[str]] = {
             key: value
             for key, value in {
+                **_type_query(types),
                 "status": None if request.status is None else request.status.value,
-                "type": request.type,
                 "assigned_agent_name": request.agent,
                 "session_id": request.session_id,
                 "parent_task_id": request.parent_task_id,
@@ -164,12 +204,45 @@ class ApiTaskReader:
             }.items()
             if value is not None
         }
-        body = self._api.get("/tasks", query=query, resource="tasks")
+        body = self._task_list(self._api.get("/tasks", query=query, resource="tasks"))
+        if types and any(row["type"] not in types for row in body):
+            # A server that predates `types` ignores it and lists every type.
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} can't list several task types at once; "
+                "list one --type at a time.",
+            )
+        return body
+
+    async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
+        query: dict[str, str | list[str]] = {
+            key: value
+            for key, value in {
+                **_type_query(request.types),
+                "status": None if request.status is None else request.status.value,
+                "by": request.by,
+                "assigned_agent_name": request.agent,
+                "limit": str(request.limit),
+            }.items()
+            if value is not None
+        }
+        try:
+            body = self._api.get("/tasks/latest", query=query, resource="tasks")
+        except CayuApiNotFound:
+            # A server that predates the route reads `latest` as a task id.
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} can't read the latest tasks; its Cayu predates "
+                "`GET /tasks/latest`.",
+            ) from None
+        return self._task_list(body)
+
+    def _task_list(self, body: object) -> list[dict[str, Any]]:
         if not isinstance(body, list) or not all(_is_task_row(row) for row in body):
             raise CayuApiError(
                 "not_cayu", f"{self._api.description} returned an invalid task list."
             )
-        return body
+        return cast("list[dict[str, Any]]", body)
 
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         try:
@@ -383,6 +456,14 @@ def _schedule(task: Task) -> dict[str, Any]:
 
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
+
+
+def _type_query(types: tuple[str, ...]) -> dict[str, str | list[str] | None]:
+    # One type goes as `type`, which every server reads; several as `types`.
+    return {
+        "type": types[0] if len(types) == 1 else None,
+        "types": list(types) if len(types) > 1 else None,
+    }
 
 
 def _is_task_row(value: object) -> bool:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any, cast
 
 from pydantic import (
     BaseModel,
@@ -34,12 +37,19 @@ class TaskOrder(StrEnum):
     UPDATED_AT_DESC = "updated_at_desc"
 
 
+# The most task types one query may name.
+MAX_TASK_QUERY_TYPES = 50
+
+
 class TaskQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     q: str | None = None
     status: TaskStatus | None = None
     type: str | None = None
+    # Several task types: a task of any of them matches, and a worker claims any of them
+    # in the store's usual claim order. Give ``type`` or ``types``, not both.
+    types: tuple[str, ...] | None = None
     session_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
@@ -61,6 +71,95 @@ class TaskQuery(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("types")
+    @classmethod
+    def validate_types(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if not 1 <= len(value) <= MAX_TASK_QUERY_TYPES:
+            raise ValueError(f"types must name 1 to {MAX_TASK_QUERY_TYPES} task types.")
+        types = tuple(require_clean_nonblank(item, "types") for item in value)
+        if len(set(types)) != len(types):
+            raise ValueError("types must not repeat a task type.")
+        return types
+
+    @model_validator(mode="after")
+    def validate_one_type_filter(self) -> TaskQuery:
+        if self.type is not None and self.types is not None:
+            raise ValueError("Give type or types, not both.")
+        return self
+
+
+def task_query_types(query: TaskQuery) -> tuple[str, ...] | None:
+    """The task types ``query`` matches, or ``None`` when it matches every type."""
+
+    if query.types is not None:
+        return query.types
+    return None if query.type is None else (query.type,)
+
+
+# ``by`` for ``TaskStore.latest_tasks``: a field of the task's input, such as
+# ``input.repository`` or ``input.target.repository``.
+# A segment names an object key; one PostgreSQL could read as an array index (such as
+# 0 or -1) would read an array element there.
+_LATEST_BY_SEGMENT = re.compile(r"(?=[A-Za-z0-9_-]{1,64}$)[0-9-]*[A-Za-z_][A-Za-z0-9_-]*")
+_MAX_LATEST_BY_DEPTH = 8
+
+
+def latest_tasks_key_path(by: str) -> tuple[str, ...]:
+    """The input path ``by`` names (``"input.repository"`` is ``("repository",)``)."""
+
+    if not isinstance(by, str):
+        raise TypeError("by must be a string such as 'input.repository'.")
+    root, _, rest = by.partition(".")
+    segments = tuple(rest.split(".")) if rest else ()
+    if (
+        root != "input"
+        or not 1 <= len(segments) <= _MAX_LATEST_BY_DEPTH
+        or not all(_LATEST_BY_SEGMENT.fullmatch(segment) for segment in segments)
+    ):
+        raise ValueError(
+            "by must name a field of the task's input, such as 'input.repository': "
+            f"up to {_MAX_LATEST_BY_DEPTH} names of letters, digits, '_' and '-', "
+            "each with at least one letter or '_'."
+        )
+    return segments
+
+
+def task_input_key(task_input: object, path: tuple[str, ...]) -> str | None:
+    """The string at ``path`` in a task's input, or ``None`` when it isn't a string."""
+
+    value: Any = task_input
+    for segment in path:
+        if not isinstance(value, Mapping) or segment not in value:
+            return None
+        value = cast("Mapping[str, Any]", value)[segment]
+    return value if isinstance(value, str) else None
+
+
+def select_latest_tasks(
+    tasks: Iterable[Task], query: TaskQuery, path: tuple[str, ...] | None
+) -> list[Task]:
+    """The finished tasks newest first (by completion), one per input key with ``path``,
+    and the page ``query.limit`` and ``query.offset`` select.
+
+    Stores that can't do this natively use it on tasks already matched to ``query``.
+    """
+
+    finished = sorted(
+        sorted((task for task in tasks if task.completed_at is not None), key=lambda t: t.id),
+        key=lambda task: task.completed_at or datetime.min,
+        reverse=True,
+    )
+    if path is not None:
+        newest: dict[str, Task] = {}
+        for task in finished:
+            key = task_input_key(task.input, path)
+            if key is not None and key not in newest:
+                newest[key] = task
+        finished = list(newest.values())
+    return finished[query.offset : query.offset + query.limit]
 
 
 class TaskAggregateFilter(BaseModel):
@@ -154,6 +253,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
         q=query.q,
         status=query.status,
         type=query.type,
+        types=query.types,
         session_id=query.session_id,
         parent_task_id=query.parent_task_id,
         assigned_agent_name=query.assigned_agent_name,
@@ -210,7 +310,8 @@ def _task_matches(task: Task, query: TaskQuery) -> bool:
         return False
     if query.status is not None and task.status != query.status:
         return False
-    if query.type is not None and task.type != query.type:
+    types = task_query_types(query)
+    if types is not None and task.type not in types:
         return False
     if query.session_id is not None and task.session_id != query.session_id:
         return False
@@ -245,7 +346,8 @@ def _task_matches_claim_filter(task: Task, query: TaskQuery) -> bool:
         and (task.work_contract is not None) != query.has_work_contract
     ):
         return False
-    if query.type is not None and task.type != query.type:
+    types = task_query_types(query)
+    if types is not None and task.type not in types:
         return False
     if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
         return False

@@ -180,6 +180,9 @@ class FakeCloud:
         self.requests: list[tuple[str, str | None]] = []
         # Answers to the next reads of one task, before it is read from `tasks`.
         self.task_answers: list[tuple[int, Any]] = []
+        # `GET /tasks/latest`'s answer; None plays a server that predates it.
+        self.latest: list[dict[str, Any]] | None = None
+        self.queries: list[dict[str, list[str]]] = []
 
 
 @pytest.fixture
@@ -210,6 +213,9 @@ def cloud(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[FakeCloud
             if state.agent_status is not None:
                 return state.agent_status, {"detail": "Not authenticated"}
             route = path[len(state.api_base) :]
+            state.queries.append(query)
+            if route == "/tasks/latest" and state.latest is not None:
+                return 200, state.latest
             if route == "/tasks":
                 rows = [
                     {key: value for key, value in task.items() if key != "result"}
@@ -827,6 +833,101 @@ def test_wait_with_no_wait_fails_at_once_on_a_sleeping_agent() -> None:
     assert reads == ["t"]
 
 
+def _seed_passes(path: Path) -> None:
+    async def seed() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            for index, repository in enumerate(("o/a", "o/b", "o/a")):
+                await store.create_task(
+                    TaskCreate(
+                        task_id=f"pass-{index}", type="pass", input={"repository": repository}
+                    )
+                )
+                claimed = await store.claim_task("worker", None)
+                assert claimed is not None
+                await store.complete_task(
+                    claimed.id,
+                    {"pass": index},
+                    worker_id="worker",
+                    claim_generation=claimed.claim_generation,
+                )
+            await store.create_task(TaskCreate(task_id="recheck-1", type="recheck"))
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+
+def test_latest_reads_the_newest_completed_task_and_the_newest_per_input_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    database = tmp_path / "passes.db"
+    _seed_passes(database)
+
+    code, latest = _run(capsys, "latest", "--sqlite", str(database), "--type", "pass", "--json")
+    assert code == 0
+    assert [(task["id"], task["result"]) for task in latest["tasks"]] == [("pass-2", {"pass": 2})]
+    assert latest["by"] is None
+
+    code, grouped = _run(
+        capsys, "latest", "--sqlite", str(database), "--type", "pass", "--by", "input.repository",
+        "--json",
+    )  # fmt: skip
+    assert code == 0
+    assert [(task["id"], task["key"]) for task in grouped["tasks"]] == [
+        ("pass-2", "o/a"),
+        ("pass-1", "o/b"),
+    ]
+
+    code, out = _run(capsys, "latest", "--sqlite", str(database), "--by", "input.repository")
+    assert code == 0
+    assert out.splitlines()[0].split() == ["id", "type", "key", "status", "completed_at"]
+
+    code, listed = _run(
+        capsys, "list", "--sqlite", str(database), "--type", "recheck,pass", "--json"
+    )
+    assert code == 0
+    assert len(listed["tasks"]) == 4
+
+    with pytest.raises(SystemExit):
+        main(["task", "latest", "--sqlite", str(database), "--by", "result.repository"])
+
+
+def test_application_latest_and_several_types_read_the_agents_api(
+    cloud: FakeCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud.latest = [_api_task("scan-9", "completed", input={"repository": "o/a"}, result={})]
+
+    code, latest = _run(
+        capsys, "latest", "--application", "bug-hunter", "--type", "scan", "--by",
+        "input.repository", "--json",
+    )  # fmt: skip
+    assert code == 0
+    assert [(task["id"], task["key"]) for task in latest["tasks"]] == [("scan-9", "o/a")]
+    assert cloud.queries[-1] == {
+        "type": ["scan"],
+        "status": ["completed"],
+        "by": ["input.repository"],
+        "limit": ["50"],
+    }
+
+    # A server that predates the route reads `latest` as a task id.
+    cloud.latest = None
+    code, failed = _run(capsys, "latest", "--application", "bug-hunter", "--json")
+    assert code == 1
+    assert "predates" in failed["error"]["message"]
+
+    # A server that predates `types` ignores it and lists every type.
+    cloud.tasks = [_api_task("scan-1", "completed"), _api_task("other-1", "pending", type="other")]
+    code, failed = _run(
+        capsys, "list", "--application", "bug-hunter", "--type", "scan", "--type", "review",
+        "--json",
+    )  # fmt: skip
+    assert code == 1
+    assert "several task types" in failed["error"]["message"]
+    assert cloud.queries[-1]["types"] == ["scan", "review"]
+
+
 def test_field_prints_one_value_and_raw_prints_text_as_is(
     database: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -962,3 +1063,5 @@ def test_the_public_readers_read_a_local_store_the_same_way(database: Path) -> N
 
     assert {row["id"] for row in rows} == {"done", "stopped"}
     assert task is not None and task["result"] == {"findings": 3}
+    with pytest.raises(ValueError, match="type or types"):
+        TaskListRequest(type="scan", types=("review",))

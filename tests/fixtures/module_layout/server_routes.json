@@ -63,6 +63,7 @@
   "GET /api/tasks/{task_id}/schedule/events name=list_task_schedule_events class=PrivateTaskScheduleRoute GET=list_task_schedule_events_api_tasks__task_id__schedule_events_get",
   "POST /api/tasks/schedule/reschedule name=reschedule_task class=PrivateTaskScheduleRoute POST=reschedule_task_api_tasks_schedule_reschedule_post",
   "POST /api/tasks/schedule/cancel name=cancel_scheduled_task class=PrivateTaskScheduleRoute POST=cancel_scheduled_task_api_tasks_schedule_cancel_post",
+  "GET /api/tasks/latest name=latest_tasks class=APIRoute GET=latest_tasks_api_tasks_latest_get",
   "GET /api/tasks/{task_id} name=get_task class=APIRoute GET=get_task_api_tasks__task_id__get",
   "POST /api/tasks/{task_id}/pause name=pause_task class=APIRoute POST=pause_task_api_tasks__task_id__pause_post",
   "POST /api/tasks/{task_id}/block name=block_task class=APIRoute POST=block_task_api_tasks__task_id__block_post",

@@ -10,3 +10,9 @@ export function taskGroupCount(counts: ApiTaskIndex["counts_by_status"], group?:
 export function taskGroupStatuses(group?: string): string[] {
   return TASK_GROUPS.find((item) => item.id === group)?.statuses ?? []
 }
+/** The `type` filter: one type, or several separated by commas (`?type=pass,recheck`). */
+export function taskTypeFilter(type?: string): { type?: string; types?: string[] } {
+  const types = [...new Set((type ?? "").split(",").map((item) => item.trim()))].filter(Boolean)
+  if (types.length > 1) return { types }
+  return types.length ? { type: types[0] } : {}
+}

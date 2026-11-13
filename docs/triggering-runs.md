@@ -135,6 +135,19 @@ await run_task_worker(app, task_store, handle, worker_id="worker-1",
                       execution_timeout_s=600)
 ```
 
+One loop can claim tasks of several types: `TaskQuery(types=("pass", "recheck"))`
+matches a task of any of them, and the worker takes them in the store's usual claim
+order (oldest available first), whatever the order of the types. Two kinds of work
+that must not overlap then share one loop without sharing a type. `type` and `types`
+can't both be set; the dispatcher and `VerifiedTaskWorker` take one type.
+
+To read the newest finished task, use `task_store.latest_task(TaskQuery(type="digest",
+status=TaskStatus.COMPLETED))`, which orders by `completed_at` in the store. For the
+newest per input field, `task_store.latest_tasks(TaskQuery(type="pass",
+status=TaskStatus.COMPLETED), by="input.repository")` returns one task per distinct
+repository, newest first, in one query on SQLite and PostgreSQL. `cayu task latest`
+reads the same.
+
 `execution_timeout_s` is the longest one handler call may take, grace period
 included, counted from handler start, whether or not its runs are attached to
 the task. It defaults to `None` (no limit). The last `execution_grace_s`
@@ -217,6 +230,32 @@ its first admission, queue time included, even if `execution_timeout_s` is longe
 budget is shorter than its `execution_timeout_s`. Keys are store-wide, so scoped
 (tenant-bound) callers cannot set or read them, and keyed tasks cannot join
 graphs or groups. A `TaskRetryPolicy` still works per task alongside a key.
+
+To queue a task once per key, such as one digest per morning however often a
+schedule fires, use `create_task_once(task_store, TaskCreate(..., retry_key=KEY))`
+from `cayu.tasks`. It returns a `TaskOnce`: `task` is the task holding the key and
+`created` says whether this call made it. While that task is queued or running, and
+after it completed, the call creates nothing and returns it, also when callers race;
+there is nothing to catch. Its budget is one task by default, so a key whose task
+failed stays failed and the call returns the failed task. To be able to queue again
+after a failure, pass `attempts=N` on the first call: when the key's task failed, was
+cancelled or was skipped, the next call queues another, up to N tasks for the key.
+Otherwise queue again under a new key, for example the slot with a suffix. The first use of
+the key fixes its budget, and later calls keep it. The task IDs come from the key
+and the attempt number, so two callers queueing the same attempt make one task; the
+request can't set its own `task_id`.
+
+```python
+from cayu.tasks import TaskCreate, create_task_once
+
+queued = await create_task_once(
+    task_store,
+    TaskCreate(type="digest", input={"slot": slot}, retry_key=f"digest-{slot}"),
+    attempts=2,  # one more try if the first fails
+)
+if queued.created:
+    ...
+```
 
 `concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
 call, not a per-slot quota; recovered continuations and contracted-task parking
