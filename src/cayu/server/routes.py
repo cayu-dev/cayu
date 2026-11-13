@@ -8835,14 +8835,6 @@ def create_router(
         pricing_route=_BoundedSessionPricingRoute,
         resolve_scope=_resolve_rollup_scope,
     )
-    register_session_rollup_route(
-        router,
-        protected=protected,
-        store=session_store,
-        redact=cayu_app.redact_json,
-        serialize_cursor=partial(_serialize_session_cursor, cayu_app),
-        resolve_scope=_resolve_rollup_scope,
-    )
     register_session_trace(
         router,
         protected=protected,

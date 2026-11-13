@@ -50,7 +50,6 @@
   "GET /api/sessions/{session_id}/timing name=get_session_timing class=APIRoute GET=get_session_timing_api_sessions__session_id__timing_get",
   "GET /api/sessions/{session_id}/runtime-timing name=get_session_runtime_timing class=APIRoute GET=get_session_runtime_timing_api_sessions__session_id__runtime_timing_get",
   "POST /api/sessions/rollup name=post_session_rollup class=_BoundedSessionPricingRoute POST=post_session_rollup_api_sessions_rollup_post",
-  "POST /api/sessions/rollup name=post_session_rollup class=APIRoute POST=post_session_rollup_api_sessions_rollup_post",
   "GET /api/sessions/{session_id}/trace name=get_session_trace class=APIRoute GET=get_session_trace_api_sessions__session_id__trace_get",
   "GET /api/sessions/{session_id}/events name=list_session_events class=APIRoute GET=list_session_events_api_sessions__session_id__events_get",
   "GET /api/sessions/{session_id}/events/stream name=follow_session_events class=APIRoute GET=follow_session_events_api_sessions__session_id__events_stream_get",

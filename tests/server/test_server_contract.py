@@ -2,6 +2,8 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 import json
+import warnings
+from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 
@@ -10,6 +12,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from cayu.applications import CayuApp
@@ -82,6 +85,21 @@ class _UncalledEnvironmentFactory(EnvironmentFactory):
 
 def _client() -> TestClient:
     return TestClient(create_server(CayuApp(), config=ServerConfig.local_development()))
+
+
+def test_every_route_and_operation_id_is_registered_once() -> None:
+    server = create_server(CayuApp(), config=ServerConfig.local_development())
+    routes = [route for route in server.routes if isinstance(route, APIRoute)]
+    endpoints = Counter((method, route.path) for route in routes for method in route.methods)
+    operation_ids = Counter(route.unique_id for route in routes)
+    assert [key for key, count in endpoints.items() if count > 1] == []
+    assert [key for key, count in operation_ids.items() if count > 1] == []
+    (rollup,) = [route for route in routes if route.path == "/api/sessions/rollup"]
+    assert type(rollup).__name__ == "_BoundedSessionPricingRoute"
+    # FastAPI warns about a duplicate operation id while it builds the schema.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        server.openapi()
 
 
 def _normalize_schema_node(value):

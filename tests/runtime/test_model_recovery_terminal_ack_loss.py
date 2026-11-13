@@ -337,15 +337,11 @@ def test_model_recovery_readback_rejects_a_superseding_native_claim(
     tmp_path, database_url, monkeypatch, replay_path, successor
 ):
     """A tentative successor claim fences an earlier acknowledgement readback."""
-    import cayu.runtime._recovery_ownership as recovery_ownership
     from cayu.sessions._invocation_lifecycle import SettleInvocationCommand
     from cayu.sessions.authority import SessionRunFenced
     from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 
     _model_orphan(tmp_path, database_url)
-    monkeypatch.setattr(
-        recovery_ownership, "_INCOMPLETE_RECOVERY_CLAIM_LEASE", timedelta(seconds=1)
-    )
 
     async def scenario():
         stores = open_application_stores(
@@ -358,6 +354,7 @@ def test_model_recovery_readback_rejects_a_superseding_native_claim(
         native_apply = app._runtime_session_store.apply_invocation_lifecycle_command
         settle = app._manual_model_completion_recovery.recover_model_completion_stage
         observed = []
+        injected = []
 
         async def reserve_successor(command):
             result = await native_apply(command)
@@ -365,39 +362,33 @@ def test_model_recovery_readback_rejects_a_superseding_native_claim(
                 command.transition.model_completion_stage_settlement is None
             ):
                 return result
-            async with asyncio.timeout(10):
-                while True:
-                    current = _incomplete_recovery_claim_from_checkpoint(
-                        await other.session_store.load_checkpoint("scan")
-                    )
-                    if current[1] <= datetime.now(UTC):
-                        break
-                    await asyncio.sleep(0.02)
 
-            def claim_at_store_time(session, checkpoint, store_now):
+            def expire_or_replace_at_store_time(session, checkpoint, store_now):
                 current = _incomplete_recovery_claim_from_checkpoint(checkpoint)
-                assert current[0] == command.recovery_claim_id and current[1] <= store_now
+                assert current[0] == command.recovery_claim_id
                 copied = dict(checkpoint)
                 marker = dict(copied["incomplete_session_recovery_claim"])
-                marker["claim_id"] = "native-successor-claim"
-                marker["claim_expires_at"] = (store_now + timedelta(seconds=30)).isoformat()
+                # Install the state this readback test needs after the commit.
+                # A one-second runtime lease could expire before this hook ran
+                # on a loaded runner, so no successor would ever be installed.
+                marker["claimed_at"] = (store_now - timedelta(seconds=2)).isoformat()
+                marker["claim_expires_at"] = (store_now - timedelta(seconds=1)).isoformat()
+                if successor:
+                    marker["claim_id"] = "native-successor-claim"
+                    marker["claimed_at"] = store_now.isoformat()
+                    marker["claim_expires_at"] = (store_now + timedelta(minutes=5)).isoformat()
                 copied["incomplete_session_recovery_claim"] = marker
                 return copied
 
-            if not successor:
-                if replay_path == "lost_ack":
-                    raise OSError(
-                        "model settlement acknowledgement lost after ordinary lease expiry"
-                    )
-                return result
             before = await other.session_store.load("scan")
             reserved = await other.session_store.reserve_stalled_run_recovery(
                 "scan",
                 statuses={SessionStatus.INTERRUPTED},
                 inactive_for_seconds=None,
-                checkpoint_transform=claim_at_store_time,
+                checkpoint_transform=expire_or_replace_at_store_time,
             )
             assert reserved.run_epoch == before.run_epoch
+            injected.append(True)
             if replay_path == "lost_ack":
                 raise OSError("model settlement acknowledgement lost after successor reserved")
             return result
@@ -433,6 +424,7 @@ def test_model_recovery_readback_rejects_a_superseding_native_claim(
         )
         try:
             await app.reconcile_orphaned_sessions()
+            assert injected == [True], "The post-commit ownership fault was not installed"
             assert len(observed) == 1, observed
             if successor:
                 assert isinstance(observed[0], SessionRunFenced), observed
