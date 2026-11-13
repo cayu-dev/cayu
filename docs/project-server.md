@@ -35,7 +35,13 @@ For trusted local development, open access requires an explicit opt-in:
 cayu serve --dev --host 127.0.0.1 --port 8000
 ```
 
-`--dev` uses `ServerConfig.local_development()`. With or without `--dev`,
+`--dev` uses `ServerConfig.local_development()` and registers the
+demonstration provider, `DemoModelProvider`, as `demo` (never the default; an app
+that registers its own `demo` keeps it), so a session started under it, by a
+seeding script for example, can be answered and continued from the app or the
+Developer dashboard with canned, marked replies. A protected server doesn't
+register it, and answers such a session's items with 409 naming the provider.
+See [the providers guide](../src/cayu/guides/providers.md). With or without `--dev`,
 `cayu serve` turns on [request timing](server-configuration.md#request-timing),
 so `cayu diagnostics requests` can report per-route cost from the running
 process, and writes Cayu's [request log](server-configuration.md#request-log) in

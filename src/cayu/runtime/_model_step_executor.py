@@ -194,7 +194,11 @@ from cayu.releases import release_event_fields
 from cayu.runtime import _context_events
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime._cache_affinity import SessionCacheAffinity
+from cayu.runtime._cache_affinity import (
+    SessionCacheAffinity,
+    provider_session_key,
+    provider_step_key,
+)
 from cayu.runtime._child_session_notifications import (
     CHILD_SESSION_NOTIFICATION_INTENT_KEY,
     ChildSessionNotificationStageBinding,
@@ -1226,6 +1230,7 @@ class ModelStepExecutor:
         tool_discovery_native_tool_names: Iterable[str] | None = None,
         model_execution_selection: ModelExecutionSelection | None = None,
         tool_catalogue_exposure: ResolvedToolExposure | None = None,
+        step_key: str | None = None,
     ) -> ModelRequest:
         effective_model = session.model
         if model_execution_selection is not None:
@@ -1551,6 +1556,8 @@ class ModelStepExecutor:
             ),
             options=redacted_options,
             cache_affinity_key=await self._cache_affinity.key_for(session),
+            session_key=provider_session_key(session.id),
+            step_key=step_key,
             # Only a session whose model came from its slot names it, and only for the slot's
             # model: never a failover fallback's or a resumed session's new target.
             model_slot=(
@@ -3546,6 +3553,7 @@ class ModelStepRun:
             tool_discovery_native_tool_names=discovery_native_tool_names,
             model_execution_selection=self._model_execution_selection,
             tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
+            step_key=provider_step_key(model_step_identity.model_step_id),
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -4961,6 +4969,7 @@ class ModelStepRun:
             ),
             model_execution_selection=self._model_execution_selection,
             tool_catalogue_exposure=self._all_tools_within_capability_ceiling,
+            step_key=model_request.step_key,
         )
         yield (
             await self._executor._event_writer.emit(

@@ -53,6 +53,10 @@ _DEFAULT_PAGE_LIMIT = 50
 #: How many of Cloud's decision records `cayu inbox decisions` lists at most, and by default.
 _MAX_DECISIONS = 1000
 _DEFAULT_DECISIONS = 50
+#: The most choices `cayu inbox answer --option` numbers.
+_MAX_OPTIONS = 1000
+#: Decisions that continue the session in this process when the inbox is local.
+_CONTINUING = frozenset({"approve", "deny", "answer"})
 
 
 def add_inbox_parser(subparsers: Any) -> None:
@@ -64,8 +68,8 @@ def add_inbox_parser(subparsers: Any) -> None:
         description=(
             "List an agent's inbox (tool approvals, questions, recovery items and knowledge "
             "proposals), show one item with the arguments the application's human-review "
-            "policy lets you see, approve or deny tool approvals, and dismiss items "
-            "whose session won't continue. Without --application "
+            "policy lets you see, approve or deny tool approvals, answer questions, and "
+            "dismiss items whose session won't continue. Without --application "
             "it opens the project's application and its store in this process; with "
             "--application NAME it reads that Cayu Cloud Agent with your `cayu cloud login`."
         ),
@@ -153,26 +157,41 @@ def add_inbox_parser(subparsers: Any) -> None:
                 "Needs --reason, recorded with the adoption."
             ),
         )
-        command.add_argument(
-            "--wait-seconds",
-            type=_wait_seconds,
-            default=3600.0,
-            help=(
-                "Locally, how long to wait for the work the decision continues in this process "
-                "before stopping it; a stopped session can be resumed (default 3600)."
-            ),
-        )
-        command.add_argument(
-            "--claim-task",
-            action="store_true",
-            help=(
-                "The session belongs to a task whose worker let it go while it waits: let the "
-                "runtime claim the task's continuation, as the dashboard's option does. A task "
-                "another worker holds is refused."
-            ),
-        )
+        _add_continuation_options(command)
         _add_review_options(command)
         _add_target_options(command)
+
+    answer = commands.add_parser(
+        "answer",
+        help="Answer a pending question.",
+        description=(
+            "Answer a question the agent asked (ask_user): with TEXT, or with --option N, "
+            "one of the question's choices as `cayu inbox show` numbers them. The answer "
+            "goes through the same settle and human-review flow as the dashboards and is "
+            "recorded with you as its decider. Locally the session then continues in this "
+            "process until it pauses or ends."
+        ),
+    )
+    _add_item_options(answer)
+    answer.add_argument(
+        "text",
+        metavar="TEXT",
+        nargs="?",
+        help="The answer. With --session, the only positional argument.",
+    )
+    answer.add_argument(
+        "--option",
+        type=_limit(_MAX_OPTIONS),
+        metavar="N",
+        help="Answer with the question's choice number N (from 1), instead of TEXT.",
+    )
+    answer.add_argument(
+        "--reason",
+        help=f"Why, recorded with the answer (at most {_REASON_MAX_CHARS} characters).",
+    )
+    _add_continuation_options(answer)
+    _add_review_options(answer)
+    _add_target_options(answer)
 
     dismiss = commands.add_parser(
         "dismiss",
@@ -275,6 +294,27 @@ def _add_item_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_continuation_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--wait-seconds",
+        type=_wait_seconds,
+        default=3600.0,
+        help=(
+            "Locally, how long to wait for the work the decision continues in this process "
+            "before stopping it; a stopped session can be resumed (default 3600)."
+        ),
+    )
+    parser.add_argument(
+        "--claim-task",
+        action="store_true",
+        help=(
+            "The session belongs to a task whose worker let it go while it waits: let the "
+            "runtime claim the task's continuation, as the dashboard's option does. A task "
+            "another worker holds is refused."
+        ),
+    )
+
+
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--purpose",
@@ -343,6 +383,8 @@ async def _run(args: argparse.Namespace) -> int:
             _check_reason(reason)
         if args.application is not None and args.reviewer is not None:
             raise ValueError("--reviewer applies to the local inbox; a Cloud Agent records you.")
+        if args.inbox_command == "answer":
+            _answer_arguments(args)
         if args.inbox_command != "list" and (args.item_id is None) == (args.session is None):
             raise ValueError("Name the item with ITEM_ID or its session with --session.")
         if getattr(args, "adopt_profile", False) and reason is None:
@@ -393,7 +435,7 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
             if service is None
             else service.cayu_app
         )
-        deciding = args.inbox_command in {"approve", "deny"}
+        deciding = args.inbox_command in _CONTINUING
         local: LocalInbox | None = None
         try:
             reviewer = args.reviewer or _local_reviewer()
@@ -402,6 +444,10 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
                 # closing the app stops it.
                 await app.start_model_policy()
                 await app.start_model_slots()
+                # A demonstration session continues here as under `cayu serve --dev`.
+                from cayu.cli.serve import register_demo_provider
+
+                register_demo_provider(app)
             local = LocalInbox(
                 app,
                 reviewer=reviewer,
@@ -601,7 +647,7 @@ async def _show(args: argparse.Namespace, inbox: InboxClient) -> int:
     review: dict[str, Any] | None = None
     review_error: InboxClientError | None = None
     long_text: dict[str, dict[str, Any]] = {}
-    if isinstance(item, dict) and _has_review(item):
+    if isinstance(item, dict) and _has_review(item, inbox):
         try:
             review = await inbox.review(
                 args.item_id, str(item["session_id"]), purpose=_purpose(args, inbox)
@@ -648,7 +694,9 @@ async def _show(args: argparse.Namespace, inbox: InboxClient) -> int:
 
 async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
     decision = args.inbox_command
-    kinds = _DISMISSABLE if decision == "dismiss" else frozenset({"approval"})
+    kinds = {"dismiss": _DISMISSABLE, "answer": frozenset({"question"})}.get(
+        decision, frozenset({"approval"})
+    )
     state = await inbox.item(await _resolve_item_id(args, inbox, kinds))
     item = state.get("item")
     if state.get("status") != "pending" or not isinstance(item, dict):
@@ -663,12 +711,19 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             "`cayu inbox dismiss` dismisses recovery items, approvals and questions; "
             f"this item is a {item.get('kind')}.",
         )
-    if decision != "dismiss" and item.get("kind") != "approval":
+    if decision == "answer" and item.get("kind") != "question":
+        raise InboxClientError(
+            "not_a_question",
+            f"`cayu inbox answer` answers questions; this item is a {item.get('kind')}.",
+        )
+    if decision in {"approve", "deny"} and item.get("kind") != "approval":
         raise InboxClientError(
             "not_an_approval",
             f"`cayu inbox {decision}` settles tool approvals; this item is a {item.get('kind')}.",
         )
     body: dict[str, Any] = {"decision": decision}
+    if decision == "answer":
+        body["answer"] = _chosen_answer(args, item)
     if args.reason is not None:
         body["reason"] = args.reason
     if getattr(args, "claim_task", False):
@@ -678,7 +733,7 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
             "idempotency_key": secrets.token_urlsafe(24),
             "reason": args.reason,
         }
-    if decision != "dismiss" and _has_review(item):
+    if decision != "dismiss" and _has_review(item, inbox):
         reference = await _decision_reference(args, inbox, item, decision)
         if reference is not None:
             body["review_reference"] = reference
@@ -716,7 +771,9 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
         return 0
     settlement = settled.get("settlement") or {}
     who = (settlement.get("decided_by") or {}).get("subject")
-    done = {"approve": "Approved", "deny": "Denied", "dismiss": "Dismissed"}[decision]
+    done = {"approve": "Approved", "deny": "Denied", "answer": "Answered", "dismiss": "Dismissed"}[
+        decision
+    ]
     again = " (already recorded)" if answer.get("replayed") is True else ""
     print(f"{done} {args.item_id}{again}" + (f" as {_plain(who)}." if who else "."))
     if session_status is not None:
@@ -742,6 +799,16 @@ async def _decision_reference(
             and item.get("arguments_unavailable_reason") != "quarantined"
         ):
             return None
+        # A question's item doesn't say whether a Cloud Agent has a review policy, and
+        # without one its review route refuses (Cloud's `403 review_refused`, the same
+        # refusal as a policy that refuses this person). Send the answer without a
+        # reference: the settle route itself refuses it when the Agent does require a review.
+        if (
+            exc.code in {"forbidden", "http_403", "review_refused"}
+            and item.get("kind") == "question"
+            and item.get("arguments_unavailable_reason") != "quarantined"
+        ):
+            return None
         raise
     if not _review_matches(review, item):
         raise _review_mismatch()
@@ -757,13 +824,49 @@ async def _decision_reference(
             "The review withholds this call's content, so it can't be approved: "
             f"{review.get('guidance')} You can deny it.",
         )
+    if decision == "answer" and review.get("status") != "permitted":
+        raise InboxClientError(
+            "review_withheld",
+            "The review withholds this question, so it can't be answered here: "
+            f"{review.get('guidance')} You can dismiss it.",
+        )
     return reference
 
 
-def _has_review(item: dict[str, Any]) -> bool:
+def _answer_arguments(args: argparse.Namespace) -> None:
+    """Sort out ITEM_ID and TEXT: with --session, the one positional is the answer."""
+
+    if args.session is not None and args.item_id is not None and args.text is None:
+        args.item_id, args.text = None, args.item_id
+    if (args.text is None) == (args.option is None):
+        raise ValueError("Answer with TEXT or with --option N, not both.")
+    if args.text is not None and not args.text.strip():
+        raise ValueError("The answer must not be blank.")
+
+
+def _chosen_answer(args: argparse.Namespace, item: dict[str, Any]) -> str:
+    if args.option is None:
+        return str(args.text)
+    options = [str(option) for option in item.get("options") or ()]
+    if not options:
+        raise InboxClientError(
+            "no_options", "This question has no choices to number; answer it with TEXT."
+        )
+    if args.option > len(options):
+        raise InboxClientError(
+            "no_such_option",
+            f"This question has {len(options)} choices; --option takes 1 to {len(options)}.",
+        )
+    return options[args.option - 1]
+
+
+def _has_review(item: dict[str, Any], inbox: InboxClient) -> bool:
     """Whether the item's application may show it through a human-review policy."""
 
     if item.get("kind") not in {"approval", "question"} or not item.get("session_id"):
+        return False
+    # A question's item doesn't say whether there is a policy; the local application does.
+    if getattr(inbox, "reviews_configured", None) is False:
         return False
     return item.get("arguments_unavailable_reason") != "no_review_policy"
 
@@ -812,7 +915,7 @@ def _print_state(state: dict[str, Any]) -> None:
             ("tool", item.get("tool_name")),
             ("detail", item.get("detail")),
             ("question", item.get("question")),
-            ("options", ", ".join(item.get("options") or ()) or None),
+            ("options", _numbered(item.get("options") or ())),
             ("created", item.get("created_at")),
             ("decisions", ", ".join(item.get("decisions") or ()) or None),
         ]
@@ -831,7 +934,15 @@ def _print_state(state: dict[str, Any]) -> None:
     width = max(len(name) for name, _ in rows)
     for name, value in rows:
         if value is not None:
-            print(f"{name.ljust(width)}  {_plain(value)}")
+            # A value of several lines (the numbered options) keeps its column.
+            print(f"{name.ljust(width)}  " + _plain(value).replace("\n", "\n" + " " * (width + 2)))
+
+
+def _numbered(options: Any) -> str | None:
+    """A question's choices, one per line, numbered as `cayu inbox answer --option` takes them."""
+
+    lines = [f"{number}. {_plain(option)}" for number, option in enumerate(options, start=1)]
+    return "\n".join(lines) or None
 
 
 def _print_arguments(

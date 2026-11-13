@@ -95,15 +95,18 @@ def add_session_parser(subparsers: Any) -> None:
 
     session = subparsers.add_parser(
         "session",
-        help="Inspect durable sessions and resolve unavailable provider work.",
+        help="Inspect durable sessions, start one, and resolve unavailable provider work.",
         description=(
             "Inspect durable Cayu sessions without mutating storage, in a local store or a "
-            "Cayu Cloud Agent (--application NAME), or send an explicit provider-operation "
-            "disposition to a running Cayu server. Start with `cayu session list`; JSON is "
-            "the default output."
+            "Cayu Cloud Agent (--application NAME), start a conversation as a person "
+            "(`cayu session start`), or send an explicit provider-operation disposition to a "
+            "running Cayu server. Start with `cayu session list`; JSON is the default output."
         ),
     )
     commands = session.add_subparsers(dest="session_command", required=True)
+    from cayu.cli._session_start import add_session_start_parser
+
+    add_session_start_parser(commands)
     list_parser = commands.add_parser(
         "list",
         help="List sessions by newest activity.",
@@ -569,6 +572,10 @@ def run_session(args: argparse.Namespace) -> int:
 def _run_session(args: argparse.Namespace) -> int:
     """Run after the optional output destination owns stdout."""
 
+    if args.session_command == "start":
+        from cayu.cli._session_start import run_session_start
+
+        return run_session_start(args)
     if args.session_command == "close":
         try:
             return _close_session(args)

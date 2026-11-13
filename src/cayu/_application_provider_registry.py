@@ -74,11 +74,20 @@ class ApplicationProviderRegistry:
         default: bool = False,
         model_patterns: Iterable[str] | None = None,
         registration_site: tuple[str | None, str | None] = (None, None),
+        claim_default: bool = True,
     ) -> ModelProvider:
+        """Register ``provider``; the first one becomes the default unless told not to.
+
+        ``claim_default=False`` registers a provider only sessions that name it use,
+        such as the demonstration provider ``cayu serve --dev`` adds: it never becomes
+        the default, even in an application with no other provider.
+        """
         if not isinstance(provider, ModelProvider):
             raise TypeError("Provider registration requires a ModelProvider.")
         if not isinstance(default, bool):
             raise TypeError("Provider default flag must be a bool.")
+        if default and not claim_default:
+            raise ValueError("A provider registered as the default claims the default.")
         stored_model_patterns = _validate_provider_model_patterns(model_patterns)
         provider_name = require_clean_nonblank(provider.name, "provider.name")
         usage_dialect = copy_usage_dialect(provider.usage_dialect, "provider.usage_dialect")
@@ -103,7 +112,7 @@ class ApplicationProviderRegistry:
             registration_symbol=registration_symbol,
             usage_dialect=usage_dialect,
         )
-        if default or self._default_name is None:
+        if default or (claim_default and self._default_name is None):
             self._default_name = provider_name
         return provider
 

@@ -24,6 +24,8 @@ from cayu.sessions.store import SessionStore
 CACHE_AFFINITY_KEY_PREFIX = "cayu-"
 _CACHE_AFFINITY_DOMAIN = b"cayu.prompt-cache-affinity.v1\x00"
 _CACHE_AFFINITY_DIGEST_CHARS = 32
+_SESSION_KEY_DOMAIN = b"cayu.provider-session-key.v1\x00"
+_STEP_KEY_DOMAIN = b"cayu.provider-step-key.v1\x00"
 # Bounds the provenance walk; real fork chains are far shorter.
 _MAX_LINEAGE_DEPTH = 64
 _MAX_CACHED_SESSIONS = 4096
@@ -35,6 +37,32 @@ def cache_affinity_key_for_lineage_root(root_session_id: str) -> str:
     if type(root_session_id) is not str or not root_session_id:
         raise ValueError("A cache-affinity lineage root must be a nonblank session id.")
     digest = sha256(_CACHE_AFFINITY_DOMAIN + root_session_id.encode("utf-8")).hexdigest()
+    return CACHE_AFFINITY_KEY_PREFIX + digest[:_CACHE_AFFINITY_DIGEST_CHARS]
+
+
+def provider_session_key(session_id: str) -> str:
+    """Return the non-secret per-session key a model request carries for providers.
+
+    It never puts the raw session id in a request, and unlike the cache-affinity key
+    every fork gets its own.
+    """
+
+    if type(session_id) is not str or not session_id:
+        raise ValueError("A provider session key needs a nonblank session id.")
+    digest = sha256(_SESSION_KEY_DOMAIN + session_id.encode("utf-8")).hexdigest()
+    return CACHE_AFFINITY_KEY_PREFIX + digest[:_CACHE_AFFINITY_DIGEST_CHARS]
+
+
+def provider_step_key(model_step_id: str) -> str:
+    """Return the non-secret per-step key a model request carries for providers.
+
+    Every attempt at one logical model step carries the same key; the next step gets
+    another, even when its messages are identical.
+    """
+
+    if type(model_step_id) is not str or not model_step_id:
+        raise ValueError("A provider step key needs a nonblank model step id.")
+    digest = sha256(_STEP_KEY_DOMAIN + model_step_id.encode("utf-8")).hexdigest()
     return CACHE_AFFINITY_KEY_PREFIX + digest[:_CACHE_AFFINITY_DIGEST_CHARS]
 
 

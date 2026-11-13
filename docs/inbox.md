@@ -500,9 +500,18 @@ $ cayu inbox approve inbox_... --reason "Checked against the vendor master."
 $ cayu inbox deny inbox_... --reason "Wrong vendor."
 $ cayu inbox dismiss inbox_... --reason "The run ended on Oct 25."
 $ cayu inbox approve --session invoice-7 --reason "Checked."
+$ cayu inbox answer inbox_... "Week of 17 November"
+$ cayu inbox answer --session auditor-visit --option 1
 ```
 
 `dismiss` takes recovery items, approvals and questions, as described above.
+`answer` answers a question with TEXT, or with `--option N`, the question's choice
+number N as `show` numbers them (from 1). It goes through the same settle and
+human-review flow as `approve`, is recorded with you as its decider, and locally
+continues the session in this process like an approval does. A question asked under
+the demonstration provider (`cayu session start --scripted-tool-call ask_user=...`)
+continues with its canned replies, since the local inbox registers it as
+`cayu serve --dev` does.
 
 `list` reads the inbox page by page until every item is listed, then prints them
 oldest first, so a large inbox is listed whole. `--limit N` (1 to 200) lists one page
@@ -515,7 +524,7 @@ counts what it listed, and a page asks `GET /api/inbox/counts`, so `cayu inbox l
 --limit 1` answers whether anything is waiting without listing every item. When the
 inbox can't count exactly, `counts` is null and `counts_unavailable_reason` says why.
 
-`show`, `approve`, `deny` and `dismiss` take the item's id, or `--session ID` instead:
+`show`, `approve`, `deny`, `answer` and `dismiss` take the item's id, or `--session ID` instead:
 the session's pending actions are then read directly (as `list --session` reads them,
 not through the paged listing), and the command acts on the session's one item of
 the kind it settles. A session waiting on several is refused with their ids. `cayu

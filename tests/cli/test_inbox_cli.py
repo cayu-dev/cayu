@@ -613,6 +613,59 @@ def test_an_agent_without_reviews_is_decided_without_a_reference_unless_it_has_a
     assert [call[0] for call in cloud.calls] == ["GET", "GET"]
 
 
+def test_a_cloud_question_whose_review_is_refused_is_answered_without_a_reference(
+    monkeypatch, capsys
+) -> None:
+    # Cloud answers a review with `403 review_refused` both when the Agent has no policy and
+    # when its policy refuses the person; only the settle route tells them apart.
+    refused = CloudApiError(
+        "api_request_rejected",
+        "Cayu Cloud API returned HTTP 403: Human-review access is not authorized.",
+        status_code=403,
+        code="review_refused",
+        body={"code": "review_refused"},
+    )
+    question = {
+        **_PENDING,
+        "kind": "question",
+        "tool_name": "ask_user",
+        "decisions": ["answer"],
+        "arguments_unavailable_reason": None,
+    }
+    answered = {
+        **_SETTLED,
+        "item": {
+            **_SETTLED["item"],
+            "kind": "question",
+            "settlement": {"decision": "answer", "decided_by": {"subject": "user_1"}},
+        },
+    }
+    cloud = _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", "/inbox_a"): {**_STATE, "kind": "question", "item": question},
+            ("GET", "/inbox_a/review"): refused,
+            ("POST", "/inbox_a/settle"): answered,
+        },
+    )
+    assert main(["inbox", "answer", "inbox_a", "Yes.", "--application", "bugs", "--json"]) == 0
+    assert cloud.calls[-1][2]["payload"] == {"decision": "answer", "answer": "Yes."}
+    capsys.readouterr()
+
+    # A question that says its Agent has a policy isn't answered past the policy's refusal.
+    quarantined = {**question, "arguments_unavailable_reason": "quarantined"}
+    cloud = _cloud_cli(
+        monkeypatch,
+        {
+            ("GET", "/inbox_a"): {**_STATE, "kind": "question", "item": quarantined},
+            ("GET", "/inbox_a/review"): refused,
+        },
+    )
+    assert main(["inbox", "answer", "inbox_a", "Yes.", "--application", "bugs", "--json"]) == 1
+    assert _json(capsys)["error"]["code"] == "review_refused"
+    assert [call[0] for call in cloud.calls] == ["GET", "GET"]
+
+
 def test_a_project_services_sessions_continue_with_its_loop_policies(
     monkeypatch, tmp_path, capsys
 ) -> None:

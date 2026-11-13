@@ -309,6 +309,12 @@ class PricingResourceMapping(BaseModel):
         return require_clean_nonblank(value, info.field_name)
 
 
+# What the runtime-owned, zero-priced "cayu-tool-dispatch" identity bills. Native
+# tool dispatch bills "tool-dispatch". The demonstration provider bills it too, but a
+# budget first checks a demo step by its request model, "demo", before the provider
+# has resolved that identity, so the demo model is zero-priced here as well.
+_RUNTIME_ZERO_PRICED_RESOURCES = frozenset({"tool-dispatch", "demo"})
+
 _BUILTIN_CONTEXTUAL_PRICING_REQUIREMENTS = (
     ContextualPricingRequirement(
         provider_name="bedrock",
@@ -645,7 +651,10 @@ class PriceBook(BaseModel):
             billing_identity.provider_name if billing_identity is not None else provider_name
         )
         pricing_model = billing_identity.resource_id if billing_identity is not None else model
-        if pricing_provider_name == "cayu-tool-dispatch" and pricing_model == "tool-dispatch":
+        if (
+            pricing_provider_name == "cayu-tool-dispatch"
+            and pricing_model in _RUNTIME_ZERO_PRICED_RESOURCES
+        ):
             # This runtime-owned identity dispatches native tools without a model
             # request. Its zero charge is independent of commercial price books.
             return _PriceBookMatch(_external_tool_dispatch_price(), "tool-dispatch", "exact")

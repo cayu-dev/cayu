@@ -677,6 +677,11 @@ def test_provider_conformance_registration_requires_bounded_capability_reasons()
     assert registration.provider_type is _NoopProvider
 
 
+# Exported providers that adapt no model service, so the transport conformance
+# scenarios (wire errors, deadlines, retries) don't apply. Their own tests cover them.
+_NOT_SERVICE_ADAPTERS = frozenset({providers_module.DemoModelProvider})
+
+
 def _exported_builtin_provider_types() -> set[type[ModelProvider]]:
     return {
         value
@@ -684,6 +689,7 @@ def _exported_builtin_provider_types() -> set[type[ModelProvider]]:
         if isinstance((value := getattr(providers_module, name)), type)
         and value is not ModelProvider
         and issubclass(value, ModelProvider)
+        and value not in _NOT_SERVICE_ADAPTERS
     }
 
 

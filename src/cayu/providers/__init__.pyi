@@ -87,6 +87,9 @@ from cayu.providers.deadlines import (
     ProviderStreamDeadlineEvidence as ProviderStreamDeadlineEvidence,
 )
 from cayu.providers.deadlines import ProviderStreamDeadlines as ProviderStreamDeadlines
+from cayu.providers.demo import DEMO_MODEL as DEMO_MODEL
+from cayu.providers.demo import DEMO_PROVIDER_NAME as DEMO_PROVIDER_NAME
+from cayu.providers.demo import DemoModelProvider as DemoModelProvider
 from cayu.providers.diagnostics import ProviderErrorCapture as ProviderErrorCapture
 from cayu.providers.diagnostics import capture_provider_errors as capture_provider_errors
 from cayu.providers.gateway import GatewayProvider as GatewayProvider

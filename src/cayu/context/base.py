@@ -4616,6 +4616,8 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
         cache_affinity_key=request.cache_affinity_key,
+        session_key=request.session_key,
+        step_key=request.step_key,
         model_slot=request.model_slot,
     )
 

@@ -130,6 +130,8 @@ class InboxClient(Protocol):
     where: str
     #: The human-review purpose the application names for its reviews, when it says.
     purpose: str | None
+    #: Whether the application has a human-review policy; ``None`` when it doesn't say.
+    reviews_configured: bool | None
 
     async def list_items(
         self,
@@ -254,6 +256,7 @@ class LocalInbox:
             transport=httpx.ASGITransport(app=api), base_url="http://cayu.local"
         )
         self.purpose: str | None = app.human_review_purpose
+        self.reviews_configured: bool | None = app.human_review_configured
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -367,6 +370,8 @@ class CloudInbox:
     where = "cloud"
     # Cloud doesn't say which purpose an Agent's policy accepts.
     purpose = None
+    # Nor whether the Agent has a policy at all.
+    reviews_configured = None
 
     def __init__(
         self,

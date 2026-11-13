@@ -1020,6 +1020,39 @@ record has `record_type: summary` and carries both). A Cloud Agent serves the
 same computation a page at a time at `POST /api/sessions/rollup`; an Agent whose Cayu
 predates it answers that it doesn't serve rollups yet.
 
+### Starting a conversation as a person
+
+`cayu session start` starts a session with a first message, in the project's
+application in this process:
+
+```console
+cayu session start --agent assistant --subject alice --label organization=acme \
+  --label department=finance --message "What do we still need before we close Q3?" \
+  --scripted-reply "Three things are open: ..."
+cayu session start --agent assistant --subject alice --label organization=acme \
+  --message "Set up the auditor's visit." \
+  --scripted-tool-call ask_user='{"question": "Which week?", "options": ["17 Nov", "24 Nov"]}'
+```
+
+With `--subject` it runs through `app.access(subject)`, the path the product routes
+take, so the application's resource-access policy decides whether that person may
+start it with those labels; without it, it starts as an operator. Without a script the
+agent answers with the project's provider. `--scripted-reply TEXT` and
+`--scripted-tool-call TOOL=JSON`, repeated and mixed in the order given, are the
+agent's first model steps instead, from the demonstration provider
+(`DemoModelProvider`, provider `demo`), so no model is called. A reply ends the agent's
+turn and an `ask_user` question waits for an answer, so nothing may follow either; the
+rest of a script isn't carried to the process that continues the session, and a call
+sent for approval that stops the run before the script is done is reported as a
+failure. A scripted `ask_user` question, or a call the agent's tool policy sends for
+approval, leaves the session waiting in the inbox; `cayu inbox answer`, `cayu inbox
+approve` and `cayu serve --dev` continue it with canned replies marked as
+demonstration replies. The session's provider `demo` and its `cayu_session_start`
+metadata mark it as scripted. It prints the session id and what the session waits on;
+`--format json` prints the session's id, status, agent, provider, model and labels,
+`waiting_on` and `failure`. Starting a Cayu Cloud Agent's session this way isn't
+supported yet.
+
 ### Closing a session nobody will continue
 
 `cayu session close` ends a pending or interrupted session that won't continue, such

@@ -298,6 +298,8 @@ def _build_serve_app(
         else:
             dashboard = server_module.DashboardConfig()
         app = build_project_app(project.target, command="Serve")
+        if args.dev:
+            register_demo_provider(app)
         lifecycle = server_module.ServerLifecycleConfig(
             startup_recovery_statuses=settings.startup_recovery_statuses,
             recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
@@ -348,6 +350,25 @@ def _build_serve_app(
         if settings.ui is not None:
             print(f"Web app: {_control_plane_url(args.host, args.port, '/')}")
     return server
+
+
+def register_demo_provider(app: Any) -> bool:
+    """Let a development server continue sessions started under the demo provider.
+
+    ``cayu serve --dev`` registers ``DemoModelProvider`` as ``demo`` (never the
+    default), so a demonstration session started by a script or `cayu session
+    start` can be answered and continued here with canned, marked replies. An app
+    that registers its own ``demo`` provider keeps it. Returns whether it registered.
+    """
+
+    from cayu.providers.demo import DEMO_PROVIDER_NAME, DemoModelProvider
+
+    if DEMO_PROVIDER_NAME in app.list_providers():
+        return False
+    # Only sessions that name `demo` use it: it never becomes the default, even in an
+    # application that registers no other provider.
+    app._provider_registry.register(DemoModelProvider(), claim_default=False)
+    return True
 
 
 def request_log_covers(server: Any) -> bool:

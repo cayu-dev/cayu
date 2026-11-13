@@ -3016,6 +3016,9 @@
           "ProviderStreamDeadlineEvidence",
           "ProviderStreamDeadlines"
         ],
+        "cayu.providers.demo": [
+          "DemoModelProvider"
+        ],
         "cayu.providers.diagnostics": [
           "ProviderErrorCapture",
           "capture_provider_errors"
@@ -3094,6 +3097,8 @@
       "present": [
         "DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS",
         "DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL",
+        "DEMO_MODEL",
+        "DEMO_PROVIDER_NAME",
         "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES"
       ]
     },

@@ -47,6 +47,35 @@ show it as it is instead of a bare 500. A session started under a provider the
 server doesn't register can't continue there: `/api/resume`, the inbox and the
 resource router's `/resume` answer 409 naming the provider.
 
+To show an application with no provider at all, use `cayu.providers.DemoModelProvider`.
+It never calls a model, is priced at zero, and marks each reply it makes up
+("Demonstration reply, no model was called."). Give it a script of first turns, reply
+texts and `ModelStreamEvent.tool_call(...)` events such as an `ask_user` question or a
+call its tool policy sends for approval, and start sessions under it with
+`RunRequest(target=ModelTarget(provider_name=DEMO_PROVIDER_NAME, model=DEMO_MODEL))`.
+Its identity is its name and Cayu's version, not its script, and `cayu serve --dev`
+registers a plain one as `demo`, so the session a script started can be answered and
+continued there: the steps after the script get canned replies.
+
+```python
+from cayu import Message, RunRequest
+from cayu.providers import DEMO_MODEL, DEMO_PROVIDER_NAME, DemoModelProvider, ModelStreamEvent
+from cayu.sessions import ModelTarget
+
+app.register_provider(DemoModelProvider([
+    ModelStreamEvent.tool_call(
+        name="ask_user",
+        arguments={"question": "Which week suits the auditors?", "options": ["17 Nov", "24 Nov"]},
+    ),
+]))
+async for _event in app.run(RunRequest(
+    agent_name="assistant",
+    target=ModelTarget(provider_name=DEMO_PROVIDER_NAME, model=DEMO_MODEL),
+    messages=[Message.text("user", "Set up the auditor's visit.")],
+)):
+    pass
+```
+
 ## Check that a model answers
 
 `cayu providers check MODEL` tells you whether a model answers through the

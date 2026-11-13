@@ -10217,6 +10217,22 @@ The key is a routing hint derived from session identity, like the session id,
 so it is not part of the execution profile or of the provider-neutral request
 fingerprint. A replay in a new session therefore still compares equal.
 
+`ModelRequest.session_key` is the per-session counterpart, for providers that
+keep per-session state in memory. The runtime sets it on every agent model
+request to `cayu-` plus 32 hex characters of a domain-separated SHA-256 digest
+of the session id, so every fork has its own. It is never serialized: no
+adapter sends it, and it is not part of the request fingerprint or of any
+durable record. A compaction request carries none. `DemoModelProvider` keys its
+script position on it.
+
+`ModelRequest.step_key` names the one logical model step a request serves, the
+same way: `cayu-` plus a digest of the step's id, never serialized. Every attempt
+at a step, including a context-overflow recovery request, carries the same key,
+and the next step gets a new one even when its messages are identical. Token
+counting, cache-prefix and compaction requests carry none. `DemoModelProvider`
+uses it to tell a retried step, which replays its turn, from a new step, which
+advances the script.
+
 ### Prompt-prefix stability
 
 Provider prompt caches reuse only an exact prefix of the earlier request, so the

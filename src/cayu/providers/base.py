@@ -8,7 +8,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -957,6 +965,21 @@ class ModelRequest(BaseModel):
     send it (OpenAI Responses maps it to ``prompt_cache_key`` unless the caller
     set that option); other adapters ignore it.
     """
+    session_key: str | None = Field(default=None, exclude=True)
+    """Non-secret token for the one session this request serves.
+
+    The runtime sets it to a digest of the session's id. Unlike ``cache_affinity_key``,
+    a fork gets its own. It is never serialized, so it is not part of a request's
+    fingerprint or of anything sent to a model; a provider that keeps per-session state
+    in memory, such as ``DemoModelProvider``'s script position, may key it on this.
+    """
+    step_key: str | None = Field(default=None, exclude=True)
+    """Non-secret token for the one model step this request serves.
+
+    The runtime sets it to the step's id, which a retry of that step keeps and the
+    session's next step doesn't, so a provider can tell a repeated request from a new
+    step even when the messages are identical. Never serialized, like ``session_key``.
+    """
     model_slot: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -979,9 +1002,9 @@ class ModelRequest(BaseModel):
             )
         return value
 
-    @field_validator("cache_affinity_key")
+    @field_validator("cache_affinity_key", "session_key", "step_key")
     @classmethod
-    def validate_cache_affinity_key(cls, value: str | None) -> str | None:
+    def validate_routing_key(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is None:
             return None
         if (
@@ -989,7 +1012,7 @@ class ModelRequest(BaseModel):
             or not 1 <= len(value) <= MAX_CACHE_AFFINITY_KEY_CHARS
             or any(character not in _CACHE_AFFINITY_KEY_CHARACTERS for character in value)
         ):
-            raise ValueError("cache_affinity_key must be 1-64 ASCII letters, digits, '-' or '_'.")
+            raise ValueError(f"{info.field_name} must be 1-64 ASCII letters, digits, '-' or '_'.")
         return value
 
     @field_validator("targeted_tool_projection", mode="before")
@@ -2027,5 +2050,7 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
         cache_affinity_key=request.cache_affinity_key,
+        session_key=request.session_key,
+        step_key=request.step_key,
         model_slot=request.model_slot,
     )
