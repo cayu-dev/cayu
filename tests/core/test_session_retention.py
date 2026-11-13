@@ -35,6 +35,8 @@ _KEPT_POSTGRES_TABLES = (
     "cayu_schema_migrations",
     "cayu_schema_migration_receipts",
     "cayu_public_authority_alias_config",
+    "cayu_artifact_index",
+    "cayu_artifact_index_stores",
     "cayu_public_authority_alias_key_first_uses",
     "cayu_public_authority_alias_keys",
     "cayu_transcript_search_configuration",

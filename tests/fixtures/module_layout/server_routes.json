@@ -20,6 +20,7 @@
   "GET /api/environments name=list_environments class=APIRoute GET=list_environments_api_environments_get",
   "GET /api/environments/{environment_name:path} name=get_environment class=APIRoute",
   "GET /api/shared-allocations name=list_shared_allocations class=APIRoute GET=list_shared_allocations_api_shared_allocations_get",
+  "POST /api/artifacts/index/reindex name=reindex_artifacts class=APIRoute POST=reindex_artifacts_api_artifacts_index_reindex_post",
   "GET /api/artifacts name=list_artifacts class=APIRoute GET=list_artifacts_api_artifacts_get",
   "GET /api/artifacts/{artifact_id} name=get_artifact class=APIRoute GET=get_artifact_api_artifacts__artifact_id__get",
   "GET /api/artifacts/{artifact_id}/content name=get_artifact_content class=APIRoute GET=get_artifact_content_api_artifacts__artifact_id__content_get",

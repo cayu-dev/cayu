@@ -988,6 +988,95 @@
       "title": "ApiArchivedKnowledgeItem",
       "type": "object"
     },
+    "ApiArtifactIndexDrift": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_store_id": {
+          "title": "Artifact Store Id",
+          "type": "string"
+        },
+        "backfilled_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Backfilled At"
+        },
+        "changed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Changed",
+          "type": "array"
+        },
+        "changed_count": {
+          "minimum": 0.0,
+          "title": "Changed Count",
+          "type": "integer"
+        },
+        "drift": {
+          "title": "Drift",
+          "type": "boolean"
+        },
+        "index_count": {
+          "minimum": 0.0,
+          "title": "Index Count",
+          "type": "integer"
+        },
+        "missing": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Missing",
+          "type": "array"
+        },
+        "missing_count": {
+          "minimum": 0.0,
+          "title": "Missing Count",
+          "type": "integer"
+        },
+        "orphaned": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Orphaned",
+          "type": "array"
+        },
+        "orphaned_count": {
+          "minimum": 0.0,
+          "title": "Orphaned Count",
+          "type": "integer"
+        },
+        "repaired": {
+          "title": "Repaired",
+          "type": "boolean"
+        },
+        "store_count": {
+          "minimum": 0.0,
+          "title": "Store Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact_store_id",
+        "store_count",
+        "index_count",
+        "missing_count",
+        "orphaned_count",
+        "changed_count",
+        "missing",
+        "orphaned",
+        "changed",
+        "drift",
+        "repaired"
+      ],
+      "title": "ApiArtifactIndexDrift",
+      "type": "object"
+    },
     "ApiArtifactSummary": {
       "additionalProperties": false,
       "properties": {
@@ -7742,6 +7831,49 @@
       "title": "ArtifactReadResponse",
       "type": "object"
     },
+    "ArtifactReindexBody": {
+      "additionalProperties": false,
+      "description": "Compare the artifact index with the artifact stores, and repair it unless ``check``.",
+      "properties": {
+        "artifact_store_id": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Artifact Store Id"
+        },
+        "check": {
+          "default": false,
+          "title": "Check",
+          "type": "boolean"
+        }
+      },
+      "title": "ArtifactReindexBody",
+      "type": "object"
+    },
+    "ArtifactReindexResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "stores": {
+          "items": {
+            "$ref": "#/components/schemas/ApiArtifactIndexDrift"
+          },
+          "title": "Stores",
+          "type": "array"
+        }
+      },
+      "required": [
+        "stores"
+      ],
+      "title": "ArtifactReindexResponse",
+      "type": "object"
+    },
     "ArtifactScope": {
       "enum": [
         "session",
@@ -7840,6 +7972,17 @@
           "minimum": 1.0,
           "title": "Limit",
           "type": "integer"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
         },
         "next_offset": {
           "anyOf": [
@@ -35538,6 +35681,23 @@
           },
           {
             "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
             "name": "environment_name",
             "required": false,
             "schema": {
@@ -35652,6 +35812,64 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ArtifactsResponse"
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/artifacts/index/reindex": {
+      "post": {
+        "operation_id": "reindex_artifacts_api_artifacts_index_reindex_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/ArtifactReindexBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ArtifactReindexResponse"
               }
             }
           },

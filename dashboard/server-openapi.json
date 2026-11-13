@@ -1220,6 +1220,95 @@
         "title": "ApiArchivedKnowledgeItem",
         "type": "object"
       },
+      "ApiArtifactIndexDrift": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_store_id": {
+            "title": "Artifact Store Id",
+            "type": "string"
+          },
+          "backfilled_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backfilled At"
+          },
+          "changed": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed",
+            "type": "array"
+          },
+          "changed_count": {
+            "minimum": 0.0,
+            "title": "Changed Count",
+            "type": "integer"
+          },
+          "drift": {
+            "title": "Drift",
+            "type": "boolean"
+          },
+          "index_count": {
+            "minimum": 0.0,
+            "title": "Index Count",
+            "type": "integer"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "missing_count": {
+            "minimum": 0.0,
+            "title": "Missing Count",
+            "type": "integer"
+          },
+          "orphaned": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Orphaned",
+            "type": "array"
+          },
+          "orphaned_count": {
+            "minimum": 0.0,
+            "title": "Orphaned Count",
+            "type": "integer"
+          },
+          "repaired": {
+            "title": "Repaired",
+            "type": "boolean"
+          },
+          "store_count": {
+            "minimum": 0.0,
+            "title": "Store Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "artifact_store_id",
+          "store_count",
+          "index_count",
+          "missing_count",
+          "orphaned_count",
+          "changed_count",
+          "missing",
+          "orphaned",
+          "changed",
+          "drift",
+          "repaired"
+        ],
+        "title": "ApiArtifactIndexDrift",
+        "type": "object"
+      },
       "ApiArtifactSummary": {
         "additionalProperties": false,
         "properties": {
@@ -8147,6 +8236,49 @@
         "title": "ArtifactReadResponse",
         "type": "object"
       },
+      "ArtifactReindexBody": {
+        "additionalProperties": false,
+        "description": "Compare the artifact index with the artifact stores, and repair it unless ``check``.",
+        "properties": {
+          "artifact_store_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Store Id"
+          },
+          "check": {
+            "default": false,
+            "title": "Check",
+            "type": "boolean"
+          }
+        },
+        "title": "ArtifactReindexBody",
+        "type": "object"
+      },
+      "ArtifactReindexResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "stores": {
+            "items": {
+              "$ref": "#/components/schemas/ApiArtifactIndexDrift"
+            },
+            "title": "Stores",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stores"
+        ],
+        "title": "ArtifactReindexResponse",
+        "type": "object"
+      },
       "ArtifactScope": {
         "enum": [
           "session",
@@ -8361,6 +8493,17 @@
             "minimum": 1.0,
             "title": "Limit",
             "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
           },
           "next_offset": {
             "anyOf": [
@@ -51963,6 +52106,23 @@
           },
           {
             "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
             "name": "artifact_store_id",
             "required": false,
             "schema": {
@@ -52105,6 +52265,85 @@
           }
         },
         "summary": "List Artifacts"
+      }
+    },
+    "/api/artifacts/index/reindex": {
+      "post": {
+        "description": "Compare the artifact index with each artifact store, or one, by walking the store once. With check, only report drift: an artifact with no index row, a row with no artifact, or differing metadata. Without it, also repair the rows and mark the store filled, so lists read the index.",
+        "operationId": "reindex_artifacts_api_artifacts_index_reindex_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactReindexBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactReindexResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The requested artifact store or artifact does not exist."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Registered artifact-store identifiers are not unique."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "An artifact store is misconfigured or returned invalid data."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "An artifact store is unavailable."
+          }
+        },
+        "summary": "Reindex Artifacts"
       }
     },
     "/api/artifacts/{artifact_id}": {

@@ -19,6 +19,7 @@ from cayu._time_buckets import BucketUnit, TimeSeriesSpec
 from cayu.artifacts.base import ArtifactStore, ArtifactStoreUnavailableError
 from cayu.budgets.pricing import PriceBook
 from cayu.messages import Message, MessageRole, TextPart
+from cayu.server._artifact_index_reads import ArtifactIndexReads
 from cayu.server._session_overview_query import SessionOverviewSelection
 from cayu.server.contracts import (
     MAX_SESSION_FIRST_MESSAGE_LENGTH,
@@ -67,12 +68,14 @@ class SessionOverviewService:
         project_session: Callable[[str], str],
         redact: Callable[[Any], Any],
         artifact_stores: Callable[[], dict[str, ArtifactStore]],
+        artifact_index: ArtifactIndexReads | None = None,
     ) -> None:
         self.store = store
         self.pricing = pricing
         self.project_session = project_session
         self.redact = redact
         self.artifact_stores = artifact_stores
+        self.artifact_index = artifact_index
         # The service reads one store with one price book for its lifetime, so
         # a page sums usage and prices cost only for sessions whose events
         # changed since an earlier page read them.
@@ -183,7 +186,26 @@ class SessionOverviewService:
         # and refuses distinct stores with conflicting IDs. IDs in different
         # stores denote different artifacts, exactly as in GET /artifacts.
         totals = dict.fromkeys(session_ids, 0)
-        for store in self.artifact_stores().values():
+        stores = self.artifact_stores()
+        indexed: set[str] = set()
+        if self.artifact_index is not None and stores:
+            # Stores whose index rows are filled are counted in one indexed read;
+            # only the others are still walked.
+            indexed = await self.artifact_index.filled(stores)
+        if indexed:
+            try:
+                counts = await self.store.count_indexed_session_artifacts(
+                    tuple(indexed), session_ids
+                )
+            except Exception:
+                raise SessionOverviewUnavailable("Artifact counts are unavailable.") from None
+            if type(counts) is not dict or counts.keys() != totals.keys():
+                raise SessionOverviewUnavailable("Artifact store cannot provide a complete count.")
+            for session_id, count in counts.items():
+                totals[session_id] += count
+        for store_id, store in stores.items():
+            if store_id in indexed:
+                continue
             counts = await store.count_session_artifacts(session_ids)
             # Count evidence is scalar; do not serialize unrelated metadata.
             if (

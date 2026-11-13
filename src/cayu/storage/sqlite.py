@@ -48,6 +48,7 @@ from cayu.sessions.messaging import (
     SessionMessageSource,
 )
 from cayu.sessions.records import update_session_annotations
+from cayu.storage import _artifact_index_store as artifact_index_ops
 from cayu.storage import _creation_fence
 from cayu.storage import _sqlite_context_views as context_view_ops
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
@@ -65,11 +66,11 @@ from cayu.storage import _sqlite_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _sqlite_tool_grants as tool_grants_ops
 from cayu.storage import _sqlite_transcript as transcript_ops
 from cayu.storage import _sqlite_transcript_content as transcript_content
+from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMixin
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
-from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._read_lanes import ReadLane, current_read_lane
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
@@ -443,7 +444,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = KNOWLEDGE_LOOKUP_TOTALS_REVISION
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = ARTIFACT_INDEX_REVISION
 _T = TypeVar("_T")
 # Read-only connections per file-backed session store. Interactive reads (one
 # session, a transcript, state) lease the first set; bulk-lane reads (dashboard
@@ -1141,6 +1142,7 @@ class SQLiteSessionStore(
         return await self._run_read(snapshot)
 
     supports_session_titles: ClassVar[bool] = True
+    supports_artifact_index: ClassVar[bool] = True
     supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_cost_details: ClassVar[bool] = True
@@ -7212,6 +7214,45 @@ class SQLiteSessionStore(
 
     async def read_session_titles(self, query: SessionTitleQuery) -> SessionTitleSnapshot:
         return await session_queries.read_session_titles(self._run_read, query)
+
+    async def record_indexed_artifacts(
+        self, store_id: str, artifacts: Sequence[Any], *, observed_at: datetime
+    ) -> None:
+        await artifact_index_ops.sqlite_record_live(
+            self._run_write, store_id, artifacts, observed_at
+        )
+
+    async def record_deleted_artifacts(
+        self, store_id: str, artifact_ids: Sequence[str], *, deleted_at: datetime
+    ) -> None:
+        await artifact_index_ops.sqlite_record_deleted(
+            self._run_write, store_id, artifact_ids, deleted_at
+        )
+
+    async def mark_artifact_index_store(
+        self, store_id: str, *, backfilled_at: datetime | None
+    ) -> None:
+        await artifact_index_ops.sqlite_mark_store(self._run_write, store_id, backfilled_at)
+
+    async def read_artifact_index_stores(
+        self, store_ids: Sequence[str]
+    ) -> dict[str, datetime | None]:
+        return await artifact_index_ops.sqlite_read_stores(self._run_read, store_ids)
+
+    async def scan_artifact_index(
+        self, store_id: str, *, after: str | None, limit: int
+    ) -> tuple[tuple[str, str], ...]:
+        return await artifact_index_ops.sqlite_scan(self._run_read, store_id, after, limit)
+
+    async def count_indexed_session_artifacts(
+        self, store_ids: Sequence[str], session_ids: Sequence[str]
+    ) -> dict[str, int]:
+        return await artifact_index_ops.sqlite_count_sessions(
+            self._run_read, store_ids, session_ids
+        )
+
+    async def query_artifact_index(self, query: Any) -> Any:
+        return await artifact_index_ops.sqlite_query(self._run_read, query)
 
     async def aggregate_environment_activity(
         self, query: EnvironmentActivityQuery

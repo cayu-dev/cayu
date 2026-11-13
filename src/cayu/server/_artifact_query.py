@@ -3,27 +3,26 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from heapq import heappush, heapreplace
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import HTTPException
 
+from cayu.artifacts._index import ArtifactIndexOrder, artifact_kind
 from cayu.artifacts._scan import ArtifactScanFilter
-from cayu.artifacts.base import ArtifactMetadata, ArtifactStore
+from cayu.artifacts.base import (
+    ArtifactListResult,
+    ArtifactMetadata,
+    ArtifactStore,
+    ArtifactStoreUnavailableError,
+)
 from cayu.session_metadata import validate_title
 from cayu.sessions.display import SessionTitleQuery, SessionTitleSnapshot
 from cayu.sessions.store import SessionStore
 
-ArtifactOrder = Literal[
-    "created_at_desc",
-    "created_at_asc",
-    "filename_asc",
-    "filename_desc",
-    "size_bytes_desc",
-    "size_bytes_asc",
-]
+ArtifactOrder = ArtifactIndexOrder
 ARTIFACT_QUERY_SCAN_MAX = 100_000
 ARTIFACT_QUERY_BATCH_SIZE = 100
 
@@ -37,29 +36,47 @@ def supports_artifact_search(stores: dict[str, ArtifactStore], sessions: Session
 
 
 def artifact_search_available(stores: dict[str, ArtifactStore], sessions: SessionStore) -> bool:
-    """The dashboard can search across every registered store."""
-    return supports_artifact_search(stores, sessions)
+    """The dashboard can search across every registered store.
+
+    With an artifact index, search reads the index; until a store's index rows
+    are filled it walks the store, which needs a metadata scan.
+    """
+    return supports_artifact_search(stores, sessions) or (
+        bool(stores) and getattr(sessions, "supports_artifact_index", False) is True
+    )
 
 
-def artifact_kind(content_type: str) -> str:
-    kind = content_type.split(";", 1)[0].strip().lower()
-    if kind in {"image/gif", "image/jpeg", "image/png", "image/webp"}:
-        return f"{kind[6:].upper()} image"
-    if kind.startswith("image/"):
-        return "Image"
-    if kind == "application/json" or kind.endswith("+json"):
-        return "JSON"
-    if kind == "text/markdown":
-        return "Markdown"
-    if kind == "text/csv":
-        return "CSV"
-    if kind.startswith("text/"):
-        return "Text"
-    if kind == "application/pdf":
-        return "PDF"
-    if any(part in kind for part in ("zip", "tar", "gzip", "x-7z", "compressed")):
-        return "Archive"
-    return "File"
+def artifact_search_values(
+    filename: Any,
+    content_type: Any,
+    agent_name: Any,
+    environment_name: Any,
+    session_title: Any,
+    artifact_id: Any,
+) -> tuple[Any, ...]:
+    """The values an artifact search looks in, in the order the dashboard shows them."""
+
+    return (
+        filename,
+        artifact_kind(content_type),
+        content_type,
+        agent_name,
+        environment_name,
+        session_title,
+        artifact_id,
+    )
+
+
+def matches_artifact_search(
+    needle: str, values: Iterable[Any], redact: Callable[[Any], Any]
+) -> bool:
+    """A literal, case-insensitive match in a value as it is shown, after redaction.
+
+    A match only inside a redacted secret does not count, so a search can never
+    confirm a guess at one.
+    """
+
+    return any(type(value) is str and needle in value.lower() for value in map(redact, values))
 
 
 async def read_titles(
@@ -168,19 +185,15 @@ async def query_artifacts(
                 row["session_title"] = (
                     title_cache.get(artifact.session_id) if artifact.session_id else None
                 )
-                text = [
+                text = artifact_search_values(
                     row["filename"],
-                    artifact_kind(row["content_type"]),
                     row["content_type"],
                     row["agent_name"],
                     row["environment_name"],
                     row["session_title"],
                     row["id"],
-                ]
-                if needle and not any(
-                    type(value) is str and needle in value.lower()
-                    for value in (redact(value) for value in text)
-                ):
+                )
+                if needle and not matches_artifact_search(needle, text, redact):
                     continue
                 total += 1
                 if order_by.startswith("filename_"):
@@ -229,4 +242,91 @@ async def query_artifacts(
         "limit": limit,
         "offset": offset,
         "next_offset": offset + limit if has_more and offset + limit <= 10_000 else None,
+    }
+
+
+async def list_store_artifacts(
+    stores: dict[str, ArtifactStore],
+    sessions: SessionStore,
+    *,
+    serialize: Callable[[ArtifactMetadata, str], dict[str, Any]],
+    redact_title: Callable[[Any], Any],
+    filters: ArtifactScanFilter,
+    offset: int,
+    limit: int,
+    offset_max: int,
+) -> dict[str, Any]:
+    """Newest artifacts first, read from each store's own listing (the reference path)."""
+
+    artifacts: list[dict[str, Any]] = []
+    total_count: int | None = 0
+    truncated = False
+    per_store_limit = offset + limit
+    for store_id, store in stores.items():
+        try:
+            result = await store.list(
+                scope=filters.scope,
+                session_id=filters.session_id,
+                agent_name=filters.agent_name,
+                environment_name=filters.environment_name,
+                limit=per_store_limit,
+            )
+            if type(result) is not ArtifactListResult:
+                raise TypeError("Artifact stores must return ArtifactListResult from list().")
+            page = ArtifactListResult(
+                artifacts=result.artifacts,
+                total_count=result.total_count,
+                truncated=result.truncated,
+            )
+        except (ArtifactStoreUnavailableError, OSError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Artifact store is unavailable.",
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Artifact store returned invalid artifact data.",
+            ) from exc
+        artifacts.extend(serialize(artifact, store_id) for artifact in page.artifacts)
+        if page.total_count is None:
+            total_count = None
+            truncated = True
+        elif total_count is not None:
+            total_count += page.total_count
+        truncated = truncated or page.truncated
+
+    artifacts.sort(
+        key=lambda row: (str(row["created_at"]), str(row["artifact_store_id"]), str(row["id"])),
+        reverse=True,
+    )
+    page_artifacts = artifacts[offset : offset + limit]
+    titles = await read_titles(
+        sessions,
+        tuple(dict.fromkeys(row["session_id"] for row in page_artifacts if row["session_id"])),
+        redact_title,
+    )
+    for row in page_artifacts:
+        row["session_title"] = titles.get(row["session_id"])
+    next_offset = None
+    has_more = False
+    if total_count is None:
+        if len(artifacts) > offset + limit or truncated:
+            has_more = True
+            candidate_next_offset = offset + limit
+            if candidate_next_offset <= offset_max:
+                next_offset = candidate_next_offset
+    elif offset + limit < total_count:
+        has_more = True
+        candidate_next_offset = offset + limit
+        if candidate_next_offset <= offset_max:
+            next_offset = candidate_next_offset
+    truncated = has_more
+    return {
+        "artifacts": page_artifacts,
+        "total_count": total_count,
+        "truncated": truncated,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
     }

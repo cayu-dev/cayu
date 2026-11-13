@@ -3031,6 +3031,35 @@ class ArtifactsResponse(ApiBaseModel):
     limit: StrictInt = Field(ge=1)
     offset: StrictInt = Field(ge=0)
     next_offset: StrictInt | None = Field(default=None, ge=0)
+    #: Keyset position of the next page, when the artifact index serves the list.
+    next_cursor: str | None = None
+
+
+class ArtifactReindexBody(ApiBaseModel):
+    """Compare the artifact index with the artifact stores, and repair it unless ``check``."""
+
+    check: StrictBool = False
+    artifact_store_id: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class ApiArtifactIndexDrift(ApiBaseModel):
+    artifact_store_id: str
+    store_count: StrictInt = Field(ge=0)
+    index_count: StrictInt = Field(ge=0)
+    missing_count: StrictInt = Field(ge=0)
+    orphaned_count: StrictInt = Field(ge=0)
+    changed_count: StrictInt = Field(ge=0)
+    #: Up to 20 artifact IDs of each kind of drift.
+    missing: list[str]
+    orphaned: list[str]
+    changed: list[str]
+    drift: StrictBool
+    repaired: StrictBool
+    backfilled_at: str | None = None
+
+
+class ArtifactReindexResponse(ApiBaseModel):
+    stores: list[ApiArtifactIndexDrift]
 
 
 class ArtifactReadResponse(ApiBaseModel):

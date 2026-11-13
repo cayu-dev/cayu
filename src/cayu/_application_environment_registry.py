@@ -137,6 +137,7 @@ class ApplicationEnvironmentRegistry:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
+            self._bind_artifact_index(artifact_store_registration.store)
             self._session_closure = closure
         if default:
             self._default_environment_name = registration.spec.name
@@ -298,6 +299,7 @@ class ApplicationEnvironmentRegistry:
             self._artifact_store_registrations_by_id[artifact_store_registration.store_id] = (
                 artifact_store_registration
             )
+            self._bind_artifact_index(artifact_store_registration.store)
             self._session_closure = closure
         return self._factory_registration_scope(registered_environment, retain_idle_resources)
 
@@ -387,6 +389,14 @@ class ApplicationEnvironmentRegistry:
         """Serialize rebuilding one environment name in this process."""
 
         return self._rebuild_locks.setdefault(name, asyncio.Lock())
+
+    def _bind_artifact_index(self, store: ArtifactStore) -> None:
+        """Record the store's commits and deletions in the session store's artifact index."""
+
+        if getattr(self._session_store, "supports_artifact_index", False) is True:
+            from cayu.artifacts._index import bind_artifact_index
+
+            bind_artifact_index(store, self._session_store)
 
     def registered_artifact_stores(self) -> tuple[ArtifactStore, ...]:
         """Every distinct artifact store registered with an environment."""

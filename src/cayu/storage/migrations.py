@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 
@@ -652,6 +653,11 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(
         revision=KNOWLEDGE_LOOKUP_TOTALS_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146
     ),
+    # Artifact lists, searches and counts read cayu_artifact_index, which the
+    # artifact store commit hook writes and triggers on cayu_sessions keep
+    # titled. Older binaries never read it; their artifact writes are drift that
+    # `cayu artifact reindex` repairs. Session stores require it.
+    Revision(revision=ARTIFACT_INDEX_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

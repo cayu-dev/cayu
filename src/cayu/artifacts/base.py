@@ -355,12 +355,24 @@ def artifact_count_session_ids(session_ids: Sequence[str]) -> tuple[str, ...]:
 
 
 class ArtifactStore(ABC):
-    """Durable uploaded/generated file storage for an environment."""
+    """Durable uploaded/generated file storage for an environment.
+
+    Every subclass's ``put_bytes``, ``delete`` and ``delete_session_closure_artifact``
+    also record the commit or deletion in the artifact index of each session store
+    bound with ``bind_artifact_index`` (``cayu.artifacts._index``), so lists and
+    counts read the index instead of the store. Unbound stores are unaffected.
+    """
 
     # Public diagnostic metadata; subclasses changing backend must override it.
     storage_kind: ClassVar[Literal["local_disk", "s3", "unknown"]] = "unknown"
 
     id: str
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        from cayu.artifacts._index import install_artifact_index_hooks
+
+        install_artifact_index_hooks(cls)
 
     @abstractmethod
     async def put_bytes(

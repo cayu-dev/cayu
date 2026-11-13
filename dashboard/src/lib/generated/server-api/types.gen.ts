@@ -687,6 +687,60 @@ export type ApiArchivedKnowledgeItem = {
 };
 
 /**
+ * ApiArtifactIndexDrift
+ */
+export type ApiArtifactIndexDrift = {
+    /**
+     * Artifact Store Id
+     */
+    artifact_store_id: string;
+    /**
+     * Backfilled At
+     */
+    backfilled_at?: string | null;
+    /**
+     * Changed
+     */
+    changed: Array<string>;
+    /**
+     * Changed Count
+     */
+    changed_count: number;
+    /**
+     * Drift
+     */
+    drift: boolean;
+    /**
+     * Index Count
+     */
+    index_count: number;
+    /**
+     * Missing
+     */
+    missing: Array<string>;
+    /**
+     * Missing Count
+     */
+    missing_count: number;
+    /**
+     * Orphaned
+     */
+    orphaned: Array<string>;
+    /**
+     * Orphaned Count
+     */
+    orphaned_count: number;
+    /**
+     * Repaired
+     */
+    repaired: boolean;
+    /**
+     * Store Count
+     */
+    store_count: number;
+};
+
+/**
  * ApiArtifactSummary
  */
 export type ApiArtifactSummary = {
@@ -4014,6 +4068,32 @@ export type ArtifactReadResponse = {
 };
 
 /**
+ * ArtifactReindexBody
+ *
+ * Compare the artifact index with the artifact stores, and repair it unless ``check``.
+ */
+export type ArtifactReindexBody = {
+    /**
+     * Artifact Store Id
+     */
+    artifact_store_id?: string | null;
+    /**
+     * Check
+     */
+    check?: boolean;
+};
+
+/**
+ * ArtifactReindexResponse
+ */
+export type ArtifactReindexResponse = {
+    /**
+     * Stores
+     */
+    stores: Array<ApiArtifactIndexDrift>;
+};
+
+/**
  * ArtifactScope
  */
 export type ArtifactScope = 'session' | 'environment';
@@ -4127,6 +4207,10 @@ export type ArtifactsResponse = {
      * Limit
      */
     limit: number;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
     /**
      * Next Offset
      */
@@ -26209,6 +26293,10 @@ export type ListArtifactsApiArtifactsGetData = {
          */
         offset?: number;
         /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
          * Artifact Store Id
          */
         artifact_store_id?: string | null;
@@ -26265,6 +26353,47 @@ export type ListArtifactsApiArtifactsGetResponses = {
 };
 
 export type ListArtifactsApiArtifactsGetResponse = ListArtifactsApiArtifactsGetResponses[keyof ListArtifactsApiArtifactsGetResponses];
+
+export type ReindexArtifactsApiArtifactsIndexReindexPostData = {
+    body: ArtifactReindexBody;
+    path?: never;
+    query?: never;
+    url: '/api/artifacts/index/reindex';
+};
+
+export type ReindexArtifactsApiArtifactsIndexReindexPostErrors = {
+    /**
+     * The requested artifact store or artifact does not exist.
+     */
+    404: ApiErrorResponse;
+    /**
+     * Registered artifact-store identifiers are not unique.
+     */
+    409: ApiErrorResponse;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * An artifact store is misconfigured or returned invalid data.
+     */
+    500: ApiErrorResponse;
+    /**
+     * An artifact store is unavailable.
+     */
+    503: ApiErrorResponse;
+};
+
+export type ReindexArtifactsApiArtifactsIndexReindexPostError = ReindexArtifactsApiArtifactsIndexReindexPostErrors[keyof ReindexArtifactsApiArtifactsIndexReindexPostErrors];
+
+export type ReindexArtifactsApiArtifactsIndexReindexPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ArtifactReindexResponse;
+};
+
+export type ReindexArtifactsApiArtifactsIndexReindexPostResponse = ReindexArtifactsApiArtifactsIndexReindexPostResponses[keyof ReindexArtifactsApiArtifactsIndexReindexPostResponses];
 
 export type GetArtifactApiArtifactsArtifactIdGetData = {
     body?: never;

@@ -78,7 +78,6 @@ from cayu.approvals.tools import (
 from cayu.approvals.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.artifacts._scan import ArtifactScanFilter
 from cayu.artifacts.base import (
-    ArtifactListResult,
     ArtifactScope,
     ArtifactStore,
     ArtifactStoreUnavailableError,
@@ -171,11 +170,12 @@ from cayu.runtime.request_costs import (
 from cayu.runtime.system_diagnostics import DeploymentKind, resolve_deployment_kind
 from cayu.runtime.tool_completion import ToolCompletionPolicy
 from cayu.server._app_info_routes import register_app_info_routes
+from cayu.server._artifact_index_reads import ArtifactIndexReads, query_indexed_artifacts
 from cayu.server._artifact_query import (
     ArtifactOrder,
     artifact_search_available,
+    list_store_artifacts,
     query_artifacts,
-    read_titles,
 )
 from cayu.server._browser_client import (
     BROWSER_CLIENT_MODULE,
@@ -3765,14 +3765,6 @@ def _serialize_artifact(cayu_app: Any, metadata: Any, *, artifact_store_id: str)
     }
 
 
-def _artifact_sort_key(artifact: dict[str, Any]) -> tuple[str, str, str]:
-    return (
-        str(artifact["created_at"]),
-        str(artifact["artifact_store_id"]),
-        str(artifact["id"]),
-    )
-
-
 def _decode_artifact_text(content: bytes, content_type: str) -> str | None:
     normalized_content_type = content_type.split(";", 1)[0].strip().lower()
     if normalized_content_type.startswith("text/") or normalized_content_type in {
@@ -4678,6 +4670,7 @@ def create_router(
         finally:
             if coordinator is not None:
                 await coordinator.stop()
+            await artifact_index.close()
             # The declared targets' own applications stop with the server that served them.
             for declared_app in declared_eval_apps:
                 try:
@@ -4686,6 +4679,8 @@ def create_router(
                     logger.warning("A declared eval target's application did not close cleanly.")
 
     router = APIRouter(prefix=api_prefix, lifespan=evals_lifespan)
+    # Artifact lists and overview counts read the session store's artifact index.
+    artifact_index = ArtifactIndexReads(session_store)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
     session_message_router = APIRouter(
         route_class=_private_session_message_route_class(auth),
@@ -7192,6 +7187,13 @@ def create_router(
         optional_auth_context=optional_auth_context,
     )
 
+    artifact_index.register_reindex_route(
+        router,
+        stores=lambda: _artifact_stores_by_id(cayu_app),
+        dependencies=heavy_read(),
+        responses=ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+    )
+
     @router.get(
         "/artifacts",
         response_model=ArtifactsResponse,
@@ -7203,6 +7205,7 @@ def create_router(
         order_by: ArtifactOrder = "created_at_desc",
         limit: Annotated[int, Query(ge=1, le=_ARTIFACT_PAGE_LIMIT_MAX)] = 100,
         offset: Annotated[int, Query(ge=0, le=_ARTIFACT_PAGE_OFFSET_MAX)] = 0,
+        cursor: Annotated[str | None, Query(max_length=2048)] = None,
         artifact_store_id: Annotated[str | None, Query()] = None,
         scope: ArtifactScope | None = None,
         session_id: Annotated[str | None, Query()] = None,
@@ -7231,14 +7234,40 @@ def create_router(
         filters = ArtifactScanFilter(
             scope, requested_session_id, requested_agent_name, requested_environment_name
         )
+
+        def serialize(artifact: Any, store_id: str) -> dict[str, Any]:
+            return _serialize_artifact(cayu_app, artifact, artifact_store_id=store_id)
+
+        def redact(value: Any) -> Any:
+            return _redact_control_plane_json(cayu_app, value, "artifact search")
+
+        if selected_stores and await artifact_index.filled(selected_stores) == set(selected_stores):
+            if cursor is not None and offset:
+                raise HTTPException(422, "Artifact pages take a cursor or an offset, not both.")
+            return await query_indexed_artifacts(
+                session_store,
+                tuple(selected_stores),
+                serialize=serialize,
+                redact=redact,
+                redacts_secrets=getattr(cayu_app, "redacts_secrets", True) is not False,
+                filters=filters,
+                q=q,
+                order_by=order_by,
+                offset=offset,
+                cursor=cursor,
+                limit=limit,
+                offset_max=_ARTIFACT_PAGE_OFFSET_MAX,
+            )
+        if cursor is not None:
+            raise HTTPException(
+                409, "Artifact cursors are available once the artifact index is filled."
+            )
         if q is not None or order_by != "created_at_desc":
             return await query_artifacts(
                 selected_stores,
                 session_store,
-                serialize=lambda artifact, store_id: _serialize_artifact(
-                    cayu_app, artifact, artifact_store_id=store_id
-                ),
-                redact=lambda value: _redact_control_plane_json(cayu_app, value, "artifact search"),
+                serialize=serialize,
+                redact=redact,
                 filters=filters,
                 q=q,
                 order_by=order_by,
@@ -7246,78 +7275,16 @@ def create_router(
                 limit=limit,
             )
 
-        artifacts: list[dict[str, Any]] = []
-        total_count: int | None = 0
-        truncated = False
-        per_store_limit = offset + limit
-        for store_id, store in selected_stores.items():
-            try:
-                result = await store.list(
-                    scope=scope,
-                    session_id=requested_session_id,
-                    agent_name=requested_agent_name,
-                    environment_name=requested_environment_name,
-                    limit=per_store_limit,
-                )
-                if type(result) is not ArtifactListResult:
-                    raise TypeError("Artifact stores must return ArtifactListResult from list().")
-                page = ArtifactListResult(
-                    artifacts=result.artifacts,
-                    total_count=result.total_count,
-                    truncated=result.truncated,
-                )
-            except (ArtifactStoreUnavailableError, OSError) as exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Artifact store is unavailable.",
-                ) from exc
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Artifact store returned invalid artifact data.",
-                ) from exc
-            artifacts.extend(
-                _serialize_artifact(cayu_app, artifact, artifact_store_id=store_id)
-                for artifact in page.artifacts
-            )
-            if page.total_count is None:
-                total_count = None
-                truncated = True
-            elif total_count is not None:
-                total_count += page.total_count
-            truncated = truncated or page.truncated
-
-        artifacts.sort(key=_artifact_sort_key, reverse=True)
-        page_artifacts = artifacts[offset : offset + limit]
-        titles = await read_titles(
+        return await list_store_artifacts(
+            selected_stores,
             session_store,
-            tuple(dict.fromkeys(row["session_id"] for row in page_artifacts if row["session_id"])),
-            lambda value: _redact_control_plane_json(cayu_app, value, "session title"),
+            serialize=serialize,
+            redact_title=lambda value: _redact_control_plane_json(cayu_app, value, "session title"),
+            filters=filters,
+            offset=offset,
+            limit=limit,
+            offset_max=_ARTIFACT_PAGE_OFFSET_MAX,
         )
-        for row in page_artifacts:
-            row["session_title"] = titles.get(row["session_id"])
-        next_offset = None
-        has_more = False
-        if total_count is None:
-            if len(artifacts) > offset + limit or truncated:
-                has_more = True
-                candidate_next_offset = offset + limit
-                if candidate_next_offset <= _ARTIFACT_PAGE_OFFSET_MAX:
-                    next_offset = candidate_next_offset
-        elif offset + limit < total_count:
-            has_more = True
-            candidate_next_offset = offset + limit
-            if candidate_next_offset <= _ARTIFACT_PAGE_OFFSET_MAX:
-                next_offset = candidate_next_offset
-        truncated = has_more
-        return {
-            "artifacts": page_artifacts,
-            "total_count": total_count,
-            "truncated": truncated,
-            "limit": limit,
-            "offset": offset,
-            "next_offset": next_offset,
-        }
 
     async def _read_artifact_from_request(
         artifact_id: str,
@@ -7806,6 +7773,7 @@ def create_router(
         project_session=cayu_app.project_session_id_for_exposure,
         redact=cayu_app.redact_json,
         artifact_stores=lambda: _artifact_stores_by_id(cayu_app),
+        artifact_index=artifact_index,
     )
     from cayu.server._session_displays import register_session_displays
 

@@ -48,6 +48,7 @@ from cayu.sessions.messaging import (
     SessionMessageSource,
 )
 from cayu.sessions.records import update_session_annotations
+from cayu.storage import _artifact_index_store as artifact_index_ops
 from cayu.storage import _creation_fence
 from cayu.storage import _postgres_alias_checks as alias_checks
 from cayu.storage import _postgres_base as postgres_base
@@ -70,11 +71,11 @@ from cayu.storage import _postgres_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _postgres_tool_grants as tool_grants_ops
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage import _postgres_transcript_content as transcript_content
+from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
-from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
@@ -452,7 +453,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = KNOWLEDGE_LOOKUP_TOTALS_REVISION
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = ARTIFACT_INDEX_REVISION
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -648,6 +649,7 @@ class PostgresSessionStore(
             return require_clause_admitted(bounds, pg_support.session_from_row(row, labels=labels))
 
     supports_session_titles: ClassVar[bool] = True
+    supports_artifact_index: ClassVar[bool] = True
     supports_environment_activity: ClassVar[bool] = True
     supports_usage_series: ClassVar[bool] = True
     supports_usage_cost_details: ClassVar[bool] = True
@@ -6540,6 +6542,52 @@ class PostgresSessionStore(
     async def read_session_titles(self, query: SessionTitleQuery) -> SessionTitleSnapshot:
         await self._ensure_ready()
         return await session_queries.read_session_titles(self._connection, query)
+
+    async def record_indexed_artifacts(
+        self, store_id: str, artifacts: Sequence[Any], *, observed_at: datetime
+    ) -> None:
+        await self._ensure_ready()
+        await artifact_index_ops.postgres_record_live(
+            self._connection, store_id, artifacts, observed_at
+        )
+
+    async def record_deleted_artifacts(
+        self, store_id: str, artifact_ids: Sequence[str], *, deleted_at: datetime
+    ) -> None:
+        await self._ensure_ready()
+        await artifact_index_ops.postgres_record_deleted(
+            self._connection, store_id, artifact_ids, deleted_at
+        )
+
+    async def mark_artifact_index_store(
+        self, store_id: str, *, backfilled_at: datetime | None
+    ) -> None:
+        await self._ensure_ready()
+        await artifact_index_ops.postgres_mark_store(self._connection, store_id, backfilled_at)
+
+    async def read_artifact_index_stores(
+        self, store_ids: Sequence[str]
+    ) -> dict[str, datetime | None]:
+        await self._ensure_ready()
+        return await artifact_index_ops.postgres_read_stores(self._connection, store_ids)
+
+    async def scan_artifact_index(
+        self, store_id: str, *, after: str | None, limit: int
+    ) -> tuple[tuple[str, str], ...]:
+        await self._ensure_ready()
+        return await artifact_index_ops.postgres_scan(self._connection, store_id, after, limit)
+
+    async def count_indexed_session_artifacts(
+        self, store_ids: Sequence[str], session_ids: Sequence[str]
+    ) -> dict[str, int]:
+        await self._ensure_ready()
+        return await artifact_index_ops.postgres_count_sessions(
+            self._connection, store_ids, session_ids
+        )
+
+    async def query_artifact_index(self, query: Any) -> Any:
+        await self._ensure_ready()
+        return await artifact_index_ops.postgres_query(self._connection, query)
 
     async def aggregate_environment_activity(
         self, query: EnvironmentActivityQuery

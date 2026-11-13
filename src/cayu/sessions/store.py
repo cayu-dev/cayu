@@ -488,6 +488,7 @@ class SessionStore(ABC):
     external_wait_version: ClassVar[int] = 0
     _producer_attachment_version: ClassVar[int] = 0
     supports_session_titles: ClassVar[bool] = False
+    supports_artifact_index: ClassVar[bool] = False
     supports_environment_activity: ClassVar[bool] = False
     supports_usage_series: ClassVar[bool] = False
     supports_usage_cost_details: ClassVar[bool] = False
@@ -5328,6 +5329,54 @@ class SessionStore(ABC):
         titles. Do not hydrate events, transcripts, checkpoints or whole sessions.
         """
         raise NotImplementedError("Batched session title reads are unsupported.")
+
+    # The artifact index (``cayu.artifacts._index``). Optional; advertise
+    # supports_artifact_index. Artifact stores bound to this store write it on
+    # every commit and deletion; artifact lists and counts read it.
+
+    async def record_indexed_artifacts(
+        self, store_id: str, artifacts: Sequence[Any], *, observed_at: datetime
+    ) -> None:
+        """Record up to 500 artifacts ``store_id`` holds, as observed at ``observed_at``.
+
+        Each row applies only when ``observed_at`` is at least as new as the row's,
+        so a slow writer never undoes a later deletion; a newer write revives it.
+        """
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def record_deleted_artifacts(
+        self, store_id: str, artifact_ids: Sequence[str], *, deleted_at: datetime
+    ) -> None:
+        """Record up to 500 deletions, observed at ``deleted_at``; rows are kept as tombstones."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def mark_artifact_index_store(
+        self, store_id: str, *, backfilled_at: datetime | None
+    ) -> None:
+        """Record that the index was filled from the store (or, with None, that it needs filling)."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def read_artifact_index_stores(
+        self, store_ids: Sequence[str]
+    ) -> dict[str, datetime | None]:
+        """When each named store was last filled; stores never recorded are absent."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def scan_artifact_index(
+        self, store_id: str, *, after: str | None, limit: int
+    ) -> tuple[tuple[str, str], ...]:
+        """Live ``(artifact_id, metadata_json)`` rows of one store after ``after``, by id."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def count_indexed_session_artifacts(
+        self, store_ids: Sequence[str], session_ids: Sequence[str]
+    ) -> dict[str, int]:
+        """Live session-scoped artifacts of each session (zero included) in the named stores."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def query_artifact_index(self, query: Any) -> Any:
+        """One ``ArtifactIndexPage`` for an ``ArtifactIndexQuery``, read with keyset paging."""
+        raise NotImplementedError("This session store has no artifact index.")
 
     # Page reads. Each takes the session IDs of one page (at most
     # MAX_PAGE_READ_SESSIONS) and answers for all of them. The defaults loop over

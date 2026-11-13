@@ -16,6 +16,10 @@ from cayu.storage._accounting_schema import (
     POSTGRES_AUXILIARY_ACCOUNTING_DDL,
 )
 from cayu.storage._agent_snapshot_schema import POSTGRES_AGENT_SNAPSHOT_DDL
+from cayu.storage._artifact_index_schema import (
+    ARTIFACT_INDEX_REVISION,
+    POSTGRES_ARTIFACT_INDEX_DDL,
+)
 from cayu.storage._authorization_grant_schema import POSTGRES_TOOL_AUTHORIZATION_GRANT_DDL
 from cayu.storage._collaboration_schema import (
     POSTGRES_COLLABORATION_CLARIFICATION_DDL,
@@ -1021,6 +1025,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ),
     # Task list indexes, trigger-maintained status counts and prerequisite edges.
     TASK_INDEX_REVISION: POSTGRES_TASK_INDEX_DDL,
+    # Artifact lists and counts read an index the artifact store commit hook writes.
+    ARTIFACT_INDEX_REVISION: POSTGRES_ARTIFACT_INDEX_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

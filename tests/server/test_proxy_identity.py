@@ -301,6 +301,7 @@ _FULL_ACCESS_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
             ("DELETE", "/sessions/{session_id}"),
             ("PATCH", "/sessions/{session_id}/labels"),
             ("PATCH", "/sessions/{session_id}/metadata"),
+            ("POST", "/artifacts/index/reindex"),
             ("POST", "/diagnostics/model-check"),
             ("POST", "/knowledge/{entry_id}/retire"),
             ("POST", "/provider-operations/resolve"),

@@ -1519,6 +1519,52 @@ reads, not a frozen snapshot across stores: concurrent saves or removals can cha
 later pages. The supported pagination bounds remain `limit` 1–500 and `offset`
 0–10,000.
 
+### The artifact index
+
+SQLite and PostgreSQL session stores keep an index of artifact metadata,
+`cayu_artifact_index` (storage revision 152), so `GET /api/artifacts`, its search
+and sorts, a session's Artifacts tab, an environment's files and the artifact counts
+in session overviews read indexed rows instead of walking the artifact stores.
+Artifact content is still read from the store, and only when a file is opened.
+
+- **Writing it.** `CayuApp` binds every registered artifact store to its session
+  store. From then on each committed `put_bytes`, each `delete` and each claimed
+  deletion from retention writes or tombstones that artifact's row. The hook is in
+  `ArtifactStore` itself, so every backend, built in or not, is covered.
+  `cayu.artifacts._index.bind_artifact_index(store, session_store)` binds a store
+  used outside an app. Each write carries the time its operation finished (a fill,
+  the time its walk began), and a row only takes a newer write, so a slow write
+  never undoes a later deletion and a fill never undoes one that finished while it
+  ran.
+- **Filling it.** Lists use the index for a store once it has been filled from that
+  store. The first read that meets a store not yet filled starts one walk of it in
+  the background and is answered from the store meanwhile. `POST
+  /api/artifacts/index/reindex` (`cayu artifact reindex`) fills or checks it on
+  demand.
+- **Drift.** An artifact store is external storage, so its commit and the index row
+  cannot share a transaction. Writes from processes outside Cayu, from older
+  binaries, or a row that fails to land leave drift. A failed row marks the store
+  unfilled, so lists fall back to the store until the next fill.
+  `cayu artifact reindex --check` reports artifacts with no row, rows with no
+  artifact and rows whose metadata differs, and exits 1 on drift; without `--check`
+  it repairs them.
+- **Search.** `q` matches the same fields as before, case-insensitively and
+  literally, through an FTS5 trigram index on SQLite and `pg_trgm` indexes on
+  PostgreSQL. Without `pg_trgm` (a role that cannot create the extension), search
+  scans the index table, which stays narrow. When the app redacts secrets, every
+  match is rechecked against the values as shown, and the page and `total_count`
+  count only matches that survive, as the store walk did, so a search never
+  confirms a guess at a secret.
+- **Paging.** Index-served pages return `next_cursor`; pass it back as `cursor` for
+  keyset paging at any depth. A cursor names only the last row's store and id; the
+  index reads that row's sort value, so a cursor never carries a filename. `offset`
+  keeps working up to 10,000.
+
+```sh
+cayu artifact reindex --server-url http://localhost:8000 --check
+cayu artifact list --server-url http://localhost:8000 --cursor <next_cursor>
+```
+
 The CLI uses the same protected API, filters and pagination:
 
 ```sh

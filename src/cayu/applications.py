@@ -4623,6 +4623,11 @@ class CayuApp(
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
 
+    @property
+    def redacts_secrets(self) -> bool:
+        """Whether any configured secret value is redacted from what the app returns."""
+        return self._secret_redactor.has_values
+
     def redact_uppercase_text(self, value: str) -> str:
         """Redact text after the same uppercase normalization used by authorities."""
 

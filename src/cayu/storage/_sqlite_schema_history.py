@@ -7,6 +7,10 @@ Migration execution, hooks and conditional column changes live in
 from __future__ import annotations
 
 from cayu.storage._accounting_schema import SQLITE_ACCOUNTING_DDL, SQLITE_AUXILIARY_ACCOUNTING_DDL
+from cayu.storage._artifact_index_schema import (
+    ARTIFACT_INDEX_REVISION,
+    SQLITE_ARTIFACT_INDEX_DDL,
+)
 from cayu.storage._authorization_grant_schema import SQLITE_TOOL_AUTHORIZATION_GRANT_DDL
 from cayu.storage._collaboration_schema import (
     SQLITE_COLLABORATION_CLARIFICATION_DDL,
@@ -807,6 +811,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     );""",
     # Task list indexes, trigger-maintained status counts and prerequisite edges.
     TASK_INDEX_REVISION: SQLITE_TASK_INDEX_DDL,
+    # Artifact lists and counts read an index the artifact store commit hook writes.
+    ARTIFACT_INDEX_REVISION: SQLITE_ARTIFACT_INDEX_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

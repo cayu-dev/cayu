@@ -106,6 +106,10 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
                     "include_forks": "true",
                     "limit": "100",
                 }
+                if store.supports_artifact_index:
+                    # Fill the artifact index first, so counts read it, not the store.
+                    filled = await client.post("/api/artifacts/index/reindex", json={})
+                    assert filled.status_code == 200, filled.text
                 before = await client.get("/api/sessions", params=params)
                 assert before.status_code == 200, before.text
                 counts_before = await client.get("/api/sessions/overview/counts")
@@ -129,13 +133,20 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             assert len(body["overviews"]) == 5 * families
             prefix = f"p{families}-"
             rows = {row["session_id"].removeprefix(prefix): row for row in body["overviews"]}
-            return page_calls, calls, rows, totals
+            return page_calls, calls, rows, totals, store.supports_artifact_index
         finally:
             await _close_store(store)
 
     async def scenario():
-        small, small_counts, small_rows, small_totals = await page_reads(2)
-        large, large_counts, large_rows, large_totals = await page_reads(6)
+        small, small_counts, small_rows, small_totals, indexed = await page_reads(2)
+        large, large_counts, large_rows, large_totals, _ = await page_reads(6)
+        # With an artifact index, counts read it in one query; without one, each
+        # store counts the page's sessions in one read.
+        artifact_count = (
+            "sessions.count_indexed_session_artifacts"
+            if indexed
+            else "artifacts.count_session_artifacts"
+        )
         assert small == large, (small, large)
         # Counts read a store page of sessions at a time, the same reads however
         # many sessions the page holds.
@@ -165,7 +176,7 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             "sessions.load_session_operations",
             "sessions.count_child_runs",
             "sessions.query_first_transcript_records",
-            "artifacts.count_session_artifacts",
+            artifact_count,
         ):
             assert large[name] >= 1, (name, large)
         # The listed rows are summarized as listed. Each fence after a group of
@@ -183,6 +194,8 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             "sessions.load_session_operation",
             "sessions.query_transcript",
             "artifacts.list",
+            "artifacts.scan_metadata",
+            *(("artifacts.count_session_artifacts",) if indexed else ()),
         ):
             assert large[name] == 0, (name, large)
         for rows in (small_rows, large_rows):

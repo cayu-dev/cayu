@@ -238,7 +238,7 @@
     "cayu.cli.evals:_run"
   ],
   "cayu.cli._cloud_agent_api:CayuApi": [
-    "cayu.cli.artifact:_run_artifact",
+    "cayu.cli.artifact:_open_api",
     "cayu.cli.diagnostics:_run_system",
     "cayu.cli.environment:_open_api",
     "cayu.cli.knowledge:open_knowledge_reader",
@@ -250,7 +250,7 @@
     "CayuApi._bounded_request"
   ],
   "cayu.cli._cloud_agent_api:open_cloud_agent_api": [
-    "cayu.cli.artifact:_run_artifact",
+    "cayu.cli.artifact:_open_api",
     "cayu.cli.diagnostics:_run_system",
     "cayu.cli.environment:_open_api",
     "cayu.cli.session:_close_cloud_session",
