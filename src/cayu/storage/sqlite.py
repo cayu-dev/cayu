@@ -69,12 +69,14 @@ from cayu.storage._context_selection_fence import SQLiteContextSelectionFenceMix
 from cayu.storage._creation_fence import SQLiteCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
+from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._read_lanes import ReadLane, current_read_lane
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
 from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
+    from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -440,7 +442,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 150
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = KNOWLEDGE_LOOKUP_TOTALS_REVISION
 _T = TypeVar("_T")
 # Read-only connections per file-backed session store. Interactive reads (one
 # session, a transcript, state) lease the first set; bulk-lane reads (dashboard
@@ -6701,6 +6703,16 @@ class SQLiteSessionStore(
                 max_pages=max_pages,
             )
 
+    async def knowledge_lookup_totals(
+        self, identities: Collection[tuple[str, str]]
+    ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+        return await session_queries.knowledge_lookup_totals(self._run_read, identities)
+
+    async def stored_knowledge_lookup_totals(
+        self,
+    ) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+        return await session_queries.stored_knowledge_lookup_totals(self._run_read)
+
     async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
         return await session_queries.tool_usage_totals(self._run_read)
 
@@ -7370,6 +7382,43 @@ class SQLiteSessionStore(
         return await self._query_pending_actions(
             query, checkpoint_root_guard=checkpoint_root_guard, session_ids=None
         )
+
+    async def count_pending_actions(
+        self, query: PendingActionQuery | None = None
+    ) -> dict[PendingActionKind, int]:
+        from cayu.storage._pending_action_counts_sql import (
+            SQLITE_PENDING_ACTION_COUNTS_INDEX,
+            count_woken_recoveries,
+            pending_action_counts,
+            pending_action_counts_sql,
+            woken_recovery_sessions_sql,
+        )
+
+        query = PendingActionQuery() if query is None else query
+        if type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        sql, params = pending_action_counts_sql(
+            query,
+            placeholder="?",
+            index_hint=f"INDEXED BY {SQLITE_PENDING_ACTION_COUNTS_INDEX}",
+        )
+        woken_sql, woken_params = woken_recovery_sessions_sql(
+            query, placeholder="?", dialect="sqlite"
+        )
+
+        def read(connection: sqlite3.Connection) -> tuple[dict[PendingActionKind, int], list[str]]:
+            counts = pending_action_counts(connection.execute(sql, params).fetchone())
+            woken = (
+                [str(row[0]) for row in connection.execute(woken_sql, woken_params)]
+                if woken_sql
+                else []
+            )
+            return counts, woken
+
+        counts, woken = await self._run_read(read)
+        if not woken:
+            return counts
+        return await count_woken_recoveries(self, counts, woken, query)
 
     async def query_pending_actions_for_sessions(
         self,

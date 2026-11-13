@@ -24,7 +24,12 @@ export function InboxList({ search, pageSize = 50 }: { search: InboxSearch; page
     agent_name: search.agent_name,
   })
   const items = inbox.data?.items ?? []
-  const ids = [...new Set(items.flatMap((item) => (item.session_id ? [item.session_id] : [])))]
+  // Items carry their session's title; ask the host only for sessions they don't name.
+  const ids = [
+    ...new Set(
+      items.flatMap((item) => (item.session_id && !item.session_title ? [item.session_id] : [])),
+    ),
+  ]
   const sessions = useQuery({
     queryKey: inboxKeys.sessionTitles(ids),
     queryFn: () => api.sessionTitles!(ids),
@@ -97,7 +102,7 @@ export function InboxList({ search, pageSize = 50 }: { search: InboxSearch; page
             item.session_id
               ? {
                   sessionId: item.session_id,
-                  title: titles.get(item.session_id) ?? item.session_id,
+                  title: item.session_title ?? titles.get(item.session_id) ?? item.session_id,
                 }
               : undefined
           }

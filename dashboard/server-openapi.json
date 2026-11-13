@@ -27904,6 +27904,18 @@
             ],
             "title": "Session Id"
           },
+          "session_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The title of the session an approval, question or recovery item waits in, when it has one (its cayu:title metadata).",
+            "title": "Session Title"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -57085,7 +57097,7 @@
     },
     "/api/inbox/counts": {
       "get": {
-        "description": "Count every pending inbox kind independently of list page size. Limited callers receive unavailable counts, never hidden totals. Reads bounded source pages to exhaustion; source issues yield unavailable counts.",
+        "description": "Count every pending inbox kind independently of list page size. Limited callers receive unavailable counts, never hidden totals. Without `q`, counts come from the stores' stored pending-action flags and pending-knowledge count when they keep them; otherwise, and with `q`, this reads bounded source pages to exhaustion, and source issues yield unavailable counts. The response carries a weak ETag; send it back as If-None-Match to get 304 when nothing changed.",
         "operationId": "inbox_counts_api_inbox_counts_get",
         "parameters": [
           {
@@ -57137,6 +57149,23 @@
                 }
               ],
               "title": "Q"
+            }
+          },
+          {
+            "in": "header",
+            "name": "if-none-match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-None-Match"
             }
           }
         ],

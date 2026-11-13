@@ -73,6 +73,7 @@ from cayu.storage._context_selection_fence import PostgresContextSelectionFenceM
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
 from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
+from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
@@ -89,6 +90,7 @@ from cayu.storage.work_context_postgres import (
 )
 
 if TYPE_CHECKING:
+    from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
         ZeroWorkInterruptionRequest,
@@ -448,7 +450,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 150
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = KNOWLEDGE_LOOKUP_TOTALS_REVISION
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -6304,6 +6306,11 @@ class PostgresSessionStore(
     ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
         return await session_queries.knowledge_lookup_totals(self._ready_connection, identities)
 
+    async def stored_knowledge_lookup_totals(
+        self,
+    ) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+        return await session_queries.stored_knowledge_lookup_totals(self._ready_connection)
+
     async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
         return await session_queries.tool_usage_totals(self._ready_connection)
 
@@ -6702,6 +6709,34 @@ class PostgresSessionStore(
         return await self._query_pending_actions(
             query, checkpoint_root_guard=checkpoint_root_guard, session_ids=None
         )
+
+    async def count_pending_actions(
+        self, query: PendingActionQuery | None = None
+    ) -> dict[PendingActionKind, int]:
+        from cayu.storage._pending_action_counts_sql import (
+            count_woken_recoveries,
+            pending_action_counts,
+            pending_action_counts_sql,
+            woken_recovery_sessions_sql,
+        )
+
+        query = PendingActionQuery() if query is None else query
+        if type(query) is not PendingActionQuery:
+            raise TypeError("Pending-action queries must be PendingActionQuery instances.")
+        sql, params = pending_action_counts_sql(query, placeholder="%s")
+        woken_sql, woken_params = woken_recovery_sessions_sql(
+            query, placeholder="%s", dialect="postgres"
+        )
+        async with self._ready_connection() as conn, conn.cursor() as cur:
+            await cur.execute(cast("LiteralString", sql), params)
+            counts = pending_action_counts(await cur.fetchone())
+            woken: list[str] = []
+            if woken_sql:
+                await cur.execute(cast("LiteralString", woken_sql), woken_params)
+                woken = [str(row[0]) for row in await cur.fetchall()]
+        if not woken:
+            return counts
+        return await count_woken_recoveries(self, counts, woken, query)
 
     async def query_pending_actions_for_sessions(
         self,

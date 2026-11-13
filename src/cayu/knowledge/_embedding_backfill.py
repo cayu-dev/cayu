@@ -118,9 +118,10 @@ def _knowledge_embedding_backfill_fingerprint(
     if query.cursor is not None:
         raise ValueError("Embedding backfill uses its own cursor, not a knowledge list cursor.")
     material = {
-        # Keep existing backfill cursors valid when the optional list-only field
-        # is absent. Backfill continues by chunk, rather than by entry.
-        "query": query.model_dump(mode="json", exclude={"cursor"}),
+        # Leave out the list-only fields so existing backfill cursors stay valid.
+        # Backfill continues by chunk, rather than by entry, and whether a list
+        # page counts its total doesn't change which entries match.
+        "query": query.model_dump(mode="json", exclude={"cursor", "count_total"}),
         "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
         "refresh_existing": refresh_existing,
         "projection_type": KNOWLEDGE_CHUNK_TEXT_PROJECTION,

@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useState } from "react"
 import { useApi } from "./services"
 
 const firstPage = { cursor: null as string | null, visited: [] as string[], number: 1 }
@@ -25,10 +25,6 @@ export function useKeptKnowledge(enabled: boolean) {
     if (!next || cycle || result.isFetching) return
     setPosition({ cursor: next, visited: [...position.visited, next], number: position.number + 1 })
   }, [next, cycle, result.isFetching, position])
-  useEffect(() => {
-    if (next && result.data?.entries.length === 0 && position.number % 25 !== 0 && !result.error)
-      advance()
-  }, [next, result.data, result.error, position.number, advance])
   const refresh = async () => {
     // Reset only the first page, not every previously visited cursor query.
     await client.cancelQueries({ queryKey: ["knowledge", "kept"] })

@@ -120,7 +120,16 @@ async def _wake_id(app: CayuApp, session_id: str) -> str:
 
 async def _actions(app: CayuApp, session_id: str):
     page = await app.session_store.query_pending_actions(PendingActionQuery(session_id=session_id))
-    return [(action.kind, action.tool_call_id) for action in page.actions], page.issues
+    actions = [(action.kind, action.tool_call_id) for action in page.actions]
+    if not isinstance(app.session_store, InMemorySessionStore):
+        # The stored inbox count agrees with the list, a woken round's recovery included.
+        counts = await app.session_store.count_pending_actions(
+            PendingActionQuery(session_id=session_id)
+        )
+        assert counts == {
+            kind: sum(1 for listed, _ in actions if listed is kind) for kind in counts
+        }
+    return actions, page.issues
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite", "postgres"])

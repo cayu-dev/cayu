@@ -52,25 +52,26 @@ async def _fail_while_the_call_ran(
     environment: str | None,
     calls: tuple[str, ...] = (CALL,),
     results: tuple[str, ...] = (),
+    session_id: str = SESSION,
 ) -> None:
     """The run started ``exec_command`` and failed before it recorded how the call ended."""
 
     await store.create(
         RunRequest(
             agent_name="verifier",
-            session_id=SESSION,
+            session_id=session_id,
             messages=[Message.text("user", "verify")],
             environment_name=environment,
         ),
         identity=SessionIdentity(provider_name=_PROVIDER.name, model="fake-model"),
     )
     await store.append_events(
-        SESSION,
+        session_id,
         [
             *(
                 Event(
                     type=EventType.TOOL_CALL_STARTED,
-                    session_id=SESSION,
+                    session_id=session_id,
                     tool_name="exec_command",
                     payload={**ROUND, "tool_call_id": call, "arguments": ARGUMENTS},
                 )
@@ -80,7 +81,7 @@ async def _fail_while_the_call_ran(
             *(
                 Event(
                     type=EventType.TOOL_CALL_COMPLETED,
-                    session_id=SESSION,
+                    session_id=session_id,
                     tool_name="exec_command",
                     payload={
                         **ROUND,
@@ -92,7 +93,7 @@ async def _fail_while_the_call_ran(
             ),
             Event(
                 type=EventType.SESSION_FAILED,
-                session_id=SESSION,
+                session_id=session_id,
                 payload={
                     "error": "Execution candidate was refused: runner_poisoned.",
                     "error_type": "ExecutionAdmissionError",
@@ -101,7 +102,7 @@ async def _fail_while_the_call_ran(
         ],
     )
     await store.checkpoint(
-        SESSION,
+        session_id,
         {
             "pending_tool_round": {
                 **ROUND,
@@ -112,7 +113,7 @@ async def _fail_while_the_call_ran(
             }
         },
     )
-    await store.update_status(SESSION, SessionStatus.FAILED)
+    await store.update_status(session_id, SessionStatus.FAILED)
 
 
 def _app(store, **options) -> CayuApp:

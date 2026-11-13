@@ -112,6 +112,7 @@ from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _tool_usage_sql as tool_usage_sql
 
 if TYPE_CHECKING:
+    from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
@@ -843,44 +844,42 @@ async def fold_event_snapshot(
 
 
 @runtime_session_query
+async def stored_knowledge_lookup_totals(
+    connect: PostgresConnection,
+) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+    """Every row of ``cayu_knowledge_lookup_totals``, for the recompute check."""
+
+    from cayu.knowledge.usage import KnowledgeLookupTotal
+
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute(
+            "SELECT namespace, entry_id, lookups, sessions, last_lookup_at "
+            "FROM cayu_knowledge_lookup_totals"
+        )
+        rows = await cur.fetchall()
+    return {
+        (namespace, entry_id): KnowledgeLookupTotal(
+            int(lookups), int(sessions), pg_support.to_utc(last)
+        )
+        for namespace, entry_id, lookups, sessions, last in rows
+    }
+
+
+@runtime_session_query
 async def knowledge_lookup_totals(
     connect: PostgresConnection, identities: Collection[tuple[str, str]]
 ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
-    """Count retained lookups for the requested pairs in SQL, inside one snapshot.
+    """Read lookup counts for the requested pairs from ``cayu_knowledge_lookup_totals``.
 
-    Matches ``fold_knowledge_lookup_totals``: an event counts when its JSON type is
-    ``knowledge.lookup``, its payload namespace is a string and its ``entry_ids``
-    is an array holding the entry ID as a string, once per event however often the
-    ID repeats. The sequence is the snapshot's newest event of any type.
+    Matches ``fold_knowledge_lookup_totals``; the totals are trigger-maintained
+    and folded at commit, so a snapshot sees each committed lookup exactly once.
+    The sequence is the snapshot's newest event of any type.
     """
 
     wanted = list(dict.fromkeys(identities))
     totals: dict[tuple[str, str], tuple[int, datetime | None]] = dict.fromkeys(wanted, (0, None))
     newest_plan = session_store_sql.build_event_query_sql(
         EventQuery(limit=1, order_by=EventOrder.SEQUENCE_DESC), dialect=SQL_DIALECT
-    )
-    lookup_plan = session_store_sql.build_event_query_sql(
-        EventQuery(after_sequence=0, limit=1, event_type=EventType.KNOWLEDGE_LOOKUP),
-        dialect=SQL_DIALECT,
-        extra_after_sequence_clauses=(
-            session_store_sql.SqlClause(
-                "cayu_events.event ->> 'type' = %s", (str(EventType.KNOWLEDGE_LOOKUP),)
-            ),
-            session_store_sql.SqlClause(
-                "jsonb_typeof(cayu_events.event -> 'payload' -> 'namespace') = 'string'", ()
-            ),
-            session_store_sql.SqlClause(
-                "jsonb_typeof(cayu_events.event -> 'payload' -> 'entry_ids') = 'array'", ()
-            ),
-            session_store_sql.SqlClause(
-                "cayu_events.event -> 'payload' ->> 'namespace' = ANY(%s::text[])",
-                (list(dict.fromkeys(namespace for namespace, _ in wanted)),),
-            ),
-            session_store_sql.SqlClause(
-                "(cayu_events.event -> 'payload' -> 'entry_ids') ?| %s::text[]",
-                (list(dict.fromkeys(entry_id for _, entry_id in wanted)),),
-            ),
-        ),
     )
     async with connect() as conn, conn.cursor() as cur:
         await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -899,41 +898,21 @@ async def knowledge_lookup_totals(
             newest_plan.params,
         )
         newest = await cur.fetchone()
-        if not wanted:
-            return totals, 0 if newest is None else newest[0]
-        # The pairs and their filters are bound values; the SQL text is fixed.
-        await cur.execute(
-            cast(
-                "LiteralString",
-                f"""
-                WITH lookup AS (
-                    SELECT cayu_events.sequence,
-                           cayu_events.event -> 'payload' ->> 'namespace' AS namespace,
-                           cayu_events.event -> 'payload' -> 'entry_ids' AS entry_ids,
-                           cayu_events.timestamp AS looked_up_at
-                    FROM cayu_events
-                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
-                    {lookup_plan.where_sql}
-                )
-                SELECT wanted.namespace, wanted.entry_id,
-                       COUNT(DISTINCT lookup.sequence), MAX(lookup.looked_up_at)
-                FROM lookup
-                CROSS JOIN LATERAL jsonb_array_elements(lookup.entry_ids) AS returned(value)
-                JOIN unnest(%s::text[], %s::text[]) AS wanted(namespace, entry_id)
-                  ON wanted.namespace = lookup.namespace
-                 AND jsonb_typeof(returned.value) = 'string'
-                 AND wanted.entry_id = returned.value #>> '{{}}'
-                GROUP BY wanted.namespace, wanted.entry_id
+        if wanted:
+            await cur.execute(
+                """
+                SELECT totals.namespace, totals.entry_id, totals.lookups, totals.last_lookup_at
+                FROM unnest(%s::text[], %s::text[]) AS wanted(namespace, entry_id)
+                JOIN cayu_knowledge_lookup_totals AS totals
+                  ON totals.namespace = wanted.namespace AND totals.entry_id = wanted.entry_id
                 """,
-            ),
-            (
-                *lookup_plan.params,
-                [namespace for namespace, _ in wanted],
-                [entry_id for _, entry_id in wanted],
-            ),
-        )
-        for namespace, entry_id, count, last in await cur.fetchall():
-            totals[(namespace, entry_id)] = int(count), pg_support.to_utc(last)
+                (
+                    [namespace for namespace, _ in wanted],
+                    [entry_id for _, entry_id in wanted],
+                ),
+            )
+            for namespace, entry_id, count, last in await cur.fetchall():
+                totals[(namespace, entry_id)] = int(count), pg_support.to_utc(last)
     return totals, 0 if newest is None else newest[0]
 
 

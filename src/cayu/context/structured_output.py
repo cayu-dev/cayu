@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -23,6 +26,13 @@ from cayu.tools.catalogue import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults.redaction import SecretRedactor
 
 _STRUCTURED_OUTPUT_TEXT_FIELD = "structured output"
+# Digests of schemas that passed the meta-schema check. Every checkpoint that
+# carries a pending tool round repeats its agent's tool schemas, and checking one
+# against the 2020-12 meta-schema costs milliseconds, so readers that decode many
+# checkpoints (the inbox, pending-action reads) check each distinct schema once.
+_CHECKED_SCHEMAS: OrderedDict[bytes, None] = OrderedDict()
+_CHECKED_SCHEMAS_LIMIT = 1024
+_CHECKED_SCHEMAS_LOCK = threading.Lock()
 _INVALID_PORTABLE_JSON_MESSAGE = "Final assistant output is not valid portable JSON."
 
 # JSON Schema object members are typed protocol structure, including when they
@@ -172,10 +182,7 @@ class StructuredOutputSpec(BaseModel):
         copied = copy_durable_json_value(value, "json_schema")
         if type(copied) is not dict:
             raise ValueError("Structured output JSON Schema must be an object.")
-        try:
-            Draft202012Validator.check_schema(copied)
-        except SchemaError as exc:
-            raise ValueError(f"Invalid structured output JSON Schema: {exc.message}") from exc
+        _check_json_schema(copied)
         return copied
 
     @field_validator("name", "repair_prompt")
@@ -189,6 +196,26 @@ class StructuredOutputSpec(BaseModel):
             return None
         field_name = info.field_name or "value"
         return require_durable_clean_nonblank(value, field_name)
+
+
+def _check_json_schema(schema: dict[str, Any]) -> None:
+    """Check ``schema`` against the 2020-12 meta-schema, once per distinct schema."""
+
+    digest = sha256(
+        json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).digest()
+    with _CHECKED_SCHEMAS_LOCK:
+        if digest in _CHECKED_SCHEMAS:
+            _CHECKED_SCHEMAS.move_to_end(digest)
+            return
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise ValueError(f"Invalid structured output JSON Schema: {exc.message}") from exc
+    with _CHECKED_SCHEMAS_LOCK:
+        _CHECKED_SCHEMAS[digest] = None
+        while len(_CHECKED_SCHEMAS) > _CHECKED_SCHEMAS_LIMIT:
+            _CHECKED_SCHEMAS.popitem(last=False)
 
 
 class StructuredOutputError(BaseModel):

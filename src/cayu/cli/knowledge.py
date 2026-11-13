@@ -153,6 +153,39 @@ def add_knowledge_parser(subparsers: Any) -> None:
     add_read_target_options(show_parser)
     add_output_options(show_parser, formats=("table", "json"), default="table")
 
+    lookups = commands.add_parser(
+        "lookups",
+        help="Check the stored knowledge lookup counts.",
+        description=(
+            "Knowledge lists show each entry's lookups and last lookup time from counts "
+            "the session store keeps beside its events. `cayu knowledge lookups check` "
+            "recomputes every count from the retained knowledge.lookup events and lists "
+            "any entry whose stored count differs; it exits 1 when one does."
+        ),
+    )
+    lookup_commands = lookups.add_subparsers(dest="lookups_command", required=True)
+    check_parser = lookup_commands.add_parser(
+        "check",
+        help="Recompute lookup counts from events and compare them with the stored ones.",
+        description=(
+            "Read a local session store (--sqlite, --postgres, or the project's store) "
+            "read-only. Run it while the store isn't taking lookups, since a lookup "
+            "recorded between the two reads shows up as a difference."
+        ),
+    )
+    store_target = check_parser.add_mutually_exclusive_group()
+    store_target.add_argument("--sqlite", metavar="PATH", help="Check this SQLite database.")
+    store_target.add_argument("--postgres", metavar="DSN", help="Check this Postgres database.")
+    check_parser.set_defaults(
+        application=None,
+        server_url=None,
+        context=None,
+        authorization_env="CAYU_API_AUTHORIZATION",
+        timeout_seconds=30.0,
+        wake_timeout_seconds=180.0,
+    )
+    add_output_options(check_parser, formats=("table", "json"), default="table")
+
 
 def run_knowledge(args: argparse.Namespace) -> int:
     if args.knowledge_command in {"keep", "drop", "archive"}:
@@ -168,6 +201,8 @@ def run_knowledge(args: argparse.Namespace) -> int:
 
 
 async def _run_knowledge_command(args: argparse.Namespace, target: ReadTarget) -> int:
+    if args.knowledge_command == "lookups":
+        return await _check_lookups(args, target)
     reader = open_knowledge_reader(target)
     try:
         if args.knowledge_command == "list":
@@ -356,3 +391,72 @@ def _page_limit(value: str) -> int:
     if not 1 <= limit <= MAX_KNOWLEDGE_PAGE:
         raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_KNOWLEDGE_PAGE}")
     return limit
+
+
+async def _check_lookups(args: argparse.Namespace, target: ReadTarget) -> int:
+    from cayu.cli._task_readers import _session_store
+    from cayu.sessions.knowledge_usage import check_knowledge_lookup_totals
+
+    if target.store is None:
+        raise ValueError("Lookup counts are checked in a local store: pass --sqlite or --postgres.")
+    store = _session_store(target.store)
+    close = getattr(store, "close", None)
+    try:
+        check = await check_knowledge_lookup_totals(store)
+    finally:
+        if close is not None:
+            await close()
+
+    def total(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return {
+            "lookups": value.lookups,
+            "sessions": value.sessions,
+            "last_lookup_at": value.last_lookup_at.isoformat(),
+        }
+
+    rows = [
+        {
+            "namespace": mismatch.namespace,
+            "entry_id": mismatch.entry_id,
+            "stored": total(mismatch.stored),
+            "recomputed": total(mismatch.recomputed),
+        }
+        for mismatch in check.mismatches
+    ]
+    if args.output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "schema_version": CLI_SCHEMA_VERSION,
+                    "entries_stored": check.entries_stored,
+                    "matches": not rows,
+                    "mismatches": rows,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif rows:
+        print_table(
+            ("namespace", "entry", "stored", "recomputed"),
+            [
+                {
+                    "namespace": row["namespace"],
+                    "entry": row["entry_id"],
+                    "stored": _lookup_cell(row["stored"]),
+                    "recomputed": _lookup_cell(row["recomputed"]),
+                }
+                for row in rows
+            ],
+        )
+    else:
+        print(f"Lookup counts match the events for {check.entries_stored} entries.")
+    return 1 if rows else 0
+
+
+def _lookup_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    return f"{value['lookups']} in {value['sessions']} sessions, last {value['last_lookup_at']}"

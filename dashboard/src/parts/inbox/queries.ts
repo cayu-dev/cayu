@@ -59,23 +59,6 @@ export function useInbox(query: InboxQuery = {}, poll = true) {
         number: current.number + 1,
       })
   }
-  useEffect(() => {
-    if (
-      next &&
-      page.items.length === 0 &&
-      !page.issues?.length &&
-      current.number % 25 !== 0 &&
-      !result.isFetching &&
-      !result.error &&
-      !cycleError
-    )
-      setPosition({
-        identity,
-        cursor: next,
-        visited: [...current.visited, next],
-        number: current.number + 1,
-      })
-  }, [next, page, current, identity, result.isFetching, result.error, cycleError])
   const watching = poll && current.cursor === null && !!api.watch
   const { session_id, agent_name, q, kind } = query
   useEffect(() => {

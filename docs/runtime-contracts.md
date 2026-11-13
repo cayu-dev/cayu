@@ -21812,7 +21812,38 @@ activation receipts through three batch methods: `SessionStore.knowledge_lookup_
 Their defaults fold the snapshot or call the single-item method once per item, so
 a custom store stays correct without overriding them. The PostgreSQL stores answer
 each with a fixed number of queries, so a page costs the same number of database
-round trips at any size.
+round trips at any size, and since storage revision 152 the SQLite stores do too.
+
+Since storage revision 152, SQLite and PostgreSQL answer
+`SessionStore.knowledge_lookup_totals` from `cayu_knowledge_lookup_totals`,
+one row per namespace and entry with its lookups, the distinct sessions that made
+them and the latest lookup time, instead of folding every retained
+`knowledge.lookup` event on each read. It is folded from
+`cayu_knowledge_lookups`, one row per lookup event and distinct entry ID it
+returned. Triggers on `cayu_events` keep both in step with every insert, payload
+update and deletion, including writes from older binaries, and the migration
+copies the lookups already retained. An event counts exactly as
+`fold_knowledge_lookup_totals` counts it. PostgreSQL changes the totals only at
+commit: one statement, in key order, folds every lookup the transaction added and
+every counted lookup it deleted (queued in `cayu_knowledge_lookup_removals`, which
+is empty outside a transaction). A transaction holds no totals row lock before
+then, so concurrent writers never deadlock on the totals rows, however many
+events they write or delete. `SessionStore.stored_knowledge_lookup_totals`
+returns every stored row, and `check_knowledge_lookup_totals` (or `cayu knowledge
+lookups check --sqlite PATH` / `--postgres DSN`) compares them with a recompute
+from the events and exits 1 on any difference.
+
+Knowledge lists drive from `cayu_knowledge_entry_order` since the same revision:
+one row per entry with its namespace, current status and sort key (importance,
+missing as 0.0, and update time), written by triggers on the entry and revision
+tables, with an index on `(status, sort key)`. A status filter no longer scans
+every revision ever written in that status. `KnowledgeListQuery.count_total`
+defaults to true; with false, a store may read one entry past the page instead of
+counting every match, and reports `total_entries_known` only on the last page
+(`null` while more follow). The kept-knowledge listing and the inbox's knowledge
+pages pass false; the pending-knowledge listing, the knowledge tool and the CLI
+keep their totals. Session and knowledge stores require revision 152, so run
+`cayu storage migrate` before starting the upgraded application.
 
 ### Tool presentation declarations
 

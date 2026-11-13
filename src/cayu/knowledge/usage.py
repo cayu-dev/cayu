@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
+from typing import NamedTuple
 
 from cayu.events import Event, EventType
 
@@ -44,3 +46,11 @@ def knowledge_usage_contribution(event: Event) -> tuple[str, tuple[str, ...]] | 
     if not isinstance(namespace, str) or not isinstance(ids, list):
         return None
     return namespace, tuple(dict.fromkeys(value for value in ids if isinstance(value, str)))
+
+
+class KnowledgeLookupTotal(NamedTuple):
+    """One entry's lookups, the sessions that made them and the latest lookup time."""
+
+    lookups: int
+    sessions: int
+    last_lookup_at: datetime

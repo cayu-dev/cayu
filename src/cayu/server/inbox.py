@@ -120,6 +120,13 @@ class InboxItem(_InboxModel):
         ),
     )
     session_id: str | None = None
+    session_title: str | None = Field(
+        default=None,
+        description=(
+            "The title of the session an approval, question or recovery item waits in, "
+            "when it has one (its cayu:title metadata)."
+        ),
+    )
     agent_name: str | None = None
     created_at: datetime
     title: str

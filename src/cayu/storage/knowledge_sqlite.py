@@ -232,6 +232,7 @@ from cayu.knowledge.search import (
     copy_knowledge_query,
     decode_knowledge_list_cursor,
 )
+from cayu.storage import _knowledge_order_schema as knowledge_order_schema
 from cayu.storage import _sqlite_connection as sqlite_connection
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
@@ -241,6 +242,7 @@ from cayu.storage._knowledge_closure import (
     KnowledgeClosureQuery,
     copy_knowledge_closure_query,
 )
+from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage.targets import require_sqlite_store_allowed
 
@@ -257,7 +259,8 @@ _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
         (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
     }
 )
-_SQLITE_MIN_REQUIRED_REVISION = 78
+# Lists drive from cayu_knowledge_entry_order.
+_SQLITE_MIN_REQUIRED_REVISION = KNOWLEDGE_LOOKUP_TOTALS_REVISION
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -997,6 +1000,51 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     rows[0][0], access_scope=scope, deny_inaccessible=False
                 )
         return None if receipt is None else copy_knowledge_activation_receipt(receipt)
+
+    @runtime_knowledge_operation("read")
+    async def load_entry_activation_receipts(
+        self,
+        revisions: Sequence[tuple[str, int]],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> dict[tuple[str, int], KnowledgeActivationReceipt | None]:
+        """A page's activation receipts in one read transaction, as ``load_entry_activation_receipt``."""
+
+        scope = self._operation_access_scope(access_scope)
+        wanted: list[tuple[str, int]] = []
+        for entry_id, revision in revisions:
+            _validate_knowledge_revision(revision, "revision")
+            identity = (_knowledge_entry_id(entry_id), revision)
+            if identity not in wanted:
+                wanted.append(identity)
+        receipts: dict[tuple[str, int], KnowledgeActivationReceipt | None] = dict.fromkeys(wanted)
+        if not wanted:
+            return receipts
+        async with self._lock:
+            with sqlite_connection._transaction(self._connection, begin_immediate=False):
+                rows = self._connection.execute(
+                    """
+                    SELECT receipt.entry_id, receipt.entry_revision, receipt.operation_id
+                    FROM json_each(?) AS wanted
+                    JOIN cayu_knowledge_activation_receipts AS receipt
+                      ON receipt.entry_id = json_extract(wanted.value, '$[0]')
+                     AND receipt.entry_revision = json_extract(wanted.value, '$[1]')
+                    """,
+                    (json.dumps(wanted),),
+                ).fetchall()
+                operations: dict[tuple[str, int], str] = {}
+                for row in rows:
+                    identity = (str(row["entry_id"]), int(row["entry_revision"]))
+                    if identity in operations:
+                        raise KnowledgeActivationConflict("malformed_receipt")
+                    operations[identity] = str(row["operation_id"])
+                for identity, operation_id in operations.items():
+                    # Each receipt is parsed fresh from its row, so the caller owns it
+                    # without another validating copy.
+                    receipts[identity] = self._load_activation_receipt_unlocked(
+                        operation_id, access_scope=scope, deny_inaccessible=False
+                    )
+        return receipts
 
     @runtime_knowledge_operation("read")
     async def load_activation_receipt(
@@ -3429,20 +3477,35 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 self._connection,
                 begin_immediate=False,
             ):
-                total_entries_known = self._count_list_entries_unlocked(where_sql, params)
+                listed = _listed_entries_sql(knowledge_query)
+                total_entries_known = None
+                if knowledge_query.count_total:
+                    alone = _order_alone_count_sql(knowledge_query, scope)
+                    total_entries_known = (
+                        self._count_list_entries_unlocked(listed, where_sql, params)
+                        if alone is None
+                        else int(self._connection.execute(*alone).fetchone()[0])
+                    )
+                from_sql, listed_sql, listed_params = listed
                 rows = self._connection.execute(
                     f"""
                     SELECT e.id
-                    FROM cayu_knowledge_current_entries AS e
-                    WHERE 1 = 1
+                    FROM {from_sql}
+                    WHERE {listed_sql}
                     {where_sql}
-                    ORDER BY COALESCE(e.importance, 0.0) DESC,
-                             e.updated_at DESC,
-                             e.id ASC
+                    ORDER BY {knowledge_order_schema.ORDER_BY_SQL}
                     LIMIT ?
                     """,
-                    [*params, knowledge_query.limit],
+                    [
+                        *listed_params,
+                        *params,
+                        knowledge_query.limit + (total_entries_known is None),
+                    ],
                 ).fetchall()
+                more = len(rows) > knowledge_query.limit
+                rows = rows[: knowledge_query.limit]
+                if total_entries_known is None and not more:
+                    total_entries_known = len(rows)
                 entry_map = self._load_entries_unlocked([str(row["id"]) for row in rows])
                 entries = [
                     entry for row in rows if (entry := entry_map.get(str(row["id"]))) is not None
@@ -3458,7 +3521,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             entries=items,
             facets=facets,
             facets_truncated=facets_truncated,
-            truncated=byte_truncated or len(items) < total_entries_known or facets_truncated,
+            truncated=byte_truncated
+            or more
+            or (total_entries_known is not None and len(items) < total_entries_known)
+            or facets_truncated,
             limit=knowledge_query.limit,
             max_bytes=knowledge_query.max_bytes,
             total_entries_known=total_entries_known,
@@ -3667,15 +3733,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return hits, truncated
 
-    def _count_list_entries_unlocked(self, where_sql: str, params: list[object]) -> int:
+    def _count_list_entries_unlocked(
+        self, listed: tuple[str, str, list[object]], where_sql: str, params: list[object]
+    ) -> int:
+        from_sql, listed_sql, listed_params = listed
         row = self._connection.execute(
             f"""
             SELECT COUNT(*)
-            FROM cayu_knowledge_current_entries AS e
-            WHERE 1 = 1
+            FROM {from_sql}
+            WHERE {listed_sql}
             {where_sql}
             """,
-            params,
+            [*listed_params, *params],
         ).fetchone()
         return 0 if row is None else int(row[0])
 
@@ -5957,6 +6026,34 @@ def _knowledge_list_filter_sql(query: KnowledgeListQuery) -> tuple[str, list[obj
         """
         params.extend([importance, importance, timestamp, importance, timestamp, entry_id])
     return where_sql, params
+
+
+def _listed_cursor(query: KnowledgeListQuery) -> tuple[float, object, str] | None:
+    if query.cursor is None:
+        return None
+    importance, updated_at, entry_id = decode_knowledge_list_cursor(query.cursor)
+    return importance, sqlite_records.format_datetime(updated_at), entry_id
+
+
+def _listed_entries_sql(query: KnowledgeListQuery) -> tuple[str, str, list[object]]:
+    return knowledge_order_schema.listed_entries_sql(
+        statuses=[str(status) for status in query.statuses],
+        namespace=query.namespace,
+        cursor=_listed_cursor(query),
+        placeholder="?",
+    )
+
+
+def _order_alone_count_sql(
+    query: KnowledgeListQuery, scope: KnowledgeAccessScope
+) -> tuple[str, list[object]] | None:
+    return knowledge_order_schema.order_alone_count_sql(
+        query,
+        scope,
+        cursor=_listed_cursor(query),
+        now=sqlite_records.format_datetime(datetime.now(UTC)),
+        placeholder="?",
+    )
 
 
 def _knowledge_access_scope_filter_sql(

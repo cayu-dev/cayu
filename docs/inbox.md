@@ -79,9 +79,19 @@ requires starting without a cursor. The browser client's `listInbox` and
 
 `GET /api/inbox/counts` accepts `session_id`, `agent_name` and `q` and returns
 `counts` for all four kinds, `total_count`, `complete`, and `unavailable_reason`.
-It follows the same bounded source pages to exhaustion, independently of the
-list's page size, deduplicating exact item identities. It never returns a capped
-subtotal. With an inbox access rule, `counts` and `total_count` are null,
+Without `q`, a store that keeps stored counts answers from them: SQLite and
+PostgreSQL count approvals, questions and recovery items from the pending-action
+flags each checkpoint write stores (`SessionStore.count_pending_actions`), and
+pending proposals with one count over the knowledge store. That is one indexed
+read whatever the history, but it doesn't rebuild each item, so a waiting
+session whose state doesn't decode, or a recovery round whose every call already
+finished, counts once where the list reports an issue or nothing until the
+session moves on. With `q`, or a store without stored counts, it follows the
+same bounded source pages to exhaustion, independently of the list's page size,
+deduplicating exact item identities. It never returns a capped subtotal. The
+response carries a weak `ETag`; send it back as `If-None-Match` and an
+unchanged count answers `304` with no body, so the badge poll every page makes
+costs no body while nothing changes. With an inbox access rule, `counts` and `total_count` are null,
 `complete` is false and `unavailable_reason` is `access_limited`; no hidden
 store totals are exposed. Source issues or conflicting representations of an
 item similarly return null counts with `source_incomplete`. Read failures and

@@ -22,8 +22,14 @@ from cayu.storage._completion_verifier_dispatch_schema import (
 )
 from cayu.storage._eval_trial_slot_schema import SQLITE_EVAL_RUN_TRIAL_SLOT_DDL
 from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
+from cayu.storage._knowledge_lookup_schema import (
+    KNOWLEDGE_LOOKUP_TOTALS_REVISION,
+    SQLITE_KNOWLEDGE_LOOKUP_DDL,
+)
+from cayu.storage._knowledge_order_schema import SQLITE_KNOWLEDGE_ORDER_DDL
 from cayu.storage._model_policy_schema import SQLITE_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import SQLITE_PARTICIPANT_BINDINGS_DDL
+from cayu.storage._pending_action_counts_sql import SQLITE_PENDING_ACTION_COUNTS_INDEX_DDL
 from cayu.storage._product_operation_schema import SQLITE_PRODUCT_OPERATION_DDL
 from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
@@ -788,6 +794,11 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     148: "",
     # Usage rollups and tool totals read a narrow trigger-maintained event copy.
     149: SQLITE_USAGE_EVENTS_DDL,
+    # Knowledge lookup counts and list order, and inbox counts, read
+    # trigger-maintained tables and a covering index.
+    KNOWLEDGE_LOOKUP_TOTALS_REVISION: SQLITE_KNOWLEDGE_LOOKUP_DDL
+    + SQLITE_KNOWLEDGE_ORDER_DDL
+    + SQLITE_PENDING_ACTION_COUNTS_INDEX_DDL,
     # When each alias key was first used. A table of its own, so binaries from
     # revision 146 on, which check the alias key table's exact shape, still open it.
     150: """CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_key_first_uses (

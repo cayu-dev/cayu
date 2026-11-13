@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 
 # Prefix for every Cayu-owned table, so Cayu state never collides with an app's own
@@ -640,6 +641,17 @@ REVISIONS: tuple[Revision, ...] = (
     # included. The migration counts and copies existing tasks. Task stores
     # require it.
     Revision(revision=TASK_INDEX_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # Knowledge lookup counts read cayu_knowledge_lookup_totals, folded from
+    # cayu_knowledge_lookups, a narrow copy of each lookup's returned entries
+    # (PostgreSQL also queues deleted ones in cayu_knowledge_lookup_removals until
+    # commit), and knowledge lists drive from cayu_knowledge_entry_order. Triggers on the
+    # event and knowledge tables maintain them for every writer, older binaries
+    # included, and the migration copies what is retained. SQLite inbox counts
+    # read a covering index over checkpoint pending-action flags. Session and
+    # knowledge stores require it.
+    Revision(
+        revision=KNOWLEDGE_LOOKUP_TOTALS_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146
+    ),
 )
 
 #: The revision an empty database is initialized to.

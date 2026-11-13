@@ -164,7 +164,11 @@ from cayu.sessions.messaging import (
     SessionMessageQuery,
     SessionMessageSource,
 )
-from cayu.sessions.pending_action_contracts import PendingActionListResult, PendingActionQuery
+from cayu.sessions.pending_action_contracts import (
+    PendingActionKind,
+    PendingActionListResult,
+    PendingActionQuery,
+)
 from cayu.sessions.queries import SessionAggregateFilter, SessionListResult, SessionQuery
 from cayu.sessions.records import (
     CheckpointTransform,
@@ -219,6 +223,7 @@ from cayu.tools.grants import (
 if TYPE_CHECKING:
     from cayu.collaboration._contracts import ExactLookup
     from cayu.collaboration.participants import ParticipantRef as _ParticipantRef
+    from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._model_failover_stage import ModelFailoverStageAdmission
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
@@ -4944,6 +4949,17 @@ class SessionStore(ABC):
 
         return await fold_knowledge_lookup_totals(self, identities)
 
+    async def stored_knowledge_lookup_totals(
+        self,
+    ) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+        """Every ``(namespace, entry_id)`` row of the store's stored lookup totals.
+
+        Optional native capability, for ``check_knowledge_lookup_totals`` and
+        ``cayu knowledge lookups check``. A store that folds events on every read
+        keeps no totals to check.
+        """
+        raise NotImplementedError("This SessionStore keeps no stored lookup totals.")
+
     async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
         """Tally retained tool calls, failures and approval decisions by raw tool name.
 
@@ -5441,6 +5457,19 @@ class SessionStore(ABC):
         """
 
         return await page_reads.count_child_runs_one_by_one(self, parents)
+
+    async def count_pending_actions(
+        self, query: PendingActionQuery | None = None
+    ) -> dict[PendingActionKind, int]:
+        """Count approvals, questions and recovery items waiting on a person.
+
+        Optional native capability, for inbox badges: a native store counts from
+        stored state without rebuilding each action, so its count can include an
+        action ``query_pending_actions`` would leave out or report as an issue.
+        ``query.q``, ``kind``, ``cursor`` and ``limit`` don't apply. Callers that
+        need exact agreement with the list page ``query_pending_actions``.
+        """
+        raise NotImplementedError("This SessionStore has no native pending-action count.")
 
     async def query_pending_actions_for_sessions(
         self,

@@ -232,6 +232,7 @@ def register_kept_knowledge(
                 cursor=position,
                 limit=limit,
                 max_bytes=max_bytes,
+                count_total=False,
             )
         except ValidationError as exc:
             fields = sorted({str(error["loc"][0]) for error in exc.errors() if error.get("loc")})

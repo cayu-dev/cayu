@@ -1,4 +1,4 @@
-"""Exact inbox counts from the same bounded pages that readers can list."""
+"""Inbox counts: from stored counts when the stores keep them, else from list pages."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from hashlib import sha256
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 
 from cayu.server.inbox import InboxCounts, InboxItemKind, InboxPage
 
@@ -50,3 +50,20 @@ async def count_inbox(read_page: Callable[[str | None], Awaitable[InboxPage]]) -
         positions.add(cursor)
         # In-memory adapters may complete awaits synchronously; yield between pages.
         await asyncio.sleep(0)
+
+
+def conditional_counts(
+    counts: InboxCounts, response: Response, if_none_match: str | None
+) -> InboxCounts | Response:
+    """Tag the counts with a weak ETag, answering 304 when the caller already has them.
+
+    The badge is polled from every page, so an unchanged count costs no body.
+    """
+
+    body = counts.model_dump_json().encode("utf-8")
+    tag = f'W/"{sha256(body).hexdigest()[:32]}"'
+    response.headers["ETag"] = tag
+    offered = {value.strip() for value in (if_none_match or "").split(",")}
+    if tag in offered or "*" in offered:
+        return Response(status_code=304, headers=dict(response.headers))
+    return counts

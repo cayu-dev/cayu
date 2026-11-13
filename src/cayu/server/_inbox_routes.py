@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
-from fastapi import APIRouter, HTTPException, Path, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Path, Query, Response
 from pydantic import ValidationError
 
 from cayu._application_provider_registry import ProviderNotRegistered
@@ -66,8 +66,9 @@ from cayu.runtime.human_attention import (
     manual_recovery_settlement,
     observe_human_attention,
 )
+from cayu.server._artifact_query import read_titles
 from cayu.server._inbox_access import PENDING_KINDS, InboxAccessGate
-from cayu.server._inbox_counts import count_inbox
+from cayu.server._inbox_counts import conditional_counts, count_inbox
 from cayu.server._inbox_cursor import InboxCursorSeal
 from cayu.server._kept_knowledge import KNOWLEDGE_REVIEWER_VERSION
 from cayu.server._knowledge_preview import INBOX_DETAIL_CHARS, knowledge_excerpt
@@ -158,6 +159,12 @@ _KNOWLEDGE_PAGE_MAX_BYTES = 262_144
 _KNOWLEDGE_SCAN_PAGES = 10
 _NO_STORE = {"Cache-Control": "private, no-store"}
 _NOT_FOUND = "Inbox item not found."
+_ZERO_COUNTS: dict[InboxItemKind, int] = {
+    "approval": 0,
+    "question": 0,
+    "recovery": 0,
+    "knowledge": 0,
+}
 
 ItemIdPath = Annotated[str, Path(pattern=_ITEM_ID_PATTERN)]
 
@@ -605,7 +612,7 @@ class InboxOperations:
     counts: Callable[..., Awaitable[InboxCounts]]
     state: Callable[[str, AuthContext | None], Awaitable[InboxItemState]]
     settle: Callable[[str, InboxSettleRequest, AuthContext | None], Awaitable[InboxSettleResponse]]
-    pending_item: Callable[[InboxItemKind, PendingActionRecord], InboxItem]
+    pending_item: Callable[..., InboxItem]
 
 
 def inbox_operations(
@@ -633,7 +640,20 @@ def inbox_operations(
         _serialize_session_cursor,
     )
 
-    def pending_item(kind: InboxItemKind, action: PendingActionRecord) -> InboxItem:
+    async def session_titles(actions: list[PendingActionRecord]) -> dict[str, str | None]:
+        """The page's session titles in one store read; none when it can't say."""
+
+        ids = tuple(dict.fromkeys(action.session.id for action in actions))
+        try:
+            return await read_titles(session_store, ids, cayu_app.redact_json)
+        except HTTPException:
+            return {}
+
+    def pending_item(
+        kind: InboxItemKind,
+        action: PendingActionRecord,
+        titles: dict[str, str | None] | None = None,
+    ) -> InboxItem:
         assert action.attention_id is not None
         projected = _serialize_pending_action(cayu_app, action)
         locator = _SessionLocator(
@@ -644,6 +664,7 @@ def inbox_operations(
             kind=kind,
             attention_id=action.attention_id,
             session_id=locator.public_session_id,
+            session_title=(titles or {}).get(action.session.id),
             agent_name=projected["session"]["agent_name"],
             created_at=action.event.event.timestamp,
             title=projected["title"],
@@ -857,7 +878,8 @@ def inbox_operations(
 
     async def session_item_state(item: _SessionItem) -> InboxItemState:
         if item.pending is not None:
-            return _pending_state(pending_item(item.kind, item.pending))
+            titles = await session_titles([item.pending])
+            return _pending_state(pending_item(item.kind, item.pending, titles))
         public_session_id = cayu_app.project_session_id_for_exposure(item.session.id)
         locator = _SessionLocator(
             item.kind,
@@ -1454,8 +1476,9 @@ def inbox_operations(
                 permitted = await inbox_gate.scan_pending(
                     auth_context, query.model_copy(update={"cursor": after, "limit": limit})
                 )
+                titles = await session_titles(permitted.actions)
                 items = [
-                    pending_item(kind, action)
+                    pending_item(kind, action, titles)
                     for action in permitted.actions
                     if (kind := _listed_kind(action)) is not None
                 ]
@@ -1487,8 +1510,9 @@ def inbox_operations(
             raise HTTPException(status_code=409, detail=exc.safe_evidence()) from exc
         except PendingActionResultTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
+        titles = await session_titles(page.actions)
         items = [
-            pending_item(kind, action)
+            pending_item(kind, action, titles)
             for action in page.actions
             if (kind := _listed_kind(action)) is not None
         ]
@@ -1561,7 +1585,12 @@ def inbox_operations(
         items: list[InboxItem] = []
         for _page in range(_KNOWLEDGE_SCAN_PAGES):
             listed = await workflow.list_pending(
-                cursor=position, limit=_PENDING_SCAN_LIMIT, max_bytes=_KNOWLEDGE_PAGE_MAX_BYTES
+                cursor=position,
+                # Read only what the page still needs; hidden or unmatched
+                # proposals are made up from the next store page.
+                limit=min(_PENDING_SCAN_LIMIT, limit - len(items)),
+                max_bytes=_KNOWLEDGE_PAGE_MAX_BYTES,
+                count_total=False,
             )
             more = listed.truncated and (
                 listed.total_entries_known is None
@@ -1698,6 +1727,9 @@ def inbox_operations(
         q = _clean_optional_query_value(q, "q")
         if inbox_gate.applies(auth_context):
             return InboxCounts.unavailable("access_limited")
+        stored = None if q is not None else await stored_counts(session_id, agent_name)
+        if stored is not None:
+            return stored
 
         async def read_page(cursor: str | None) -> InboxPage:
             return await inbox_page(
@@ -1705,6 +1737,36 @@ def inbox_operations(
             )
 
         return await count_inbox(read_page)
+
+    async def stored_counts(session_id: str | None, agent_name: str | None) -> InboxCounts | None:
+        """Counts from stored pending-action flags and the pending-knowledge count.
+
+        ``None`` when a store can't count natively; the caller then scans pages.
+        """
+
+        private_session = session_id
+        if session_id is not None:
+            try:
+                private_session = await cayu_app._resolve_public_session_id(session_id)
+            except ValueError:
+                return InboxCounts(counts=dict(_ZERO_COUNTS), total_count=0, complete=True)
+        try:
+            pending = await session_store.count_pending_actions(
+                PendingActionQuery(session_id=private_session, agent_name=agent_name)
+            )
+        except NotImplementedError:
+            return None
+        counts: dict[InboxItemKind, int] = dict(_ZERO_COUNTS)
+        for pending_kind, listed in PENDING_KINDS.items():
+            counts[listed] += pending.get(pending_kind, 0)
+        if knowledge_review_workflow is not None and session_id is None and agent_name is None:
+            listed_knowledge = await knowledge_review_workflow().list_pending(
+                limit=1, max_bytes=_KNOWLEDGE_PAGE_MAX_BYTES
+            )
+            if listed_knowledge.total_entries_known is None:
+                return None
+            counts["knowledge"] = listed_knowledge.total_entries_known
+        return InboxCounts(counts=counts, total_count=sum(counts.values()), complete=True)
 
     async def item_state(item_id: str, auth_context: AuthContext | None) -> InboxItemState:
         state, _source = await visible_item(item_id, auth_context)
@@ -1852,8 +1914,11 @@ def register_inbox_routes(
         },
         description=(
             "Count every pending inbox kind independently of list page size. "
-            "Limited callers receive unavailable counts, never hidden totals. "
-            "Reads bounded source pages to exhaustion; source issues yield unavailable counts."
+            "Limited callers receive unavailable counts, never hidden totals. Without `q`, "
+            "counts come from the stores' stored pending-action flags and pending-knowledge "
+            "count when they keep them; otherwise, and with `q`, this reads bounded source "
+            "pages to exhaustion, and source issues yield unavailable counts. The response "
+            "carries a weak ETag; send it back as If-None-Match to get 304 when nothing changed."
         ),
     )
     async def inbox_counts(
@@ -1861,10 +1926,12 @@ def register_inbox_routes(
         session_id: Annotated[str | None, Query(max_length=4096)] = None,
         agent_name: Annotated[str | None, Query(max_length=4096)] = None,
         q: Annotated[str | None, Query(max_length=4096)] = None,
+        if_none_match: Annotated[str | None, Header(max_length=1024)] = None,
         auth_context: AuthContext | None = inbox_auth_context,
-    ) -> InboxCounts:
+    ) -> Response | InboxCounts:
         response.headers.update(_NO_STORE)
-        return await operations.counts(auth_context, session_id, agent_name, q)
+        counts = await operations.counts(auth_context, session_id, agent_name, q)
+        return conditional_counts(counts, response, if_none_match)
 
     @router.get(
         "/inbox/{item_id}",

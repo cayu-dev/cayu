@@ -422,7 +422,7 @@ export function InboxCard({
             showEvidence={showKnowledgeEvidence}
           />
         )}
-        {item.arguments_unavailable_reason === "no_review_policy" && (
+        {item.kind === "approval" && item.arguments_unavailable_reason === "no_review_policy" && (
           <p className="text-xs text-muted-foreground">
             This agent shows no arguments for approvals. To show selected ones, the agent can
             configure a human review policy such as{" "}

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from cayu._validation import copy_json_value, copy_label_map, require_finite
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
@@ -276,6 +276,11 @@ class KnowledgeListQuery(BaseModel):
     cursor: str | None = None
     limit: int = DEFAULT_KNOWLEDGE_LIMIT
     max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+    #: Count every matching entry for ``total_entries_known``. Without it a store
+    #: may read one row past the page instead, and reports the total only on the
+    #: last page (``None`` while more entries follow), so a polled page stays
+    #: bounded by its size rather than by the matching entries.
+    count_total: StrictBool = True
 
     @field_validator("cursor")
     @classmethod
@@ -720,6 +725,7 @@ def copy_knowledge_list_query(query: KnowledgeListQuery) -> KnowledgeListQuery:
         cursor=query.cursor,
         limit=query.limit,
         max_bytes=query.max_bytes,
+        count_total=query.count_total,
     )
 
 

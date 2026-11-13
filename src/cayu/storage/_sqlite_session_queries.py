@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -104,6 +104,7 @@ from cayu.storage import _tool_usage_sql as tool_usage_sql
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 if TYPE_CHECKING:
+    from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
@@ -840,6 +841,88 @@ async def fold_event_snapshot(
 
 
 @runtime_session_query
+async def knowledge_lookup_totals(
+    run_read: SQLiteOperationRunner, identities: Collection[tuple[str, str]]
+) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+    """Read lookup counts for the requested pairs from ``cayu_knowledge_lookup_totals``.
+
+    Matches ``fold_knowledge_lookup_totals``; the totals are trigger-maintained.
+    The sequence is the snapshot's newest event of any type.
+    """
+
+    wanted = list(dict.fromkeys(identities))
+    newest_plan = session_store_sql.build_event_query_sql(EventQuery(limit=1), dialect=SQL_DIALECT)
+
+    def read(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[tuple[str, str], tuple[int, datetime | None]], int]:
+        totals: dict[tuple[str, str], tuple[int, datetime | None]] = dict.fromkeys(
+            wanted, (0, None)
+        )
+        connection.execute("BEGIN")
+        try:
+            newest = connection.execute(
+                f"""
+                SELECT cayu_events.sequence
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                {newest_plan.where_sql}
+                ORDER BY cayu_events.sequence DESC
+                LIMIT 1
+                """,
+                newest_plan.params,
+            ).fetchone()
+            rows = (
+                connection.execute(
+                    """
+                    SELECT totals.namespace, totals.entry_id, totals.lookups,
+                           totals.last_lookup_at
+                    FROM json_each(?) AS wanted
+                    JOIN cayu_knowledge_lookup_totals AS totals
+                      ON totals.namespace = json_extract(wanted.value, '$[0]')
+                     AND totals.entry_id = json_extract(wanted.value, '$[1]')
+                    """,
+                    (json.dumps(wanted),),
+                ).fetchall()
+                if wanted
+                else []
+            )
+        finally:
+            connection.rollback()
+        for row in rows:
+            totals[(str(row["namespace"]), str(row["entry_id"]))] = (
+                int(row["lookups"]),
+                sqlite_records.parse_datetime(row["last_lookup_at"]),
+            )
+        return totals, 0 if newest is None else int(newest[0])
+
+    return await run_read(read)
+
+
+async def stored_knowledge_lookup_totals(
+    run_read: SQLiteOperationRunner,
+) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+    """Every row of ``cayu_knowledge_lookup_totals``, for the recompute check."""
+
+    from cayu.knowledge.usage import KnowledgeLookupTotal
+
+    def read(connection: sqlite3.Connection) -> dict[tuple[str, str], KnowledgeLookupTotal]:
+        rows = connection.execute(
+            "SELECT namespace, entry_id, lookups, sessions, last_lookup_at "
+            "FROM cayu_knowledge_lookup_totals"
+        ).fetchall()
+        return {
+            (str(row["namespace"]), str(row["entry_id"])): KnowledgeLookupTotal(
+                int(row["lookups"]),
+                int(row["sessions"]),
+                sqlite_records.parse_datetime(row["last_lookup_at"]),
+            )
+            for row in rows
+        }
+
+    return await run_read(read)
+
+
 async def tool_usage_totals(
     run_read: SQLiteOperationRunner,
 ) -> tuple[dict[str, ToolUsageTally], int]:

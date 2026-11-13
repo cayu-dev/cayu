@@ -18,8 +18,10 @@ from cayu.knowledge._activation_rules import (
     _validate_review_approval_scope,
 )
 from cayu.knowledge.access import runtime_knowledge_operation
+from cayu.storage import _knowledge_order_schema as knowledge_order_schema
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
+from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 
 if TYPE_CHECKING:
     from cayu.knowledge.maintenance_governance import (
@@ -465,7 +467,8 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
 
     resource_knowledge_access_version = 1
 
-    _min_required_revision = 78
+    # Lists drive from cayu_knowledge_entry_order.
+    _min_required_revision = KNOWLEDGE_LOOKUP_TOTALS_REVISION
     # Inspection (`cayu knowledge`) reads through a store whose every transaction is read-only.
     _supports_read_only = True
 
@@ -4070,24 +4073,46 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
-            total_entries_known = await self._count_list_entries(cur, where_sql, params)
+            listed = _postgres_listed_entries_sql(query)
+            total_entries_known = None
+            if query.count_total:
+                alone = knowledge_order_schema.order_alone_count_sql(
+                    query,
+                    scope,
+                    cursor=None
+                    if query.cursor is None
+                    else decode_knowledge_list_cursor(query.cursor),
+                    now=datetime.now(UTC),
+                    placeholder="%s",
+                )
+                if alone is None:
+                    total_entries_known = await self._count_list_entries(
+                        cur, listed, where_sql, params
+                    )
+                else:
+                    await cur.execute(cast("LiteralString", alone[0]), alone[1])
+                    row = await cur.fetchone()
+                    total_entries_known = 0 if row is None else int(row[0])
+            from_sql, listed_sql, listed_params = listed
             await cur.execute(
                 cast(
                     "LiteralString",
                     f"""
                     SELECT e.id
-                    FROM cayu_knowledge_current_entries AS e
-                    WHERE TRUE
+                    FROM {from_sql}
+                    WHERE {listed_sql}
                     {where_sql}
-                    ORDER BY COALESCE(e.importance, 0.0) DESC,
-                             e.updated_at DESC,
-                             e.id ASC
+                    ORDER BY {knowledge_order_schema.ORDER_BY_SQL}
                     LIMIT %s
                     """,
                 ),
-                [*params, query.limit],
+                [*listed_params, *params, query.limit + (total_entries_known is None)],
             )
             rows = await cur.fetchall()
+            more = len(rows) > query.limit
+            rows = rows[: query.limit]
+            if total_entries_known is None and not more:
+                total_entries_known = len(rows)
             entry_map = await self._load_entries(cur, [str(row[0]) for row in rows])
             entries = [entry for row in rows if (entry := entry_map.get(str(row[0]))) is not None]
             facets, facets_truncated = await self._list_facets(cur, query, where_sql, params)
@@ -4097,7 +4122,10 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
             entries=items,
             facets=facets,
             facets_truncated=facets_truncated,
-            truncated=byte_truncated or len(items) < total_entries_known or facets_truncated,
+            truncated=byte_truncated
+            or more
+            or (total_entries_known is not None and len(items) < total_entries_known)
+            or facets_truncated,
             limit=query.limit,
             max_bytes=query.max_bytes,
             total_entries_known=total_entries_known,
@@ -6579,17 +6607,19 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
     async def _count_list_entries(
         self,
         cur: Any,
+        listed: tuple[str, str, list[object]],
         where_sql: str,
         params: list[object],
     ) -> int:
+        from_sql, listed_sql, listed_params = listed
         await cur.execute(
             f"""
             SELECT COUNT(*)
-            FROM cayu_knowledge_current_entries AS e
-            WHERE TRUE
+            FROM {from_sql}
+            WHERE {listed_sql}
             {where_sql}
             """,
-            params,
+            [*listed_params, *params],
         )
         row = await cur.fetchone()
         return 0 if row is None else int(row[0])
@@ -6988,6 +7018,15 @@ def _postgres_knowledge_list_filter_sql(
         """
         params.extend([importance, importance, updated_at, importance, updated_at, entry_id])
     return where_sql, params
+
+
+def _postgres_listed_entries_sql(query: KnowledgeListQuery) -> tuple[str, str, list[object]]:
+    return knowledge_order_schema.listed_entries_sql(
+        statuses=[str(status) for status in query.statuses],
+        namespace=query.namespace,
+        cursor=None if query.cursor is None else decode_knowledge_list_cursor(query.cursor),
+        placeholder="%s",
+    )
 
 
 def _postgres_knowledge_access_scope_filter_sql(

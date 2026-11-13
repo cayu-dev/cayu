@@ -31,6 +31,11 @@ from cayu.storage._completion_verifier_dispatch_schema import (
 )
 from cayu.storage._eval_trial_slot_schema import POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL
 from cayu.storage._external_wait_schema import POSTGRES_EXTERNAL_WAIT_DDL
+from cayu.storage._knowledge_lookup_schema import (
+    KNOWLEDGE_LOOKUP_TOTALS_REVISION,
+    POSTGRES_KNOWLEDGE_LOOKUP_DDL,
+)
+from cayu.storage._knowledge_order_schema import POSTGRES_KNOWLEDGE_ORDER_DDL
 from cayu.storage._model_policy_schema import POSTGRES_MODEL_POLICY_DDL
 from cayu.storage._participant_bindings_schema import POSTGRES_PARTICIPANT_BINDINGS_DDL
 from cayu.storage._product_operation_schema import POSTGRES_PRODUCT_OPERATION_DDL
@@ -1004,6 +1009,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     148: POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL,
     # Usage rollups and tool totals read a narrow trigger-maintained event copy.
     149: POSTGRES_USAGE_EVENTS_DDL,
+    # Knowledge lookup counts and list order read trigger-maintained tables.
+    KNOWLEDGE_LOOKUP_TOTALS_REVISION: POSTGRES_KNOWLEDGE_LOOKUP_DDL + POSTGRES_KNOWLEDGE_ORDER_DDL,
     # When each alias key was first used. A table of its own, so binaries from
     # revision 146 on, which check the alias key table's exact shape, still open it.
     150: (

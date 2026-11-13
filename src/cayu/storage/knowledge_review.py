@@ -239,8 +239,13 @@ class KnowledgeReviewWorkflow:
         cursor: str | None = None,
         limit: int | None = None,
         max_bytes: int | None = None,
+        count_total: bool = True,
     ) -> KnowledgeListResult:
-        """List pending entries within the workflow scope."""
+        """List pending entries within the workflow scope.
+
+        ``count_total=False`` reads one entry past the page instead of counting
+        every pending entry (``KnowledgeListQuery.count_total``).
+        """
 
         query = KnowledgeListQuery(
             namespace=self._scoped_namespace(namespace),
@@ -255,6 +260,7 @@ class KnowledgeReviewWorkflow:
             cursor=cursor,
             limit=self.default_limit if limit is None else limit,
             max_bytes=self.default_max_bytes if max_bytes is None else max_bytes,
+            count_total=count_total,
         )
         return await self.store.list_entries(query, access_scope=self.access_scope)
 

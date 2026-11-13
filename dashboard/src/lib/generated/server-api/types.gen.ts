@@ -13526,6 +13526,12 @@ export type InboxItem = {
      */
     session_id?: string | null;
     /**
+     * Session Title
+     *
+     * The title of the session an approval, question or recovery item waits in, when it has one (its cayu:title metadata).
+     */
+    session_title?: string | null;
+    /**
      * Title
      */
     title: string;
@@ -29728,6 +29734,12 @@ export type ListInboxApiInboxGetResponse = ListInboxApiInboxGetResponses[keyof L
 
 export type InboxCountsApiInboxCountsGetData = {
     body?: never;
+    headers?: {
+        /**
+         * If-None-Match
+         */
+        'if-none-match'?: string | null;
+    };
     path?: never;
     query?: {
         /**

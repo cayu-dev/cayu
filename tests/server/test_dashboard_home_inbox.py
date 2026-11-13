@@ -472,7 +472,7 @@ def test_inbox_member_keeps_and_drops_knowledge_with_source_fields():
 
 
 @pytest.mark.parametrize("stale", [False, True])
-def test_inbox_follows_empty_sealed_pages_and_never_shows_hidden_counts(stale):
+def test_inbox_continues_past_empty_sealed_pages_and_never_shows_hidden_counts(stale):
     async def scenario():
         async with _home_browser(role="member", limited=True) as (page, base, _requests, responses):
             rejected = False
@@ -493,7 +493,15 @@ def test_inbox_follows_empty_sealed_pages_and_never_shows_hidden_counts(stale):
 
             await page.route("**/api/inbox?*", expire_cursor)
             await page.goto(base + "/cayu/inbox?kind=approval", wait_until="networkidle")
-            await expect(page.get_by_role("button", name="Approve", exact=True)).to_be_visible()
+            # An empty page of hidden items waits for the person to continue; nothing
+            # advances on its own.
+            approve = page.get_by_role("button", name="Approve", exact=True)
+            for _ in range(25):
+                if await approve.count():
+                    break
+                await page.get_by_role("button", name="Continue scanning", exact=True).click()
+                await page.wait_for_load_state("networkidle")
+            await expect(approve).to_be_visible()
             await expect(
                 page.get_by_text("Counts unavailable: your access is limited.", exact=True)
             ).to_be_visible()
