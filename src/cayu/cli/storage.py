@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 from collections.abc import Iterator
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from glob import escape as glob_escape
 from pathlib import Path
@@ -29,7 +30,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from cayu._filesystem_lock import cooperative_path_lock
 from cayu._version import package_version
 from cayu.build_provenance import current_runtime_build_provenance
-from cayu.cli._output import add_output_options
+from cayu.cli._output import add_output_options, terminal_safe
 from cayu.cli.store_targets import (
     SessionStoreBackend,
     SessionStoreTargetError,
@@ -48,6 +49,10 @@ _SUBCOMMANDS = (
     ("migrate", "Apply pending forward migrations under the backend lock."),
     ("export", "Export sessions (or tasks) as JSON or JSONL for backup/replay."),
     ("prune", "Dry-run or apply storage retention to sessions, evals, artifacts, workspaces."),
+    (
+        "verify-events",
+        "Rerun full validation over stored events and report rows edited outside Cayu.",
+    ),
 )
 # `reset-aliases` takes its own options; see _add_reset_aliases_parser.
 
@@ -127,6 +132,21 @@ def add_storage_parser(subparsers: Any) -> None:
             add_output_options(sub, formats=("json", "jsonl"))
         elif name == "prune":
             _add_prune_arguments(sub)
+            add_output_options(sub)
+        elif name == "verify-events":
+            sub.add_argument(
+                "--after-sequence",
+                type=int,
+                default=0,
+                metavar="N",
+                help="Start after this event sequence (default: 0, the first event).",
+            )
+            sub.add_argument(
+                "--max-events",
+                type=_positive_int,
+                metavar="N",
+                help="Check at most N events, then report where to continue (default: all).",
+            )
             add_output_options(sub)
         else:
             if name == "migrate":
@@ -255,6 +275,8 @@ def run_storage(args: argparse.Namespace) -> int:
             return _export(args)
         if args.storage_command == "prune":
             return _prune(args)
+        if args.storage_command == "verify-events":
+            return _verify_events(args)
     except (schema.SchemaError, OSError, RuntimeError, ValueError) as exc:
         message = str(exc)
         if args.postgres is not None:
@@ -2410,6 +2432,75 @@ def _export(args: argparse.Namespace) -> int:
         return 1
 
 
+#: ``cayu storage verify-events`` exit code when any stored event fails validation.
+VERIFY_EVENTS_EXIT_INVALID = 5
+
+
+def _verify_events(args: argparse.Namespace) -> int:
+    """Validate stored events page by page; exit 5 when any row fails."""
+
+    from cayu.storage._stored_event_verification import VERIFY_EVENTS_PAGE_LIMIT
+
+    if args.after_sequence < 0:
+        raise ValueError("--after-sequence must be a non-negative integer.")
+
+    async def run() -> dict[str, Any]:
+        store = _session_store(args, read_only=True)
+        checked = 0
+        failures: list[dict[str, Any]] = []
+        after = args.after_sequence
+        complete = False
+        try:
+            await _ensure_store_ready_for_export(store)
+            while not complete:
+                remaining = None if args.max_events is None else args.max_events - checked
+                if remaining is not None and remaining <= 0:
+                    break
+                page = await store.verify_stored_events(
+                    after_sequence=after,
+                    limit=min(VERIFY_EVENTS_PAGE_LIMIT, remaining or VERIFY_EVENTS_PAGE_LIMIT),
+                )
+                checked += page.checked
+                complete = page.complete
+                failures.extend(asdict(failure) for failure in page.failures)
+                if page.through_sequence is not None:
+                    after = page.through_sequence
+                if args.output_format == "table" and checked % 50_000 < page.checked:
+                    print(f"checked {checked} event(s) through sequence {after}", file=sys.stderr)
+        finally:
+            await store.close()
+        return {
+            "schema_version": "1",
+            "checked": checked,
+            "through_sequence": after,
+            "complete": complete,
+            "invalid": len(failures),
+            "failures": failures,
+        }
+
+    result = asyncio.run(run()) if args.postgres is None else _run_postgres(run, args)
+    if result is None:
+        return 1
+    with _output_stream(args.output) as stream:
+        if args.output_format == "json":
+            stream.write(json.dumps(result, sort_keys=True) + "\n")
+        else:
+            state = "all events" if result["complete"] else "up to sequence"
+            stream.write(
+                f"checked {result['checked']} event(s), {state} {result['through_sequence']}; "
+                f"{result['invalid']} failed validation\n"
+            )
+            for failure in result["failures"]:
+                described = " ".join(
+                    terminal_safe(str(failure[key]))
+                    for key in ("event_type", "session_id", "error_type", "error")
+                )
+                stream.write(f"  sequence {failure['sequence']}: {described}\n")
+            if not result["complete"]:
+                stream.write(f"continue with --after-sequence {result['through_sequence']}\n")
+    return VERIFY_EVENTS_EXIT_INVALID if result["failures"] else 0
+
+
 def _prune_policy(args: argparse.Namespace) -> Any:
     from cayu.storage.retention import (
         ArtifactRetentionPolicy,
@@ -2725,8 +2816,9 @@ async def _ensure_store_ready_for_export(store: Any) -> None:
         await ensure_schema()
 
 
-def _session_store(args: argparse.Namespace) -> Any:
+def _session_store(args: argparse.Namespace, *, read_only: bool = False) -> Any:
     # Export reads; validate (don't create) so it never mutates the database.
+    # ``read_only`` also skips alias-key reconciliation, for pure checks.
     if args.sqlite is not None:
         from cayu.storage import SQLiteSessionStore
 
@@ -2734,6 +2826,7 @@ def _session_store(args: argparse.Namespace) -> Any:
             args.sqlite,
             schema_mode=schema.SchemaMode.VALIDATE,
             public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+            read_only=read_only,
         )
     from cayu.storage import PostgresSessionStore
 
@@ -2741,6 +2834,7 @@ def _session_store(args: argparse.Namespace) -> Any:
         args.postgres,
         schema_mode=schema.SchemaMode.VALIDATE,
         public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        read_only=read_only,
     )
 
 

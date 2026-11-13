@@ -93,6 +93,7 @@ from cayu.storage import _postgres_locked_reads as locked_reads
 from cayu.storage import _postgres_model_stage as model_stage_ops
 from cayu.storage import _postgres_public_authority as public_authority_ops
 from cayu.storage import _postgres_session_queries as session_queries
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage import _postgres_transcript_content as transcript_content
@@ -175,7 +176,7 @@ async def load_material(
             (receipt.session_id, list(requested_event_ids)),
         )
         events_by_id = {
-            row[0]: Event(**pg_support._json_obj(row[1])) for row in await cur.fetchall()
+            row[0]: pg_stored_events.event_from_document(row[1]) for row in await cur.fetchall()
         }
     return ReceiptMaterial(
         transcript=transcript,
@@ -420,7 +421,7 @@ async def publish_runtime(
                         "WHERE session_id = %s AND event_id = ANY(%s) FOR SHARE",
                         (session_id, list(referenced_event_ids)),
                         lambda rows: {
-                            row[0]: Event(**pg_support._json_obj(row[1])) for row in rows
+                            row[0]: pg_stored_events.event_from_document(row[1]) for row in rows
                         },
                     )
                 batch["checkpoint"] = locked_reads.checkpoint_for_transform(session_id)
@@ -585,7 +586,9 @@ async def publish_runtime(
                         raise ValueError(
                             "Tool-round lifecycle evidence exceeds the publication limit."
                         )
-                    durable_tool_events = [Event(**pg_support._json_obj(row[1])) for row in rows]
+                    durable_tool_events = [
+                        pg_stored_events.event_from_document(row[1]) for row in rows
+                    ]
                 _validate_tool_round_publication(
                     request,
                     durable_references,

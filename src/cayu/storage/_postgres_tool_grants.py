@@ -25,6 +25,7 @@ from cayu.sessions.interactions import (
 )
 from cayu.sessions.invocation import SessionInvocation
 from cayu.sessions.records import SessionStatus, SessionStatusConflict
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._postgres_event_publication import EventWriter
 from cayu.storage._postgres_transcript import PostgresConnection
@@ -167,7 +168,7 @@ async def issue_targeted_tool_grants(
                         raise RuntimeError("Targeted grant issuance lost interaction admission.")
                     validate_targeted_tool_grant_batch_evidence(
                         copied_records,
-                        Event(**pg_support._json_obj(interaction_started_row[0])),
+                        pg_stored_events.event_from_document(interaction_started_row[0]),
                     )
                 invocation = SessionInvocation.model_validate(session_row[4])
                 new_events: list[Event] = []
@@ -217,7 +218,7 @@ async def issue_targeted_tool_grants(
                             raise RuntimeError("Targeted grant lost its durable issuance evidence.")
                         validate_targeted_tool_grant_issuance_evidence(
                             existing,
-                            Event(**pg_support._json_obj(issued_row[0])),
+                            pg_stored_events.event_from_document(issued_row[0]),
                         )
                         reused_event = targeted_tool_grant_event(
                             existing,
@@ -693,7 +694,7 @@ async def bind_targeted_tool_grant_use(
                                         )
                                     validate_targeted_tool_grant_lifecycle_event(
                                         record,
-                                        Event(**pg_support._json_obj(event_row[0])),
+                                        pg_stored_events.event_from_document(event_row[0]),
                                         event_type=(EventType.TARGETED_TOOL_REFERENCE_CONSUMED),
                                         outcome=TargetedToolUseDisposition.BOUND.value,
                                         event_id_suffix=f"use:{binding.use_id}",
@@ -916,7 +917,7 @@ async def revoke_targeted_tool_grant(
                                 raise RuntimeError(
                                     "Targeted grant revocation lost its durable event evidence."
                                 )
-                            event = Event(**pg_support._json_obj(event_row[0]))
+                            event = pg_stored_events.event_from_document(event_row[0])
                             validate_targeted_tool_grant_revocation_evidence(
                                 stored,
                                 event,
@@ -1056,7 +1057,7 @@ async def reconstruct_targeted_tool_grants(
                     raise RuntimeError("Targeted grant reconstruction lost interaction admission.")
                 validate_targeted_tool_grant_batch_evidence(
                     records,
-                    Event(**pg_support._json_obj(interaction_started_row[0])),
+                    pg_stored_events.event_from_document(interaction_started_row[0]),
                 )
                 await cur.execute(
                     "SELECT 1 FROM cayu_events "

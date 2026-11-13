@@ -543,6 +543,16 @@ async def _wait_for_task(
     return await asyncio.wait_for(poll(), timeout=timeout_s)
 
 
+async def _wait_for_warning(
+    caplog: pytest.LogCaptureFixture, text: str, *, timeout_s: float = 5.0
+) -> None:
+    async def poll() -> None:
+        while not _warnings(caplog, text):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout=timeout_s)
+
+
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 @pytest.mark.parametrize("settlement", ["undeclared", "cancel", "restart"])
 def test_a_busy_worker_fences_and_settles_a_task_another_worker_lost(
@@ -603,6 +613,9 @@ def test_a_busy_worker_fences_and_settles_a_task_another_worker_lost(
                     store, "lost", lambda task: task.status_reason == "cancellation_requested"
                 )
                 assert outcome.status is TaskStatus.CLAIMED
+                # The fence and the warning come from separate scans, so wait
+                # for the warning before the worker is released and stops.
+                await _wait_for_warning(caplog, "is fenced")
             elif settlement == "cancel":
                 outcome = await _wait_for_task(
                     store, "lost", lambda task: task.status is TaskStatus.CANCELLED

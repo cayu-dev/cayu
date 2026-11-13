@@ -15,10 +15,13 @@ from cayu.deadlines import (
     TASK_EVENT_DEADLINE_METADATA_KEY,
     ExecutionDeadlineReport,
 )
-from cayu.events import Event
+from cayu.events import Event, event_from_trusted_store_record
 from cayu.messages import Message
 from cayu.sessions.creation import session_invocation_for_run_request, session_metadata_for_creation
-from cayu.sessions.event_delivery import restore_persisted_event_authority
+from cayu.sessions.event_delivery import (
+    persisted_event_authority_candidates,
+    restore_persisted_event_authority,
+)
 from cayu.sessions.invocation import SessionInvocation, TaskInvocation
 from cayu.sessions.queries import SessionOrder
 from cayu.sessions.records import (
@@ -29,6 +32,7 @@ from cayu.sessions.records import (
     SessionIdentity,
     SessionStatus,
     runtime_build_provenance_from_session_metadata,
+    stored_event_record,
 )
 from cayu.sessions.requests import RunRequest, session_instance_id_for_run_request
 from cayu.storage import _session_store_sql as session_store_sql
@@ -678,8 +682,7 @@ EVENT_COLUMN_NAMES: tuple[str, ...] = (
 )
 
 
-def event_from_row(row: sqlite3.Row) -> Event:
-    """Validate an owned Event without adding cache-copy work to history scans."""
+def _stored_authority_flags(row: sqlite3.Row) -> tuple[bool, bool]:
     input_contract_runtime_owned = row["input_contract_runtime_owned"]
     if type(input_contract_runtime_owned) is not int or input_contract_runtime_owned not in {
         0,
@@ -691,6 +694,49 @@ def event_from_row(row: sqlite3.Row) -> Event:
         file_attachment_attestations_runtime_owned
     ) is not int or file_attachment_attestations_runtime_owned not in {0, 1}:
         raise ValueError("Stored file-attachment attestation proof is malformed.")
+    return input_contract_runtime_owned == 1, file_attachment_attestations_runtime_owned == 1
+
+
+def event_from_row(row: sqlite3.Row) -> Event:
+    """Rebuild a stored event this store's ingestion validated, without re-walking it.
+
+    ``event_from_trusted_store_record`` lists the checks that still run. The
+    authority flags keep their exact checks, so a tampered flag is still
+    rejected, and the store's private authority is restored without a copy.
+    """
+
+    input_contract_runtime_owned, file_attachment_attestations_runtime_owned = (
+        _stored_authority_flags(row)
+    )
+    return event_from_trusted_store_record(
+        event_type=row["event_type"],
+        session_id=row["session_id"],
+        interaction_id=row["interaction_id"],
+        event_id=row["event_id"],
+        timestamp=row["timestamp"],
+        agent_name=row["agent_name"],
+        environment_name=row["environment_name"],
+        workflow_name=row["workflow_name"],
+        tool_name=row["tool_name"],
+        payload_json=row["payload_json"],
+        runtime_payload_authority_candidates=persisted_event_authority_candidates(
+            row["event_type"],
+            input_contract_runtime_owned=input_contract_runtime_owned,
+            file_attachment_attestations_runtime_owned=file_attachment_attestations_runtime_owned,
+        ),
+    )
+
+
+def validating_event_from_row(row: sqlite3.Row) -> Event:
+    """Rebuild a stored event through full durable validation.
+
+    The full-validation reference for :func:`event_from_row`, used by
+    equivalence tests and store verification.
+    """
+
+    input_contract_runtime_owned, file_attachment_attestations_runtime_owned = (
+        _stored_authority_flags(row)
+    )
     return restore_persisted_event_authority(
         Event(
             type=row["event_type"],
@@ -704,20 +750,21 @@ def event_from_row(row: sqlite3.Row) -> Event:
             tool_name=row["tool_name"],
             payload=json.loads(row["payload_json"]),
         ),
-        input_contract_runtime_owned=input_contract_runtime_owned == 1,
-        file_attachment_attestations_runtime_owned=(
-            file_attachment_attestations_runtime_owned == 1
-        ),
+        input_contract_runtime_owned=input_contract_runtime_owned,
+        file_attachment_attestations_runtime_owned=file_attachment_attestations_runtime_owned,
     )
 
 
 def event_record_from_row(row: sqlite3.Row | None) -> EventRecord | None:
     if row is None:
         return None
-    return EventRecord(
-        sequence=row["sequence"],
-        event=event_from_row(row),
-    )
+    return stored_event_record_from_row(row)
+
+
+def stored_event_record_from_row(row: sqlite3.Row) -> EventRecord:
+    """The record of one stored event row, without the defensive event copy."""
+
+    return stored_event_record(row["sequence"], event_from_row(row))
 
 
 def load_session_labels_batch(

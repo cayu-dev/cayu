@@ -59,7 +59,6 @@ from cayu.sessions.environment_activity import (
     copy_environment_activity_query,
     environment_activity_snapshot,
 )
-from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.event_queries import (
     EventOrder,
     EventQuery,
@@ -93,6 +92,7 @@ from cayu.sessions.records import (
     Session,
     SessionStatus,
     stored_event_head,
+    stored_event_record,
 )
 from cayu.sessions.summaries import (
     EventSummary,
@@ -107,6 +107,7 @@ from cayu.sessions.topology import (
 )
 from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _postgres_aggregates as postgres_aggregates
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _tool_usage_sql as tool_usage_sql
@@ -205,7 +206,7 @@ def event_record_from_row(row: tuple[Any, Any] | None) -> EventRecord | None:
     """Build an EventRecord from a ``(sequence, event)`` row, or None for a missing row."""
     if row is None:
         return None
-    return EventRecord(sequence=row[0], event=Event(**pg_support._json_obj(row[1])))
+    return pg_stored_events.event_record_from_document(row[0], row[1])
 
 
 _INSPECTION_IDENTITY_COLUMNS = """
@@ -353,7 +354,7 @@ async def load_events(
             (session_id,),
         )
         rows = await cur.fetchall()
-        return [Event(**pg_support._json_obj(row[0])) for row in rows]
+        return [pg_stored_events.event_from_document(row[0]) for row in rows]
 
 
 async def load_user_input_supersession_events(
@@ -387,7 +388,7 @@ async def load_user_input_supersession_events(
             ),
         )
         rows = await cur.fetchall()
-        return [Event(**pg_support._json_obj(row[0])) for row in rows]
+        return [pg_stored_events.event_from_document(row[0]) for row in rows]
 
 
 async def load_tool_round_lifecycle_events(
@@ -425,7 +426,7 @@ async def load_tool_round_lifecycle_events(
         rows = await cur.fetchall()
         if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
             raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-        return [Event(**pg_support._json_obj(row[0])) for row in rows]
+        return [pg_stored_events.event_from_document(row[0]) for row in rows]
 
 
 async def load_tool_round_lifecycle_events_for_round(
@@ -480,7 +481,7 @@ async def load_tool_round_lifecycle_events_for_round(
         rows = await cur.fetchall()
         if len(rows) > _tool_round_lifecycle_event_limit(copied_ids):
             raise ValueError("Tool-round lifecycle evidence exceeds the publication limit.")
-        return [Event(**pg_support._json_obj(row[0])) for row in rows]
+        return [pg_stored_events.event_from_document(row[0]) for row in rows]
 
 
 @runtime_session_query
@@ -552,13 +553,18 @@ async def read_usage_accounting(
     usage_cache: SessionUsageCache,
 ) -> UsageAccountingSnapshot:
     from cayu.runtime._usage_accounting import (
+        USAGE_ACCOUNTING_FULL_PAYLOAD_TYPES,
         USAGE_ACCOUNTING_PAGE_SIZE,
         SessionUsageCache,
         UsageAccountingReducer,
+        UsageAccountingRow,
         usage_accounting_query,
     )
 
     query = usage_accounting_query(query)
+    full_payload_types = ", ".join(
+        f"'{event_type}'" for event_type in USAGE_ACCOUNTING_FULL_PAYLOAD_TYPES
+    )
     cached_session_id = SessionUsageCache.session_scope(
         query, by_session=by_session, by_identity=by_identity
     )
@@ -595,16 +601,32 @@ async def read_usage_accounting(
             await cur.execute(
                 cast(
                     "LiteralString",
-                    "SELECT cayu_events.sequence, cayu_events.event FROM cayu_events "
+                    # The narrow copy holds every payload member the reducer
+                    # reads, except for an event without ``usage_metrics``,
+                    # whose raw-usage normalization reads its whole payload.
+                    "SELECT cayu_events.sequence, cayu_events.session_id, "
+                    "cayu_events.event_type, "
+                    "CASE WHEN narrow.sequence IS NULL OR ("
+                    f"cayu_events.event_type IN ({full_payload_types}) "
+                    "AND narrow.payload -> 'usage_metrics' IS NULL"
+                    ") THEN cayu_events.event -> 'payload' ELSE narrow.payload END "
+                    "FROM cayu_events "
                     "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                    "LEFT JOIN cayu_usage_events AS narrow "
+                    "ON narrow.sequence = cayu_events.sequence "
                     f"{plan.where_sql} ORDER BY cayu_events.sequence ASC",
                 ),
                 plan.params,
             )
             while rows := await cur.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
-                reducer.add_page(
+                reducer.add_rows(
                     [
-                        EventRecord(sequence=row[0], event=Event(**pg_support._json_obj(row[1])))
+                        UsageAccountingRow(
+                            sequence=row[0],
+                            session_id=row[1],
+                            type=row[2],
+                            payload=pg_support._json_obj(row[3]),
+                        )
                         for row in rows
                     ]
                 )
@@ -730,7 +752,7 @@ async def read_cost_accounting(
 
         def add_rows(rows: list[Any]) -> None:
             for row in rows:
-                reducer.add(row[0], Event(**pg_support._json_obj(row[1])))
+                reducer.add(row[0], pg_stored_events.event_from_document(row[1]))
 
         async def add_group(key: tuple[str, bool, str]) -> None:
             statement, params = cost_group_lookup_statement(
@@ -1057,10 +1079,7 @@ async def query_latest_interaction_events(
             params,
         )
         rows = await cur.fetchall()
-        return [
-            EventRecord(sequence=row[0], event=Event(**pg_support._json_obj(row[1])))
-            for row in rows
-        ]
+        return [pg_stored_events.event_record_from_document(row[0], row[1]) for row in rows]
 
 
 async def summarize_events(
@@ -1495,9 +1514,9 @@ async def query_child_session_lifecycle(
                         (retained_ids, lifecycle_types),
                     )
                     for event_row in await cur.fetchall():
-                        event = Event(**pg_support._json_obj(event_row[2]))
-                        records_by_child[str(event_row[0])][EventType(event.type)] = EventRecord(
-                            sequence=event_row[1], event=event
+                        event = pg_stored_events.event_from_document(event_row[2])
+                        records_by_child[str(event_row[0])][EventType(event.type)] = (
+                            stored_event_record(event_row[1], event)
                         )
 
                 consumption_key_by_child: dict[str, str] = {}
@@ -1847,13 +1866,12 @@ async def _query_events(
     )
     rows = await cur.fetchall()
     return [
-        EventRecord(
-            sequence=row[0],
-            event=restore_persisted_event_authority(
-                Event(**pg_support._json_obj(row[1])),
-                input_contract_runtime_owned=row[2],
-                file_attachment_attestations_runtime_owned=row[3],
-            ),
+        pg_stored_events.event_record_from_document(
+            row[0],
+            row[1],
+            restore_authority=True,
+            input_contract_runtime_owned=row[2],
+            file_attachment_attestations_runtime_owned=row[3],
         )
         for row in rows
     ]

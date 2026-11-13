@@ -14,7 +14,6 @@ from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event
 from cayu.runtime.evidence_spool import EvidenceSpool
-from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.records import (
     EventRecord,
     RunnerObservedEventIdentity,
@@ -36,7 +35,7 @@ from cayu.sessions.terminal_evidence import (
     _terminal_session_evidence_expected_event_type,
     _validate_runner_observed_event_identity_snapshot,
 )
-from cayu.storage import _postgres_support as pg_support
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_transcript import PostgresConnection, SessionLoader
 
@@ -578,13 +577,12 @@ async def _load_evidence(
                                 )
                             spool.append(
                                 "event",
-                                EventRecord(
-                                    sequence=row[0],
-                                    event=restore_persisted_event_authority(
-                                        Event(**pg_support._json_obj(row[1])),
-                                        input_contract_runtime_owned=row[2],
-                                        file_attachment_attestations_runtime_owned=row[3],
-                                    ),
+                                pg_stored_events.event_record_from_document(
+                                    row[0],
+                                    row[1],
+                                    restore_authority=True,
+                                    input_contract_runtime_owned=row[2],
+                                    file_attachment_attestations_runtime_owned=row[3],
                                 ),
                             )
                         after_sequence = rows[-1][0]
@@ -644,13 +642,12 @@ async def _load_evidence(
                         TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                     )
                 events = tuple(
-                    EventRecord(
-                        sequence=row[0],
-                        event=restore_persisted_event_authority(
-                            Event(**pg_support._json_obj(row[1])),
-                            input_contract_runtime_owned=row[2],
-                            file_attachment_attestations_runtime_owned=row[3],
-                        ),
+                    pg_stored_events.event_record_from_document(
+                        row[0],
+                        row[1],
+                        restore_authority=True,
+                        input_contract_runtime_owned=row[2],
+                        file_attachment_attestations_runtime_owned=row[3],
                     )
                     for row in event_rows
                 )

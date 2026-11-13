@@ -202,6 +202,19 @@ class EventRecord(BaseModel):
         return copy_event(value)
 
 
+def stored_event_record(sequence: int, event: Event) -> EventRecord:
+    """An EventRecord around an event a store decoder just built for this record.
+
+    ``EventRecord`` copies its event so a caller's later edits cannot reach it.
+    A decoder's fresh event has no other holder, so that copy is skipped. Any
+    other value takes the validating constructor.
+    """
+
+    if type(event) is Event and type(sequence) is int and 1 <= sequence <= MAX_DURABLE_JSON_INTEGER:
+        return EventRecord.model_construct(sequence=sequence, event=event)
+    return EventRecord(sequence=sequence, event=event)
+
+
 @dataclass(frozen=True, slots=True)
 class EventHead:
     """Where a stored event sits and what it is, without its payload.

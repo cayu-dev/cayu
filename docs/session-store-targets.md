@@ -101,8 +101,8 @@ non-mutating backend contract.
 
 ## Storage commands
 
-`cayu storage status`, `cayu storage migrate`, `cayu storage export`, and
-`cayu storage prune` use this resolver. Without `--sqlite` or `--postgres` they select the store from
+`cayu storage status`, `cayu storage migrate`, `cayu storage export`,
+`cayu storage prune` and `cayu storage verify-events` use this resolver. Without `--sqlite` or `--postgres` they select the store from
 `CAYU_DATABASE_URL`, then `[tool.cayu.session_store]`, then the existing
 `data/cayu.db` convention. An explicit option always wins, and `--postgres`
 still accepts a libpq key/value DSN as well as a URL. The JSON output names
@@ -117,6 +117,15 @@ driver errors after a failed connection.
 `cayu storage prune` dry-runs or applies storage retention; its sessions and
 evals targets use this resolver, and its artifacts and workspaces targets use
 the project's application stores. See [Storage retention](storage-retention.md).
+
+`cayu storage verify-events` reruns full durable validation over every stored
+event, in sequence order, and lists the rows that fail. Reads trust the rows
+the store's own ingestion validated and skip two payload checks (node count
+and nesting depth) that only an edit made directly to the database could
+break; this command is how to confirm none was. It reads only, reports
+each failure's sequence, session, event type and error without payload
+content, and exits 5 when any row fails. `--max-events N` checks a bounded
+batch and prints the sequence to pass to `--after-sequence` next.
 
 ### Direct connection for migrations
 

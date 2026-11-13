@@ -126,13 +126,14 @@ async def _full_read(store, session_id: str):
 
 def _hydrated_rows(monkeypatch) -> list[int]:
     rows: list[int] = []
-    add_page = UsageAccountingReducer.add_page
+    add_rows = UsageAccountingReducer.add_rows
 
-    def observed(self, records):
-        rows.append(len(records))
-        return add_page(self, records)
+    # Every store's page, whether built from events or narrow rows, lands here.
+    def observed(self, page):
+        rows.append(len(page))
+        return add_rows(self, page)
 
-    monkeypatch.setattr(UsageAccountingReducer, "add_page", observed)
+    monkeypatch.setattr(UsageAccountingReducer, "add_rows", observed)
     return rows
 
 

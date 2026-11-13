@@ -117,13 +117,13 @@ def test_session_list_includes_usage_without_rescanning_history(monkeypatch) -> 
     assert [row["model_steps"] for row in body["usage"]] == [1, 2, 3]
 
     hydrated: list[int] = []
-    add_page = UsageAccountingReducer.add_page
+    add_rows = UsageAccountingReducer.add_rows
 
     def observed(self, records):
         hydrated.append(len(records))
-        return add_page(self, records)
+        return add_rows(self, records)
 
-    monkeypatch.setattr(UsageAccountingReducer, "add_page", observed)
+    monkeypatch.setattr(UsageAccountingReducer, "add_rows", observed)
     again = client.get("/api/sessions", params={"include": "usage", "order_by": "created_at_asc"})
     assert again.json()["usage"] == body["usage"]
     assert hydrated == []

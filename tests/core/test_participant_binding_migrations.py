@@ -272,6 +272,7 @@ def test_historical_postgres_upgrade_continues_session(postgres_dsn, revision, m
 
     from cayu.storage import _postgres_schema_history as postgres_schema_history
     from cayu.storage import postgres as pg
+    from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
 
     async def run():
         async with await psycopg.AsyncConnection.connect(
@@ -297,6 +298,10 @@ def test_historical_postgres_upgrade_continues_session(postgres_dsn, revision, m
                 ) as connection:
                     for statement in postgres_schema_history._MIGRATION_STEPS[144]:
                         await connection.execute(statement)
+                    # Usage accounting joins the narrow usage copy (revision
+                    # 149); an empty table falls back to full payloads, and the
+                    # upgrade creates its triggers and backfills it.
+                    await connection.execute(POSTGRES_USAGE_EVENTS_DDL[0])
                 events = [
                     event
                     async for event in _app(store).run(

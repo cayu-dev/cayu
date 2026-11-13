@@ -11,7 +11,7 @@ from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
 
-from cayu.events import Event, EventType
+from cayu.events import EventType
 from cayu.runtime._child_session_notifications import (
     ChildSessionLifecycleOccurrence,
     ChildSessionLifecycleOccurrenceSource,
@@ -85,6 +85,7 @@ from cayu.sessions._runtime_publication_rules import (
 from cayu.sessions.authority import SessionRunFenced, _runtime_publication_json_equal
 from cayu.sessions.records import Session, SessionStatusConflict
 from cayu.storage import _postgres_locked_reads as locked_reads
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage._postgres_session_messages import EventAppender, SteeringGuard
@@ -346,7 +347,7 @@ async def mark_dispatched(
                             raise SessionModelCompletionStageConflict(
                                 "Child-session notification occurrence is no longer canonical."
                             )
-                        event = Event(**pg_support._json_obj(event_row[1]))
+                        event = pg_stored_events.event_from_document(event_row[1])
                         occurrence = ChildSessionLifecycleOccurrence(
                             source=ChildSessionLifecycleOccurrenceSource.EVENT,
                             source_id=event.id,
@@ -538,7 +539,7 @@ async def prepare(
                             expected_selection,
                             None
                             if event_row is None
-                            else Event(**pg_support._json_obj(event_row[0])),
+                            else pg_stored_events.event_from_document(event_row[0]),
                         )
                     await conn.rollback()
                     return ModelCompletionStageResult(

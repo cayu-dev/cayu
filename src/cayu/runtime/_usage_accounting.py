@@ -6,7 +6,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
@@ -32,6 +32,29 @@ if TYPE_CHECKING:
 
 USAGE_ACCOUNTING_PAGE_SIZE = 256
 USAGE_ACCOUNTING_CACHE_MAX_SESSIONS = 4096
+
+#: Payload-bearing usage events whose narrow ``cayu_usage_events`` copy may
+#: lack a member the reducer reads: an event without ``usage_metrics`` is
+#: normalized from its raw usage, which also reads ``requested_model``.
+USAGE_ACCOUNTING_FULL_PAYLOAD_TYPES: tuple[str, ...] = (
+    str(EventType.MODEL_COMPLETED),
+    str(EventType.MODEL_AUXILIARY_ATTEMPT_SETTLED),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class UsageAccountingRow:
+    """The parts of one usage-bearing event the reducer reads.
+
+    Stores read these from the narrow ``cayu_usage_events`` copy instead of
+    rebuilding whole events. ``payload`` holds at least every member
+    ``session_usage_summary`` reads for ``type``.
+    """
+
+    sequence: int
+    session_id: str
+    type: str
+    payload: dict[str, Any]
 
 
 class UsageIdentitySummary(BaseModel):
@@ -197,14 +220,29 @@ class UsageAccountingReducer:
         self._identity_sessions: dict[tuple[bool, str | None, str | None], dict[str, None]] = {}
 
     def add_page(self, records: Sequence[EventRecord]) -> None:
-        if len(records) > USAGE_ACCOUNTING_PAGE_SIZE:
+        self.add_rows(
+            [
+                UsageAccountingRow(
+                    sequence=record.sequence,
+                    session_id=record.event.session_id,
+                    type=record.event.type,
+                    payload=record.event.payload,
+                )
+                for record in records
+            ]
+        )
+
+    def add_rows(self, rows: Sequence[UsageAccountingRow]) -> None:
+        """Reduce one ordered page of usage-bearing events."""
+
+        if len(rows) > USAGE_ACCOUNTING_PAGE_SIZE:
             raise ValueError("Usage accounting page exceeds its working-set bound.")
         previous = self._through_sequence
-        for record in records:
-            if record.sequence <= previous:
+        for row in rows:
+            if row.sequence <= previous:
                 raise ValueError("Usage accounting requires one strictly ordered watermark.")
-            previous = record.sequence
-        events = [record.event for record in records]
+            previous = row.sequence
+        events = rows
         self._summary = combine_session_usage_summaries(
             self._summary.session_id,
             (self._summary, session_usage_summary(self._summary.session_id, events)),

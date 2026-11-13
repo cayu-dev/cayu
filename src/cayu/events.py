@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -9,11 +11,21 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import (
     DURABLE_DOCUMENT_LIMITS,
     DURABLE_EVENT_LIMITS,
+    MAX_DURABLE_JSON_INTEGER,
+    MIN_DURABLE_JSON_INTEGER,
     copy_durable_record,
     inspect_bounded_durable_json,
     require_durable_clean_nonblank,
@@ -330,6 +342,11 @@ class Event(BaseModel):
     # durable validator.
     _payload_validation_stamp: object | None = PrivateAttr(default=None)
     _candidate_envelope_stamp: _CandidateEnvelopeStamp | None = PrivateAttr(default=None)
+    # The JSON text a built-in store wrote for this payload after validating it,
+    # set only by ``event_from_trusted_store_record``. A copy reuses it only while
+    # the payload still serializes to exactly this text, so a mutated payload
+    # falls back to the full durable validator like an unstamped one.
+    _stored_payload_json: str | None = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
         del __context
@@ -376,7 +393,10 @@ class Event(BaseModel):
         try:
             payload = _copy_prevalidated_payload(self.payload, stamp)
         except _PayloadStampMismatch:
-            return super().__deepcopy__()
+            stored = _copy_store_written_payload(self)
+            if stored is None:
+                return super().__deepcopy__()
+            return super().__deepcopy__({id(self.payload): stored})
         # Nothing outside this event refers to the payload or its stamp, and a
         # validated payload is a tree, so mapping just these two is complete.
         return super().__deepcopy__(
@@ -555,13 +575,20 @@ def copy_event(event: Event) -> Event:
             event._payload_validation_stamp,
         )
     except _PayloadStampMismatch:
-        payload_is_unchanged = False
-        # The same admission Event's payload validator applies, so an object
-        # result is installed below instead of being copied a second time. A
-        # non-object still goes through the constructor and fails its type check.
-        payload = copy_durable_record(event.payload, "payload", limits=DURABLE_DOCUMENT_LIMITS)
-        payload_is_admitted = type(payload) is dict
+        stored = _copy_store_written_payload(event)
+        if stored is not None:
+            payload = stored
+            payload_is_unchanged = True
+            payload_is_admitted = True
+        else:
+            payload_is_unchanged = False
+            # The same admission Event's payload validator applies, so an object
+            # result is installed below instead of being copied a second time. A
+            # non-object still goes through the constructor and fails its type check.
+            payload = copy_durable_record(event.payload, "payload", limits=DURABLE_DOCUMENT_LIMITS)
+            payload_is_admitted = type(payload) is dict
     else:
+        stored = None
         payload_is_unchanged = True
         payload_is_admitted = True
     copied = Event(
@@ -586,7 +613,11 @@ def copy_event(event: Event) -> Event:
             or event._candidate_envelope_stamp != copied._candidate_envelope_stamp
         ):
             copied._candidate_envelope_stamp = _validate_event_candidate(copied)
-        copied._payload_validation_stamp = _durable_payload_stamp(payload)
+        if stored is not None:
+            # Still the stored text: keep proving it by content, not by a stamp.
+            copied._stored_payload_json = event._stored_payload_json
+        else:
+            copied._payload_validation_stamp = _durable_payload_stamp(payload)
     copied._id_origin = event._id_origin
     copied._runtime_generated_id = event._runtime_generated_id
     copied._runtime_payload_authority = event._runtime_payload_authority
@@ -595,6 +626,230 @@ def copy_event(event: Event) -> Event:
     copied._durable_sequence = event._durable_sequence
     copied._trusted_export_history = event._trusted_export_history
     return copied
+
+
+def store_payload_json(payload: Any) -> str:
+    """The exact JSON text built-in stores write for an event payload."""
+
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+class _UntrustedStoredPayload(Exception):
+    """Internal signal that stored payload text needs the full durable validator."""
+
+
+def _stored_json_float(text: str) -> float | int:
+    value = float(text)
+    if not math.isfinite(value):
+        raise _UntrustedStoredPayload
+    if value.is_integer():
+        # The durable validator admits an integral float as the integer it equals.
+        if not MIN_DURABLE_JSON_INTEGER <= value <= MAX_DURABLE_JSON_INTEGER:
+            raise _UntrustedStoredPayload
+        return int(value)
+    return value
+
+
+def _stored_json_int(text: str) -> int:
+    value = int(text)
+    # Only a token of 19 or more digits can fall outside the 64-bit range.
+    if len(text) > 18 and not MIN_DURABLE_JSON_INTEGER <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise _UntrustedStoredPayload
+    return value
+
+
+def _stored_json_constant(text: str) -> Any:
+    raise _UntrustedStoredPayload
+
+
+# The hooks see number and constant tokens only, never string contents, so a
+# non-finite number, an integral float or an out-of-range integer is caught
+# exactly while the rest decodes at C speed (the integer hook adds well under a
+# microsecond to a typical stored payload).
+_STORED_PAYLOAD_DECODER = json.JSONDecoder(
+    parse_float=_stored_json_float,
+    parse_int=_stored_json_int,
+    parse_constant=_stored_json_constant,
+)
+_STORED_TEXT_ESCAPE_RE = re.compile(r"\\u(?:0000|[dD][89a-fA-F])")
+_TIMESTAMP_ADAPTER: TypeAdapter[datetime] = TypeAdapter(datetime)
+_EVENT_TYPES_BY_VALUE: dict[str, EventType] = {member.value: member for member in EventType}
+
+
+def _decode_stored_payload(text: Any) -> dict[str, Any]:
+    """Decode payload text a built-in store wrote, or raise ``_UntrustedStoredPayload``."""
+
+    if type(text) is not str:
+        raise _UntrustedStoredPayload
+    try:
+        encoded_length = len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        # A lone surrogate code point in the text itself.
+        raise _UntrustedStoredPayload from None
+    if encoded_length > DURABLE_DOCUMENT_LIMITS.max_bytes or "\x00" in text:
+        raise _UntrustedStoredPayload
+    if "\\u" in text and _STORED_TEXT_ESCAPE_RE.search(text) is not None:
+        # An escaped NUL or surrogate; valid surrogate pairs also land here and
+        # are admitted by the full validator, which this only costs time.
+        raise _UntrustedStoredPayload
+    try:
+        payload = _STORED_PAYLOAD_DECODER.decode(text)
+    except (ValueError, RecursionError):
+        raise _UntrustedStoredPayload from None
+    if type(payload) is not dict:
+        raise _UntrustedStoredPayload
+    return payload
+
+
+def _copy_store_written_payload(event: Event) -> dict[str, Any] | None:
+    """A detached copy of a payload that still equals the text its store wrote."""
+
+    text = event._stored_payload_json
+    if text is None:
+        return None
+    try:
+        if store_payload_json(event.payload) != text:
+            return None
+    except (TypeError, ValueError, RecursionError):
+        return None
+    # Decoding the stored text, not copying the live graph, means the copy is
+    # always the value the store validated, whatever objects the caller holds.
+    try:
+        return _decode_stored_payload(text)
+    except _UntrustedStoredPayload:
+        return None
+
+
+def _trusted_envelope_text(value: Any, field_name: str, *, optional: bool) -> str | None:
+    if value is None and optional:
+        return None
+    if type(value) is not str:
+        raise _UntrustedStoredPayload
+    return require_durable_clean_nonblank(value, field_name)
+
+
+def event_from_trusted_store_record(
+    *,
+    event_type: Any,
+    session_id: Any,
+    interaction_id: Any,
+    event_id: Any,
+    timestamp: Any,
+    agent_name: Any,
+    environment_name: Any,
+    workflow_name: Any,
+    tool_name: Any,
+    payload_json: Any,
+    runtime_payload_authority_candidates: tuple[str, ...] = (),
+) -> Event:
+    """Rebuild an Event from a record a built-in store wrote, without re-walking it.
+
+    Only built-in store decoders call this, for rows the store's own ingestion
+    boundary (``_copy_event_for_session_store``) validated before writing them.
+    Trust boundaries (JSONL restore, imports, events from outside the store)
+    construct ``Event`` normally and keep full validation.
+
+    Checks that still run on every record:
+
+    - every envelope field: exact types, the event-type registry, durable clean
+      non-blank identifiers and names, the id length limit and timestamp parsing,
+      with the same validators ``Event`` uses;
+    - the payload: JSON syntax, a JSON object, the durable byte limit, no NaN
+      or infinity, integers and integral floats inside the durable integer
+      range (an integral float becomes the integer it equals, as the validator
+      makes it), and no NUL or lone surrogate, raw or escaped;
+    - authority: each candidate field the store attested that holds a string is
+      attested again, and must be non-blank, exactly as
+      ``event_with_runtime_payload_authority`` requires.
+
+    Checks skipped for store-written rows, which the write path enforced and
+    only a direct edit of the database could break: the payload's node count
+    and its nesting depth. ``cayu storage verify-events`` reruns the full
+    validator over stored events.
+
+    A record failing any of these checks goes through the validating
+    constructor instead, which raises exactly the error a read raised before.
+    The payload carries no identity stamp, which costs more than decoding it.
+    Instead the stored text is kept, and a copy reuses it only while the
+    payload still serializes to that exact text.
+    """
+
+    try:
+        payload = _decode_stored_payload(payload_json)
+        if type(event_type) is not str:
+            raise _UntrustedStoredPayload
+        checked_type: EventType | str | None = _EVENT_TYPES_BY_VALUE.get(event_type)
+        if checked_type is None:
+            checked_type = _validate_custom_event_type(event_type)
+        if type(event_id) is not str or len(event_id) > EVENT_ID_MAX_CHARS:
+            raise _UntrustedStoredPayload
+        fields: dict[str, Any] = {
+            "type": checked_type,
+            "session_id": _trusted_envelope_text(session_id, "session_id", optional=False),
+            "interaction_id": _trusted_envelope_text(
+                interaction_id, "interaction_id", optional=True
+            ),
+            "id": _trusted_envelope_text(event_id, "id", optional=False),
+            "timestamp": _TIMESTAMP_ADAPTER.validate_python(timestamp),
+            "agent_name": _trusted_envelope_text(agent_name, "agent_name", optional=True),
+            "environment_name": _trusted_envelope_text(
+                environment_name, "environment_name", optional=True
+            ),
+            "workflow_name": _trusted_envelope_text(workflow_name, "workflow_name", optional=True),
+            "tool_name": _trusted_envelope_text(tool_name, "tool_name", optional=True),
+            "payload": payload,
+        }
+        authority = []
+        for field_name in runtime_payload_authority_candidates:
+            value = payload.get(field_name)
+            if type(value) is not str:
+                continue
+            if not value.strip():
+                raise _UntrustedStoredPayload
+            authority.append((field_name, value))
+    except (_UntrustedStoredPayload, ValueError, TypeError):
+        event = Event(
+            type=event_type,
+            session_id=session_id,
+            interaction_id=interaction_id,
+            id=event_id,
+            timestamp=timestamp,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            workflow_name=workflow_name,
+            tool_name=tool_name,
+            payload=json.loads(payload_json) if type(payload_json) is str else payload_json,
+        )
+        attested = tuple(
+            field_name
+            for field_name in runtime_payload_authority_candidates
+            if type(event.payload.get(field_name)) is str
+        )
+        return event_with_runtime_payload_authority(event, *attested) if attested else event
+    event = Event.model_construct(**fields)
+    # The stamp the validating constructor records: every envelope value except
+    # the payload, in ``event_durable_envelope`` order.
+    rendered_type = str(event.type)
+    rendered_timestamp = event.timestamp.isoformat()
+    event._candidate_envelope_stamp = _CandidateEnvelopeStamp(
+        (
+            (str, event.id),
+            (str, rendered_type),
+            (str, event.session_id),
+            (type(event.interaction_id), event.interaction_id),
+            (str, rendered_timestamp),
+            (type(event.agent_name), event.agent_name),
+            (type(event.environment_name), event.environment_name),
+            (type(event.workflow_name), event.workflow_name),
+            (type(event.tool_name), event.tool_name),
+        )
+    )
+    # Kept even when the text is not this payload's canonical form: a copy then
+    # finds the two differ and takes the full validator, which costs only time.
+    event._stored_payload_json = payload_json
+    if authority:
+        event._runtime_payload_authority = frozenset(authority)
+    return event
 
 
 def _durable_payload_stamp(value: Any) -> object:

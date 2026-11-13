@@ -542,10 +542,7 @@ async def _load_evidence(
                     for row in rows:
                         spool.append(
                             "event",
-                            EventRecord(
-                                sequence=row["sequence"],
-                                event=sqlite_records.event_from_row(row),
-                            ),
+                            sqlite_records.stored_event_record_from_row(row),
                         )
                 cursor.close()
                 cursor = connection.execute(
@@ -601,10 +598,7 @@ async def _load_evidence(
                 raise TerminalSessionEvidenceError(
                     TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                 )
-            events = tuple(
-                EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
-                for row in event_rows
-            )
+            events = tuple(sqlite_records.stored_event_record_from_row(row) for row in event_rows)
             decode = transcript_content.decoder(
                 connection, session_id, [row["message_json"] for row in transcript_rows]
             )

@@ -11,10 +11,9 @@ from collections.abc import Sequence
 from typing import Any, LiteralString, cast
 
 from cayu._validation import DurableValueError
-from cayu.events import Event, EventType
+from cayu.events import EventType
 from cayu.messages import MessageRole
 from cayu.sessions._page_reads import count_child_runs_from
-from cayu.sessions.event_delivery import restore_persisted_event_authority
 from cayu.sessions.records import (
     EventRecord,
     Session,
@@ -29,6 +28,7 @@ from cayu.sessions.summaries import (
     SessionStepCounts,
     session_status_outcome,
 )
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript_content as transcript_content
 from cayu.storage._postgres_session_queries import load_session_labels_batch
@@ -176,7 +176,7 @@ def _latest_after_lifecycle(type_filter: LiteralString) -> LiteralString:
 def _event_record(sequence: Any, event: Any) -> EventRecord | None:
     if sequence is None:
         return None
-    return EventRecord(sequence=sequence, event=Event(**pg_support._json_obj(event)))
+    return pg_stored_events.event_record_from_document(sequence, event)
 
 
 async def count_session_steps(cur: Any, session_ids: Sequence[str]) -> dict[str, SessionStepCounts]:
@@ -299,13 +299,12 @@ async def query_latest_events(
     )
     found: dict[str, EventRecord] = {}
     for row in await cur.fetchall():
-        record = EventRecord(
-            sequence=row[0],
-            event=restore_persisted_event_authority(
-                Event(**pg_support._json_obj(row[1])),
-                input_contract_runtime_owned=row[2],
-                file_attachment_attestations_runtime_owned=row[3],
-            ),
+        record = pg_stored_events.event_record_from_document(
+            row[0],
+            row[1],
+            restore_authority=True,
+            input_contract_runtime_owned=row[2],
+            file_attachment_attestations_runtime_owned=row[3],
         )
         found[record.event.session_id] = record
     return {session_id: found[session_id] for session_id in session_ids if session_id in found}

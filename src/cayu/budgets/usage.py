@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 
 from pydantic import (
     BaseModel,
@@ -957,7 +957,19 @@ USAGE_BEARING_EVENT_TYPES: tuple[EventType, ...] = (
 )
 
 
-def session_usage_summary(session_id: str, events: list[Event]) -> SessionUsageSummary:
+class UsageBearingEvent(Protocol):
+    """What ``session_usage_summary`` reads of an event: its type and payload."""
+
+    @property
+    def type(self) -> EventType | str: ...
+
+    @property
+    def payload(self) -> dict[str, Any]: ...
+
+
+def session_usage_summary(
+    session_id: str, events: Sequence[UsageBearingEvent]
+) -> SessionUsageSummary:
     from cayu.budgets.aggregates import (
         aggregate_hosted_tool_usage_metrics_from_event_payload,
         summary_usage_metrics_from_event_payload,

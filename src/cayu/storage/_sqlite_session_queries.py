@@ -489,10 +489,7 @@ async def query_events(
             """,
             params,
         ).fetchall()
-        return [
-            EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
-            for row in rows
-        ]
+        return [sqlite_records.stored_event_record_from_row(row) for row in rows]
 
     return await run_read(run_query)
 
@@ -525,14 +522,19 @@ async def read_usage_accounting(
     usage_cache: SessionUsageCache,
 ) -> UsageAccountingSnapshot:
     from cayu.runtime._usage_accounting import (
+        USAGE_ACCOUNTING_FULL_PAYLOAD_TYPES,
         USAGE_ACCOUNTING_PAGE_SIZE,
         SessionUsageCache,
         UsageAccountingReducer,
+        UsageAccountingRow,
         usage_accounting_query,
     )
 
     query = usage_accounting_query(query)
     plan = session_store_sql.build_accounting_event_query_sql(query, dialect=SQL_DIALECT)
+    full_payload_types = ", ".join(
+        f"'{event_type}'" for event_type in USAGE_ACCOUNTING_FULL_PAYLOAD_TYPES
+    )
     cached_session_id = SessionUsageCache.session_scope(
         query, by_session=by_session, by_identity=by_identity
     )
@@ -572,23 +574,32 @@ async def read_usage_accounting(
             reducer = UsageAccountingReducer(
                 read_query, by_session=by_session, by_identity=by_identity
             )
-            event_columns = ", ".join(
-                f"cayu_events.{name}" for name in sqlite_records.EVENT_COLUMN_NAMES
-            )
             # One statement holds one read snapshot. fetchmany bounds hydration;
             # query.limit is a page size, never a cap on authoritative history.
+            # The trigger-maintained narrow copy holds every payload member the
+            # reducer reads, except for an event without ``usage_metrics``,
+            # whose raw-usage normalization reads its whole payload.
             cursor = connection.execute(
-                f"SELECT cayu_events.sequence, {event_columns} FROM cayu_events "
+                "SELECT cayu_events.sequence, cayu_events.session_id, cayu_events.event_type, "
+                "CASE WHEN narrow.sequence IS NULL OR ("
+                f"cayu_events.event_type IN ({full_payload_types}) "
+                "AND json_type(narrow.payload_json, '$.usage_metrics') IS NULL"
+                ") THEN cayu_events.payload_json ELSE narrow.payload_json END AS payload_json "
+                "FROM cayu_events "
                 "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                "LEFT JOIN cayu_usage_events AS narrow ON narrow.sequence = cayu_events.sequence "
                 f"{read_plan.where_sql} ORDER BY cayu_events.sequence ASC",
                 read_plan.params,
             )
             try:
                 while rows := cursor.fetchmany(USAGE_ACCOUNTING_PAGE_SIZE):
-                    reducer.add_page(
+                    reducer.add_rows(
                         [
-                            EventRecord(
-                                sequence=row["sequence"], event=sqlite_records.event_from_row(row)
+                            UsageAccountingRow(
+                                sequence=row[0],
+                                session_id=row[1],
+                                type=row[2],
+                                payload=json.loads(row[3]),
                             )
                             for row in rows
                         ]
@@ -1020,10 +1031,7 @@ def _query_events_bounded_snapshot(
         """,
         params,
     ).fetchall()
-    return [
-        EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
-        for row in rows
-    ]
+    return [sqlite_records.stored_event_record_from_row(row) for row in rows]
 
 
 async def query_latest_interaction_events(
@@ -1057,10 +1065,7 @@ async def query_latest_interaction_events(
             """,
             params,
         ).fetchall()
-        return [
-            EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
-            for row in rows
-        ]
+        return [sqlite_records.stored_event_record_from_row(row) for row in rows]
 
     return await run_read(run_query)
 

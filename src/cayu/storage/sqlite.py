@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.storage._stored_event_verification import StoredEventVerificationPage
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -6305,7 +6306,7 @@ class SQLiteSessionStore(
         builder.add_class(
             "events",
             (
-                EventRecord(sequence=row["sequence"], event=sqlite_records.event_from_row(row))
+                sqlite_records.stored_event_record_from_row(row)
                 for row in connection.execute(
                     "SELECT * FROM cayu_events WHERE session_id = ? ORDER BY sequence LIMIT ?",
                     (session_id, max_records + 1),
@@ -6510,11 +6511,7 @@ class SQLiteSessionStore(
                 )
                 while page := rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
                     for row in page:
-                        builder.event(
-                            EventRecord(
-                                sequence=row["sequence"], event=sqlite_records.event_from_row(row)
-                            )
-                        )
+                        builder.event(sqlite_records.stored_event_record_from_row(row))
                 rows = connection.execute(
                     "SELECT session_order, interaction_id, message_json FROM cayu_transcript_messages "
                     "WHERE session_id = ? ORDER BY session_order",
@@ -6620,6 +6617,23 @@ class SQLiteSessionStore(
 
     async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
         return await session_queries.query_event_heads(self._run_read, query)
+
+    async def verify_stored_events(
+        self, *, after_sequence: int = 0, limit: int = 1000
+    ) -> StoredEventVerificationPage:
+        """Rerun full durable validation over one page of stored events.
+
+        Reads skip the payload checks the store's ingestion already enforced;
+        this confirms no row was edited outside Cayu since it was written.
+        """
+
+        from cayu.storage._stored_event_verification import verify_sqlite_events
+
+        return await self._run_read(
+            lambda connection: verify_sqlite_events(
+                connection, after_sequence=after_sequence, limit=limit
+            )
+        )
 
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False

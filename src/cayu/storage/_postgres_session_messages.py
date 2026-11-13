@@ -69,6 +69,7 @@ from cayu.sessions.transcript_input import (
     session_messages_input_contract_evidence,
 )
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage import _postgres_transcript_content as transcript_content
@@ -531,7 +532,7 @@ async def enqueue_session_message(
                     await conn.commit()
                     return EnqueueSessionMessageResult(
                         message=existing,
-                        event=Event(**pg_support._json_obj(event_row[0])),
+                        event=pg_stored_events.event_from_document(event_row[0]),
                         replayed=True,
                     )
                 for owner in await closure_owners(cur, (request.session_id,)):

@@ -31,6 +31,7 @@ from cayu.sessions.event_delivery import (
     validate_persisted_event_side_effect_error,
     validate_persisted_event_side_effect_lease_seconds,
 )
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -270,7 +271,7 @@ async def _lease_claimable_delivery(
         session_id=row[0],
         event_id=row[1],
         event_sequence=row[2],
-        event=Event(**pg_support._json_obj(event_row[0])),
+        event=pg_stored_events.event_from_document(event_row[0]),
         attempt=row[3],
         claim_id=claim_id,
         lease_expires_at=pg_support.to_utc(row[4]),

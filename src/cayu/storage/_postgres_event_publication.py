@@ -33,6 +33,7 @@ from cayu.sessions.mcp_manifest_history import (
 from cayu.sessions.records import Session
 from cayu.storage import _postgres_event_delivery as event_delivery_ops
 from cayu.storage import _postgres_locked_reads as locked_reads
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._postgres_transcript import PostgresConnection
 from cayu.workflows.base import WORKFLOW_ATTEMPT_EVENT_TYPE
@@ -285,7 +286,7 @@ async def append_tool_effect_conflict(
                 existing = await cur.fetchone()
                 if existing is not None:
                     event = reconcile_tool_effect_conflict_event(
-                        event, Event(**pg_support._json_obj(existing[0]))
+                        event, pg_stored_events.event_from_document(existing[0])
                     )
                 else:
                     for owner in await closure_owners(cur, (session_id,)):

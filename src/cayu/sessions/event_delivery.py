@@ -540,6 +540,35 @@ def _event_file_attachment_attestations_are_runtime_owned(event: Event) -> bool:
     )
 
 
+def persisted_event_authority_candidates(
+    event_type: Any,
+    *,
+    input_contract_runtime_owned: bool = False,
+    file_attachment_attestations_runtime_owned: bool = False,
+) -> tuple[str, ...]:
+    """Fields whose stored string value the built-in store ingestion attested.
+
+    The same allowlist :func:`restore_persisted_event_authority` restores, for
+    decoders that rebuild a stored event without copying it.
+    """
+
+    if type(input_contract_runtime_owned) is not bool:
+        raise TypeError("input_contract_runtime_owned must be a bool.")
+    if type(file_attachment_attestations_runtime_owned) is not bool:
+        raise TypeError("file_attachment_attestations_runtime_owned must be a bool.")
+    return tuple(
+        field_name
+        for field_name in _persisted_event_authority_fields(event_type)
+        if (
+            field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
+        )
+        and (
+            field_name != MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
+            or file_attachment_attestations_runtime_owned
+        )
+    )
+
+
 def restore_persisted_event_authority(
     event: Event,
     *,
@@ -560,21 +589,14 @@ def restore_persisted_event_authority(
     """
 
     copied = copy_event(event)
-    if type(input_contract_runtime_owned) is not bool:
-        raise TypeError("input_contract_runtime_owned must be a bool.")
-    if type(file_attachment_attestations_runtime_owned) is not bool:
-        raise TypeError("file_attachment_attestations_runtime_owned must be a bool.")
     fields = tuple(
         field_name
-        for field_name in _persisted_event_authority_fields(copied.type)
+        for field_name in persisted_event_authority_candidates(
+            copied.type,
+            input_contract_runtime_owned=input_contract_runtime_owned,
+            file_attachment_attestations_runtime_owned=file_attachment_attestations_runtime_owned,
+        )
         if type(copied.payload.get(field_name)) is str
-        and (
-            field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
-        )
-        and (
-            field_name != MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
-            or file_attachment_attestations_runtime_owned
-        )
     )
     return event_with_runtime_payload_authority(copied, *fields) if fields else copied
 

@@ -64,6 +64,7 @@ from cayu.storage import _postgres_publication as publication_ops
 from cayu.storage import _postgres_session_creation as creation_ops
 from cayu.storage import _postgres_session_messages as message_ops
 from cayu.storage import _postgres_session_queries as session_queries
+from cayu.storage import _postgres_stored_events as pg_stored_events
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _postgres_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _postgres_tool_grants as tool_grants_ops
@@ -99,6 +100,7 @@ if TYPE_CHECKING:
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.storage._stored_event_verification import StoredEventVerificationPage
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -1298,9 +1300,7 @@ class PostgresSessionStore(
                     closures = await cur.fetchall()
                     publication_id = closed_round_publication_id(
                         pointer,
-                        tuple(
-                            Event.model_validate(pg_support._json_obj(item[0])) for item in closures
-                        ),
+                        tuple(pg_stored_events.event_from_document(item[0]) for item in closures),
                     )
                     key = _runtime_publication_storage_key(publication_id)
                     await cur.execute(
@@ -1324,7 +1324,7 @@ class PostgresSessionStore(
                 (session_id, pointer.completion_event_id),
             )
             row = await cur.fetchone()
-            completion = None if row is None else Event.model_validate(pg_support._json_obj(row[0]))
+            completion = None if row is None else pg_stored_events.event_from_document(row[0])
             await cur.execute(
                 "SELECT session_order, interaction_id, message FROM cayu_transcript_messages "
                 "WHERE session_id = %s AND session_order > %s AND session_order <= %s "
@@ -2320,7 +2320,9 @@ class PostgresSessionStore(
         terminal_publication_block = _terminal_publication_delete_block_reason(
             session=session,
             checkpoint=checkpoint,
-            evidence_events=[Event(**pg_support._json_obj(row[0])) for row in await cur.fetchall()],
+            evidence_events=[
+                pg_stored_events.event_from_document(row[0]) for row in await cur.fetchall()
+            ],
         )
         if terminal_publication_block is not None:
             raise ValueError(
@@ -3818,7 +3820,8 @@ class PostgresSessionStore(
                         )
                         if (
                             existing_row is not None
-                            and Event(**pg_support._json_obj(existing_row[0])) != receipt.event
+                            and pg_stored_events.event_from_document(existing_row[0])
+                            != receipt.event
                         ):
                             raise RuntimeError(
                                 "Interaction transition receipt conflicts with retained event history."
@@ -3827,7 +3830,7 @@ class PostgresSessionStore(
                             receipt.terminal_event != copied_terminal_event
                             or (
                                 existing_terminal_row is not None
-                                and Event(**pg_support._json_obj(existing_terminal_row[0]))
+                                and pg_stored_events.event_from_document(existing_terminal_row[0])
                                 != receipt.terminal_event
                             )
                         ):
@@ -4312,7 +4315,7 @@ class PostgresSessionStore(
             )
             if (
                 existing_record is not None
-                and Event(**pg_support._json_obj(existing_record)) != receipt.event
+                and pg_stored_events.event_from_document(existing_record) != receipt.event
             ):
                 raise RuntimeError(
                     "Interaction transition receipt conflicts with retained event history."
@@ -4384,7 +4387,7 @@ class PostgresSessionStore(
                 raise RuntimeError("Interaction transition receipt has a conflicting event ID.")
             if (
                 existing_record is not None
-                and Event(**pg_support._json_obj(existing_record)) != receipt.event
+                and pg_stored_events.event_from_document(existing_record) != receipt.event
             ):
                 raise RuntimeError(
                     "Interaction transition receipt conflicts with retained event history."
@@ -5076,7 +5079,7 @@ class PostgresSessionStore(
         )
         row = await cur.fetchone()
         if row is not None:
-            return Event(**pg_support._json_obj(row[0]))
+            return pg_stored_events.event_from_document(row[0])
         await self._append_events_with_cursor(
             cur,
             event.session_id,
@@ -5948,9 +5951,7 @@ class PostgresSessionStore(
             (
                 "events",
                 "SELECT sequence, event FROM cayu_events WHERE session_id = %s ORDER BY sequence LIMIT %s",
-                lambda row: EventRecord(
-                    sequence=row[0], event=Event(**pg_support._json_obj(row[1]))
-                ),
+                lambda row: pg_stored_events.event_record_from_document(row[0], row[1]),
             ),
             (
                 "transcript",
@@ -6105,11 +6106,7 @@ class PostgresSessionStore(
                 )
                 while page := await rows.fetchmany(SESSION_EXPORT_PAGE_SIZE):
                     for row in page:
-                        builder.event(
-                            EventRecord(
-                                sequence=row[0], event=Event(**pg_support._json_obj(row[1]))
-                            )
-                        )
+                        builder.event(pg_stored_events.event_record_from_document(row[0], row[1]))
             async with conn.cursor(name=f"session_export_transcript_{uuid4().hex}") as rows:
                 await rows.execute(
                     "SELECT session_order, interaction_id, message FROM cayu_transcript_messages "
@@ -6226,6 +6223,20 @@ class PostgresSessionStore(
 
     async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
         return await session_queries.query_event_heads(self._ready_connection, query)
+
+    async def verify_stored_events(
+        self, *, after_sequence: int = 0, limit: int = 1000
+    ) -> StoredEventVerificationPage:
+        """Rerun full durable validation over one page of stored events.
+
+        Reads skip the payload checks the store's ingestion already enforced;
+        this confirms no row was edited outside Cayu since it was written.
+        """
+
+        from cayu.storage._stored_event_verification import verify_postgres_events
+
+        async with self._ready_connection() as conn, conn.cursor() as cur:
+            return await verify_postgres_events(cur, after_sequence=after_sequence, limit=limit)
 
     async def event_exists(self, query: EventQuery) -> bool:
         return await session_queries.event_exists(self._ready_connection, query)

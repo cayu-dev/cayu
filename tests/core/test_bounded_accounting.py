@@ -143,13 +143,13 @@ def test_usage_snapshot_matches_reference_and_incremental_watermark(
     from cayu.runtime._usage_accounting import UsageAccountingReducer
 
     page_sizes = []
-    add_page = UsageAccountingReducer.add_page
+    add_rows = UsageAccountingReducer.add_rows
 
     def observed(self, records):
         page_sizes.append(len(records))
-        return add_page(self, records)
+        return add_rows(self, records)
 
-    monkeypatch.setattr(UsageAccountingReducer, "add_page", observed)
+    monkeypatch.setattr(UsageAccountingReducer, "add_rows", observed)
 
     async def run():
         store = accounting_store_factory()
@@ -411,7 +411,7 @@ def test_usage_snapshot_excludes_append_committed_between_fetches(
             appended = False
             if backend == "sqlite":
                 loop = asyncio.get_running_loop()
-                original_add = UsageAccountingReducer.add_page
+                original_add = UsageAccountingReducer.add_rows
 
                 def append_during_read(self, rows):
                     nonlocal appended
@@ -422,7 +422,7 @@ def test_usage_snapshot_excludes_append_committed_between_fetches(
                         ).result(timeout=10)
                     return original_add(self, rows)
 
-                monkeypatch.setattr(UsageAccountingReducer, "add_page", append_during_read)
+                monkeypatch.setattr(UsageAccountingReducer, "add_rows", append_during_read)
             else:
                 from psycopg import AsyncServerCursor
 
