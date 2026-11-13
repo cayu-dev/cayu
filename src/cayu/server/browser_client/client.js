@@ -628,6 +628,13 @@ function watchTasks(context, filter, options) {
   if (filter.run !== undefined && filter.run !== null) {
     valueFilters.push(["metadata", "run", filter.run])
   }
+  // A filter travels as key=value and the server splits it at the first "=", so a key
+  // that holds one would be read as a shorter key and select other tasks.
+  for (const [name, key] of valueFilters) {
+    if (key.includes("=")) {
+      throw new TypeError(`A task ${name} filter key must not contain "=": ${key}`)
+    }
+  }
   // A server without these filters would ignore them and return other tasks.
   if (valueFilters.length > 0 && !taskValueFiltersAvailable(context.contract)) {
     throw new CayuClientError(

@@ -1383,6 +1383,20 @@ test("watchTasks takes the watchSessions form and sends nothing while hidden", a
   stop()
 })
 
+test("watchTasks refuses a filter key the server would read as another key", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  for (const filter of [{ input: { "a=b": "c" } }, { metadata: { "a=b": "c" } }]) {
+    assert.throws(() => client.watchTasks(filter, () => {}), TypeError)
+  }
+  // A value may hold "=": everything after the first one is the value.
+  const stop = client.watchTasks({ input: { a: "b=c" } }, () => {})
+  await flush()
+  assert.deepEqual(server.requestsTo("/tasks")[0].query.getAll("input"), ["a=b=c"])
+  stop()
+  await flush()
+})
+
 test("watchTasks stops on authorization failures and refuses a server without tasks", async () => {
   const server = new FakeServer()
   const client = await connect({ apiBaseUrl: API, fetch: server.fetch })

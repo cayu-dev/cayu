@@ -852,7 +852,8 @@ filters (at most eight). Each matches a top-level value of the task's input or
 metadata as the task's detail shows it, after redaction, so a hidden secret
 grants no membership; numbers match by value (`number=217`, `ratio=2` matches
 `2.0`) and booleans as `true` or `false` (`dry_run=false`). `metadata=run=<key>` selects the tasks of one run. Everything
-after the first `=` is the value. Cursors stay bound to these filters too.
+after the first `=` is the value, so a key cannot hold one, and `client.js` refuses
+a filter whose key does. Cursors stay bound to these filters too.
 The contract's `task_value_filters` surface says the server supports them; a
 server without it ignores the parameters, so `client.js` refuses to send them
 there.
