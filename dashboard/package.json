@@ -51,6 +51,7 @@
     "zustand": "^5.0.14"
   },
   "overrides": {
-    "js-yaml": "4.3.2"
+    "js-yaml": "4.3.2",
+    "seroval": "1.7.9"
   }
 }
