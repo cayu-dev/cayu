@@ -322,9 +322,45 @@ React-router deep links use the base path and API URL injected by the server.
 
 ## Ownership, upgrades, and compatibility
 
-The destination must be explicit and empty. Cayu never rewrites an ejected directory during
-installation, upgrade, or later CLI commands. Eject a new copy elsewhere when you want to inspect
-a newer release, then merge application changes deliberately.
+The destination must be explicit and empty. Installing or upgrading Cayu never rewrites an
+ejected directory; only `cayu dashboard upgrade` does, when you run it.
+
+The source keeps `cayu-dashboard-source.json`, which records the Cayu version it came from and
+the sha256 of every file as ejected. After moving the project to a new Cayu release, bring the
+dashboard up to it with:
+
+```bash
+cayu dashboard upgrade ./control-plane --dry-run   # print the plan; add --json for an agent
+cayu dashboard upgrade ./control-plane
+cd control-plane
+npm ci
+npm run check:api
+```
+
+The command compares each file with the manifest (did the project edit it?) and with the
+installed release's source (did the release change it?):
+
+- A file the project didn't edit takes the release's version: it is replaced, added when the
+  release adds it, or removed when the release removes it.
+- A file the project edited and the release didn't change is kept.
+- A file both changed is kept, and the release's version is written next to it as
+  `FILE.cayu-VERSION` (for example `src/main.tsx.cayu-0.20.0`) and listed. Cayu has only the
+  old release's hashes, not its content, so it doesn't attempt a three-way merge. Merge the
+  release's changes by hand and delete the `.cayu-VERSION` file. Until you delete it, running
+  the command again, for the same release or a later one, lists the merge as pending and leaves
+  that file as it is.
+- A file the project edited and the release removed is kept and listed, for you to decide. The
+  new manifest no longer lists it, so later runs leave it alone.
+- Generated files (`src/lib/release-metadata.ts`, `server-openapi.json` and `src/lib/generated/`)
+  and the manifest always take the release's version, since `npm run check:api` requires what
+  the installed Cayu generates.
+
+Files the project added itself are left alone. The command exits 1 when it lists files to merge
+or decide by hand, and 2 when it refuses: a directory without `cayu-dashboard-source.json`, or
+one ejected from a newer Cayu than the installed one. It writes the manifest last, so an
+interrupted upgrade can be run again. `cayu check` warns (`DASHBOARD_SOURCE_VERSION_MISMATCH`)
+when an ejected dashboard in the project, or up to two folders below it, came from another Cayu
+release, and names the command.
 
 The dashboard checks the server's exact control-plane contract before loading data. A Cayu
 upgrade that changes that contract produces a visible compatibility failure, and `npm run

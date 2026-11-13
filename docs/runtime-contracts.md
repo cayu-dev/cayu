@@ -6995,11 +6995,23 @@ census used for metadata-owner, pending-metadata, or destination-alias discovery
 inspected-entry limit, including unrelated entries, and fails closed when that limit is exhausted. A
 boundary-cleanup failure is reported without weakening the
 committed receipt. It performs no network or repository lookup. The extracted project is
-application-owned: installation, upgrade, and later Cayu commands never rewrite it. Explicit API
+application-owned: installation, upgrade, and other Cayu commands never rewrite it. Explicit API
 generation may update that copy, while ordinary drift checking and the browser compatibility gate
 remain read-only. `DashboardConfig.directory`, `mount_cayu(..., dashboard_dir=...)`, and
 `mount_dashboard(..., dashboard_dir=...)` serve its production `dist/` under the same access,
 base-path, deep-link, redaction, and capability contracts as the bundled dashboard.
+
+`cayu dashboard upgrade DIRECTORY [--dry-run] [--json]` is the one command that rewrites an
+ejected copy, and only when run. It reads the copy's `cayu-dashboard-source.json` and the
+installed, validated source bundle, and refuses a copy without that manifest or one ejected from a
+newer Cayu. A file whose hash matches the manifest takes the release's version (replaced, added or
+removed); an edited file is kept, and when the release also changed it the release's version is
+written beside it as `FILE.cayu-VERSION` and listed. An edited file the release removed is kept
+and listed. Generated files and the manifest always take the release's version, so `npm run
+check:api` passes when nothing else changed. Planning is a pure function of the old manifest, the
+release and the project's file hashes, separate from applying it. The command never follows a link
+inside the copy, writes each file through a temporary file and rename, writes the manifest last so
+an interrupted run can be repeated, and exits 1 when files need a hand merge and 2 when it refuses.
 
 The optional server exposes `GET /api/sessions/{session_id}/summary` for compact
 session health views. It combines session identity/status, storage-backed event

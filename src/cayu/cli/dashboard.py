@@ -151,13 +151,14 @@ class _BundleResource:
 
 
 def add_dashboard_parser(subparsers: Any) -> None:
-    """Register the ``dashboard eject`` and ``dashboard parts`` command group."""
+    """Register the ``dashboard eject``, ``upgrade`` and ``parts`` command group."""
     dashboard = subparsers.add_parser(
         "dashboard",
         help="Manage the bundled Cayu Developer dashboard source.",
         description=(
             "Manage the bundled Cayu Developer dashboard source. "
-            "Use `cayu dashboard eject DESTINATION` to create an editable project, and "
+            "Use `cayu dashboard eject DESTINATION` to create an editable project, "
+            "`cayu dashboard upgrade DIRECTORY` to bring it up to the installed release, and "
             "`cayu dashboard parts` to install its pages as parts in a web app."
         ),
     )
@@ -171,6 +172,23 @@ def add_dashboard_parser(subparsers: Any) -> None:
         ),
     )
     eject.add_argument("destination", type=Path, metavar="DESTINATION")
+    upgrade = dashboard_commands.add_parser(
+        "upgrade",
+        help="Bring an ejected dashboard up to the installed Cayu release.",
+        description=(
+            "Bring a dashboard made with `cayu dashboard eject` up to the installed Cayu "
+            "release. Files the project didn't edit are replaced, added or removed. Files it "
+            "edited are kept; when the release changed one too, its version is written next "
+            "to it as FILE.cayu-VERSION to merge by hand. The release metadata and "
+            "cayu-dashboard-source.json are rewritten for the installed release. Exits 1 when "
+            "there are files to merge by hand, and 2 when it refuses."
+        ),
+    )
+    upgrade.add_argument("directory", type=Path, metavar="DIRECTORY")
+    upgrade.add_argument(
+        "--dry-run", action="store_true", help="Print the plan without changing any file."
+    )
+    upgrade.add_argument("--json", action="store_true", help="Emit the plan as JSON.")
     add_parts_parser(dashboard_commands)
 
 
@@ -178,6 +196,10 @@ def run_dashboard(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``dashboard`` invocation."""
     if args.dashboard_command == "parts":
         return run_dashboard_parts(args)
+    if args.dashboard_command == "upgrade":
+        from cayu.cli._dashboard_upgrade import run_dashboard_upgrade
+
+        return run_dashboard_upgrade(args)
     try:
         result = eject_dashboard_source(args.destination)
     except Exception as exc:
@@ -212,34 +234,11 @@ def eject_dashboard_source(
     expected_server_contract_version: str = SERVER_CONTRACT_VERSION,
 ) -> DashboardEjectResult:
     """Validate and atomically materialize the packaged editable dashboard source."""
-    using_packaged_bundle = bundle_bytes is None
-    if bundle_bytes is None:
-        resource = _dashboard_source_resource()
-        try:
-            bundle_bytes = resource.resource.read_bytes()
-        except OSError as exc:
-            raise DashboardSourceError(
-                f"could not read the dashboard source bundle: {exc}"
-            ) from exc
-        expected_cayu_version = resource.cayu_version
-    elif expected_cayu_version is None:
-        from cayu.cli import _version
-
-        expected_cayu_version = _version()
-
-    artifact = validate_dashboard_source_bundle(
-        bundle_bytes,
+    artifact = load_dashboard_source(
+        bundle_bytes=bundle_bytes,
         expected_cayu_version=expected_cayu_version,
         expected_server_contract_version=expected_server_contract_version,
     )
-    if using_packaged_bundle:
-        compiled_digest = _packaged_compiled_dashboard_digest()
-        if compiled_digest != artifact.manifest.compiled_dashboard_digest:
-            raise DashboardSourceError(
-                "packaged dashboard source does not match the compiled dashboard: "
-                f"expected {artifact.manifest.compiled_dashboard_digest}, "
-                f"found {compiled_digest}"
-            )
     try:
         validate_guarded_tree_files(artifact.contents)
     except GuardedTreePublicationError as exc:
@@ -276,6 +275,48 @@ def eject_dashboard_source(
             translated.add_note(note)
         raise translated from exc
     return DashboardEjectResult(destination=destination, manifest=artifact.manifest)
+
+
+def load_dashboard_source(
+    *,
+    bundle_bytes: bytes | None = None,
+    expected_cayu_version: str | None = None,
+    expected_server_contract_version: str = SERVER_CONTRACT_VERSION,
+) -> ValidatedDashboardSource:
+    """Read and validate the installed Cayu's dashboard source bundle, or ``bundle_bytes``.
+
+    The contents include the bundle manifest under ``BUNDLE_MANIFEST_NAME``, as eject
+    writes it.
+    """
+    using_packaged_bundle = bundle_bytes is None
+    if bundle_bytes is None:
+        resource = _dashboard_source_resource()
+        try:
+            bundle_bytes = resource.resource.read_bytes()
+        except OSError as exc:
+            raise DashboardSourceError(
+                f"could not read the dashboard source bundle: {exc}"
+            ) from exc
+        expected_cayu_version = resource.cayu_version
+    elif expected_cayu_version is None:
+        from cayu.cli import _version
+
+        expected_cayu_version = _version()
+
+    artifact = validate_dashboard_source_bundle(
+        bundle_bytes,
+        expected_cayu_version=expected_cayu_version,
+        expected_server_contract_version=expected_server_contract_version,
+    )
+    if using_packaged_bundle:
+        compiled_digest = _packaged_compiled_dashboard_digest()
+        if compiled_digest != artifact.manifest.compiled_dashboard_digest:
+            raise DashboardSourceError(
+                "packaged dashboard source does not match the compiled dashboard: "
+                f"expected {artifact.manifest.compiled_dashboard_digest}, "
+                f"found {compiled_digest}"
+            )
+    return artifact
 
 
 def _dashboard_publication_request_digest(contents: dict[str, bytes]) -> str:

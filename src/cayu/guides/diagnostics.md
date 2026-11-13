@@ -63,6 +63,20 @@ read-only. The Developer dashboard can still decide them when its runtime
 config sets `humanReviewPurpose`. Give the policy a `dashboard_purpose`
 property, as `ToolArgumentReview` does.
 
+## dashboard-source-version-mismatch
+
+`DASHBOARD_SOURCE_VERSION_MISMATCH` warns that a Developer dashboard made with
+`cayu dashboard eject` (found by its `cayu-dashboard-source.json`, in the project
+root or up to two folders below it) came from another Cayu release than the
+installed one. Its `npm run check:api` fails until the source matches the
+installed release, and its build follows the server contract of the release it
+came from. Run `cayu dashboard upgrade DIRECTORY` (add `--dry-run` to see the
+plan first): files the project didn't edit take the release's version, edited
+files are kept, and an edited file the release also changed gets the release's
+version next to it as `FILE.cayu-VERSION` to merge by hand. Then run `npm ci`
+and `npm run check:api` in the dashboard. When the dashboard came from a newer
+Cayu, install that Cayu instead; the upgrade refuses to go backwards.
+
 ## session-store-alias-keyring-required
 
 `SESSION_STORE_ALIAS_KEYRING_REQUIRED` means the application factory could not

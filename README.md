@@ -628,8 +628,10 @@ npm run build
 
 Extraction uses package data only—no repository clone, GitHub access, or network request. Serve
 the resulting `dist/` with `DashboardConfig(directory=...)`,
-`mount_cayu(..., dashboard_dir=...)`, or `mount_dashboard(..., dashboard_dir=...)`. Cayu never
-rewrites the extracted application-owned source during upgrades. See [Open and replaceable
+`mount_cayu(..., dashboard_dir=...)`, or `mount_dashboard(..., dashboard_dir=...)`. Installing a
+new Cayu never rewrites the extracted application-owned source; `cayu dashboard upgrade
+./control-plane` brings it up to the installed release, replacing the files you didn't edit and
+listing the ones you did that the release also changed. See [Open and replaceable
 Developer dashboard](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) for the complete workflow, compatibility gate, and
 redistribution obligations.
 
