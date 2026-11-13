@@ -763,13 +763,6 @@ def test_the_pull_request_read_model_reads_a_pull_from_the_fake() -> None:
     fake.add_review(REPO, 7, "cayu-reviewer[bot]", state="APPROVED")
     fake.add_comment(REPO, 7, "Looks risky.", author="alice")
 
-    def compare(variables: Any, repository: str) -> dict[str, Any]:
-        counts = {"aheadBy": pull.ahead_by, "behindBy": pull.behind_by}
-        head = {"target": {"oid": pull.head_sha}}
-        return {"data": {"repository": {"ref": {"compare": counts}, "head": head}}}
-
-    fake.on_graphql("PullRequestCompare", compare)
-
     facts = run(github_pulls.read_pull(fake.client(read_only=True), REPO, 7))
 
     assert (facts.state, facts.labels, facts.author) == ("open", ("ready",), "cayu-scout[bot]")
@@ -779,6 +772,45 @@ def test_the_pull_request_read_model_reads_a_pull_from_the_fake() -> None:
     assert [review.author for review in facts.reviews] == ["cayu-reviewer[bot]"]
     assert [comment.author for comment in facts.comments or ()] == ["alice"]
     assert not fake.unanswered
+
+
+def test_the_compare_query_resolves_branches_but_not_pull_request_refs() -> None:
+    fake = _fake()
+    pull = fake.add_pull(REPO, 7, head_ref="fix", behind_by=3, ahead_by=2)
+    query = """query PullRequestCompare(
+      $base: String!, $head: String!, $branch: String!, $pull: String!
+    ) {
+      repository(owner: "acme", name: "widgets") {
+        ref(qualifiedName: $base) { compare(headRef: $head) { aheadBy behindBy } }
+        branch: ref(qualifiedName: $branch) { target { oid } }
+        pull: ref(qualifiedName: $pull) { target { oid } }
+      }
+    }"""
+
+    def compared(head: str) -> dict[str, Any]:
+        variables = {"base": "refs/heads/main", "head": head}
+        variables |= {"branch": "refs/heads/fix", "pull": "refs/pull/7/head"}
+        return run(fake.client().graphql(query, variables, repository=REPO)).data["repository"]
+
+    # As GitHub's GraphQL answers: a pull request's ref doesn't resolve, though a compare takes
+    # it, the head commit or the head branch.
+    for head in (pull.head_sha, "refs/pull/7/head", "fix"):
+        assert compared(head) == {
+            "ref": {"compare": {"aheadBy": 2, "behindBy": 3}},
+            "branch": {"target": {"oid": pull.head_sha}},
+            "pull": None,
+        }
+    assert compared("b" * 40)["ref"] == {"compare": None}
+
+
+def test_the_compare_query_takes_the_pull_on_the_compared_base() -> None:
+    fake = _fake()
+    fake.add_pull(REPO, 7, head_sha="c" * 40, behind_by=1)
+    fake.add_pull(REPO, 8, head_sha="c" * 40, base="release", behind_by=4)
+
+    facts = run(github_pulls.read_pull(fake.client(read_only=True), REPO, 8))
+
+    assert (facts.behind_by, facts.ahead_by, facts.gaps) == (4, 1, ())
 
 
 def test_the_pull_request_listing_reads_its_answer_from_on_graphql() -> None:

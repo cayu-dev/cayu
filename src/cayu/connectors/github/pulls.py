@@ -61,7 +61,6 @@ _COMPARE_QUERY = """
 query PullRequestCompare($owner: String!, $name: String!, $base: String!, $head: String!) {
   repository(owner: $owner, name: $name) {
     ref(qualifiedName: $base) { compare(headRef: $head) { aheadBy behindBy } }
-    head: ref(qualifiedName: $head) { target { oid } }
   }
 }
 """
@@ -368,7 +367,7 @@ async def read_pull(
     base = pull["base"]["ref"]
     commit = f"{root}/commits/{head_sha}"
     compared, committed, check_runs, runs, statuses, reviews, conversation = await _all(
-        _fact("behind_by", _compare(gh, repository, base, number, head_sha)),
+        _fact("behind_by", _compare(gh, repository, base, head_sha)),
         _fact("head_committed_at", gh.get(f"{root}/git/commits/{head_sha}")),
         _fact(
             "checks",
@@ -547,37 +546,25 @@ async def _fact(name: str, read: Awaitable[_Value], *, missing: bool = True) -> 
 
 
 async def _compare(
-    gh: GitHubClient, repository: str, base: str, number: int, head_sha: str
+    gh: GitHubClient, repository: str, base: str, head_sha: str
 ) -> Mapping[str, Any] | FactGap:
-    """GraphQL's compare of the base branch with the pull request's head (``refs/pull/N/head``,
-    which a fork's pull request has too): its ``aheadBy`` and ``behindBy``, without files. The
-    same answer says which commit that ref named; when it isn't ``head_sha``, the commit the
-    record describes, the head moved during the read and the counts are left out."""
+    """GraphQL's compare of the base branch with ``head_sha``, the head commit the record
+    describes: its ``aheadBy`` and ``behindBy``, without files. The compare names the commit
+    itself, which a fork's pull request makes readable in the base repository too, so a head
+    that moves during the read leaves these counts about the head the record names; GraphQL
+    can't resolve the ``refs/pull/N/head`` ref to a commit (it answers ``null``)."""
 
     owner, _, name = repository.partition("/")
     answer = await gh.graphql(
         _COMPARE_QUERY,
-        {
-            "owner": owner,
-            "name": name,
-            "base": f"refs/heads/{base}",
-            "head": f"refs/pull/{number}/head",
-        },
+        {"owner": owner, "name": name, "base": f"refs/heads/{base}", "head": head_sha},
         repository=repository,
-        accept=_missing_or_forbidden_under(("repository", "ref"), ("repository", "head")),
+        accept=_missing_or_forbidden_under(("repository", "ref")),
     )
-    found = answer.data["repository"]
-    compared = (found.get("ref") or {}).get("compare")
+    compared = (answer.data["repository"].get("ref") or {}).get("compare")
     if answer.accepted or not isinstance(compared, dict):
         said = "; ".join(error.message for error in answer.accepted)
         return FactGap("behind_by", said or f"GitHub has no compare of {base} with the head.")
-    compared_head = ((found.get("head") or {}).get("target") or {}).get("oid")
-    if compared_head != head_sha:
-        return FactGap(
-            "behind_by",
-            f"The head moved to {compared_head or 'nothing'} while {head_sha} was read; "
-            "its compare with the base wasn't taken.",
-        )
     return compared
 
 

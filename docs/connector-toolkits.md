@@ -477,9 +477,11 @@ assert not fake.unanswered
   header doesn't name its repository is refused, as Cayu Cloud's connector refuses it.
 - **GraphQL.** There is no GraphQL engine: `on_graphql(name, answer)` answers the operation
   named `name` (the document's first definition, so not one that starts with a `fragment`) with
-  `answer(variables, repository)`, the whole answer with its `data` and `errors`. `read_pull` reads
-  the rest from the fake's routes once a test answers its `PullRequestCompare` query, and
-  `list_pulls` reads its `PullRequestFacts` query's answer.
+  `answer(variables, repository)`, the whole answer with its `data` and `errors`. The fake
+  answers `read_pull`'s `PullRequestCompare` query itself, from the pulls' `behind_by` and
+  `ahead_by`, resolving a branch but not a pull request's `refs/pull/N/head`, as GitHub's
+  GraphQL doesn't; `read_pull` reads the rest from the fake's routes, and `list_pulls` reads its
+  `PullRequestFacts` query's answer.
 
 ## GitHub tools
 

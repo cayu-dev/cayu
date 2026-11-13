@@ -57,18 +57,6 @@ def waits(monkeypatch: pytest.MonkeyPatch) -> None:
 def _fake() -> FakeGitHub:
     fake = FakeGitHub(login=BOT)
     fake.add_repository(REPO)
-
-    def compare(variables: Any, repository: str) -> dict[str, Any]:
-        pull = next(
-            pull
-            for pull in fake.repository(repository).pulls
-            if variables["head"] == f"refs/pull/{pull.number}/head"
-        )
-        counts = {"aheadBy": pull.ahead_by, "behindBy": pull.behind_by}
-        head = {"target": {"oid": pull.head_sha}}
-        return {"data": {"repository": {"ref": {"compare": counts}, "head": head}}}
-
-    fake.on_graphql("PullRequestCompare", compare)
     return fake
 
 

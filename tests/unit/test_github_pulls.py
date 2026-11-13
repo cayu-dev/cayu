@@ -24,18 +24,10 @@ GRAPHQL = "/graphql"
 TOO_LARGE = Refusal(502, "upstream_response_too_large", "The answer is over 5 MiB.")
 
 
-def _compared(compare: dict[str, int] | None, head: str = SHA) -> dict[str, Any]:
-    """GraphQL's compare of the base branch with the pull request's head, and the commit that
-    head named."""
+def _compared(compare: dict[str, int] | None) -> dict[str, Any]:
+    """GraphQL's compare of the base branch with the pull request's head."""
 
-    return {
-        "data": {
-            "repository": {
-                "ref": None if compare is None else {"compare": compare},
-                "head": {"target": {"oid": head}},
-            }
-        }
-    }
+    return {"data": {"repository": {"ref": None if compare is None else {"compare": compare}}}}
 
 
 def _graphql_error(kind: str, *path: str | int) -> dict[str, Any]:
@@ -254,7 +246,7 @@ def test_read_pull_answers_every_fact_through_rest() -> None:
     compare = by_path[GRAPHQL].json()
     assert "query PullRequestCompare" in compare["query"]
     assert compare["variables"]["base"] == "refs/heads/release/1.x"
-    assert compare["variables"]["head"] == "refs/pull/7/head"
+    assert compare["variables"]["head"] == SHA
     assert by_path[f"{ROOT}/commits/{SHA}/check-runs"].query["per_page"] == "30"
     assert by_path[f"{ROOT}/actions/runs"].query["head_sha"] == SHA
 
@@ -384,15 +376,6 @@ def test_an_outage_or_rate_limit_still_fails_the_read(
 ) -> None:
     with pytest.raises(error):
         _read(_rest(_routes(**{f"{ROOT}/pulls/7/reviews": failure})))
-
-
-def test_a_compare_of_a_head_that_moved_during_the_read_is_a_gap() -> None:
-    moved = Answer(body=_compared({"aheadBy": 1, "behindBy": 0}, head="b" * 40))
-    facts = _read(_rest(_routes(**{GRAPHQL: moved})))
-
-    assert (facts.behind_by, facts.ahead_by) == (None, None)
-    assert [gap.fact for gap in facts.gaps] == ["behind_by"]
-    assert "moved" in facts.gaps[0].reason and SHA in facts.gaps[0].reason
 
 
 def test_a_missing_base_branch_is_a_gap_on_the_compare() -> None:

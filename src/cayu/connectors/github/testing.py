@@ -11,8 +11,8 @@ runs, workflow runs and their reruns and logs, issues, comments, labels, release
 collaborator permissions). Any other route, query filter or body field raises
 ``NotImplementedError`` rather than being guessed or ignored, and is kept in ``unanswered``, which
 a test asserts is empty in case the application caught the error; ``route()`` adds a route. It
-has no GraphQL engine: ``on_graphql(name, answer)`` answers a named operation, as the test
-writes it. Refusal texts and orders that GitHub's documentation doesn't give were checked
+has no GraphQL engine: it answers ``read_pull``'s ``PullRequestCompare`` query from the pulls, and
+``on_graphql(name, answer)`` answers any other named operation, as the test writes it. Refusal texts and orders that GitHub's documentation doesn't give were checked
 against GitHub itself, and say so where they are made.
 """
 
@@ -58,6 +58,15 @@ _PAGING = frozenset({"per_page", "page"})
 _PASSED = frozenset({"success", "neutral", "skipped"})
 _OPERATION = re.compile(r"^\s*(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _COMMENT = re.compile(r"#[^\n\r]*")
+#: A ``ref(qualifiedName: $variable) { ... }`` field of a GraphQL document, with its alias and
+#: the variable a ``compare(headRef: $variable)`` inside it names.
+_REF_FIELD = re.compile(
+    r"(?:(\w+)\s*:\s*)?\bref\(\s*qualifiedName:\s*\$(\w+)\s*\)\s*\{"
+    r"([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}"
+)
+_COMPARE_HEAD = re.compile(r"compare\(\s*headRef:\s*\$(\w+)\s*\)")
+_COMPARE_OPERATION = "PullRequestCompare"
+_PULL_REF = re.compile(r"refs/pull/(\d+)/head")
 
 
 def _iso(when: datetime) -> str:
@@ -507,7 +516,8 @@ class FakeGitHub:
         """Answer the GraphQL operation named ``operation`` (``query Name(...)``) with
         ``answer(variables, repository)``: the whole answer, ``{"data": ..., "errors": ...}``.
         The operation is the document's first definition, so a document that starts with a
-        ``fragment`` isn't answered."""
+        ``fragment`` isn't answered. An answer given here takes the place of the fake's own
+        ``PullRequestCompare`` answer."""
 
         self._graphql[operation] = answer
 
@@ -614,7 +624,10 @@ class FakeGitHub:
     def _answer_graphql(self, call: Call) -> ConnectionResponse:
         document = call.json() or {}
         matched = _OPERATION.match(_COMMENT.sub(" ", str(document.get("query", ""))))
-        answer = self._graphql.get(matched.group(1)) if matched else None
+        operation = matched.group(1) if matched else None
+        answer = self._graphql.get(operation or "")
+        if answer is None and operation == _COMPARE_OPERATION:
+            return reply(200, self._compare_refs(document, call.repository or ""))
         if answer is None:
             raise self.unanswerable(
                 call,
@@ -622,6 +635,36 @@ class FakeGitHub:
                 "(query Name(...)) and register one with on_graphql().",
             )
         return reply(200, dict(answer(document.get("variables") or {}, call.repository or "")))
+
+    def _compare_refs(self, document: Mapping[str, Any], repository: str) -> dict[str, Any]:
+        """``read_pull``'s ``PullRequestCompare`` query: each ``ref(qualifiedName:)`` field of
+        the document answered from the pulls, with its ``target`` and its ``compare(headRef:)``
+        when asked. As checked against GitHub, GraphQL resolves a branch but answers ``null``
+        for a pull request's ``refs/pull/N/head``, though a compare takes that ref, a branch or
+        a commit as its head."""
+
+        variables = document.get("variables") or {}
+        found = self.repositories.get(repository.lower())
+        if found is None:
+            missing = f"Could not resolve to a Repository with the name '{repository}'."
+            error = {"type": "NOT_FOUND", "path": ["repository"], "message": missing}
+            return {"data": {"repository": None}, "errors": [error]}
+        data: dict[str, Any] = {}
+        for alias, name, fields in _REF_FIELD.findall(str(document.get("query", ""))):
+            qualified = str(variables.get(name, ""))
+            target = _ref_target(found, qualified)
+            if target is None:
+                data[alias or "ref"] = None
+                continue
+            answered: dict[str, Any] = {}
+            if re.search(r"\btarget\b", fields):
+                answered["target"] = {"oid": target}
+            head = _COMPARE_HEAD.search(fields)
+            if head:
+                base = qualified.removeprefix("refs/heads/")
+                answered["compare"] = _ref_compare(found, base, str(variables.get(head[1], "")))
+            data[alias or "ref"] = answered
+        return {"data": {"repository": data}}
 
     def _page(
         self,
@@ -948,6 +991,49 @@ def _head(repository: Repository, ref: str) -> PullRequest | None:
     """The pull whose head is ``ref``: its sha, or its branch."""
 
     return next((pull for pull in repository.pulls if ref in (pull.head_sha, pull.head_ref)), None)
+
+
+def _ref_target(repository: Repository, qualified: str) -> str | None:
+    """The commit GraphQL's ``ref(qualifiedName:)`` names: a pull's head branch names its head,
+    the default branch or a pull's base a commit of its own; anything else, ``refs/pull/N/head``
+    included, is ``None``."""
+
+    if not qualified.startswith("refs/heads/"):
+        return None
+    branch = qualified.removeprefix("refs/heads/")
+    pull = next((pull for pull in repository.pulls if pull.head_ref == branch), None)
+    if pull is not None:
+        return pull.head_sha
+    if branch == repository.default_branch or any(p.base == branch for p in repository.pulls):
+        return hashlib.sha1(f"{repository.full_name}@{branch}".encode()).hexdigest()
+    return None
+
+
+def _ref_compare(repository: Repository, base: str, head: str) -> dict[str, int] | None:
+    """GraphQL's compare of branch ``base`` with ``head`` (a commit, branch or pull request
+    ref), from the pull's ``behind_by`` and ``ahead_by``; ``None`` for a head of no pull on
+    ``base``."""
+
+    if head.removeprefix("refs/heads/") == base:
+        return {"aheadBy": 0, "behindBy": 0}
+    number = _PULL_REF.fullmatch(head)
+    branch = head.removeprefix("refs/heads/")
+    pull = next(
+        (
+            pull
+            for pull in repository.pulls
+            if pull.base == base
+            and (
+                pull.number == int(number[1])
+                if number
+                else branch in (pull.head_sha, pull.head_ref)
+            )
+        ),
+        None,
+    )
+    if pull is None:
+        return None
+    return {"aheadBy": pull.ahead_by, "behindBy": pull.behind_by}
 
 
 def _compare(r: _Served) -> ConnectionResponse:
