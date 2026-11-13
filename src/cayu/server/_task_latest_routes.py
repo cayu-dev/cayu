@@ -20,8 +20,18 @@ if TYPE_CHECKING:
     from cayu.tasks.records import Task
     from cayu.tasks.store import TaskStore
 
-# How many groups one store read asks for while paging over the shown groups.
+# How many groups one store read asks for while paging over the shown groups, and how
+# many such reads one request may make: each runs the store's grouping query again.
 _GROUP_READ_SIZE = 1000
+_MAX_GROUP_READS = 10
+_TOO_DEEP = (
+    f"With by, a request reads at most {_GROUP_READ_SIZE * _MAX_GROUP_READS} keys. "
+    "Narrow the tasks with type, status or session_id, or use a smaller offset."
+)
+
+
+class _PageTooDeep(Exception):
+    """The page lies past the keys one request may read."""
 
 
 async def _shown_groups(
@@ -31,13 +41,14 @@ async def _shown_groups(
 
     A key that redaction masks forms no group: one row per hidden value would count the
     hidden values and tell which tasks share one. The page is cut after those groups
-    are left out, so it has no gaps that would count them either.
+    are left out, so it has no gaps that would count them either. A page that is not
+    full after the reads one request may make is refused, not returned short.
     """
 
     path = latest_tasks_key_path(by)
     page: list[Task] = []
     skipped = read = 0
-    while len(page) < query.limit:
+    for _ in range(_MAX_GROUP_READS):
         groups = await store.latest_tasks(
             query.model_copy(update={"offset": read, "limit": _GROUP_READ_SIZE}), by=by
         )
@@ -50,9 +61,9 @@ async def _shown_groups(
             elif len(page) < query.limit:
                 page.append(task)
         read += len(groups)
-        if len(groups) < _GROUP_READ_SIZE:
-            break
-    return page
+        if len(groups) < _GROUP_READ_SIZE or len(page) == query.limit:
+            return page
+    raise _PageTooDeep
 
 
 def register_task_latest_route(
@@ -127,6 +138,8 @@ def register_task_latest_route(
                 tasks = await _shown_groups(store, query, by, cayu_app.redact_json)
         except NotImplementedError:
             raise HTTPException(501, "This task store can't read the latest tasks.") from None
+        except _PageTooDeep:
+            raise HTTPException(422, _TOO_DEEP) from None
         rows = [serialize_task(cayu_app, task) for task in tasks]
         allowed_types = query.types or ((query.type,) if query.type is not None else None)
         return [

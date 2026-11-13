@@ -868,7 +868,9 @@ included, newest first by `completed_at`: `type` or repeated `types`, `status`,
 maximum 1,000) and `offset`. With `by=input.KEY` it returns the newest task for
 each distinct text value of that input field, and `limit` and `offset` page the
 keys. A value that redaction masks forms no key, so the keys neither count the
-hidden values nor show which tasks share one. It reads the store natively (`TaskStore.latest_tasks`), applies resource
+hidden values nor show which tasks share one. With `by`, one request reads at most
+10,000 keys, hidden ones included; a page that lies past them is refused with 422,
+so narrow the tasks or use a smaller `offset`. It reads the store natively (`TaskStore.latest_tasks`), applies resource
 access bounds, and returns 501 for a store that can't.
 
 `GET /api/tasks/{task_id}/dependents` returns the same bounded envelope for tasks

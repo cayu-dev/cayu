@@ -137,3 +137,25 @@ def test_latest_by_input_key_forms_no_group_from_a_hidden_value() -> None:
     assert grouped(limit=1, offset=2) == []
     # Without grouping every task is still listed, its hidden value masked.
     assert len(client.get("/api/tasks/latest").json()) == len(tokens)
+
+    # One request reads the store a bounded number of times: a page past the keys
+    # those reads reach is refused, and a full page needs no further read.
+    from cayu.server import _task_latest_routes as route
+
+    reads = []
+    read_store = store.latest_tasks
+
+    async def counted(query: TaskQuery, by: str | None = None) -> list:
+        reads.append(query.offset)
+        return await read_store(query, by=by)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(route, "_GROUP_READ_SIZE", 1)
+        patch.setattr(route, "_MAX_GROUP_READS", 2)
+        patch.setattr(store, "latest_tasks", counted)
+        assert grouped(limit=1) == ["t4"]
+        assert reads == [0, 1]
+        reads.clear()
+        refused = client.get("/api/tasks/latest", params={"by": "input.token", "offset": 1})
+        assert refused.status_code == 422 and "at most" in refused.json()["detail"]
+        assert reads == [0, 1]
