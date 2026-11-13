@@ -347,6 +347,92 @@ def test_a_next_session_setting_keeps_the_value_the_session_started_with(monkeyp
     assert [{**arguments, "number": 2}] == MERGED
 
 
+@pytest.mark.parametrize("same_agent", [True, False])
+def test_a_fork_keeps_or_reads_the_next_session_settings_of_its_agent(
+    monkeypatch, same_agent
+) -> None:
+    from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+    from cayu.evals.testing import ScriptedModelProvider
+    from cayu.messages import Message
+    from cayu.providers.base import ModelStreamEvent
+    from cayu.runtime.execution_profiles import (
+        ExecutionProfileAdoptionIntent,
+        ExecutionProfileAuthorityDecision,
+        ExecutionProfilePolicy,
+        ExecutionProfilePolicyAction,
+        ExecutionProfilePolicyResult,
+    )
+    from cayu.sessions.requests import ForkSessionRequest, RunRequest
+
+    monkeypatch.setenv("APP_MERGE_MODES", "o/a=approve")
+
+    class Adopt(ExecutionProfilePolicy):
+        identity = "test:setting-policy-fork-adoption:v1"
+
+        async def decide(self, request):
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="Fork to the selected agent.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+
+    async def scenario():
+        app = CayuApp(enable_logging=False, execution_profile_policy=Adopt())
+        reply = [
+            ModelStreamEvent.text_delta("Done."),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+        app.register_provider(ScriptedModelProvider(reply, name="fake"), default=True)
+        app.declare_settings([_modes_setting(env="APP_MERGE_MODES")])
+        app.register_agent(
+            AgentSpec(name="shepherd", model="fake-model"),
+            tools=[Merge(), Comment()],
+            tool_policy=_map_policy(app),
+        )
+        app.register_agent(
+            AgentSpec(name="helper", model="fake-model"),
+            tools=[Comment()],
+            tool_policy=AllowAllToolPolicy(),
+        )
+        source_agent = "shepherd" if same_agent else "helper"
+        async for _ in app.run(
+            RunRequest(
+                agent_name=source_agent,
+                session_id="source",
+                messages=[Message.text("user", "Look at o/a.")],
+            )
+        ):
+            pass
+        # The value changes after the source started and before the fork.
+        monkeypatch.setenv("APP_MERGE_MODES", "o/a=auto")
+        request = ForkSessionRequest(
+            source_session_id="source",
+            session_id="fork",
+            agent_name="shepherd",
+            execution_profile_selection="current_child",
+            profile_adoption=ExecutionProfileAdoptionIntent(
+                idempotency_key="fork",
+                reason="Fork to the shepherd.",
+                requested_by=ResolutionActor(
+                    subject="operator", source=ResolutionActorSource.REQUEST
+                ),
+            ),
+        )
+        [_ async for _ in app.fork_session(request)]
+        fork = await app.session_store.load("fork")
+        await app.aclose()
+        return fork
+
+    fork = asyncio.run(scenario())
+    assert fork is not None
+    # A fork of the same agent keeps the source's value; one that selects another agent
+    # reads that agent's settings as it starts, like any new session.
+    expected = {"o/a": "approve"} if same_agent else {"o/a": "auto"}
+    assert fork.metadata["cayu:session_settings"] == {
+        "app.merge_modes": {"value": expected, "source": "environment", "refused": None}
+    }
+
+
 def test_a_live_setting_is_not_kept_by_the_session(monkeypatch) -> None:
     monkeypatch.setenv("APP_MERGE_MODE", "approve")
 

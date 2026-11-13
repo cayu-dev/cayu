@@ -205,7 +205,11 @@ from cayu.tools.exposure import (
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
 )
-from cayu.tools.policy import metadata_with_taint_labels, taint_labels_from_metadata
+from cayu.tools.policy import (
+    ToolPolicy,
+    metadata_with_taint_labels,
+    taint_labels_from_metadata,
+)
 from cayu.tools.targeted_projection import resolve_targeted_tool_projection
 from cayu.vaults.redaction import SecretRedactor
 from cayu.workspaces.observation_recovery import (
@@ -786,6 +790,7 @@ class SessionFork:
         fork_environment_rebuild_record: Callable[
             [Session, str | None], Awaitable[EnvironmentRebuildRecord | None]
         ],
+        session_settings: Callable[[ToolPolicy], dict[str, Any] | None] | None = None,
     ) -> None:
         self.session_store = session_store
         self._task_store = task_store
@@ -808,6 +813,7 @@ class SessionFork:
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._ensure_session_environment = ensure_session_environment
         self._fork_environment_rebuild_record = fork_environment_rebuild_record
+        self._session_settings = session_settings
         self._effective_retry_policy = effective_retry_policy
         if type(application_run_defaults) is not RunDefaults:
             raise TypeError("application_run_defaults must be a RunDefaults.")
@@ -1953,10 +1959,16 @@ class SessionFork:
             and source_slot["model"] == model
         ):
             fork_metadata[MODEL_SLOT_METADATA_KEY] = source_slot
-        # It keeps the next_session settings the source started with while it keeps its agent.
-        source_settings = source_session.metadata.get(SESSION_SETTINGS_METADATA_KEY)
-        if source_settings is not None and agent_name == source_session.agent_name:
-            fork_metadata[SESSION_SETTINGS_METADATA_KEY] = source_settings
+        # It keeps the next_session settings the source started with while it keeps its agent;
+        # a fork to another agent reads that agent's now, as a new session would.
+        if agent_name == source_session.agent_name:
+            fork_settings = source_session.metadata.get(SESSION_SETTINGS_METADATA_KEY)
+        elif self._session_settings is not None:
+            fork_settings = self._session_settings(registered_agent.tool_policy)
+        else:
+            fork_settings = None
+        if fork_settings:
+            fork_metadata[SESSION_SETTINGS_METADATA_KEY] = fork_settings
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
                 fork_metadata,

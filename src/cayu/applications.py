@@ -1695,6 +1695,7 @@ class CayuApp(
             get_registered_environment_for_session=self._get_registered_environment_for_session,
             ensure_session_environment=partial(ensure_session_environment, self),
             fork_environment_rebuild_record=partial(fork_environment_rebuild_record, self),
+            session_settings=self._session_settings,
             effective_retry_policy=self._effective_retry_policy,
             application_run_defaults=resolved_config.run,
             execution_profile_process_identity=self._execution_profile_process_identity,
