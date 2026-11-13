@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu.agents import AgentAuthoringState
-from cayu.runtime.manifest import AppManifest, FrozenJsonObject
+from cayu.runtime.manifest import AppManifest, FrozenJsonObject, ToolManifest
 from cayu.runtime.service_manifest import (
     PublicServiceManifest,
     RuntimeStoreDurability,
@@ -47,6 +47,9 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "TOOL_APPROVAL_VALIDITY_RULE",
     "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
     "TOOL_KNOWLEDGE_STORE_UNAVAILABLE",
+    "TOOL_POLICY_SETTING_ALLOWS",
+    "TOOL_POLICY_SETTING_DEFAULT_ALLOWS",
+    "TOOL_POLICY_SETTING_INVALID",
 )
 # Every code `check_public_service_deployment` reports. `cayu serve` refuses to start a
 # production public service while any of them is reported.
@@ -441,6 +444,7 @@ def check_manifest(
                 )
             )
 
+        opaque: dict[str, list[str]] = {}
         for tool in agent.tools:
             if not tool_input_schema_supported(tool.model_dump(mode="json")["input_schema"]):
                 diagnostics.append(
@@ -552,6 +556,7 @@ def check_manifest(
                         verification_command="cayu check --fail-on warning --json",
                     )
                 )
+            diagnostics.extend(_setting_policy_diagnostics(agent.name, tool))
             if (
                 tool.effect != "external"
                 or tool.policy_coverage
@@ -570,29 +575,21 @@ def check_manifest(
                 )
             ):
                 continue
-            coverage_unknown = tool.policy_coverage == "unknown"
+            if tool.policy_coverage == "unknown":
+                opaque.setdefault(tool._opaque_policy or agent.tool_policy, []).append(tool.name)
+                continue
             diagnostics.append(
                 ProjectDiagnostic(
-                    code=(
-                        "EXTERNAL_TOOL_COVERAGE_UNKNOWN"
-                        if coverage_unknown
-                        else "EXTERNAL_TOOL_UNGUARDED"
-                    ),
+                    code="EXTERNAL_TOOL_UNGUARDED",
                     severity=DiagnosticSeverity.ERROR,
                     subject=f"tool:{agent.name}/{tool.name}",
                     path=f"agents.{agent.name}.tools.{tool.name}.policy_coverage",
                     message=(
-                        f"External-effect tool '{tool.name}' uses {agent.tool_policy}, whose "
-                        "effective coverage cannot be verified statically."
-                        if coverage_unknown
-                        else f"External-effect tool '{tool.name}' has effective policy coverage "
+                        f"External-effect tool '{tool.name}' has effective policy coverage "
                         f"'{tool.policy_coverage}' under {agent.tool_policy}."
                     ),
                     hint=(
-                        "Register a statically describable policy with enforcing coverage for "
-                        "this tool; custom policy behavior remains fail-closed."
-                        if coverage_unknown
-                        else "Register an enforcing ToolPolicy, such as "
+                        "Register an enforcing ToolPolicy, such as "
                         "EnvironmentScopedToolPolicy for pre-authorized environment scopes or "
                         "AlwaysRequireApprovalToolPolicy for per-call approval."
                     ),
@@ -603,11 +600,45 @@ def check_manifest(
                         "policy": agent.tool_policy,
                         "coverage": tool.policy_coverage,
                     },
-                    documentation_anchor=(
-                        "cayu guide diagnostics#external-tool-coverage-unknown"
-                        if coverage_unknown
-                        else "cayu guide diagnostics#external-tool-unguarded"
+                    documentation_anchor="cayu guide diagnostics#external-tool-unguarded",
+                    verification_command="cayu inspect --json && cayu check --deploy --json",
+                )
+            )
+        for policy, tool_names in sorted(opaque.items()):
+            tools = ", ".join(f"'{name}'" for name in tool_names)
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="EXTERNAL_TOOL_COVERAGE_UNKNOWN",
+                    severity=DiagnosticSeverity.ERROR,
+                    subject=(
+                        f"tool:{agent.name}/{tool_names[0]}"
+                        if len(tool_names) == 1
+                        else f"agent:{agent.name}"
                     ),
+                    path=(
+                        f"agents.{agent.name}.tools.{tool_names[0]}.policy_coverage"
+                        if len(tool_names) == 1
+                        else f"agents.{agent.name}.tool_policy"
+                    ),
+                    message=(
+                        f"{policy} decides external-effect tool{'s' if len(tool_names) > 1 else ''} "
+                        f"{tools}, and its coverage cannot be verified statically."
+                    ),
+                    hint=(
+                        "Register a statically describable policy with enforcing coverage for "
+                        "these tools, or route only the tools that need custom logic to the "
+                        "custom policy with ToolPolicyRouter; custom policy behavior remains "
+                        "fail-closed."
+                    ),
+                    tags=("deploy", "security"),
+                    parameters={
+                        "agent": agent.name,
+                        "tool": tool_names[0],
+                        "tools": list(tool_names),
+                        "policy": policy,
+                        "coverage": "unknown",
+                    },
+                    documentation_anchor="cayu guide diagnostics#external-tool-coverage-unknown",
                     verification_command="cayu inspect --json && cayu check --deploy --json",
                 )
             )
@@ -631,6 +662,80 @@ def check_manifest(
         diagnostics=tuple(selected),
         service_evidence=_service_evidence(service_manifest, diagnostics),
     )
+
+
+def _setting_policy_diagnostics(agent: str, tool: ToolManifest) -> list[ProjectDiagnostic]:
+    """What a tool's SettingToolPolicy can't map, and when it lets the tool run unapproved."""
+
+    facts = tool._setting_policy
+    if facts is None:
+        return []
+    subject = f"tool:{agent}/{tool.name}"
+    setting = facts.setting
+    parameters = {"agent": agent, "tool": tool.name, "setting": setting}
+    problem = facts.problem
+    if problem is not None:
+        return [
+            ProjectDiagnostic(
+                code="TOOL_POLICY_SETTING_INVALID",
+                severity=DiagnosticSeverity.ERROR,
+                subject=subject,
+                path=f"agents.{agent}.tools.{tool.name}.policy_setting",
+                message=f"Tool '{tool.name}' is decided by SettingToolPolicy, but {problem}",
+                hint=(
+                    "Declare the setting as an enum, or a map_setting with value_choices, and "
+                    "map every choice to a decision, exactly."
+                ),
+                tags=("configuration", "security"),
+                parameters=parameters,
+                documentation_anchor="cayu guide diagnostics#tool-policy-setting-invalid",
+                verification_command="cayu check --json",
+            )
+        ]
+    found: list[ProjectDiagnostic] = []
+    allowing = facts.allowing_values
+    if allowing:
+        key_argument = facts.key_argument
+        values = " or ".join(str(value) for value in allowing)
+        found.append(
+            ProjectDiagnostic(
+                code="TOOL_POLICY_SETTING_ALLOWS",
+                severity=DiagnosticSeverity.INFO,
+                subject=subject,
+                path=f"agents.{agent}.tools.{tool.name}.policy_setting",
+                message=(
+                    f"{tool.name} runs without approval when {setting} is {values}"
+                    + ("" if key_argument is None else f" for its {key_argument}")
+                    + "."
+                ),
+                tags=("security",),
+                parameters={**parameters, "values": list(allowing)},
+                documentation_anchor="cayu guide diagnostics#tool-policy-setting-allows",
+                verification_command="cayu check --json",
+            )
+        )
+    if facts.default_allows and tool.effect == "external":
+        found.append(
+            ProjectDiagnostic(
+                code="TOOL_POLICY_SETTING_DEFAULT_ALLOWS",
+                severity=DiagnosticSeverity.WARNING,
+                subject=subject,
+                path=f"agents.{agent}.tools.{tool.name}.policy_setting",
+                message=(
+                    f"With nothing configured, {setting}'s default lets external-effect tool "
+                    f"'{tool.name}' run without approval."
+                ),
+                hint=(
+                    "Give the setting a default that requires approval or denies, so a new "
+                    "deployment starts closed."
+                ),
+                tags=("deploy", "security"),
+                parameters=parameters,
+                documentation_anchor="cayu guide diagnostics#tool-policy-setting-default-allows",
+                verification_command="cayu check --json",
+            )
+        )
+    return found
 
 
 def _check_project_control_plane(

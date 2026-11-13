@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.budgets.base import BudgetLimit
     from cayu.sessions.records import Session
+    from cayu.tools.policy import ToolPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +480,28 @@ class ManagedSettingsEntrances:
         if setting is None:
             raise KeyError(f"No managed setting is declared as {key!r}.")
         return self._read_managed_setting(setting)
+
+    def _session_settings(self: CayuApp, policy: ToolPolicy) -> dict[str, Any] | None:
+        """The ``next_session`` settings a new session's ``SettingToolPolicy`` decides
+        from, read as the session starts.
+
+        The session keeps them in its metadata, as it keeps its model, so a value
+        changed later applies to new sessions, not to running or resumed ones.
+        """
+
+        from cayu.tools.policy_router import setting_policies
+        from cayu.tools.setting_policy import session_setting_record, setting_choices
+
+        keys = {item.setting for item in setting_policies(policy) if item.settings is self}
+        if not keys:
+            return None
+        return {
+            setting.key: session_setting_record(self._read_managed_setting(setting))
+            for setting in self.managed_settings()
+            if setting.key in keys
+            and setting.applies == "next_session"
+            and setting_choices(setting) is not None
+        } or None
 
     def read_managed_settings(self: CayuApp) -> tuple[ManagedSettingReading, ...]:
         """Every declared setting's value and where it comes from, sorted by key."""

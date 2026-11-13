@@ -126,8 +126,9 @@ def test_maintained_wrapper_preserves_exact_base_coverage(kind):
         == manifest.model_dump()
     )
     diagnostics = check_manifest(manifest).diagnostics
+    # An opaque policy is reported once, naming every tool it leaves unknown.
     assert sum(d.code == "EXTERNAL_TOOL_COVERAGE_UNKNOWN" for d in diagnostics) == (
-        2
+        1
         if kind in {"custom", "subclass", "cycle", "nested-cycle", "guarded-cycle", "mixed-cycle"}
         else 0
     )

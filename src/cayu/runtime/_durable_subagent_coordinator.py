@@ -71,6 +71,7 @@ from cayu.sessions.requests import (
     InterruptSessionRequest,
     RunRequest,
     bind_runtime_model_slot,
+    bind_runtime_session_settings,
     copy_run_request,
     run_request_with_prepared_session_authority,
     run_request_with_runtime_generated_authority,
@@ -100,6 +101,7 @@ from cayu.tools.exposure import (
     resolve_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
 )
+from cayu.tools.policy import ToolPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +162,7 @@ class DurableSubagentCoordinator:
             Awaitable[_QueuedDispatchSettlement],
         ],
         acknowledge_dispatch: Callable[..., Awaitable[None]],
+        session_settings: Callable[[ToolPolicy], dict[str, Any] | None] | None = None,
     ) -> None:
         self.session_store = session_store
         self._runtime_session_store = runtime_session_store
@@ -174,6 +177,7 @@ class DurableSubagentCoordinator:
         self._load_session_invocation = load_session_invocation
         self._classify_dispatch_settlement = classify_dispatch_settlement
         self._acknowledge_dispatch = acknowledge_dispatch
+        self._session_settings = session_settings
 
     def _route_registered_provider_for_model(
         self,
@@ -929,6 +933,13 @@ class DurableSubagentCoordinator:
             request = copy_run_request(intent.request)
             # The child is created with the slot its model came from when it was prepared.
             bind_runtime_model_slot(request, intent.child_model_slot)
+            # The next_session settings its tool policy reads, as the child starts.
+            bind_runtime_session_settings(
+                request,
+                None
+                if self._session_settings is None
+                else self._session_settings(registered_child.tool_policy),
+            )
             request = run_request_with_runtime_generated_authority(
                 request,
                 "session_id",

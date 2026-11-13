@@ -189,6 +189,40 @@ exact downstream built-ins without calling guards or probing application stores.
 Overriding policy subclasses and unknown downstream policies remain unknown.
 Declare a behavior identity on custom guards for portable recovery; coverage is
 not a self-attestation and does not prove the guard's application logic.
+A custom policy is reported once per agent, naming every external tool it
+decides. To keep the custom logic for one tool only, route that tool to it with
+`ToolPolicyRouter({"merge_pull_request": MyPolicy()}, default=...)`: each tool's
+coverage then comes from its own route, so only the routed tool stays unknown.
+A setting-driven decision needs no custom policy at all: see
+`tool-policy-setting-invalid`.
+
+## tool-policy-setting-invalid
+
+`TOOL_POLICY_SETTING_INVALID` means a tool is decided by `SettingToolPolicy`, but
+the policy can't map the setting it reads: the setting isn't declared, it is
+neither an `enum` nor a `map_setting` with `value_choices`, a map setting has no
+`key_argument` (or an enum has one), `decisions` doesn't map the setting's
+choices exactly, or `key_argument` isn't a string property of the tool's input
+schema. At run time such a call gets the policy's `otherwise` decision (deny or
+approval), never an allow. Declare the setting with `app.declare_settings(...)`
+or `register_agent(settings=...)` and map every choice.
+
+## tool-policy-setting-allows
+
+`TOOL_POLICY_SETTING_ALLOWS` is information: it says which values of the setting
+let the tool run without approval, for example "merge_pull_request runs without
+approval when app.merge_modes is auto for its repository". Whoever can change
+the setting in Cayu Cloud, or in the `env` variable it falls back to, decides
+that. A `live` setting is read each time a call is authorized; a `next_session`
+one when a session starts, and the session keeps that value while it runs and
+when it resumes.
+
+## tool-policy-setting-default-allows
+
+`TOOL_POLICY_SETTING_DEFAULT_ALLOWS` means that with nothing configured, the
+setting's declared default lets an external-effect tool run without approval.
+Give the setting a default that requires approval or denies, so a new
+deployment starts closed.
 
 ## tool-approval-validity-rule
 

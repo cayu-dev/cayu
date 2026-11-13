@@ -127,7 +127,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfileMigrationRequired,
 )
 from cayu.runtime.loop_policies import LoopPolicy
-from cayu.session_metadata import inherited_display_metadata
+from cayu.session_metadata import SESSION_SETTINGS_METADATA_KEY, inherited_display_metadata
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
 from cayu.sessions._checkpoint_publication import _initial_transcript_pending_interaction_id
@@ -1953,6 +1953,10 @@ class SessionFork:
             and source_slot["model"] == model
         ):
             fork_metadata[MODEL_SLOT_METADATA_KEY] = source_slot
+        # It keeps the next_session settings the source started with while it keeps its agent.
+        source_settings = source_session.metadata.get(SESSION_SETTINGS_METADATA_KEY)
+        if source_settings is not None and agent_name == source_session.agent_name:
+            fork_metadata[SESSION_SETTINGS_METADATA_KEY] = source_settings
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
                 fork_metadata,

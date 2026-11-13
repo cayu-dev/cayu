@@ -24304,6 +24304,10 @@ export type ToolManifest = {
      * Policy Environment Names
      */
     policy_environment_names?: Array<string> | null;
+    /**
+     * Policy Setting
+     */
+    policy_setting?: string | null;
     registration_provenance: RegistrationProvenance;
     /**
      * Sandboxed

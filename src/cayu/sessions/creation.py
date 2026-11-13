@@ -25,6 +25,7 @@ from cayu.execution_profiles import (
     direct_tool_capability_ceiling_component,
 )
 from cayu.session_metadata import (
+    SESSION_SETTINGS_METADATA_KEY,
     TITLE_METADATA_KEY,
     reject_session_display_metadata,
     validate_title,
@@ -55,7 +56,12 @@ from cayu.sessions.invocation import (
     session_invocation_from_task,
 )
 from cayu.sessions.records import RUNTIME_BUILD_PROVENANCE_METADATA_KEY, Session, SessionIdentity
-from cayu.sessions.requests import RunRequest, copy_run_request, runtime_model_slot
+from cayu.sessions.requests import (
+    RunRequest,
+    copy_run_request,
+    runtime_model_slot,
+    runtime_session_settings,
+)
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
     ToolCapabilityCeiling,
@@ -213,6 +219,13 @@ def session_metadata_for_creation(
     )
     if model_slot is not None and model_slot["model"] == identity.model:
         copied[MODEL_SLOT_METADATA_KEY] = model_slot
+    # Runtime-owned too: the next_session settings session preparation read for it.
+    copied.pop(SESSION_SETTINGS_METADATA_KEY, None)
+    session_settings = (
+        None if prepared_request is None else runtime_session_settings(prepared_request)
+    )
+    if session_settings:
+        copied[SESSION_SETTINGS_METADATA_KEY] = session_settings
     if tool_capability_ceiling is not None:
         copied = session_metadata_with_tool_capability_ceiling(
             copied,

@@ -48324,6 +48324,17 @@
             ],
             "title": "Policy Environment Names"
           },
+          "policy_setting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Policy Setting"
+          },
           "registration_provenance": {
             "$ref": "#/components/schemas/RegistrationProvenance"
           },

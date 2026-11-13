@@ -19,6 +19,10 @@ EVAL_TRIAL_METADATA_KEY = "cayu:eval_trial"
 ATTENTION_HANDOFF_METADATA_KEY = "cayu:attention_handoff"
 RUN_LINEAGE_METADATA_KEY = "cayu:run_lineage"
 TASK_METADATA_KEY = "cayu:task_id"
+#: The ``next_session`` managed settings a session's SettingToolPolicy reads, with the
+#: values the session started with: ``{key: {"value", "source", "refused"}}``. Runtime
+#: authority, written when the session is created.
+SESSION_SETTINGS_METADATA_KEY = "cayu:session_settings"
 MAX_SESSION_TITLE_LENGTH = 256
 MAX_SESSION_SUMMARY_LENGTH = 4096
 MAX_AGENT_DESCRIPTION_LENGTH = 1024

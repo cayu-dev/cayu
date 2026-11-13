@@ -23,6 +23,8 @@ from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
 )
+from cayu.tools.policy_router import ToolPolicyRouter
+from cayu.tools.setting_policy import SettingToolPolicy
 from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
 
@@ -32,6 +34,14 @@ def _violation_action(decision: ToolPolicyDecision) -> str:
         if decision is ToolPolicyDecision.REQUIRE_APPROVAL
         else "denies the call"
     )
+
+
+def _decision_text(decision: ToolPolicyDecision) -> str:
+    return {
+        ToolPolicyDecision.ALLOW: "runs without approval",
+        ToolPolicyDecision.REQUIRE_APPROVAL: "requires approval",
+        ToolPolicyDecision.DENY: "is denied",
+    }[decision]
 
 
 def policy_details(policy: ToolPolicy, name: str) -> tuple[list[str], bool]:
@@ -47,6 +57,18 @@ def _details(policy: ToolPolicy, name: str, seen: frozenset[int]) -> tuple[list[
     if id(policy) in seen:
         return ["Policy composition is cyclic; inspect the application policy."], False
     seen = seen | {id(policy)}
+    if type(policy) is ToolPolicyRouter:
+        return _details(policy.policy_for(name), name, seen)
+    if type(policy) is SettingToolPolicy:
+        entry = "" if policy.key_argument is None else f" for the call's {policy.key_argument}"
+        mapped = "; ".join(
+            f"{value}: {_decision_text(decision)}"
+            for value, decision in sorted(policy.decisions.items())
+        )
+        return [
+            f"Decided by the managed setting {policy.setting}{entry}, read when the call is authorized: {mapped}.",
+            f"With no usable value (undeclared, refused, missing entry) the call {_decision_text(policy.otherwise)}.",
+        ], True
     if type(policy) is StructuredCommandToolPolicy:
         base_details, base_complete = (
             (["This policy has no base restrictions for this tool."], True)

@@ -1725,6 +1725,7 @@ class CayuApp(
             managed_evidence=self._managed_session_evidence,
             model_slot=self._session_model_slot,
             model_slot_name=self._model_slot_name,
+            session_settings=self._session_settings,
         )
 
         self._session_tasks = SessionTaskLifecycle(
@@ -2035,6 +2036,7 @@ class CayuApp(
             load_session_invocation=self.session_invocation_for_dispatch,
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
             acknowledge_dispatch=self._acknowledge_queued_dispatch,
+            session_settings=self._session_settings,
         )
 
         self._queued_dispatch_coordinator = QueuedDispatchCoordinator(

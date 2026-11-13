@@ -63,3 +63,30 @@ def test_inspect_retains_manifest_when_coverage_drifts(tmp_path, monkeypatch, ca
         "remember_knowledge"
     ]
     assert any(d["path"].endswith("policy_coverage") for d in report["diagnostics"])
+
+
+def test_a_custom_policy_behind_a_guard_is_reported_once_without_drift(
+    tmp_path, monkeypatch, capsys
+):
+    assert main(["new", "profile", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "profile"
+    policy = project / "policies/tools.py"
+    policy.write_text(
+        policy.read_text()
+        + "\nfrom cayu.tools import GuardedToolPolicy, ToolPolicy, ToolPolicyResult\n"
+        "\ndef build_tool_policy(external_tool_names):\n"
+        "    class MergeModes(ToolPolicy):\n"
+        "        async def authorize(self, request):\n"
+        '            return ToolPolicyResult(decision="require_approval")\n'
+        "\n"
+        "    return GuardedToolPolicy(guards=(), then=MergeModes())\n"
+    )
+    monkeypatch.chdir(project)
+    main(["check", "--json"])
+    diagnostics = json.loads(capsys.readouterr().out)["diagnostics"]
+    codes = [d["code"] for d in diagnostics]
+    assert codes.count("EXTERNAL_TOOL_COVERAGE_UNKNOWN") == 1
+    assert "SCAFFOLD_CAPABILITY_DRIFT" not in codes
+    [finding] = [d for d in diagnostics if d["code"] == "EXTERNAL_TOOL_COVERAGE_UNKNOWN"]
+    assert finding["parameters"]["policy"].endswith("MergeModes")

@@ -132,8 +132,6 @@ from cayu.tools.grants import (
 )
 from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
-    ApprovalFloorToolPolicy,
-    GuardedToolPolicy,
     TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
@@ -232,21 +230,12 @@ def _tool_effect(
 
 
 def _taint_policy(policy: ToolPolicy) -> TaintAwareToolPolicy | None:
-    # Composition wrappers keep the downstream policy's protection; follow every layer.
-    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    # Composition wrappers keep the downstream policy's protection; follow every
+    # layer, including each route of a ToolPolicyRouter, which admits only one.
+    from cayu.tools.policy_router import taint_policies
 
-    while True:
-        if type(policy) is GuardedToolPolicy:
-            policy = policy.then
-            continue
-        if type(policy) is ApprovalFloorToolPolicy:
-            policy = policy.inner
-            continue
-        downstream = policy.then if type(policy) is ToolAuthorizationGrantPolicy else None
-        if downstream is None:
-            break
-        policy = downstream
-    return policy if isinstance(policy, TaintAwareToolPolicy) else None
+    found = taint_policies(policy)
+    return found[0] if len(found) == 1 else None
 
 
 def _registered_tool_argument_error(registered_tool, arguments):

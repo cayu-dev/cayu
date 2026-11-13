@@ -343,7 +343,10 @@ def check_scaffold_capabilities(
         )
         expected_coverage = "approval_required" if "approvals" in selected else "denied"
         observed_coverage = proposal.policy_coverage if proposal is not None else "unknown"
-        if observed_coverage != expected_coverage:
+        # An opaque policy's unknown coverage is already reported by `cayu check`
+        # (EXTERNAL_TOOL_COVERAGE_UNKNOWN); it says nothing about drift.
+        opaque = proposal is not None and observed_coverage == "unknown"
+        if observed_coverage != expected_coverage and not opaque:
             diagnostics.append(
                 _diagnostic(
                     code="SCAFFOLD_CAPABILITY_DRIFT",

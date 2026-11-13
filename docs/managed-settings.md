@@ -136,6 +136,42 @@ for reading in app.read_managed_settings():
         print(reading.key, reading.value, reading.source, reading.refused or "")
 ```
 
+### Deciding a tool call from a setting
+
+`SettingToolPolicy` turns an `enum` setting, or a `map_setting` whose values are
+choices, into a tool policy decision. It reads the value as the setting's
+`applies` says: a `live` setting when each call is authorized, a `next_session`
+one (the default) when the session starts. The session keeps the
+`next_session` values it started with in its metadata, under
+`cayu:session_settings`, as it keeps its model, so a changed value applies to new
+sessions and not to running or resumed ones. Route the policy to the tools it
+decides with `ToolPolicyRouter`:
+
+```python
+from cayu.managed_settings import map_setting
+from cayu.tools import (
+    AlwaysRequireApprovalToolPolicy, SettingToolPolicy, ToolPolicyDecision, ToolPolicyRouter,
+)
+
+app.declare_settings([map_setting(
+    "merge_modes", label="Merge modes", item_pattern=r"[\w.-]+/[\w.-]+",
+    value_choices=("report", "approve", "auto"), default={}, env="APP_MERGE_MODES")])
+policy = ToolPolicyRouter(
+    {"merge_pull_request": SettingToolPolicy(
+        app, "app.merge_modes",
+        {"auto": ToolPolicyDecision.ALLOW,
+         "approve": ToolPolicyDecision.REQUIRE_APPROVAL,
+         "report": ToolPolicyDecision.DENY},
+        key_argument="repository")},
+    default=AlwaysRequireApprovalToolPolicy())
+```
+
+A repository with no entry, a refused value or a missing argument gets
+`otherwise` (deny by default), and so does every call while the setting's
+declaration doesn't fit the policy. `cayu check` reports such a setting
+(`TOOL_POLICY_SETTING_INVALID`) and says which values let the tool run without
+approval.
+
 Presets and factories that register a part for you pass `settings` through
 (`WebBridgeProfile.register_agent`, `register_coding_environment`) and never
 declare settings of their own on the part's behalf.

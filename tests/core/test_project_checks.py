@@ -16,7 +16,7 @@ from cayu.environments import (
     EnvironmentSpec,
 )
 from cayu.evals import ScriptedModelProvider
-from cayu.managed_settings import model_setting
+from cayu.managed_settings import ManagedSetting, ManagedSettingChoice, model_setting
 from cayu.runners import LocalRunner
 from cayu.runtime import ProjectDiagnostic, check_manifest
 from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
@@ -30,6 +30,7 @@ from cayu.tools import (
     ReadKnowledgeTool,
     RequiredFieldRule,
     SearchKnowledgeTool,
+    SettingToolPolicy,
     ToolPolicyDecision,
     ToolPolicyResult,
     WriteFileTool,
@@ -143,8 +144,44 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "TOOL_APPROVAL_VALIDITY_RULE",
         "TOOL_TERMINAL_PAYLOAD_UNBOUNDED",
         "TOOL_KNOWLEDGE_STORE_UNAVAILABLE",
+        "TOOL_POLICY_SETTING_ALLOWS",
+        "TOOL_POLICY_SETTING_DEFAULT_ALLOWS",
+        "TOOL_POLICY_SETTING_INVALID",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
+
+
+def _setting_decided_app(default_mode: str) -> CayuApp:
+    """An external tool decided by a merge-mode setting; ``nope`` isn't one of its choices."""
+
+    app = CayuApp(enable_logging=False)
+    app.declare_settings(
+        [
+            ManagedSetting(
+                key="merge_mode",
+                type="enum",
+                label="Merge mode",
+                choices=(
+                    ManagedSettingChoice(value="auto", label="Auto"),
+                    ManagedSettingChoice(value="approve", label="Approve"),
+                ),
+                default="auto",
+            )
+        ]
+    )
+    app.register_agent(
+        AgentSpec(name="sender", model="model"),
+        tools=[_ExternalTool()],
+        tool_policy=SettingToolPolicy(
+            app,
+            "app.merge_mode",
+            {
+                default_mode: ToolPolicyDecision.ALLOW,
+                "approve": ToolPolicyDecision.REQUIRE_APPROVAL,
+            },
+        ),
+    )
+    return app
 
 
 def test_public_service_deployment_rejects_in_memory_runtime_stores() -> None:
@@ -581,6 +618,11 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     knowledgeless_codes = {
         item.code for item in check_manifest(knowledgeless.describe()).diagnostics
     }
+    setting_codes = {
+        item.code
+        for allows in ("auto", "nope")
+        for item in check_manifest(_setting_decided_app(allows).describe()).diagnostics
+    }
     legacy_model = CayuApp(enable_logging=False)
     with pytest.warns(DeprecationWarning):
         setting = model_setting()
@@ -645,6 +687,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unconstrained_codes
         | unbounded_codes
         | knowledgeless_codes
+        | setting_codes
         | legacy_model_codes
         | public_service_codes
         | nondurable_task_service_codes

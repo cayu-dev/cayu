@@ -1250,9 +1250,11 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
         StaticToolPolicy,
         TaintAwareToolPolicy,
     )
+    from cayu.tools.setting_policy import SettingToolPolicy
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     policy_types = (
+        SettingToolPolicy,
         AllowAllToolPolicy,
         AlwaysRequireApprovalToolPolicy,
         EnvironmentScopedToolPolicy,
@@ -1269,26 +1271,25 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
 
 
 def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
-    from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
     from cayu.tools.policy import GuardedToolPolicy, RequiredArguments
+    from cayu.tools.policy_router import ToolPolicyRouter
 
+    if type(policy) is ToolPolicyRouter:
+        # A route's own material or declared identity; the router adds only the routing.
+        routed = {name: _policy_component(route) for name, route in sorted(policy.routes.items())}
+        default = _policy_component(policy.default)
+        if default is None or any(component is None for component in routed.values()):
+            return None
+        return {"routes": routed, "default": default}
     if type(policy) is GuardedToolPolicy:
 
         def component(value: object) -> dict[str, Any] | None:
-            material = (
-                RequiredArguments._execution_profile_material(value)
-                if type(value) is RequiredArguments
-                else _cayu_policy_material(value)
-            )
-            if material is not None:
+            if type(value) is RequiredArguments:
                 return {
                     "component": f"{type(value).__module__}:{type(value).__qualname__}",
-                    "material": material,
+                    "material": RequiredArguments._execution_profile_material(value),
                 }
-            identity = copy_execution_profile_behavior_identity(
-                getattr(value, "execution_profile_identity", None)
-            )
-            return None if identity is None else {"identity": identity.model_dump(mode="json")}
+            return _policy_component(value)
 
         downstream = component(policy.then)
         guards = [component(guard) for guard in policy.guards]
@@ -1303,23 +1304,24 @@ def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
         material: dict[str, Any] = policy._execution_profile_material()
         if policy.then is None:
             return {**material, "then": None}
-        then = policy.then
-        downstream_material = _cayu_policy_material(then)
-        if downstream_material is not None:
-            return {
-                **material,
-                "then": {
-                    "component": f"{type(then).__module__}:{type(then).__qualname__}",
-                    "material": downstream_material,
-                },
-            }
-        then_identity = copy_execution_profile_behavior_identity(
-            getattr(then, "execution_profile_identity", None)
-        )
-        if then_identity is None:
-            return None
-        return {**material, "then": {"identity": then_identity.model_dump(mode="json")}}
+        then = _policy_component(policy.then)
+        return None if then is None else {**material, "then": then}
     return _material_from_exact_type(policy, _cayu_policy_material_extractors())
+
+
+def _policy_component(value: object) -> dict[str, Any] | None:
+    from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
+
+    material = _cayu_policy_material(value)
+    if material is not None:
+        return {
+            "component": f"{type(value).__module__}:{type(value).__qualname__}",
+            "material": material,
+        }
+    identity = copy_execution_profile_behavior_identity(
+        getattr(value, "execution_profile_identity", None)
+    )
+    return None if identity is None else {"identity": identity.model_dump(mode="json")}
 
 
 @dataclass(frozen=True)

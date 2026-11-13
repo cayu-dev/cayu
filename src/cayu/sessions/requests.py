@@ -56,6 +56,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.tool_completion import ToolCompletionPolicy, copy_tool_completion_policy
 from cayu.session_metadata import (
     MAX_SESSION_TITLE_LENGTH,
+    SESSION_SETTINGS_METADATA_KEY,
     reject_session_display_metadata,
     validate_title,
 )
@@ -255,6 +256,41 @@ def bind_runtime_model_slot(request: RunRequest, record: Mapping[str, str] | Non
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeSessionSettings:
+    """Process-local proof that session preparation read the settings a new session records."""
+
+    token: object
+    record: Mapping[str, Any]
+
+
+_RUNTIME_SESSION_SETTINGS_TOKEN = object()
+
+
+def bind_runtime_session_settings(request: RunRequest, record: Mapping[str, Any] | None) -> None:
+    """Record, on a prepared request, the ``next_session`` settings its new session keeps."""
+
+    request._runtime_session_settings = (
+        None
+        if not record
+        else _RuntimeSessionSettings(
+            _RUNTIME_SESSION_SETTINGS_TOKEN, MappingProxyType(copy_durable_metadata(dict(record)))
+        )
+    )
+
+
+def runtime_session_settings(request: RunRequest) -> dict[str, Any] | None:
+    """The settings session preparation bound to ``request``; None for anything else."""
+
+    holder = request._runtime_session_settings
+    if (
+        type(holder) is not _RuntimeSessionSettings
+        or holder.token is not _RUNTIME_SESSION_SETTINGS_TOKEN
+    ):
+        return None
+    return copy_durable_metadata(dict(holder.record))
+
+
 def runtime_model_slot(request: RunRequest) -> dict[str, str] | None:
     """The slot record session preparation bound to ``request``; None for anything else."""
 
@@ -357,6 +393,9 @@ class RunRequest(BaseModel):
     # The model slot this new session's model came from (``bind_runtime_model_slot``): written
     # to the session's metadata when it is created, never taken from the caller.
     _runtime_model_slot: object | None = PrivateAttr(default=None)
+    # The next_session settings this new session keeps (``bind_runtime_session_settings``),
+    # written to its metadata when it is created, like the model slot.
+    _runtime_session_settings: object | None = PrivateAttr(default=None)
 
     @field_validator("title", mode="before")
     @classmethod
@@ -394,6 +433,7 @@ class RunRequest(BaseModel):
                     EVAL_TRIAL_METADATA_KEY,
                     TASK_METADATA_KEY,
                     MODEL_SLOT_METADATA_KEY,
+                    SESSION_SETTINGS_METADATA_KEY,
                 )
                 if key in copied
             ),
@@ -423,6 +463,8 @@ class RunRequest(BaseModel):
                 authority_name = "task authority"
             elif reserved_key == MODEL_SLOT_METADATA_KEY:
                 authority_name = "model-slot authority"
+            elif reserved_key == SESSION_SETTINGS_METADATA_KEY:
+                authority_name = "session-settings authority"
             else:
                 authority_name = "prompt-transition authority"
             raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
@@ -886,6 +928,7 @@ class ForkSessionRequest(BaseModel):
             EVAL_TRIAL_METADATA_KEY: "eval-trial authority",
             TASK_METADATA_KEY: "task authority",
             MODEL_SLOT_METADATA_KEY: "model-slot authority",
+            SESSION_SETTINGS_METADATA_KEY: "session-settings authority",
         }
         reserved_key = next(
             (key for key in reserved_authority_kinds if key in copied),
@@ -1138,6 +1181,13 @@ def copy_run_request(request: RunRequest) -> RunRequest:
     copied._runtime_model_slot = (
         model_slot
         if type(model_slot) is _RuntimeModelSlot and model_slot.token is _RUNTIME_MODEL_SLOT_TOKEN
+        else None
+    )
+    session_settings = request._runtime_session_settings
+    copied._runtime_session_settings = (
+        session_settings
+        if type(session_settings) is _RuntimeSessionSettings
+        and session_settings.token is _RUNTIME_SESSION_SETTINGS_TOKEN
         else None
     )
     prepared_creation = request._runtime_work_attempt_creation

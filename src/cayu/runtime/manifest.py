@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -57,10 +58,12 @@ from cayu.tools.policy import (
     ToolPolicy,
     ToolPolicyDecision,
 )
+from cayu.tools.policy_router import ToolPolicyRouter
 from cayu.tools.result_projection import (
     ArtifactExternalizingToolResultPolicy,
     ToolResultProjectionPolicy,
 )
+from cayu.tools.setting_policy import SettingToolPolicy
 from cayu.workspaces.branches import (
     WorkspaceBranchCapabilities,
     WorkspaceBranchLifecycleSummary,
@@ -268,6 +271,8 @@ class ToolManifest(_ManifestModel):
     approval_validity_rules: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
     command_policy: str | None = None
     named_checks: tuple[NamedCheckManifest, ...] = ()
+    # The managed setting a SettingToolPolicy decides this tool's calls from.
+    policy_setting: str | None = Field(default=None, exclude_if=lambda value: value is None)
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
     # In-process fact for checks, not part of the published manifest: the
@@ -281,6 +286,11 @@ class ToolManifest(_ManifestModel):
     # In-process fact for checks, like the ones above: a knowledge tool whose
     # agent's default environment supplies no knowledge store.
     _knowledge_store_unavailable: bool = PrivateAttr(default=False)
+    # In-process facts for checks, like the ones above: what the tool's
+    # SettingToolPolicy maps and whether it can, and the type of the opaque policy
+    # that leaves the tool's coverage unknown.
+    _setting_policy: SettingPolicyFacts | None = PrivateAttr(default=None)
+    _opaque_policy: str | None = PrivateAttr(default=None)
 
     @field_validator("adapter_identity", mode="before")
     @classmethod
@@ -693,8 +703,16 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         for tool in agent.tools
         if tool._knowledge_store_unavailable
     }
+    policy_facts = {
+        (agent.name, tool.name): (tool._setting_policy, tool._opaque_policy)
+        for agent in agents
+        for tool in agent.tools
+    }
     for agent in manifest.agents:
         for tool in agent.tools:
+            tool._setting_policy, tool._opaque_policy = policy_facts.get(
+                (agent.name, tool.name), (None, None)
+            )
             tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
             tool._terminal_payload_bound_undeclared = (agent.name, tool.name) in unbounded
             tool._knowledge_store_unavailable = (agent.name, tool.name) in without_knowledge
@@ -885,6 +903,10 @@ def _describe_tool(
     knowledge_store_unavailable: bool = False,
 ) -> ToolManifest:
     execution_contract = ToolExecutionContract.model_validate(tool.execution_contract)
+    decisive, floored = _decisive_policy(tool_policy, tool_name)
+    setting_policy = decisive if type(decisive) is SettingToolPolicy else None
+    routed_policy = _routed_policy(tool_policy, tool_name)
+    coverage = _tool_policy_coverage(tool_policy, tool_name, tool.schema)
     manifest = ToolManifest(
         name=tool_name,
         description=tool.description,
@@ -902,13 +924,13 @@ def _describe_tool(
         adapter_configuration_sha256=execution_contract.adapter_configuration_sha256,
         hard_deadline_seconds=execution_contract.hard_deadline_seconds,
         input_schema=app.redact_json(tool.schema),
-        policy_coverage=_tool_policy_coverage(tool_policy, tool_name, tool.schema),
+        policy_coverage=coverage,
         policy_environment_names=_policy_environment_names(tool_policy, tool_name),
         parameter_policy_decision=_parameter_policy_decision(tool_policy, tool_name),
         approval_validity_rules=(
             tuple(
                 f"{type(rule).__name__}({rule.parameter})"
-                for rule in tool_policy.rules.get(tool_name, ())
+                for rule in routed_policy.rules.get(tool_name, ())
                 if type(rule) in {RequiredFieldRule, RequiredAllowlistRule}
                 and not (
                     type(rule) is RequiredFieldRule
@@ -919,15 +941,22 @@ def _describe_tool(
                     == r"\S"
                 )
             )
-            if type(tool_policy) is ParameterConstrainedToolPolicy
-            and tool_policy.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+            if type(routed_policy) is ParameterConstrainedToolPolicy
+            and routed_policy.decision == ToolPolicyDecision.REQUIRE_APPROVAL
             else ()
         ),
         command_policy=_command_policy_name(tool.tool),
         named_checks=_named_check_manifests(tool.tool),
+        policy_setting=None if setting_policy is None else setting_policy.setting,
         registration_provenance=registration_provenance,
         implementation_provenance=_provenance(tool.tool, project_root),
     )
+    if setting_policy is not None:
+        manifest._setting_policy = _setting_policy_facts(
+            app, setting_policy, tool.schema, floored=floored
+        )
+    if coverage == "unknown":
+        manifest._opaque_policy = _type_name(decisive)
     manifest._policy_allows_explicitly = _policy_allows_explicitly(tool_policy, tool_name)
     manifest._terminal_payload_bound_undeclared = application_tool_declares_no_bound(
         tool.tool, execution_contract.max_terminal_payload_bytes
@@ -946,6 +975,8 @@ def _policy_allows_explicitly(
     if id(policy) in _seen:
         return False
     seen = _seen | {id(policy)}
+    if type(policy) is ToolPolicyRouter:
+        return _policy_allows_explicitly(policy.policy_for(tool_name), tool_name, _seen=seen)
     if type(policy) is GuardedToolPolicy:
         return _policy_allows_explicitly(policy.then, tool_name, _seen=seen)
     if type(policy) is ApprovalFloorToolPolicy:
@@ -1146,6 +1177,12 @@ def _parameter_policy_decision(
 ) -> Literal["deny", "require_approval"] | None:
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
+    if type(policy) is ToolPolicyRouter:
+        if id(policy) in _seen:
+            return None
+        return _parameter_policy_decision(
+            policy.policy_for(tool_name), tool_name, _seen=_seen | {id(policy)}
+        )
     seen = set(_seen)
     while type(policy) is StructuredCommandToolPolicy:
         if id(policy) in seen or policy._base_policy is None:
@@ -1175,6 +1212,10 @@ def _policy_environment_names(
 ) -> tuple[str, ...] | None:
     if id(policy) in _seen:
         return None
+    if type(policy) is ToolPolicyRouter:
+        return _policy_environment_names(
+            policy.policy_for(tool_name), tool_name, _seen=_seen | {id(policy)}
+        )
     if type(policy) is GuardedToolPolicy:
         return _policy_environment_names(policy.then, tool_name, _seen=_seen | {id(policy)})
     if type(policy) is ApprovalFloorToolPolicy:
@@ -1196,6 +1237,17 @@ def _tool_policy_coverage(
     if id(policy) in _seen:
         return "unknown"
     seen = _seen | {id(policy)}
+    if type(policy) is ToolPolicyRouter:
+        # Each tool's coverage is its own route's: only a tool routed to an opaque
+        # policy is unknown.
+        return _tool_policy_coverage(policy.policy_for(tool_name), tool_name, schema, _seen=seen)
+    if type(policy) is SettingToolPolicy:
+        possible = policy.possible_decisions()
+        if possible == {ToolPolicyDecision.DENY}:
+            return "denied"
+        if ToolPolicyDecision.ALLOW not in possible:
+            return "approval_required"
+        return "conditional"
     if type(policy) is StructuredCommandToolPolicy:
         base = (
             "allowed"
@@ -1298,6 +1350,69 @@ def _tool_policy_coverage(
             return base_coverage
         return "conditional" if tool_name == "run_command" else "allowed"
     return "unknown"
+
+
+def _routed_policy(policy: ToolPolicy, tool_name: str) -> ToolPolicy:
+    """The policy a router hands this tool to, following nested routers."""
+
+    seen: set[int] = set()
+    while type(policy) is ToolPolicyRouter and id(policy) not in seen:
+        seen.add(id(policy))
+        policy = policy.policy_for(tool_name)
+    return policy
+
+
+def _decisive_policy(policy: ToolPolicy, tool_name: str) -> tuple[ToolPolicy, bool]:
+    """Follow the built-in wrappers to the policy that decides this tool's calls.
+
+    Also says whether an approval floor on the way names the tool, so an allow
+    from the decisive policy still needs approval.
+    """
+
+    from cayu.tools.structured_commands import StructuredCommandToolPolicy
+
+    floored = False
+    seen: set[int] = set()
+    while id(policy) not in seen:
+        seen.add(id(policy))
+        if type(policy) is ToolPolicyRouter:
+            policy = policy.policy_for(tool_name)
+        elif type(policy) is GuardedToolPolicy:
+            policy = policy.then
+        elif type(policy) is ApprovalFloorToolPolicy:
+            floored = floored or tool_name in policy.tools
+            policy = policy.inner
+        elif type(policy) is StructuredCommandToolPolicy and policy._base_policy is not None:
+            policy = policy._base_policy
+        else:
+            break
+    return policy, floored
+
+
+@dataclass(frozen=True)
+class SettingPolicyFacts:
+    """What a tool's SettingToolPolicy maps, for ``cayu check``."""
+
+    setting: str
+    key_argument: str | None
+    problem: str | None
+    allowing_values: tuple[str, ...]
+    default_allows: bool
+
+
+def _setting_policy_facts(
+    app: CayuApp, policy: SettingToolPolicy, schema: Mapping[str, object], *, floored: bool
+) -> SettingPolicyFacts:
+    declared = next((item for item in app.managed_settings() if item.key == policy.setting), None)
+    problem = policy.problem(declared, schema)
+    allows = problem is None and not floored
+    return SettingPolicyFacts(
+        setting=policy.setting,
+        key_argument=policy.key_argument,
+        problem=problem,
+        allowing_values=policy.allowing_values() if allows else (),
+        default_allows=allows and declared is not None and policy.default_allows(declared),
+    )
 
 
 def _provenance(value: object, project_root: Path | None) -> RegistrationProvenance:

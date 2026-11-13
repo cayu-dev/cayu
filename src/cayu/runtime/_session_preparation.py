@@ -74,6 +74,7 @@ from cayu.sessions.records import Session, SessionIdentity
 from cayu.sessions.requests import (
     RunRequest,
     bind_runtime_model_slot,
+    bind_runtime_session_settings,
     copy_run_request,
     run_request_authority_is_runtime_generated,
     run_request_with_task_invocation,
@@ -96,6 +97,7 @@ from cayu.tools.grants import (
     TargetedToolGrant,
     prepare_targeted_tool_grants,
 )
+from cayu.tools.policy import ToolPolicy
 from cayu.tools.targeted_projection import (
     TargetedToolProjectionKind,
     resolve_targeted_tool_projection,
@@ -226,6 +228,7 @@ class SessionPreparation:
         managed_evidence: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None,
         model_slot: Callable[[str], ModelSlotResolution | None] | None = None,
         model_slot_name: Callable[[str], str | None] | None = None,
+        session_settings: Callable[[ToolPolicy], dict[str, Any] | None] | None = None,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -261,6 +264,7 @@ class SessionPreparation:
         self._managed_evidence = managed_evidence
         self._model_slot = model_slot
         self._model_slot_name = model_slot_name
+        self._session_settings = session_settings
 
     def resolve_new_run_environment(
         self,
@@ -893,6 +897,14 @@ class SessionPreparation:
         # The session records the slot its model came from, so its requests name the slot
         # for as long as it runs, whatever later releases declare.
         bind_runtime_model_slot(request, None if model_slot is None else model_slot.record())
+        # Likewise the next_session settings its tool policy decides from: read now, when
+        # the session starts, and kept for as long as it runs.
+        bind_runtime_session_settings(
+            request,
+            None
+            if self._session_settings is None
+            else self._session_settings(registered_agent.tool_policy),
+        )
         return _PreparedInitialRun(
             request=request,
             registered_agent=registered_agent,

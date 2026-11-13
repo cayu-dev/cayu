@@ -85,8 +85,9 @@ def test_checker_recognizes_only_maintained_scope_for_real_external_tools(kind):
         assert not diagnostics
         assert all(t.policy_environment_names is None for t in manifest.agents[0].tools)
     else:
-        # read_file is idempotent (content-addressed snapshots), so three remain.
-        assert len(diagnostics) == 3
+        # read_file is idempotent (content-addressed snapshots), so three remain;
+        # an opaque policy is reported once for all three.
+        assert len(diagnostics) == (1 if kind == "custom" else 3)
         assert {d.code for d in diagnostics} == {
             "EXTERNAL_TOOL_COVERAGE_UNKNOWN" if kind == "custom" else "EXTERNAL_TOOL_UNGUARDED"
         }
