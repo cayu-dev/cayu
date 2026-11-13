@@ -393,3 +393,27 @@ def test_session_grants_do_not_pass_to_a_new_session_reusing_the_id(tmp_path) ->
         assert len(harness.tool.calls) == 1
 
     asyncio.run(scenario())
+
+
+def test_a_preview_records_no_grant_use(tmp_path) -> None:
+    turns = _command_turn("call_1", ["make", "test"]) + _command_turn("call_2", ["make", "test"])
+    harness = Harness(tmp_path, turns=turns)
+
+    async def scenario():
+        await harness.run("s1")
+        await harness.remember("s1", WORKSPACE)
+        (grant,) = await harness.service.list_grants()
+        before = await harness.grants.list_uses(grant.grant_id)
+        preview = await harness.app.preview_tool_call(
+            "assistant", "exec_command", {"argv": ["make", "test"]}, session_id="s2"
+        )
+        after_preview = await harness.grants.list_uses(grant.grant_id)
+        await harness.run("s2")
+        after_run = await harness.grants.list_uses(grant.grant_id)
+        return grant, before, preview, after_preview, after_run
+
+    grant, before, preview, after_preview, after_run = asyncio.run(scenario())
+    assert preview.decision is ToolPolicyDecision.ALLOW
+    assert preview.metadata[TOOL_AUTHORIZATION_GRANT_METADATA_KEY]["grant_id"] == grant.grant_id
+    assert after_preview == before
+    assert len(after_run) == len(before) + 1

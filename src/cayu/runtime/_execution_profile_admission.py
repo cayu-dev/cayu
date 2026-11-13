@@ -649,6 +649,18 @@ def resolve_execution_profile_identity(
                 if tool_exposure_policy_entry is None
                 else {"tool_exposure_policy": tool_exposure_policy_entry}
             ),
+            # Absent without proposal-only tools so existing profiles keep their identity.
+            **(
+                {}
+                if not registered_agent.proposal_tool_names
+                else {
+                    "proposal_only_tools": {
+                        "kind": "cayu:proposal-only-tools",
+                        "schema_version": 1,
+                        "tools": sorted(registered_agent.proposal_tool_names),
+                    }
+                }
+            ),
             # Absent in the default mode so existing profiles keep their identity.
             **(
                 {}

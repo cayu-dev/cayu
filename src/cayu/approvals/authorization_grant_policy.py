@@ -40,6 +40,7 @@ from cayu.runtime.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.tools.policy import (
+    TOOL_POLICY_DRY_RUN_METADATA_KEY,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -301,6 +302,21 @@ class ToolAuthorizationGrantPolicy(ToolPolicy):
                 boundary=boundary,
             )
         grant = grants[0]
+        if request.metadata.get(TOOL_POLICY_DRY_RUN_METADATA_KEY) is True:
+            # A preview records no grant use and draws no sample: the call never runs.
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.ALLOW,
+                reason=(
+                    "A durable tool authorization grant would authorize this call; "
+                    "the call itself may still be drawn for sampled review."
+                ),
+                metadata={
+                    TOOL_AUTHORIZATION_GRANT_METADATA_KEY: {
+                        **grant.evidence_payload(),
+                        "sampled_review_rate_bps": grant.sampled_review_rate_bps,
+                    }
+                },
+            )
         bucket = tool_authorization_grant_sample_bucket(
             grant_id=grant.grant_id,
             session_id=request.session.id,

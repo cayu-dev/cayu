@@ -19,12 +19,14 @@ from cayu.runtime.application_lifecycle import _admitted_entrance, _tracked_entr
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
-    from cayu.approvals.proposals import ToolCallProposalOutcome
+    from cayu.approvals.proposals import ToolCallPreview, ToolCallProposalOutcome
     from cayu.environments.shared_allocations import (
         SharedAllocationPage,
         SharedAllocationRelease,
         SharedAllocationReleaseMode,
     )
+    from cayu.sessions.invocation import InvocationOriginClaim
+    from cayu.tools.exposure import ToolCapabilityCeiling
 
 
 _T = TypeVar("_T")
@@ -130,6 +132,80 @@ class WorkflowEntrances:
         async with aclosing(self.run(request)) as stream:
             events = [event async for event in stream]
         return ToolCallProposalOutcome.from_events(events)
+
+    @_tracked_entrance
+    async def read_tool_call_proposal(
+        self: CayuApp, session_id: str
+    ) -> ToolCallProposalOutcome | None:
+        """Where a proposal session's call stands now, or None when no such session exists.
+
+        It reads the session's persisted events as the public API shows them, so its
+        identifiers are the ones ``propose_tool_call`` returned and
+        ``resolve_tool_approval`` takes. A session that isn't a tool-call proposal
+        raises ``ValueError``.
+        """
+        from cayu.approvals.proposals import ToolCallProposalOutcome
+        from cayu.runtime._session_queries import query_all_event_records
+        from cayu.runtime._tool_call_proposals import TOOL_CALL_PROPOSAL_PROVIDER_NAME
+        from cayu.sessions.event_queries import EventQuery
+
+        if type(session_id) is not str or not session_id.strip():
+            raise ValueError("session_id must be a non-blank string.")
+        session = await self.session_store.load(session_id)
+        if session is None:
+            return None
+        if session.provider_name != TOOL_CALL_PROPOSAL_PROVIDER_NAME:
+            raise ValueError(f"Session {session_id} is not a tool-call proposal.")
+        records = await query_all_event_records(
+            self.session_store, EventQuery(session_id=session_id, limit=1000)
+        )
+        return ToolCallProposalOutcome.from_events(
+            self._project_persisted_event_record_for_exposure(record).event for record in records
+        )
+
+    @_tracked_entrance
+    async def preview_tool_call(
+        self: CayuApp,
+        agent_name: str,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        tool_call_id: str | None = None,
+        session_id: str | None = None,
+        invocation_origin: InvocationOriginClaim | None = None,
+        tool_capability_ceiling: ToolCapabilityCeiling | None = None,
+        labels: Mapping[str, str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ToolCallPreview:
+        """What ``propose_tool_call`` with these values would decide, recording nothing.
+
+        It runs the same checks (registered, exposed or proposal-only, inside the
+        ceiling, arguments matching the schema, no registered secret) and calls the
+        agent's tool policy with ``metadata["cayu:dry_run"] = True``. No session,
+        event or approval is created and no tool runs. A policy reading live state
+        decides from it as it is now, so the proposal itself can still differ.
+        """
+        from cayu.approvals.proposals import _require_secret_free_proposal
+        from cayu.runtime._tool_call_preview import preview_tool_call
+
+        _require_secret_free_proposal(
+            self._secret_redactor,
+            tool_name=tool_name,
+            arguments=arguments,
+            tool_call_id=tool_call_id,
+        )
+        return await preview_tool_call(
+            self,
+            agent_name,
+            tool_name,
+            dict(arguments or {}),
+            tool_call_id=tool_call_id or "preview",
+            session_id=session_id,
+            invocation_origin=invocation_origin,
+            tool_capability_ceiling=tool_capability_ceiling,
+            labels=dict(labels or {}),
+            metadata=dict(metadata or {}),
+        )
 
     @_tracked_entrance
     async def list_shared_allocations(

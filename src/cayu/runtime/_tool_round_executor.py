@@ -123,6 +123,7 @@ from cayu.runtime._interruption_coordinator import (
 )
 from cayu.runtime._invocation_lifecycle import InvocationContext
 from cayu.runtime._phase_timing import timed_phase, timed_tool_round
+from cayu.runtime._proposal_only_tools import proposal_call_refusal
 from cayu.runtime._run_exit import classify_run_exit
 from cayu.runtime._run_limits import (
     LimitEvaluation,
@@ -440,6 +441,19 @@ class ToolRoundExecutor:
                         call=tool_call,
                         result=None,
                         evidence=ToolPolicyEvidence.UNEXPOSED,
+                    )
+                )
+                continue
+            refusal = proposal_call_refusal(
+                registered_agent, session, tool_call, frozen_exposure=tool_exposure is not None
+            )
+            if refusal is not None:
+                # Decided before, and instead of, any tool policy.
+                policy_outcomes.append(
+                    runtime_records.ToolCallPolicyOutcome(
+                        call=tool_call,
+                        result=refusal,
+                        evidence=ToolPolicyEvidence.AUTHORITATIVE,
                     )
                 )
                 continue

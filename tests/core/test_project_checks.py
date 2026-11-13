@@ -31,6 +31,7 @@ from cayu.tools import (
     RequiredFieldRule,
     SearchKnowledgeTool,
     SettingToolPolicy,
+    StaticToolExposurePolicy,
     ToolPolicyDecision,
     ToolPolicyResult,
     WriteFileTool,
@@ -147,6 +148,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "TOOL_POLICY_SETTING_ALLOWS",
         "TOOL_POLICY_SETTING_DEFAULT_ALLOWS",
         "TOOL_POLICY_SETTING_INVALID",
+        "TOOL_PROPOSAL_ONLY_EXPOSED",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
 
@@ -618,6 +620,10 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     knowledgeless_codes = {
         item.code for item in check_manifest(knowledgeless.describe()).diagnostics
     }
+    proposal_exposed_codes = {
+        item.code
+        for item in check_manifest(_proposal_only_app(exposed=True).describe()).diagnostics
+    }
     setting_codes = {
         item.code
         for allows in ("auto", "nope")
@@ -687,6 +693,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | unconstrained_codes
         | unbounded_codes
         | knowledgeless_codes
+        | proposal_exposed_codes
         | setting_codes
         | legacy_model_codes
         | public_service_codes
@@ -808,6 +815,49 @@ def test_external_tool_requires_effective_policy_coverage_for_that_tool() -> Non
         "AGENT_PROVIDER_NOT_FOUND",
         "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
     ]
+
+
+def _proposal_only_app(*, exposed: bool = False, guarded: bool = True) -> CayuApp:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="sender", model="model"),
+        proposal_tools=[_ExternalTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["send"] if guarded else ["other"]),
+        tool_exposure_policy=(
+            StaticToolExposurePolicy(profile_id="send", tools=["send"]) if exposed else None
+        ),
+    )
+    return app
+
+
+def test_proposal_only_tools_are_described_and_checked_like_other_tools() -> None:
+    manifest = _proposal_only_app().describe()
+    [tool] = manifest.agents[0].tools
+    assert tool.offered_to_model is False
+    assert tool.model_dump(mode="json")["offered_to_model"] is False
+    assert tool.policy_coverage == "approval_required"
+    assert [item.code for item in check_manifest(manifest).diagnostics] == [
+        "AGENT_PROVIDER_NOT_FOUND",
+        "EVAL_EXECUTION_IDENTITY_PROCESS_LOCAL",
+    ]
+    # Only code proposes it, but running it unguarded is still reported.
+    unguarded = check_manifest(_proposal_only_app(guarded=False).describe())
+    assert "EXTERNAL_TOOL_UNGUARDED" in [item.code for item in unguarded.diagnostics]
+
+    exposed = check_manifest(_proposal_only_app(exposed=True).describe())
+    [finding] = [item for item in exposed.diagnostics if item.code == "TOOL_PROPOSAL_ONLY_EXPOSED"]
+    assert finding.severity == "error"
+    assert finding.parameters == {"agent": "sender", "tool": "send"}
+
+    ordinary = CayuApp(enable_logging=False)
+    ordinary.register_agent(
+        AgentSpec(name="sender", model="model"),
+        tools=[_ExternalTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["send"]),
+    )
+    [ordinary_tool] = ordinary.describe().agents[0].tools
+    assert ordinary_tool.offered_to_model is True
+    assert "offered_to_model" not in ordinary_tool.model_dump(mode="json")
 
 
 def test_custom_policy_subclasses_are_not_described_as_trusted_builtins() -> None:

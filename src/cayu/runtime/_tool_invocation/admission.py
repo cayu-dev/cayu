@@ -132,6 +132,7 @@ from cayu.tools.grants import (
 )
 from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
+    TOOL_POLICY_DRY_RUN_METADATA_KEY,
     TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
@@ -1144,11 +1145,13 @@ class ToolInvocationAdmission:
         taint_labels: Iterable[str] | None = None,
         tool_round_id: str | None = None,
         recorded_scope: PendingToolApproval | None = None,
+        dry_run: bool = False,
     ) -> ToolPolicyResult:
         """Authorize one call; ``recorded_scope`` replays a pause's own environment scope.
 
         A paused call's live environment may be an unallocated placeholder, so
         re-authorizing it uses the environment and workspace its pause recorded.
+        Only ``dry_run`` sets the policy's dry-run marker; request metadata can't.
         """
 
         registered_tool = registered_agent.executable_tool(tool_call.name)
@@ -1159,9 +1162,15 @@ class ToolInvocationAdmission:
                 reason=error,
                 metadata={"reason": "invalid_arguments"},
             )
-        policy_metadata = request_metadata
+        policy_metadata = {
+            key: value
+            for key, value in request_metadata.items()
+            if key != TOOL_POLICY_DRY_RUN_METADATA_KEY
+        }
+        if dry_run:
+            policy_metadata[TOOL_POLICY_DRY_RUN_METADATA_KEY] = True
         if taint_labels:
-            policy_metadata = metadata_with_taint_labels(request_metadata, taint_labels)
+            policy_metadata = metadata_with_taint_labels(policy_metadata, taint_labels)
         request = ToolPolicyRequest(
             session=session.model_copy(deep=True),
             # A fork-controller body is governed as its host agent.

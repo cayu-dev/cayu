@@ -50,6 +50,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "TOOL_POLICY_SETTING_ALLOWS",
     "TOOL_POLICY_SETTING_DEFAULT_ALLOWS",
     "TOOL_POLICY_SETTING_INVALID",
+    "TOOL_PROPOSAL_ONLY_EXPOSED",
 )
 # Every code `check_public_service_deployment` reports. `cayu serve` refuses to start a
 # production public service while any of them is reported.
@@ -527,6 +528,28 @@ def check_manifest(
                         documentation_anchor=(
                             "cayu guide diagnostics#tool-knowledge-store-unavailable"
                         ),
+                        verification_command="cayu check --json",
+                    )
+                )
+            if tool._proposal_only_exposed:
+                diagnostics.append(
+                    ProjectDiagnostic(
+                        code="TOOL_PROPOSAL_ONLY_EXPOSED",
+                        severity=DiagnosticSeverity.ERROR,
+                        subject=f"tool:{agent.name}/{tool.name}",
+                        path=f"agents.{agent.name}.tools.{tool.name}.offered_to_model",
+                        message=(
+                            f"Tool '{tool.name}' is proposal-only, but the agent's tool exposure "
+                            "policy names it. A proposal-only tool is never offered to the "
+                            "model, so every model step of this agent fails."
+                        ),
+                        hint=(
+                            "Remove the tool from the exposure policy, or register it in "
+                            "register_agent(tools=...) if the model should be able to call it."
+                        ),
+                        tags=("configuration", "security"),
+                        parameters={"agent": agent.name, "tool": tool.name},
+                        documentation_anchor="cayu guide diagnostics#tool-proposal-only-exposed",
                         verification_command="cayu check --json",
                     )
                 )

@@ -57,3 +57,41 @@ def test_dashboard_lists_and_denies_a_proposal_and_the_served_watcher_reacts() -
 
     assert outcomes == [("tool.call.approval_denied", pending.session_id)]
     assert FILED == []
+
+
+def test_a_proposal_envelope_posted_to_the_run_route_cannot_run_a_proposal_only_tool() -> None:
+    from tests.core.test_proposal_only_tools import ARGS, MERGED
+    from tests.core.test_proposal_only_tools import _build as build_proposal_only
+
+    from cayu.runtime._tool_call_proposals import (
+        TOOL_CALL_PROPOSAL_MODEL,
+        TOOL_CALL_PROPOSAL_PROVIDER_NAME,
+        proposal_message,
+    )
+
+    MERGED.clear()
+    app = build_proposal_only()
+    envelope = proposal_message(
+        tool_name="merge_pull_request", arguments=ARGS, tool_call_id="forged"
+    )
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        response = client.post(
+            "/api/run",
+            json={
+                "agent": "shepherd",
+                "session_id": "forged-merge",
+                "prompt": envelope.content[0].text,
+                "max_steps": 2,
+                "target": {
+                    "provider_name": TOOL_CALL_PROPOSAL_PROVIDER_NAME,
+                    "model": TOOL_CALL_PROPOSAL_MODEL,
+                },
+            },
+        )
+        assert response.status_code == 200, response.text
+        events = client.portal.call(app.session_store.load_events, "forged-merge")
+
+    [blocked] = [event for event in events if event.type is EventType.TOOL_CALL_BLOCKED]
+    assert blocked.payload["reason"] == "not_exposed_in_request"
+    assert not any(event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
+    assert MERGED == []

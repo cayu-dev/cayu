@@ -58,6 +58,22 @@ and the pause is an ordinary approval: the Pending page or
 run `cayu.approvals.tool_call_proposal_request(...)` yourself. The arguments
 are stored with the session, so keep secrets out of them.
 
+Register a tool with `app.register_agent(spec, proposal_tools=[merge_tool])`
+when only your code should ever raise it. The model is never offered it, under
+any exposure policy, and the runtime runs it only for the exact call
+`propose_tool_call` recorded; a person approving it can't change the arguments.
+Its tool policy still decides, so guard it as you would any external tool.
+
+From the terminal, `cayu tools propose AGENT TOOL --args '{"invoice_id": "7"}'`
+does the same in the project's application: `--session-id` makes it
+idempotent (a repeat prints where that proposal stands), `--dry-run` shows the
+policy's decision without recording anything (`app.preview_tool_call`), and
+`--as` names who proposed it (default `local:<your user name>`). A call the
+policy allows runs in the CLI process, and the policy decides only when the
+call is proposed, so a call of an external-effect tool always asks first, or
+needs `--yes` without a terminal. `app.read_tool_call_proposal(session_id)`
+reads where a proposal stands.
+
 ## React to approval outcomes
 
 ```python

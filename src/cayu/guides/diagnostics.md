@@ -290,6 +290,19 @@ covers concrete environments and factories that report
 an app with no environment, is reported too. Cayu logs the same warning when
 the agent is registered and its environment is already registered.
 
+## tool-proposal-only-exposed
+
+`TOOL_PROPOSAL_ONLY_EXPOSED` means a tool registered with
+`register_agent(..., proposal_tools=[...])` is also named by the agent's
+`StaticToolExposurePolicy`. A proposal-only tool is never offered to the model:
+only `app.propose_tool_call` (or `cayu tools propose`) raises it, and the runtime
+admits the call only when it matches the proposal session's own record. An
+exposure policy that names it fails each model step like one naming an
+unregistered tool. Drop the tool from the policy, or register it with `tools=`
+if the model should call it. `cayu inspect --json` shows
+`"offered_to_model": false` on every proposal-only tool. Being proposal-only is
+not a guard: the tool's policy coverage is checked like any other tool's.
+
 ## tool-input-schema-runtime-unsupported
 
 `TOOL_INPUT_SCHEMA_RUNTIME_UNSUPPORTED` means the registered schema is not a

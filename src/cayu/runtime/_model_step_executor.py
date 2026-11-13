@@ -274,6 +274,12 @@ from cayu.runtime._model_tool_discovery import (
     _redacted_provider_tool_definitions,
 )
 from cayu.runtime._phase_timing import timed_model_step, timed_phase
+from cayu.runtime._proposal_only_tools import (
+    exposure_with_proposed_tool,
+    model_facing_exposure,
+    model_facing_policy_input,
+    with_registration_counts,
+)
 from cayu.runtime._provider_operation_cancellation_owner import (
     ProviderOperationCancellationOwner,
 )
@@ -2889,6 +2895,10 @@ class ModelStepRun:
             # Preserve both the historical metadata bounds and the expose-all
             # hot path: registration already validated this immutable snapshot.
             return self._all_tools_within_capability_ceiling
+        # Proposal-only tools are never a policy's to choose.
+        registered_tools, capability_ceiling = model_facing_policy_input(
+            self._registered_agent, self._tool_capability_ceiling.tool_names
+        )
         request = ToolExposurePolicyRequest(
             session_id=self._session.id,
             agent_name=self._registered_agent.spec.name,
@@ -2897,12 +2907,16 @@ class ModelStepRun:
             step=step,
             transcript_cursor=transcript_cursor,
             catalogue_revision=self._registered_agent.tool_catalogue.revision,
-            registered_tools=self._registered_agent.tool_capabilities,
-            capability_ceiling=self._tool_capability_ceiling.tool_names,
+            registered_tools=registered_tools,
+            capability_ceiling=capability_ceiling,
             previous_profile_id=self._previous_tool_exposure_profile_id,
             metadata=self._request_metadata,
         )
-        exposure = resolve_tool_exposure(policy, request)
+        exposure = with_registration_counts(
+            self._registered_agent,
+            resolve_tool_exposure(policy, request),
+            self._tool_capability_ceiling.tool_names,
+        )
         if (
             exposure.profile_id != ALL_REGISTERED_TOOLS_PROFILE_ID
             and self._executor._secret_redactor.redact_text(exposure.profile_id)
@@ -3257,10 +3271,20 @@ class ModelStepRun:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
         previous_tool_exposure_profile_id = self._previous_tool_exposure_profile_id
+        resolving_fresh_exposure = self._initial_tool_exposure is None
         tool_exposure = self._resolve_tool_exposure(
             step=step,
             transcript_cursor=source_transcript_cursor,
         )
+        if resolving_fresh_exposure:
+            tool_exposure = await exposure_with_proposed_tool(
+                self._registered_agent,
+                tool_exposure,
+                session=self._session,
+                provider=self._request_registered_provider.provider,
+                ceiling_names=self._tool_capability_ceiling.tool_names,
+                session_store=self._executor._session_store,
+            )
         targeted_projection_kind = None if finish_up else self._targeted_tool_projection_kind
         discovery_projection_kind = None if finish_up else self._tool_discovery_projection_kind
         if finish_up:
@@ -5721,10 +5745,11 @@ def _require_frozen_tool_exposure(
 def _all_registered_tool_exposure(
     registered_agent: runtime_records.RegisteredAgentState,
 ) -> ResolvedToolExposure:
-    """Return the registration-time expose-all snapshot."""
+    """Return the registration-time expose-all snapshot a model may see."""
 
-    return _require_frozen_tool_exposure(
-        registered_agent.all_registered_tool_exposure,
+    return model_facing_exposure(
+        registered_agent,
+        _require_frozen_tool_exposure(registered_agent.all_registered_tool_exposure),
     )
 
 
@@ -5744,12 +5769,15 @@ def _tool_capability_ceiling_exposure(
     )
     if tuple(capability.name for capability in selected) != ceiling_names:
         raise ValueError("The durable tool capability ceiling conflicts with registration.")
-    return ResolvedToolExposure(
-        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
-        catalogue_revision=registered_agent.tool_catalogue.revision,
-        tools=selected,
-        registered_count=len(capabilities),
-        ceiling_count=len(selected),
+    return model_facing_exposure(
+        registered_agent,
+        ResolvedToolExposure(
+            profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+            catalogue_revision=registered_agent.tool_catalogue.revision,
+            tools=selected,
+            registered_count=len(capabilities),
+            ceiling_count=len(selected),
+        ),
     )
 
 

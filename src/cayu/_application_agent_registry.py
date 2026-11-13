@@ -216,6 +216,7 @@ class ApplicationAgentRegistry:
         default_thinking_source: CayuConfigSource = "framework",
         registration_site: tuple[str | None, str | None] = (None, None),
         tools: Iterable[Tool] | None = None,
+        proposal_tools: Iterable[Tool] | None = None,
         pause_check: Callable[[Tool], None] | None = None,
         tool_effect_reconcilers: Mapping[str, ToolEffectReconciliationRegistration] | None = None,
         mcp_toolsets: Iterable[McpToolset] | None = None,
@@ -399,6 +400,14 @@ class ApplicationAgentRegistry:
             except TypeError as exc:
                 raise TypeError("Agent tools must be an iterable of Tool instances.") from exc
 
+        proposal_tool_list = _proposal_only_tools(
+            proposal_tools,
+            targeted_tool_mode=stored_targeted_tool_mode,
+            tool_discovery_mode=stored_tool_discovery_mode,
+            tool_exposure_mode=stored_tool_exposure_mode,
+        )
+        agent_tools.extend(proposal_tool_list)
+
         refreshable_source_keys = {
             _mcp_refresh_source_key(toolset) for toolset in stored_mcp_toolsets
         }
@@ -565,6 +574,7 @@ class ApplicationAgentRegistry:
             registration_symbol=registration_symbol,
             child_session_context_contributor=stored_child_session_context,
             model_slot=model_slot,
+            proposal_tool_names=frozenset(tool.name for tool in proposal_tool_list),
         )
         if self._environment_registry is not None:
             # Runs before any MCP ownership is claimed or anything is published.
@@ -992,6 +1002,47 @@ def _agents_contain_mcp_source(
         for agent in agents.values()
         for registered in agent.tools.values()
     )
+
+
+def _proposal_only_tools(
+    proposal_tools: Iterable[Tool] | None,
+    *,
+    targeted_tool_mode: object,
+    tool_discovery_mode: object,
+    tool_exposure_mode: ToolExposureMode,
+) -> list[Tool]:
+    """Validate the tools only application code may propose; the model never sees them.
+
+    Targeted grants, tool discovery and the stable catalogue each make tools
+    addressable or visible to the model outside the exposure snapshot, so an
+    agent with proposal-only tools uses none of them.
+    """
+
+    if proposal_tools is None:
+        return []
+    if isinstance(proposal_tools, str | bytes):
+        raise TypeError("Agent proposal_tools must be an iterable of Tool instances.")
+    try:
+        listed = list(proposal_tools)
+    except TypeError as exc:
+        raise TypeError("Agent proposal_tools must be an iterable of Tool instances.") from exc
+    if not listed:
+        return []
+    for tool in listed:
+        if not isinstance(tool, Tool):
+            raise TypeError("Agent proposal_tools must be Tool instances.")
+        if isinstance(tool, McpToolAdapter):
+            raise ValueError("An MCP tool cannot be registered as proposal-only.")
+    if (
+        targeted_tool_mode is not None
+        or tool_discovery_mode is not None
+        or tool_exposure_mode is ToolExposureMode.STABLE_CATALOGUE
+    ):
+        raise ValueError(
+            "proposal_tools cannot be combined with targeted_tool_mode, tool_discovery_mode "
+            "or tool_exposure_mode='stable_catalogue': each can show a tool to the model."
+        )
+    return listed
 
 
 def _registered_agent_with_fork_controller_tools(

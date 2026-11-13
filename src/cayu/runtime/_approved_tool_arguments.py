@@ -140,6 +140,11 @@ async def admit_approved_tool_arguments(
             "Only a call that tool policy sent to approval can be approved with changes."
         )
     registered_agent = invocation_context.registered_agent
+    if call.tool_name in registered_agent.proposal_tool_names:
+        raise ToolApprovalArgumentsRefused(
+            "A proposal-only tool runs exactly the call application code proposed; "
+            "approve it unchanged or deny it."
+        )
     registered_tool = registered_agent.executable_tool(call.tool_name)
     if registered_tool is None:
         raise ToolApprovalArgumentsRefused(

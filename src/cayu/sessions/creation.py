@@ -44,6 +44,7 @@ from cayu.sessions._run_identity import (
     run_marks_for_creation,
     run_task_for_creation,
 )
+from cayu.sessions._tool_call_proposal_record import TOOL_CALL_PROPOSAL_METADATA_KEY
 from cayu.sessions.fork_overlays import FORK_LINEAGE_METADATA_KEY, fork_lineage_for_child
 from cayu.sessions.forks import FORK_EXECUTION_PROFILE_METADATA_KEY
 from cayu.sessions.invocation import (
@@ -61,6 +62,7 @@ from cayu.sessions.requests import (
     copy_run_request,
     runtime_model_slot,
     runtime_session_settings,
+    runtime_tool_call_proposal,
 )
 from cayu.tools.exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
@@ -219,6 +221,11 @@ def session_metadata_for_creation(
     )
     if model_slot is not None and model_slot["model"] == identity.model:
         copied[MODEL_SLOT_METADATA_KEY] = model_slot
+    # Runtime-owned: only ``tool_call_proposal_request`` names the call a proposal may raise.
+    copied.pop(TOOL_CALL_PROPOSAL_METADATA_KEY, None)
+    proposal = None if prepared_request is None else runtime_tool_call_proposal(prepared_request)
+    if proposal is not None:
+        copied[TOOL_CALL_PROPOSAL_METADATA_KEY] = proposal
     # Runtime-owned too: the next_session settings session preparation read for it.
     copied.pop(SESSION_SETTINGS_METADATA_KEY, None)
     session_settings = (

@@ -48396,6 +48396,11 @@
             "title": "Named Checks",
             "type": "array"
           },
+          "offered_to_model": {
+            "default": true,
+            "title": "Offered To Model",
+            "type": "boolean"
+          },
           "parallel_safe": {
             "title": "Parallel Safe",
             "type": "boolean"

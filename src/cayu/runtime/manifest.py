@@ -271,6 +271,10 @@ class ToolManifest(_ManifestModel):
     approval_validity_rules: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
     command_policy: str | None = None
     named_checks: tuple[NamedCheckManifest, ...] = ()
+    # False for a proposal-only tool: only application code proposes it, and no
+    # model request ever lists it. Omitted when true, so other manifests keep
+    # their fingerprint.
+    offered_to_model: bool = Field(default=True, exclude_if=lambda value: value)
     # The managed setting a SettingToolPolicy decides this tool's calls from.
     policy_setting: str | None = Field(default=None, exclude_if=lambda value: value is None)
     registration_provenance: RegistrationProvenance
@@ -286,6 +290,9 @@ class ToolManifest(_ManifestModel):
     # In-process fact for checks, like the ones above: a knowledge tool whose
     # agent's default environment supplies no knowledge store.
     _knowledge_store_unavailable: bool = PrivateAttr(default=False)
+    # In-process fact for checks, like the ones above: a proposal-only tool that
+    # a statically readable exposure policy names.
+    _proposal_only_exposed: bool = PrivateAttr(default=False)
     # In-process facts for checks, like the ones above: what the tool's
     # SettingToolPolicy maps and whether it can, and the type of the opaque policy
     # that leaves the tool's coverage unknown.
@@ -703,6 +710,12 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         for tool in agent.tools
         if tool._knowledge_store_unavailable
     }
+    proposal_only_exposed = {
+        (agent.name, tool.name)
+        for agent in agents
+        for tool in agent.tools
+        if tool._proposal_only_exposed
+    }
     policy_facts = {
         (agent.name, tool.name): (tool._setting_policy, tool._opaque_policy)
         for agent in agents
@@ -710,6 +723,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     }
     for agent in manifest.agents:
         for tool in agent.tools:
+            tool._proposal_only_exposed = (agent.name, tool.name) in proposal_only_exposed
             tool._setting_policy, tool._opaque_policy = policy_facts.get(
                 (agent.name, tool.name), (None, None)
             )
@@ -841,6 +855,11 @@ def _describe_agent(
         )
         == "missing"
     )
+    from cayu.runtime._proposal_only_tools import exposure_policy_names_proposal_tool
+
+    exposed_proposal_tools = exposure_policy_names_proposal_tool(
+        registration.tool_exposure_policy, registration.proposal_tool_names
+    )
     return AgentManifest(
         name=name,
         model=spec.model,
@@ -870,6 +889,8 @@ def _describe_agent(
                 registration_provenance=registration_provenance,
                 project_root=project_root,
                 knowledge_store_unavailable=knowledge_store_unavailable,
+                proposal_only=tool_name in registration.proposal_tool_names,
+                exposure_policy_names_it=tool_name in exposed_proposal_tools,
             )
             for tool_name, tool in sorted(registration.tools.items())
         ),
@@ -901,6 +922,8 @@ def _describe_tool(
     registration_provenance: RegistrationProvenance,
     project_root: Path | None,
     knowledge_store_unavailable: bool = False,
+    proposal_only: bool = False,
+    exposure_policy_names_it: bool = False,
 ) -> ToolManifest:
     execution_contract = ToolExecutionContract.model_validate(tool.execution_contract)
     decisive, floored = _decisive_policy(tool_policy, tool_name)
@@ -947,10 +970,12 @@ def _describe_tool(
         ),
         command_policy=_command_policy_name(tool.tool),
         named_checks=_named_check_manifests(tool.tool),
+        offered_to_model=not proposal_only,
         policy_setting=None if setting_policy is None else setting_policy.setting,
         registration_provenance=registration_provenance,
         implementation_provenance=_provenance(tool.tool, project_root),
     )
+    manifest._proposal_only_exposed = exposure_policy_names_it
     if setting_policy is not None:
         manifest._setting_policy = _setting_policy_facts(
             app, setting_policy, tool.schema, floored=floored

@@ -105,6 +105,10 @@ class RegisteredAgentState:
     fork_controller_tool_names: frozenset[str] = frozenset()
     # The model slot whose binding chooses new sessions' model, and which Gateway requests name.
     model_slot: str | None = None
+    # Registered tools only application code may propose (``propose_tool_call``). They
+    # are never offered to the model, and a call is admitted only when it matches the
+    # proposal session's runtime-owned record.
+    proposal_tool_names: frozenset[str] = frozenset()
 
     def executable_tool(self, name: str) -> RegisteredTool | None:
         """Resolve an application or runtime-owned executable without merging catalogues."""

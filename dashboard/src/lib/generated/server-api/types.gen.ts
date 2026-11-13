@@ -24362,6 +24362,10 @@ export type ToolManifest = {
      */
     named_checks?: Array<NamedCheckManifest>;
     /**
+     * Offered To Model
+     */
+    offered_to_model?: boolean;
+    /**
      * Parallel Safe
      */
     parallel_safe: boolean;

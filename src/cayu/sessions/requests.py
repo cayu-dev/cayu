@@ -74,6 +74,12 @@ from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     TASK_METADATA_KEY,
 )
+from cayu.sessions._tool_call_proposal_record import (
+    TOOL_CALL_PROPOSAL_METADATA_KEY,
+    held_tool_call_proposal,
+    is_runtime_tool_call_proposal_holder,
+    runtime_tool_call_proposal_holder,
+)
 from cayu.sessions.fork_overlays import (
     FORK_LINEAGE_METADATA_KEY,
     FORK_OVERLAY_METADATA_KEY,
@@ -111,6 +117,7 @@ from cayu.tools.exposure import (
     copy_tool_capability_ceiling,
 )
 from cayu.tools.grants import TargetedToolGrant, validate_targeted_tool_grants
+from cayu.tools.policy import TOOL_POLICY_DRY_RUN_METADATA_KEY
 
 # Compaction guidance can carry a domain glossary or a list of facts to keep.
 COMPACTION_INSTRUCTIONS_MAX_CHARS = 32_768
@@ -256,6 +263,18 @@ def bind_runtime_model_slot(request: RunRequest, record: Mapping[str, str] | Non
     )
 
 
+def bind_runtime_tool_call_proposal(request: RunRequest, record: Mapping[str, Any]) -> None:
+    """Record, on a proposal request, the one call its new session may raise."""
+
+    request._runtime_tool_call_proposal = runtime_tool_call_proposal_holder(record)
+
+
+def runtime_tool_call_proposal(request: RunRequest) -> dict[str, Any] | None:
+    """The proposal record bound to ``request``; None for any other request."""
+
+    return held_tool_call_proposal(request._runtime_tool_call_proposal)
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeSessionSettings:
     """Process-local proof that session preparation read the settings a new session records."""
@@ -393,6 +412,9 @@ class RunRequest(BaseModel):
     # The model slot this new session's model came from (``bind_runtime_model_slot``): written
     # to the session's metadata when it is created, never taken from the caller.
     _runtime_model_slot: object | None = PrivateAttr(default=None)
+    # The call a tool-call proposal session may raise (``bind_runtime_tool_call_proposal``):
+    # written to the new session's metadata, never taken from the caller.
+    _runtime_tool_call_proposal: object | None = PrivateAttr(default=None)
     # The next_session settings this new session keeps (``bind_runtime_session_settings``),
     # written to its metadata when it is created, like the model slot.
     _runtime_session_settings: object | None = PrivateAttr(default=None)
@@ -433,6 +455,8 @@ class RunRequest(BaseModel):
                     EVAL_TRIAL_METADATA_KEY,
                     TASK_METADATA_KEY,
                     MODEL_SLOT_METADATA_KEY,
+                    TOOL_CALL_PROPOSAL_METADATA_KEY,
+                    TOOL_POLICY_DRY_RUN_METADATA_KEY,
                     SESSION_SETTINGS_METADATA_KEY,
                 )
                 if key in copied
@@ -463,6 +487,10 @@ class RunRequest(BaseModel):
                 authority_name = "task authority"
             elif reserved_key == MODEL_SLOT_METADATA_KEY:
                 authority_name = "model-slot authority"
+            elif reserved_key == TOOL_CALL_PROPOSAL_METADATA_KEY:
+                authority_name = "tool-call-proposal authority"
+            elif reserved_key == TOOL_POLICY_DRY_RUN_METADATA_KEY:
+                authority_name = "tool-policy dry-run authority"
             elif reserved_key == SESSION_SETTINGS_METADATA_KEY:
                 authority_name = "session-settings authority"
             else:
@@ -928,6 +956,8 @@ class ForkSessionRequest(BaseModel):
             EVAL_TRIAL_METADATA_KEY: "eval-trial authority",
             TASK_METADATA_KEY: "task authority",
             MODEL_SLOT_METADATA_KEY: "model-slot authority",
+            TOOL_CALL_PROPOSAL_METADATA_KEY: "tool-call-proposal authority",
+            TOOL_POLICY_DRY_RUN_METADATA_KEY: "tool-policy dry-run authority",
             SESSION_SETTINGS_METADATA_KEY: "session-settings authority",
         }
         reserved_key = next(
@@ -1182,6 +1212,10 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         model_slot
         if type(model_slot) is _RuntimeModelSlot and model_slot.token is _RUNTIME_MODEL_SLOT_TOKEN
         else None
+    )
+    proposal = request._runtime_tool_call_proposal
+    copied._runtime_tool_call_proposal = (
+        proposal if is_runtime_tool_call_proposal_holder(proposal) else None
     )
     session_settings = request._runtime_session_settings
     copied._runtime_session_settings = (

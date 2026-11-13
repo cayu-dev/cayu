@@ -20,10 +20,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from cayu._validation import copy_durable_json_object
 from cayu.events import Event, EventType
@@ -35,8 +35,10 @@ from cayu.runtime._tool_call_proposals import (
 )
 from cayu.session_metadata import MAX_SESSION_TITLE_LENGTH
 from cayu.sessions._model_failover import ModelTarget
-from cayu.sessions.requests import RunRequest
+from cayu.sessions._tool_call_proposal_record import tool_call_proposal_record
+from cayu.sessions.requests import RunRequest, bind_runtime_tool_call_proposal
 from cayu.tools.base import ToolResult
+from cayu.tools.policy import ToolPolicyDecision
 from cayu.vaults.redaction import SecretRedactor
 
 # One step raises the call; the second records that it settled.
@@ -165,6 +167,30 @@ class ToolCallProposalOutcome(BaseModel):
         return cls(session_id=session_id, status=status, **fields)
 
 
+class ToolCallPreview(BaseModel):
+    """What proposing one call would do now, decided without recording anything.
+
+    ``decision`` is the tool policy's, or DENY when the call is stopped before the
+    policy runs; ``blocked_by`` then says where (``unregistered``,
+    ``tool_exposure`` or ``invalid_arguments``), and is ``tool_policy`` when the
+    policy denied it. ``metadata`` is the policy result's metadata, such as the
+    setting reading a ``SettingToolPolicy`` decided from.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    agent_name: str
+    tool_name: str
+    decision: ToolPolicyDecision
+    blocked_by: (
+        Literal["unregistered", "tool_exposure", "invalid_arguments", "tool_policy"] | None
+    ) = None
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    proposal_only: bool = False
+    effect: str | None = None
+
+
 def _string_leaves(value: Any) -> Iterable[str]:
     if type(value) is str:
         yield value
@@ -248,13 +274,13 @@ def tool_call_proposal_request(
         raise ValueError(f"A tool call proposal owns these RunRequest fields: {', '.join(owned)}.")
     if arguments is not None and not isinstance(arguments, Mapping):
         raise TypeError("arguments must be a mapping.")
+    call_id = tool_call_id or f"proposal-{uuid4().hex}"
+    copied_arguments = copy_durable_json_object(dict(arguments or {}), "arguments")
     message = proposal_message(
-        tool_name=tool_name,
-        arguments=dict(arguments or {}),
-        tool_call_id=tool_call_id or f"proposal-{uuid4().hex}",
+        tool_name=tool_name, arguments=copied_arguments, tool_call_id=call_id
     )
     request_fields.setdefault("title", f"Proposed {tool_name}"[:MAX_SESSION_TITLE_LENGTH])
-    return RunRequest(
+    request = RunRequest(
         agent_name=agent_name,
         messages=[message],
         target=ModelTarget(
@@ -263,9 +289,20 @@ def tool_call_proposal_request(
         max_steps=_PROPOSAL_MAX_STEPS,
         **request_fields,
     )
+    # The runtime-owned record is what admits a proposal-only tool: the
+    # transcript text alone never does, because any caller that can start a
+    # run can write a proposal envelope.
+    bind_runtime_tool_call_proposal(
+        request,
+        tool_call_proposal_record(
+            tool_name=tool_name, tool_call_id=call_id, arguments=copied_arguments
+        ),
+    )
+    return request
 
 
 __all__ = [
+    "ToolCallPreview",
     "ToolCallProposalOutcome",
     "ToolCallProposalStatus",
     "tool_call_proposal_request",
