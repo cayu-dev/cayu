@@ -9,7 +9,7 @@ from fastapi import HTTPException, Query, Response
 from pydantic import ValidationError
 
 from cayu.server.contracts import ApiTaskDetail
-from cayu.tasks.queries import TaskQuery, latest_tasks_key_path
+from cayu.tasks.queries import TaskQuery, latest_tasks_key_path, task_input_key
 from cayu.tasks.records import TaskStatus
 
 if TYPE_CHECKING:
@@ -18,6 +18,41 @@ if TYPE_CHECKING:
 
     from cayu.applications import CayuApp
     from cayu.tasks.records import Task
+    from cayu.tasks.store import TaskStore
+
+# How many groups one store read asks for while paging over the shown groups.
+_GROUP_READ_SIZE = 1000
+
+
+async def _shown_groups(
+    store: TaskStore, query: TaskQuery, by: str, redact: Callable[[Any], Any]
+) -> list[Task]:
+    """The page of ``query`` over the groups whose key the response shows unmasked.
+
+    A key that redaction masks forms no group: one row per hidden value would count the
+    hidden values and tell which tasks share one. The page is cut after those groups
+    are left out, so it has no gaps that would count them either.
+    """
+
+    path = latest_tasks_key_path(by)
+    page: list[Task] = []
+    skipped = read = 0
+    while len(page) < query.limit:
+        groups = await store.latest_tasks(
+            query.model_copy(update={"offset": read, "limit": _GROUP_READ_SIZE}), by=by
+        )
+        for task in groups:
+            key = task_input_key(task.input, path)
+            if redact(key) != key:
+                continue
+            if skipped < query.offset:
+                skipped += 1
+            elif len(page) < query.limit:
+                page.append(task)
+        read += len(groups)
+        if len(groups) < _GROUP_READ_SIZE:
+            break
+    return page
 
 
 def register_task_latest_route(
@@ -86,7 +121,10 @@ def register_task_latest_route(
         if any(cayu_app.redact_json(value) != value for value in requested):
             return []
         try:
-            tasks = await store.latest_tasks(query, by=by)
+            if by is None:
+                tasks = await store.latest_tasks(query)
+            else:
+                tasks = await _shown_groups(store, query, by, cayu_app.redact_json)
         except NotImplementedError:
             raise HTTPException(501, "This task store can't read the latest tasks.") from None
         rows = [serialize_task(cayu_app, task) for task in tasks]

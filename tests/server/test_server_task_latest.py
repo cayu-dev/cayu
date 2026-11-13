@@ -101,3 +101,39 @@ def test_latest_selectors_match_the_public_projection_not_hidden_values() -> Non
     for guess in (secret, "acct-secret-wrong"):
         assert client.get("/api/tasks/latest", params={"assigned_agent_name": guess}).json() == []
     assert [task["id"] for task in client.get("/api/tasks/latest").json()] == ["t1"]
+
+
+def test_latest_by_input_key_forms_no_group_from_a_hidden_value() -> None:
+    from cayu.vaults.redaction import SecretRedactor
+
+    secrets = ("tok-secret-1a2b", "tok-secret-3c4d", "tok-secret-5e6f")
+    tokens = (secrets[0], "plain-a", secrets[1], secrets[0], "plain-b", secrets[2])
+    store = InMemoryTaskStore()
+
+    async def seed() -> None:
+        for index, token in enumerate(tokens):
+            await store.create_task(
+                TaskCreate(task_id=f"t{index}", type="pass", input={"token": token})
+            )
+            claimed = await store.claim_task("worker", TaskQuery(type="pass"))
+            assert claimed is not None
+            await store.complete_task(
+                claimed.id, {}, worker_id="worker", claim_generation=claimed.claim_generation
+            )
+
+    asyncio.run(seed())
+    app = CayuApp(task_store=store, secret_redactor=SecretRedactor(secrets))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    def grouped(**paging: int) -> list[str]:
+        params = {"by": "input.token", **paging}
+        return [task["id"] for task in client.get("/api/tasks/latest", params=params).json()]
+
+    # One row per hidden value would count the hidden values and pair the tasks that
+    # share one. Only the keys the response shows form groups, and paging is over those.
+    assert grouped() == ["t4", "t1"]
+    assert grouped(limit=1) == ["t4"]
+    assert grouped(limit=1, offset=1) == ["t1"]
+    assert grouped(limit=1, offset=2) == []
+    # Without grouping every task is still listed, its hidden value masked.
+    assert len(client.get("/api/tasks/latest").json()) == len(tokens)
