@@ -1153,7 +1153,9 @@ def test_sealed_cursors_bind_query_identity_and_lifetime(monkeypatch) -> None:
     # A position sealed for one listing never opens in another.
     with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
         codec.open("actions", token, binding)
-    for bad in ("malformed", token[:-2] + "AA"):
+    # Change a character whose six bits all count, to one it isn't already.
+    tampered = token[:-3] + ("B" if token[-3] != "B" else "C") + token[-2:]
+    for bad in ("malformed", tampered):
         with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
             codec.open("knowledge", bad, binding)
     with pytest.raises(HTTPException, match="Invalid or expired inbox cursor"):
