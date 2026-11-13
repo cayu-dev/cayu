@@ -163,6 +163,12 @@ the check accepts without executing them:
   `**kwargs` unpacking stays unproven.
 - Type aliases such as `Callable[..., AbstractContextManager[T]]` built from
   `typing`, `collections.abc` and the `contextlib` context-manager ABCs.
+- Any annotation Python leaves unevaluated under `from __future__ import
+  annotations`: on an undecorated function's parameters and return, on a module
+  variable, and on a variable of a class with no decorator, no class keyword and
+  no base other than `object`. The assigned value is still checked. Other
+  classes, such as models, dataclasses, `NamedTuple` and `TypedDict`, can read
+  their annotations when the class is created, so theirs are still checked.
 - `Enum`/`StrEnum`/`IntEnum`, `TypedDict` and `NamedTuple` declarations with
   annotations and literal values.
 - `@functools.cache`, `@functools.lru_cache` and `@lru_cache(maxsize=...)` with

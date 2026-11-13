@@ -1436,6 +1436,7 @@ def _import_side_effect_diagnostic(
     unproven_base = any(
         unsafe_node is base for base, _scope in _import_time_class_base_uses(statement)
     )
+    in_annotation = _is_annotation_part(statement, unsafe_node)
     if not unproven_base:
         unsafe_node = _narrowed_unsafe_node(unsafe_node)
     construct = _construct_name(unsafe_node)
@@ -1578,6 +1579,14 @@ def _import_side_effect_diagnostic(
                 "or `field(default_factory=list)` and the like (not a lambda), and only "
                 "such dataclasses as bases. Otherwise build the instance inside a function."
             )
+    if in_annotation and not unproven_base:
+        hint += (
+            " Under `from __future__ import annotations` the check skips the annotations "
+            "Python leaves unevaluated: on module variables, on variables of a class with "
+            "no base, decorator or keyword, and on undecorated functions. Other classes, "
+            "such as models, dataclasses, `NamedTuple` and `TypedDict`, can read theirs "
+            "when the class is created."
+        )
     return _diagnostic(
         code="SCAFFOLD_IMPORT_SIDE_EFFECT",
         path=f"{relative}:{unsafe_node.lineno}",
@@ -5140,12 +5149,14 @@ def _ordered_class_scopes(body: list[ast.stmt]) -> tuple[frozenset[str], ...]:
 
 
 def _without_postponed_annotations(tree: ast.Module) -> ast.Module:
-    """Drop signature annotations that Python does not evaluate at import.
+    """Drop annotations that Python does not evaluate at import.
 
     Under ``from __future__ import annotations`` an undecorated function's
     parameter and return annotations stay strings until something introspects
     them. Decorated functions keep theirs because decorators such as
     ``functools.singledispatch`` or Pydantic validators can evaluate them.
+    Variable annotations at module level and in plain classes become the
+    strings Python stores; see `_postpone_variable_annotations`.
     """
 
     if not any(
@@ -5168,7 +5179,59 @@ def _without_postponed_annotations(tree: ast.Module) -> ast.Module:
             ):
                 if argument is not None:
                     argument.annotation = None
+    shadowed = _module_rebound_names(tree)
+    if any(
+        isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+        for node in ast.walk(tree)
+    ):
+        shadowed |= {"object"}
+    _postpone_variable_annotations(tree.body, shadowed)
     return tree
+
+
+def _postpone_variable_annotations(statements: list[ast.stmt], shadowed: frozenset[str]) -> None:
+    """Replace the annotation of each variable that Python leaves unevaluated with its text.
+
+    Python stores such an annotation as a string, so the scan sees the string it
+    would see for a quoted annotation; the assigned value still runs and stays
+    scanned. A class keeps its annotations when anything may read them as the
+    class is created: a decorator such as ``@dataclass``, a base such as
+    ``BaseModel``, ``NamedTuple`` or ``TypedDict`` and its ``__init_subclass__``,
+    a metaclass or other class keyword, or type parameters. Only a class with no
+    base other than the builtin ``object`` is plain. ``shadowed`` holds the names
+    that may not mean the builtin in the enclosing scopes.
+    """
+
+    for statement in statements:
+        if isinstance(statement, ast.AnnAssign):
+            statement.annotation = ast.copy_location(
+                ast.Constant(ast.unparse(statement.annotation)), statement.annotation
+            )
+        elif isinstance(statement, ast.ClassDef):
+            if not (
+                statement.decorator_list
+                or statement.keywords
+                or getattr(statement, "type_params", None)
+                or any(
+                    not (isinstance(base, ast.Name) and base.id == "object")
+                    for base in statement.bases
+                )
+                or (statement.bases and "object" in shadowed)
+            ):
+                _postpone_variable_annotations(
+                    statement.body,
+                    shadowed | _scope_rebound_names(statement.body, include_imports=True),
+                )
+        elif not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Compound statements at module or class level run their suites at import.
+            for suite in (
+                getattr(statement, "body", []),
+                getattr(statement, "orelse", []),
+                getattr(statement, "finalbody", []),
+                *(handler.body for handler in getattr(statement, "handlers", [])),
+                *(case.body for case in getattr(statement, "cases", [])),
+            ):
+                _postpone_variable_annotations(suite, shadowed)
 
 
 def _scope_rebound_names(
@@ -5433,6 +5496,21 @@ def _import_time_expression_uses(
         for target in node.targets:
             add(target)
     return tuple(expressions)
+
+
+def _is_annotation_part(statement: ast.stmt, node: ast.AST) -> bool:
+    """Whether ``node`` lies in a variable, parameter or return annotation of ``statement``."""
+
+    for item in ast.walk(statement):
+        if isinstance(item, (ast.AnnAssign, ast.arg)):
+            annotation = item.annotation
+        elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotation = item.returns
+        else:
+            continue
+        if annotation is not None and any(part is node for part in ast.walk(annotation)):
+            return True
+    return False
 
 
 def _argument_annotations(arguments: ast.arguments) -> tuple[ast.expr, ...]:
