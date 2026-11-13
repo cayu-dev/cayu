@@ -327,3 +327,34 @@ def test_sqlite_migration_backfills_counts_and_edges(tmp_path: Path) -> None:
             assert (await store.check_task_counts()).matches
 
     asyncio.run(run())
+
+
+@pytest.mark.usefixtures("postgres_dsn")
+def test_postgres_read_only_store_counts_pending_changes_without_folding(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.tasks_postgres import PostgresTaskStore
+
+    async def run() -> None:
+        writer = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            for index in range(3):
+                await writer.create_task(TaskCreate(type="demo.review", title=f"t{index}"))
+        finally:
+            await writer.close()
+        reader = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE, read_only=True)
+        try:
+            check = await reader.check_task_counts()
+            result = await reader.query_task_index(TaskIndexQuery(filters=TaskQuery(limit=2)))
+        finally:
+            await reader.close()
+        assert check.matches, check.differences
+        assert check.by_status["pending"] >= 3
+        # Earlier tests in the module share the database, so compare with the check.
+        assert int(result.total_count) == sum(check.by_status.values())
+        assert {
+            status: int(count) for status, count in result.counts_by_status.model_dump().items()
+        } == check.by_status
+
+    asyncio.run(run())

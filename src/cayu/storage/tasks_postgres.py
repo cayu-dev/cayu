@@ -453,6 +453,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_local_execution_attempts: ClassVar[bool] = True
     supports_session_closure_deletion: ClassVar[bool] = True
     supports_native_task_index: ClassVar[bool] = True
+    # `cayu task` opens the store read-only: every connection's transaction is then
+    # READ ONLY, so the database itself refuses any write.
+    _supports_read_only = True
     supports_session_closure_claims: ClassVar[bool] = True
     supports_session_retention_epochs: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True

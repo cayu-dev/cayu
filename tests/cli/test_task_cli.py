@@ -1094,3 +1094,29 @@ def test_counts_show_stored_counts_and_recompute_finds_drift(
     code, out = _run(capsys, "counts", "--sqlite", str(database), "--recompute")
     assert code == 1
     assert "completed" in out and "scan" in out and "hunter" in out
+
+
+@pytest.mark.usefixtures("postgres_dsn")
+def test_task_commands_read_a_postgres_store_read_only(
+    postgres_dsn: str, postgres_url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cayu.storage import PostgresTaskStore
+
+    async def seed() -> None:
+        store = PostgresTaskStore(postgres_dsn, schema_mode=schema.SchemaMode.CREATE)
+        try:
+            await store.create_task(TaskCreate(task_id="pg-one", type="scan"))
+            await store.create_task(TaskCreate(task_id="pg-two", type="scan"))
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    code, out = _run(capsys, "list", "--postgres", postgres_url, "--json")
+    assert code == 0
+    assert {task["id"] for task in out["tasks"]} == {"pg-one", "pg-two"}
+    # The two creations are still pending count changes; a read-only reader counts
+    # them without folding.
+    code, out = _run(capsys, "counts", "--postgres", postgres_url, "--recompute", "--json")
+    assert code == 0
+    assert out["matches"] is True
+    assert out["by_status"]["pending"] == 2

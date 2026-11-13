@@ -53,8 +53,14 @@ async def _begin_snapshot(cursor) -> Any:
 
 
 async def fold_task_count_changes(store: PostgresTaskStore) -> None:
-    """Fold pending count changes, unless another reader is already folding."""
+    """Fold pending count changes, unless another reader is already folding.
 
+    Folding only keeps the changes table short: every count read adds the pending
+    changes to the stored counts. A read-only store, which can't write, skips it.
+    """
+
+    if store._read_only:
+        return
     lock, *fold = POSTGRES_FOLD_TASK_COUNT_CHANGES
     async with store._ready_connection() as connection, connection.cursor() as cursor:
         await cursor.execute(_sql(lock))
