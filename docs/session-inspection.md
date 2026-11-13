@@ -1078,9 +1078,10 @@ and sessions without an attached task. Native invocation admission protects
 successor runs; unfinished attached tasks remain with the task worker's separate
 expired-handoff recovery. Unknown effects and unavailable environment bindings
 remain recorded. Lease expiry never proves an external call stopped. The next
-startup also repairs these runs after a shutdown timeout or SIGKILL. Retained human
-gates and foreground-child obligations with unavailable environments remain with
-their existing recovery owner. Unknown external effects still require manual recovery. Governed tasks
+startup also repairs these runs after a shutdown timeout or SIGKILL. An unavailable
+environment does not cause an accepted approval, answer or exact foreground-child
+obligation to be consumed: that work stays interrupted with its original profile
+and binding. Unknown external effects still require manual recovery. Governed tasks
 with unknown model dispatches retain their explicit recovery contract and fence.
 Missing terminal evidence for a committed abandonment is retried
 immediately. Within the existing seven-day finisher lookback, committed

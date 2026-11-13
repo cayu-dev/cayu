@@ -240,6 +240,28 @@ class InvocationTerminalDecision(BaseModel):
             assert source_id is not None
             expected_interaction_event_id = f"{source_id}:interaction_failed"
             expected_terminal_event_id = f"{source_id}:session_failed"
+            # A linked failure retains its task/interaction identities while
+            # its queued invocation owns the selected session terminal event.
+            if (
+                self.runtime_task_failure_id is not None
+                and self.terminal_event_id != expected_terminal_event_id
+            ):
+                queued_operation_id = self.terminal_payload.get(
+                    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+                )
+                if queued_operation_id is not None:
+                    if type(queued_operation_id) is not str:
+                        raise ValueError("Queued failure operation identity must be a string.")
+                    expected_terminal_event_id = queued_dispatch_terminal_event_id(
+                        queued_operation_id
+                    )
+                    task_failure = (self.task_error_payload or {}).get("runtime_task_failure")
+                    if (
+                        type(task_failure) is not dict
+                        or task_failure.get("session_terminal_event_id") != self.terminal_event_id
+                        or task_failure.get("session_failure_payload") != self.terminal_payload
+                    ):
+                        raise ValueError("Queued failure lost its exact task-owned selection.")
         if self.outcome is InvocationTerminalOutcome.FAILED and (
             self.predecessor_interaction_event_id is not None
         ):

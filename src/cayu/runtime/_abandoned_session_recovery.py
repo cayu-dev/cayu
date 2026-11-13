@@ -20,6 +20,33 @@ from cayu.sessions.recovery import (
     SessionExecutionInProgress,
 )
 from cayu.sessions.store import SessionStore
+from cayu.tasks.records import Task, TaskStatus
+
+
+@dataclass(frozen=True)
+class _ExpiredAttachedTaskAuthority:
+    """Private proof that the worker validated its native expired claim.
+
+    The exact claim remains owned by the task store and is checked again when
+    the worker settles it. This token grants only the typed recovery entrance;
+    the enclosing scope separately binds the session incarnation and epoch.
+    """
+
+    @classmethod
+    def from_claim(cls, task: Task, session: Session) -> _ExpiredAttachedTaskAuthority:
+        if (
+            type(task) is not Task
+            or task.status is not TaskStatus.RUNNING
+            or task.worker_id is None
+            or type(task.claim_generation) is not int
+            or task.claim_generation < 1
+            or task.lease_expires_at is None
+            or task.status_reason not in {None, "cancellation_requested"}
+            or task.session_id != session.id
+            or task.session_instance_id != session.instance_id
+        ):
+            raise SessionRunFenced("Expired task recovery lost its exact attached claim.")
+        return cls()
 
 
 @dataclass(frozen=True)
@@ -31,6 +58,7 @@ class AbandonedExecution:
     # Whether the continuation that follows the takeover replays elected calls.
     replays_tool_calls: bool = False
     retain_recovery_run_epoch: Callable[[int], None] | None = None
+    expired_attached_task: _ExpiredAttachedTaskAuthority | None = None
 
     def require_matches(self, session: Session) -> None:
         if (session.id, session.instance_id, session.run_epoch) != (
@@ -52,7 +80,15 @@ def _abandoned_execution(
     *,
     replays_tool_calls: bool = False,
     retain_recovery_run_epoch: Callable[[int], None] | None = None,
+    expired_attached_task: Task | None = None,
 ) -> Iterator[None]:
+    # Only the private task-worker entrance passes its store-resolved claim.
+    # Request metadata and identical durable session values cannot mint it.
+    task_authority = (
+        None
+        if expired_attached_task is None
+        else _ExpiredAttachedTaskAuthority.from_claim(expired_attached_task, session)
+    )
     token = _ABANDONED_EXECUTION.set(
         AbandonedExecution(
             session.id,
@@ -61,8 +97,19 @@ def _abandoned_execution(
             session.status,
             replays_tool_calls,
             retain_recovery_run_epoch,
+            task_authority,
         )
     )
+    try:
+        yield
+    finally:
+        _ABANDONED_EXECUTION.reset(token)
+
+
+@contextmanager
+def _without_abandoned_execution() -> Iterator[None]:
+    """Drop takeover authority when an independently owned terminal phase begins."""
+    token = _ABANDONED_EXECUTION.set(None)
     try:
         yield
     finally:
@@ -76,6 +123,22 @@ def abandoned_execution_takeover(session: Session) -> bool:
     return current is not None and (session.id, session.instance_id) == (
         current.session_id,
         current.session_instance_id,
+    )
+
+
+def abandoned_attached_task_takeover(session: Session) -> bool:
+    """Whether this exact run has the worker's private expired-claim authority.
+
+    Native reservation checks the original epoch; its admitted context advances
+    it once. This scope never survives serialization or authenticates raw public
+    requests, and later task settlement still performs its own exact native CAS.
+    """
+    current = _ABANDONED_EXECUTION.get()
+    return (
+        current is not None
+        and current.expired_attached_task is not None
+        and abandoned_execution_takeover(session)
+        and session.run_epoch in {current.run_epoch, current.run_epoch + 1}
     )
 
 

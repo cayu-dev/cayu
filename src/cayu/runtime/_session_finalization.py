@@ -242,6 +242,7 @@ from cayu.sessions._checkpoint_preservation import (
     _invocation_lifecycle_authority_read_scope,
 )
 from cayu.sessions._execution_profile_checkpoint import (
+    ActiveInvocationExecutionProfile,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
     active_invocation_execution_profile_matches_session_epoch,
@@ -261,6 +262,8 @@ from cayu.sessions._interaction_transitions import (
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
     SettleInvocationCommand,
+    require_invocation_rebind_lineage,
+    require_released_invocation_command_authority,
 )
 from cayu.sessions._invocation_scope import (
     _activate_session_interaction,
@@ -971,6 +974,35 @@ def _checkpoint_with_pending_session_interrupt(
                 and expected_interrupted_user_input is not None
                 and session.run_epoch == expected_current_run_epoch + 1
             )
+            if (
+                not current_epoch_matches
+                and session.status is SessionStatus.INTERRUPTED
+                and expected_interrupted_user_input is not None
+                and active_profile is not None
+            ):
+                # Recovery may rebind and release this same paused invocation
+                # more than once. Its exact opening was authenticated by the
+                # interruption entrance; prove every later epoch transfer from
+                # native receipts, rather than admitting an arbitrary old pause.
+                require_invocation_rebind_lineage(
+                    checkpoint,
+                    session_instance_id=session.instance_id,
+                    original=ActiveInvocationExecutionProfile(
+                        session_id=pending_user_input.session_id,
+                        interaction_id=pending_user_input.source_interaction_id,
+                        run_epoch=expected_current_run_epoch,
+                        profile=stored_profile,
+                    ),
+                    current=active_profile,
+                )
+                require_released_invocation_command_authority(
+                    session,
+                    checkpoint,
+                    session_id=session.id,
+                    session_instance_id=session.instance_id,
+                    active_profile=active_profile,
+                )
+                current_epoch_matches = True
             if (
                 pending_user_input.session_id != session.id
                 or pending_user_input.session_instance_id != session.instance_id

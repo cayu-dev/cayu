@@ -269,11 +269,14 @@ def _application(
     mode: str,
     *,
     environment=None,
+    task_store=None,
     crash: bool = False,
     operations: _Operations | None = None,
     background: bool = True,
 ):
-    app = CayuApp(session_store=store, budget_policy=_budget(), enable_logging=False)
+    app = CayuApp(
+        session_store=store, task_store=task_store, budget_policy=_budget(), enable_logging=False
+    )
     if mode == "background":
         provider = _BackgroundProvider(operations or _Operations(), background=background)
     else:

@@ -38,7 +38,7 @@ from tests.core.test_sleep_until_children import (
     _until_idle,
 )
 
-from cayu import AgentSpec, CayuApp, Message, RunRequest
+from cayu import AgentSpec, CayuApp, EventType, Message, RunRequest
 from cayu.providers.base import ModelRequest, ModelStreamEvent
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionStatus
@@ -665,7 +665,9 @@ def test_a_store_error_while_settling_is_retried_by_the_next_pass(
     asyncio.run(scenario())
 
 
-def test_a_cancelled_task_whose_session_needs_a_person_is_left_for_them(tmp_path, request) -> None:
+def test_a_cancelled_task_with_a_lost_model_call_settles_without_redispatch(
+    tmp_path, request
+) -> None:
     async def scenario() -> None:
         clock = _Clock(datetime.now(UTC))
         sessions, tasks = _stores("memory", clock, tmp_path, request)
@@ -684,13 +686,17 @@ def test_a_cancelled_task_whose_session_needs_a_person_is_left_for_them(tmp_path
             await _cancel_fenced(app, task_id)
             await _expire("memory", clock)
             page = await _recover_page(app)
-            assert page.recovered == 0 and page.manual_recovery_required
-            assert (await _next_worker(app)).attention_required
-            # Only a person can settle the model call; the task waits for them.
-            held = await tasks.load_task(task_id)
-            assert held.status is TaskStatus.RUNNING
-            assert held.status_reason == "cancellation_requested"
-            assert (await sessions.load(_session_id(task_id))).status is SessionStatus.RUNNING
+            assert page.recovered == 1 and not page.manual_recovery_required
+            assert not page.failed
+            await _assert_cancelled_and_interrupted(app, task_id)
+            # The expired attached owner settles the ordinary unknown model
+            # outcome without making another provider request or continuing work.
+            assert provider.requests == []
+            assert await sessions.load_active_model_completion_stage(_session_id(task_id)) is None
+            events = await sessions.load_events(_session_id(task_id))
+            assert sum(event.type is EventType.SESSION_INTERRUPTED for event in events) == 1
+            assert not (await _next_worker(app)).attention_required
+            assert await sessions.load_events(_session_id(task_id)) == events
         finally:
             await app.aclose()
 

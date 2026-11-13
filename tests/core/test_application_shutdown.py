@@ -79,6 +79,7 @@ PRIVATE_EXECUTION_ENTRANCES = frozenset(
         "_dispatch_queued",
         "_execute_work_attempt",
         "_recover_claimed_work_attempt",
+        "_recover_expired_attached_task_session",
         "_recover_incomplete_session_private",
         "_resume_private",
         "_run_private",

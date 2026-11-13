@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import weakref
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
@@ -112,6 +113,17 @@ class StreamInterruptPoll:
         await self._control.raise_if_interrupted(self._session_id)
 
 
+# Every application's session control in this process, so recovery in one
+# application can tell whether another one here is still running a session.
+_PROCESS_SESSION_CONTROLS: weakref.WeakSet[SessionControl[Any]] = weakref.WeakSet()
+
+
+def process_has_active_session(session_id: str) -> bool:
+    """Whether any application in this process is still running ``session_id``."""
+
+    return any(control.has_active_tasks(session_id) for control in tuple(_PROCESS_SESSION_CONTROLS))
+
+
 class SessionControl(Generic[UsageTrackerT]):
     """Own process-local session runs and durable interruption observation.
 
@@ -125,6 +137,7 @@ class SessionControl(Generic[UsageTrackerT]):
         self, *, session_store: SessionStore, execution_config: SessionExecutionConfig | None = None
     ) -> None:
         self._session_store = session_store
+        _PROCESS_SESSION_CONTROLS.add(self)
         self.execution_presence = SessionExecutionPresence(
             session_store, execution_config or SessionExecutionConfig()
         )

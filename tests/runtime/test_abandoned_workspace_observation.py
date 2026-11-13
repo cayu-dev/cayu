@@ -35,6 +35,8 @@ from cayu import (
 )
 from cayu.environments.base import Environment
 from cayu.environments.bindings import DeterministicWorkspaceBinding
+from cayu.runtime import _incomplete_session_recovery as incomplete_recovery
+from cayu.runtime._abandoned_tool_result_publication import AbandonedToolResults
 from cayu.runtime._incomplete_session_recovery import IncompleteSessionRecovery
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import IncompleteSessionRecoveryAction
@@ -164,10 +166,19 @@ async def _nothing(self, session_id):
     return ()
 
 
+async def _nothing_published(*, pending_round, **kwargs):
+    return AbandonedToolResults(pending_round=pending_round)
+
+
 def _as_earlier_release(patch) -> None:
-    """Abandon without closing the round's observations, as releases before it did."""
+    """Abandon without closing the round's observations, as releases before it did.
+
+    Those releases didn't publish the round's staged result either, which would
+    close its observation first.
+    """
 
     patch.setattr(IncompleteSessionRecovery, "finish_abandoned_workspace_observations", _nothing)
+    patch.setattr(incomplete_recovery, "publish_abandoned_tool_results", _nothing_published)
 
 
 async def _open_observations(store) -> dict:
@@ -208,6 +219,16 @@ def test_reconciliation_closes_the_observation_of_the_run_it_abandons(
         # result still binds the observation to the write's outcome.
         assert (finalized.payload["status"], finalized.payload.get("detail_code")) == (
             _WITHOUT_ENVIRONMENT[crash]
+        )
+        # The staged result is published once its observation is closed, withheld since
+        # its after-tool hooks hadn't run. A write the worker died inside has none.
+        terminals = [
+            event
+            for event in await store.load_events("fix")
+            if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ]
+        assert [event.payload["tool_call_id"] for event in terminals] == (
+            ["call-workspace"] if crash == "finalization" else []
         )
         # Closing the ended session again replays instead of failing.
         closed = await reader.close_session("fix", reason="Worker lost.")

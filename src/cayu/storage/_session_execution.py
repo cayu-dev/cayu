@@ -193,6 +193,7 @@ class MemorySessionExecutionMixin:
                 session_instance_id=session.instance_id,
                 run_epoch=session.run_epoch,
                 status=session.status,
+                owner_only=not include_waits,
                 # The same approval/input bits the SQL stores read; a wake is neither.
                 waiting=include_waits
                 and bool(pending_action_checkpoint_metrics(checkpoint)[2] & 3),
@@ -331,6 +332,7 @@ class SQLiteSessionExecutionMixin:
                 session_instance_id=row[1],
                 run_epoch=row[2],
                 status=row[3],
+                owner_only=not include_waits,
                 waiting=include_waits and bool((row[4] or 0) & 3),
                 waiting_for_child=include_waits and bool((row[4] or 0) & 8),
                 owner=None if row[5] is None else _ExecutionOwner.model_validate_json(row[5]),
@@ -460,6 +462,7 @@ class PostgresSessionExecutionMixin:
                 session_instance_id=row[1],
                 run_epoch=row[2],
                 status=row[3],
+                owner_only=not include_waits,
                 waiting=include_waits and bool((row[4] or 0) & 3),
                 waiting_for_child=include_waits and bool((row[4] or 0) & 8),
                 owner=None if row[5] is None else _ExecutionOwner.model_validate(row[5]),

@@ -46,7 +46,9 @@ from cayu.runtime._continuation_task_failure import (
     runtime_task_failure_event_id,
     runtime_task_failure_identity_from_task,
     runtime_task_failure_receipt_matches,
+    runtime_task_failure_session_event_id,
     runtime_task_failure_session_payload,
+    runtime_task_failure_terminal_event_id,
     runtime_task_failure_turn_payload,
     runtime_task_terminalization_idempotency_key,
 )
@@ -75,18 +77,22 @@ from cayu.runtime._task_lease_authority import (
 from cayu.runtime._terminal_event_publication import (
     TerminalEventPublication,
 )
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.loop_policies import (
     LoopPolicy,
 )
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
 )
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
 )
 from cayu.sessions._invocation_lifecycle import (
     AdmittedInvocationBinding,
+    require_invocation_rebind_lineage,
+    require_released_invocation_command_authority,
 )
 from cayu.sessions._invocation_scope import (
     _deactivate_session_interaction,
@@ -97,6 +103,7 @@ from cayu.sessions._invocation_terminal_decision import (
     invocation_terminal_decision_from_checkpoint,
     invocation_terminal_decision_matches_active_profile,
     invocation_terminal_decision_matches_recovery_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions._terminal_evidence import _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
@@ -204,6 +211,10 @@ class SessionTaskLifecycle:
         """Finish one durable FAILED winner after its task owner disappeared."""
 
         terminal_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        if terminal_decision is None:
+            terminal_decision = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+            if terminal_decision is not None and terminal_decision.run_epoch != session.run_epoch:
+                return None
         if (
             terminal_decision is None
             or terminal_decision.outcome is not InvocationTerminalOutcome.FAILED
@@ -268,6 +279,9 @@ class SessionTaskLifecycle:
             or failure_identity.execution_profile_fingerprint
             != terminal_decision.execution_profile_fingerprint
             or failure_identity.observed_at != terminal_decision.observed_at
+            or proposed_failure_task.error is None
+            or runtime_task_failure_terminal_event_id(proposed_failure_task, failure_identity)
+            != terminal_decision.terminal_event_id
             or runtime_task_failure_session_payload(proposed_failure_task)
             != terminal_decision.terminal_payload
             or runtime_task_failure_turn_payload(proposed_failure_task)
@@ -357,6 +371,7 @@ class SessionTaskLifecycle:
             task_lease_expires_at=original_lease_expires_at,
             task_handoff_id=original_handoff_id,
             cancelled_by_request=cancelled_by_request,
+            recovery_decision=terminal_decision,
         )
         if not replayed:
             raise TaskClaimLost(
@@ -781,6 +796,7 @@ class SessionTaskLifecycle:
         task_lease_expires_at: datetime | None = None,
         task_handoff_id: str | None,
         cancelled_by_request: bool = False,
+        recovery_decision: InvocationTerminalDecision | None = None,
     ) -> tuple[bool, tuple[Event, ...]]:
         """Converge a receipt-backed generic task failure without redispatching work.
 
@@ -804,13 +820,29 @@ class SessionTaskLifecycle:
             raise KeyError(f"Task not found: {task_id}") from None
         checkpoint = await self.session_store.load_checkpoint(session.id)
         terminal_decision = invocation_terminal_decision_from_checkpoint(checkpoint)
+        failure_decision = terminal_decision
+        if recovery_decision is not None:
+            retained = terminal_decision or settled_invocation_terminal_decision_from_checkpoint(
+                checkpoint
+            )
+            if (
+                type(recovery_decision) is not InvocationTerminalDecision
+                or recovery_decision.schema_version != 1
+                or recovery_decision.outcome is not InvocationTerminalOutcome.FAILED
+                or recovery_decision.runtime_task_failure_id is None
+                or retained != recovery_decision
+            ):
+                raise TaskClaimLost("Runtime failure recovery lost its exact elected decision.")
+            # Settled evidence authorizes exact replay, never a new election or
+            # task mutation. Only this internal native reread can restore it.
+            failure_decision = retained
         if (
             terminal_decision is not None
             and terminal_decision.outcome is InvocationTerminalOutcome.COMPLETED
         ):
             # A committed completion owes no failure; its own finisher completes the task.
             return False, ()
-        if terminal_decision is not None:
+        if failure_decision is not None:
             decision_active_profile = active_invocation_execution_profile_from_checkpoint(
                 checkpoint
             )
@@ -819,21 +851,25 @@ class SessionTaskLifecycle:
                 or decision_active_profile.session_id != session.id
                 or decision_active_profile.run_epoch != session.run_epoch
                 or not invocation_terminal_decision_matches_active_profile(
-                    terminal_decision,
+                    failure_decision,
                     session_id=session.id,
                     session_instance_id=session.instance_id,
                     run_epoch=session.run_epoch,
                     interaction_id=decision_active_profile.interaction_id,
                     execution_profile_fingerprint=(decision_active_profile.profile.fingerprint),
                 )
-                or terminal_decision.task_id != task.id
+                or failure_decision.task_id != task.id
             ):
                 raise TaskClaimLost(
                     "Invocation terminal decision conflicts with its attached task."
                 ) from None
-            if terminal_decision.outcome is InvocationTerminalOutcome.INTERRUPTED:
+            if failure_decision.outcome is InvocationTerminalOutcome.INTERRUPTED:
                 return False, ()
-            if task.status is TaskStatus.RUNNING and not cancelled_by_request:
+            if (
+                terminal_decision is not None
+                and task.status is TaskStatus.RUNNING
+                and not cancelled_by_request
+            ):
                 await self.require_linked_continuation_task_authority(
                     task_id=task.id,
                     task_worker_id=task_worker_id,
@@ -855,19 +891,19 @@ class SessionTaskLifecycle:
             # Failing it may have settled the task through its worker's
             # cancellation request instead, now or on an earlier attempt.
             cancelled_by_request = cancelled_by_request or (
-                terminal_decision.outcome is InvocationTerminalOutcome.FAILED
+                failure_decision.outcome is InvocationTerminalOutcome.FAILED
                 and task.status is TaskStatus.CANCELLED
             )
         evidence = task
         if cancelled_by_request:
-            if terminal_decision is None or terminal_decision.task_error_payload is None:
+            if failure_decision is None or failure_decision.task_error_payload is None:
                 raise TaskClaimLost(
                     "A task cancelled by its request needs the committed failure's evidence."
                 ) from None
             evidence = task.model_copy(
                 update={
                     "status": TaskStatus.FAILED,
-                    "error": terminal_decision.task_error_payload,
+                    "error": failure_decision.task_error_payload,
                 },
                 deep=True,
             )
@@ -878,18 +914,16 @@ class SessionTaskLifecycle:
         )
         if identity is None:
             return False, ()
-        if terminal_decision is not None and (
-            terminal_decision.outcome is not InvocationTerminalOutcome.FAILED
-            or terminal_decision.runtime_task_failure_id != identity.failure_id
-            or terminal_decision.interaction_id != identity.interaction_id
-            or terminal_decision.execution_profile_fingerprint
+        if failure_decision is not None and (
+            failure_decision.outcome is not InvocationTerminalOutcome.FAILED
+            or failure_decision.runtime_task_failure_id != identity.failure_id
+            or failure_decision.interaction_id != identity.interaction_id
+            or failure_decision.execution_profile_fingerprint
             != identity.execution_profile_fingerprint
-            or terminal_decision.observed_at != identity.observed_at
-            or terminal_decision.interaction_event_id
+            or failure_decision.observed_at != identity.observed_at
+            or failure_decision.interaction_event_id
             != runtime_task_failure_event_id(identity, "interaction_failed")
-            or terminal_decision.terminal_event_id
-            != runtime_task_failure_event_id(identity, "session_failed")
-            or terminal_decision.task_error_payload != evidence.error
+            or failure_decision.task_error_payload != evidence.error
         ):
             raise TaskClaimLost(
                 "Failure terminal decision conflicts with durable task evidence."
@@ -907,6 +941,45 @@ class SessionTaskLifecycle:
                     run_epoch=session.run_epoch,
                 )
             )
+            if not released_failure_epoch and session.status is SessionStatus.FAILED:
+                # Terminal binding cleanup can rebind this same invocation. An
+                # epoch difference alone never proves that relationship: retain
+                # the original elected failure and every native rebind/release.
+                with _invocation_lifecycle_authority_read_scope():
+                    lineage_checkpoint = await self.session_store.load_checkpoint(session.id)
+                settled = settled_invocation_terminal_decision_from_checkpoint(lineage_checkpoint)
+                current_profile = active_invocation_execution_profile_from_checkpoint(
+                    lineage_checkpoint
+                )
+                if (
+                    settled is not None
+                    and settled.runtime_task_failure_id == identity.failure_id
+                    and settled.task_error_payload == evidence.error
+                    and current_profile is not None
+                    and current_profile.interaction_id == identity.interaction_id
+                    and current_profile.profile.fingerprint
+                    == identity.execution_profile_fingerprint
+                ):
+                    try:
+                        require_invocation_rebind_lineage(
+                            lineage_checkpoint,
+                            session_instance_id=session.instance_id,
+                            original=current_profile.model_copy(
+                                update={"run_epoch": identity.run_epoch}
+                            ),
+                            current=current_profile,
+                        )
+                        require_released_invocation_command_authority(
+                            session,
+                            lineage_checkpoint,
+                            session_id=session.id,
+                            session_instance_id=session.instance_id,
+                            active_profile=current_profile,
+                        )
+                    except SessionRunFenced:
+                        pass
+                    else:
+                        released_failure_epoch = True
             if not released_failure_epoch:
                 raise TaskClaimLost(
                     "Terminal task failure belongs to a stale session run epoch."
@@ -921,8 +994,8 @@ class SessionTaskLifecycle:
                 session_instance_id=session.instance_id,
                 expected_runtime_task_terminalization_request_sha256=(
                     None
-                    if terminal_decision is None
-                    else terminal_decision.task_terminalization_request_sha256
+                    if failure_decision is None
+                    else failure_decision.task_terminalization_request_sha256
                 ),
             )
         failure_payload = runtime_task_failure_session_payload(evidence)
@@ -934,14 +1007,21 @@ class SessionTaskLifecycle:
             raise TaskClaimLost(
                 "Terminal task failure has conflicting durable session evidence."
             ) from None
+        assert evidence.error is not None
+        terminal_event_id = runtime_task_failure_session_event_id(
+            identity,
+            failure_payload,
+            selected_event_id=runtime_task_failure_terminal_event_id(evidence, identity),
+        )
         turn_completed_payload = runtime_task_failure_turn_payload(evidence)
         if turn_completed_payload is None:
             raise TaskClaimLost(
                 "Terminal task failure lost its durable turn completion payload."
             ) from None
-        if terminal_decision is not None and (
-            terminal_decision.terminal_payload != failure_payload
-            or terminal_decision.turn_completed_payload != turn_completed_payload
+        if failure_decision is not None and (
+            failure_decision.terminal_event_id != terminal_event_id
+            or failure_decision.terminal_payload != failure_payload
+            or failure_decision.turn_completed_payload != turn_completed_payload
         ):
             raise TaskClaimLost(
                 "Failure terminal decision conflicts with its replay payloads."
@@ -974,7 +1054,6 @@ class SessionTaskLifecycle:
                 and event.payload == turn_completed_payload
             )
 
-        terminal_event_id = runtime_task_failure_event_id(identity, "session_failed")
         turn_completed_event_id = runtime_task_failure_event_id(identity, "turn_completed")
         durable_terminal_event: Event | None = None
         terminal_records = await self.session_store.query_events(
@@ -1020,6 +1099,15 @@ class SessionTaskLifecycle:
                 )
             durable_terminal_event = copy_event(terminal_event)
 
+        if (
+            recovery_decision is not None
+            and terminal_decision is None
+            and durable_terminal_event is None
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Settled runtime task failure lost its atomic terminal evidence."
+            )
+
         if session.status not in {
             SessionStatus.RUNNING,
             SessionStatus.INTERRUPTING,
@@ -1030,20 +1118,46 @@ class SessionTaskLifecycle:
             )
         registered_agent = self._get_registered_agent(session.agent_name)
         registered_provider = self._get_registered_provider(session.provider_name)
-        registered_environment = self._get_registered_environment_for_session(
-            session.environment_name
-        )
-        environment_name = _environment_name(registered_environment)
+        environment_unavailable = False
+        try:
+            registered_environment = self._get_registered_environment_for_session(
+                session.environment_name
+            )
+        except KeyError:
+            if recovery_decision is None:
+                raise
+            registered_environment = None
+            environment_unavailable = True
+        environment_name = session.environment_name
         budget_policy = self._get_budget_policy()
-        execution_profile_snapshot = await self._execution_profile_continuation.validate(
-            session=session,
-            checkpoint=checkpoint,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            budget_policy=budget_policy,
-            require_open_interaction=False,
-            record_rejection=False,
-        )
+        execution_profile_snapshot = None
+        run_runtime_hooks = True
+        if not environment_unavailable:
+            try:
+                execution_profile_snapshot = await self._execution_profile_continuation.validate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    budget_policy=budget_policy,
+                    require_open_interaction=False,
+                    record_rejection=False,
+                )
+            except ExecutionProfileMismatchError:
+                if recovery_decision is None:
+                    raise
+        if execution_profile_snapshot is None:
+            # Only the exact elected failure and task receipt authorize this
+            # non-dispatch fallback. Preserve normal matched-profile hooks, but
+            # never execute replacement hooks under the old invocation identity.
+            if recovery_decision is None:
+                raise TaskClaimLost("Runtime failure replay has no current execution profile.")
+            execution_profile_snapshot = active_invocation_execution_profile_from_checkpoint(
+                checkpoint
+            )
+            if execution_profile_snapshot is None:
+                raise TaskClaimLost("Runtime failure recovery lost its frozen invocation profile.")
+            run_runtime_hooks = False
         if (
             execution_profile_snapshot.interaction_id != identity.interaction_id
             or execution_profile_snapshot.profile.fingerprint
@@ -1095,6 +1209,7 @@ class SessionTaskLifecycle:
                     registered_environment=registered_environment,
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
+                    run_runtime_hooks=run_runtime_hooks,
                 ):
                     replay_events.append(event)
             finally:
@@ -1118,6 +1233,7 @@ class SessionTaskLifecycle:
                         task_failed_template.model_copy(
                             update={
                                 "id": runtime_task_failure_event_id(identity, "task_failed"),
+                                "environment_name": environment_name,
                                 "interaction_id": identity.interaction_id,
                                 "timestamp": identity.observed_at,
                                 "payload": {
@@ -1160,6 +1276,7 @@ class SessionTaskLifecycle:
                         task_lease_expires_at=task_lease_expires_at,
                         task_handoff_id=task_handoff_id,
                         cancelled_by_request=cancelled_by_request,
+                        recovery_decision=recovery_decision,
                     )
                     return replayed, (*replay_events, *terminal_events)
             if interaction_id != identity.interaction_id:
@@ -1281,6 +1398,11 @@ class SessionTaskLifecycle:
                         payload=failure_payload,
                     ),
                     "runtime_task_failure_id",
+                    *(
+                        (_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,)
+                        if _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY in failure_payload
+                        else ()
+                    ),
                 ),
                 execution_profile,
             )
@@ -1367,6 +1489,7 @@ class SessionTaskLifecycle:
                         registered_environment=registered_environment,
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
+                        run_runtime_hooks=run_runtime_hooks,
                     ):
                         replay_events.append(event)
                 else:
@@ -1379,6 +1502,7 @@ class SessionTaskLifecycle:
                         registered_environment=registered_environment,
                         execution_profile=execution_profile,
                         invocation_context=invocation_context,
+                        run_runtime_hooks=run_runtime_hooks,
                     ):
                         replay_events.append(event)
             finally:
@@ -1394,6 +1518,7 @@ class SessionTaskLifecycle:
                     registered_environment=registered_environment,
                     execution_profile=execution_profile,
                     invocation_context=invocation_context,
+                    run_runtime_hooks=run_runtime_hooks,
                     expected_run_operation_epoch=identity.run_epoch,
                 ):
                     replay_events.append(event)

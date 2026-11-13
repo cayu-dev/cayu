@@ -1910,12 +1910,19 @@ gone (as for `close_session` below) and whose tasks are all terminal is recovere
 `recover_abandoned_sessions` recovers it: left `interrupted`, with
 `pending_tool_effect` (an inbox recovery item) when a call it was running has an
 unknown outcome. Where its environment isn't registered, it fails as abandoned
-instead, through the same fenced transition a close without the environment uses,
+instead when it has no retained gate or foreground-child obligation, through the
+same fenced transition a close without the environment uses,
 with reason `orphaned_session_reconciled` and action `abandoned_orphaned_run` (or
 `abandoned_tool_effect` when it lists unknown tool calls). A run that stopped inside
 model work (an assistant turn, a context compaction, an auxiliary call, a background
 provider operation, or an answer recorded but not published) ends the same way, with
-that work settled as a close without the environment settles it (below).
+that work settled as a close without the environment settles it (below). A tool
+result the run staged and didn't publish is published before the session fails,
+under the same fenced claim, and the abandonment record lists it under
+`published_tool_calls`: as recorded when its after-tool hooks had run, and with the
+result withheld (`tool.call.failed`, reason `abandoned_before_tool_result_hooks`)
+when they hadn't, since running them needs the run's hooks and environment. Workspace
+observations still open are closed first. No tool, hook or model runs again.
 
 Every attested lost execution is eligible without waiting for the inactivity
 window, regardless of environment registration or task attribution. The
@@ -1965,9 +1972,22 @@ the latter for a person's decision. Positive native owner loss removes the
 inactivity delay for registered conversations too. An inherited task ID does not
 authorize changing that task's current attempt.
 
-Retained human gates and foreground-child obligations with unavailable environments
-remain subject to their existing recovery owner. This generic sweep does not
-consume their accepted work or bypass the task worker's attached-task guards.
+When an unavailable environment would otherwise strand an accepted human gate or
+a positively matched foreground-child obligation, lost-owner recovery interrupts
+the invocation without consuming that work. It preserves the gate's accepted
+resolution, original profile, tool receipts and environment binding. This path
+uses ordinary invocation and interruption settlement, skips terminal extension
+hooks that cannot run under the unavailable environment, and does not dispatch a
+provider, tool or environment factory. Unknown external effects remain manual
+recovery at a continuation boundary; interrupted status is not deployment consent.
+The same settlement owner handles an expired attached task only through its private
+worker entrance carrying the exact task claim tuple; public request metadata cannot
+supply that authority. Under that claim, the existing model owner settles prepared
+model work, promotes an already-recorded response, or records auxiliary uncertainty
+before interruption; an owned turn with no dispatched work can also end. An in-flight
+background provider operation retains its dedicated resolution contract and is not
+sent through this cleanup-only path. A missing environment does not bypass the task
+claim or let a successor task be changed.
 
 Verifier-governed work keeps its existing recovery contract. An unknown dispatched
 model call can retain the governed task and run fence for explicit operator

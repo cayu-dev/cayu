@@ -34,6 +34,12 @@ from cayu.sessions._execution_profile_checkpoint import (
     active_invocation_execution_profile_from_checkpoint,
 )
 from cayu.sessions._foreground_child_checkpoint import FOREGROUND_CHILD_WAIT_KEY
+from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
+    settled_invocation_terminal_decision_from_checkpoint,
+)
 from cayu.sessions._paired_writes import owed_decision_of_status
 from cayu.sessions._pending_approval_reader import (
     PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
@@ -126,6 +132,7 @@ def abandoned_session_record(
     metadata: dict[str, Any],
     tool_round: dict[str, Any],
     unknown_tool_calls: list[dict[str, str]],
+    published_tool_calls: list[dict[str, str]] | None = None,
     denied_approval: dict[str, Any] | None = None,
     closed: dict[str, Any] | None = None,
     model_call: dict[str, Any] | None = None,
@@ -139,6 +146,12 @@ def abandoned_session_record(
         "tool_round": tool_round,
         "unknown_tool_calls": unknown_tool_calls,
     }
+    if published_tool_calls:
+        # Results the lost run had staged, each with its durable terminal event:
+        # published as the round was retired, or appended by the run just before it
+        # died. ``result`` is ``recorded``, or ``withheld`` when the result's
+        # after-tool hooks hadn't run.
+        record["published_tool_calls"] = published_tool_calls
     if denied_approval is not None:
         # A person denied the round's approval, but the round could not continue:
         # the application's execution profile had changed, or the session's
@@ -202,6 +215,10 @@ def abandoned_session_from_checkpoint(
         or type(record.get("tool_round")) is not dict
         or type(record.get("unknown_tool_calls")) is not list
         or any(type(call) is not dict for call in record["unknown_tool_calls"])
+        or (
+            "published_tool_calls" in record
+            and not _valid_published_tool_calls(record["published_tool_calls"])
+        )
         or ("denied_approval" in record and not _valid_denied_approval(record["denied_approval"]))
         or ("closed" in record and not _valid_closed(record["closed"]))
         or ("model_call" in record and not _valid_model_call(record["model_call"]))
@@ -225,6 +242,21 @@ _DENIED_APPROVAL_STRING_FIELDS = (
     "resolution_request_digest",
     "denied_at",
 )
+
+
+_PUBLISHED_TOOL_CALL_FIELDS = frozenset(
+    {"tool_round_id", "tool_call_id", "tool_name", "event_id", "result"}
+)
+
+
+def _valid_published_tool_calls(calls: Any) -> bool:
+    return type(calls) is list and all(
+        type(call) is dict
+        and set(call) == _PUBLISHED_TOOL_CALL_FIELDS
+        and all(type(value) is str for value in call.values())
+        and call["result"] in {"recorded", "withheld"}
+        for call in calls
+    )
 
 
 _CLOSED_FIELDS = frozenset({"tool_round_id", "approval_id", "input_id"})
@@ -814,7 +846,10 @@ class SessionAbandonment:
             raise SessionStatusConflict(
                 "This subagent's parent session waits on it; end the parent session instead."
             )
-        abandoned = await self._incomplete_recovery.abandon_orphaned_without_environment(
+        (
+            abandoned,
+            tool_results,
+        ) = await self._incomplete_recovery.abandon_orphaned_without_environment(
             session,
             reason=reason,
             metadata=metadata,
@@ -823,6 +858,10 @@ class SessionAbandonment:
         )
         retired = await self._incomplete_recovery.finish_abandoned_workspace_observations(
             session.id
+        )
+        published = () if tool_results is None else tool_results.published_tool_calls
+        repaired = bool(retired) or (
+            tool_results is not None and bool(tool_results.workspace_observation_events)
         )
         # No recovery owner reconstructed the run, so nothing closed its interaction.
         await self._session_recovery.settle_released_open_interaction(session.id)
@@ -845,11 +884,11 @@ class SessionAbandonment:
                 else IncompleteSessionRecoveryAction.ABANDONED_ORPHANED_RUN,
                 *(
                     (IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION,)
-                    if retired
+                    if repaired
                     else ()
                 ),
             ),
-            events=retired,
+            events=(*(() if tool_results is None else tool_results.events), *retired),
             message=(
                 ("Closed" if closed is not None else "Failed")
                 + " the session its lost worker left running; it can no longer continue."
@@ -857,6 +896,11 @@ class SessionAbandonment:
                     f" {len(unknown)} tool call(s) it was running have unknown outcomes and "
                     "were not dispatched again."
                     if unknown
+                    else ""
+                )
+                + (
+                    f" {len(published)} tool result(s) it had staged were published."
+                    if published
                     else ""
                 )
                 + (
@@ -1313,15 +1357,18 @@ class SessionAbandonment:
         whose owner is provably gone (``owner_gone``) and whose tasks are all terminal
         is recovered as ``recover_abandoned_sessions`` would: interrupted, with
         ``pending_tool_effect`` when a tool call it was running has an unknown outcome.
+        A native invocation's exact elected linked-task failure instead finishes
+        through its task failure owner, including its still-uncommitted task write.
         Where its environment isn't registered, so recovery can't take it over, it
-        fails as abandoned instead (``abandon_orphaned_without_environment``). Any
-        other session is left alone and not reported. A positively attested lost owner
+        fails as abandoned instead (``abandon_orphaned_without_environment``),
+        except retained gates or exact foreground-child obligations, which are
+        interrupted without consuming their work. Any other session is left alone and not reported. A positively attested lost owner
         qualifies without the inactivity window, regardless of environment
         registration or task attribution. Native
         invocation admission still guards recovery; permanent abandonment also
         freezes its attached task set. It then finishes abandonments
         that failed a session but stopped before its terminal evidence
-        (``_finish_unfinished_abandonments``), and terminal turns whose run stopped
+        (``_finish_unfinished_failures``), and terminal turns whose run stopped
         before it published what their decision owes (``recover_committed_outcomes``).
         Interrupted sessions from the last seven days with a validated pending
         interruption marker also finish through the existing recovery owner.
@@ -1391,7 +1438,7 @@ class SessionAbandonment:
                     cursor = page.next_cursor
         # A committed abandonment is already terminal; publishing its missing
         # evidence cannot take over a conversation and must not wait for grace.
-        results.extend(await self._finish_unfinished_abandonments())
+        results.extend(await self._finish_unfinished_failures())
         results.extend(
             await self._incomplete_recovery.recover_committed_outcomes(
                 inactive_for_seconds=inactive_for_seconds,
@@ -1400,15 +1447,40 @@ class SessionAbandonment:
         )
         return results
 
-    async def _finish_unfinished_abandonments(self) -> list[IncompleteSessionRecoveryResult]:
-        """Finish abandonments that failed a session but stopped before its evidence.
+    @staticmethod
+    def _has_exact_linked_failure(session: Session, checkpoint: dict[str, Any] | None) -> bool:
+        decision = invocation_terminal_decision_from_checkpoint(checkpoint) or (
+            settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+        )
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        return bool(
+            decision is not None
+            and decision.schema_version == 1
+            and decision.outcome is InvocationTerminalOutcome.FAILED
+            and decision.runtime_task_failure_id is not None
+            and decision.task_id is not None
+            and profile is not None
+            and profile.run_epoch == session.run_epoch
+            and invocation_terminal_decision_matches_active_profile(
+                decision,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=session.run_epoch,
+                interaction_id=profile.interaction_id,
+                execution_profile_fingerprint=profile.profile.fingerprint,
+            )
+        )
+
+    async def _finish_unfinished_failures(self) -> list[IncompleteSessionRecoveryResult]:
+        """Finish exact failed outcomes whose process stopped before final release.
 
         An abandonment commits ``failed`` before it publishes ``session.failed`` and
         settles the run's interaction, so a process that died in between, or a
         publication that failed, leaves a failed session no running-session sweep
         selects again. This revisits failed sessions that ended within
         ``_UNFINISHED_TERMINAL_LOOKBACK``, newest first, and finishes each
-        abandoned one still missing that evidence.
+        abandoned one still missing that evidence. Native linked-task failure
+        decisions retain their own exact task/terminal owner through this scan.
         """
 
         results: list[IncompleteSessionRecoveryResult] = []
@@ -1428,6 +1500,24 @@ class SessionAbandonment:
                 if session.updated_at < cutoff:
                     return results
                 try:
+                    checkpoint = await self._session_store.load_checkpoint(session.id)
+                    if (
+                        self._session_store.supports_session_execution
+                        and self._has_exact_linked_failure(session, checkpoint)
+                        and await self._incomplete_recovery.execution_owner(session) == "lost"
+                    ) or await self._incomplete_recovery.has_unfinished_linked_failure_binding(
+                        session
+                    ):
+                        results.append(
+                            await self._session_recovery.recover_incomplete_session(
+                                IncompleteSessionRecoveryRequest(
+                                    session_id=session.id,
+                                    inactive_for_seconds=0,
+                                    reason="committed_runtime_task_failure_recovered",
+                                )
+                            )
+                        )
+                        continue
                     record = await self._unfinished_abandonment(session)
                     if record is None:
                         continue
@@ -1436,7 +1526,7 @@ class SessionAbandonment:
                     )
                 except Exception as exc:
                     logger.warning(
-                        "Finishing the abandonment of session %s failed: error_type=%s",
+                        "Finishing the failed session %s failed: error_type=%s",
                         session.id,
                         type(exc).__name__,
                     )
@@ -1444,7 +1534,7 @@ class SessionAbandonment:
                         _unresumed_close(
                             session.id,
                             IncompleteSessionRecoveryAction.FAILED,
-                            f"Finishing the session's abandonment failed: {type(exc).__name__}.",
+                            f"Finishing the session's failed outcome failed: {type(exc).__name__}.",
                         )
                     )
             if page.next_cursor is None or page.next_cursor == cursor:
@@ -1531,7 +1621,13 @@ class SessionAbandonment:
             elif not await self.owner_gone(session):
                 return None
             if not await self.tasks_are_terminal(session.id):
-                return None
+                checkpoint = await self._session_store.load_checkpoint(session.id)
+                if not (
+                    self._session_store.supports_session_execution
+                    and self._has_exact_linked_failure(session, checkpoint)
+                    and await self._incomplete_recovery.execution_owner(session) == "lost"
+                ):
+                    return None
             try:
                 # Selection is not ownership: the public ID may be replaced or
                 # resumed while task/environment evidence is being read.

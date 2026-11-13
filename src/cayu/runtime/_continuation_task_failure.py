@@ -19,6 +19,10 @@ from cayu._validation import (
     copy_durable_json_object,
     require_durable_clean_nonblank,
 )
+from cayu.sessions._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    queued_dispatch_terminal_event_id,
+)
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.store import TaskStore
 from cayu.tasks.terminalization import (
@@ -30,6 +34,22 @@ from cayu.tasks.terminalization import (
 
 _RUNTIME_TASK_FAILURE_MARKER_KEY = "runtime_task_failure"
 _RUNTIME_TASK_FAILURE_SCHEMA = "cayu.runtime-task-failure.v2"
+# The selected session terminal event id is optional so v2 markers written by
+# v0.19.1, which have no such key, still parse.
+_SESSION_TERMINAL_EVENT_ID_KEY = "session_terminal_event_id"
+_RUNTIME_TASK_FAILURE_MARKER_KEYS = frozenset(
+    {
+        "schema",
+        "failure_id",
+        "session_instance_id",
+        "run_epoch",
+        "interaction_id",
+        "execution_profile_fingerprint",
+        "observed_at",
+        "session_failure_payload",
+        "turn_completed_payload",
+    }
+)
 _RUNTIME_TASK_FAILURE_TERMINALIZATION_PENDING_STATE = (
     "_cayu_runtime_task_failure_terminalization_pending"
 )
@@ -175,6 +195,7 @@ def runtime_task_failure_payload(
     identity: RuntimeTaskFailureIdentity,
     diagnostic_payload: dict[str, Any],
     session_failure_payload: dict[str, Any],
+    session_terminal_event_id: str,
     turn_completed_payload: dict[str, Any],
 ) -> dict[str, Any]:
     """Bind a portable diagnostic to replayable runtime failure authority."""
@@ -184,6 +205,9 @@ def runtime_task_failure_payload(
     payload = dict(diagnostic_payload)
     if payload.get("session_id") != identity.session_id:
         raise ValueError("Runtime task failure diagnostic has a conflicting session_id.")
+    runtime_task_failure_session_event_id(
+        identity, session_failure_payload, selected_event_id=session_terminal_event_id
+    )
     payload[_RUNTIME_TASK_FAILURE_MARKER_KEY] = {
         "schema": _RUNTIME_TASK_FAILURE_SCHEMA,
         "failure_id": identity.failure_id,
@@ -192,6 +216,7 @@ def runtime_task_failure_payload(
         "interaction_id": identity.interaction_id,
         "execution_profile_fingerprint": identity.execution_profile_fingerprint,
         "observed_at": identity.observed_at.isoformat(),
+        _SESSION_TERMINAL_EVENT_ID_KEY: session_terminal_event_id,
         "session_failure_payload": copy_durable_json_object(
             session_failure_payload,
             "session_failure_payload",
@@ -223,17 +248,10 @@ def runtime_task_failure_identity_from_task(
     ):
         return None
     marker = task.error.get(_RUNTIME_TASK_FAILURE_MARKER_KEY)
-    if type(marker) is not dict or set(marker) != {
-        "schema",
-        "failure_id",
-        "session_instance_id",
-        "run_epoch",
-        "interaction_id",
-        "execution_profile_fingerprint",
-        "observed_at",
-        "session_failure_payload",
-        "turn_completed_payload",
-    }:
+    if type(marker) is not dict or set(marker) not in (
+        _RUNTIME_TASK_FAILURE_MARKER_KEYS,
+        _RUNTIME_TASK_FAILURE_MARKER_KEYS | {_SESSION_TERMINAL_EVENT_ID_KEY},
+    ):
         return None
     if (
         marker.get("schema") != _RUNTIME_TASK_FAILURE_SCHEMA
@@ -242,6 +260,7 @@ def runtime_task_failure_identity_from_task(
         or type(marker.get("interaction_id")) is not str
         or type(marker.get("execution_profile_fingerprint")) is not str
         or type(marker.get("observed_at")) is not str
+        or type(marker.get(_SESSION_TERMINAL_EVENT_ID_KEY, "")) is not str
         or type(marker.get("session_failure_payload")) is not dict
         or type(marker.get("turn_completed_payload")) is not dict
     ):
@@ -260,7 +279,33 @@ def runtime_task_failure_identity_from_task(
         return None
     if marker.get("failure_id") != identity.failure_id:
         return None
+    try:
+        runtime_task_failure_session_event_id(
+            identity,
+            marker["session_failure_payload"],
+            selected_event_id=_marker_session_terminal_event_id(marker, identity),
+        )
+    except (TypeError, ValueError):
+        return None
     return identity
+
+
+def _marker_session_terminal_event_id(
+    marker: dict[str, Any], identity: RuntimeTaskFailureIdentity
+) -> str:
+    # v0.19.1 wrote v2 markers without the selected event id. It always
+    # published a linked failure under the ordinary event id, never a queued one.
+    selected = marker.get(_SESSION_TERMINAL_EVENT_ID_KEY)
+    if selected is None:
+        return runtime_task_failure_event_id(identity, "session_failed")
+    return selected
+
+
+def runtime_task_failure_terminal_event_id(task: Task, identity: RuntimeTaskFailureIdentity) -> str:
+    """Return the session terminal event id a parsed runtime failure marker selected."""
+
+    assert type(task.error) is dict
+    return _marker_session_terminal_event_id(task.error[_RUNTIME_TASK_FAILURE_MARKER_KEY], identity)
 
 
 def runtime_task_failure_session_payload(task: Task) -> dict[str, Any] | None:
@@ -311,6 +356,25 @@ def runtime_task_failure_event_id(
     if type(identity) is not RuntimeTaskFailureIdentity:
         raise TypeError("identity must be a RuntimeTaskFailureIdentity.")
     return f"{identity.failure_id}:{outcome}"
+
+
+def runtime_task_failure_session_event_id(
+    identity: RuntimeTaskFailureIdentity,
+    session_payload: dict[str, Any],
+    *,
+    selected_event_id: str,
+) -> str:
+    """Restore the session identity from the exact task-owned failure payload."""
+
+    ordinary_id = runtime_task_failure_event_id(identity, "session_failed")
+    if selected_event_id == ordinary_id:
+        return ordinary_id
+    operation_id = session_payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+    if type(operation_id) is not str:
+        raise ValueError("Queued failure requires its selected operation identity.")
+    if selected_event_id != queued_dispatch_terminal_event_id(operation_id):
+        raise ValueError("Task failure session event conflicts with its selected operation.")
+    return selected_event_id
 
 
 def runtime_task_failure_receipt_matches(

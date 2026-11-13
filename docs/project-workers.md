@@ -209,10 +209,15 @@ worker that recovers interrupted handoffs (long-running or `--until-idle`; every
 `run_task_worker` does unless it passes `recover_interrupted_handoffs=False`)
 settles it as `cancelled` as soon as its session can be interrupted, whether the
 task was mid-turn, asleep in `sleep_until` or parked on an external wait. It never
-runs the model or a tool again for it. Two cases aren't settled automatically yet:
-a session that needs a person to interrupt it (a model call in flight), and a
-session that waits on a subagent. `cayu inspect --fenced-tasks` lists them; settle
-the session first, then reconcile the task with
+runs the model or a tool again for it. An ordinary model call left in flight is
+settled with an unknown provider outcome under the expired task's exact session
+incarnation and run epoch; its reserved budget is charged in full. This is also
+how a non-cancelled expired task gets an interrupted handoff. Provider operations
+that can be inspected or resumed and unknown external tool effects retain their
+explicit recovery boundaries; recovery does not retry those effects. A cancelled
+task whose session waits on a subagent has its own lost run interrupted, but the
+task stays fenced until the whole chain is settled. `cayu inspect --fenced-tasks`
+lists it; settle any unresolved descendant first, then reconcile the task with
 `TaskStore.reconcile_task_cancellation`.
 
 To run a task created with `TaskCreate(restartable=True)` again instead of
@@ -249,9 +254,10 @@ a deploy: a settled model call can expose a resumable boundary, while a tool cal
 with an unknown external outcome retains a manual-recovery item and can still hold
 Cloud's publication. Live owners and unattested fresh runs are left alone.
 Unfinished attached tasks stay with the task worker's expired-handoff recovery.
-Unavailable environments with retained human gates or foreground-child obligations
-still need their existing recovery owner; this sweep does not consume that work.
-Verifier-governed work with
+Accepted approvals, answers and exact foreground-child obligations keep their
+recorded work when the environment is unavailable: recovery interrupts the lost
+invocation, retains its profile and binding, and skips terminal extension hooks.
+It dispatches no provider, tool or environment factory. Verifier-governed work with
 an unknown model dispatch retains its existing explicit recovery requirement and
 its task/run fence; generic recovery does not bypass the verifier.
 A large population can make a pass take

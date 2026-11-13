@@ -98,6 +98,7 @@ from cayu.runtime._invocation_lifecycle import (
 )
 from cayu.runtime._outcome_decision_settlement import (
     OwedOutcome,
+    bind_owed_terminal_to_run_operation,
     completed_task_event,
     completion_terminal_payload,
     owed_decision_install,
@@ -175,6 +176,7 @@ from cayu.sessions._paired_writes import unsettled_owed_decision
 from cayu.sessions._terminal_evidence import (
     _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
     _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+    _session_run_operation_from_checkpoint,
     interruption_request_id_from_payload,
 )
 from cayu.sessions.authority import SessionRunFenced
@@ -1179,6 +1181,20 @@ class SessionOutcomePublication:
         ):
             if payload is None or prepared_failure_turn_completed is None:
                 raise AssertionError("Runtime failure lost its terminal evidence.") from exc
+            failure_checkpoint = await self.session_store.load_checkpoint(state.session.id)
+            failure_operation = _session_run_operation_from_checkpoint(failure_checkpoint)
+            if (
+                failure_operation is not None
+                and failure_operation.run_epoch != state.session.run_epoch
+            ):
+                raise SessionRunFenced("Task failure lost its queued run-operation epoch.") from exc
+            failure_terminal_event_id, payload = bind_owed_terminal_to_run_operation(
+                checkpoint=failure_checkpoint,
+                terminal_event_id=runtime_task_failure_event_id(
+                    runtime_failure_identity, "session_failed"
+                ),
+                terminal_payload=payload,
+            )
             compaction_failure = automatic_compaction_failure_payload(
                 exc, redactor=self._secret_redactor
             )
@@ -1195,6 +1211,7 @@ class SessionOutcomePublication:
                 identity=runtime_failure_identity,
                 diagnostic_payload=diagnostic_task_error,
                 session_failure_payload=payload,
+                session_terminal_event_id=failure_terminal_event_id,
                 turn_completed_payload=prepared_failure_turn_completed.payload,
             )
             task_terminalization_request_sha256 = (
@@ -1220,10 +1237,7 @@ class SessionOutcomePublication:
                     runtime_failure_identity,
                     "interaction_failed",
                 ),
-                terminal_event_id=runtime_task_failure_event_id(
-                    runtime_failure_identity,
-                    "session_failed",
-                ),
+                terminal_event_id=failure_terminal_event_id,
                 observed_at=runtime_failure_identity.observed_at,
                 terminal_payload=payload,
                 task_id=task_id,

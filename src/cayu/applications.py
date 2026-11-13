@@ -7837,6 +7837,33 @@ class CayuApp(
         del request
         return await recovery
 
+    @_admitted_entrance
+    @execution_owned_by("recovery")
+    async def _recover_expired_attached_task_session(
+        self,
+        session: Session,
+        task: Task,
+    ) -> IncompleteSessionRecoveryResult:
+        """Settle the exact run selected by the expired-task handoff owner.
+
+        The worker validates its store-discovered expired task claim before this
+        private entrance. The native recovery reservation rechecks the captured
+        session incarnation and epoch before fencing it. Public recovery never
+        enables the automatic unknown-model settlement used by this owner.
+        """
+        from cayu.runtime._abandoned_session_recovery import _abandoned_execution
+
+        with _abandoned_execution(session, expired_attached_task=task):
+            return await self._session_recovery.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=session.id,
+                    inactive_for_seconds=None,
+                    reason="expired_attached_task_owner",
+                    metadata={"recovery_scope": "attached_task"},
+                ),
+                recover_abandoned_models=True,
+            )
+
     @execution_owned_by("foreground_child_delivery")
     async def _continue_foreground_parent(self, claim: PersistedEventSideEffectClaim) -> bool:
         from cayu.runtime._foreground_child_continuation import continue_foreground_parent

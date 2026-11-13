@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import logging
+import weakref
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -781,6 +782,25 @@ def _advance_cleanup_environment(
     owner.invocation_context = context
 
 
+#: Every environment lifecycle in this process, so recovery in one application can see
+#: cleanup another application sharing the store still runs for a session.
+_PROCESS_ENVIRONMENT_LIFECYCLES: weakref.WeakSet[EnvironmentLifecycle] = weakref.WeakSet()
+
+
+def process_retains_environment_cleanup(
+    session_id: str, *, excluding: EnvironmentLifecycle | None = None
+) -> bool:
+    """Whether another application in this process still owns environment cleanup for
+    ``session_id``: an owner admission, a deferred factory cleanup, or a setup whose cleanup
+    hasn't finished or is settling. ``excluding`` is the asking application's own
+    lifecycle, whose cleanup its recovery already coordinates with."""
+
+    return any(
+        lifecycle is not excluding and lifecycle.retains_environment_cleanup(session_id)
+        for lifecycle in tuple(_PROCESS_ENVIRONMENT_LIFECYCLES)
+    )
+
+
 class EnvironmentLifecycle(EnvironmentExitOwnership):
     """Own environment factory, workspace binding, and reconnect state."""
 
@@ -857,6 +877,25 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             max_operations=_MAX_RETAINED_FINAL_WORKSPACE_OBSERVATIONS
         )
         super().__init__(session_store, self._active_environment_setups, self.shared_allocations)
+        _PROCESS_ENVIRONMENT_LIFECYCLES.add(self)
+
+    def retains_environment_cleanup(self, session_id: str) -> bool:
+        """Whether this application is still running environment cleanup for ``session_id``.
+        A cleanup that finished and waits for recovery to retry it is not running, and a
+        deferred run-fence release only waits for cleanup, so neither counts."""
+
+        if session_id in self._pending_environment_owner_admissions:
+            return True
+        factory_cleanup = self._deferred_factory_cleanup_tasks.get(session_id)
+        if factory_cleanup is not None and not factory_cleanup.done():
+            return True
+        setup_owner = self._active_environment_setups.get(session_id)
+        if setup_owner is None:
+            return False
+        return not setup_owner.cleanup_ready_for_retry or any(
+            task is not None and not task.done()
+            for task in (setup_owner.cleanup_settlement_task, setup_owner.admission_settlement_task)
+        )
 
     def _session_run_here(self, session_id: str) -> tuple[str, int] | None:
         """The incarnation and run epoch of the run this process executes for a session."""

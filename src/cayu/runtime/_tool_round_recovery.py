@@ -1034,6 +1034,34 @@ def unknown_recovered_tool_result(
 def hook_scope_unavailable_recovery_event(event: Event) -> Event:
     """Fail closed when restart erased a dynamic round's hook redactor."""
 
+    return _withheld_terminal_event(
+        event,
+        content=(
+            "Tool result unavailable because its invocation-secret scope could not "
+            "be reconstructed before recovery hooks."
+        ),
+        reason="recovery_hook_secret_scope_unavailable",
+    )
+
+
+def abandoned_before_hooks_recovery_event(event: Event) -> Event:
+    """Withhold a staged result whose hooks hadn't run when its session was abandoned.
+
+    Its after-tool hooks could still rewrite or redact the result, and abandoning
+    the session runs none of them.
+    """
+
+    return _withheld_terminal_event(
+        event,
+        content=(
+            "Tool result unavailable because the session was abandoned before the "
+            "result's after-tool hooks ran."
+        ),
+        reason="abandoned_before_tool_result_hooks",
+    )
+
+
+def _withheld_terminal_event(event: Event, *, content: str, reason: str) -> Event:
     if type(event) is not Event or event.type not in _TOOL_ROUND_TERMINAL_EVENT_TYPES:
         raise TypeError("Recovered hook quarantine requires a terminal tool event.")
     # Quarantine removes unsafe output, not the durable fact that a denied call
@@ -1041,16 +1069,13 @@ def hook_scope_unavailable_recovery_event(event: Event) -> Event:
     # without a started event and make continuation reconciliation reject it.
     never_executed = event.type in staged_terminal_reader._NONEXECUTED_TERMINAL_EVENT_TYPES
     result = ToolResult(
-        content=(
-            "Tool result unavailable because its invocation-secret scope could not "
-            "be reconstructed before recovery hooks."
-        ),
+        content=content,
         structured={
             **({} if never_executed else {"error": "invalid_tool_output"}),
             "outcome_unknown": not never_executed,
             **({"executed": False} if never_executed else {}),
             "recovered": True,
-            "reason": "recovery_hook_secret_scope_unavailable",
+            "reason": reason,
         },
         is_error=True,
     )

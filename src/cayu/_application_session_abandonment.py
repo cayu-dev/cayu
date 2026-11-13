@@ -85,7 +85,9 @@ class SessionAbandonmentEntrances:
         listing any unknown tool calls, and a model call it was making in
         ``model_call_outcome_unknown``, or in ``model_call_settled`` when its recorded
         answer was published or its background provider operation cancelled); its
-        environment binding stays recorded.
+        environment binding stays recorded. Retained human gates and exact
+        foreground-child obligations are interrupted without consuming their work,
+        even when their environment is unavailable.
 
         An attested lost execution qualifies immediately, without the inactivity
         window, including registered environments and runs without attached tasks.

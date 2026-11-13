@@ -78,6 +78,10 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_call_replay as tool_call_replay
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._abandoned_tool_result_publication import (
+    AbandonedToolResults,
+    publish_abandoned_tool_results,
+)
 from cayu.runtime._continuation_task_failure import (
     load_direct_task_failure_replay,
     provider_operation_task_failure_payload,
@@ -231,6 +235,7 @@ from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
 )
+from cayu.sessions._checkpoint_preservation import _invocation_lifecycle_authority_read_scope
 from cayu.sessions._durable_operation_ownership import DurableOperationOwnership
 from cayu.sessions._execution_profile_checkpoint import (
     EXECUTION_PROFILE_METADATA_KEY,
@@ -242,8 +247,14 @@ from cayu.sessions._execution_profile_checkpoint import (
 )
 from cayu.sessions._invocation_lifecycle import (
     invocation_lifecycle_receipt_history_present,
+    require_invocation_rebind_lineage,
+    require_released_invocation_command_authority,
 )
 from cayu.sessions._invocation_terminal_decision import (
+    InvocationTerminalDecision,
+    InvocationTerminalOutcome,
+    invocation_terminal_decision_from_checkpoint,
+    invocation_terminal_decision_matches_active_profile,
     settled_invocation_terminal_decision_from_checkpoint,
 )
 from cayu.sessions._model_stage import ModelCompletionStage
@@ -1583,24 +1594,28 @@ class IncompleteSessionRecovery:
                     ),
                 )
 
-        # Every recovery path (single, batch, task and work attempts) comes
-        # here: resolve the environment built from the session's own record,
-        # rebuilt separately when its slot name now holds another job's.
-        async with self._session_environments.recovery_scope(
-            session, read_only=read_only_environment
-        ):
+        mutation_admitted = False
+
+        async def admit_once() -> None:
+            nonlocal mutation_admitted
+            if mutation_admitted or before_mutation is None:
+                return
+            await before_mutation()
+            mutation_admitted = True
+
+        async def recover_owned(target: Session) -> IncompleteSessionRecoveryResult:
             return await self._recover_incomplete_session_owned(
                 recover_abandoned_model=recover_abandoned_model,
                 abandon_unknown_tool_effects=abandon_unknown_tool_effects,
                 execution_to_wait=execution_to_wait,
                 _work_attempt=_work_attempt,
                 preserve_interaction_id=preserve_interaction_id,
-                session=session,
+                session=target,
                 inactive_for_seconds=inactive_for_seconds,
                 reason=reason,
                 metadata=metadata,
                 previous_status=previous_status,
-                before_mutation=before_mutation,
+                before_mutation=admit_once,
                 record_profile_rejection=record_profile_rejection,
                 retain_open_interaction_invocation=retain_open_interaction_invocation,
                 retain_invocation_context=retain_invocation_context,
@@ -1611,6 +1626,116 @@ class IncompleteSessionRecovery:
                 participant_context=participant_context,
                 interrupt_for_manual_tool_recovery=interrupt_for_manual_tool_recovery,
             )
+
+        # All recovery entrances retain the same environment scope and admission
+        # while completing a decided failure and its saved binding cleanup.
+        async with self._session_environments.recovery_scope(
+            session, read_only=read_only_environment
+        ):
+            source_checkpoint = await self._session_store.load_checkpoint(session.id)
+            source_failure = invocation_terminal_decision_from_checkpoint(source_checkpoint) or (
+                settled_invocation_terminal_decision_from_checkpoint(source_checkpoint)
+            )
+            result = await recover_owned(session)
+            current = await self._recovery_ownership.require_session(session.id)
+            if (
+                source_failure is None
+                or current.instance_id != session.instance_id
+                or not await self.has_unfinished_linked_failure_binding(
+                    current, expected_failure=source_failure
+                )
+            ):
+                return result
+            from cayu.runtime._abandoned_session_recovery import _without_abandoned_execution
+
+            # The old task/run has settled and released. Its takeover token must
+            # not carry authority into the independently claimed binding cleanup.
+            with _without_abandoned_execution():
+                cleanup = await recover_owned(current)
+            events = {event.id: event for event in result.events}
+            events.update({event.id: event for event in cleanup.events})
+            return cleanup.model_copy(
+                update={
+                    "previous_status": previous_status,
+                    "actions": tuple(dict.fromkeys((*result.actions, *cleanup.actions))),
+                    "events": tuple(events.values()),
+                }
+            )
+
+    async def has_unfinished_linked_failure_binding(
+        self,
+        session: Session,
+        *,
+        expected_failure: InvocationTerminalDecision | None = None,
+    ) -> bool:
+        """Select saved cleanup of an exact settled failure; never execute its work."""
+        if (
+            not self._session_store.supports_session_execution
+            or session.status is not SessionStatus.FAILED
+        ):
+            return False
+        with _invocation_lifecycle_authority_read_scope():
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        decision = settled_invocation_terminal_decision_from_checkpoint(checkpoint)
+        profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if (
+            decision is None
+            or (expected_failure is not None and decision != expected_failure)
+            or decision.schema_version != 1
+            or decision.outcome is not InvocationTerminalOutcome.FAILED
+            or decision.runtime_task_failure_id is None
+            or decision.task_id is None
+            or profile is None
+            or not invocation_terminal_decision_matches_active_profile(
+                decision,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                run_epoch=decision.run_epoch,
+                interaction_id=profile.interaction_id,
+                execution_profile_fingerprint=profile.profile.fingerprint,
+            )
+        ):
+            return False
+        require_invocation_rebind_lineage(
+            checkpoint,
+            session_instance_id=session.instance_id,
+            original=profile.model_copy(update={"run_epoch": decision.run_epoch}),
+            current=profile,
+        )
+        if active_invocation_execution_profile_is_released(
+            profile, session_id=session.id, run_epoch=session.run_epoch
+        ):
+            require_released_invocation_command_authority(
+                session,
+                checkpoint,
+                session_id=session.id,
+                session_instance_id=session.instance_id,
+                active_profile=profile,
+            )
+        elif await self.execution_owner(session) != "lost":
+            return False
+        try:
+            environment = self._resolve_registered_environment(session.environment_name)
+        except KeyError:
+            return False
+        marker = completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+        if marker is not None:
+            # Cleanup that died after disposal and retirement leaves only its marker:
+            # the allocation is gone, but the marker and the run fence still need clearing.
+            return (
+                marker["outcome"] == "failed"
+                and marker["task_id"] in (None, decision.task_id)
+                and marker["environment_name"] == session.environment_name
+                and marker["execution_profile_fingerprint"] == profile.profile.fingerprint
+            )
+        return (
+            await self._environment_lifecycle.prepare_terminal_binding_finalization(
+                session=session,
+                execution_profile=profile.profile,
+                registered_environment=environment,
+            )
+            is not None
+        )
 
     async def _recover_incomplete_session_owned(
         self,
@@ -1660,14 +1785,9 @@ class IncompleteSessionRecovery:
                 "authority additionally requires both."
             )
 
-        mutation_admitted = False
-
         async def admit_before_mutation() -> None:
-            nonlocal mutation_admitted
-            if mutation_admitted or before_mutation is None:
-                return
-            await before_mutation()
-            mutation_admitted = True
+            if before_mutation is not None:
+                await before_mutation()
 
         zero_work = await self.terminalize_zero_work_interruption(
             session=session,
@@ -1685,6 +1805,55 @@ class IncompleteSessionRecovery:
             raise RuntimeError("Zero-work interruption authority changed before publication.")
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
+        if (
+            session.status is SessionStatus.FAILED
+            and self._session_store.supports_session_execution
+        ):
+            from cayu.runtime._environment_lifecycle import process_retains_environment_cleanup
+            from cayu.runtime._session_control import process_has_active_session
+            from cayu.runtime._session_execution_presence import process_owner_id
+
+            # A published linked failure reads as terminal to the public
+            # projection while its owner may still be fanning it out or running
+            # AFTER_SESSION_FAILED hooks. Replaying it would release that live
+            # owner's invocation, so a live owner's failure is left to it. Another
+            # process's owner is live while its lease lasts; an owner in this
+            # process is live only while an application here still runs the
+            # session, since presence outlasts a run that ended unreleased.
+            # Environment cleanup another application here is still running, for
+            # its run or its own recovery, is active work too. This application's
+            # own cleanup is coordinated by its recovery.
+            owner = await self._session_store._inspect_session_execution_owner(session.id)
+            owner_is_current = owner.state == "executing" and owner.run_epoch == session.run_epoch
+            if owner_is_current and process_retains_environment_cleanup(
+                session.id, excluding=self._environment_lifecycle
+            ):
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    message=(
+                        "Another application in this process is still cleaning up the "
+                        "session's environment."
+                    ),
+                )
+            if owner_is_current and (
+                owner.owner_id != process_owner_id() or process_has_active_session(session.id)
+            ):
+                if owner.lease_expires_at is None:
+                    raise RuntimeError("Executing session presence lacks its lease expiry.")
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_EXECUTION_OWNER,),
+                    execution_lease_expires_at=owner.lease_expires_at,
+                    message=(
+                        "Session execution owner is still finishing its failure; its lease "
+                        f"is active until {owner.lease_expires_at.isoformat()}."
+                    ),
+                )
         recovered_runtime_failure = (
             await self._session_tasks.recover_committed_runtime_task_failure(
                 session,
@@ -1694,6 +1863,28 @@ class IncompleteSessionRecovery:
             )
         )
         if recovered_runtime_failure is not None:
+            # Failure replay publishes the task-owned outcome, but has no live
+            # run whose finally block releases its invocation. Close that exact
+            # original epoch through its exact native settlement receipt. A new
+            # recovery epoch would invalidate the immutable task-failure identity.
+            failure_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            current_failure = await self._recovery_ownership.require_session(session.id)
+            if (
+                failure_profile is not None
+                and current_failure.instance_id == session.instance_id
+                and current_failure.run_epoch == session.run_epoch
+                and current_failure.status is SessionStatus.FAILED
+                and not active_invocation_execution_profile_is_released(
+                    failure_profile,
+                    session_id=current_failure.id,
+                    run_epoch=current_failure.run_epoch,
+                )
+            ):
+                await self._environment_lifecycle.release_settled_invocation(
+                    session_id=current_failure.id,
+                    expected_session_instance_id=current_failure.instance_id,
+                    expected_active_profile=failure_profile,
+                )
             return recovered_runtime_failure
         recovered_completion = await self._session_tasks.recover_committed_completion(
             session,
@@ -2085,6 +2276,7 @@ class IncompleteSessionRecovery:
                 events=(),
                 message=(f"Agent not registered: {session.agent_name!r}; session left untouched."),
             )
+        orphaned_work_without_environment = False
         try:
             registered_environment = self._resolve_registered_environment(session.environment_name)
         except KeyError:
@@ -2095,7 +2287,75 @@ class IncompleteSessionRecovery:
                     inactive_for_seconds=inactive_for_seconds,
                     previous_status=previous_status,
                 )
-            raise
+            from cayu.runtime._abandoned_session_recovery import (
+                abandoned_attached_task_takeover,
+                abandoned_execution_takeover,
+            )
+
+            attached_takeover = abandoned_attached_task_takeover(session)
+            # Only the exact native lost-owner entrance may settle retained gates
+            # without their environment. Public recovery keeps its ordinary
+            # reconstruction contract, and no executable work is resumed here.
+            retained = pending_approval or pending_user_input or pending_tool_round
+            pending_children = (
+                await self._pending_foreground_children_at_human_gate(
+                    session=session,
+                    checkpoint=checkpoint,
+                    pending=retained,
+                    registered_agent=registered_agent,
+                    include_inflight=True,
+                    include_child_actions=True,
+                )
+                if retained is not None and abandoned_execution_takeover(session)
+                else ()
+            )
+            if not (
+                abandoned_execution_takeover(session)
+                and (attached_takeover or await self.execution_owner(session) == "lost")
+                and active_invocation_profile is not None
+                and (
+                    retained is None
+                    or (
+                        retained.execution_profile_fingerprint
+                        == active_invocation_profile.profile.fingerprint
+                        and retained.agent_name == session.agent_name
+                        and retained.environment_name == session.environment_name
+                    )
+                )
+                and (
+                    attached_takeover
+                    or (
+                        retained is not None
+                        and (
+                            pending_approval is not None
+                            or pending_user_input is not None
+                            or pending_children
+                        )
+                        and active_model_completion is None
+                    )
+                )
+                and pending_provider_disposition is None
+                and pending_completion_finalization is None
+                and post_action is None
+                and execution_to_wait is None
+                and not pending_allocations
+            ):
+                raise
+            if active_model_completion is not None:
+                stage = active_model_completion.stage
+                if stage.state == "in_flight" and (
+                    stage.intent.get("provider_operation_start") is not None
+                    or await load_recoverable_provider_operation(self._session_store, stage)
+                    is not None
+                    or await load_recoverable_provider_operation_start(self._session_store, stage)
+                    is not None
+                ):
+                    raise SessionStatusConflict(
+                        "Unavailable-environment settlement leaves a background provider "
+                        "operation to its dedicated recovery owner."
+                    ) from None
+            orphaned_work_without_environment = True
+            registered_environment = None
         registered_provider = self._resolve_registered_provider(session.provider_name)
         if (
             session.status is SessionStatus.RUNNING
@@ -2191,7 +2451,7 @@ class IncompleteSessionRecovery:
             pending_disposition = (
                 None if pending_provider_disposition is None else pending_provider_disposition[0]
             )
-            if pending_completion_finalization is not None:
+            if pending_completion_finalization is not None or orphaned_work_without_environment:
                 # This recovery dispatches neither provider nor tools. Reuse
                 # the frozen invocation identity across process-local object
                 # replacement, then validate the current binding and target
@@ -2431,6 +2691,71 @@ class IncompleteSessionRecovery:
                 nonlocal registered_environment, invocation_context, command_recovery_context
                 assert claim is not None
                 recovery_session = claim.session
+                if orphaned_work_without_environment:
+                    if invocation_context is None:
+                        raise RuntimeError("Lost-work settlement has no invocation authority.")
+                    active_now = await self._session_store.load_active_model_completion_stage(
+                        session.id
+                    )
+                    if active_now != active_model_completion:
+                        raise SessionStatusConflict("Lost run's selected model boundary changed.")
+                    model_events: tuple[Event, ...] = ()
+                    if active_now is not None:
+                        if recover_abandoned_model is not None:
+                            model_events = await recover_abandoned_model(
+                                claim.session, invocation_context
+                            )
+                        settled = await self._recovery_ownership.require_session(session.id)
+                        if settled.status is SessionStatus.INTERRUPTED:
+                            repaired = await self.terminal_finalization.repair(
+                                session=settled,
+                                terminal_run_epoch=claim.session.run_epoch,
+                                terminal_timestamp=settled.updated_at,
+                                previous_status=previous_status,
+                                claim_id=claim.claim_id,
+                                interruption_reason=reason,
+                            )
+                            return repaired.model_copy(
+                                update={
+                                    "actions": (
+                                        IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+                                        *repaired.actions,
+                                    ),
+                                    "events": (*model_events, *repaired.events),
+                                }
+                            )
+                        # The same model owner publishes retained responses,
+                        # abandons undispatched work and records auxiliary
+                        # uncertainty. Background operations were excluded
+                        # before admission; this boundary never dispatches work.
+                        boundary = await self._model_completion_recovery.reconcile_model_completion_boundary(
+                            settled, invocation_context=invocation_context
+                        )
+                        recovery_session = boundary.session
+                        model_events = (*model_events, *boundary.recovery_events)
+                        checkpoint_now = await self._session_store.load_checkpoint(session.id)
+                        approval_now, input_now, round_now = self._retained_work_from_checkpoint(
+                            checkpoint_now, session=recovery_session
+                        )
+                    else:
+                        approval_now, input_now, round_now = (
+                            pending_approval,
+                            pending_user_input,
+                            pending_tool_round,
+                        )
+                    interrupted = await self._interrupt_orphaned_work_without_environment(
+                        session=recovery_session,
+                        previous_status=previous_status,
+                        invocation_context=invocation_context,
+                        pending_approval=approval_now,
+                        pending_user_input=input_now,
+                        pending_round=round_now,
+                        reason=reason,
+                        metadata=metadata,
+                    )
+                    return interrupted.model_copy(
+                        update={"events": (*model_events, *interrupted.events)}
+                    )
                 if terminal_binding_finalization is not None:
                     if invocation_context is None:
                         raise RuntimeError("Terminal binding cleanup lost invocation authority.")
@@ -4653,21 +4978,13 @@ class IncompleteSessionRecovery:
             # recovery, but a consumed external call still needs the same
             # durable uncertainty transition after worker loss. Keep the
             # human gate and selected terminals intact; never dispatch here.
-            events.extend(
-                await settle_prepared_tool_effects(
-                    store=self._session_store,
-                    writer=self._event_writer,
-                    session=session,
-                    pending=pending_approval,
-                    profile=None
-                    if execution_profile_snapshot is None
-                    else execution_profile_snapshot.profile,
-                )
-            )
-            unresolved_effect = await ToolEffectStateOwner(self._session_store).preserve_unresolved(
-                session,
-                tool_round_id=pending_approval.tool_round_id,
-                tool_call_ids=tuple(call.tool_call_id for call in pending_approval.tool_calls),
+            unresolved_effect = await self._settle_retained_tool_effects(
+                session=session,
+                pending=pending_approval,
+                profile=None
+                if execution_profile_snapshot is None
+                else execution_profile_snapshot.profile,
+                events=events,
             )
             pending_child_ids: tuple[str, ...] = ()
             if unresolved_effect:
@@ -4789,21 +5106,13 @@ class IncompleteSessionRecovery:
             # Like approval-owned rounds, a user-input pause bypasses ordinary
             # round recovery. Classify dispatched sibling effects without
             # consuming the answer or authorizing another tool invocation.
-            events.extend(
-                await settle_prepared_tool_effects(
-                    store=self._session_store,
-                    writer=self._event_writer,
-                    session=session,
-                    pending=pending_user_input,
-                    profile=None
-                    if execution_profile_snapshot is None
-                    else execution_profile_snapshot.profile,
-                )
-            )
-            unresolved_effect = await ToolEffectStateOwner(self._session_store).preserve_unresolved(
-                session,
-                tool_round_id=pending_user_input.tool_round_id,
-                tool_call_ids=tuple(call.tool_call_id for call in pending_user_input.tool_calls),
+            unresolved_effect = await self._settle_retained_tool_effects(
+                session=session,
+                pending=pending_user_input,
+                profile=None
+                if execution_profile_snapshot is None
+                else execution_profile_snapshot.profile,
+                events=events,
             )
             pending_child_ids = ()
             if unresolved_effect:
@@ -5714,7 +6023,7 @@ class IncompleteSessionRecovery:
         metadata: dict[str, Any],
         inactive_for_seconds: int,
         closed: dict[str, str] | None = None,
-    ) -> Session:
+    ) -> tuple[Session, AbandonedToolResults | None]:
         """Fail a running session whose owner is gone and whose environment isn't here.
 
         For a session a lost worker left ``running`` or ``interrupting`` (for example
@@ -5732,7 +6041,9 @@ class IncompleteSessionRecovery:
         through its provider's operation adapter; an answer the provider gave that
         wasn't published yet is published, its budget settled from its usage; and a
         provider-operation disposition the run accepted and didn't finish has its
-        source call charged and is retired. The abandonment record lists each, and
+        source call charged and is retired. A tool result the run staged and didn't
+        publish is published (``publish_abandoned_tool_results``), with its result
+        withheld when its after-tool hooks hadn't run. The abandonment record lists each, and
         the session fails as abandoned in the same fenced transition, which
         ``closed`` marks as a person's close. Its terminal ``session.failed`` is
         published under the same claim, and settling the run's interaction then
@@ -5745,7 +6056,8 @@ class IncompleteSessionRecovery:
         session that changed since, is paused on an approval, a question or a wake,
         or stopped inside a background provider operation whose provider isn't
         registered here, raises ``SessionStatusConflict``, which names it and the
-        way forward.
+        way forward. Returns the failed session and what publishing the staged tool
+        results did, if the run had a tool round.
         """
 
         session = await self._session_store.load(expected.id)
@@ -6085,7 +6397,7 @@ class IncompleteSessionRecovery:
         reason: str,
         metadata: dict[str, Any],
         closed: dict[str, str] | None,
-    ) -> Session:
+    ) -> tuple[Session, AbandonedToolResults | None]:
         """Under ``claim``, fail the fenced run as abandoned and publish its evidence."""
 
         fenced = claim.session
@@ -6128,7 +6440,27 @@ class IncompleteSessionRecovery:
                 runtime_session=fenced,
             )
         unknown_tool_calls: list[dict[str, str]] = []
+        tool_results: AbandonedToolResults | None = None
         if pending_round is not None:
+            try:
+                registered_environment = self._resolve_registered_environment(
+                    fenced.environment_name
+                )
+            except KeyError:
+                registered_environment = None
+            # Results the lost run staged and didn't publish are published, not lost
+            # with the round it retires.
+            tool_results = await publish_abandoned_tool_results(
+                session=fenced,
+                claim_id=claim.claim_id,
+                pending_round=pending_round,
+                session_store=self._session_store,
+                event_writer=self._event_writer,
+                redactor=self._secret_redactor,
+                workspace_observation_recovery=self._workspace_observation_recovery,
+                registered_environment=registered_environment,
+            )
+            pending_round = tool_results.pending_round
             calls = tuple(call.tool_call_id for call in pending_round.tool_calls)
             # The calls the lost run had started become unknown, as recovery does.
             await ToolEffectStateOwner(self._session_store).preserve_unresolved(
@@ -6177,6 +6509,9 @@ class IncompleteSessionRecovery:
                 metadata=metadata,
                 tool_round=durable_round,
                 unknown_tool_calls=unknown_tool_calls,
+                published_tool_calls=(
+                    None if tool_results is None else list(tool_results.published_tool_calls)
+                ),
                 closed=closed_record,
                 model_call=(
                     None if model_call is None else model_call.record(cancellation=cancellation)
@@ -6203,7 +6538,7 @@ class IncompleteSessionRecovery:
             previous_status=claim.session_before_fence.status,
             claim_id=claim.claim_id,
         )
-        return abandoned
+        return abandoned, tool_results
 
     async def deny_stranded_approval(
         self,
@@ -6458,6 +6793,227 @@ class IncompleteSessionRecovery:
         await self._event_writer.fan_out_persisted(published)
         return tuple(published)
 
+    async def _settle_retained_tool_effects(
+        self,
+        *,
+        session: Session,
+        pending: PendingToolApproval | PendingUserInput | pending_rounds.PendingToolRound,
+        profile: ExecutionProfileIdentity | None,
+        events: list[Event],
+    ) -> bool:
+        """Settle durable prepared/uncertain effects without consuming a human gate."""
+
+        events.extend(
+            await settle_prepared_tool_effects(
+                store=self._session_store,
+                writer=self._event_writer,
+                session=session,
+                pending=pending,
+                profile=profile,
+            )
+        )
+        return await ToolEffectStateOwner(self._session_store).preserve_unresolved(
+            session,
+            tool_round_id=pending.tool_round_id,
+            tool_call_ids=tuple(call.tool_call_id for call in pending.tool_calls),
+        )
+
+    def _retained_work_from_checkpoint(
+        self,
+        checkpoint: dict[str, Any] | None,
+        *,
+        session: Session,
+    ) -> tuple[
+        PendingToolApproval | None,
+        PendingUserInput | None,
+        pending_rounds.PendingToolRound | None,
+    ]:
+        approval = pending_approval_reader.pending_approval_from_checkpoint(
+            checkpoint, redactor=self._secret_redactor, consume_on_rejection=True
+        )
+        user_input, _intent = user_input_lifecycle_authority_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            current_run_epoch=session.run_epoch,
+            runtime_session=session,
+        )
+        round_now = pending_round_reader.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        return approval, user_input, round_now
+
+    async def _interrupt_orphaned_work_without_environment(
+        self,
+        *,
+        session: Session,
+        previous_status: SessionStatus,
+        invocation_context: InvocationContext,
+        pending_approval: PendingToolApproval | None,
+        pending_user_input: PendingUserInput | None,
+        pending_round: pending_rounds.PendingToolRound | None,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> IncompleteSessionRecoveryResult:
+        """Use ordinary gate and interruption owners, retaining unavailable resources."""
+
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        approval, user_input, round_now = self._retained_work_from_checkpoint(
+            checkpoint, session=session
+        )
+        # Native admission revalidates the selected incarnation and epoch. Its
+        # claimed gate must also be the one selected before any effects settle.
+        if (
+            approval != pending_approval
+            or user_input != pending_user_input
+            or round_now != pending_round
+        ):
+            raise SessionStatusConflict("Lost session's retained work changed.")
+        pending = approval or user_input or round_now
+        if pending is not None and (
+            pending.execution_profile_fingerprint != invocation_context.profile.fingerprint
+        ):
+            raise SessionStatusConflict("Lost retained work lacks its exact invocation profile.")
+        children = (
+            await self._pending_foreground_children_at_human_gate(
+                session=session,
+                checkpoint=checkpoint,
+                pending=pending,
+                registered_agent=invocation_context.registered_agent,
+                include_inflight=True,
+                include_child_actions=True,
+            )
+            if pending is not None
+            else ()
+        )
+        from cayu.runtime._abandoned_session_recovery import abandoned_attached_task_takeover
+
+        if (
+            approval is None
+            and user_input is None
+            and not children
+            and not abandoned_attached_task_takeover(session)
+        ):
+            raise SessionStatusConflict(
+                "Lost run no longer has its selected retained-work authority."
+            )
+        events: list[Event] = []
+        unresolved = (
+            await self._settle_retained_tool_effects(
+                session=session, pending=pending, profile=invocation_context.profile, events=events
+            )
+            if pending is not None
+            else False
+        )
+        if unresolved:
+            events.extend(
+                await self._pending_tool_round_recovery.deliver_pending_tool_effect_uncertainty(
+                    session
+                )
+            )
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "metadata": metadata,
+            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+            "interruption_request_id": str(uuid4()),
+            "recovered": True,
+        }
+        if pending is not None:
+            payload.update(
+                model_step_id=pending.model_step_id,
+                model_attempt_id=pending.model_attempt_id,
+                tool_round_id=pending.tool_round_id,
+            )
+        if approval is not None:
+            payload.update(
+                interruption_type=_INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                **approval_support.bounded_pending_approval_event_payload(
+                    approval, redactor=self._secret_redactor
+                ),
+            )
+        elif user_input is not None:
+            payload.update(
+                interruption_type=_INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                **pending_user_input_interruption_payload(user_input),
+            )
+        if unresolved and (approval is not None or user_input is not None):
+            assert pending is not None
+            unknown_calls = await self._unknown_tool_calls(
+                session,
+                pending.tool_round_id,
+                [(call.tool_call_id, call.tool_name) for call in pending.tool_calls],
+            )
+            if not unknown_calls:
+                raise RuntimeError("Lost-gate uncertainty has no exact dispatched call.")
+            payload["manual_recovery_required"] = True
+            payload["tool_call_id"] = unknown_calls[0]["tool_call_id"]
+            payload["tool_name"] = unknown_calls[0]["tool_name"]
+            if approval is not None:
+                payload["approval_id"] = approval.approval_id
+            else:
+                assert user_input is not None
+                payload["user_input"] = {
+                    "input_id": user_input.input_id,
+                    "tool_call_id": unknown_calls[0]["tool_call_id"],
+                    "tool_name": unknown_calls[0]["tool_name"],
+                }
+        if children:
+            payload["pending_subagent_session_ids"] = list(children)
+        # Persist the exact retained-gate projection with the status change:
+        # interrupt_recovery consumes this marker, and a replacement sweep can
+        # finish the same interruption if this process dies before publication.
+        if session.status is SessionStatus.RUNNING:
+            session = await self._session_store.transition_status_and_checkpoint(
+                session.id,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.INTERRUPTING,
+                checkpoint_transform=_checkpoint_with_pending_session_interrupt(
+                    payload, cascade_created_at=self._clock()
+                ),
+            )
+        # This owner never reconnects an unavailable environment or invokes
+        # extension hooks. The original binding, accepted receipt and pending
+        # round remain durable while normal finalization settles this invocation.
+        async for event in self._session_finalization.interrupt_recovery(
+            RecoveryInterruptionRequest(
+                session=session,
+                registered_agent=invocation_context.registered_agent,
+                registered_environment=None,
+                environment_name=session.environment_name,
+                execution_profile=invocation_context.profile,
+                invocation_context=invocation_context,
+                recovery_claim_id=invocation_context.recovery_claim_id,
+                run_terminal_hooks=False,
+            )
+        ):
+            events.append(event)
+        current = await self._recovery_ownership.require_session(session.id)
+        actions = [IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED]
+        if unresolved:
+            actions.append(IncompleteSessionRecoveryAction.PENDING_TOOL_EFFECT)
+        if approval is not None:
+            actions.append(IncompleteSessionRecoveryAction.PENDING_APPROVAL)
+        elif user_input is not None:
+            actions.append(IncompleteSessionRecoveryAction.PENDING_USER_INPUT)
+        elif children:
+            actions.append(IncompleteSessionRecoveryAction.PENDING_SUBAGENT)
+        elif pending is not None:
+            actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=previous_status,
+            status=current.status,
+            actions=tuple(actions),
+            events=tuple(events),
+            pending_approval_id=None if approval is None else approval.approval_id,
+            pending_user_input_id=None if user_input is None else user_input.input_id,
+            pending_subagent_session_ids=children,
+            message="Interrupted the lost run; its retained work, uncertain effects and unavailable environment remain for recovery.",
+        )
+
     async def _finalize_interrupting_for_recovery(
         self,
         *,
@@ -6561,9 +7117,10 @@ class IncompleteSessionRecovery:
         *,
         session: Session,
         checkpoint: dict[str, Any] | None,
-        pending: PendingToolApproval | PendingUserInput,
+        pending: PendingToolApproval | PendingUserInput | pending_rounds.PendingToolRound,
         registered_agent: runtime_records.RegisteredAgentState,
         include_child_actions: bool = False,
+        include_inflight: bool = False,
     ) -> tuple[str, ...]:
         """Read exact child obligations without repairing submissions or consuming a gate.
 
@@ -6580,7 +7137,9 @@ class IncompleteSessionRecovery:
             effect = await owner.resolve_call(
                 session, tool_round_id=pending.tool_round_id, tool_call_id=call.tool_call_id
             )
-            if effect is None or effect.state != "outcome_unknown":
+            if effect is None or effect.state not in (
+                {"executing", "outcome_unknown"} if include_inflight else {"outcome_unknown"}
+            ):
                 continue
             key = tool_execution.tool_idempotency_key(
                 session_id=session.id,

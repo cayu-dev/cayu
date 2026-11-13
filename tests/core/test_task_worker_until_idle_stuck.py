@@ -195,7 +195,7 @@ async def _recover_with(monkeypatch, error: Exception, *, parked: bool = False):
 
     monkeypatch.setattr(app.session_store, "load", load)
     monkeypatch.setattr(external_wait_tasks, "recover_before_handoff", not_an_external_wait)
-    monkeypatch.setattr(app, "recover_incomplete_session", raises)
+    monkeypatch.setattr(app, "_recover_expired_attached_task_session", raises)
     monkeypatch.setattr(external_wait_tasks, "stop_wait_left_arming", raises)
     try:
         return await task_worker._recover_expired_interrupted_task_handoffs(

@@ -152,6 +152,7 @@ def execution_state(
     status,
     waiting,
     waiting_for_child=False,
+    owner_only=False,
     owner,
     now,
 ):
@@ -163,7 +164,11 @@ def execution_state(
         and owner.run_epoch == run_epoch
     )
     live = current and execution_owner_is_live(owner, now)
-    if status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+    if owner_only:
+        # Admission needs the native owner even while terminal publication or
+        # a retained gate gives the public projection a different state.
+        state = "executing" if live else "owner_lost" if current else "unknown"
+    elif status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
         state = "terminal"
     elif waiting:
         state = "waiting"

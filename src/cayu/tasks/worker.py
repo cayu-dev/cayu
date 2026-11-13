@@ -123,7 +123,6 @@ from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.pending_action_contracts import PendingActionQuery
 from cayu.sessions.records import Session, SessionStatus
-from cayu.sessions.recovery import IncompleteSessionRecoveryRequest
 from cayu.tasks._cancellation import (
     _cancellation_drain_holds,
     _task_cancellation_terminalization_request,
@@ -4645,25 +4644,12 @@ async def _recover_expired_interrupted_task_handoffs(
             or current.status_reason != task.status_reason
         ):
             continue
-        if _task_cancellation_requested(task):
-            from cayu.tasks.session_wakes import in_subagent_chain
-
-            # A foreground subagent may still run under the same lost claim: a
-            # cancelled task in a chain of subagent calls is left fenced, as before,
-            # and nothing of its sessions is touched.
-            try:
-                if await in_subagent_chain(app, session):
-                    continue
-            except Exception:
-                failed.add(task.id)
-                continue
         if session.status in {
             SessionStatus.PENDING,
             SessionStatus.RUNNING,
             SessionStatus.INTERRUPTING,
         } or await _completion_owes_task(app, session, task.id):
             from cayu.external_wait_tasks import recover_before_handoff
-            from cayu.runtime._abandoned_session_recovery import _abandoned_execution
 
             try:
                 # A turn that died before its external wait parked is recovered by
@@ -4673,15 +4659,7 @@ async def _recover_expired_interrupted_task_handoffs(
                     # worker renews session presence. The exact-run guard is
                     # checked again in the store's recovery reservation, so it
                     # cannot authorize fencing a replacement's newer epoch.
-                    with _abandoned_execution(session):
-                        await app.recover_incomplete_session(
-                            IncompleteSessionRecoveryRequest(
-                                session_id=session.id,
-                                inactive_for_seconds=None,
-                                reason="expired_attached_task_owner",
-                                metadata={"recovery_scope": "attached_task"},
-                            )
-                        )
+                    await app._recover_expired_attached_task_session(session, task)
             except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -4726,10 +4704,16 @@ async def _recover_expired_interrupted_task_handoffs(
             failed.add(task.id)
             continue
         if _task_cancellation_requested(task):
-            # Nobody is left to drain the cancellation, and the interrupted session
-            # fences the lost worker's run: settle it instead of handing it off. A
-            # session in a chain of subagent calls was left alone above.
+            from cayu.tasks.session_wakes import in_subagent_chain
+
+            # Recovery can interrupt this exact parent while retaining a pending
+            # child. That is not proof the whole chain stopped: re-read the chain
+            # before releasing the task, and retain its fence while any child or
+            # foreground wait remains unresolved. The native settlement below
+            # separately revalidates the original expired task claim.
             try:
+                if await in_subagent_chain(app, session):
+                    continue
                 if await _settle_expired_owner_cancellation(
                     task_store,
                     task,
