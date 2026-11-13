@@ -5,7 +5,7 @@
 export declare const CLIENT_VERSION: "1"
 /** Exact server contract version this module was released with. */
 export declare const CONTRACT_VERSION: string
-/** Minimum spacing between `watchSessions` refreshes. It cannot be lowered. */
+/** Minimum spacing between watch refreshes (`watchSessions`, `watchTasks`, `watchInbox`). It cannot be lowered. */
 export declare const MIN_WATCH_INTERVAL_MS: 15000
 
 export type SessionStatus =
@@ -186,6 +186,73 @@ export interface WatchSessionsOptions {
   onError?: (error: CayuClientError) => void
   /** Called once when the watch stops. `"idle"` means no listed session was active. */
   onStop?: (reason: WatchStopReason) => void
+  /** Refresh interval. Values below 15000 ms are raised to 15000 ms. */
+  intervalMs?: number
+  /** Ceiling for the backoff applied while nothing changes. Defaults to 120000 ms. */
+  maxIntervalMs?: number
+  signal?: AbortSignal
+}
+
+export type TaskStatus =
+  | "pending"
+  | "waiting_dependencies"
+  | "waiting_group"
+  | "dependency_skipped"
+  | "claimed"
+  | "running"
+  | "paused"
+  | "blocked"
+  | "needs_attention"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | (string & {})
+
+/** Task list item returned by `GET /api/tasks`; see the OpenAPI `ApiTaskListItem` schema. */
+export interface CayuTask {
+  id: string
+  type: string
+  title: string | null
+  status: TaskStatus
+  status_reason: string | null
+  error_code: string | null
+  session_id: string | null
+  parent_task_id: string | null
+  assigned_agent_name: string | null
+  created_at: string
+  updated_at: string
+  completed_at: string | null
+  [field: string]: unknown
+}
+
+/** A top-level input or metadata value a task must have. */
+export type TaskValue = string | number | boolean
+
+export interface WatchTasksFilter {
+  /** One task type or several. Several types are read with one request each. */
+  type?: string | readonly string[]
+  /** One status or several. */
+  status?: TaskStatus | readonly TaskStatus[]
+  /**
+   * Top-level input values every listed task has, as its detail shows them, for
+   * example `{ repository: "cayu-tech/cayu" }`. Numbers match by value.
+   */
+  input?: Readonly<Record<string, TaskValue>>
+  /** The run a task belongs to: its `metadata.run`. */
+  run?: string
+  /** Other top-level metadata values every listed task has. */
+  metadata?: Readonly<Record<string, TaskValue>>
+  /** Page size per request, newest update first. Defaults to 100. */
+  limit?: number
+}
+
+export interface WatchTasksOptions {
+  /** Called with the merged task list, newest update first, whenever it changes. */
+  onChange?: (tasks: CayuTask[]) => void
+  /** Called once with the non-retryable error that stopped the watch. */
+  onError?: (error: CayuClientError) => void
+  /** Called once when the watch stops. */
+  onStop?: (reason: Exclude<WatchStopReason, "idle">) => void
   /** Refresh interval. Values below 15000 ms are raised to 15000 ms. */
   intervalMs?: number
   /** Ceiling for the backoff applied while nothing changes. Defaults to 120000 ms. */
@@ -385,6 +452,21 @@ export interface CayuClient {
   ): Promise<InboxSettleResult>
   /** Returns a function that stops the watch. It never stops as idle. */
   watchInbox(options?: WatchInboxOptions): () => void
+  /** Whether the server serves tasks. `watchTasks` throws `unavailable` otherwise. */
+  readonly tasksAvailable: boolean
+  /**
+   * Watch the tasks that match `filter`. Each read sends the ETag of the last answer,
+   * so an unchanged list costs a 304. Pauses while the page is hidden, backs off while
+   * nothing changes, and never stops as idle. Returns a function that stops the watch.
+   * Throws `unavailable` for an `input`, `metadata` or `run` filter when the server
+   * doesn't advertise the `task_value_filters` capability, since it would ignore them.
+   */
+  watchTasks(
+    filter: WatchTasksFilter,
+    onChange: (tasks: CayuTask[]) => void,
+    options?: Omit<WatchTasksOptions, "onChange">,
+  ): () => void
+  watchTasks(filter?: WatchTasksFilter, options?: WatchTasksOptions): () => void
 }
 
 /** Read `/api/contract`, check its version, and return a client. */

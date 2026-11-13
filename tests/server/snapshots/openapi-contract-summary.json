@@ -9243,6 +9243,16 @@
             }
           ]
         },
+        "task_value_filters": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tasks": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
@@ -42625,12 +42635,50 @@
           },
           {
             "in": "query",
+            "name": "input",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Input"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
               "default": 50,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "metadata",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Metadata"
             }
           },
           {
@@ -42773,6 +42821,9 @@
                 "title": "Response List Tasks Api Tasks Get"
               }
             }
+          },
+          "304": {
+            "content": {}
           },
           "422": {
             "content": {

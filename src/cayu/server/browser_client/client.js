@@ -3,7 +3,7 @@
  * Cayu browser client.
  *
  * A dependency-free ES module served by `mount_cayu` at `{path}/client.js`.
- * It follows sessions, watches session lists and the agent's inbox with
+ * It follows sessions, watches session lists, tasks and the agent's inbox with
  * bounded, visibility-aware request behavior so custom UIs do not have to
  * hand-write polling loops, and settles inbox items.
  * `cayu guide app-ui` describes the rules this module implements.
@@ -28,7 +28,7 @@ const LIFECYCLE_EVENT_TYPES = new Set([
   "session.resumed",
 ])
 
-/** Minimum spacing between `watchSessions` refreshes. It cannot be lowered. */
+/** Minimum spacing between watch refreshes (`watchSessions`, `watchTasks`, `watchInbox`). It cannot be lowered. */
 export const MIN_WATCH_INTERVAL_MS = 15_000
 
 const STREAM_HEALTHY_AFTER_MS = 10_000
@@ -204,6 +204,24 @@ class CayuClient {
   watchInbox(options = {}) {
     requireInbox(this.#context.contract)
     return watchInbox(this.#context, options)
+  }
+
+  /** Whether the server serves tasks. `watchTasks` throws `unavailable` otherwise. */
+  get tasksAvailable() {
+    return tasksAvailable(this.#context.contract)
+  }
+
+  /**
+   * Watch the tasks that match `filter`. Takes `(filter, onChange, options)` or,
+   * like `watchSessions`, `(filter, options)` with `options.onChange`.
+   */
+  watchTasks(filter = {}, onChange = undefined, options = {}) {
+    if (!tasksAvailable(this.#context.contract)) {
+      throw new CayuClientError("unavailable", "This server has no task store.")
+    }
+    const resolved =
+      typeof onChange === "function" ? { ...options, onChange } : { ...(onChange ?? options) }
+    return watchTasks(this.#context, filter ?? {}, resolved)
   }
 
   async getSessionUsage(sessionId, options = {}) {
@@ -555,6 +573,86 @@ function watchSessions(context, filter, options) {
       idle: !sessions.some((session) => ACTIVE_STATUSES.has(session.status)),
     }
   })
+}
+
+function watchTasks(context, filter, options) {
+  const types = listOf(filter.type)
+  const statuses = listOf(filter.status)
+  const valueFilters = [
+    ...Object.entries(filter.input ?? {}).map(([key, value]) => ["input", key, value]),
+    ...Object.entries(filter.metadata ?? {}).map(([key, value]) => ["metadata", key, value]),
+  ]
+  if (filter.run !== undefined && filter.run !== null) {
+    valueFilters.push(["metadata", "run", filter.run])
+  }
+  // A server without these filters would ignore them and return other tasks.
+  if (valueFilters.length > 0 && !taskValueFiltersAvailable(context.contract)) {
+    throw new CayuClientError(
+      "unavailable",
+      "This server can't filter tasks by input, metadata or run.",
+    )
+  }
+  // One read per task type, each revalidated with the ETag of its last answer so a
+  // quiet watch costs a 304 and no body.
+  const reads = (types.length === 0 ? [null] : types).map((type) => {
+    const params = new URLSearchParams({
+      limit: String(positive(filter.limit, DEFAULTS.watchPageLimit)),
+    })
+    if (type !== null) params.set("type", type)
+    for (const status of statuses) params.append("statuses", status)
+    for (const [name, key, value] of valueFilters) params.append(name, `${key}=${value}`)
+    return `/tasks?${params}`
+  })
+  const cache = new Map()
+
+  // Tasks queued later must show up, so the watch never stops as idle; it backs off
+  // while nothing changes and pauses while hidden.
+  return startWatch(options, async (runner) => {
+    const byId = new Map()
+    for (const path of reads) {
+      const tasks = await runner.run((signal) => requestJsonIfChanged(context, path, cache, signal))
+      if (!Array.isArray(tasks)) {
+        throw new CayuClientError("contract", "The server returned an invalid task list.")
+      }
+      for (const task of tasks) byId.set(task.id, task)
+    }
+    const tasks = [...byId.values()].sort((left, right) =>
+      String(right.updated_at).localeCompare(String(left.updated_at)),
+    )
+    return {
+      value: tasks,
+      // The whole row: some changes (a scrubbed error summary) keep status and updated_at.
+      key: JSON.stringify(tasks),
+      idle: false,
+    }
+  })
+}
+
+function tasksAvailable(contract) {
+  return contract?.capabilities?.surfaces?.tasks?.read?.enabled === true
+}
+
+function taskValueFiltersAvailable(contract) {
+  return contract?.capabilities?.surfaces?.task_value_filters?.read?.enabled === true
+}
+
+/** GET a JSON body, sending the ETag of the last answer and reusing it on a 304. */
+async function requestJsonIfChanged(context, path, cache, signal) {
+  const cached = cache.get(path)
+  const headers = cached ? { "If-None-Match": cached.etag } : {}
+  const response = await send(context, path, { signal, headers })
+  if (response.status === 304 && cached) return cached.body
+  if (!response.ok) throw await httpError(response)
+  const body = await readJson(response)
+  const etag = response.headers.get("ETag")
+  if (etag) cache.set(path, { etag, body })
+  else cache.delete(path)
+  return body
+}
+
+function listOf(value) {
+  if (value === undefined || value === null) return []
+  return [...new Set(Array.isArray(value) ? value : [value])]
 }
 
 function watchInbox(context, options) {

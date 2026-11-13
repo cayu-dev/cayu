@@ -803,6 +803,19 @@ records across at most 16 native pages. Exhausting that budget or seeing repeate
 identities while pages shift returns 503 without partial items. Exact counts
 remain unavailable for these custom stores; native exact-count scans are uncapped.
 
+Both shapes also take repeated `input=key=value` and `metadata=key=value`
+filters (at most eight). Each matches a top-level value of the task's input or
+metadata as the task's detail shows it, after redaction, so a hidden secret
+grants no membership; numbers match by value (`number=217`, `ratio=2` matches
+`2.0`) and booleans as `true` or `false` (`dry_run=false`). `metadata=run=<key>` selects the tasks of one run. Everything
+after the first `=` is the value. Cursors stay bound to these filters too.
+The contract's `task_value_filters` surface says the server supports them; a
+server without it ignores the parameters, so `client.js` refuses to send them
+there.
+Every task list response carries a weak `ETag`; send it back as `If-None-Match`
+and an unchanged list answers `304` with no body. `client.js`'s `watchTasks`
+does both, so a page that shows tasks follows them without a timer of its own.
+
 `GET /api/tasks/{task_id}/dependents` returns the same bounded envelope for tasks
 whose authoritative prerequisites contain that task. It includes internal task
 types because they can be real dependencies. Unknown source tasks return 404.

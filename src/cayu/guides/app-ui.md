@@ -38,6 +38,13 @@ It provides:
 - `watchSessions(filter, { onChange, onError, onStop, intervalMs, signal })`
   returns a function that stops the watch.
 - `getSessionUsage(sessionId)` reads `GET /api/sessions/{id}/usage`.
+- `watchTasks(filter, onChange, { onError, onStop, intervalMs, signal })` (or
+  `watchTasks(filter, { onChange, ... })`) watches the tasks that match a
+  `filter` of `type` (one or several), `status` (one or several), `input`
+  values, `run` (the task's `metadata.run`) and other `metadata` values, and
+  returns a function that stops the watch; see [Show tasks](#show-tasks). It
+  throws `unavailable` for an `input`, `metadata` or `run` filter on a server
+  that doesn't advertise `task_value_filters`, which would ignore them.
 - `watchInbox({ onChange, onError, onStop, intervalMs, signal })`,
   `listInbox`, `getInboxItem` and `settleInboxItem` read and settle the agent's
   inbox; see [Show the agent's inbox](#show-the-agents-inbox).
@@ -60,6 +67,10 @@ What the client guarantees, so your code does not have to:
   (lower `intervalMs` values are raised to 15 s), doubles the interval while
   the list is unchanged, and stops (`onStop("idle")`) once no listed session
   is `pending`, `running`, or `interrupting`.
+- **Task cadence.** `watchTasks` keeps the same 15-second floor and backoff,
+  and revalidates each read with the list's `ETag`, so an unchanged list costs a
+  `304` with no body. It never stops as idle, because new tasks can be queued
+  at any time.
 - **Errors.** Transient failures (network, 408, 429, 5xx) are retried with
   exponential backoff and jitter, and never sooner than `Retry-After`. Other
   4xx responses (401, 403, 404, 422, ...) and responses that do not match the
@@ -299,6 +310,30 @@ arguments), an answer field for a `question` with its `options` as choices, and
 session in the Developer dashboard. A settled item shows its
 `settlement.decision`, `decided_by.subject` and `decided_at`. Render every text field
 as escaped text.
+
+## Show tasks
+
+A page built on tasks (the latest results of a scheduled job, a list of runs, a
+job someone just queued) follows them with `watchTasks` instead of its own timer:
+
+```js
+const stop = cayu.watchTasks(
+  { type: "nightly_report", status: ["running", "completed"], input: { repository: "acme/api" } },
+  (tasks) => renderReports(tasks), // newest update first
+)
+```
+
+- **Filter.** `type` and `status` take one value or a list; several types are read
+  with one request each. `input` and `metadata` match top-level values as the task's
+  detail shows them, and `run` is the task's `metadata.run`. `limit` (default 100)
+  is the page size per type.
+- **What arrives.** The rows of `GET /api/tasks`, merged and newest update first.
+  They leave out each task's input and result: read the one you show with
+  `GET /api/tasks/{task_id}` when `onChange` reports it finished.
+- **Cost.** The same 15-second floor and backoff as `watchSessions`, nothing while
+  the tab is hidden, and each read revalidated with the list's `ETag`, so a quiet
+  watch costs a `304` with no body. It never stops as idle; call the returned
+  function when the page goes away.
 
 ## Keep GET handlers read-only
 

@@ -11622,6 +11622,16 @@
               }
             ]
           },
+          "task_value_filters": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tasks": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -63357,6 +63367,7 @@
     },
     "/api/tasks": {
       "get": {
+        "description": "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a top-level value of the task's input or metadata as the task detail shows it; numbers match by value and booleans as true or false. The response carries a weak `ETag`; a matching `If-None-Match` returns `304` without a body.",
         "operationId": "list_tasks_api_tasks_get",
         "parameters": [
           {
@@ -63519,6 +63530,44 @@
           },
           {
             "in": "query",
+            "name": "input",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Input"
+            }
+          },
+          {
+            "in": "query",
+            "name": "metadata",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Metadata"
+            }
+          },
+          {
+            "in": "query",
             "name": "order_by",
             "required": false,
             "schema": {
@@ -63568,6 +63617,9 @@
               }
             },
             "description": "Successful Response"
+          },
+          "304": {
+            "description": "The list still matches `If-None-Match`."
           },
           "422": {
             "content": {

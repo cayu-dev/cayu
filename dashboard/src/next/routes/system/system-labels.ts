@@ -41,6 +41,7 @@ const SURFACE: Partial<Record<keyof ControlPlaneSurfaceCapabilities, string>> = 
   task_creation: "Creating tasks",
   task_graph_creation: "Task graph creation",
   task_index: "Task filters and counts",
+  task_value_filters: "Task input and metadata filters",
   tasks: "Tasks",
   tool_display: "Tool display names",
   tool_inventory: "Tool list",

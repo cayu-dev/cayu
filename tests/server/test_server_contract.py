@@ -289,6 +289,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "task_value_filters": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
+        },
         "task_graph_creation": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},

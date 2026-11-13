@@ -5638,6 +5638,7 @@ export type ControlPlaneSurfaceCapabilities = {
     task_creation?: OptionalSurfaceCapability | null;
     task_graph_creation?: OptionalSurfaceCapability | null;
     task_index?: OptionalSurfaceCapability | null;
+    task_value_filters?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     tool_display?: OptionalSurfaceCapability | null;
     tool_inventory?: OptionalSurfaceCapability | null;
@@ -32520,6 +32521,14 @@ export type ListTasksApiTasksGetData = {
          * Assigned Agent Name
          */
         assigned_agent_name?: string | null;
+        /**
+         * Input
+         */
+        input?: Array<string> | null;
+        /**
+         * Metadata
+         */
+        metadata?: Array<string> | null;
         order_by?: TaskOrder;
         /**
          * Limit

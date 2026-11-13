@@ -7,7 +7,6 @@ import base64
 import contextlib
 import hashlib
 import inspect
-import json
 import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -195,6 +194,7 @@ from cayu.server._corpus_routes import (
 from cayu.server._data_volume_routes import register_data_volume_routes
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._environment_details import artifact_storage_kind, environment_activity_details
+from cayu.server._etag import tagged_json
 from cayu.server._eval_addition_routes import register_eval_addition_routes
 from cayu.server._eval_report_routes import reporting_router
 from cayu.server._eval_view_routes import register_eval_view_routes
@@ -246,7 +246,7 @@ from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server._task_controls_routes import register_task_controls_routes
 from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
-from cayu.server._task_index import read_task_index
+from cayu.server._task_index import TaskValueFilters, read_task_index
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -1100,24 +1100,6 @@ def _public_model_stage(stage: ActiveModelStageInspection | None) -> dict[str, A
     if stage is None:
         return None
     return {**stage.model_dump(mode="json"), "model_step_id": None, "model_attempt_id": None}
-
-
-def _session_state_etag(body: Mapping[str, Any]) -> str:
-    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
-    return f'W/"{hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]}"'
-
-
-def _if_none_match_matches(header: str | None, etag: str) -> bool:
-    """Weakly compare an ``If-None-Match`` header with one entity tag."""
-
-    if header is None:
-        return False
-    opaque = etag.removeprefix("W/")
-    for candidate in header.split(","):
-        candidate = candidate.strip()
-        if candidate == "*" or candidate.removeprefix("W/") == opaque:
-            return True
-    return False
 
 
 _MutationAcceptanceStage = Literal[
@@ -8668,14 +8650,11 @@ def create_router(
             "execution": execution.model_dump(mode="json"),
             "execution_snapshots": [item.model_dump(mode="json") for item in execution_snapshots],
         }
-        etag = _session_state_etag(body)
         # `no-cache` lets a browser store the body but revalidate every read,
         # so repeated polls of an unchanged session cost a 304 and no body.
-        cache_headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
-        if _if_none_match_matches(http_request.headers.get("if-none-match"), etag):
-            return Response(status_code=304, headers=cache_headers)
-        response.headers.update(cache_headers)
-        return body
+        return tagged_json(
+            http_request, response, body, tagged=body, cache_control="private, no-cache"
+        )
 
     async def get_session_tool_view(
         session_id: NonBlankString,
@@ -9447,9 +9426,19 @@ def create_router(
         return _serialize_session(cayu_app, session)
 
     @router.get(
-        "/tasks", response_model=list[ApiTaskListItem] | ApiTaskIndex, dependencies=protected
+        "/tasks",
+        response_model=list[ApiTaskListItem] | ApiTaskIndex,
+        dependencies=protected,
+        responses={304: {"description": "The list still matches `If-None-Match`."}},
+        description=(
+            "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a "
+            "top-level value of the task's input or metadata as the task detail shows it; "
+            "numbers match by value and booleans as true or false. The response carries a "
+            "weak `ETag`; a matching `If-None-Match` returns `304` without a body."
+        ),
     )
     async def list_tasks(
+        http_request: Request,
         response: Response,
         auth_context: AuthContext | None = optional_auth_context,
         include: Literal["counts"] | None = None,
@@ -9462,11 +9451,14 @@ def create_router(
         session_id: str | None = None,
         parent_task_id: str | None = None,
         assigned_agent_name: str | None = None,
+        input_filter: Annotated[list[str] | None, Query(alias="input")] = None,
+        metadata_filter: Annotated[list[str] | None, Query(alias="metadata")] = None,
         order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC,
         limit: int = 50,
         offset: int = 0,
     ):
         response.headers["Cache-Control"] = "private, no-store"
+        values = TaskValueFilters.parse(input_filter, metadata_filter)
         if task_store is None:
             if include == "counts":
                 raise HTTPException(501, "Task index is unavailable.")
@@ -9492,6 +9484,7 @@ def create_router(
             or q is not None
             or not include_internal
             or statuses
+            or values
             or any(
                 value is not None
                 for value in (task_type, session_id, parent_task_id, assigned_agent_name)
@@ -9508,10 +9501,17 @@ def create_router(
                 actor=auth_context,
                 statuses=tuple(statuses or ()),
                 allow_offset=include is None,
+                values=values,
+                redact=lambda value, field: _redact_control_plane_json(cayu_app, value, field),
             )
-            return page if include == "counts" else page["items"]
-        tasks = await task_store.list_tasks(query)
-        return [_serialize_task_list_item(cayu_app, t) for t in tasks]
+            body: Any = page if include == "counts" else page["items"]
+        else:
+            tasks = await task_store.list_tasks(query)
+            body = [_serialize_task_list_item(cayu_app, t) for t in tasks]
+        # A watch that reads an unchanged list gets a 304 and no body.
+        return tagged_json(
+            http_request, response, body, tagged={"tasks": body}, cache_control="private, no-store"
+        )
 
     async def _require_task_store():
         if task_store is None:

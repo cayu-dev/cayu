@@ -50,6 +50,8 @@ function makeContract({
   follow = sessionFollowContract(),
   usage = true,
   inbox = true,
+  tasks = true,
+  taskValueFilters = tasks,
   contractVersion = CONTRACT_VERSION,
   clientVersion = CLIENT_VERSION,
 } = {}) {
@@ -60,6 +62,8 @@ function makeContract({
       : { configured: false, read: { enabled: false, unavailable_reason: "not_configured" } },
   }
   if (inbox) surfaces.inbox = enabled()
+  if (tasks) surfaces.tasks = enabled()
+  if (taskValueFilters) surfaces.task_value_filters = enabled()
   if (stream) {
     sse.session_follow = follow
     surfaces.session_follow = enabled()
@@ -160,6 +164,7 @@ class FakeServer {
     this.usageEtag = '"usage-1"'
     // Inbox pages by cursor; the first page has the null cursor.
     this.inboxPages = new Map([[null, { items: [], issues: [], next_cursor: null }]])
+    this.tasks = []
   }
 
   /** Answer the next request whose path ends with `suffix` with `respond()`. */
@@ -198,6 +203,29 @@ class FakeServer {
       return page
         ? json({ has_more: page.next_cursor !== null, ...page })
         : json({}, { status: 422 })
+    }
+    if (path === "/tasks") {
+      // Mirrors GET /api/tasks: one type, any of several statuses, input and metadata
+      // key=value filters, and a weak ETag over the body.
+      const type = request.query.get("type")
+      const statuses = request.query.getAll("statuses")
+      const valueFilters = ["input", "metadata"].flatMap((name) =>
+        request.query.getAll(name).map((text) => {
+          const at = text.indexOf("=")
+          return [name, text.slice(0, at), text.slice(at + 1)]
+        }),
+      )
+      const body = this.tasks.filter(
+        (task) =>
+          (type === null || task.type === type) &&
+          (statuses.length === 0 || statuses.includes(task.status)) &&
+          valueFilters.every(([name, key, value]) => String(task[name]?.[key]) === value),
+      )
+      const etag = `W/"${JSON.stringify(body.map((task) => [task.id, task.status, task.updated_at]))}"`
+      if (request.headers.get("If-None-Match") === etag) {
+        return new Response(null, { status: 304, headers: { ETag: etag } })
+      }
+      return json(body, { headers: { ETag: etag } })
     }
     if (path === "/sessions") {
       const status = request.query.get("status")
@@ -1194,4 +1222,146 @@ test("getInboxCounts sends only scope filters to the shared count endpoint", asy
   assert.equal(requests[0].searchParams.get("agent_name"), "agent")
   assert.equal(requests[0].searchParams.has("kind"), false)
   assert.equal(requests[0].searchParams.get("q"), "safe public text")
+})
+
+function task(id, status, { type = "shepherd_pass", updatedAt = "2026-09-01T00:00:00+00:00", input = {}, metadata = {} } = {}) {
+  return { id, type, status, updated_at: updatedAt, input, metadata }
+}
+
+test("watchTasks filters by type, status, input and run, and revalidates with the ETag", async () => {
+  const server = new FakeServer()
+  server.tasks = [
+    task("cayu", "running", { input: { repository: "cayu-tech/cayu" }, metadata: { run: "r1" } }),
+    task("design", "running", { input: { repository: "cayu-tech/cayu-design" }, metadata: { run: "r1" } }),
+    task("digest", "running", { type: "digest", input: { repository: "cayu-tech/cayu" } }),
+    task("recheck", "completed", { type: "recheck", input: { repository: "cayu-tech/cayu" }, metadata: { run: "r1" } }),
+  ]
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  assert.equal(client.tasksAvailable, true)
+  const changes = []
+  const stops = []
+  const stop = client.watchTasks(
+    {
+      type: ["shepherd_pass", "recheck"],
+      status: ["running", "completed"],
+      input: { repository: "cayu-tech/cayu" },
+      run: "r1",
+    },
+    (tasks) => changes.push(tasks.map((item) => item.id)),
+    { intervalMs: 1_000, onStop: (reason) => stops.push(reason) },
+  )
+  await flush()
+  assert.deepEqual(changes, [["cayu", "recheck"]])
+  const [first, second] = server.requestsTo("/tasks")
+  assert.deepEqual(
+    [first.query.get("type"), second.query.get("type")],
+    ["shepherd_pass", "recheck"],
+  )
+  assert.deepEqual(first.query.getAll("statuses"), ["running", "completed"])
+  assert.deepEqual(first.query.getAll("input"), ["repository=cayu-tech/cayu"])
+  assert.deepEqual(first.query.getAll("metadata"), ["run=r1"])
+  assert.equal(first.headers.get("If-None-Match"), null)
+
+  // Unchanged: every refresh is a 304, and the interval backs off.
+  await advance(240_000, 1_000)
+  const passes = server.requestsTo("/tasks").filter((r) => r.query.get("type") === "shepherd_pass")
+  const gaps = passes.slice(1).map((request, index) => request.at - passes[index].at)
+  assert.deepEqual(gaps, [15_000, 30_000, 60_000, 120_000])
+  assert.ok(passes.slice(1).every((request) => request.headers.get("If-None-Match") !== null))
+  assert.deepEqual(changes, [["cayu", "recheck"]])
+
+  // The pass finishes: the next refresh sees it and the interval resets to 15 s.
+  server.tasks[0] = task("cayu", "completed", {
+    updatedAt: "2026-09-01T00:10:00+00:00",
+    input: { repository: "cayu-tech/cayu" },
+    metadata: { run: "r1" },
+  })
+  await advance(105_000, 1_000)
+  assert.deepEqual(changes.at(-1), ["cayu", "recheck"])
+  assert.equal(changes.length, 2)
+  const count = server.requestsTo("/tasks").length
+  await advance(15_000, 1_000)
+  assert.equal(server.requestsTo("/tasks").length, count + 2)
+  assert.deepEqual(stops, [])
+  stop()
+  await assertQuiet(server)
+  assert.deepEqual(stops, ["stopped"])
+})
+
+test("watchTasks reports a row change that keeps status and updated_at", async () => {
+  const server = new FakeServer()
+  server.tasks = [{ ...task("a", "failed"), error_summary: "Error: token abc123" }]
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const changes = []
+  const stop = client.watchTasks({}, (tasks) => changes.push(tasks[0].error_summary))
+  await flush()
+  server.tasks = [{ ...task("a", "failed"), error_summary: "Error: [REDACTED]" }]
+  // The fake's ETag covers id, status and updated_at only, so send a fresh body.
+  server.once("/tasks", () => json(server.tasks, { headers: { ETag: 'W/"scrubbed"' } }))
+  await advance(15_000, 1_000)
+  assert.deepEqual(changes, ["Error: token abc123", "Error: [REDACTED]"])
+  stop()
+  await flush()
+})
+
+test("watchTasks takes the watchSessions form and sends nothing while hidden", async () => {
+  const server = new FakeServer()
+  server.tasks = [task("a", "completed")]
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const changes = []
+  document.setHidden(true)
+  const stop = client.watchTasks({}, { onChange: (tasks) => changes.push(tasks.length) })
+  await assertQuiet(server, 5 * 60_000)
+
+  document.setHidden(false)
+  await flush()
+  assert.deepEqual(changes, [1])
+  const [request] = server.requestsTo("/tasks")
+  assert.equal(request.query.get("type"), null)
+  assert.equal(request.query.get("limit"), "100")
+  document.setHidden(true)
+  await assertQuiet(server, 5 * 60_000)
+  stop()
+})
+
+test("watchTasks stops on authorization failures and refuses a server without tasks", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  server.once("/tasks", () => json({ detail: "Forbidden" }, { status: 403 }))
+  const errors = []
+  const stops = []
+  client.watchTasks({ type: "digest" }, () => {}, {
+    onError: (error) => errors.push(error),
+    onStop: (reason) => stops.push(reason),
+  })
+  await flush()
+  assert.equal(errors.length, 1)
+  assert.equal(errors[0].kind, "auth")
+  assert.deepEqual(stops, ["error"])
+  await assertQuiet(server)
+
+  const bare = new FakeServer(makeContract({ tasks: false }))
+  const without = await connect({ apiBaseUrl: API, fetch: bare.fetch })
+  assert.equal(without.tasksAvailable, false)
+  assert.throws(
+    () => without.watchTasks({}, () => {}),
+    (error) => error.kind === "unavailable",
+  )
+  assert.equal(bare.requests.length, 1)
+
+  // A server from before the input and metadata filters would ignore them, so the
+  // client refuses to send them there rather than show other tasks.
+  const older = new FakeServer(makeContract({ taskValueFilters: false }))
+  const before = await connect({ apiBaseUrl: API, fetch: older.fetch })
+  for (const filter of [{ input: { repository: "a/b" } }, { metadata: { k: "v" } }, { run: "r1" }]) {
+    assert.throws(
+      () => before.watchTasks(filter, () => {}),
+      (error) => error.kind === "unavailable" && /input, metadata or run/.test(error.message),
+    )
+  }
+  assert.equal(older.requests.length, 1)
+  const plain = before.watchTasks({ type: "digest" }, () => {})
+  await flush()
+  plain()
+  assert.equal(older.requests.length, 2)
 })

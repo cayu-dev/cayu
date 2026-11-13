@@ -107,6 +107,12 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.task_index_supported,
                     mutation_supported=False,
                 ),
+                # The task list's `input` and `metadata` filters, which the index serves.
+                task_value_filters=_optional_surface(
+                    self.tasks_configured,
+                    read_supported=self.task_index_supported,
+                    mutation_supported=False,
+                ),
                 task_graph_creation=_optional_surface(
                     self.tasks_configured,
                     read_supported=False,
