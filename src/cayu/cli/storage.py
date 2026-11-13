@@ -281,7 +281,9 @@ def _reset_aliases(args: argparse.Namespace) -> int:
             )
         project = discover_cayu_project_configuration(discovery_keys=("session_store", "factory"))
         path = target.sqlite_path
-        require_development_database(path, project_root=None if project is None else project.root)
+        checked = require_development_database(
+            path, project_root=None if project is None else project.root
+        )
         store = read_store_keyring(path)
     except (ProjectError, SessionStoreTargetError, ValueError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -306,8 +308,8 @@ def _reset_aliases(args: argparse.Namespace) -> int:
             print("Not reset.")
             return 1
     try:
-        removed = reset_aliases(path)
-    except sqlite3.Error as exc:
+        removed = reset_aliases(checked)
+    except (sqlite3.Error, ValueError) as exc:
         print(f"error: could not reset {path}: {exc}", file=sys.stderr)
         return 1
     print(f"Reset {path}: dropped {removed} aliases and the recorded keyring.")

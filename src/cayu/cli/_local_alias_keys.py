@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,13 +191,85 @@ def keyring_required_diagnostic(
     )
 
 
-def reset_aliases(path: Path) -> int:
-    """Drop every alias row and the recorded keyring; return how many aliases went."""
+@dataclass(frozen=True)
+class CheckedDatabase:
+    """A development database as `require_development_database` found it: where its
+    file really is, and which file that was."""
 
-    connection = sqlite3.connect(path, isolation_level=None, timeout=5)
+    path: Path
+    identity: tuple[int, int] | None  # Device and inode; None when there is no file yet.
+
+
+# What every SQLite database file starts with.
+_DATABASE_HEADER = b"SQLite format 3\x00"
+# Where the operating system lists the files this process holds open, where it does.
+_OPEN_FILES = Path("/dev/fd")
+
+
+def _open_files() -> dict[int, tuple[int, int, int]] | None:
+    """The regular files this process holds open, by descriptor: each one's device,
+    inode and number of names. None where the system does not list them."""
+
+    try:
+        names = os.listdir(_OPEN_FILES)
+    except OSError:
+        return None
+    held = {}
+    for name in names:
+        try:
+            found = os.fstat(int(name))
+        except (OSError, ValueError):
+            continue  # The listing's own descriptor, closed by now.
+        if stat.S_ISREG(found.st_mode):
+            held[int(name)] = (found.st_dev, found.st_ino, found.st_nlink)
+    return held
+
+
+def _opened_database(
+    before: dict[int, tuple[int, int, int]] | None, path: Path
+) -> tuple[int, int, int] | None:
+    """The database file opened since `before` was taken: the one file among those
+    opened since that starts as a database does. A write-ahead log or another file
+    SQLite opens beside it is not it. None when there is no such file, or more than
+    one. Where the system does not list open files, the file now at `path`: all there
+    is to go by."""
+
+    held = _open_files()
+    if before is None or held is None:
+        try:
+            found = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (found.st_dev, found.st_ino, found.st_nlink)
+    databases = [
+        file
+        for descriptor, file in held.items()
+        if before.get(descriptor) != file
+        and os.pread(descriptor, len(_DATABASE_HEADER), 0) == _DATABASE_HEADER
+    ]
+    return databases[0] if len(databases) == 1 else None
+
+
+def reset_aliases(checked: CheckedDatabase) -> int:
+    """Drop every alias row and the recorded keyring; return how many aliases went.
+
+    Only in the file that was checked. The path may lead to another file by the time
+    it is opened, through a link put there after the check, so what counts is the
+    file the connection holds: it must be the checked one, under its one name.
+    """
+
+    before = _open_files()
+    connection = sqlite3.connect(checked.path, isolation_level=None, timeout=5)
     try:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            # The transaction holds the database file open: what it is no longer changes.
+            if checked.identity is None or (*checked.identity, 1) != _opened_database(
+                before, checked.path
+            ):
+                raise ValueError(
+                    f"{checked.path} is not the file that was checked any more; nothing was reset."
+                )
             present = {
                 str(row[0])
                 for row in connection.execute(
@@ -223,8 +296,9 @@ def reset_aliases(path: Path) -> int:
         connection.close()
 
 
-def require_development_database(path: Path, *, project_root: Path | None) -> None:
-    """Refuse anything but a SQLite file inside a project's data/ directory."""
+def require_development_database(path: Path, *, project_root: Path | None) -> CheckedDatabase:
+    """Refuse anything but a SQLite file inside a project's data/ directory, and
+    return the file that passed."""
 
     if project_root is None:
         raise ValueError(
@@ -244,3 +318,14 @@ def require_development_database(path: Path, *, project_root: Path | None) -> No
         )
     if os.path.islink(path):
         raise ValueError(f"{path} is a symbolic link; reset the database file itself.")
+    try:
+        found = os.stat(resolved, follow_symlinks=False)
+    except FileNotFoundError:
+        return CheckedDatabase(resolved, None)
+    if found.st_nlink > 1:
+        # The same file under a name elsewhere: resetting it here would reset it there.
+        raise ValueError(
+            f"{path} has another name (a hard link); reset-aliases only resets a "
+            "database that is in the project's data/ directory alone."
+        )
+    return CheckedDatabase(resolved, (found.st_dev, found.st_ino))

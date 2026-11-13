@@ -190,6 +190,95 @@ def test_reset_aliases_refuses_a_symlinked_data_directory(
         SQLiteSessionStore(outside / "cayu.db")
 
 
+@pytest.mark.parametrize("swap", ["symbolic_link", "hard_link"])
+def test_reset_aliases_refuses_a_file_swapped_in_after_the_check(
+    project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    swap: str,
+) -> None:
+    database = project / "data" / "cayu.db"
+    _open_with_keyring(database)
+    outside = tmp_path / "outside.db"
+    _open_with_keyring(outside)
+
+    def confirm(_prompt: str) -> str:
+        # While the operator is at the prompt, the path comes to lead elsewhere.
+        database.unlink()
+        if swap == "symbolic_link":
+            database.symlink_to(outside)
+        else:
+            database.hardlink_to(outside)
+        return "cayu.db"
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", confirm)
+
+    assert main(["storage", "reset-aliases"]) == 1
+    assert "not the file that was checked" in capsys.readouterr().err
+    # The database outside the project kept its aliases and its keyring.
+    with pytest.raises(_AliasStoreKeyringRequired):
+        SQLiteSessionStore(outside)
+
+
+@pytest.mark.parametrize("swap", ["and_back", "as_write_ahead_log"])
+def test_reset_aliases_goes_by_the_database_it_opened_not_by_the_path(
+    project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    swap: str,
+) -> None:
+    database = project / "data" / "cayu.db"
+    _open_with_keyring(database)
+    outside = tmp_path / "outside.db"
+    _open_with_keyring(outside)
+    aside = tmp_path / "aside.db"
+    connect = sqlite3.connect
+
+    def swapped(path: Path, **options: object) -> sqlite3.Connection:
+        if options.get("uri"):
+            return connect(path, **options)  # The read before the prompt: left alone.
+        if swap == "and_back":
+            # The path leads to the outside database while it is opened, and back to
+            # the checked one before anything looks at the path again.
+            database.rename(aside)
+            database.hardlink_to(outside)
+            connection = connect(path, **options)
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            database.unlink()
+            aside.rename(database)
+            return connection
+        # The checked file becomes the write-ahead log of the outside database, so the
+        # connection holds it open too, though not as its database.
+        log = database.with_name("cayu.db-wal")
+        database.rename(log)
+        log.write_bytes(b"")
+        database.hardlink_to(outside)
+        return connect(path, **options)
+
+    monkeypatch.setattr("cayu.cli._local_alias_keys.sqlite3.connect", swapped)
+    assert main(["storage", "reset-aliases", "--yes"]) == 1
+    assert "not the file that was checked" in capsys.readouterr().err
+    monkeypatch.undo()
+    with pytest.raises(_AliasStoreKeyringRequired):
+        SQLiteSessionStore(outside)
+
+
+def test_reset_aliases_refuses_a_database_with_another_name(
+    project: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside.db"
+    _open_with_keyring(outside)
+    (project / "data" / "cayu.db").hardlink_to(outside)
+
+    assert main(["storage", "reset-aliases", "--yes"]) == 1
+    assert "has another name" in capsys.readouterr().err
+    with pytest.raises(_AliasStoreKeyringRequired):
+        SQLiteSessionStore(outside)
+
+
 def test_status_does_not_claim_an_unchecked_store_opens(
     project: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
