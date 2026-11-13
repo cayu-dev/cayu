@@ -12,6 +12,7 @@ import { createRoot } from "react-dom/client"
 import { ServerContractProvider } from "@/components/dashboard/server-contract"
 import { ViewerProvider } from "@/components/dashboard/viewer"
 import type { AppInfoResponse } from "@/lib/generated/server-api"
+import { DashboardPartsHost } from "./app/parts-host"
 import { createDashboardRouter } from "./app/routes"
 import { ServicesProvider } from "./app/services"
 import { createMockApi } from "./mock/api"
@@ -71,14 +72,23 @@ function App() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: the viewer follows the seed.
   const viewer = useMemo<AppInfoResponse>(() => {
     const { app } = api.records()
-    return { name: app.name, runtime_version: app.runtime_version, full_access: true, role: null }
+    return {
+      name: app.name,
+      runtime_version: app.runtime_version,
+      full_access: true,
+      role: null,
+      human_review_required: false,
+      human_review_purpose: null,
+    }
   }, [seedId])
   return (
     <QueryClientProvider client={queryClient}>
       <ServicesProvider value={services}>
         <ServerContractProvider contract={CONTRACT}>
           <ViewerProvider value={viewer}>
-            <RouterProvider router={router} />
+            <DashboardPartsHost>
+              <RouterProvider router={router} />
+            </DashboardPartsHost>
           </ViewerProvider>
         </ServerContractProvider>
       </ServicesProvider>

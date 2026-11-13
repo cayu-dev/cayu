@@ -10,8 +10,10 @@ from cayu.cli._check_keys import (
     lent_memory_evidence_key,
     lent_memory_key_diagnostic,
     review_without_keyring_diagnostic,
+    review_without_purpose_diagnostic,
     uses_tool_argument_review,
 )
+from cayu.cli._dashboard_parts import dashboard_parts_findings
 from cayu.cli._local_alias_keys import keyring_required_diagnostic
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import (
@@ -108,7 +110,9 @@ def _run_check(args: argparse.Namespace) -> int:
         report = _with_diagnostics(
             report,
             filter_findings(
-                serve_ui_findings(project.root), tags=requested_tags, deploy_only=args.deploy
+                (*serve_ui_findings(project.root), *dashboard_parts_findings(project.root)),
+                tags=requested_tags,
+                deploy_only=args.deploy,
             ),
         )
         if (
@@ -326,7 +330,8 @@ def check_project(
 def _key_findings(
     root: Path, app: CayuApp, *, lent_memory_key: bool, deploy: bool
 ) -> tuple[ProjectDiagnostic, ...]:
-    """Keys this run lacks: a lent memory evidence key, a review without a keyring."""
+    """Keys this run lacks: a lent memory evidence key, a review without a keyring or
+    without a purpose apps can request it with."""
 
     findings: list[ProjectDiagnostic] = []
     if lent_memory_key:
@@ -337,6 +342,8 @@ def _key_findings(
         and (module := uses_tool_argument_review(root)) is not None
     ):
         findings.append(review_without_keyring_diagnostic(module))
+    if app.human_review_configured and app.human_review_purpose is None:
+        findings.append(review_without_purpose_diagnostic())
     return tuple(findings)
 
 

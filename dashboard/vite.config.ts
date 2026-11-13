@@ -28,6 +28,9 @@ export default defineConfig(({ command }) => ({
           return source;
         },
       }] : []),
+      // The parts in src/parts import components through `@kit`; here that is the
+      // dashboard's own (src/kit). An app importing the parts maps `@kit` to its kit.
+      { find: /^@kit\/(.*)$/, replacement: path.resolve(__dirname, "./src/kit/$1") },
       { find: "@", replacement: path.resolve(__dirname, "./src") },
       { find: "@prototype-seeds", replacement: PROTOTYPE_SEEDS },
     ],

@@ -31,6 +31,26 @@ in Session Trace. The `/sessions/:id/workflow` alias opens it; `/agents`,
 Supported old Evals run/result query links map to the current Evals pages.
 See [the page map](src/next/PAGE-MAP.md) for page ownership and runtime references.
 
+## Parts
+
+`src/parts` holds pages an Agent's own app can show too, starting with the Inbox
+(`src/parts/inbox`: `InboxPart`, and `InboxFilters`, `InboxList` and `InboxCard` on
+their own). A part reads everything it needs from a `PartsHost` (`src/parts/host.tsx`):
+the clock, a `Link`, an `onSettled` hook, and one section per part with its data
+client and what the viewer may do. The dashboard provides its host in
+`src/next/app/parts-host.tsx`, and its Inbox, session and Knowledge pages render the
+same parts. Query keys parts use start with `"cayu"` (`partKeys`, `inboxKeys`).
+
+Parts import components only through `@kit/ui`, `@kit/lib` and `@kit/icons`, which
+`src/kit` maps to the dashboard's own components and lucide icons under HugeIcons
+names. `tests/parts-boundary.test.mjs` keeps parts free of the router, `window`,
+lucide and `@/` imports.
+
+`npm run build:parts -- [OUT_DIR]` packs the parts as `@cayu-tech/dashboard-parts` at
+the Cayu version in `src/lib/release-metadata.ts` (`parts/package.json` is the manifest,
+`vite.parts.config.ts` and `tsconfig.parts.json` build it). Cayu's wheel carries that
+tarball, and `cayu dashboard parts` writes it into an app's `web/vendor/`.
+
 Keep this source copy, generated HTTP types and the server contract matched.
 Ejecting or upgrading Cayu does not automatically port application-owned UI
 changes or migrate older prototype/browser state.

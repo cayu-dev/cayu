@@ -23,8 +23,14 @@ def register_app_info_routes(
     runtime_version: str | None,
     roles: ControlPlaneRoles | None,
     optional_auth_context: Depends,
+    human_review_required: bool = False,
+    human_review_purpose: str | None = None,
 ) -> None:
-    """Publish bounded server identity without reading any application stores."""
+    """Publish bounded server identity without reading any application stores.
+
+    It also says whether deciding needs protected human review and with which purpose,
+    so an app's own pages know whether to show the review before a decision.
+    """
 
     project_name, _ = _bounded_diagnostic_text(
         project_name, max_chars=MAX_SYSTEM_DEPLOYMENT_NAME_CHARS
@@ -54,4 +60,6 @@ def register_app_info_routes(
             runtime_version=runtime_version or "unknown",
             role=role,
             full_access=full_access,
+            human_review_required=human_review_required,
+            human_review_purpose=human_review_purpose,
         )

@@ -16,10 +16,18 @@ from cayu._dashboard_artifacts import (
     BUILD_INPUT_FILES,
     BUNDLE_PACKAGE_ROOT,
     COMPILED_PACKAGE_ROOT,
+    PARTS_PACKAGE_ROOT,
     SOURCE_ROOT,
 )
 
 _ROOT = Path(__file__).parents[2]
+
+
+def _compile_into(stage, compiled):
+    """Stand in for the container: these compiled assets, and the packaged parts tarball."""
+    builder._write_files(stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT, compiled)
+    parts = Path(str(files("cayu").joinpath(*PARTS_PACKAGE_ROOT.split("/"))))
+    builder._write_files(stage / "src" / "cayu" / PARTS_PACKAGE_ROOT, tree_contents(parts))
 
 
 @pytest.fixture
@@ -30,7 +38,7 @@ def checkout(tmp_path, monkeypatch):
     shutil.copyfile(_ROOT / ".gitattributes", root / ".gitattributes")
     shutil.copyfile(_ROOT / "pyproject.toml", root / "pyproject.toml")
     builder._write_files(root, builder._inputs(_ROOT))
-    for package_path in (COMPILED_PACKAGE_ROOT, BUNDLE_PACKAGE_ROOT):
+    for package_path in (COMPILED_PACKAGE_ROOT, BUNDLE_PACKAGE_ROOT, PARTS_PACKAGE_ROOT):
         source = files("cayu").joinpath(*package_path.split("/"))
         shutil.copytree(str(source), root / "src" / "cayu" / package_path)
     monkeypatch.setattr(builder, "ROOT", root)
@@ -42,10 +50,10 @@ def checkout(tmp_path, monkeypatch):
     )
 
     def compile(stage):
-        shutil.copytree(
-            root / "src" / "cayu" / COMPILED_PACKAGE_ROOT,
-            stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT,
-        )
+        for package_path in (COMPILED_PACKAGE_ROOT, PARTS_PACKAGE_ROOT):
+            shutil.copytree(
+                root / "src" / "cayu" / package_path, stage / "src" / "cayu" / package_path
+            )
 
     monkeypatch.setattr(builder, "_build_frontend", compile)
     return root
@@ -79,9 +87,7 @@ def test_check_reports_changes_without_writing_and_regeneration_repairs_them(che
         for name, content in baseline.items()
         if f"{COMPILED_PACKAGE_ROOT}/" in name
     }
-    builder._build_frontend = lambda stage: builder._write_files(
-        stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT, compiled
-    )
+    builder._build_frontend = lambda stage: _compile_into(stage, compiled)
     (assets / "index.html").unlink()
     (assets / "obsolete.js").write_bytes(b"old")
     before = builder._outputs(checkout)
@@ -159,9 +165,7 @@ def test_regeneration_handles_asset_path_type_changes(checkout, monkeypatch, old
     monkeypatch.setattr(
         builder,
         "_build_frontend",
-        lambda stage: builder._write_files(
-            stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT, compiled
-        ),
+        lambda stage: _compile_into(stage, compiled),
     )
     assert builder.main(["--check"]) == 1
     assert builder._outputs(checkout) == original
@@ -190,9 +194,7 @@ def test_regeneration_preserves_asset_directory_capitalization(
     monkeypatch.setattr(
         builder,
         "_build_frontend",
-        lambda stage: builder._write_files(
-            stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT, compiled
-        ),
+        lambda stage: _compile_into(stage, compiled),
     )
     original = builder._outputs(checkout)
     paths = {path.relative_to(assets).as_posix() for path in assets.rglob("*")}
@@ -278,6 +280,23 @@ def test_builder_rejects_symlinks_without_modifying_the_target(checkout, locatio
     with pytest.raises(ValueError):
         builder.main([])
     assert target.exists()
+
+
+def test_a_build_without_its_parts_tarball_publishes_nothing(checkout, monkeypatch):
+    before = builder._outputs(checkout)
+
+    def compile_without_parts(stage):
+        shutil.copytree(
+            checkout / "src" / "cayu" / COMPILED_PACKAGE_ROOT,
+            stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT,
+        )
+        (stage / "src" / "cayu" / PARTS_PACKAGE_ROOT).mkdir(parents=True)
+
+    monkeypatch.setattr(builder, "_build_frontend", compile_without_parts)
+
+    with pytest.raises(ValueError, match="not one tarball"):
+        builder.main([])
+    assert builder._outputs(checkout) == before
 
 
 @pytest.mark.parametrize(

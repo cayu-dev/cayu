@@ -206,27 +206,8 @@ export function Kbd({ children }: { children: ReactNode }) {
   )
 }
 
-export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
-  return (
-    <div className="rounded-xl border border-dashed border-border px-6 py-10 text-center">
-      <p className="text-sm font-medium">{title}</p>
-      {children && (
-        <div className="mx-auto mt-1.5 max-w-md text-sm text-muted-foreground">{children}</div>
-      )}
-    </div>
-  )
-}
-
-export function ErrorState({ error }: { error: unknown }) {
-  return (
-    <p
-      role="alert"
-      className="min-w-0 [overflow-wrap:anywhere] rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-    >
-      {error instanceof Error ? error.message : "Something went wrong loading this page."}
-    </p>
-  )
-}
+// Shared with the parts in src/parts, which apps import.
+export { EmptyState, ErrorState } from "../../parts/states"
 
 /* ---------- shell state shared by the sidebar and each page's top bar ---------- */
 

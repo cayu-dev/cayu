@@ -24,6 +24,7 @@ PRs since the previous release; do not rely on an accumulated `Unreleased` secti
    npm ci
    CAYU_PYTHON=../.venv/bin/python npm run generate:api
    npm run build:package
+   npm run build:parts -- ../src/cayu/data/dashboard_parts
    cd ..
    uv run python scripts/build_dashboard_source_bundle.py
    ```

@@ -163,3 +163,26 @@ def review_without_keyring_diagnostic(module: str) -> ProjectDiagnostic:
         documentation_anchor="cayu guide diagnostics#human-review-keyring-missing",
         verification_command="cayu check --json",
     )
+
+
+def review_without_purpose_diagnostic() -> ProjectDiagnostic:
+    return ProjectDiagnostic(
+        code="HUMAN_REVIEW_PURPOSE_MISSING",
+        severity=DiagnosticSeverity.WARNING,
+        subject="human_review",
+        path="human_review_policy",
+        message=(
+            "The app's human review policy names no dashboard_purpose. Settling an approval "
+            "or a question needs a protected review's reference, and an app requests the "
+            "review with the purpose /api/app reports, which is null here. So an Agent's own "
+            "pages can only show those items read-only, and people decide in the Developer "
+            "dashboard, which needs `humanReviewPurpose` in its runtime config."
+        ),
+        hint=(
+            "Give the policy a `dashboard_purpose` property that returns the purpose its "
+            "authorize() accepts, as ToolArgumentReview does."
+        ),
+        tags=("configuration",),
+        documentation_anchor="cayu guide diagnostics#human-review-purpose-missing",
+        verification_command="cayu check --json",
+    )

@@ -34,6 +34,7 @@ import type {
 } from "@/lib/generated/server-api"
 import type { MutationExecutionOptions } from "@/lib/mutation-browser"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
+import type { InboxQuery, RecoveryRequest } from "../../parts/types"
 import type {
   AddToEvals,
   EvalRunDetail,
@@ -184,30 +185,8 @@ export type SessionOverview = {
   forked?: boolean
 }
 
-/**
- * Public server-side Inbox filters; query and cursor share the same access scope.
- */
-export type InboxQuery = {
-  q?: string
-  limit?: number
-  cursor?: string | null
-  session_id?: string
-  agent_name?: string
-  kind?: InboxItem["kind"]
-}
-
-/**
- * Settling a manual recovery with the evidence of what happened: whether the tool call
- * that never reported a result really completed or failed, the externally verified result
- * or failure reason, and, when the call was a question, the person's answer again.
- */
-export type RecoveryRequest = {
-  /** The inbox item's `attention_id`, naming which pending recovery this settles. */
-  attention_id?: string | null
-  outcome: "completed" | "failed"
-  message: string
-  answer?: string | null
-}
+// Shared with the parts in src/parts, which apps import.
+export type { InboxQuery, RecoveryRequest } from "../../parts/types"
 
 /** What the shell shows about the running app, from `GET /api/app` (backend item 8). */
 export type AppInfo = { name: string; runtime_version: string }

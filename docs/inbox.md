@@ -489,6 +489,9 @@ claim, and keeps or drops the same entry `POST /api/knowledge/{id}/approve` and
 - `GET /api/human-attention/{attention_id}` and the attention handoff report it
   `resolved` or `cancelled` once the Runtime closes it.
 
+An Agent's own web app can show the same Inbox as the Developer dashboard: see
+[Use the dashboard's pages in your own app](control-plane.md#use-the-dashboards-pages-in-your-own-app).
+
 ## From the command line
 
 `cayu inbox` lists, shows and decides the same items from a terminal:

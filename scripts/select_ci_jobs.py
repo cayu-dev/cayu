@@ -73,7 +73,9 @@ _FAULT_INJECTION_PREFIXES = (
 _DASHBOARD_EXACT_PATHS = {
     ".gitattributes",
     "scripts/build_b2b_web.py",
+    "scripts/build_dashboard.py",
     "scripts/generate_dashboard_api_types.py",
+    "src/cayu/_dashboard_artifacts.py",
     "src/cayu/_server_contract_version.py",
     "src/cayu/_validation.py",
 }
@@ -185,11 +187,13 @@ def _affects_dashboard(path: str) -> bool:
             "src/cayu/artifacts/",
             "src/cayu/cli/templates/b2b_web/",
             "src/cayu/core/",
+            "src/cayu/data/dashboard_parts/",
             "src/cayu/evals/",
             "src/cayu/runtime/",
             "src/cayu/server/",
             "src/cayu/storage/",
             "tests/browser_client/",
+            "tests/dashboard_parts_consumer/",
             "tests/server/",
         )
     )

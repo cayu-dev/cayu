@@ -4814,6 +4814,8 @@ def create_router(
         runtime_version=capability_snapshot.cayu_version,
         roles=role_policy if isinstance(role_policy, ControlPlaneRoles) else None,
         optional_auth_context=optional_auth_context,
+        human_review_required=cayu_app.human_review_configured,
+        human_review_purpose=cayu_app.human_review_purpose,
     )
 
     async def _session_message_context(request: Request) -> SessionMessageAccessContext:

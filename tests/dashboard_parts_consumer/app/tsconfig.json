@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "module": "esnext",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"],
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": false,
+    "paths": {
+      "@kit/icons": ["./src/kit-icons.ts"],
+      "@kit/*": ["./src/kit/shadcn/*"]
+    }
+  },
+  "files": ["src/main.tsx", "node_modules/@cayu-tech/dashboard-parts/dist/parts/index.d.ts", "node_modules/@cayu-tech/dashboard-parts/dist/parts/inbox/index.d.ts"]
+}

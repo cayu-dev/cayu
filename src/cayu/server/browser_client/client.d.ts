@@ -419,6 +419,64 @@ export interface WatchInboxOptions extends InboxFilters {
   signal?: AbortSignal
 }
 
+/** `/api/app`: the Agent's name, the signed-in person's access, and protected review. */
+export interface AppInfo {
+  name: string
+  runtime_version: string
+  role: string | null
+  full_access: boolean
+  /** A human review policy is configured: settling an approval or question needs its reference. */
+  human_review_required: boolean
+  /** The purpose to request reviews with; null when there's no policy or it names none. */
+  human_review_purpose: string | null
+}
+
+export interface HumanReviewContext {
+  purpose: string
+  recipient: string
+  tenant?: string | null
+}
+
+/** Opaque proof of the review a person saw; send it back as `review_reference`. */
+export interface HumanReviewReference {
+  content_tag: string
+  context: HumanReviewContext
+  policy_version: string
+}
+
+export type HumanReviewStatus = "permitted" | "redacted" | "unavailable"
+
+/** Protected review content. Text fields are HTML-escaped (`display_format`). */
+export interface HumanReviewView {
+  session_id: string
+  status: HumanReviewStatus
+  guidance: string
+  kind?: "user_input" | "tool_approval" | null
+  interaction_id?: string | null
+  tool_round_id?: string | null
+  tool_call_id?: string | null
+  reference?: HumanReviewReference | null
+  fields?: { label: string; text: string }[]
+  /** Fields shown only in part; read one whole with `readHumanReviewLongField`. */
+  long_fields?: { key: string; label: string; characters: number }[]
+  calls?: {
+    tool_call_id: string
+    tool_name: string
+    on_grant: "eligible" | "denied" | "withheld"
+  }[]
+  display_format?: "html_escaped_text"
+}
+
+export interface HumanReviewLongFieldView {
+  session_id: string
+  key: string
+  status: HumanReviewStatus
+  label?: string | null
+  text?: string | null
+  characters?: number | null
+  display_format?: "html_escaped_text"
+}
+
 export interface CayuClient {
   readonly contract: CayuContract
   /** Whether the server advertises the session follow stream. */
@@ -452,6 +510,19 @@ export interface CayuClient {
   ): Promise<InboxSettleResult>
   /** Returns a function that stops the watch. It never stops as idle. */
   watchInbox(options?: WatchInboxOptions): () => void
+  getAppInfo(options?: { signal?: AbortSignal }): Promise<AppInfo>
+  /** The current protected review of a session's pending approval or question. */
+  getHumanReview(
+    sessionId: string,
+    options: { purpose: string; signal?: AbortSignal },
+  ): Promise<HumanReviewView>
+  /** One field the review at `reference` shows only in part, whole. */
+  readHumanReviewLongField(
+    sessionId: string,
+    reference: HumanReviewReference,
+    key: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<HumanReviewLongFieldView>
   /** Whether the server serves tasks. `watchTasks` throws `unavailable` otherwise. */
   readonly tasksAvailable: boolean
   /**

@@ -1,0 +1,3 @@
+/* The generator's kit stylesheet, then the package's Tailwind source line. */
+@import "./kit/shadcn/styles.css";
+@import "@cayu-tech/dashboard-parts/styles.css";

@@ -4,15 +4,12 @@ import {
   isProfileChangedConflict,
   PROFILE_ADOPTION_REASON,
   withProfileAdoption,
-} from "../src/next/app/inbox-adoption.ts"
+} from "../src/parts/inbox/inbox-adoption.ts"
 
 test("only a 409 profile_changed settle offers adoption", () => {
-  assert.equal(isProfileChangedConflict({ status: 409, detail: { code: "profile_changed" } }), true)
-  assert.equal(isProfileChangedConflict({ status: 409, detail: { code: "conflict" } }), false)
-  assert.equal(
-    isProfileChangedConflict({ status: 400, detail: { code: "profile_changed" } }),
-    false,
-  )
+  assert.equal(isProfileChangedConflict({ status: 409, code: "profile_changed" }), true)
+  assert.equal(isProfileChangedConflict({ status: 409, code: "conflict" }), false)
+  assert.equal(isProfileChangedConflict({ status: 400, code: "profile_changed" }), false)
   assert.equal(isProfileChangedConflict({ status: 409, detail: "profile_changed" }), false)
   assert.equal(isProfileChangedConflict(null), false)
 })

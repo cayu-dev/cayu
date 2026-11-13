@@ -24,11 +24,23 @@ window.__vite_plugin_react_preamble_installed__ = true;
 window.__CAYU_DASHBOARD_CONFIG__ = {apiBaseUrl:'/api'};
 const React = (await import('/node_modules/.vite/deps/react.js')).default;
 const {createRoot} = (await import('/node_modules/.vite/deps/react-dom_client.js')).default;
-const {ProtectedHumanReview} = await import('/src/components/dashboard/protected-human-review.tsx');
+const {ProtectedReviewPart} = await import('/src/parts/protected-review.tsx');
+const {dashboardReviewApi} = await import('/src/lib/human-review.ts');
 const mutations = await import('/src/lib/mutation-browser.ts');
-createRoot(document.getElementById('root')).render(React.createElement(ProtectedHumanReview, {
-  sessionId:'review-session', purpose:'delivery', kind: KIND, disabled:false,
-  unavailableReason:null, onDecision:async body => {
+// The resolve routes name the reviewed interaction, so keep the view the part inspected.
+let view = null;
+const api = {...dashboardReviewApi,
+  inspect: async (...args) => (view = await dashboardReviewApi.inspect(...args))};
+createRoot(document.getElementById('root')).render(React.createElement(ProtectedReviewPart, {
+  api, sessionId:'review-session', purpose:'delivery', kind: KIND, disabled:false,
+  onDecision:async decision => {
+    const body = decision.decision === 'answer'
+      ? {session_id:view.session_id, input_id:view.interaction_id, answer:decision.answer,
+         review_reference:decision.review_reference}
+      : {session_id:view.session_id, approval_id:view.interaction_id,
+         tool_round_id:view.tool_round_id, tool_call_id:view.tool_call_id,
+         decision:decision.decision, reason:decision.reason,
+         review_reference:decision.review_reference};
     const result = await ('input_id' in body ? mutations.executeResolveUserInputMutation(body)
       : mutations.executeResolveToolApprovalMutation(body));
     if (result.phase !== 'terminal') throw new Error('Decision was rejected or unconfirmed.');

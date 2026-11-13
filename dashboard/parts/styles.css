@@ -1,0 +1,7 @@
+/*
+ * Lets Tailwind see the classes Cayu's dashboard parts use. Import it from the app's
+ * kit stylesheet, after `@import "tailwindcss"`:
+ *
+ *   @import "@cayu-tech/dashboard-parts/styles.css";
+ */
+@source "./dist";

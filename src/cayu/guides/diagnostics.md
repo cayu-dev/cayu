@@ -51,6 +51,18 @@ run `cayu keys generate --env-file .env` once and start the app with
 `uv run --env-file .env ...`. A database opened with a keyring keeps requiring
 it, so keep using the same keys.
 
+## human-review-purpose-missing
+
+`HUMAN_REVIEW_PURPOSE_MISSING` warns that the app's human review policy has no
+`dashboard_purpose`. With a policy configured, settling an approval or a
+question needs the `review_reference` of a protected review, and a review is
+requested for a purpose the policy's `authorize()` accepts. An Agent's own app
+learns that purpose from `GET /api/app` (`human_review_purpose`, also
+`getAppInfo()` in client.js); without one it can only show those items
+read-only. The Developer dashboard can still decide them when its runtime
+config sets `humanReviewPurpose`. Give the policy a `dashboard_purpose`
+property, as `ToolArgumentReview` does.
+
 ## session-store-alias-keyring-required
 
 `SESSION_STORE_ALIAS_KEYRING_REQUIRED` means the application factory could not

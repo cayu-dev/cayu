@@ -53,6 +53,8 @@ import { validateSessionHistorySearch } from "@/lib/session-history-search"
 import { prepareSessionTaskReplay, type TaskReplayAcceptance } from "@/lib/session-task-replay"
 import { readAsConversation, rememberConversation, sessionView } from "@/lib/session-view"
 import { cn } from "@/lib/utils"
+import { partKeys } from "../../../parts"
+import { InboxCard, inboxKeys } from "../../../parts/inbox"
 import {
   useInbox,
   useOverview,
@@ -97,7 +99,6 @@ import { Composer } from "./composer"
 import { Conversation, SubagentRows } from "./conversation"
 import { DetailsPanel, PANEL_TABS, type PanelTab } from "./details-panel"
 import { SessionEvalAdditionDialog } from "./eval-addition-action"
-import { InboxCard } from "./inbox-card"
 import { TraceView } from "./trace-view"
 
 export function SessionPage({
@@ -247,17 +248,16 @@ export function SessionPage({
       "overview",
       "transcript",
       "sessions",
-      "inbox",
       "state",
       "session-state",
       "session-list",
-      "inbox-counts",
       "session-children",
       "session-parent",
       "session-messages",
-      "session-recovery",
     ])
       void queryClient.invalidateQueries({ queryKey: [key] })
+    void queryClient.invalidateQueries({ queryKey: inboxKeys.all })
+    void queryClient.invalidateQueries({ queryKey: partKeys.sessionRecoveries() })
   }
   const progress = useSessionProgress({
     sessionId,
@@ -276,10 +276,9 @@ export function SessionPage({
           "session-children",
           "session-parent",
           "session-messages",
-          "session-recovery",
         ].map((key) => queryClient.invalidateQueries({ queryKey: [key, sessionId] })),
-        queryClient.invalidateQueries({ queryKey: ["inbox"] }),
-        queryClient.invalidateQueries({ queryKey: ["inbox-counts"] }),
+        queryClient.invalidateQueries({ queryKey: partKeys.sessionRecoveries(sessionId) }),
+        queryClient.invalidateQueries({ queryKey: inboxKeys.all }),
         queryClient.invalidateQueries({ queryKey: ["trace", sessionId] }),
         queryClient.invalidateQueries({
           queryKey: ["trace-events", sessionId],

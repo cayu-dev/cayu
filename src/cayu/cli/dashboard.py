@@ -34,6 +34,7 @@ from cayu._dashboard_artifacts import (
 )
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli import _guarded_tree_publication as _tree_publication
+from cayu.cli._dashboard_parts import add_parts_parser, run_dashboard_parts
 from cayu.cli._guarded_tree_publication import (
     DestinationPolicy,
     GuardedTreePublicationError,
@@ -150,13 +151,14 @@ class _BundleResource:
 
 
 def add_dashboard_parser(subparsers: Any) -> None:
-    """Register the ``dashboard eject`` command group."""
+    """Register the ``dashboard eject`` and ``dashboard parts`` command group."""
     dashboard = subparsers.add_parser(
         "dashboard",
         help="Manage the bundled Cayu Developer dashboard source.",
         description=(
             "Manage the bundled Cayu Developer dashboard source. "
-            "Use `cayu dashboard eject DESTINATION` to create an editable project."
+            "Use `cayu dashboard eject DESTINATION` to create an editable project, and "
+            "`cayu dashboard parts` to install its pages as parts in a web app."
         ),
     )
     dashboard_commands = dashboard.add_subparsers(dest="dashboard_command", required=True)
@@ -169,10 +171,13 @@ def add_dashboard_parser(subparsers: Any) -> None:
         ),
     )
     eject.add_argument("destination", type=Path, metavar="DESTINATION")
+    add_parts_parser(dashboard_commands)
 
 
 def run_dashboard(args: argparse.Namespace) -> int:
     """Dispatch a parsed ``dashboard`` invocation."""
+    if args.dashboard_command == "parts":
+        return run_dashboard_parts(args)
     try:
         result = eject_dashboard_source(args.destination)
     except Exception as exc:

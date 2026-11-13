@@ -35,12 +35,17 @@ _DASHBOARD_SOURCE_BUNDLE = (
 )
 _WHEEL_DASHBOARD_SOURCE = f"cayu/data/dashboard_source/{_DASHBOARD_SOURCE_BUNDLE_NAME}"
 _SDIST_DASHBOARD_SOURCE = f"src/cayu/data/dashboard_source/{_DASHBOARD_SOURCE_BUNDLE_NAME}"
+_DASHBOARD_PARTS_NAME = f"cayu-dashboard-parts-{_VERSION}.tgz"
+_DASHBOARD_PARTS = _ROOT / "src" / "cayu" / "data" / "dashboard_parts" / _DASHBOARD_PARTS_NAME
+_WHEEL_DASHBOARD_PARTS = f"cayu/data/dashboard_parts/{_DASHBOARD_PARTS_NAME}"
+_SDIST_DASHBOARD_PARTS = f"src/cayu/data/dashboard_parts/{_DASHBOARD_PARTS_NAME}"
 
 artifact_validator = runpy.run_path(str(_ROOT / "scripts" / "check_release_artifacts.py"))
 validate_sdist = artifact_validator["validate_sdist"]
 validate_wheel = artifact_validator["validate_wheel"]
 validate_sidecar_equivalence = artifact_validator["validate_sidecar_equivalence"]
 validate_dashboard_source_equivalence = artifact_validator["validate_dashboard_source_equivalence"]
+validate_dashboard_parts_equivalence = artifact_validator["validate_dashboard_parts_equivalence"]
 
 
 def test_built_wheel_serve_startup_timeout_reaps_process(
@@ -116,6 +121,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/server/browser_client/client.js",
         "cayu/server/browser_client/client.d.ts",
         _WHEEL_DASHBOARD_SOURCE,
+        _WHEEL_DASHBOARD_PARTS,
         *{f"cayu/server/dashboard/{name}" for name in compiled_dashboard},
         *{f"{artifact_validator['_WHEEL_SIDECAR_PREFIX']}/{name}" for name in sidecar},
         f"{_WHEEL_DIST_INFO}/METADATA",
@@ -175,6 +181,8 @@ def _write_wheel(
                 content = compiled_dashboard[name.removeprefix(dashboard_prefix)]
             if name == _WHEEL_DASHBOARD_SOURCE:
                 content = _DASHBOARD_SOURCE_BUNDLE.read_bytes()
+            if name == _WHEEL_DASHBOARD_PARTS:
+                content = _DASHBOARD_PARTS.read_bytes()
             if name == f"{_WHEEL_DIST_INFO}/METADATA":
                 content = _core_metadata()
             if name in contents_by_name:
@@ -210,7 +218,7 @@ def _write_sdist(
         artifact_validator["_SDIST_REQUIRED"]
         | additional_names
         | {f"{prefix}/{name}" for name in sidecar}
-        | {_SDIST_DASHBOARD_SOURCE}
+        | {_SDIST_DASHBOARD_SOURCE, _SDIST_DASHBOARD_PARTS}
         | {f"src/cayu/server/dashboard/{name}" for name in compiled_dashboard}
     ) - (omitted_names or set())
     with tarfile.open(path, "w:gz") as archive:
@@ -233,6 +241,8 @@ def _write_sdist(
                 content = compiled_dashboard[relative_name.removeprefix(dashboard_prefix)]
             if relative_name == _SDIST_DASHBOARD_SOURCE:
                 content = _DASHBOARD_SOURCE_BUNDLE.read_bytes()
+            if relative_name == _SDIST_DASHBOARD_PARTS:
+                content = _DASHBOARD_PARTS.read_bytes()
             if relative_name == "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
                 content = compiled_dashboard["THIRD_PARTY_LICENSES.md"]
             if relative_name == "PKG-INFO":
@@ -600,6 +610,66 @@ def test_validate_release_artifacts_require_identical_dashboard_source_bundles(
             tmp_path / "wheel.whl",
             sdist_bundle=b"source",
             wheel_bundle=b"wheel",
+        )
+
+
+def test_validate_wheel_requires_dashboard_parts_package(tmp_path: Path) -> None:
+    wheel = tmp_path / "missing-dashboard-parts.whl"
+    names = _valid_wheel_names()
+    names.remove(_WHEEL_DASHBOARD_PARTS)
+    _write_wheel(wheel, names)
+
+    with pytest.raises(ValueError, match="missing required dashboard parts package"):
+        validate_wheel(wheel)
+
+
+def _parts_with_version(version: str) -> bytes:
+    output = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(_DASHBOARD_PARTS.read_bytes()), mode="r:gz") as source,
+        tarfile.open(fileobj=output, mode="w:gz") as target,
+    ):
+        for member in source.getmembers():
+            data = source.extractfile(member).read() if member.isfile() else b""  # type: ignore[union-attr]
+            if member.name == "package/package.json":
+                manifest = json.loads(data)
+                data = json.dumps({**manifest, "version": version}).encode()
+                member.size = len(data)
+            target.addfile(member, io.BytesIO(data))
+    return output.getvalue()
+
+
+def test_validate_wheel_rejects_dashboard_parts_at_another_version(tmp_path: Path) -> None:
+    wheel = tmp_path / "dashboard-parts-version.whl"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={_WHEEL_DASHBOARD_PARTS: _parts_with_version("9.9.9")},
+    )
+
+    with pytest.raises(ValueError, match="version '9.9.9', not Cayu's"):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_rejects_a_second_dashboard_parts_package(tmp_path: Path) -> None:
+    wheel = tmp_path / "dashboard-parts-two.whl"
+    stale = "cayu/data/dashboard_parts/cayu-dashboard-parts-0.0.1.tgz"
+    _write_wheel(wheel, _valid_wheel_names() | {stale})
+
+    with pytest.raises(ValueError, match="expected exactly dashboard parts package"):
+        validate_wheel(wheel)
+
+
+def test_validate_release_artifacts_require_identical_dashboard_parts(tmp_path: Path) -> None:
+    sdist = tmp_path / f"cayu-{_VERSION}.tar.gz"
+    wheel = tmp_path / f"cayu-{_VERSION}-py3-none-any.whl"
+    _write_sdist(sdist)
+    _write_wheel(wheel, _valid_wheel_names())
+    validate_dashboard_parts_equivalence(sdist, wheel)
+
+    with pytest.raises(ValueError, match="dashboard parts package differs"):
+        validate_dashboard_parts_equivalence(
+            sdist, wheel, sdist_parts=b"source", wheel_parts=b"wheel"
         )
 
 

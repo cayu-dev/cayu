@@ -48,6 +48,13 @@ It provides:
 - `watchInbox({ onChange, onError, onStop, intervalMs, signal })`,
   `listInbox`, `getInboxItem` and `settleInboxItem` read and settle the agent's
   inbox; see [Show the agent's inbox](#show-the-agents-inbox).
+- `getAppInfo()` reads `GET /api/app`: the Agent's name, the person's access, and
+  whether deciding needs protected human review (`human_review_required`) with which
+  `human_review_purpose`.
+- `getHumanReview(sessionId, { purpose })` and
+  `readHumanReviewLongField(sessionId, reference, key)` read the protected review a
+  person decides with; settle with its `reference` as `review_reference`. Keep the
+  view out of shared caches and storage.
 
 What the client guarantees, so your code does not have to:
 

@@ -896,6 +896,10 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
         ("Dashboard typecheck", ("run", "typecheck")),
         ("Dashboard API drift", ("run", "check:api:repo")),
         ("Dashboard package build", ("run", "build:package")),
+        (
+            "Dashboard parts package",
+            ("run", "build:parts", "--", "../src/cayu/data/dashboard_parts"),
+        ),
     ):
         runner.run(label, ("npm", *npm_args), cwd=dashboard)
     # The prototype (the design reference) opens every page in a browser.
@@ -903,6 +907,8 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
         runner, launcher=("npx",), label="Dashboard prototype browser", cwd=dashboard
     )
     runner.run("Dashboard prototype pages", ("npm", "run", "test:prototype"), cwd=dashboard)
+    # An app installs the packed parts with the generator's kit, builds, and drives them.
+    runner.run("Dashboard parts consumer", ("node", "tests/dashboard_parts_consumer/run.mjs"))
     runner.run("B2B web interface", ("python3", "scripts/build_b2b_web.py", "--check"))
     # The browser client served by mount_cayu is plain JavaScript outside the
     # dashboard package; its behavior tests need only Node's built-in runner.
@@ -921,10 +927,10 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
     runner.run(
         "Packaged dashboard assets unchanged",
         """
-status="$(git status --porcelain -- src/cayu/server/dashboard)"
+status="$(git status --porcelain -- src/cayu/server/dashboard src/cayu/data/dashboard_parts)"
 if test -n "$status"; then
   echo "$status"
-  git diff --stat -- src/cayu/server/dashboard
+  git diff --stat -- src/cayu/server/dashboard src/cayu/data/dashboard_parts
   exit 1
 fi
 """.strip(),

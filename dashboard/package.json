@@ -10,6 +10,7 @@
     "dev": "vite",
     "build": "tsc && vite build && node scripts/finalize-third-party-licenses.mjs dist && node scripts/check-third-party-licenses.mjs dist",
     "build:package": "tsc && vite build --outDir ../src/cayu/server/dashboard --emptyOutDir && node scripts/finalize-third-party-licenses.mjs ../src/cayu/server/dashboard && node scripts/check-third-party-licenses.mjs ../src/cayu/server/dashboard",
+    "build:parts": "node scripts/pack-parts.mjs",
     "preview": "vite preview",
     "generate:api": "node scripts/run-python.mjs scripts/generate-api-types.py",
     "generate:api:repo": "node scripts/run-python.mjs --repository scripts/generate-api-types.py",

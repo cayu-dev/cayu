@@ -150,12 +150,17 @@ export { SUPPORTED_SERVER_CONTRACT_VERSION } from "./release-metadata.ts"
 export class ApiClientError extends Error {
   readonly status: number
   readonly detail: unknown
+  /** The server's machine-readable `detail.code`, such as `profile_changed`, when it sent one. */
+  readonly code: string | undefined
 
   constructor(message: string, status: number, detail: unknown = null) {
     super(message)
     this.name = "ApiClientError"
     this.status = status
     this.detail = detail
+    const code =
+      detail && typeof detail === "object" ? (detail as { code?: unknown }).code : undefined
+    this.code = typeof code === "string" ? code : undefined
   }
 }
 

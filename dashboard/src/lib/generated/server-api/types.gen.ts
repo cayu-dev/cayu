@@ -3646,6 +3646,18 @@ export type AppInfoResponse = {
      */
     full_access: boolean;
     /**
+     * Human Review Purpose
+     *
+     * The purpose to request protected reviews with (the policy's dashboard_purpose). Null when no policy is configured or the policy names none; then an app can't decide items that need the review.
+     */
+    human_review_purpose: string | null;
+    /**
+     * Human Review Required
+     *
+     * Whether a human review policy is configured, so settling an approval or a question needs the review_reference of a protected review.
+     */
+    human_review_required: boolean;
+    /**
      * Name
      */
     name: string;

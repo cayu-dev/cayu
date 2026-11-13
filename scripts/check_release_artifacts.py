@@ -18,7 +18,10 @@ from cayu._dashboard_artifacts import (
     BUNDLE_PACKAGE_ROOT,
     COMPILED_PACKAGE_ROOT,
     COMPILED_REQUIRED_FILES,
+    PARTS_PACKAGE_ROOT,
+    parts_tarball_name,
     source_bundle_name,
+    validate_parts_tarball,
 )
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli.dashboard import (
@@ -53,6 +56,8 @@ _SDIST_SIDECAR_PREFIX = "examples/aws/lambda_microvm_sidecar"
 _WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
 _SDIST_DASHBOARD_SOURCE_PREFIX = f"src/cayu/{BUNDLE_PACKAGE_ROOT}"
 _WHEEL_DASHBOARD_SOURCE_PREFIX = f"cayu/{BUNDLE_PACKAGE_ROOT}"
+_SDIST_DASHBOARD_PARTS_PREFIX = f"src/cayu/{PARTS_PACKAGE_ROOT}"
+_WHEEL_DASHBOARD_PARTS_PREFIX = f"cayu/{PARTS_PACKAGE_ROOT}"
 _GUIDE_FILES = {filename for filename, _description in _GUIDES.values()}
 _SDIST_REQUIRED = {
     *{"src/" + name for name in _PUBLIC_LAYOUT_REQUIRED},
@@ -174,6 +179,7 @@ _NON_PUBLIC_IDENTIFIERS = (
 class ValidatedReleaseContents:
     sidecar: dict[str, bytes]
     dashboard_bundle: bytes
+    dashboard_parts: bytes
 
 
 def _fail(message: str) -> Never:
@@ -407,7 +413,15 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
         bundle_prefix=_SDIST_DASHBOARD_SOURCE_PREFIX,
         compiled_prefix=f"src/cayu/{COMPILED_PACKAGE_ROOT}",
     )
-    return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
+    dashboard_parts = _validate_dashboard_parts(
+        contents_by_relative_name,
+        archive=archive,
+        package_version=package_version,
+        prefix=_SDIST_DASHBOARD_PARTS_PREFIX,
+    )
+    return ValidatedReleaseContents(
+        sidecar=sidecar, dashboard_bundle=dashboard_bundle, dashboard_parts=dashboard_parts
+    )
 
 
 def validate_wheel(archive: Path) -> ValidatedReleaseContents:
@@ -508,7 +522,15 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
         bundle_prefix=_WHEEL_DASHBOARD_SOURCE_PREFIX,
         compiled_prefix=f"cayu/{COMPILED_PACKAGE_ROOT}",
     )
-    return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
+    dashboard_parts = _validate_dashboard_parts(
+        file_contents,
+        archive=archive,
+        package_version=package_version,
+        prefix=_WHEEL_DASHBOARD_PARTS_PREFIX,
+    )
+    return ValidatedReleaseContents(
+        sidecar=sidecar, dashboard_bundle=dashboard_bundle, dashboard_parts=dashboard_parts
+    )
 
 
 def validate_dashboard_build(
@@ -581,6 +603,31 @@ def _validate_dashboard_source(
     return bundle
 
 
+def _validate_dashboard_parts(
+    archive_contents: dict[str, bytes],
+    *,
+    archive: Path,
+    package_version: str,
+    prefix: str,
+) -> bytes:
+    """Exactly the @cayu-tech/dashboard-parts tarball at the package's version."""
+    expected_name = f"{prefix}/{parts_tarball_name(package_version)}"
+    found = sorted(name for name in archive_contents if name.startswith(f"{prefix}/"))
+    if not found:
+        _fail(f"{archive}: missing required dashboard parts package: {expected_name}")
+    if found != [expected_name]:
+        _fail(
+            f"{archive}: expected exactly dashboard parts package {expected_name}, "
+            f"found {', '.join(found)}"
+        )
+    tarball = archive_contents[expected_name]
+    try:
+        validate_parts_tarball(tarball, cayu_version=package_version)
+    except ValueError as exc:
+        raise ValueError(f"{archive}: invalid dashboard parts package: {exc}") from exc
+    return tarball
+
+
 def validate_sidecar_equivalence(
     sdist: Path,
     wheel: Path,
@@ -616,6 +663,19 @@ def validate_dashboard_source_equivalence(
         _fail(f"{wheel}: dashboard source bundle differs from the sdist bundle")
 
 
+def validate_dashboard_parts_equivalence(
+    sdist: Path,
+    wheel: Path,
+    *,
+    sdist_parts: bytes | None = None,
+    wheel_parts: bytes | None = None,
+) -> None:
+    source = sdist_parts if sdist_parts is not None else validate_sdist(sdist).dashboard_parts
+    package = wheel_parts if wheel_parts is not None else validate_wheel(wheel).dashboard_parts
+    if source != package:
+        _fail(f"{wheel}: dashboard parts package differs from the sdist's")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", nargs="+", type=Path)
@@ -637,6 +697,12 @@ def main(argv: list[str] | None = None) -> int:
         wheels[0],
         sdist_bundle=sdist_contents.dashboard_bundle,
         wheel_bundle=wheel_contents.dashboard_bundle,
+    )
+    validate_dashboard_parts_equivalence(
+        sdists[0],
+        wheels[0],
+        sdist_parts=sdist_contents.dashboard_parts,
+        wheel_parts=wheel_contents.dashboard_parts,
     )
     print(f"validated {sdists[0]} and {wheels[0]}")
     return 0

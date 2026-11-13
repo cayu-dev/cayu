@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from tests.server.test_proxy_identity import FakeJwks, _as, _auth, _token
 
 from cayu.applications import CayuApp
+from cayu.approvals import HumanReviewDisclosure, HumanReviewPolicy, ToolArgumentReview
 from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
@@ -37,7 +38,14 @@ def test_app_info_without_role_enforcement_ignores_role_claims_and_headers():
         response = client.get("/api/app", headers={"X-Cayu-Identity": "not-authenticated"})
         assert response.status_code == 200
         body = response.json()
-        assert set(body) == {"name", "runtime_version", "role", "full_access"}
+        assert set(body) == {
+            "name",
+            "runtime_version",
+            "role",
+            "full_access",
+            "human_review_required",
+            "human_review_purpose",
+        }
         assert isinstance(body["name"], str)
         assert (
             body["runtime_version"]
@@ -119,6 +127,8 @@ def test_app_info_openapi_has_a_typed_body_and_no_caller_identity_parameters():
         "runtime_version",
         "role",
         "full_access",
+        "human_review_required",
+        "human_review_purpose",
     }
 
 
@@ -230,3 +240,43 @@ def test_app_info_refuses_missing_malformed_or_unknown_proxy_roles(claims):
     assert (
         client.get("/api/app", headers=_as(_token(key, role="admin"))).json()["full_access"] is True
     )
+
+
+class _PurposelessReview(HumanReviewPolicy):
+    """A custom policy that names no dashboard_purpose."""
+
+    version = "purposeless-v1"
+
+    @property
+    def binding_key(self) -> bytes:
+        return b"k" * 32
+
+    def authorize(self, context, *, session_id, session_metadata, action) -> bool:
+        return True
+
+    def project(self, context, source) -> HumanReviewDisclosure:
+        return HumanReviewDisclosure(status="unavailable")
+
+
+@pytest.mark.parametrize(
+    ("policy", "required", "purpose"),
+    [
+        (None, False, None),
+        (
+            ToolArgumentReview({"merge": ("repository",)}, binding_key=b"k" * 32, purpose="merges"),
+            True,
+            "merges",
+        ),
+        (_PurposelessReview(), True, None),
+    ],
+)
+def test_app_info_says_whether_deciding_needs_protected_review_and_its_purpose(
+    policy, required, purpose
+):
+    app = CayuApp(human_review_policy=policy)
+    response = TestClient(create_server(app, config=ServerConfig.local_development())).get(
+        "/api/app"
+    )
+    assert response.status_code == 200
+    assert response.json()["human_review_required"] is required
+    assert response.json()["human_review_purpose"] == purpose

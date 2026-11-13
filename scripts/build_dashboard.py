@@ -20,8 +20,11 @@ from cayu._dashboard_artifacts import (
     BUILD_PLATFORM,
     BUNDLE_PACKAGE_ROOT,
     COMPILED_PACKAGE_ROOT,
+    PARTS_PACKAGE_ROOT,
     SOURCE_ROOT,
+    parts_tarball_name,
     source_bundle_name,
+    validate_parts_tarball,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,9 +80,12 @@ def _write_files(root: Path, contents: dict[str, bytes]) -> None:
         path.write_bytes(content)
 
 
+_OUTPUT_ROOTS = (COMPILED_PACKAGE_ROOT, BUNDLE_PACKAGE_ROOT, PARTS_PACKAGE_ROOT)
+
+
 def _outputs(root: Path) -> dict[str, bytes]:
     result = {}
-    for package_path in (COMPILED_PACKAGE_ROOT, BUNDLE_PACKAGE_ROOT):
+    for package_path in _OUTPUT_ROOTS:
         prefix = f"src/cayu/{package_path}"
         directory = root / prefix
         if directory.is_symlink() or directory.exists():
@@ -94,6 +100,8 @@ def _build_frontend(stage: Path) -> None:
     name = f"cayu-dashboard-{uuid.uuid4().hex}"
     output = stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT
     output.mkdir(parents=True)
+    parts = stage / "src" / "cayu" / PARTS_PACKAGE_ROOT
+    parts.mkdir(parents=True)
     command = ["docker", "run", "--rm", "--init", "--name", name, "--platform", BUILD_PLATFORM]
     if hasattr(os, "getuid"):
         command += ["--user", f"{os.getuid()}:{os.getgid()}"]
@@ -104,6 +112,8 @@ def _build_frontend(stage: Path) -> None:
         f"{stage}:/input:ro",
         "--volume",
         f"{output}:/output",
+        "--volume",
+        f"{parts}:/parts",
         BUILD_IMAGE,
         "sh",
         "-ec",
@@ -118,6 +128,8 @@ def _build_frontend(stage: Path) -> None:
                 "npm ci --include=dev --no-audit --no-fund",
                 "npm run build:package",
                 f"cp -R /tmp/build/src/cayu/{COMPILED_PACKAGE_ROOT}/. /output/",
+                # @cayu-tech/dashboard-parts, packed straight into the wheel's data.
+                "npm run build:parts -- /parts",
             )
         ),
     ]
@@ -171,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         compiled = tree_contents(stage / "src" / "cayu" / COMPILED_PACKAGE_ROOT)
         bundle = build_bundle(cayu_version=version, repo_root=stage)
         validate_dashboard_build(compiled, bundle, package_version=version)
+        parts = tree_contents(stage / "src" / "cayu" / PARTS_PACKAGE_ROOT)
+        parts_name = parts_tarball_name(version)
+        if list(parts) != [parts_name]:
+            raise ValueError(f"the parts build wrote {sorted(parts)}, not one tarball")
+        validate_parts_tarball(parts[parts_name], cayu_version=version)
         _write_files(
             stage, {f"src/cayu/{BUNDLE_PACKAGE_ROOT}/{source_bundle_name(version)}": bundle}
         )
@@ -180,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("Dashboard inputs or outputs changed during the build; rerun the command.")
     changes = _changes(original, expected)
     if not changes:
-        print("Packaged dashboard assets and source bundle match the canonical build.")
+        print("Packaged dashboard assets, source bundle and parts match the canonical build.")
         return 0
     print("\n".join(changes))
     if args.check:
@@ -191,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     # Remove empty output directories from the leaves up. This also lets new
     # paths replace their parents' capitalization on case-insensitive filesystems.
     # Keep the output roots and any directories that still contain retained files.
-    for package_path in (COMPILED_PACKAGE_ROOT, BUNDLE_PACKAGE_ROOT):
+    for package_path in _OUTPUT_ROOTS:
         directory = ROOT / "src" / "cayu" / package_path
         for path in sorted(directory.rglob("*"), reverse=True):
             if path.is_dir() and not any(path.iterdir()):
@@ -199,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_files(
         ROOT, {name: value for name, value in expected.items() if original.get(name) != value}
     )
-    print("Updated packaged dashboard assets and source bundle; commit both outputs.")
+    print("Updated packaged dashboard assets, source bundle and parts; commit the outputs.")
     return 0
 
 

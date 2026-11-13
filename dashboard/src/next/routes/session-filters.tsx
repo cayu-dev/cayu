@@ -23,8 +23,8 @@ type AdvancedFilterDraft = {
   labelSelectors: string
 }
 
-export const selectClassName =
-  "h-8 rounded-lg border border-input bg-background px-2 text-sm outline-none focus:border-ring"
+// Shared with the parts in src/parts, which apps import.
+export { selectClassName } from "../../parts/styles"
 
 const advancedInputClassName = "mt-1.5"
 

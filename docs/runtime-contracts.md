@@ -10931,6 +10931,13 @@ and never changes authorization on another route. Migration: regenerate
 OpenAPI clients and deploy independently hosted dashboards with their matching
 server contract version.
 
+Server contract version 91 adds `human_review_required` and `human_review_purpose` to
+`GET /api/app`. `human_review_required` is true when the application has a human
+review policy, so settling an approval or a question needs a protected review's
+`review_reference`; `human_review_purpose` is the policy's `dashboard_purpose`, or
+null when there is no policy or it names none. client.js adds `getAppInfo`,
+`getHumanReview` and `readHumanReviewLongField` over the existing routes.
+
 Server contract version 52 adds `RunRequest.title`, the optional `title` field on
 `POST /api/run`, and `capabilities.surfaces.session_display_metadata`. The
 `app.run(request)` signature is unchanged. Session titles, summaries and explicit

@@ -2147,6 +2147,20 @@ class AppInfoResponse(ApiBaseModel):
     runtime_version: StrictStr = Field(max_length=128)
     role: StrictStr | None
     full_access: StrictBool
+    human_review_required: StrictBool = Field(
+        description=(
+            "Whether a human review policy is configured, so settling an approval or a "
+            "question needs the review_reference of a protected review."
+        )
+    )
+    human_review_purpose: StrictStr | None = Field(
+        max_length=128,
+        description=(
+            "The purpose to request protected reviews with (the policy's dashboard_purpose). "
+            "Null when no policy is configured or the policy names none; then an app can't "
+            "decide items that need the review."
+        ),
+    )
 
 
 class ServerContractResponse(ApiBaseModel):

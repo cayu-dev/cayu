@@ -1,3 +1,3 @@
 """Dependency-light control-plane contract identity."""
 
-SERVER_CONTRACT_VERSION = "90"
+SERVER_CONTRACT_VERSION = "91"

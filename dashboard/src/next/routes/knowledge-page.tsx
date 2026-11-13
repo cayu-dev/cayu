@@ -6,12 +6,12 @@ import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { ROLE_FORBIDDEN_REASON } from "@/lib/dashboard-access"
 import type { ApiKeptKnowledgeItem } from "@/lib/generated/server-api"
+import { InboxCard, inboxKeys } from "../../parts/inbox"
 import { useKeptKnowledge } from "../app/knowledge-query"
 import { useInbox } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
 import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar } from "./common"
-import { InboxCard } from "./session/inbox-card"
 
 export function KnowledgePage({
   keptUnavailable = null,
@@ -224,7 +224,7 @@ function Entry({ entry }: { entry: ApiKeptKnowledgeItem }) {
     onSuccess: () => {
       setRevision(null)
       void client.invalidateQueries({ queryKey: ["knowledge"] })
-      void client.invalidateQueries({ queryKey: ["inbox-counts"] })
+      void client.invalidateQueries({ queryKey: inboxKeys.counts() })
     },
   })
   return (

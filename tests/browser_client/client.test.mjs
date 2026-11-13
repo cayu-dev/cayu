@@ -1224,6 +1224,65 @@ test("getInboxCounts sends only scope filters to the shared count endpoint", asy
   assert.equal(requests[0].searchParams.get("q"), "safe public text")
 })
 
+test("getAppInfo reads whether deciding needs protected review, and with which purpose", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const info = {
+    name: "Shepherd",
+    runtime_version: "0.19.1",
+    role: "member",
+    full_access: false,
+    human_review_required: true,
+    human_review_purpose: "merges",
+  }
+  server.once("/api/app", () => json(info))
+
+  assert.deepEqual(await client.getAppInfo(), info)
+  const [request] = server.requestsTo("/api/app")
+  assert.equal(request.init.method, "GET")
+  assert.equal(request.init.credentials, "same-origin")
+})
+
+test("getHumanReview and readHumanReviewLongField read the review a person decides with", async () => {
+  const server = new FakeServer()
+  const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
+  const reference = {
+    content_tag: "tag",
+    policy_version: "v1",
+    context: { purpose: "merges", recipient: "alice", tenant: null },
+  }
+  const view = {
+    session_id: "s/1",
+    status: "permitted",
+    guidance: "Review all calls before deciding.",
+    reference,
+  }
+  const field = { session_id: "s/1", key: "body", status: "permitted", text: "All of it." }
+  server.once("/human-review", () => json(view))
+  server.once("/human-review/long-field", () => json(field))
+
+  assert.deepEqual(await client.getHumanReview("s/1", { purpose: "merges" }), view)
+  assert.deepEqual(await client.readHumanReviewLongField("s/1", reference, "body"), field)
+  const [inspect] = server.requestsTo("/human-review")
+  assert.equal(inspect.path, "/cayu/api/sessions/s%2F1/human-review")
+  assert.equal(inspect.query.get("purpose"), "merges")
+  const [read] = server.requestsTo("/long-field")
+  assert.equal(read.init.method, "POST")
+  assert.deepEqual(JSON.parse(read.init.body), { review_reference: reference, key: "body" })
+
+  server.once("/human-review", () =>
+    json({ detail: "Human-review access is not authorized." }, { status: 403 }),
+  )
+  await assert.rejects(client.getHumanReview("s1", { purpose: "merges" }), (error) => {
+    assert.equal(error.kind, "auth")
+    assert.equal(error.status, 403)
+    return true
+  })
+  await assert.rejects(client.getHumanReview("s1", {}), TypeError)
+  await assert.rejects(client.readHumanReviewLongField("s1", null, "body"), TypeError)
+  await assert.rejects(client.readHumanReviewLongField("s1", reference, ""), TypeError)
+})
+
 function task(id, status, { type = "shepherd_pass", updatedAt = "2026-09-01T00:00:00+00:00", input = {}, metadata = {} } = {}) {
   return { id, type, status, updated_at: updatedAt, input, metadata }
 }

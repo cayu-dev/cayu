@@ -12,7 +12,7 @@
 /** Version of this module's public API, advertised as `client.version` by `/api/contract`. */
 export const CLIENT_VERSION = "1"
 /** Exact server contract version this module was released with. */
-export const CONTRACT_VERSION = "90"
+export const CONTRACT_VERSION = "91"
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"])
 const ACTIVE_STATUSES = new Set(["pending", "running", "interrupting"])
@@ -204,6 +204,49 @@ class CayuClient {
   watchInbox(options = {}) {
     requireInbox(this.#context.contract)
     return watchInbox(this.#context, options)
+  }
+
+  /**
+   * The Agent's name and the signed-in person's access, and whether deciding needs
+   * protected human review (`human_review_required`) with which `human_review_purpose`.
+   */
+  async getAppInfo(options = {}) {
+    return requestJson(this.#context, "/app", { signal: options.signal })
+  }
+
+  /**
+   * The current protected human review of a session's pending approval or question,
+   * for `purpose` (`getAppInfo().human_review_purpose`). Settle with its `reference`
+   * as `review_reference`. The view holds protected material: keep it out of shared
+   * caches and storage.
+   */
+  async getHumanReview(sessionId, options = {}) {
+    const id = requireSessionId(sessionId)
+    const purpose = options.purpose
+    if (typeof purpose !== "string" || purpose.trim() === "") {
+      throw new TypeError("purpose must be a non-empty string.")
+    }
+    const path = `/sessions/${encodeURIComponent(id)}/human-review`
+    return requestJson(this.#context, `${path}?${new URLSearchParams({ purpose })}`, {
+      signal: options.signal,
+    })
+  }
+
+  /** One field the review at `reference` shows only in part (`long_fields`), whole. */
+  async readHumanReviewLongField(sessionId, reference, key, options = {}) {
+    const id = requireSessionId(sessionId)
+    if (reference === null || typeof reference !== "object") {
+      throw new TypeError("reference must be the review's reference.")
+    }
+    if (typeof key !== "string" || key === "") {
+      throw new TypeError("key must be a non-empty string.")
+    }
+    const path = `/sessions/${encodeURIComponent(id)}/human-review/long-field`
+    return requestJson(this.#context, path, {
+      method: "POST",
+      body: { review_reference: reference, key },
+      signal: options.signal,
+    })
   }
 
   /** Whether the server serves tasks. `watchTasks` throws `unavailable` otherwise. */

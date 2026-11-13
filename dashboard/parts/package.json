@@ -1,0 +1,26 @@
+{
+  "name": "@cayu-tech/dashboard-parts",
+  "version": "0.0.0",
+  "description": "The Cayu Developer dashboard's pages as parts an Agent's own app can show: the Inbox first.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": ["*.css"],
+  "exports": {
+    ".": {
+      "types": "./dist/parts/index.d.ts",
+      "import": "./dist/parts/index.js"
+    },
+    "./inbox": {
+      "types": "./dist/parts/inbox/index.d.ts",
+      "import": "./dist/parts/inbox/index.js"
+    },
+    "./styles.css": "./styles.css",
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "styles.css", "README.md", "LICENSE", "NOTICE"],
+  "peerDependencies": {
+    "@tanstack/react-query": "^5",
+    "react": "^19",
+    "react-dom": "^19"
+  }
+}

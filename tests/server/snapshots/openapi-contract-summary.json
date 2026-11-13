@@ -7206,6 +7206,24 @@
           "title": "Full Access",
           "type": "boolean"
         },
+        "human_review_purpose": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The purpose to request protected reviews with (the policy's dashboard_purpose). Null when no policy is configured or the policy names none; then an app can't decide items that need the review.",
+          "title": "Human Review Purpose"
+        },
+        "human_review_required": {
+          "description": "Whether a human review policy is configured, so settling an approval or a question needs the review_reference of a protected review.",
+          "title": "Human Review Required",
+          "type": "boolean"
+        },
         "name": {
           "maxLength": 128,
           "title": "Name",
@@ -7232,7 +7250,9 @@
         "name",
         "runtime_version",
         "role",
-        "full_access"
+        "full_access",
+        "human_review_required",
+        "human_review_purpose"
       ],
       "title": "AppInfoResponse",
       "type": "object"
@@ -26483,7 +26503,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "90",
+          "default": "91",
           "title": "Contract Version",
           "type": "string"
         },
@@ -34665,7 +34685,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "90",
+          "default": "91",
           "title": "Contract Version",
           "type": "string"
         }

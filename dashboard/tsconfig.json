@@ -20,7 +20,7 @@
     "noUnusedParameters": true,
     "noUncheckedIndexedAccess": true,
     "baseUrl": ".",
-    "paths": { "@/*": ["./src/*"] },
+    "paths": { "@/*": ["./src/*"], "@kit/*": ["./src/kit/*"] },
     "ignoreDeprecations": "6.0",
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true

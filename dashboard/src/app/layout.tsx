@@ -44,6 +44,7 @@ import { readSidebarHidden, writeSidebarHidden } from "../lib/sidebar-preference
 import { useTheme } from "../lib/theme"
 import { cn } from "../lib/utils"
 import { realApi } from "../next/api/real"
+import { DashboardPartsHost } from "../next/app/parts-host"
 import { useInboxCounts } from "../next/app/queries"
 import { ServicesProvider } from "../next/app/services"
 import { Kbd, ShellContext } from "../next/routes/common"
@@ -175,7 +176,9 @@ function IdentityGate() {
           knowledgeReviewEnabled: serverContract.capabilities.mutations.knowledge_review.enabled,
         }}
       >
-        <DashboardShell />
+        <DashboardPartsHost>
+          <DashboardShell />
+        </DashboardPartsHost>
       </ServicesProvider>
     </ViewerProvider>
   )

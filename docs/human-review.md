@@ -271,3 +271,34 @@ A failed or stale decision clears the review and requires explicit inspection
 again. Redacted/unavailable approval content permits only denial when a bound
 reference is present; missing references disable all decisions. Recovery gates
 still require the explicit SDK/server recovery contract described above.
+
+## In an Agent's own app
+
+An app's pages decide under the same review. `GET /api/app` (client.js
+`getAppInfo()`) reports `human_review_required`, true when a policy is configured,
+and `human_review_purpose`, the policy's `dashboard_purpose`. With a purpose, the
+app inspects the review as the signed-in person (`getHumanReview(sessionId,
+{ purpose })`), shows it, and settles the inbox item with the view's `reference`
+as `review_reference`. Settling without it is refused with 403, and so is anyone
+else's reference: the recipient must be the authenticated person.
+
+`ProtectedReviewPart` from `@cayu-tech/dashboard-parts` does this. It reads through
+a `ReviewApi` (`reviewApiFromCayuClient(client)` for client.js) and keeps the review
+in component memory, and its `onDecision` gives `{ decision, review_reference,
+answer?, reason? }` for the app's own settle. Pass it as the Inbox host's
+`ProtectedReview`, or render it in an Agent's own approval pages:
+
+```tsx
+const info = await client.getAppInfo()
+const reviewApi = reviewApiFromCayuClient(client)
+const ProtectedReview = info.human_review_required
+  ? (props) => (
+      <ProtectedReviewPart {...props} api={reviewApi} purpose={info.human_review_purpose} />
+    )
+  : undefined
+```
+
+When a review is required and the policy names no purpose, `human_review_purpose`
+is null, the part shows the item read-only, and `cayu check` warns
+(`HUMAN_REVIEW_PURPOSE_MISSING`). A review needs a person: under `cayu serve --dev`
+there is no recipient, so sign in through the identity proxy to try it.

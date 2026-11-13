@@ -25,7 +25,9 @@ for watched files, startup failures and shutdown behavior.
 
 ## Agent identity and viewer access
 
-`GET /api/app` returns `name`, `runtime_version`, `role` and `full_access`.
+`GET /api/app` returns `name`, `runtime_version`, `role` and `full_access`, and
+`human_review_required` and `human_review_purpose`, which say whether deciding needs
+protected human review and with which purpose an app requests it.
 The name comes from the project's normalized public identity (`[project].name`),
 then the server deployment name, then `Cayu`; names outside the existing 128-character diagnostic bound are
 omitted before choosing the next fallback. The runtime version is `unknown`
@@ -345,6 +347,47 @@ The extracted project includes Cayu's `LICENSE` and `NOTICE`, third-party licens
 reviewed license baseline, and production-build license finalization. Its normal build retains
 `LICENSE`, `NOTICE`, `REDISTRIBUTION.md`, and `THIRD_PARTY_LICENSES.md` in `dist/`. Downstream
 distributors must retain applicable notices and mark modified Cayu-derived files as changed.
+
+## Use the dashboard's pages in your own app
+
+The Developer dashboard's Inbox also ships as a part an Agent's own web app imports:
+`@cayu-tech/dashboard-parts`, an npm package at the Cayu version that is packed into the
+wheel. The app shows the same Inbox, rendered with its own component kit.
+
+```bash
+cayu dashboard parts              # writes web/vendor/cayu-dashboard-parts-<version>.tgz
+cd web
+npm install ./vendor/cayu-dashboard-parts-<version>.tgz   # the first time; then `npm install`
+```
+
+`npm install` copies the tarball into `node_modules`, so React and TanStack Query resolve to
+the app's own copies (they are peer dependencies). On a later upgrade, `cayu dashboard parts`
+replaces the tarball and points the `file:` spec in `web/package.json` at it; run
+`npm install` and rebuild. `cayu check` warns (`DASHBOARD_PARTS_VERSION_MISMATCH`) when
+`web/package-lock.json` resolves the package to a version other than the installed Cayu,
+because the parts follow that release's server contract.
+
+The app provides:
+
+- `@kit/ui`, `@kit/lib` and `@kit/icons`, mapped in Vite's `resolve.alias` and tsconfig
+  `paths` to its kit. Parts use `Button`, `Card`, `CardContent`, `Input`, `cn`, and `Icon`
+  with the HugeIcons names they show.
+- `optimizeDeps: { exclude: ["@cayu-tech/dashboard-parts"] }` in its Vite config.
+- `@import "@cayu-tech/dashboard-parts/styles.css";` in its kit stylesheet, so Tailwind
+  generates the parts' classes.
+- A `PartsHostProvider` around the parts: the clock, a `Link` for sessions and tasks, an
+  optional `onSettled` to refresh its own views after a decision, and an `inbox` section with
+  the client and what the person may do. `inboxApiFromCayuClient(await connect())` builds the
+  client from `client.js`; an app that forwards `/app/inbox` to Cayu writes its own.
+
+`InboxPart` (from `@cayu-tech/dashboard-parts/inbox`) is the whole page. `InboxFilters`,
+`InboxList` and `InboxCard` work on their own for an app that lays the Inbox out
+differently. Every query key a part uses starts with `"cayu"` (`partKeys`, `inboxKeys`).
+
+When the Agent has a human review policy, pass `ProtectedReviewPart` as the inbox
+section's `ProtectedReview`, with `reviewApiFromCayuClient(client)` and the
+`human_review_purpose` from `/api/app`. See
+[In an Agent's own app](human-review.md#in-an-agents-own-app).
 
 ## Bring your own UI
 

@@ -3,7 +3,7 @@
  * or waiting keep their queries polling; finished ones don't.
  */
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useRef } from "react"
 import { ApiClientError } from "@/lib/api"
 import { activityPollInterval } from "@/lib/polling"
 import {
@@ -18,12 +18,15 @@ import {
   loadEventHistory,
   loadEventTail,
 } from "../api/paging"
-import type { InboxQuery, Session, SessionOverview, SessionTranscriptPage } from "../api/types"
+import type { Session, SessionOverview, SessionTranscriptPage } from "../api/types"
 import { isLive as isLiveRun } from "./eval-model"
 import { useApi, useServices } from "./services"
 import { loadSessionList } from "./session-list-loader"
 import { isActive } from "./session-model"
 import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
+
+// Shared with the parts in src/parts, which apps import.
+export { useInbox, useInboxCounts } from "../../parts/inbox/queries"
 
 const ACTIVE_POLL_MS = 1500
 
@@ -149,103 +152,6 @@ export function useEvents(id: string, enabled: boolean, active = false) {
   return query
 }
 
-export function useInbox(query: InboxQuery = {}, poll = true) {
-  const api = useApi()
-  const client = useQueryClient()
-  const key = useMemo(
-    () => [
-      "inbox",
-      {
-        session_id: query.session_id,
-        agent_name: query.agent_name,
-        q: query.q,
-        kind: query.kind,
-        limit: query.limit,
-      },
-    ],
-    [query.session_id, query.agent_name, query.q, query.kind, query.limit],
-  )
-  const identity = JSON.stringify(key)
-  const [position, setPosition] = useState({
-    identity,
-    cursor: null as string | null,
-    visited: [] as string[],
-    number: 1,
-  })
-  const current =
-    position.identity === identity ? position : { identity, cursor: null, visited: [], number: 1 }
-  const result = useQuery({
-    queryKey: [...key, current.cursor],
-    queryFn: ({ signal }) => api.inbox({ limit: 50, ...query, cursor: current.cursor }, signal),
-    retry: false,
-    refetchInterval: poll && current.cursor === null ? 5000 : false,
-    refetchOnWindowFocus: false,
-    refetchOnReconnect: false,
-  })
-  const page = result.data
-  const next = page?.next_cursor
-  const cycleError =
-    next && current.visited.includes(next)
-      ? new Error("The Inbox source did not advance. Refresh the list.")
-      : null
-  const advance = () => {
-    if (next && !cycleError && !result.isFetching)
-      setPosition({
-        identity,
-        cursor: next,
-        visited: [...current.visited, next],
-        number: current.number + 1,
-      })
-  }
-  useEffect(() => {
-    if (
-      next &&
-      page.items.length === 0 &&
-      !page.issues?.length &&
-      current.number % 25 !== 0 &&
-      !result.isFetching &&
-      !result.error &&
-      !cycleError
-    )
-      setPosition({
-        identity,
-        cursor: next,
-        visited: [...current.visited, next],
-        number: current.number + 1,
-      })
-  }, [next, page, current, identity, result.isFetching, result.error, cycleError])
-  const restarted = useRef<string | null>(null)
-  useEffect(() => {
-    if (
-      result.error instanceof ApiClientError &&
-      result.error.status === 422 &&
-      current.cursor &&
-      restarted.current !== identity
-    ) {
-      restarted.current = identity
-      setPosition({ identity, cursor: null, visited: [], number: 1 })
-      void client.resetQueries({ queryKey: [...key, null], exact: true })
-    }
-  }, [result.error, current.cursor, identity, client, key])
-  const refresh = async () => {
-    await client.cancelQueries({ queryKey: key })
-    setPosition({ identity, cursor: null, visited: [], number: 1 })
-    await client.resetQueries({ queryKey: [...key, null], exact: true })
-  }
-  return {
-    ...result,
-    refetch: refresh,
-    fetchNextPage: advance,
-    isFetchingNextPage: result.isFetching,
-    historical: current.cursor !== null,
-    error: result.error ?? cycleError,
-    isError: result.isError || !!cycleError,
-    isSuccess: result.isSuccess && !cycleError,
-    hasNextPage: !!next && !cycleError,
-    data: page ? { ...page, issues: page.issues ?? [] } : undefined,
-  }
-}
-
 export function useTaskTypes() {
   const api = useApi()
   return useQuery({ queryKey: ["task-types"], queryFn: () => api.taskTypes() })
@@ -345,18 +251,6 @@ export function useEvalRun(id: string, compareWith?: string) {
 export function useEvalSettings() {
   const api = useApi()
   return useQuery({ queryKey: ["evals", "settings"], queryFn: () => api.evalSettings() })
-}
-
-/** Exact counts are separate from list pagination and may deliberately be unavailable. */
-export function useInboxCounts(query: Pick<InboxQuery, "session_id" | "agent_name" | "q"> = {}) {
-  const api = useApi()
-  const { prototype, inboxEnabled } = useServices()
-  return useQuery({
-    enabled: !!prototype || inboxEnabled === true,
-    queryKey: ["inbox-counts", query],
-    queryFn: () => api.inboxCounts(query),
-    refetchInterval: 30000,
-  })
 }
 
 /** Home lists use the server's bounded filtered pages; their lengths are never totals. */
