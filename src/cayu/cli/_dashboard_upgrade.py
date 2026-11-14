@@ -144,6 +144,7 @@ def plan_dashboard_upgrade(
     from_version: str,
     to_version: str,
     sidecars: Mapping[str, Iterable[str]] | None = None,
+    case_aliases: Mapping[str, str] | None = None,
 ) -> DashboardUpgradePlan:
     """Decide what an upgrade does with each file, without touching the filesystem.
 
@@ -152,10 +153,14 @@ def plan_dashboard_upgrade(
     and ``project`` maps a path to the sha256 of the project's file, or None when it has
     none. A path missing from ``project`` counts as absent. ``sidecars`` maps a path to the
     sidecars of it the project still has (see :func:`find_sidecars`), from any release: an
-    edited file stays a pending merge while one is there.
+    edited file stays a pending merge while one is there. ``case_aliases`` maps a path to
+    the path, different only in case, whose file answers to it (see
+    :func:`find_case_aliases`); ``project`` has None for such a path. While the project
+    keeps that file, the release's file can't be added without replacing it.
     """
 
     existing_sidecars = {} if sidecars is None else sidecars
+    aliases = {} if case_aliases is None else case_aliases
 
     steps: list[DashboardUpgradeStep] = []
     unchanged: list[str] = []
@@ -169,7 +174,9 @@ def plan_dashboard_upgrade(
         generated = _is_generated(path)
         sidecar = None
         pending: tuple[str, ...] = ()
-        if generated or current == old:
+        alias = aliases.get(path)
+        alias_is_kept = alias is not None and project.get(alias) != ejected.get(alias)
+        if generated or (not alias_is_kept and current == old):
             if new is None:
                 action = UpgradeAction.REMOVE
             elif current is None:
@@ -229,6 +236,29 @@ def find_sidecars(root: Path, paths: Iterable[str]) -> dict[str, tuple[str, ...]
     return found
 
 
+def find_case_aliases(root: Path, paths: Iterable[str]) -> dict[str, str]:
+    """Paths whose file under ``root`` is really another of ``paths``, named in other case.
+
+    On a filesystem that folds case, a release that renames ``Foo.tsx`` to ``foo.tsx``
+    finds the old file under the new name. Maps each such path to the path the file is
+    stored as. Empty where names that differ only in case are different files.
+    """
+
+    by_folded: dict[str, list[str]] = {}
+    for path in paths:
+        by_folded.setdefault(path.casefold(), []).append(path)
+    listings: dict[Path, frozenset[str]] = {}
+    aliases: dict[str, str] = {}
+    for group in by_folded.values():
+        if len(group) == 1:
+            continue
+        stored = [path for path in group if _is_stored_as(root, path, listings)]
+        for path in group:
+            if path not in stored and stored and _inspect_project_path(root, path) is not None:
+                aliases[path] = stored[0]
+    return aliases
+
+
 def read_project_digests(root: Path, paths: Iterable[str]) -> dict[str, str | None]:
     """The sha256 of each project file at ``paths`` under ``root``, or None when absent.
 
@@ -257,19 +287,33 @@ def apply_dashboard_upgrade(
         _inspect_project_path(root, step.path)
         if step.sidecar is not None:
             _inspect_project_path(root, step.sidecar)
-    write_manifest = False
+    # Where case is folded, a file renamed only in case is one file under both names:
+    # the old name goes first, or its removal would take the file just written.
+    written = {
+        step.path.casefold()
+        for step in plan.steps
+        if step.action in (UpgradeAction.ADD, UpgradeAction.REPLACE)
+    }
     removals: list[str] = []
+    for step in plan.steps:
+        if step.action is UpgradeAction.REMOVE:
+            if step.path.casefold() in written:
+                _remove_project_file(root, step.path)
+            else:
+                removals.append(step.path)
+    write_manifest = False
     for step in plan.steps:
         if step.path == BUNDLE_MANIFEST_NAME:
             write_manifest = True
         elif step.action in (UpgradeAction.ADD, UpgradeAction.REPLACE):
             _write_project_file(root, step.path, release[step.path])
-        elif step.action is UpgradeAction.MERGE and step.sidecar is not None:
+        elif (
+            step.action is UpgradeAction.MERGE
+            and step.sidecar is not None
             # An existing sidecar is this release's version, perhaps being merged: keep it.
-            if _inspect_project_path(root, step.sidecar) is None:
-                _write_project_file(root, step.sidecar, release[step.path])
-        elif step.action is UpgradeAction.REMOVE:
-            removals.append(step.path)
+            and _inspect_project_path(root, step.sidecar) is None
+        ):
+            _write_project_file(root, step.sidecar, release[step.path])
     for path in removals:
         _remove_project_file(root, path)
     if write_manifest:
@@ -316,7 +360,9 @@ def upgrade_dashboard_source(
         )
     ejected_files = {item.path: item.sha256 for item in ejected.files}
     paths = sorted(set(ejected_files) | set(release.contents))
-    project = read_project_digests(root, paths)
+    case_aliases = find_case_aliases(root, paths)
+    # A file stored under another path's name is that path's file, not this one's.
+    project = read_project_digests(root, paths) | dict.fromkeys(case_aliases)
     plan = plan_dashboard_upgrade(
         ejected_files,
         release.contents,
@@ -324,6 +370,7 @@ def upgrade_dashboard_source(
         from_version=from_version,
         to_version=to_version,
         sidecars=find_sidecars(root, paths),
+        case_aliases=case_aliases,
     )
     if not dry_run:
         apply_dashboard_upgrade(root, plan, release.contents)
@@ -576,6 +623,22 @@ def _inspect_project_path(root: Path, path: str) -> Path | None:
         if not last and not stat.S_ISDIR(identity.st_mode):
             raise DashboardSourceError(f"{relative} in {root} is not a folder")
     return current
+
+
+def _is_stored_as(root: Path, path: str, listings: dict[Path, frozenset[str]]) -> bool:
+    """Whether every part of ``path`` is a name its folder lists, in this very case."""
+
+    current = root
+    for part in PurePosixPath(path).parts:
+        if current not in listings:
+            try:
+                listings[current] = frozenset(os.listdir(current))
+            except OSError:
+                listings[current] = frozenset()
+        if part not in listings[current]:
+            return False
+        current = current / part
+    return True
 
 
 def _regular_file_names(root: Path, parts: tuple[str, ...]) -> tuple[str, ...]:

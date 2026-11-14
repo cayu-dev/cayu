@@ -22,6 +22,7 @@ from cayu.cli._dashboard_upgrade import (
     dashboard_source_findings,
     find_sidecars,
     plan_dashboard_upgrade,
+    upgrade_dashboard_source,
 )
 from cayu.cli.dashboard import ValidatedDashboardSource, load_dashboard_source
 
@@ -486,3 +487,73 @@ def test_cayu_check_reports_a_stale_ejected_dashboard(
     ]
     assert finding["severity"] == "warning"
     assert "cayu dashboard upgrade dashboard" in finding["hint"]
+
+
+def _folds_case(directory: Path) -> bool:
+    """Whether names that differ only in case are one file in ``directory``."""
+    (directory / "Probe").write_bytes(b"")
+    try:
+        return (directory / "probe").exists()
+    finally:
+        (directory / "Probe").unlink()
+
+
+RENAMED_FROM = "src/Main.tsx"
+
+
+@pytest.mark.parametrize("change", ["same", "changed", "edited"])
+def test_a_file_renamed_only_in_case_is_not_lost(
+    tmp_path: Path, release: ValidatedDashboardSource, change: str
+) -> None:
+    if not _folds_case(tmp_path):
+        pytest.skip("needs a filesystem where names that differ only in case are one file")
+    new = release.contents[UNEDITED_CHANGED]
+    old = _release_files(release)
+    del old[UNEDITED_CHANGED]
+    old[RENAMED_FROM] = new if change == "same" else b"old main\n"
+    edits: dict[str, bytes | None] = {RENAMED_FROM: b"my main\n"} if change == "edited" else {}
+    root = _project(tmp_path, release, old=old, edits=edits)
+
+    for _ in range(2):  # A second run finds nothing more to do and loses nothing either.
+        upgrade_dashboard_source(root)
+        names = sorted(path.name for path in (root / "src").iterdir())
+        if change == "edited":
+            # The edited file stays as it is; the release's version waits beside it.
+            assert (root / RENAMED_FROM).read_bytes() == b"my main\n"
+            assert "Main.tsx" in names and f"main.tsx{SIDECAR_SUFFIX}" in names
+            assert (root / f"{UNEDITED_CHANGED}{SIDECAR_SUFFIX}").read_bytes() == new
+        else:
+            assert (root / UNEDITED_CHANGED).read_bytes() == new
+            assert "main.tsx" in names and "Main.tsx" not in names
+
+
+def test_plan_keeps_an_edited_file_whose_release_name_differs_only_in_case() -> None:
+    def plan(
+        project_file: bytes, was: str = "Foo.ts", now: str = "foo.ts"
+    ) -> list[tuple[str, UpgradeAction, str | None]]:
+        made = plan_dashboard_upgrade(
+            {was: _sha(b"old")},
+            {now: b"new"},
+            {was: _sha(project_file), now: None},
+            from_version="1.0.0",
+            to_version="1.1.0",
+            case_aliases={now: was},
+        )
+        return [(step.path, step.action, step.sidecar) for step in made.steps]
+
+    # Unedited, the old name goes and the new one is written.
+    assert plan(b"old") == [
+        ("Foo.ts", UpgradeAction.REMOVE, None),
+        ("foo.ts", UpgradeAction.ADD, None),
+    ]
+    # Edited, the file stays and the release's version goes beside it, not over it.
+    assert plan(b"mine") == [
+        ("Foo.ts", UpgradeAction.KEEP_REMOVED, None),
+        ("foo.ts", UpgradeAction.MERGE, "foo.ts.cayu-1.1.0"),
+    ]
+    # A generated file takes the release's version even when edited, under the new name.
+    was, now = "src/lib/generated/Api.ts", "src/lib/generated/api.ts"
+    assert plan(b"mine", was, now) == [
+        (was, UpgradeAction.REMOVE, None),
+        (now, UpgradeAction.ADD, None),
+    ]
