@@ -103,16 +103,17 @@ def test_trace_transcript_read_reconciles_only_actual_incarnation_loss(tmp_path,
         events = [event async for event in app.run(_request())]
         assert events[-1].type == "session.completed"
         entered, release = asyncio.Event(), asyncio.Event()
-        original = store.query_transcript
+        # The trace's transcript read: the tool call parts of its turns.
+        original = store.query_transcript_tool_calls
 
-        async def blocked(query):
+        async def blocked(session_id, interaction_ids):
             entered.set()
             await release.wait()
             if change == "unrelated":
                 raise KeyError("private-unrelated-store-canary")
-            return await original(query)
+            return await original(session_id, interaction_ids)
 
-        store.query_transcript = blocked
+        store.query_transcript_tool_calls = blocked
         server = create_server(app, config=ServerConfig.local_development())
         try:
             async with httpx.AsyncClient(
@@ -137,7 +138,7 @@ def test_trace_transcript_read_reconciles_only_actual_incarnation_loss(tmp_path,
                 )
                 assert "spans" not in response.text
                 assert "private-unrelated-store-canary" not in response.text
-                store.query_transcript = original
+                store.query_transcript_tool_calls = original
                 fresh = await client.get("/api/sessions/boundary/trace")
                 assert fresh.status_code == (404 if change == "delete" else 200)
         finally:

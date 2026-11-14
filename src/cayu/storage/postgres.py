@@ -78,6 +78,7 @@ from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
 from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
+from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
     PostgresEventWatcherStore as PostgresEventWatcherStore,
@@ -101,6 +102,7 @@ if TYPE_CHECKING:
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.trace_events import TraceEvent, TranscriptToolCall
     from cayu.storage._stored_event_verification import StoredEventVerificationPage
     from cayu.storage.retention import (
         RetentionAuditEntry,
@@ -453,7 +455,7 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = ARTIFACT_INDEX_REVISION
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = max(ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION)
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -6226,6 +6228,9 @@ class PostgresSessionStore(
     async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
         return await session_queries.query_event_heads(self._ready_connection, query)
 
+    async def query_trace_events(self, query: EventQuery) -> list[TraceEvent]:
+        return await session_queries.query_trace_events(self._ready_connection, query)
+
     async def verify_stored_events(
         self, *, after_sequence: int = 0, limit: int = 1000
     ) -> StoredEventVerificationPage:
@@ -7850,6 +7855,13 @@ class PostgresSessionStore(
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         return await transcript_ops.query_transcript(
             self._ready_connection, query, load_session=self._load
+        )
+
+    async def query_transcript_tool_calls(
+        self, session_id: str, interaction_ids: Sequence[str]
+    ) -> list[TranscriptToolCall]:
+        return await transcript_ops.query_transcript_tool_calls(
+            self._ready_connection, session_id, interaction_ids, load_session=self._load
         )
 
     async def search_transcript(

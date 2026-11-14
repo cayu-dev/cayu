@@ -38,6 +38,8 @@ export function useTraceHistory(sessionId: string, enabled: boolean, expectedIns
         {
           after_sequence: owner.page ? owner.live : 0,
           limit: 1000,
+          // Spans and their event IDs only; the selected span loads its events.
+          include_events: false,
           session_instance_id: owner.page?.session_instance_id ?? expectedInstanceId,
         },
         signal,
@@ -63,6 +65,7 @@ export function useTraceHistory(sessionId: string, enabled: boolean, expectedIns
               through_sequence: incoming.through_sequence,
               session_instance_id: owner.page.session_instance_id,
               limit: 1000,
+              include_events: false,
             },
             signal,
           )
@@ -91,6 +94,8 @@ export function useTraceHistory(sessionId: string, enabled: boolean, expectedIns
           through_sequence: owner.through,
           session_instance_id: owner.page.session_instance_id,
           limit: 1000,
+          // Spans and their event IDs only; the selected span loads its events.
+          include_events: false,
         },
         controller.signal,
       )

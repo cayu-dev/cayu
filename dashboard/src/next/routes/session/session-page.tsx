@@ -1050,6 +1050,7 @@ export function SessionPage({
                   ))}
                 <div ref={conversationAnchorRef}>
                   <Conversation
+                    sessionId={sessionId}
                     position={transcriptPosition}
                     blocks={filters.role === "system" || filters.role === "tool" ? [] : blocks}
                     displays={displays}

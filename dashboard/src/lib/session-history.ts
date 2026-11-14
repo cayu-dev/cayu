@@ -567,6 +567,12 @@ export type SessionProgress = {
   afterSequence: number
   throughSequence: number
   terminalDrain: boolean
+  /**
+   * The distinct types of the events this read found after `afterSequence`, so a
+   * listener refreshes only the views they change. Absent on the first read, which
+   * reports where the session stands rather than what arrived.
+   */
+  eventTypes?: string[]
 }
 
 /** Shared sequence follower; visible windows and their pin state remain caller-owned. */
@@ -587,7 +593,11 @@ export async function followSessionProgress({
       wait_seconds?: number
     },
     signal: AbortSignal,
-  ) => Promise<EventScanPage & { has_more: boolean }>
+  ) => Promise<{
+    events: readonly { sequence: number; type: string }[]
+    scan_through_sequence: number | null
+    has_more: boolean
+  }>
   onProgress: (progress: SessionProgress) => Promise<void>
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
 }): Promise<void> {
@@ -616,7 +626,12 @@ export async function followSessionProgress({
       const more = !initial && page.has_more
       const terminalDrain = !running && (initial || wasActive) && !more
       if (initial || cursor > previous || terminalDrain) {
-        await onProgress({ afterSequence: previous, throughSequence: cursor, terminalDrain })
+        await onProgress({
+          afterSequence: previous,
+          throughSequence: cursor,
+          terminalDrain,
+          ...(initial ? {} : { eventTypes: [...new Set(page.events.map((event) => event.type))] }),
+        })
         if (signal.aborted) return
       }
       // A terminal transition must survive a multi-page backlog until its final read.

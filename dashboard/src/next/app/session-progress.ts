@@ -42,7 +42,11 @@ export function useSessionProgress({
     void followSessionProgress({
       signal: controller.signal,
       active: () => active || mutationActive,
-      read: (query, signal) => api.events(sessionId, query, signal),
+      // Heads carry what the follower needs, sequence and type, without payloads.
+      read: (query, signal) =>
+        api.eventHeads
+          ? api.eventHeads(sessionId, query, signal)
+          : api.events(sessionId, query, signal),
       onProgress: async (progress) => {
         if (!controller.signal.aborted) await callback.current(progress)
       },

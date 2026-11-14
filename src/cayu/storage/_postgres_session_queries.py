@@ -105,6 +105,7 @@ from cayu.sessions.topology import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+from cayu.sessions.trace_events import TraceEvent, stored_trace_event, trace_events_of
 from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_stored_events as pg_stored_events
@@ -522,6 +523,55 @@ async def query_event_heads(connect: PostgresConnection, query: EventQuery) -> l
             params,
         )
         return [stored_event_head(*row) for row in await cur.fetchall()]
+
+
+@runtime_session_query
+async def query_trace_events(connect: PostgresConnection, query: EventQuery) -> list[TraceEvent]:
+    query = copy_event_query(query)
+    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+        return trace_events_of(await query_events(connect, query))
+    async with connect() as conn, conn.cursor() as cur:
+        plan, params = await _event_query_plan(cur, query, visible_sequence=None)
+        # The timestamp comes from the stored event, as Event reads it.
+        await cur.execute(
+            cast(
+                "LiteralString",
+                f"""
+                SELECT cayu_events.sequence,
+                       cayu_events.session_id,
+                       cayu_events.event_id,
+                       cayu_events.event_type,
+                       cayu_events.event ->> 'timestamp',
+                       cayu_events.interaction_id,
+                       cayu_events.agent_name,
+                       cayu_events.environment_name,
+                       cayu_events.workflow_name,
+                       cayu_events.tool_name,
+                       trace.payload_bytes,
+                       trace.payload
+                FROM cayu_events
+                JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                JOIN cayu_trace_events AS trace ON trace.sequence = cayu_events.sequence
+                {plan.where_sql}
+                ORDER BY cayu_events.sequence {plan.order_direction}
+                LIMIT %s
+                """,
+            ),
+            params,
+        )
+        return [
+            stored_trace_event(
+                stored_event_head(*row[:5]),
+                interaction_id=row[5],
+                agent_name=row[6],
+                environment_name=row[7],
+                workflow_name=row[8],
+                tool_name=row[9],
+                payload_bytes=row[10],
+                payload=row[11],
+            )
+            for row in await cur.fetchall()
+        ]
 
 
 @runtime_session_query

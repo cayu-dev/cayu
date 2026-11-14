@@ -233,6 +233,16 @@ from cayu.server._session_call_routes import (
     register_session_call_routes,
     register_session_rollup_route,
 )
+from cayu.server._session_events import (
+    REPLAY_ACTIVE_SESSION_STATUSES as _REPLAY_ACTIVE_SESSION_STATUSES,
+)
+from cayu.server._session_events import (
+    REPLAY_POLL_INTERVAL_MIN_S as _REPLAY_POLL_INTERVAL_MIN_S,
+)
+from cayu.server._session_events import (
+    next_replay_poll_interval as _next_replay_poll_interval,
+)
+from cayu.server._session_events import register_session_events
 from cayu.server._session_overview import (
     SessionOverviewService,
     overview_http_error,
@@ -248,6 +258,11 @@ from cayu.server._task_controls_routes import register_task_controls_routes
 from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
 from cayu.server._task_index import TaskValueFilters, read_task_index, read_tasks_by_ids
 from cayu.server._task_latest_routes import register_task_latest_route
+from cayu.server._transcript_parts import (
+    MIN_PART_BYTES,
+    register_transcript_message,
+    truncate_message_parts,
+)
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -278,7 +293,6 @@ from cayu.server.contracts import (
     PENDING_ACTION_ENDPOINT_RESPONSES,
     RUN_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
-    SESSION_EVENTS_MAX_WAIT_SECONDS,
     SESSION_FOLLOW_ENDPOINT_RESPONSES,
     SESSION_FOLLOW_PATH,
     SESSION_FOLLOW_RETRY_AFTER_SECONDS,
@@ -309,7 +323,6 @@ from cayu.server.contracts import (
     EnvironmentsResponse,
     HealthResponse,
     KnowledgeReviewDecisionRequest,
-    ListSessionEventsResponse,
     ListSessionInteractionsResponse,
     ListSessionsResponse,
     OperationalSnapshotRequest,
@@ -1167,7 +1180,6 @@ _SUPERVISION_INBOX_KINDS: dict[SupervisionEventKind, InboxItemKind] = {
     SupervisionEventKind.ANSWER: "question",
     SupervisionEventKind.RECOVER: "recovery",
 }
-_EVENT_PAGE_LIMIT_MAX = 1000
 # Marks a pending-actions cursor sealed to a caller an inbox access rule limits.
 # Plain session cursors are base64 JSON, so they never start with it.
 _SEALED_CURSOR_PREFIX = "sealed_"
@@ -1192,11 +1204,6 @@ _SERVER_INTERRUPTIBLE_SESSION_STATUSES = {
     SessionStatus.INTERRUPTING,
     SessionStatus.INTERRUPTED,
 }
-_REPLAY_ACTIVE_SESSION_STATUSES = {
-    SessionStatus.PENDING,
-    SessionStatus.RUNNING,
-    SessionStatus.INTERRUPTING,
-}
 _REPLAY_TERMINAL_EVENT_BY_STATUS = {
     SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
     SessionStatus.FAILED: EventType.SESSION_FAILED,
@@ -1220,16 +1227,6 @@ _REPLAY_OPERATION_START_EVENT_TYPES = {
     EventType.ENVIRONMENT_FACTORY_STARTED,
     EventType.ENVIRONMENT_BINDING_STARTED,
 }
-# Replays check quickly after reconnect, then back off while a live session is
-# quiet so idle streams do not continuously hammer the durable stores.
-_REPLAY_POLL_INTERVAL_MIN_S = 0.05
-_REPLAY_POLL_INTERVAL_MAX_S = 1.0
-
-
-def _next_replay_poll_interval(current: float, *, received_events: bool) -> float:
-    if received_events:
-        return _REPLAY_POLL_INTERVAL_MIN_S
-    return min(current * 2, _REPLAY_POLL_INTERVAL_MAX_S)
 
 
 def _replay_terminal_boundary_id(event: Event) -> str | None:
@@ -8844,225 +8841,29 @@ def create_router(
             project_event=lambda record: _serialize_event_record(cayu_app, record),
             project_part=lambda part: _serialize_message_part(cayu_app, part),
             project_session=cayu_app.project_session_id_for_exposure,
+            # The tool name the event projection gives every public event.
+            project_tool_name=cayu_app._secret_redactor.redact_text,
         ),
     )
 
-    @router.get(
-        "/sessions/{session_id}/events",
-        response_model=ListSessionEventsResponse,
-        dependencies=protected,
+    register_transcript_message(
+        router,
+        protected=protected,
+        store=session_store,
+        resolve_session=_resolve_public_session_id,
+        serialize_message=partial(_serialize_transcript_message, cayu_app),
     )
-    async def list_session_events(
-        session_id: NonBlankString,
-        http_request: Request,
-        event_id: str | None = Query(
-            default=None,
-            description="Return the event with this exact session-scoped event ID, if it exists.",
-        ),
-        event_type: str | None = None,
-        interaction_id: str | None = Query(
-            default=None,
-            description="Return only events attributed to this interaction.",
-        ),
-        exclude_event_type: str | None = Query(
-            default=None,
-            description="Exclude one event type before applying pagination.",
-        ),
-        tool_name: str | None = None,
-        agent_name: str | None = None,
-        environment_name: str | None = None,
-        workflow_name: str | None = None,
-        after_sequence: int | None = Query(
-            default=None,
-            ge=0,
-            description="Return only events with a greater durable sequence.",
-        ),
-        before_sequence: int | None = Query(
-            default=None,
-            ge=1,
-            description="Return only events with a smaller durable sequence.",
-        ),
-        order_by: Annotated[
-            EventOrder,
-            Query(description="Return events in durable sequence order."),
-        ] = EventOrder.SEQUENCE_ASC,
-        limit: int = Query(default=100, ge=1, le=_EVENT_PAGE_LIMIT_MAX),
-        wait_seconds: float | None = Query(
-            default=None,
-            ge=0,
-            le=SESSION_EVENTS_MAX_WAIT_SECONDS,
-            description=(
-                "Long-poll fallback for clients that cannot hold the follow stream "
-                "open. Wait up to this many seconds for a matching event after "
-                "`after_sequence` while the session is pending, running, or "
-                "interrupting, then return the page (possibly empty)."
-            ),
-        ),
-    ):
-        if wait_seconds and (
-            before_sequence is not None
-            or event_id is not None
-            or order_by != EventOrder.SEQUENCE_ASC
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "wait_seconds only applies to ascending tail reads without "
-                    "before_sequence or event_id."
-                ),
-            )
-        session_id = await _resolve_public_session_id(session_id)
-        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
-        state = await session_store.load_state(session_id)
-        if state is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        if interaction_id is not None:
-            interaction_id = await _resolve_public_interaction_id(
-                session_id=session_id,
-                value=interaction_id,
-            )
-
-        private_event_id = event_id
-        unresolved_public_event_id = False
-        if event_id is not None:
-            resolved_record, handled = await _public_or_legacy_event_record(
-                session_id,
-                event_id,
-            )
-            if handled:
-                if resolved_record is None:
-                    private_event_id = None
-                    unresolved_public_event_id = True
-                else:
-                    private_event_id = resolved_record.event.id
-
-        has_event_filters = any(
-            value is not None
-            for value in (
-                event_id,
-                event_type,
-                interaction_id,
-                exclude_event_type,
-                tool_name,
-                agent_name,
-                environment_name,
-                workflow_name,
-            )
-        )
-        try:
-            query = EventQuery(
-                session_id=session_id,
-                event_id=private_event_id,
-                event_type=event_type,
-                interaction_id=interaction_id,
-                exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
-                tool_name=tool_name,
-                agent_name=agent_name,
-                environment_name=environment_name,
-                workflow_name=workflow_name,
-                after_sequence=after_sequence,
-                before_sequence=before_sequence,
-                limit=limit + 1,
-                order_by=order_by,
-            )
-        except ValidationError as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=exc.errors(include_context=False, include_url=False),
-            ) from exc
-
-        if not wait_seconds:
-            return await _read_session_events_page(
-                session_id=session_id,
-                public_session_id=public_session_id,
-                query=query,
-                limit=limit,
-                has_event_filters=has_event_filters,
-                unresolved_public_event_id=unresolved_public_event_id,
-            )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + wait_seconds
-        poll_interval = _REPLAY_POLL_INTERVAL_MIN_S
-        while True:
-            result = await _read_session_events_page(
-                session_id=session_id,
-                public_session_id=public_session_id,
-                query=query,
-                limit=limit,
-                has_event_filters=has_event_filters,
-                unresolved_public_event_id=unresolved_public_event_id,
-            )
-            remaining = deadline - loop.time()
-            if result["events"] or remaining <= 0:
-                return result
-            current = await session_store.load_state(session_id)
-            if current is None or current.status not in _REPLAY_ACTIVE_SESSION_STATUSES:
-                return result
-            if await http_request.is_disconnected():
-                return result
-            # Same backoff as the follow stream: quick first checks, then at
-            # most one store read per second while the session is quiet.
-            await asyncio.sleep(min(poll_interval, remaining))
-            poll_interval = _next_replay_poll_interval(poll_interval, received_events=False)
-
-    async def _read_session_events_page(
-        *,
-        session_id: str,
-        public_session_id: str,
-        query: EventQuery,
-        limit: int,
-        has_event_filters: bool,
-        unresolved_public_event_id: bool,
-    ) -> dict[str, Any]:
-        after_sequence = query.after_sequence
-        before_sequence = query.before_sequence
-        order_by = query.order_by
-        raw_scan_sequence: int | None = None
-        if before_sequence is None and has_event_filters:
-            # Capture the raw high-water mark before the filtered read. Advancing
-            # through a sequence observed after that read could skip a matching
-            # event committed between the two queries.
-            latest_records = await session_store.query_events(
-                EventQuery(
-                    session_id=session_id,
-                    after_sequence=after_sequence,
-                    order_by=EventOrder.SEQUENCE_DESC,
-                    limit=1,
-                )
-            )
-            if latest_records:
-                raw_scan_sequence = latest_records[0].sequence
-
-        records = [] if unresolved_public_event_id else await session_store.query_events(query)
-        page = records[:limit]
-        has_more = len(records) > limit
-        cursor = after_sequence if order_by == EventOrder.SEQUENCE_ASC else before_sequence
-        next_sequence = page[-1].sequence if page else cursor
-
-        scan_through_sequence: int | None = None
-        if before_sequence is None:
-            scan_candidates = [sequence for sequence in (after_sequence,) if sequence is not None]
-            if order_by == EventOrder.SEQUENCE_ASC and has_more:
-                # A matching event remains beyond this response, so the tail
-                # cursor must stop at the last event actually returned.
-                if page:
-                    scan_candidates.append(page[-1].sequence)
-            else:
-                scan_candidates.extend(record.sequence for record in page)
-                if raw_scan_sequence is not None:
-                    scan_candidates.append(raw_scan_sequence)
-            if scan_candidates:
-                scan_through_sequence = max(scan_candidates)
-
-        return {
-            "session_id": public_session_id,
-            "events": [_serialize_event_record(cayu_app, record) for record in page],
-            "order_by": order_by,
-            "next_sequence": next_sequence,
-            "scan_through_sequence": scan_through_sequence,
-            "has_more": has_more,
-        }
+    register_session_events(
+        router,
+        protected=protected,
+        store=session_store,
+        serialize_event=partial(_serialize_event_record, cayu_app),
+        project_session=cayu_app.project_session_id_for_exposure,
+        project_head=cayu_app._project_persisted_event_head_for_exposure,
+        resolve_session=_resolve_public_session_id,
+        resolve_interaction=_resolve_public_interaction_id,
+        resolve_event_record=_public_or_legacy_event_record,
+    )
 
     @router.get(
         SESSION_FOLLOW_PATH,
@@ -9222,6 +9023,16 @@ def create_router(
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
         include_thinking: bool = Query(default=True),
+        max_part_bytes: int | None = Query(
+            default=None,
+            ge=MIN_PART_BYTES,
+            description=(
+                "Cut longer text and tool-result content to this many UTF-8 bytes and leave "
+                "out longer tool-result `structured` data and `artifacts`, marking each such "
+                "part `truncated` with its `full_bytes`. Read the whole message from "
+                "`GET /sessions/{session_id}/transcript/{message_index}`."
+            ),
+        ),
     ):
         session_id = await _resolve_public_session_id(session_id)
         public_session_id = cayu_app.project_session_id_for_exposure(session_id)
@@ -9251,18 +9062,17 @@ def create_router(
         consumed = min(limit, max(0, transcript_page.total_records - offset))
         next_offset = offset + consumed
 
+        messages = [
+            _serialize_transcript_message(
+                cayu_app, session_id, record.index, record.message, record.interaction_id
+            )
+            for record in transcript_page.records
+        ]
+        if max_part_bytes is not None:
+            messages = [truncate_message_parts(item, max_part_bytes) for item in messages]
         return {
             "session_id": public_session_id,
-            "messages": [
-                _serialize_transcript_message(
-                    cayu_app,
-                    session_id,
-                    record.index,
-                    record.message,
-                    record.interaction_id,
-                )
-                for record in transcript_page.records
-            ],
+            "messages": messages,
             "offset": offset,
             "next_offset": next_offset,
             "has_more": next_offset < transcript_page.total_records,

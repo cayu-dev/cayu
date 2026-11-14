@@ -96,6 +96,7 @@ from cayu.sessions.topology import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+from cayu.sessions.trace_events import TraceEvent, stored_trace_event, trace_events_of
 from cayu.sessions.usage import UsageRollupQuery, copy_usage_rollup_query
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
@@ -458,6 +459,53 @@ async def query_event_heads(run_read: SQLiteOperationRunner, query: EventQuery) 
             params,
         ).fetchall()
         return [stored_event_head(*row) for row in rows]
+
+    return await run_read(run_query)
+
+
+@runtime_session_query
+async def query_trace_events(
+    run_read: SQLiteOperationRunner, query: EventQuery
+) -> list[TraceEvent]:
+    query = copy_event_query(query)
+    if len(query.session_ids) > _EVENT_QUERY_SESSION_IDS_BATCH_SIZE:
+        return trace_events_of(await query_events(run_read, query))
+    plan = session_store_sql.build_event_query_sql(query, dialect=SQL_DIALECT)
+    params = [*plan.params, query.limit]
+    source = _event_query_source(query)
+
+    def run_query(connection: sqlite3.Connection) -> list[TraceEvent]:
+        # Every cayu_events column read here sits before payload_json, so no
+        # row's payload overflow pages are read.
+        rows = connection.execute(
+            f"""
+            SELECT cayu_events.sequence, cayu_events.session_id, cayu_events.event_id,
+                   cayu_events.event_type, cayu_events.timestamp,
+                   cayu_events.interaction_id, cayu_events.agent_name,
+                   cayu_events.environment_name, cayu_events.workflow_name,
+                   cayu_events.tool_name, trace.payload_bytes, trace.payload_json
+            FROM {source}
+            JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+            JOIN cayu_trace_events AS trace ON trace.sequence = cayu_events.sequence
+            {plan.where_sql}
+            ORDER BY cayu_events.sequence {plan.order_direction}
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [
+            stored_trace_event(
+                stored_event_head(*row[:5]),
+                interaction_id=row[5],
+                agent_name=row[6],
+                environment_name=row[7],
+                workflow_name=row[8],
+                tool_name=row[9],
+                payload_bytes=row[10],
+                payload=row[11],
+            )
+            for row in rows
+        ]
 
     return await run_read(run_query)
 

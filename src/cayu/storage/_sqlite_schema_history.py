@@ -51,6 +51,7 @@ from cayu.storage._task_index_schema import (
 )
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
+from cayu.storage._trace_event_schema import SQLITE_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import SQLITE_USAGE_EVENTS_DDL
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
@@ -813,6 +814,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     TASK_INDEX_REVISION: SQLITE_TASK_INDEX_DDL,
     # Artifact lists and counts read an index the artifact store commit hook writes.
     ARTIFACT_INDEX_REVISION: SQLITE_ARTIFACT_INDEX_DDL,
+    # The session trace reads a narrow trigger-maintained copy of each event.
+    TRACE_EVENTS_REVISION: SQLITE_TRACE_EVENTS_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

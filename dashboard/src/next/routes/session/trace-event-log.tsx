@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { type ReactNode, useState } from "react"
+import type { SessionEventHead, SessionEventHeadsPage, SessionEventsPage } from "@/lib/api"
 import {
   eventHistoryFilters,
   eventHistoryQuery,
@@ -63,18 +64,19 @@ function TraceEventLogPage({
   const queryKey = ["trace-events", sessionId, search, navigation.current, hideNoise]
   const query = useQuery({
     queryKey,
-    queryFn: ({ signal }) =>
-      api.events(
-        sessionId,
-        {
-          ...eventHistoryQuery(eventHistoryFilters(search)),
-          exclude_event_type: suppressNoise ? "model.text.delta" : undefined,
-          before_sequence: navigation.current ?? undefined,
-          order_by: "sequence_desc",
-          limit: 100,
-        },
-        signal,
-      ),
+    queryFn: ({ signal }): Promise<SessionEventHeadsPage | SessionEventsPage> => {
+      const query = {
+        ...eventHistoryQuery(eventHistoryFilters(search)),
+        exclude_event_type: suppressNoise ? "model.text.delta" : undefined,
+        before_sequence: navigation.current ?? undefined,
+        order_by: "sequence_desc" as const,
+        limit: 100,
+      }
+      // The list shows sequence, time and type; the selected event loads its payload below.
+      return api.eventHeads
+        ? api.eventHeads(sessionId, query, signal)
+        : api.events(sessionId, query, signal)
+    },
     meta: { sessionProgress: !paused && navigation.current === null },
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -85,7 +87,8 @@ function TraceEventLogPage({
     enabled: !!selected,
     queryFn: ({ signal }) => api.events(sessionId, { event_id: selected, limit: 1 }, signal),
   })
-  const events = query.data?.events ?? []
+  const events: Pick<SessionEventHead, "id" | "sequence" | "timestamp" | "type">[] =
+    query.data?.events ?? []
   const visible = suppressNoise
     ? events.filter((event) => !NOISY_EVENT_TYPES.has(event.type))
     : events

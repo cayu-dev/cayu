@@ -115,3 +115,39 @@ test("terminal initial probes ignore older history and abort wakes a real delay"
   assert.equal(updates.length, 1)
   assert.equal(updates[0].terminalDrain, true)
 })
+
+test("progress names the distinct event types each read found, except the first", async () => {
+  const abort = new AbortController()
+  const updates = []
+  const typed = (events, through) => ({
+    events: events.map(([sequence, type]) => ({ id: `event-${sequence}`, sequence, type })),
+    scan_through_sequence: through,
+    has_more: false,
+  })
+  const pages = [
+    typed([[4, "session.started"]], 4),
+    typed(
+      [
+        [5, "tool.call.started"],
+        [6, "tool.call.completed"],
+        [7, "tool.call.started"],
+      ],
+      7,
+    ),
+    typed([], 9),
+  ]
+  await history.followSessionProgress({
+    signal: abort.signal,
+    active: () => true,
+    read: async () => pages.shift(),
+    onProgress: async (update) => {
+      updates.push(update)
+      if (update.throughSequence === 9) abort.abort()
+    },
+    sleep: async () => {},
+  })
+  assert.equal(updates[0].eventTypes, undefined)
+  assert.deepEqual(updates[1].eventTypes, ["tool.call.started", "tool.call.completed"])
+  // Filters excluded everything the cursor passed: nothing to refresh.
+  assert.deepEqual(updates[2].eventTypes, [])
+})

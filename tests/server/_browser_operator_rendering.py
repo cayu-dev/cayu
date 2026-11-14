@@ -143,7 +143,7 @@ async def rendered_native_operator_journey(
         url = urlsplit(route.request.url)
         polling = (
             route.request.method == "GET"
-            and url.path.endswith("/events")
+            and url.path.endswith(("/events", "/event-heads"))
             and "wait_seconds" in parse_qs(url.query)
         )
         task = asyncio.current_task()

@@ -288,6 +288,7 @@ if TYPE_CHECKING:
         ExternalWaitScope,
     )
     from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.trace_events import TraceEvent, TranscriptToolCall
     from cayu.storage.retention import (
         RetentionAuditEntry,
         RetentionAuditRecord,
@@ -4864,6 +4865,35 @@ class SessionStore(ABC):
         """
 
         return [EventHead.of(record) for record in await self.query_events(query)]
+
+    async def query_trace_events(self, query: EventQuery) -> list[TraceEvent]:
+        """``query_events`` as the session trace reads them, with each payload reduced.
+
+        The same matches, order and visibility as ``query_events``. Each row
+        carries the event's columns, its payload's size and only the payload
+        members :mod:`cayu.sessions.trace_events` names. This default derives
+        them from whole events; native stores read a copy their triggers keep
+        and read no event payloads.
+        """
+
+        from cayu.sessions.trace_events import trace_events_of
+
+        return trace_events_of(await self.query_events(query))
+
+    async def query_transcript_tool_calls(
+        self, session_id: str, interaction_ids: Sequence[str]
+    ) -> list[TranscriptToolCall]:
+        """The tool call parts of these interactions' transcript messages, in transcript order.
+
+        Each carries its message's transcript index and its position in the
+        message, as ``query_transcript`` gives them. This default reads the
+        whole messages; native stores read only the parts and never restore
+        tool results.
+        """
+
+        from cayu.sessions.trace_events import transcript_tool_calls_of
+
+        return await transcript_tool_calls_of(self, session_id, interaction_ids)
 
     async def read_usage_accounting(
         self, query: EventQuery, *, by_session: bool = False, by_identity: bool = False

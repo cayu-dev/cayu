@@ -905,6 +905,60 @@ export type ApiErrorResponse = {
 };
 
 /**
+ * ApiEventHead
+ *
+ * An event without its payload, as ``ApiEventRecord`` gives the rest of it.
+ */
+export type ApiEventHead = {
+    /**
+     * Agent Name
+     */
+    agent_name: string | null;
+    /**
+     * Environment Name
+     */
+    environment_name: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Interaction Id
+     */
+    interaction_id: string | null;
+    /**
+     * Payload Bytes
+     *
+     * Size of the stored payload in bytes, before projection. For display; stores measure it as they keep it.
+     */
+    payload_bytes: number;
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Timestamp
+     */
+    timestamp: string;
+    /**
+     * Tool Name
+     */
+    tool_name: string | null;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Workflow Name
+     */
+    workflow_name: string | null;
+};
+
+/**
  * ApiEventRecord
  */
 export type ApiEventRecord = {
@@ -3557,6 +3611,12 @@ export type ApiToolUsage = {
  * ApiTraceSpan
  */
 export type ApiTraceSpan = {
+    /**
+     * Detail
+     *
+     * For a tool call, a preview of its arguments from the transcript: the first non-empty string argument, else the arguments as JSON, cut to 200 characters.
+     */
+    detail?: string | null;
     /**
      * Ended At
      */
@@ -14148,6 +14208,38 @@ export type LaunchScheduling = {
 };
 
 /**
+ * ListSessionEventHeadsResponse
+ *
+ * ``ListSessionEventsResponse`` with heads in place of events.
+ */
+export type ListSessionEventHeadsResponse = {
+    /**
+     * Events
+     */
+    events: Array<ApiEventHead>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Sequence
+     */
+    next_sequence?: number | null;
+    /**
+     * Order By
+     */
+    order_by: 'sequence_asc' | 'sequence_desc';
+    /**
+     * Scan Through Sequence
+     */
+    scan_through_sequence: number | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
+
+/**
  * ListSessionEventsResponse
  */
 export type ListSessionEventsResponse = {
@@ -22420,6 +22512,32 @@ export type SessionTraceResponse = {
      * Spans
      */
     spans: Array<ApiTraceSpan>;
+    /**
+     * Through Sequence
+     */
+    through_sequence: number;
+};
+
+/**
+ * SessionTraceSpanEventsResponse
+ */
+export type SessionTraceSpanEventsResponse = {
+    /**
+     * Events
+     */
+    events: Array<ApiEventRecord>;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Session Instance Id
+     */
+    session_instance_id: string;
+    /**
+     * Span Id
+     */
+    span_id: string;
     /**
      * Through Sequence
      */
@@ -31184,6 +31302,101 @@ export type EstimateSessionCostApiSessionsSessionIdCostPostResponses = {
 
 export type EstimateSessionCostApiSessionsSessionIdCostPostResponse = EstimateSessionCostApiSessionsSessionIdCostPostResponses[keyof EstimateSessionCostApiSessionsSessionIdCostPostResponses];
 
+export type ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Event Id
+         *
+         * Return the event with this exact session-scoped event ID, if it exists.
+         */
+        event_id?: string | null;
+        /**
+         * Event Type
+         */
+        event_type?: string | null;
+        /**
+         * Interaction Id
+         *
+         * Return only events attributed to this interaction.
+         */
+        interaction_id?: string | null;
+        /**
+         * Exclude Event Type
+         *
+         * Exclude one event type before applying pagination.
+         */
+        exclude_event_type?: string | null;
+        /**
+         * Tool Name
+         */
+        tool_name?: string | null;
+        /**
+         * Agent Name
+         */
+        agent_name?: string | null;
+        /**
+         * Environment Name
+         */
+        environment_name?: string | null;
+        /**
+         * Workflow Name
+         */
+        workflow_name?: string | null;
+        /**
+         * After Sequence
+         *
+         * Return only events with a greater durable sequence.
+         */
+        after_sequence?: number | null;
+        /**
+         * Before Sequence
+         *
+         * Return only events with a smaller durable sequence.
+         */
+        before_sequence?: number | null;
+        /**
+         * Return events in durable sequence order.
+         */
+        order_by?: EventOrder;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Wait Seconds
+         *
+         * Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).
+         */
+        wait_seconds?: number | null;
+    };
+    url: '/api/sessions/{session_id}/event-heads';
+};
+
+export type ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetError = ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetErrors[keyof ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetErrors];
+
+export type ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ListSessionEventHeadsResponse;
+};
+
+export type ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponse = ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponses[keyof ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponses];
+
 export type ListSessionEventsApiSessionsSessionIdEventsGetData = {
     body?: never;
     path: {
@@ -32414,6 +32627,12 @@ export type GetSessionTraceApiSessionsSessionIdTraceGetData = {
          * Limit
          */
         limit?: number;
+        /**
+         * Include Events
+         *
+         * Include the page's events. With `false` the response carries the page's spans and their event IDs and `events` is empty; load a selected span's events from `GET /sessions/{session_id}/events`.
+         */
+        include_events?: boolean;
     };
     url: '/api/sessions/{session_id}/trace';
 };
@@ -32435,6 +32654,55 @@ export type GetSessionTraceApiSessionsSessionIdTraceGetResponses = {
 };
 
 export type GetSessionTraceApiSessionsSessionIdTraceGetResponse = GetSessionTraceApiSessionsSessionIdTraceGetResponses[keyof GetSessionTraceApiSessionsSessionIdTraceGetResponses];
+
+export type GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Span Id
+         */
+        span_id: string;
+    };
+    query?: {
+        /**
+         * Session Instance Id
+         */
+        session_instance_id?: string | null;
+        /**
+         * Through Sequence
+         */
+        through_sequence?: number | null;
+        /**
+         * Include Children
+         *
+         * Also return the span's direct children's events.
+         */
+        include_children?: boolean;
+    };
+    url: '/api/sessions/{session_id}/trace/spans/{span_id}/events';
+};
+
+export type GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetError = GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetErrors[keyof GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetErrors];
+
+export type GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionTraceSpanEventsResponse;
+};
+
+export type GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponse = GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponses[keyof GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponses];
 
 export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetData = {
     body?: never;
@@ -32467,6 +32735,12 @@ export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetData = {
          * Include Thinking
          */
         include_thinking?: boolean;
+        /**
+         * Max Part Bytes
+         *
+         * Cut longer text and tool-result content to this many UTF-8 bytes and leave out longer tool-result `structured` data and `artifacts`, marking each such part `truncated` with its `full_bytes`. Read the whole message from `GET /sessions/{session_id}/transcript/{message_index}`.
+         */
+        max_part_bytes?: number | null;
     };
     url: '/api/sessions/{session_id}/transcript';
 };
@@ -32488,6 +32762,40 @@ export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponses = {
 };
 
 export type GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse = GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponses[keyof GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponses];
+
+export type GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+        /**
+         * Message Index
+         */
+        message_index: number;
+    };
+    query?: never;
+    url: '/api/sessions/{session_id}/transcript/{message_index}';
+};
+
+export type GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetError = GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetErrors[keyof GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetErrors];
+
+export type GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTranscriptMessage;
+};
+
+export type GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponse = GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponses[keyof GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponses];
 
 export type GetSessionUsageApiSessionsSessionIdUsageGetData = {
     body?: never;

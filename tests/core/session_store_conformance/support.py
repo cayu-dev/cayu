@@ -204,6 +204,7 @@ _POSTGRES_TABLES = (
     "cayu_knowledge_lookup_removals",
     "cayu_knowledge_lookups",
     "cayu_knowledge_entry_order",
+    "cayu_trace_events",
     "cayu_child_session_lifecycle_candidates",
     "cayu_events",
     "cayu_session_labels",

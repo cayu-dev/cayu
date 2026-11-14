@@ -859,6 +859,7 @@ if TYPE_CHECKING:
     )
     from cayu.sessions._session_continuation import ContinuationRecord
     from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
+    from cayu.sessions.trace_events import TraceEvent
     from cayu.storage.retention import (
         RetentionProgressCallback,
         StorageRetentionPolicy,
@@ -4797,6 +4798,22 @@ class CayuApp(
                 public_authority_alias_codec=self._public_authority_alias_codec,
             ),
         )
+
+    def _project_persisted_event_head_for_exposure(self, row: TraceEvent) -> dict[str, Any]:
+        """Project a stored event's head as ``_project_persisted_event_record_for_exposure``
+        projects its envelope, adding the stored payload's size."""
+
+        from cayu.runtime._event_projection import project_persisted_event_head
+
+        return {
+            **project_persisted_event_head(
+                row.event,
+                sequence=row.sequence,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=self._public_authority_alias_codec,
+            ),
+            "payload_bytes": row.payload_bytes,
+        }
 
     async def _project_emitted_event_for_public_api(self, event: Event) -> Event:
         """Project one emitted private event at the public application boundary."""

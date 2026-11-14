@@ -482,3 +482,48 @@ test("session declaration selection requires one visible owner and one own tool"
     )
   }
 })
+
+test("parts a transcript page cut short say where to load them whole", () => {
+  const blocks = buildBlocks([
+    msg(0, "user", [{ type: "text", text: "Review…", truncated: true, full_bytes: 140000 }]),
+    msg(1, "assistant", [
+      { type: "tool_call", ...correlation, tool_call_id: "a", tool_name: "read", arguments: {} },
+      { type: "tool_call", ...correlation, tool_call_id: "b", tool_name: "read", arguments: {} },
+    ]),
+    msg(2, "tool", [
+      { type: "tool_result", ...correlation, tool_call_id: "a", content: "short" },
+      {
+        type: "tool_result",
+        ...correlation,
+        tool_call_id: "b",
+        content: "long…",
+        truncated: true,
+        full_bytes: 1500000,
+      },
+    ]),
+  ])
+  assert.deepEqual(blocks[0].cut, { messageIndex: 0, partIndex: 0, fullBytes: 140000 })
+  const [short, long] = blocks[1].tools
+  assert.equal("resultCut" in short, false)
+  assert.deepEqual(long.resultCut, { messageIndex: 2, partIndex: 1, fullBytes: 1500000 })
+})
+
+test("cut assistant text and parts shown on their own say where to load them whole", () => {
+  const blocks = buildBlocks([
+    msg(0, "assistant", [{ type: "text", text: "x", truncated: true, full_bytes: 20000 }]),
+    msg(1, "assistant", [{ type: "image", truncated: true, full_bytes: 9000 }]),
+    msg(2, "tool", [
+      { type: "tool_result", content: "orphan", truncated: true, full_bytes: 30000 },
+    ]),
+    msg(3, "assistant", [{ type: "text", text: "whole" }]),
+  ])
+  assert.deepEqual(
+    blocks.map((block) => [block.kind, block.cut ?? null]),
+    [
+      ["text", { messageIndex: 0, partIndex: 0, fullBytes: 20000 }],
+      ["part", { messageIndex: 1, partIndex: 0, fullBytes: 9000 }],
+      ["part", { messageIndex: 2, partIndex: 0, fullBytes: 30000 }],
+      ["text", null],
+    ],
+  )
+})

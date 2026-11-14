@@ -2188,6 +2188,28 @@ class ApiEventRecord(ApiBaseModel):
     timestamp: str
 
 
+class ApiEventHead(ApiBaseModel):
+    """An event without its payload, as ``ApiEventRecord`` gives the rest of it."""
+
+    sequence: StrictInt = Field(ge=0)
+    id: str = Field(max_length=EVENT_ID_MAX_CHARS)
+    type: str
+    session_id: str
+    interaction_id: str | None
+    agent_name: str | None
+    environment_name: str | None
+    workflow_name: str | None
+    tool_name: str | None
+    timestamp: str
+    payload_bytes: StrictInt = Field(
+        ge=0,
+        description=(
+            "Size of the stored payload in bytes, before projection. For display; "
+            "stores measure it as they keep it."
+        ),
+    )
+
+
 class ApiSessionOutcome(ApiBaseModel):
     session_id: str
     status: str
@@ -3205,6 +3227,13 @@ class ApiTraceSpan(ApiBaseModel):
     ]
     event_ids: list[str]
     transcript_links: list[ApiTraceTranscriptLink]
+    detail: str | None = Field(
+        default=None,
+        description=(
+            "For a tool call, a preview of its arguments from the transcript: the first "
+            "non-empty string argument, else the arguments as JSON, cut to 200 characters."
+        ),
+    )
 
 
 class SessionTraceResponse(ApiBaseModel):
@@ -3216,6 +3245,14 @@ class SessionTraceResponse(ApiBaseModel):
     has_more: StrictBool
     events: list[ApiEventRecord]
     spans: list[ApiTraceSpan]
+
+
+class SessionTraceSpanEventsResponse(ApiBaseModel):
+    session_id: str
+    session_instance_id: str
+    span_id: str
+    through_sequence: StrictInt = Field(ge=0)
+    events: list[ApiEventRecord]
 
 
 class ListSessionEventsResponse(ApiBaseModel):
@@ -3239,6 +3276,17 @@ class ListSessionEventsResponse(ApiBaseModel):
             "after_sequence. This can be newer than next_sequence when filters exclude events."
         ),
     )
+    has_more: StrictBool
+
+
+class ListSessionEventHeadsResponse(ApiBaseModel):
+    """``ListSessionEventsResponse`` with heads in place of events."""
+
+    session_id: str
+    events: list[ApiEventHead]
+    order_by: Literal["sequence_asc", "sequence_desc"]
+    next_sequence: StrictInt | None = Field(default=None, ge=0)
+    scan_through_sequence: StrictInt | None = Field(ge=0)
     has_more: StrictBool
 
 

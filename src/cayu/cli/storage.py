@@ -31,6 +31,7 @@ from cayu._filesystem_lock import cooperative_path_lock
 from cayu._version import package_version
 from cayu.build_provenance import current_runtime_build_provenance
 from cayu.cli._output import add_output_options, terminal_safe
+from cayu.cli._storage_projection_checks import add_check_trace_parser, run_check_trace
 from cayu.cli.store_targets import (
     SessionStoreBackend,
     SessionStoreTargetError,
@@ -54,7 +55,7 @@ _SUBCOMMANDS = (
         "Rerun full validation over stored events and report rows edited outside Cayu.",
     ),
 )
-# `reset-aliases` takes its own options; see _add_reset_aliases_parser.
+# `reset-aliases` and `check-trace` take their own options; see their parsers.
 
 #: ``cayu storage status`` exit codes. 1 remains a general error and 2 an
 #: argparse usage error, so deploy steps can branch on the migration need.
@@ -229,6 +230,7 @@ def add_storage_parser(subparsers: Any) -> None:
                 )
             add_output_options(sub)
     _add_reset_aliases_parser(inner)
+    add_check_trace_parser(inner)
 
 
 def _add_reset_aliases_parser(inner: Any) -> None:
@@ -258,6 +260,9 @@ def run_storage(args: argparse.Namespace) -> int:
     if args.storage_command == "reset-aliases":
         return _reset_aliases(args)
     try:
+        if args.storage_command == "check-trace":
+            _resolve_storage_target(args)
+            return run_check_trace(args, _session_store)
         if args.storage_command == "prune" and _prune_needs_app(args):
             if args.sqlite is not None or args.postgres is not None:
                 raise ValueError(

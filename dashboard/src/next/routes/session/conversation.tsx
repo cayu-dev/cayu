@@ -1,10 +1,14 @@
+import { useQuery } from "@tanstack/react-query"
 import { ChevronRight, CornerDownRight, LoaderCircle } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { createContext, useContext, useEffect, useRef, useState } from "react"
 import { TranscriptPart } from "@/components/dashboard/transcript-part"
 import { cn } from "@/lib/utils"
 import type { SessionRow } from "../../app/queries"
+import { useApi } from "../../app/services"
 import {
   type Block,
+  type PartCut,
+  resultText,
   stepLabel,
   type ToolDisplays,
   type ToolUse,
@@ -40,14 +44,34 @@ const PENDING: Record<Pending, { row: string; tone: string; block: (tool: string
   },
 }
 
-function UserMessage({ text }: { text: string }) {
+/** The session whose transcript the conversation shows, to load parts a page cut short. */
+const ConversationSession = createContext<string | undefined>(undefined)
+
+/** A part the transcript page cut short, read whole once `enabled`. */
+function useWholePart(cut: PartCut | undefined, enabled: boolean) {
+  const api = useApi()
+  const sessionId = useContext(ConversationSession)
+  return useQuery({
+    queryKey: ["transcript-message", sessionId, cut?.messageIndex],
+    enabled: enabled && !!cut && !!sessionId && !!api.transcriptMessage,
+    staleTime: Number.POSITIVE_INFINITY,
+    queryFn: ({ signal }) => api.transcriptMessage!(sessionId!, cut!.messageIndex, signal),
+    select: (message) => message.content[cut!.partIndex] as Record<string, unknown> | undefined,
+  })
+}
+
+const kilobytes = (bytes: number) => `${Math.max(1, Math.round(bytes / 1024))} KB`
+
+function UserMessage({ text, cut }: { text: string; cut?: PartCut }) {
   const [open, setOpen] = useState(false)
-  const long = text.length > LONG_MESSAGE
+  const whole = useWholePart(cut, open)
+  const shown = open && typeof whole.data?.text === "string" ? whole.data.text : text
+  const long = text.length > LONG_MESSAGE || !!cut
   return (
     <div className="flex justify-end">
       <div className="max-w-[85%] min-w-0 rounded-2xl bg-muted px-4 py-2.5 text-[15px] leading-relaxed">
         <p className="whitespace-pre-wrap break-words">
-          {long && !open ? `${text.slice(0, 400).trimEnd()}…` : text}
+          {long && !open ? `${text.slice(0, 400).trimEnd()}…` : shown}
         </p>
         {long && (
           <button
@@ -55,7 +79,11 @@ function UserMessage({ text }: { text: string }) {
             className="mt-1.5 text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setOpen(!open)}
           >
-            {open ? "Show less" : `Show all (${Math.round(text.length / 1024)} KB)`}
+            {open
+              ? whole.isFetching
+                ? "Loading…"
+                : "Show less"
+              : `Show all (${kilobytes(cut?.fullBytes ?? text.length)})`}
           </button>
         )}
       </div>
@@ -78,6 +106,10 @@ function ToolRow({
   position?: { messageIndex: number; partIndex: number }
 }) {
   const [open, setOpen] = useState(false)
+  const [wholeResult, setWholeResult] = useState(false)
+  const whole = useWholePart(tool.resultCut, open && wholeResult)
+  const result = whole.data ? resultText(whole.data) : tool.result
+  const structured = whole.data ? (whole.data.structured ?? null) : tool.structured
   const node = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (position?.messageIndex === tool.messageIndex && position.partIndex === tool.partIndex) {
@@ -143,8 +175,8 @@ function ToolRow({
               {JSON.stringify(tool.args, null, 2)}
             </pre>
           )}
-          {tool.structured != null && <ValueView value={tool.structured} label="Tool output" />}
-          {tool.result != null && (
+          {structured != null && <ValueView value={structured} label="Tool output" />}
+          {result != null && (
             <pre
               className={cn(
                 "max-h-64 overflow-auto rounded-md p-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words",
@@ -153,12 +185,70 @@ function ToolRow({
                   : "bg-muted text-muted-foreground",
               )}
             >
-              {tool.result}
+              {result}
             </pre>
+          )}
+          {tool.resultCut && !whole.data && (
+            <button
+              type="button"
+              disabled={whole.isFetching}
+              onClick={() => setWholeResult(true)}
+              className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+            >
+              {whole.isFetching
+                ? "Loading the whole result…"
+                : `Show the whole result (${kilobytes(tool.resultCut.fullBytes)})`}
+            </button>
           )}
         </div>
       )}
     </div>
+  )
+}
+
+function AssistantText({ text, cut }: { text: string; cut?: PartCut }) {
+  const [open, setOpen] = useState(false)
+  const whole = useWholePart(cut, open)
+  return (
+    <div>
+      <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
+        {open && typeof whole.data?.text === "string" ? whole.data.text : text}
+      </p>
+      {cut && (
+        <button
+          type="button"
+          className="mt-1.5 text-xs text-muted-foreground hover:text-foreground"
+          onClick={() => setOpen(!open)}
+        >
+          {open
+            ? whole.isFetching
+              ? "Loading…"
+              : "Show less"
+            : `Show all (${kilobytes(cut.fullBytes)})`}
+        </button>
+      )}
+    </div>
+  )
+}
+
+/** A part shown on its own, with the whole part loaded on request when the page cut it. */
+function WholePart({ part, cut }: { part: Record<string, unknown>; cut?: PartCut }) {
+  const [wanted, setWanted] = useState(false)
+  const whole = useWholePart(cut, wanted)
+  return (
+    <>
+      <TranscriptPart part={whole.data ?? part} />
+      {cut && !whole.data && (
+        <button
+          type="button"
+          disabled={whole.isFetching}
+          onClick={() => setWanted(true)}
+          className="mt-1.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
+        >
+          {whole.isFetching ? "Loading…" : `Show all (${kilobytes(cut.fullBytes)})`}
+        </button>
+      )}
+    </>
   )
 }
 
@@ -261,9 +351,12 @@ export function Conversation({
   displays = {},
   onTrace,
   position,
+  sessionId,
   children,
 }: {
   blocks: Block[]
+  /** The transcript's session, to load parts its pages cut short. */
+  sessionId?: string
   /** Display labels for the specialist's tools. */
   displays?: ToolDisplays
   /** Opens the trace at a tool call's span. */
@@ -274,47 +367,44 @@ export function Conversation({
   children?: React.ReactNode
 }) {
   return (
-    <div className="space-y-4">
-      {blocks.map((b) => {
-        if (b.kind === "user") return <UserMessage key={b.key} text={b.text} />
-        if (b.kind === "text")
-          return (
-            <p key={b.key} className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
-              {b.text}
-            </p>
-          )
-        if (b.kind === "work")
-          return (
-            <WorkBlock
-              key={b.key}
-              block={b}
-              pending={pending}
-              displays={displays}
-              onTrace={onTrace}
-              position={position}
-            />
-          )
-        if (b.kind === "part")
-          return (
-            <div
-              key={b.key}
-              data-transcript-part={b.key}
-              data-transcript-role={b.user ? "user" : undefined}
-              className={b.user ? "flex justify-end" : undefined}
-            >
+    <ConversationSession.Provider value={sessionId}>
+      <div className="space-y-4">
+        {blocks.map((b) => {
+          if (b.kind === "user") return <UserMessage key={b.key} text={b.text} cut={b.cut} />
+          if (b.kind === "text") return <AssistantText key={b.key} text={b.text} cut={b.cut} />
+          if (b.kind === "work")
+            return (
+              <WorkBlock
+                key={b.key}
+                block={b}
+                pending={pending}
+                displays={displays}
+                onTrace={onTrace}
+                position={position}
+              />
+            )
+          if (b.kind === "part")
+            return (
               <div
-                className={
-                  b.user ? "max-w-[85%] min-w-0 rounded-2xl bg-muted px-4 py-2.5" : undefined
-                }
+                key={b.key}
+                data-transcript-part={b.key}
+                data-transcript-role={b.user ? "user" : undefined}
+                className={b.user ? "flex justify-end" : undefined}
               >
-                <TranscriptPart part={b.part} />
+                <div
+                  className={
+                    b.user ? "max-w-[85%] min-w-0 rounded-2xl bg-muted px-4 py-2.5" : undefined
+                  }
+                >
+                  <WholePart part={b.part} cut={b.cut} />
+                </div>
               </div>
-            </div>
-          )
-        return <ValueView key={b.key} value={b.value} />
-      })}
-      {children}
-    </div>
+            )
+          return <ValueView key={b.key} value={b.value} />
+        })}
+        {children}
+      </div>
+    </ConversationSession.Provider>
   )
 }
 

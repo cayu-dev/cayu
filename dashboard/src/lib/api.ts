@@ -91,8 +91,11 @@ import type {
   GetSessionsSummaryApiSessionsSummaryPostResponse,
   GetSessionTopologyApiSessionsSessionIdTopologyPostResponse,
   GetSessionTraceApiSessionsSessionIdTraceGetData,
+  GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetData,
+  GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponse,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
+  GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponse,
   GetSystemDiagnosticsApiSystemDiagnosticsGetResponse,
   GetTaskApiTasksTaskIdGetResponse,
   GetUsageRollupApiUsageRollupPostResponse,
@@ -108,6 +111,8 @@ import type {
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
+  ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetData,
+  ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponse,
   ListSessionEventsApiSessionsSessionIdEventsGetData,
   ListSessionEventsApiSessionsSessionIdEventsGetResponse,
   ListSessionsApiSessionsGetData,
@@ -196,6 +201,12 @@ export type SessionTopologyBody = SessionTopologyRequest
 export type SessionEventsPage = ListSessionEventsApiSessionsSessionIdEventsGetResponse
 export type SessionEventsQuery = NonNullable<
   ListSessionEventsApiSessionsSessionIdEventsGetData["query"]
+>
+/** Events without payloads, as `GET /sessions/{id}/event-heads` gives them. */
+export type SessionEventHeadsPage = ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetResponse
+export type SessionEventHead = SessionEventHeadsPage["events"][number]
+export type SessionEventHeadsQuery = NonNullable<
+  ListSessionEventHeadsApiSessionsSessionIdEventHeadsGetData["query"]
 >
 export type SessionTranscriptPage = GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse
 export type SessionTranscriptQuery = NonNullable<
@@ -1104,6 +1115,26 @@ export async function fetchSessionEvents(
   )
 }
 
+export async function fetchSessionEventHeads(
+  id: string,
+  query: SessionEventHeadsQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionEventHeadsPage> {
+  return requestJson<SessionEventHeadsPage>(
+    `/sessions/${encodeURIComponent(id)}/event-heads${queryString(query)}`,
+    { signal },
+  )
+}
+
+/** One transcript message whole, including parts a transcript page cut short. */
+export async function fetchSessionTranscriptMessage(
+  id: string,
+  index: number,
+  signal?: AbortSignal,
+): Promise<GetSessionTranscriptMessageApiSessionsSessionIdTranscriptMessageIndexGetResponse> {
+  return requestJson(`/sessions/${encodeURIComponent(id)}/transcript/${index}`, { signal })
+}
+
 export async function fetchSessionTranscript(
   id: string,
   query: SessionTranscriptQuery = {},
@@ -1222,6 +1253,25 @@ export async function fetchSessionTrace(
 ): Promise<SessionTracePage> {
   return requestJson<SessionTracePage>(
     `/sessions/${encodeURIComponent(id)}/trace${queryString(query)}`,
+    { signal },
+  )
+}
+
+export type SessionTraceSpanEvents =
+  GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetResponse
+export type SessionTraceSpanEventsQuery = NonNullable<
+  GetSessionTraceSpanEventsApiSessionsSessionIdTraceSpansSpanIdEventsGetData["query"]
+>
+
+/** One trace span's events, for its detail panel over a trace read without events. */
+export async function fetchSessionTraceSpanEvents(
+  id: string,
+  spanId: string,
+  query: SessionTraceSpanEventsQuery = {},
+  signal?: AbortSignal,
+): Promise<SessionTraceSpanEvents> {
+  return requestJson<SessionTraceSpanEvents>(
+    `/sessions/${encodeURIComponent(id)}/trace/spans/${encodeURIComponent(spanId)}/events${queryString(query)}`,
     { signal },
   )
 }

@@ -40,6 +40,17 @@ export function mergeTracePages(
   }
 }
 
+/** Add events loaded apart from the page, such as a selected span's, by event ID. */
+export function withEvents(
+  page: SessionTraceResponse,
+  events: SessionTraceResponse["events"],
+): SessionTraceResponse {
+  if (events.length === 0) return page
+  const merged = new Map(page.events.map((event) => [event.id, event]))
+  for (const event of events) merged.set(event.id, event)
+  return { ...page, events: [...merged.values()].sort((a, b) => a.sequence - b.sequence) }
+}
+
 export function buildRuntimeTrace(page: SessionTraceResponse): Span {
   const events = new Map(page.events.map((event) => [event.id, event]))
   const nodes = new Map<string, Span>()
@@ -48,7 +59,7 @@ export function buildRuntimeTrace(page: SessionTraceResponse): Span {
       id: source.id,
       kind: source.kind,
       name: source.name,
-      detail: "",
+      detail: source.detail ?? "",
       start: source.started_at === null ? 0 : Date.parse(source.started_at),
       startKnown: source.started_at !== null,
       end: source.ended_at === null ? null : Date.parse(source.ended_at),

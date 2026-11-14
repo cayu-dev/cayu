@@ -21755,6 +21755,47 @@ not the subset of calls visible on the current event page. Missing linkage remai
 unlinked rather than being matched by event order. User-input and approval waits
 retain their request identity when answered or decided.
 
+Pass `include_events=false` to get a page's spans and their event IDs without the
+events: `events` is empty and everything else is what the full page gives. The
+waterfall then loads a selected span's events from
+`GET /api/sessions/{session_id}/trace/spans/{span_id}/events`, which returns that
+span's events whole, in sequence order, reading no other event's payload. Pass
+`include_children=true` to add its direct children's events. It takes `session_instance_id` and `through_sequence` like a trace
+page, and returns 404 for a span the retained trace does not have.
+Since storage revision 154, SQLite and PostgreSQL build the trace from
+`cayu_trace_events` instead of whole events. It holds one row per event with the
+stored payload's size and a payload reduced to the members that place an event in
+the tree and decide a span's status: the top-level model step, tool round, tool
+call, command, input and approval identities, `interruption_type`, `interrupted`,
+`cancelled`, `timed_out`, `error_type` and `exit_code`; `result.structured`'s
+tool call and round for tool events; and the `approval`, `user_input` or
+`tool_calls` member of the wait events whose identity sits inside it. Triggers on
+`cayu_events` keep it in step with every insert, payload update and deletion,
+including writes from older binaries, and the migration copies the events already
+retained. Readers join it to the event's own columns, so a trace read reads no
+event payload. Tool rounds still take their call set from the transcript, but read
+only its `tool_call` parts (`SessionStore.query_transcript_tool_calls`) and never
+restore tool results. Custom stores get both reads from defaults over whole
+events and transcript pages. `cayu storage check-trace SESSION_ID...` compares a
+store's copy with a recompute from the sessions' events and exits 5 when they
+differ. Session stores require revision 154, so run `cayu storage migrate` before
+starting the upgraded application.
+
+`GET /api/sessions/{session_id}/event-heads` takes the filters, cursors and
+`wait_seconds` of `GET /api/sessions/{session_id}/events` and returns the same
+matches in the same order, each without its payload and with its stored
+`payload_bytes`. It reads `cayu_trace_events`, so a page costs the same however
+large its events are. Read one event's payload from the events endpoint with
+`event_id`.
+
+`GET /api/sessions/{session_id}/transcript` takes `max_part_bytes` (at least 256).
+A longer text, or tool-result `content`, is then cut to that many UTF-8 bytes, on a
+character boundary and after redaction. A tool result's `structured` data or
+`artifacts` longer than that as JSON are left out, as `null` and `[]`. Each part
+changed either way is marked with `truncated: true` and `full_bytes`, the size of the
+whole part as JSON. `GET /api/sessions/{session_id}/transcript/{message_index}`
+returns one message whole by its absolute index, which retention does not renumber.
+
 ## Local tool inventory and usage
 
 Server contract 61 exposes `source` and `approval` on every `/api/agents`

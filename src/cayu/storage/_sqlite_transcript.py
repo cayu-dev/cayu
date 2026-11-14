@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -27,6 +27,7 @@ from cayu.sessions._model_failover import MODEL_TARGET_PROJECTION_METADATA_KEY
 from cayu.sessions._model_stage import MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY
 from cayu.sessions._operation_records import RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, TranscriptRecord
+from cayu.sessions.trace_events import TranscriptToolCall
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
     _initial_transcript_prefix_count,
@@ -1048,6 +1049,57 @@ async def query_transcript(
             query.session_id,
             lambda connection: transcript_content.read_snapshot(connection, run_query),
         )
+    )
+
+
+async def query_transcript_tool_calls(
+    run_read: SQLiteOperationRunner, session_id: str, interaction_ids: Sequence[str]
+) -> list[TranscriptToolCall]:
+    """Read only the tool call parts of these interactions' messages.
+
+    No tool result is restored: a ``tool_call`` part never references one.
+    """
+
+    from cayu.resource_access import current_data_bounds
+    from cayu.sessions.trace_events import stored_transcript_tool_call
+
+    access_bounds = await current_data_bounds()
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interactions = sorted(set(interaction_ids))
+
+    def run_query(connection: sqlite3.Connection) -> list[TranscriptToolCall]:
+        if not sqlite_records.session_exists(connection, session_id):
+            raise KeyError(f"Session not found: {session_id}")
+        if not interactions:
+            return []
+        rows = connection.execute(
+            """
+            SELECT transcript.session_order - 1 AS transcript_index,
+                   transcript.interaction_id,
+                   CAST(part.key AS INTEGER) AS part_index,
+                   part.value AS part_json
+            FROM cayu_transcript_messages AS transcript,
+                 json_each(transcript.message_json, '$.content') AS part
+            WHERE transcript.session_id = ?
+              AND transcript.interaction_id IN (SELECT value FROM json_each(?))
+              AND transcript.session_order IS NOT NULL
+              AND part.type = 'object'
+              AND json_extract(part.value, '$.type') = 'tool_call'
+            ORDER BY transcript.session_order ASC, part.key ASC
+            """,
+            (session_id, json.dumps(interactions)),
+        ).fetchall()
+        return [
+            stored_transcript_tool_call(
+                row["transcript_index"], row["part_index"], row["interaction_id"], row["part_json"]
+            )
+            for row in rows
+        ]
+
+    from cayu.storage._session_access_records import sqlite_owner_read
+
+    return await run_read(
+        lambda connection: sqlite_owner_read(connection, access_bounds, session_id, run_query)
     )
 
 

@@ -3591,6 +3591,70 @@ def _recognize_policy_block_controls(
         controls["blocked_by"] = blocked_by
 
 
+def _public_envelope_ids(
+    event: Event, redactor: SecretRedactor, codec: PublicAuthorityAliasCodec | None
+) -> tuple[str, str | None]:
+    """The session and interaction IDs a public event carries in place of private ones."""
+
+    session_id = event.session_id
+    interaction_id = event.interaction_id
+    if redactor.redact_text(event.session_id) != event.session_id:
+        session_id = public_event_envelope_alias(
+            event.session_id,
+            field_name="session_id",
+            codec=_require_public_authority_alias_codec(codec),
+        )
+    if event.interaction_id is not None and (
+        redactor.redact_text(event.interaction_id) != event.interaction_id
+    ):
+        interaction_id = public_event_envelope_alias(
+            event.interaction_id,
+            field_name="interaction_id",
+            codec=_require_public_authority_alias_codec(codec),
+            session_id=event.session_id,
+        )
+    return session_id, interaction_id
+
+
+def project_persisted_event_head(
+    event: Event,
+    *,
+    sequence: int,
+    redactor: SecretRedactor,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+) -> dict[str, Any]:
+    """Project a stored event's envelope as ``project_persisted_runtime_event`` does.
+
+    Gives the ``id``, ``type``, IDs and names the full projection gives the
+    same event, without reading or projecting its payload.
+    """
+
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    event_type: EventType | str = event.type
+    if not isinstance(event_type, EventType) and redactor.redact_text(str(event_type)) != str(
+        event_type
+    ):
+        event_type = REDACTED_CUSTOM_EVENT_TYPE
+    session_id, interaction_id = _public_envelope_ids(event, redactor, public_authority_alias_codec)
+
+    def name(value: str | None) -> str | None:
+        return None if value is None else redactor.redact_text(value)
+
+    return {
+        "sequence": sequence,
+        "id": public_event_id(sequence),
+        "type": str(event_type),
+        "session_id": session_id,
+        "interaction_id": interaction_id,
+        "agent_name": name(event.agent_name),
+        "environment_name": name(event.environment_name),
+        "workflow_name": name(event.workflow_name),
+        "tool_name": name(event.tool_name),
+        "timestamp": event.timestamp.isoformat(),
+    }
+
+
 def _copy_projected_event(
     event: Event,
     *,
@@ -3607,22 +3671,9 @@ def _copy_projected_event(
     projected_session_id = event.session_id
     projected_interaction_id = event.interaction_id
     if redact_session_id:
-        if redactor.redact_text(event.session_id) != event.session_id:
-            projected_session_id = public_event_envelope_alias(
-                event.session_id,
-                field_name="session_id",
-                codec=_require_public_authority_alias_codec(public_authority_alias_codec),
-            )
-        if (
-            event.interaction_id is not None
-            and redactor.redact_text(event.interaction_id) != event.interaction_id
-        ):
-            projected_interaction_id = public_event_envelope_alias(
-                event.interaction_id,
-                field_name="interaction_id",
-                codec=_require_public_authority_alias_codec(public_authority_alias_codec),
-                session_id=event.session_id,
-            )
+        projected_session_id, projected_interaction_id = _public_envelope_ids(
+            event, redactor, public_authority_alias_codec
+        )
     # copy_event already owns a detached copy and the update replaces every
     # field except the immutable timestamp, so a shallow copy is enough. A deep
     # copy would also copy the stale payload stamp, which holds the whole

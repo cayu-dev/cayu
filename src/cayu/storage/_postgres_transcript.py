@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
@@ -25,6 +25,7 @@ from cayu.sessions._invocation_scope import (
     resolve_interaction_attribution,
 )
 from cayu.sessions.records import CheckpointTransform, Session, TranscriptRecord
+from cayu.sessions.trace_events import TranscriptToolCall
 from cayu.sessions.transcript_input import (
     DeferredInteractionInput,
     _initial_transcript_prefix_count,
@@ -923,6 +924,57 @@ async def query_transcript(
             records=filter_transcript_records(records, include_thinking=query.include_thinking),
             total_records=total_records,
         )
+
+
+async def query_transcript_tool_calls(
+    connect: PostgresConnection,
+    session_id: str,
+    interaction_ids: Sequence[str],
+    *,
+    load_session: SessionLoader,
+) -> list[TranscriptToolCall]:
+    """Read only the tool call parts of these interactions' messages.
+
+    No tool result is restored: a ``tool_call`` part never references one.
+    """
+
+    from cayu.resource_access import current_data_bounds
+    from cayu.sessions.trace_events import stored_transcript_tool_call
+
+    access_bounds = await current_data_bounds()
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interactions = sorted(set(interaction_ids))
+    async with connect() as conn, conn.cursor() as cur:
+        if access_bounds is not None:
+            access_bounds.require_read(await load_session(cur, session_id))
+        await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+        if await cur.fetchone() is None:
+            raise KeyError(f"Session not found: {session_id}")
+        if not interactions:
+            return []
+        await cur.execute(
+            """
+            SELECT transcript.session_order - 1 AS transcript_index,
+                   transcript.interaction_id,
+                   part.position - 1 AS part_index,
+                   part.value
+            FROM cayu_transcript_messages AS transcript
+            CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(transcript.message -> 'content') = 'array'
+                     THEN transcript.message -> 'content' ELSE '[]'::jsonb END
+            ) WITH ORDINALITY AS part(value, position)
+            WHERE transcript.session_id = %s
+              AND transcript.interaction_id = ANY(%s)
+              AND jsonb_typeof(part.value) = 'object'
+              AND part.value ->> 'type' = 'tool_call'
+            ORDER BY transcript.session_order ASC, part.position ASC
+            """,
+            (session_id, interactions),
+        )
+        return [
+            stored_transcript_tool_call(row[0], row[2], row[1], row[3])
+            for row in await cur.fetchall()
+        ]
 
 
 async def search_transcript(

@@ -74,6 +74,7 @@ from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._read_lanes import ReadLane, current_read_lane
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
+from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage.targets import require_sqlite_store_allowed
 
 if TYPE_CHECKING:
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
     from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.trace_events import TraceEvent, TranscriptToolCall
     from cayu.storage._stored_event_verification import StoredEventVerificationPage
     from cayu.storage.retention import (
         RetentionAuditEntry,
@@ -444,7 +446,7 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = ARTIFACT_INDEX_REVISION
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = max(ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION)
 _T = TypeVar("_T")
 # Read-only connections per file-backed session store. Interactive reads (one
 # session, a transcript, state) lease the first set; bulk-lane reads (dashboard
@@ -6620,6 +6622,9 @@ class SQLiteSessionStore(
     async def query_event_heads(self, query: EventQuery) -> list[EventHead]:
         return await session_queries.query_event_heads(self._run_read, query)
 
+    async def query_trace_events(self, query: EventQuery) -> list[TraceEvent]:
+        return await session_queries.query_trace_events(self._run_read, query)
+
     async def verify_stored_events(
         self, *, after_sequence: int = 0, limit: int = 1000
     ) -> StoredEventVerificationPage:
@@ -8668,6 +8673,13 @@ class SQLiteSessionStore(
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         return await transcript_ops.query_transcript(self._run_read, query)
+
+    async def query_transcript_tool_calls(
+        self, session_id: str, interaction_ids: Sequence[str]
+    ) -> list[TranscriptToolCall]:
+        return await transcript_ops.query_transcript_tool_calls(
+            self._run_read, session_id, interaction_ids
+        )
 
     async def search_transcript(
         self,

@@ -4433,7 +4433,16 @@ async def _exercise_workflow(
             ("GET", "/api/sessions"),
             *(
                 ("GET", f"/api/sessions/{WORKFLOW_FOCUS_SESSION_ID}{suffix}")
-                for suffix in ("", "/state", "/transcript", "/events", "/trace", "/messages")
+                for suffix in (
+                    "",
+                    "/state",
+                    "/transcript",
+                    "/events",
+                    "/event-heads",  # The live follower's payload-free tail.
+                    "/trace",
+                    "/trace/spans/session/events",  # The selected session span's events.
+                    "/messages",
+                )
             ),
             *(("GET", f"/api/sessions/{session_id}/transcript") for session_id in relation_ids),
         }
@@ -5927,7 +5936,8 @@ class _ApiRequestLog:
             while len(self.started) < page_reads or any(
                 not (
                     request.method == "GET"
-                    and urlsplit(request.url).path.endswith("/events")
+                    # The shared follower long-polls payload-free event heads.
+                    and urlsplit(request.url).path.endswith(("/events", "/event-heads"))
                     and parse_qs(urlsplit(request.url).query).get("wait_seconds") == ["10"]
                 )
                 for request in self.pending
@@ -6131,7 +6141,8 @@ async def _exercise_session_progress_budget(
 ) -> dict[str, int]:
     """Real long-poll remains single-flight while browser time advances independently."""
     state_path = f"/api/sessions/{session_id}/state"
-    event_path = f"/api/sessions/{session_id}/events"
+    # The shared follower reads payload-free event heads.
+    event_path = f"/api/sessions/{session_id}/event-heads"
     async with _polling_budget_page(new_context) as (page, requests, _failures):
         await page.goto(
             f"{base_url}/cayu/sessions/{session_id}?view=conversation",

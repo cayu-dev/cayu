@@ -91,6 +91,9 @@ export function useOverview(id: string, poll = true) {
   })
 }
 
+/** Bytes of a long text or tool result a transcript page carries before cutting it. */
+export const TRANSCRIPT_PART_BYTES = 8192
+
 /** One bounded window, using the same tail owner as the runtime history page. */
 export function useTranscript(
   id: string,
@@ -103,7 +106,18 @@ export function useTranscript(
     queryKey: ["transcript", id, filters, page],
     queryFn: ({ signal }): Promise<SessionTranscriptPage> =>
       loadTranscriptWindow(page, 100, 3, (window) =>
-        api.transcript(id, { ...filters, ...window }, signal),
+        api.transcript(
+          id,
+          {
+            ...filters,
+            ...window,
+            // The conversation shows a cut part's start and loads it whole when opened.
+            // System and tool views list raw parts, which have no such loader.
+            ...(filters.role !== "system" &&
+              filters.role !== "tool" && { max_part_bytes: TRANSCRIPT_PART_BYTES }),
+          },
+          signal,
+        ),
       ),
     refetchInterval: active && page === null ? ACTIVE_POLL_MS : false,
   })

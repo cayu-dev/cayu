@@ -52,6 +52,9 @@ export function shouldFollowRowClick(click: {
   )
 }
 
+/** Where a part a transcript page cut short sits, to load it whole. */
+export type PartCut = { messageIndex: number; partIndex: number; fullBytes: number }
+
 export type ToolUse = {
   key: string
   messageIndex: number
@@ -64,21 +67,29 @@ export type ToolUse = {
   structured: unknown
   error: boolean
   running: boolean
+  /** Set when the page cut the result short. */
+  resultCut?: PartCut
 }
 
 export type Block =
-  | { kind: "user"; key: string; text: string }
-  | { kind: "text"; key: string; text: string }
+  | { kind: "user"; key: string; text: string; cut?: PartCut }
+  | { kind: "text"; key: string; text: string; cut?: PartCut }
   | { kind: "work"; key: string; tools: ToolUse[]; thoughts: string[] }
   | { kind: "output"; key: string; value: unknown }
-  | { kind: "part"; key: string; part: Record<string, unknown>; user?: boolean }
+  | { kind: "part"; key: string; part: Record<string, unknown>; user?: boolean; cut?: PartCut }
 
 type Part = { [key: string]: unknown }
 const str = (v: unknown) => (typeof v === "string" ? v : "")
 const redacted = (value: string) =>
   value.includes("[REDACTED_SECRET]") || value.includes("[PRIVATE_EVENT_AUTHORITY]")
 
-function resultText(part: Part): string {
+function partCut(part: Part, messageIndex: number, partIndex: number): PartCut | undefined {
+  return part.truncated === true && typeof part.full_bytes === "number"
+    ? { messageIndex, partIndex, fullBytes: part.full_bytes }
+    : undefined
+}
+
+export function resultText(part: Part): string {
   const content = part.content
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
@@ -111,11 +122,13 @@ export function buildBlocks(
     return JSON.stringify(fields)
   }
   const positions = new Map<Part, number>()
+  const locations = new Map<Part, { messageIndex: number; partIndex: number }>()
   const calls = new Map<string, Part[]>()
   const results = new Map<string, Part[]>()
   for (const message of messages) {
-    for (const part of message.content) {
+    for (const [partIndex, part] of message.content.entries()) {
       positions.set(part, positions.size)
+      locations.set(part, { messageIndex: message.index, partIndex })
       const collection =
         message.role === "assistant" && part.type === "tool_call"
           ? calls
@@ -158,9 +171,11 @@ export function buildBlocks(
         if (part.type === "thinking" && !includeThinking) return
         const partKey = `${key}.${index}`
         if (part.type === "text") {
-          blocks.push({ kind: "user", key: partKey, text: str(part.text) })
+          const cut = partCut(part, m.index, index)
+          blocks.push({ kind: "user", key: partKey, text: str(part.text), ...(cut && { cut }) })
         } else {
-          blocks.push({ kind: "part", key: partKey, part, user: true })
+          const cut = partCut(part, m.index, index)
+          blocks.push({ kind: "part", key: partKey, part, user: true, ...(cut && { cut }) })
         }
       })
       continue
@@ -176,12 +191,14 @@ export function buildBlocks(
       } else if (m.role === "tool") {
         if (p.type === "tool_result" && !consumed.has(p)) {
           work = null
-          blocks.push({ kind: "part", key: pkey, part: p })
+          const cut = partCut(p, m.index, i)
+          blocks.push({ kind: "part", key: pkey, part: p, ...(cut && { cut }) })
         }
         return
       } else if (p.type === "text" && str(p.text).trim()) {
         work = null
-        blocks.push({ kind: "text", key: pkey, text: str(p.text) })
+        const cut = partCut(p, m.index, i)
+        blocks.push({ kind: "text", key: pkey, text: str(p.text), ...(cut && { cut }) })
       } else if (p.type === "thinking" && includeThinking && str(p.text).trim()) {
         ensureWork(pkey).thoughts.push(
           str(p.text).replaceAll("****", " · ").replaceAll("**", "").trim(),
@@ -189,6 +206,8 @@ export function buildBlocks(
       } else if (p.type === "tool_call") {
         const id = str(p.tool_call_id)
         const r = matched.get(p)
+        const where = r && locations.get(r)
+        const resultCut = r && where ? partCut(r, where.messageIndex, where.partIndex) : undefined
         ensureWork(pkey).tools.push({
           key: pkey,
           messageIndex: m.index,
@@ -201,10 +220,12 @@ export function buildBlocks(
           structured: r?.structured ?? null,
           error: r?.is_error === true,
           running: !r,
+          ...(resultCut && { resultCut }),
         })
       } else if (p.type !== "structured_output" && p.type !== "text" && p.type !== "thinking") {
         work = null
-        blocks.push({ kind: "part", key: pkey, part: p })
+        const cut = partCut(p, m.index, i)
+        blocks.push({ kind: "part", key: pkey, part: p, ...(cut && { cut }) })
       }
     })
   }

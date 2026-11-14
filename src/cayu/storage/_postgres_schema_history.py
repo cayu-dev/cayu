@@ -55,6 +55,7 @@ from cayu.storage._task_group_schema import (
 from cayu.storage._task_index_schema import POSTGRES_TASK_INDEX_DDL, TASK_INDEX_REVISION
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
+from cayu.storage._trace_event_schema import POSTGRES_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
@@ -1027,6 +1028,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     TASK_INDEX_REVISION: POSTGRES_TASK_INDEX_DDL,
     # Artifact lists and counts read an index the artifact store commit hook writes.
     ARTIFACT_INDEX_REVISION: POSTGRES_ARTIFACT_INDEX_DDL,
+    # The session trace reads a narrow trigger-maintained copy of each event.
+    TRACE_EVENTS_REVISION: POSTGRES_TRACE_EVENTS_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

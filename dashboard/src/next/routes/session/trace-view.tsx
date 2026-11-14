@@ -8,7 +8,7 @@ import { ChevronRight, Copy, Radio, X } from "lucide-react"
 import { type ReactNode, useEffect, useMemo, useState } from "react"
 import { MutationTransportStatus } from "@/components/dashboard/mutation-transport-status"
 import { useDashboardCapability } from "@/components/dashboard/server-contract"
-import { ApiClientError } from "@/lib/api"
+import { ApiClientError, type SessionTraceSpanEvents } from "@/lib/api"
 import type { MutationTransportSnapshot } from "@/lib/mutation-transport"
 import type { SessionHistorySearch } from "@/lib/session-history-search"
 import { cn } from "@/lib/utils"
@@ -36,6 +36,7 @@ import {
   mergeTracePages,
   type TranscriptPosition,
   traceSpanForPosition,
+  withEvents,
 } from "../../app/trace-runtime"
 import { ErrorState, NavLink, needsAttention, StateDot, sessionRoute } from "../common"
 import { TraceEventLog } from "./trace-event-log"
@@ -119,7 +120,11 @@ function spanLabel(s: Span, displays: ToolDisplays): { name: string; detail: str
     )
     const args = payload(done ?? s.events[0] ?? ({} as SessionEvent)).arguments
     const display = toolDisplay(s.name, displays)
-    return { name: display ? display.verb : s.name, detail: args ? argPreview(args) : "" }
+    // The server's preview labels a call whose events this page did not load.
+    return {
+      name: display ? display.verb : s.name,
+      detail: args ? argPreview(args) : s.detail,
+    }
   }
   return { name: s.name, detail: s.detail }
 }
@@ -233,12 +238,53 @@ function TraceViewContent({
         signal,
       ),
   })
-  const runtimePage = useMemo(
+  const tracePage = useMemo(
     () =>
       runtime.data?.page && focused.data
         ? mergeTracePages(runtime.data.page, focused.data)
         : runtime.data?.page,
     [runtime.data?.page, focused.data],
+  )
+  // The trace reads spans without events; the selected span loads its own.
+  const selectedSpanId = useMemo(() => {
+    if (!tracePage) return undefined
+    const exact = transcriptPosition
+      ? traceSpanForPosition(tracePage, transcriptPosition)
+      : undefined
+    const id = exact ?? spanId ?? tracePage.root_span_id
+    return tracePage.spans.some((span) => span.id === id) ? id : tracePage.root_span_id
+  }, [tracePage, transcriptPosition, spanId])
+  const spanEvents = useQuery({
+    queryKey: [
+      "trace-span-events",
+      session.id,
+      tracePage?.session_instance_id,
+      selectedSpanId,
+      tracePage?.through_sequence,
+    ],
+    enabled: traceEnabled && !prototype && !!api.traceSpanEvents && !!selectedSpanId,
+    // A live update reads the same span again through a newer sequence; keep its
+    // events meanwhile. Events attach only by span event IDs, so another span's
+    // never show here.
+    placeholderData: (previous: SessionTraceSpanEvents | undefined, previousQuery) =>
+      previousQuery?.queryKey[3] === selectedSpanId ? previous : undefined,
+    queryFn: ({ signal }) =>
+      api.traceSpanEvents!(
+        session.id,
+        selectedSpanId!,
+        {
+          session_instance_id: tracePage!.session_instance_id,
+          through_sequence: tracePage!.through_sequence,
+          // The session's detail reads its turns' events too.
+          include_children: selectedSpanId === tracePage!.root_span_id,
+        },
+        signal,
+      ),
+  })
+  const runtimePage = useMemo(
+    () =>
+      tracePage && spanEvents.data ? withEvents(tracePage, spanEvents.data.events) : tracePage,
+    [tracePage, spanEvents.data],
   )
   useEffect(() => {
     if (

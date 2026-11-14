@@ -9,6 +9,8 @@
 import type {
   AgentsPage,
   SessionDetail,
+  SessionEventHeadsPage,
+  SessionEventHeadsQuery,
   SessionEventsPage,
   SessionEventsQuery,
   SessionListQuery,
@@ -16,6 +18,8 @@ import type {
   SessionsPage,
   SessionTracePage,
   SessionTraceQuery,
+  SessionTraceSpanEvents,
+  SessionTraceSpanEventsQuery,
   SessionTranscriptPage,
   SessionTranscriptQuery,
   Task,
@@ -24,6 +28,7 @@ import type {
 import type {
   ApiTaskIndex,
   ApiTaskScheduleEvent,
+  ApiTranscriptMessage,
   InboxCounts,
   InboxItem,
   InboxItemState,
@@ -221,7 +226,22 @@ export type Api = {
     signal?: AbortSignal,
   ): Promise<SessionTranscriptPage>
   trace?(id: string, query?: SessionTraceQuery, signal?: AbortSignal): Promise<SessionTracePage>
+  /** One span's events, for a trace read without events; absent in the prototype. */
+  traceSpanEvents?(
+    id: string,
+    spanId: string,
+    query?: SessionTraceSpanEventsQuery,
+    signal?: AbortSignal,
+  ): Promise<SessionTraceSpanEvents>
   events(id: string, query?: SessionEventsQuery, signal?: AbortSignal): Promise<SessionEventsPage>
+  /** Payload-free heads with the filters and cursors of `events`; absent in the prototype. */
+  eventHeads?(
+    id: string,
+    query?: SessionEventHeadsQuery,
+    signal?: AbortSignal,
+  ): Promise<SessionEventHeadsPage>
+  /** One transcript message whole; absent in the prototype, whose parts are never cut. */
+  transcriptMessage?(id: string, index: number, signal?: AbortSignal): Promise<ApiTranscriptMessage>
   /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
   tasks(): Promise<TaskItem[]>
   taskList(query: TaskIndexQuery & { offset?: number }, signal?: AbortSignal): Promise<TaskItem[]>

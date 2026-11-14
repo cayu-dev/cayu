@@ -198,7 +198,7 @@ def test_trace_shared_live_follower_aborts_hidden_reads_and_drains_terminal_even
 
                 def observe(request):
                     query = parse_qs(urlsplit(request.url).query)
-                    if "/events?" in request.url and query.get("wait_seconds") == ["10"]:
+                    if "/event-heads?" in request.url and query.get("wait_seconds") == ["10"]:
                         requests.append(request.url)
                         long_poll.set()
 

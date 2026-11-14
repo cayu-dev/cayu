@@ -25,6 +25,7 @@ from enum import StrEnum
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
+from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 
 # Prefix for every Cayu-owned table, so Cayu state never collides with an app's own
 # tables in a shared database (ADR 0001, Decision 5).
@@ -658,6 +659,12 @@ REVISIONS: tuple[Revision, ...] = (
     # titled. Older binaries never read it; their artifact writes are drift that
     # `cayu artifact reindex` repairs. Session stores require it.
     Revision(revision=ARTIFACT_INDEX_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # The session trace and event-head pages read cayu_trace_events, a copy of
+    # each event's payload size and the few payload members the trace reads.
+    # Triggers on cayu_events maintain it for every writer, older binaries
+    # included, and the migration copies retained events. Session stores
+    # require it.
+    Revision(revision=TRACE_EVENTS_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

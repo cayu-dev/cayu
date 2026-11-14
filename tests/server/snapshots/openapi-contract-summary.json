@@ -1440,6 +1440,110 @@
       "title": "ApiErrorResponse",
       "type": "object"
     },
+    "ApiEventHead": {
+      "additionalProperties": false,
+      "description": "An event without its payload, as ``ApiEventRecord`` gives the rest of it.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "maxLength": 512,
+          "title": "Id",
+          "type": "string"
+        },
+        "interaction_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Interaction Id"
+        },
+        "payload_bytes": {
+          "description": "Size of the stored payload in bytes, before projection. For display; stores measure it as they keep it.",
+          "minimum": 0.0,
+          "title": "Payload Bytes",
+          "type": "integer"
+        },
+        "sequence": {
+          "minimum": 0.0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "timestamp": {
+          "title": "Timestamp",
+          "type": "string"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "workflow_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Workflow Name"
+        }
+      },
+      "required": [
+        "sequence",
+        "id",
+        "type",
+        "session_id",
+        "interaction_id",
+        "agent_name",
+        "environment_name",
+        "workflow_name",
+        "tool_name",
+        "timestamp",
+        "payload_bytes"
+      ],
+      "title": "ApiEventHead",
+      "type": "object"
+    },
     "ApiEventRecord": {
       "additionalProperties": false,
       "properties": {
@@ -7015,6 +7119,18 @@
     "ApiTraceSpan": {
       "additionalProperties": false,
       "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a tool call, a preview of its arguments from the transcript: the first non-empty string argument, else the arguments as JSON, cut to 200 characters.",
+          "title": "Detail"
+        },
         "ended_at": {
           "anyOf": [
             {
@@ -19006,6 +19122,68 @@
       "title": "LaunchScheduling",
       "type": "object"
     },
+    "ListSessionEventHeadsResponse": {
+      "additionalProperties": false,
+      "description": "``ListSessionEventsResponse`` with heads in place of events.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/components/schemas/ApiEventHead"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Sequence"
+        },
+        "order_by": {
+          "enum": [
+            "sequence_asc",
+            "sequence_desc"
+          ],
+          "title": "Order By",
+          "type": "string"
+        },
+        "scan_through_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scan Through Sequence"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "events",
+        "order_by",
+        "scan_through_sequence",
+        "has_more"
+      ],
+      "title": "ListSessionEventHeadsResponse",
+      "type": "object"
+    },
     "ListSessionEventsResponse": {
       "additionalProperties": false,
       "properties": {
@@ -29428,6 +29606,44 @@
         "spans"
       ],
       "title": "SessionTraceResponse",
+      "type": "object"
+    },
+    "SessionTraceSpanEventsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/components/schemas/ApiEventRecord"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "session_instance_id": {
+          "title": "Session Instance Id",
+          "type": "string"
+        },
+        "span_id": {
+          "title": "Span Id",
+          "type": "string"
+        },
+        "through_sequence": {
+          "minimum": 0.0,
+          "title": "Through Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "session_instance_id",
+        "span_id",
+        "through_sequence",
+        "events"
+      ],
+      "title": "SessionTraceSpanEventsResponse",
       "type": "object"
     },
     "SessionTrajectoryBounds": {
@@ -40345,6 +40561,250 @@
         }
       }
     },
+    "/api/sessions/{session_id}/event-heads": {
+      "get": {
+        "operation_id": "list_session_event_heads_api_sessions__session_id__event_heads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only events with a greater durable sequence.",
+              "title": "After Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only events with a smaller durable sequence.",
+              "title": "Before Sequence"
+            }
+          },
+          {
+            "in": "query",
+            "name": "environment_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Environment Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return the event with this exact session-scoped event ID, if it exists.",
+              "title": "Event Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_event_type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exclude one event type before applying pagination.",
+              "title": "Exclude Event Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interaction_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Return only events attributed to this interaction.",
+              "title": "Interaction Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order_by",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/EventOrder",
+              "default": "sequence_asc",
+              "description": "Return events in durable sequence order."
+            }
+          },
+          {
+            "in": "query",
+            "name": "tool_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tool Name"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wait_seconds",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 25.0,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Long-poll fallback for clients that cannot hold the follow stream open. Wait up to this many seconds for a matching event after `after_sequence` while the session is pending, running, or interrupting, then return the page (possibly empty).",
+              "title": "Wait Seconds"
+            }
+          },
+          {
+            "in": "query",
+            "name": "workflow_name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workflow Name"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ListSessionEventHeadsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/sessions/{session_id}/events": {
       "get": {
         "operation_id": "list_session_events_api_sessions__session_id__events_get",
@@ -42450,6 +42910,17 @@
           },
           {
             "in": "query",
+            "name": "include_events",
+            "required": false,
+            "schema": {
+              "default": true,
+              "description": "Include the page's events. With `false` the response carries the page's spans and their event IDs and `events` is empty; load a selected span's events from `GET /sessions/{session_id}/events`.",
+              "title": "Include Events",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
@@ -42504,6 +42975,98 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/SessionTraceResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/trace/spans/{span_id}/events": {
+      "get": {
+        "operation_id": "get_session_trace_span_events_api_sessions__session_id__trace_spans__span_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "span_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Span Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_children",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Also return the span's direct children's events.",
+              "title": "Include Children",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_instance_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Instance Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "through_sequence",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Through Sequence"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionTraceSpanEventsResponse"
               }
             }
           },
@@ -42573,6 +43136,24 @@
           },
           {
             "in": "query",
+            "name": "max_part_bytes",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 256,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cut longer text and tool-result content to this many UTF-8 bytes and leave out longer tool-result `structured` data and `artifacts`, marking each such part `truncated` with its `full_bytes`. Read the whole message from `GET /sessions/{session_id}/transcript/{message_index}`.",
+              "title": "Max Part Bytes"
+            }
+          },
+          {
+            "in": "query",
             "name": "offset",
             "required": false,
             "schema": {
@@ -42607,6 +43188,53 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/SessionTranscriptResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/{session_id}/transcript/{message_index}": {
+      "get": {
+        "operation_id": "get_session_transcript_message_api_sessions__session_id__transcript__message_index__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "message_index",
+            "required": true,
+            "schema": {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Message Index",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTranscriptMessage"
               }
             }
           },

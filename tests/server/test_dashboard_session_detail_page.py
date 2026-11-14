@@ -1545,7 +1545,7 @@ def test_detail_observation_example_preserves_event_and_transcript_links(monkeyp
                         await route.fulfill(response=response)
 
                 if event_page == "delayed":
-                    await page.route(f"**/api/sessions/{SESSION_ID}/events?*", delay_initial)
+                    await page.route(f"**/api/sessions/{SESSION_ID}/event-heads?*", delay_initial)
                 await page.goto(f"{base}/cayu/sessions/{SESSION_ID}?view=conversation")
                 exercise = asyncio.create_task(_exercise_session_observation(page, base, store))
                 try:
