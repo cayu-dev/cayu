@@ -279,6 +279,9 @@ export function TopBar({ children, actions }: { children?: ReactNode; actions?: 
   )
 }
 
+/** The width table pages use: the whole window, with the body's gutter. */
+export const TABLE_PAGE_WIDTH = "max-w-none"
+
 /**
  * A scrolling page body with a centered column. Back and Forward return it to where it
  * was being read, as a browser does for a whole page; following a link starts at the top.

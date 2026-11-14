@@ -32,6 +32,7 @@ import {
   ROW_LINK_CLASS,
   StateBadge,
   sessionRoute,
+  TABLE_PAGE_WIDTH,
   TopBar,
   useGo,
   useRowClick,
@@ -87,7 +88,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
       >
         Sessions
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         {canStart && starting && (
           <StartSession onPendingChange={setStartPending} onClose={() => setStarting(false)} />
         )}
@@ -278,15 +279,17 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             <table className="w-full min-w-[760px] text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">Session</th>
-                  <th className="px-3 py-2 font-medium">State</th>
-                  <th className="px-3 py-2 text-right font-medium">Updated</th>
-                  <th className="px-3 py-2 text-right font-medium">Duration</th>
-                  <th className="px-3 py-2 text-right font-medium">Tool calls</th>
-                  <th className="px-3 py-2 text-right font-medium">{priced ? "Cost" : "Tokens"}</th>
+                  <th className="px-2 py-1.5 font-medium">Session</th>
+                  <th className="px-2 py-1.5 font-medium">State</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Updated</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Duration</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Tool calls</th>
+                  <th className="px-2 py-1.5 text-right font-medium">
+                    {priced ? "Cost" : "Tokens"}
+                  </th>
                   {/* Columns that differ between rows; often the same on every page. */}
                   {varying.map((column) => (
-                    <th key={column} className="px-3 py-2 font-medium">
+                    <th key={column} className="px-2 py-1.5 font-medium">
                       {column}
                     </th>
                   ))}
@@ -304,7 +307,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                       onClick={rowClick(sessionRoute(row.session.id))}
                       className={ROW_CLASS}
                     >
-                      <td className="min-w-[16rem] max-w-[36rem] px-3 py-2">
+                      <td className="w-full min-w-[16rem] max-w-0 px-2 py-1.5">
                         <div className="flex min-w-0 items-center gap-2">
                           <NavLink
                             {...sessionRoute(row.session.id)}
@@ -328,7 +331,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                           </span>
                         )}
                       </td>
-                      <td className="max-w-sm px-3 py-2">
+                      <td className="max-w-sm px-2 py-1.5">
                         <StateBadge overview={overviewForDisplay(o)} />
                         {o.summary && (
                           <p
@@ -344,16 +347,16 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                           </p>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground">
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                         {relativeTime(Date.parse(o.last_activity_at), now())}
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums">
+                      <td className="px-2 py-1.5 text-right tabular-nums">
                         {formatDuration(duration)}
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums">
+                      <td className="px-2 py-1.5 text-right tabular-nums">
                         {formatCount(o.tool_calls)}
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums">
+                      <td className="px-2 py-1.5 text-right tabular-nums">
                         {priced ? (
                           o.cost ? (
                             <>
@@ -374,7 +377,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                       {varying.map((column) => (
                         <td
                           key={column}
-                          className="px-3 py-2 whitespace-nowrap text-muted-foreground"
+                          className="px-2 py-1.5 whitespace-nowrap text-muted-foreground"
                         >
                           {COLUMNS[column]?.(row) ?? "–"}
                         </td>

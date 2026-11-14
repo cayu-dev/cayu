@@ -44,7 +44,7 @@ import {
   suiteSelector,
   suiteViewRoute,
 } from "../../app/eval-view-model"
-import { NavLink, PageBody, sessionRoute, TopBar, useGo } from "../common"
+import { NavLink, PageBody, sessionRoute, TABLE_PAGE_WIDTH, TopBar, useGo } from "../common"
 import { ComparisonSummary } from "./comparison-details"
 import { ReportedRunPage } from "./reported-pages"
 import {
@@ -444,7 +444,7 @@ export function EvalRunViewPage() {
         )}
         <span className="truncate">{r?.suite_name ?? "Run"}</span>
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <LoadState
           error={query.error}
           pending={query.isPending}

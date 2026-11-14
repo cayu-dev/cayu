@@ -2,7 +2,7 @@
  * Every tool the agent's specialists can call: where it comes from, what it can change,
  * whether it asks a person first, and how it has been used, with links into the calls.
  */
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
+import { keepPreviousData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { ChevronRight, Search } from "lucide-react"
 import { Fragment, useMemo, useState } from "react"
@@ -12,8 +12,17 @@ import { useUnchangedBackoff } from "../../parts/backoff"
 import type { ToolApproval, ToolSource, ToolUsage, ToolWithDisplay } from "../api/types"
 import { TOOL_POLL_MS, useSpecialists, useToolUsage } from "../app/queries"
 import { useApi, useNow } from "../app/services"
-import { relativeTime } from "../app/session-model"
-import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar, useGo } from "./common"
+import { relativeTime, sessionDisplayTitle } from "../app/session-model"
+import {
+  EmptyState,
+  ErrorState,
+  NavLink,
+  PageBody,
+  sessionRoute,
+  TABLE_PAGE_WIDTH,
+  TopBar,
+  useGo,
+} from "./common"
 
 type ToolRow = {
   key: string
@@ -116,7 +125,7 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar>Tools</TopBar>
-      <PageBody width="max-w-5xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <p className="text-sm text-muted-foreground">
           Every tool this agent's specialists can call.
         </p>
@@ -160,14 +169,14 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
             <table className="w-full min-w-[820px] text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">Tool</th>
-                  <th className="px-3 py-2 font-medium">Source</th>
-                  <th className="px-3 py-2 font-medium">Effect</th>
-                  <th className="px-3 py-2 font-medium">Approval</th>
-                  <th className="px-3 py-2 font-medium">Used by</th>
-                  <th className="px-3 py-2 text-right font-medium">Calls</th>
-                  <th className="px-3 py-2 text-right font-medium">Failed</th>
-                  <th className="px-3 py-2 text-right font-medium">Last used</th>
+                  <th className="px-2 py-1.5 font-medium">Tool</th>
+                  <th className="px-2 py-1.5 font-medium">Source</th>
+                  <th className="px-2 py-1.5 font-medium">Effect</th>
+                  <th className="px-2 py-1.5 font-medium">Approval</th>
+                  <th className="px-2 py-1.5 font-medium">Used by</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Calls</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Failed</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Last used</th>
                 </tr>
               </thead>
               <tbody>
@@ -184,7 +193,7 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
                           expanded && "bg-muted/60",
                         )}
                       >
-                        <td className="max-w-[18rem] px-3 py-2">
+                        <td className="w-full min-w-[14rem] max-w-0 px-2 py-1.5">
                           <div className="flex items-center gap-1.5">
                             <ChevronRight
                               className={cn(
@@ -207,39 +216,39 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
                             {r.tool.description}
                           </div>
                         </td>
-                        <td className="max-w-[12rem] px-3 py-2 text-muted-foreground">
+                        <td className="max-w-[12rem] px-2 py-1.5 text-muted-foreground">
                           <div className="whitespace-nowrap">{source.label}</div>
                           {source.detail && (
                             <div className="truncate font-mono text-[11px]">{source.detail}</div>
                           )}
                         </td>
                         <td
-                          className={cn("px-3 py-2 whitespace-nowrap", effect.tone)}
+                          className={cn("px-2 py-1.5 whitespace-nowrap", effect.tone)}
                           title={effect.title}
                         >
                           {effect.label}
                         </td>
                         <td
-                          className={cn("px-3 py-2 whitespace-nowrap", approval?.tone)}
+                          className={cn("px-2 py-1.5 whitespace-nowrap", approval?.tone)}
                           title={approval?.title}
                         >
                           {approval?.label ?? "–"}
                         </td>
-                        <td className="max-w-[12rem] truncate px-3 py-2 text-muted-foreground">
+                        <td className="max-w-[12rem] truncate px-2 py-1.5 text-muted-foreground">
                           {r.specialists.join(", ")}
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
+                        <td className="px-2 py-1.5 text-right tabular-nums">
                           {r.usage?.calls ?? "–"}
                         </td>
                         <td
                           className={cn(
-                            "px-3 py-2 text-right tabular-nums",
+                            "px-2 py-1.5 text-right tabular-nums",
                             (r.usage?.failed ?? 0) > 0 && "text-destructive",
                           )}
                         >
                           {r.usage?.failed ?? "–"}
                         </td>
-                        <td className="px-3 py-2 text-right whitespace-nowrap text-muted-foreground tabular-nums">
+                        <td className="px-2 py-1.5 text-right whitespace-nowrap text-muted-foreground tabular-nums">
                           {r.usage?.last_used_at
                             ? relativeTime(Date.parse(r.usage.last_used_at), now())
                             : r.usage
@@ -264,6 +273,42 @@ export function ToolsPage({ usageEnabled = true }: { usageEnabled?: boolean } = 
       </PageBody>
     </div>
   )
+}
+
+/** Titles of the listed sessions, by ID, from one `sessions?ids=` read. */
+function useSessionTitles(ids: string[]) {
+  const api = useApi()
+  // Sorted, so a new call reordering the list doesn't refetch every title.
+  const unique = [...new Set(ids)].slice(0, 200).sort()
+  return useQuery({
+    queryKey: ["session-titles", unique],
+    enabled: unique.length > 0,
+    staleTime: 60_000,
+    // Titles already shown stay while a newly listed session's title loads.
+    placeholderData: keepPreviousData,
+    queryFn: async ({ signal }) => {
+      const page = await api.sessions(
+        { ids: unique, include: ["overview", "first_message"] },
+        signal,
+      )
+      const overviews = new Map((page.overviews ?? []).map((o) => [o.session_id, o]))
+      // The same title the Sessions list shows: its own, else its first message.
+      return new Map(
+        page.sessions.map((session) => {
+          const overview = overviews.get(session.id)
+          const first = overview?.first_message
+          return [
+            session.id,
+            sessionDisplayTitle(
+              session,
+              overview?.title,
+              first ? { role: "user", content: [{ type: "text", text: first }] } : undefined,
+            ),
+          ]
+        }),
+      )
+    },
+  })
 }
 
 function ToolDetail({
@@ -312,43 +357,17 @@ function ToolDetail({
   ]
   const approvals = usage?.approvals
   const source = sourceText(tool.source)
+  // Only the list the detail shows: the calls history when the API has it, else recent.
+  const titles = useSessionTitles(
+    api.toolCalls
+      ? visibleCalls.map((call) => call.session_id)
+      : (usage?.recent ?? []).map((call) => call.session_id),
+  )
+  const sessionName = (id: string) => titles.data?.get(id) || id
   return (
     <div className="grid gap-5 [overflow-wrap:anywhere] lg:grid-cols-2">
       <div className="min-w-0 space-y-3">
-        <p className="text-xs text-muted-foreground">
-          Source: {source.label}
-          {source.detail ? ` · ${source.detail}` : ""}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          Approval policy:{" "}
-          {tool.approval ? (APPROVAL[tool.approval]?.label ?? "Unknown") : "Unknown"}
-        </p>
-        <section aria-label="Policy conditions" className="space-y-2">
-          <p className="text-xs font-medium text-muted-foreground">Policy conditions</p>
-          {tool.policy_conditions == null ? (
-            <p>This Runtime does not publish policy conditions.</p>
-          ) : (
-            <ul className="list-disc space-y-1 pl-4">
-              {tool.policy_conditions.map((condition, index) => (
-                <li key={index}>{condition}</li>
-              ))}
-            </ul>
-          )}
-          {tool.policy_conditions != null && !tool.policy_conditions_complete ? (
-            <p>
-              Some conditions are private or application-defined; this explanation is incomplete.
-            </p>
-          ) : null}
-          <p className="text-xs text-muted-foreground">
-            These declarations do not authorize a call. Argument validation, grants, mandatory
-            controls, hooks and execution admission still apply.
-          </p>
-        </section>
         <div>
-          <p className="text-xs text-muted-foreground">
-            {row.specialists.length} published{" "}
-            {row.specialists.length === 1 ? "declaration" : "declarations"} with this configuration.
-          </p>
           <p className="text-xs font-medium text-muted-foreground">Description</p>
           <p className="mt-1">{tool.description || "–"}</p>
         </div>
@@ -369,6 +388,49 @@ function ToolDetail({
           {tool.parallel_safe ? " · can run in parallel" : ""}
           {tool.workspace_mutation ? " · changes the workspace" : ""}
         </p>
+        {/* Where the tool comes from and what its policy says: reference, not the decision. */}
+        <details className="text-xs">
+          <summary className="cursor-pointer font-medium text-muted-foreground">
+            Policy and source
+          </summary>
+          <div className="mt-2 space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Source: {source.label}
+              {source.detail ? ` · ${source.detail}` : ""}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Approval policy:{" "}
+              {tool.approval ? (APPROVAL[tool.approval]?.label ?? "Unknown") : "Unknown"}
+            </p>
+            <section aria-label="Policy conditions" className="space-y-2">
+              <p className="text-xs font-medium text-muted-foreground">Policy conditions</p>
+              {tool.policy_conditions == null ? (
+                <p>This Runtime does not publish policy conditions.</p>
+              ) : (
+                <ul className="list-disc space-y-1 pl-4">
+                  {tool.policy_conditions.map((condition, index) => (
+                    <li key={index}>{condition}</li>
+                  ))}
+                </ul>
+              )}
+              {tool.policy_conditions != null && !tool.policy_conditions_complete ? (
+                <p>
+                  Some conditions are private or application-defined; this explanation is
+                  incomplete.
+                </p>
+              ) : null}
+              <p className="text-xs text-muted-foreground">
+                These declarations do not authorize a call. Argument validation, grants, mandatory
+                controls, hooks and execution admission still apply.
+              </p>
+            </section>
+            <p className="text-xs text-muted-foreground">
+              {row.specialists.length} published{" "}
+              {row.specialists.length === 1 ? "declaration" : "declarations"} with this
+              configuration.
+            </p>
+          </div>
+        </details>
       </div>
       <div className="min-w-0 space-y-3">
         {approvals && (
@@ -441,7 +503,8 @@ function ToolDetail({
                         }}
                         className="block rounded px-1 py-1 text-sm hover:bg-background [overflow-wrap:anywhere]"
                       >
-                        {call.session_id} · {call.outcome.replaceAll("_", " ")} ·{" "}
+                        <span title={call.session_id}>{sessionName(call.session_id)}</span> ·{" "}
+                        {call.outcome.replaceAll("_", " ")} ·{" "}
                         {relativeTime(Date.parse(call.timestamp), now)}
                       </NavLink>
                     </li>
@@ -481,7 +544,9 @@ function ToolDetail({
                       )}
                       aria-hidden="true"
                     />
-                    <span className="min-w-0 flex-1 truncate">{c.session_id}</span>
+                    <span className="min-w-0 flex-1 truncate" title={c.session_id}>
+                      {sessionName(c.session_id)}
+                    </span>
                     <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
                       {relativeTime(Date.parse(c.at), now)}
                     </span>

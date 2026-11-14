@@ -31,6 +31,7 @@ import {
   ROW_LINK_CLASS,
   StateDot,
   sessionRoute,
+  TABLE_PAGE_WIDTH,
   TopBar,
   useRowClick,
 } from "./common"
@@ -92,7 +93,7 @@ function EnvironmentList() {
       >
         Environments
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <p className="text-sm text-muted-foreground">
           Where your agent's sessions run, and what they can reach there.
         </p>
@@ -128,12 +129,12 @@ function EnvironmentList() {
             <table className="w-full text-sm md:min-w-[820px]">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">Environment</th>
-                  <th className="hidden px-3 py-2 font-medium md:table-cell">Commands run in</th>
-                  <th className="hidden px-3 py-2 font-medium md:table-cell">Workspace</th>
-                  <th className="hidden px-3 py-2 font-medium md:table-cell">Files</th>
-                  <th className="hidden px-3 py-2 font-medium md:table-cell">Knowledge</th>
-                  <th className="px-3 py-2 text-right font-medium">Last activity</th>
+                  <th className="px-2 py-1.5 font-medium">Environment</th>
+                  <th className="hidden px-2 py-1.5 font-medium md:table-cell">Commands run in</th>
+                  <th className="hidden px-2 py-1.5 font-medium md:table-cell">Workspace</th>
+                  <th className="hidden px-2 py-1.5 font-medium md:table-cell">Files</th>
+                  <th className="hidden px-2 py-1.5 font-medium md:table-cell">Knowledge</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Last activity</th>
                 </tr>
               </thead>
               <tbody>
@@ -146,7 +147,7 @@ function EnvironmentList() {
                       onClick={rowClick(environmentRoute(env.name))}
                       className={ROW_CLASS}
                     >
-                      <td className="max-w-[16rem] px-3 py-2.5 max-md:max-w-[15rem]">
+                      <td className="w-full min-w-[14rem] max-w-0 px-2 py-1.5">
                         <div className="flex min-w-0 items-center gap-2">
                           <Box
                             className="size-4 shrink-0 text-muted-foreground"
@@ -166,13 +167,13 @@ function EnvironmentList() {
                           {mcpShort(env)}
                         </div>
                       </td>
-                      <td className="hidden px-3 py-2.5 md:table-cell">
+                      <td className="hidden px-2 py-1.5 md:table-cell">
                         <div>{runsOn(env)}</div>
                         <div className="mt-0.5 text-xs text-muted-foreground">
                           {runsOnShort(env)}
                         </div>
                       </td>
-                      <td className="hidden px-3 py-2.5 md:table-cell">
+                      <td className="hidden px-2 py-1.5 md:table-cell">
                         <div>{brief(workspaceLabel(env))}</div>
                         {workspace && (
                           <div className="mt-0.5 text-xs text-muted-foreground">
@@ -180,13 +181,13 @@ function EnvironmentList() {
                           </div>
                         )}
                       </td>
-                      <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
+                      <td className="hidden px-2 py-1.5 text-muted-foreground md:table-cell">
                         {brief(artifactStorageText(env))}
                       </td>
-                      <td className="hidden px-3 py-2.5 text-muted-foreground md:table-cell">
+                      <td className="hidden px-2 py-1.5 text-muted-foreground md:table-cell">
                         {brief(knowledgeText(env))}
                       </td>
-                      <td className="px-3 py-2.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                         <div title={activity?.last ?? undefined}>
                           {activity
                             ? activity.last

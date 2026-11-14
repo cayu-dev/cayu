@@ -15,7 +15,16 @@ import {
   suiteSelector,
   suiteViewRoute,
 } from "../../app/eval-view-model"
-import { NavLink, PageBody, ROW_CLASS, ROW_LINK_CLASS, TopBar, useGo, useRowClick } from "../common"
+import {
+  NavLink,
+  PageBody,
+  ROW_CLASS,
+  ROW_LINK_CLASS,
+  TABLE_PAGE_WIDTH,
+  TopBar,
+  useGo,
+  useRowClick,
+} from "../common"
 import {
   DateText,
   FIELD_CLASS,
@@ -88,7 +97,7 @@ export function EvalsIndexPage() {
       >
         Evals
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <p className="mt-1 text-sm text-muted-foreground">
           Suites, and how their latest runs compare with an approved baseline.
         </p>
@@ -141,7 +150,7 @@ export function EvalsIndexPage() {
                   <thead>
                     <tr className="border-b border-border text-left text-xs text-muted-foreground">
                       {["Suite", "Cases", "Last run", "Against baseline", "Baseline"].map((h) => (
-                        <th key={h} className="px-3 py-2 font-medium">
+                        <th key={h} className="px-2 py-1.5 font-medium">
                           {h}
                         </th>
                       ))}
@@ -150,7 +159,7 @@ export function EvalsIndexPage() {
                   <tbody>
                     {suites.data.items.map((s) => (
                       <tr key={s.id} className={ROW_CLASS} onClick={rowClick(suiteViewRoute(s.id))}>
-                        <td className="max-w-80 px-3 py-2">
+                        <td className="max-w-80 px-2 py-1.5">
                           <NavLink
                             {...suiteViewRoute(s.id)}
                             className={`${ROW_LINK_CLASS} block truncate`}
@@ -167,8 +176,8 @@ export function EvalsIndexPage() {
                             {"trials" in s && ` · ${s.trials.trial_count} trials`}
                           </p>
                         </td>
-                        <td className="px-3 py-2 tabular-nums">{s.case_count}</td>
-                        <td className="px-3 py-2">
+                        <td className="px-2 py-1.5 tabular-nums">{s.case_count}</td>
+                        <td className="px-2 py-1.5">
                           {s.last_run ? (
                             <>
                               <NavLink
@@ -193,8 +202,10 @@ export function EvalsIndexPage() {
                             <span className="text-muted-foreground">Not run yet</span>
                           )}
                         </td>
-                        <td className="px-3 py-2">{s.last_run && <Verdict run={s.last_run} />}</td>
-                        <td className="max-w-56 px-3 py-2 text-xs text-muted-foreground">
+                        <td className="px-2 py-1.5">
+                          {s.last_run && <Verdict run={s.last_run} />}
+                        </td>
+                        <td className="max-w-56 px-2 py-1.5 text-xs text-muted-foreground">
                           {s.baseline ? (
                             <>
                               {baselineApprovalLabel(s.baseline.updated_by)}

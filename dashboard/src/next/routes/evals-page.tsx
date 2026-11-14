@@ -29,6 +29,7 @@ import {
   PageBody,
   ROW_CLASS,
   ROW_LINK_CLASS,
+  TABLE_PAGE_WIDTH,
   TopBar,
   useRowClick,
 } from "./common"
@@ -275,7 +276,7 @@ export function EvalsPage() {
       >
         Evals
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         {creating && <NewSuite onClose={() => setCreating(false)} />}
         <p className="text-sm text-muted-foreground">
           Suites of cases the agent should keep getting right. Each run is compared with the suite's
@@ -306,17 +307,17 @@ export function EvalsPage() {
             <table className="w-full min-w-[760px] text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">Suite</th>
-                  <th className="px-3 py-2 text-right font-medium">Cases</th>
-                  <th className="px-3 py-2 font-medium">Last run</th>
-                  <th className="px-3 py-2 font-medium">Against baseline</th>
-                  <th className="px-3 py-2 font-medium">Baseline</th>
+                  <th className="px-2 py-1.5 font-medium">Suite</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Cases</th>
+                  <th className="px-2 py-1.5 font-medium">Last run</th>
+                  <th className="px-2 py-1.5 font-medium">Against baseline</th>
+                  <th className="px-2 py-1.5 font-medium">Baseline</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((s) => (
                   <tr key={s.id} onClick={rowClick(suiteRoute(s.id))} className={ROW_CLASS}>
-                    <td className="max-w-[22rem] px-3 py-2">
+                    <td className="w-full min-w-[14rem] max-w-0 px-2 py-1.5">
                       <NavLink
                         {...suiteRoute(s.id)}
                         className={cn("block truncate", ROW_LINK_CLASS)}
@@ -328,8 +329,8 @@ export function EvalsPage() {
                         {s.trials.per_case > 1 && ` · ${s.trials.per_case} trials`}
                       </div>
                     </td>
-                    <td className="px-3 py-2 text-right tabular-nums">{s.case_count}</td>
-                    <td className="px-3 py-2">
+                    <td className="px-2 py-1.5 text-right tabular-nums">{s.case_count}</td>
+                    <td className="px-2 py-1.5">
                       {s.last_run ? (
                         <div>
                           {s.last_run.status === "completed" ? (
@@ -346,10 +347,10 @@ export function EvalsPage() {
                         <span className="text-muted-foreground">Never run</span>
                       )}
                     </td>
-                    <td className="px-3 py-2">
+                    <td className="px-2 py-1.5">
                       {s.last_run?.status === "completed" ? <VerdictText run={s.last_run} /> : "–"}
                     </td>
-                    <td className="px-3 py-2 text-xs text-muted-foreground">
+                    <td className="px-2 py-1.5 text-xs text-muted-foreground">
                       {s.baseline ? (
                         <>
                           <span className="text-foreground tabular-nums">

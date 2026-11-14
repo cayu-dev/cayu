@@ -32,6 +32,7 @@ import {
   PageBody,
   ROW_CLASS,
   ROW_LINK_CLASS,
+  TABLE_PAGE_WIDTH,
   TopBar,
   taskRoute,
   useGo,
@@ -120,7 +121,7 @@ export function TasksPage() {
       >
         Tasks
       </TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         {creating && (
           <StartSession
             initialMode="task"
@@ -266,14 +267,14 @@ export function TasksPage() {
             <table className="w-full min-w-[680px] text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">Task</th>
-                  <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-2 py-1.5 font-medium">Task</th>
+                  <th className="px-2 py-1.5 font-medium">Status</th>
                   {varying.map((c) => (
-                    <th key={c} className="px-3 py-2 font-medium">
+                    <th key={c} className="px-2 py-1.5 font-medium">
                       {c}
                     </th>
                   ))}
-                  <th className="px-3 py-2 text-right font-medium">Updated</th>
+                  <th className="px-2 py-1.5 text-right font-medium">Updated</th>
                 </tr>
               </thead>
               <tbody>
@@ -282,7 +283,7 @@ export function TasksPage() {
                   const status = statusLine(failedById.get(t.id) ?? t, all, now(), undefined, false)
                   return (
                     <tr key={t.id} onClick={rowClick(taskRoute(t.id))} className={ROW_CLASS}>
-                      <td className="max-w-[26rem] px-3 py-2">
+                      <td className="w-full min-w-[14rem] max-w-0 px-2 py-1.5">
                         <div className="flex min-w-0 items-center gap-2">
                           <span
                             className={cn("size-2 shrink-0 rounded-full", GROUP_DOT[group])}
@@ -301,17 +302,17 @@ export function TasksPage() {
                           {t.type}
                         </div>
                       </td>
-                      <td className={cn("max-w-[22rem] px-3 py-2", GROUP_TEXT[group])}>
+                      <td className={cn("max-w-[22rem] px-2 py-1.5", GROUP_TEXT[group])}>
                         <span title={status} className="line-clamp-2">
                           {status}
                         </span>
                       </td>
                       {varying.map((c) => (
-                        <td key={c} className="px-3 py-2 whitespace-nowrap text-muted-foreground">
+                        <td key={c} className="px-2 py-1.5 whitespace-nowrap text-muted-foreground">
                           {COLUMNS[c]?.(t) ?? "–"}
                         </td>
                       ))}
-                      <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground">
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                         {relativeTime(Date.parse(t.updated_at), now())}
                       </td>
                     </tr>

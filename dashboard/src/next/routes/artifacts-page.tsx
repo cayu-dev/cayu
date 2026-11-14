@@ -27,6 +27,7 @@ import {
   ROW_CLASS,
   ROW_LINK_CLASS,
   sessionRoute,
+  TABLE_PAGE_WIDTH,
   TopBar,
   useGo,
   useRowClick,
@@ -126,7 +127,7 @@ export function ArtifactsPage() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TopBar>Artifacts</TopBar>
-      <PageBody width="max-w-6xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <p className="text-sm text-muted-foreground">
           Files your agent's sessions saved: reports, data, images and archives.
         </p>
@@ -275,11 +276,13 @@ export function ArtifactsPage() {
               <table className="w-full text-sm sm:min-w-[720px]">
                 <thead>
                   <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                    <th className="px-3 py-2 font-medium">File</th>
-                    <th className="hidden px-3 py-2 font-medium sm:table-cell">Kind</th>
-                    <th className="hidden px-3 py-2 text-right font-medium sm:table-cell">Size</th>
-                    <th className="hidden px-3 py-2 font-medium sm:table-cell">Made by</th>
-                    <th className="px-3 py-2 text-right font-medium">Saved</th>
+                    <th className="px-2 py-1.5 font-medium">File</th>
+                    <th className="hidden px-2 py-1.5 font-medium sm:table-cell">Kind</th>
+                    <th className="hidden px-2 py-1.5 text-right font-medium sm:table-cell">
+                      Size
+                    </th>
+                    <th className="hidden px-2 py-1.5 font-medium sm:table-cell">Made by</th>
+                    <th className="px-2 py-1.5 text-right font-medium">Saved</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -292,7 +295,7 @@ export function ArtifactsPage() {
                         onClick={rowClick(openRoute(a))}
                         className={cn(ROW_CLASS, isOpen(a) && "bg-muted/60")}
                       >
-                        <td className="max-w-[22rem] px-3 py-2 max-sm:max-w-[17rem]">
+                        <td className="w-full min-w-[14rem] max-w-0 px-2 py-1.5">
                           <div className="flex min-w-0 items-center gap-2">
                             <Icon
                               className="size-4 shrink-0 text-muted-foreground"
@@ -312,16 +315,16 @@ export function ArtifactsPage() {
                             {a.session_id ? artifactTitle(a) : "Shared file"}
                           </div>
                         </td>
-                        <td className="hidden px-3 py-2 whitespace-nowrap text-muted-foreground sm:table-cell">
+                        <td className="hidden px-2 py-1.5 whitespace-nowrap text-muted-foreground sm:table-cell">
                           {kind.label}
                         </td>
-                        <td className="hidden px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground sm:table-cell">
+                        <td className="hidden px-2 py-1.5 text-right whitespace-nowrap tabular-nums text-muted-foreground sm:table-cell">
                           {formatBytes(a.size_bytes)}
                         </td>
-                        <td className="hidden max-w-[20rem] px-3 py-2 sm:table-cell">
+                        <td className="hidden max-w-[20rem] px-2 py-1.5 sm:table-cell">
                           <MadeBy artifact={a} />
                         </td>
-                        <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground">
+                        <td className="px-2 py-1.5 text-right whitespace-nowrap tabular-nums text-muted-foreground">
                           {relativeTime(Date.parse(a.created_at), now())}
                         </td>
                       </tr>

@@ -34,6 +34,7 @@ import {
   ROW_LINK_CLASS,
   StateDot,
   sessionRoute,
+  TABLE_PAGE_WIDTH,
   TopBar,
   useGo,
   useRowClick,
@@ -258,7 +259,7 @@ export function UsagePage() {
       >
         Usage
       </TopBar>
-      <PageBody width="max-w-5xl">
+      <PageBody width={TABLE_PAGE_WIDTH}>
         <RangePicker
           range={range}
           window={shownWindow}
@@ -825,12 +826,12 @@ function ModelSplit({ data, search }: { data: UsageRollup; search: UsageSearch }
           <table aria-label="Cost and usage by provider and model" className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                <th className="px-3 py-2 font-medium">Provider and model</th>
-                <th className="px-3 py-2 text-right font-medium">Sessions</th>
-                <th className="hidden px-3 py-2 text-right font-medium sm:table-cell">Steps</th>
-                <th className="px-3 py-2 text-right font-medium">Tokens</th>
-                {showCost && <th className="px-3 py-2 text-right font-medium">Estimated cost</th>}
-                <th className="hidden w-32 px-3 py-2 font-medium sm:table-cell">
+                <th className="px-2 py-1.5 font-medium">Provider and model</th>
+                <th className="px-2 py-1.5 text-right font-medium">Sessions</th>
+                <th className="hidden px-2 py-1.5 text-right font-medium sm:table-cell">Steps</th>
+                <th className="px-2 py-1.5 text-right font-medium">Tokens</th>
+                {showCost && <th className="px-2 py-1.5 text-right font-medium">Estimated cost</th>}
+                <th className="hidden w-32 px-2 py-1.5 font-medium sm:table-cell">
                   <span className="sr-only">Share of tokens</span>
                 </th>
               </tr>
@@ -848,7 +849,7 @@ function ModelSplit({ data, search }: { data: UsageRollup; search: UsageSearch }
               ))}
               {rest && (
                 <tr className="border-t border-border text-muted-foreground">
-                  <td className="px-3 py-2 pl-7">
+                  <td className="px-2 py-1.5 pl-7">
                     {formatCount(rest.group_count)} other model
                     {rest.group_count === "1" ? "" : "s"}
                   </td>
@@ -900,7 +901,7 @@ function ProviderRows({
   return (
     <>
       <tr className="border-b border-border bg-muted/30">
-        <td className="px-3 py-2 font-medium">
+        <td className="px-2 py-1.5 font-medium">
           {group.provider ? (
             <NavLink
               to="/sessions"
@@ -934,7 +935,7 @@ function ProviderRows({
       </tr>
       {group.models.map((m) => (
         <tr key={m.model ?? "unknown"} className="border-b border-border last:border-0">
-          <td className="w-full max-w-0 px-3 py-2 pl-7">
+          <td className="w-full max-w-0 px-2 py-1.5 pl-7">
             {m.model ? (
               <NavLink
                 to="/sessions"
@@ -980,22 +981,22 @@ function Numbers({
   const share = Number(totals.usage.total_tokens) / total
   return (
     <>
-      <td className="px-3 py-2 text-right tabular-nums">{formatCount(totals.session_count)}</td>
-      <td className="hidden px-3 py-2 text-right tabular-nums sm:table-cell">
+      <td className="px-2 py-1.5 text-right tabular-nums">{formatCount(totals.session_count)}</td>
+      <td className="hidden px-2 py-1.5 text-right tabular-nums sm:table-cell">
         {formatCount(totals.model_steps)}
       </td>
       <td
-        className="px-3 py-2 text-right tabular-nums"
+        className="px-2 py-1.5 text-right tabular-nums"
         title={`${formatCount(totals.usage.input_tokens)} in · ${formatCount(totals.usage.output_tokens)} out`}
       >
         {compact(totals.usage.total_tokens)}
       </td>
       {showCost && (
-        <td className="px-3 py-2 text-right tabular-nums">
+        <td className="px-2 py-1.5 text-right tabular-nums">
           <CostValue cost={cost} />
         </td>
       )}
-      <td className="hidden px-3 py-2 sm:table-cell">
+      <td className="hidden px-2 py-1.5 sm:table-cell">
         <div className="flex items-center gap-2">
           <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
             <div
@@ -1039,10 +1040,10 @@ function TopSessions({ data }: { data: UsageRollup }) {
           <table aria-label={title} className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                <th className="px-3 py-2 font-medium">Session</th>
-                <th className="hidden px-3 py-2 font-medium sm:table-cell">Specialist</th>
-                <th className="px-3 py-2 text-right font-medium">Tokens</th>
-                {showCost && <th className="px-3 py-2 text-right font-medium">Estimated cost</th>}
+                <th className="px-2 py-1.5 font-medium">Session</th>
+                <th className="hidden px-2 py-1.5 font-medium sm:table-cell">Specialist</th>
+                <th className="px-2 py-1.5 text-right font-medium">Tokens</th>
+                {showCost && <th className="px-2 py-1.5 text-right font-medium">Estimated cost</th>}
               </tr>
             </thead>
             <tbody>
@@ -1056,7 +1057,7 @@ function TopSessions({ data }: { data: UsageRollup }) {
                     onClick={rowClick(sessionRoute(g.session_id))}
                     className={ROW_CLASS}
                   >
-                    <td className="w-full max-w-0 px-3 py-2">
+                    <td className="w-full max-w-0 px-2 py-1.5">
                       <div className="flex min-w-0 items-center gap-2">
                         <StateDot
                           state={
@@ -1074,17 +1075,17 @@ function TopSessions({ data }: { data: UsageRollup }) {
                         {specialist}
                       </div>
                     </td>
-                    <td className="hidden px-3 py-2 whitespace-nowrap text-muted-foreground sm:table-cell">
+                    <td className="hidden px-2 py-1.5 whitespace-nowrap text-muted-foreground sm:table-cell">
                       {specialist}
                     </td>
                     <td
-                      className="px-3 py-2 text-right tabular-nums"
+                      className="px-2 py-1.5 text-right tabular-nums"
                       title={`${formatCount(g.totals.model_steps)} model steps · ${formatCount(g.totals.tool_calls)} tool calls`}
                     >
                       {compact(g.totals.usage.total_tokens)}
                     </td>
                     {showCost && (
-                      <td className="px-3 py-2 text-right tabular-nums">
+                      <td className="px-2 py-1.5 text-right tabular-nums">
                         <CostValue cost={cost} />
                       </td>
                     )}
