@@ -608,3 +608,85 @@ def test_cayu_check_checks_the_web_app(
     found = {item["code"] for item in json.loads(capsys.readouterr().out)["diagnostics"]}
     ui_codes = {item for item in found if item.startswith("SERVE_UI_")}
     assert ui_codes == (set() if code is None else {code})
+
+
+# The pattern cayu-scout, cayu-shepherd and cayu-herald use for their own routes: ask the
+# auth only who is calling (`authenticate`), then apply the Agent's own role rule.
+_OWN_ROLE_RULE_ROUTES = """import inspect
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from cayu.server import AuthContext
+
+
+def build_router(app, *, development, auth):
+    authenticate = getattr(auth, "authenticate", None)
+    who = authenticate if callable(authenticate) else auth
+
+    async def person(request: Request):
+        found = who(request)
+        if inspect.isawaitable(found):
+            found = await found
+        context = (
+            found if isinstance(found, AuthContext) else AuthContext.model_validate(dict(found))
+        )
+        role = context.claims.get("role", "admin")
+        if role not in ("admin", "developer", "member"):
+            raise HTTPException(status_code=403)
+        return {"subject": context.subject, "role": role}
+
+    router = APIRouter()
+
+    @router.get("/app/whoami")
+    async def whoami(signed_in=Depends(person)):
+        return signed_in
+
+    return router
+"""
+
+_CLOUD_SIGN_IN_AUTH = """from cayu.server import BasicAuth, ProxyIdentityAuth
+from cayu.server.development_identity import registered_development_identity
+
+_proxy = registered_development_identity()
+AUTH = ProxyIdentityAuth(
+    issuer=_proxy.issuer,
+    audience=_proxy.audience,
+    signing_keys=_proxy.signing_keys(),
+    fallback=BasicAuth(username="operator", password="secret"),
+)
+"""
+
+
+def test_a_router_with_its_own_role_rule_signs_in_cloud_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launched: dict[str, Any],
+) -> None:
+    pytest.importorskip("jwt")
+    from cayu.server.development_identity import DevelopmentIdentityProxy
+
+    proxy = DevelopmentIdentityProxy()
+    proxy.register()
+    try:
+        project = _project(
+            tmp_path,
+            'routers = ["own_role_rule_routes:build_router"]\nauth = "cloud_sign_in_auth:AUTH"\n',
+        )
+        (project / "own_role_rule_routes.py").write_text(_OWN_ROLE_RULE_ROUTES, encoding="utf-8")
+        (project / "cloud_sign_in_auth.py").write_text(_CLOUD_SIGN_IN_AUTH, encoding="utf-8")
+        for module in ("own_role_rule_routes", "cloud_sign_in_auth"):
+            monkeypatch.delitem(sys.modules, module, raising=False)
+        monkeypatch.chdir(project)
+
+        assert main(["serve", "--host", "127.0.0.1"]) == 0
+
+        client = TestClient(launched["server"], base_url="http://127.0.0.1")
+        # Cayu's route rule admits a member only on the Developer dashboard's API. The
+        # auth `cayu serve` passes keeps `authenticate`, so the router's own rule decides.
+        for subject, role in (("mel", "member"), ("dee", "developer"), ("ada", "admin")):
+            signed_in = client.get("/app/whoami", headers=proxy.headers(subject, role=role))
+            assert signed_in.json() == {"subject": subject, "role": role}
+        # It still authenticates: a request with no identity and no operator login is refused.
+        assert client.get("/app/whoami").status_code == 401
+    finally:
+        proxy.unregister()
