@@ -30,8 +30,9 @@ and reading its task store derive no evidence, so these commands don't need the
 real key. `cayu check --json` lists the finding with its other diagnostics.
 `cayu inspect --json` adds a `diagnostics` list holding it to its output, also
 with `--retry-key` and `--fenced-tasks`, and `cayu inspect --table` prints it as
-a note on stderr. Commands that run the Agent, such as `cayu eval run`, store
-memory evidence and still need a real, stable key. `cayu new` creates the file,
+a note on stderr. Commands that run the Agent store memory evidence and need a
+real, stable key; `cayu eval run` lends one only to a fresh local store, as
+`memory-evidence-key-required` below describes. `cayu new` creates the file,
 but it is git-ignored, so a fresh checkout such as a CI job has none. The root
 `conftest.py` of a project made by `cayu new` then gives the tests a throwaway
 key for the pytest run. In a project without that conftest, tests that build the
