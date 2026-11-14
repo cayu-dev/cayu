@@ -395,6 +395,20 @@ def bound_artifact_index_writers(store: ArtifactStore) -> tuple[ArtifactIndexWri
     return tuple(getattr(store, "__dict__", {}).get(_WRITERS_ATTRIBUTE, ()))
 
 
+async def _mark_unfilled(writer: ArtifactIndexWriter, store_id: str) -> None:
+    """Have reads fall back to the store until it is filled again; the fill repairs."""
+
+    try:
+        await asyncio.shield(writer.mark_artifact_index_store(store_id, backfilled_at=None))
+    except Exception:
+        _LOGGER.warning(
+            "Could not mark artifact store %r for reindexing; run "
+            "`cayu artifact reindex` once the session store is reachable.",
+            store_id,
+            exc_info=True,
+        )
+
+
 async def _deliver(
     store: ArtifactStore,
     action: str,
@@ -417,16 +431,107 @@ async def _deliver(
                 store_id,
                 exc_info=True,
             )
-            try:
-                # Lists fall back to the store and the next backfill repairs it.
-                await asyncio.shield(writer.mark_artifact_index_store(store_id, backfilled_at=None))
-            except Exception:
-                _LOGGER.warning(
-                    "Could not mark artifact store %r for reindexing; run "
-                    "`cayu artifact reindex` once the session store is reachable.",
-                    store_id,
-                    exc_info=True,
-                )
+            await _mark_unfilled(writer, store_id)
+
+
+#: Index repairs still running after the store call that started them returned,
+#: such as one waiting for a store's unsettled writes; kept until they finish.
+_PENDING_REPAIRS: set[asyncio.Task[None]] = set()
+#: How long a failed store call waits for its repair before it raises anyway.
+REPAIR_WAIT_SECONDS = 5.0
+
+
+def _keep(task: asyncio.Task[None]) -> None:
+    _PENDING_REPAIRS.add(task)
+    task.add_done_callback(_PENDING_REPAIRS.discard)
+
+
+async def _finish_before_raising(repair: Awaitable[None]) -> asyncio.CancelledError | None:
+    """Run ``repair`` to its end, through cancellation, within a bound.
+
+    The store call's exception is raised once the repair finishes, so a read
+    that follows it sees the store unfilled. A repair still running at the
+    bound goes on in the background. Returns a cancellation that arrived
+    meanwhile, for the caller to raise.
+    """
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(repair)
+    deadline = loop.time() + REPAIR_WAIT_SECONDS
+    absorbed: asyncio.CancelledError | None = None
+    while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            _keep(task)
+            break
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError as cancellation:
+            absorbed = cancellation
+    return absorbed
+
+
+def _may_have_changed(store: ArtifactStore, kind: str, error: BaseException) -> bool:
+    """Whether a store call that raised ``error`` may still have changed the store.
+
+    Built-in stores attach settlement evidence to the exception: a write can
+    commit and still raise the caller's cancellation, or still be running when
+    it does. Without evidence, a cancellation or an unexpected failure may have
+    changed the store; a rejected argument has not.
+    """
+
+    from cayu.artifacts.settlement import (
+        ArtifactWriteSettlementStatus,
+        artifact_store_identity_sha256,
+        artifact_write_settlements,
+    )
+
+    try:
+        identity = artifact_store_identity_sha256(store.id)
+        records = [
+            record
+            for record in artifact_write_settlements(error)
+            if record.store_identity_sha256 == identity
+        ]
+    except Exception:
+        records = []
+    if records:
+        return any(record.status is not ArtifactWriteSettlementStatus.ABSENT for record in records)
+    if isinstance(error, asyncio.CancelledError):
+        return True
+    # A scoped access denial is raised before the store operation runs.
+    if isinstance(error, (TypeError, ValueError, PermissionError)):
+        return False
+    return not (kind == "delete" and isinstance(error, FileNotFoundError))
+
+
+async def _invalidate(store: ArtifactStore) -> None:
+    """Mark the store unfilled now, and again once the writes still running settle.
+
+    A fill that runs before a late write lands could otherwise mark the store
+    filled without it; the second mark has the next read fill it again.
+    """
+
+    writers = bound_artifact_index_writers(store)
+    store_id = store.id
+    for writer in writers:
+        await _mark_unfilled(writer, store_id)
+    # Built-in stores keep their dispatched writes, late ones included, here.
+    pending_writes = getattr(getattr(store, "_write_registry", None), "pending", None)
+    pending = pending_writes() if callable(pending_writes) else ()
+    if not pending:
+        return
+
+    async def after_settlement() -> None:
+        await asyncio.wait(pending)
+        for writer in writers:
+            await _mark_unfilled(writer, store_id)
+
+    _keep(
+        asyncio.get_running_loop().create_task(
+            after_settlement(), name=f"cayu-artifact-index-settlement:{store_id}"
+        )
+    )
 
 
 def _hook(method: Callable[..., Any], kind: str) -> Callable[..., Any]:
@@ -442,8 +547,16 @@ def _hook(method: Callable[..., Any], kind: str) -> Callable[..., Any]:
         token = _recording.set(active | {id(self)})
         try:
             result = await method(self, *args, **kwargs)
-        finally:
+        except BaseException as error:
             _recording.reset(token)
+            # The store may hold a change the index never heard of. The caller's
+            # exception, cancellation included, still propagates unchanged.
+            if bound_artifact_index_writers(self) and _may_have_changed(self, kind, error):
+                cancelled = await _finish_before_raising(_invalidate(self))
+                if cancelled is not None and not isinstance(error, asyncio.CancelledError):
+                    raise cancelled from error
+            raise
+        _recording.reset(token)
         # The time the operation finished orders it against other writes of the
         # same artifact. The store held this state from then on, so it outranks
         # a reindex that began earlier and may have seen the store before it.
@@ -561,7 +674,8 @@ async def reindex_artifact_store(
     for each artifact the store holds (a deletion that finished after the walk
     began wins), tombstones each row with no artifact, and marks the store filled, so
     reads use the index for it, when the store is bound to ``index`` (otherwise its
-    later commits would not reach the rows). The report describes what differed
+    later commits would not reach the rows) and no commit marked it as needing
+    filling while the walk ran (that commit may be missing from the walk). The report describes what differed
     before repair.
     """
 
@@ -570,6 +684,12 @@ async def reindex_artifact_store(
     if index.supports_artifact_index is not True:
         raise NotImplementedError("This session store has no artifact index.")
     started_at = datetime.now(UTC)
+    if not check:
+        # A commit that lands during the walk may be missing from it. Its hook marks
+        # the store as needing filling, which forgets this claim, so the fill below
+        # then leaves the store unfilled for the next read to fill again. A fill that
+        # claims the store after this one replaces the claim, and only it completes.
+        await index.claim_artifact_index_fill(store_id, claimed_at=started_at)
     indexed: dict[str, bytes] = {}
     after: str | None = None
     while True:
@@ -613,8 +733,15 @@ async def reindex_artifact_store(
             )
         # Reads serve a store from the index only while its commits land there.
         bound = any(writer is index for writer in bound_artifact_index_writers(store))
-        backfilled_at: datetime | None = datetime.now(UTC) if bound else None
-        await index.mark_artifact_index_store(store_id, backfilled_at=backfilled_at)
+        backfilled_at: datetime | None = None
+        if bound:
+            filled_at = datetime.now(UTC)
+            if await index.complete_artifact_index_fill(
+                store_id, claimed_at=started_at, backfilled_at=filled_at
+            ):
+                backfilled_at = filled_at
+        else:
+            await index.mark_artifact_index_store(store_id, backfilled_at=None)
     else:
         backfilled_at = (await index.read_artifact_index_stores((store_id,))).get(store_id)
     return ArtifactIndexDrift(

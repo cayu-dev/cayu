@@ -139,6 +139,58 @@ def mark_store_params(
     return (store_id, None if backfilled_at is None else s.time(backfilled_at))
 
 
+def claim_key(store_id: str) -> str:
+    """The row holding the store's newest fill claim.
+
+    A store ID never ends with whitespace, so this key is never a store's own.
+    """
+
+    return store_id + "\x1f"
+
+
+def delete_store_row_sql(dialect: Dialect) -> str:
+    mark = _spelling(dialect).mark
+    return f"DELETE FROM cayu_artifact_index_stores WHERE artifact_store_id = {mark}"
+
+
+def unfill_store_steps(store_id: str) -> tuple[tuple[Any, ...], ...]:
+    """Forget the store's fill claim, then its filled marker, as separate statements.
+
+    Reads then walk the store, and no fill that began earlier can complete. The order
+    matters on PostgreSQL (READ COMMITTED): a fill completing concurrently takes back
+    its claim before it writes the marker, so the claim delete waits for that fill to
+    commit, and the marker delete, with a fresh snapshot, then sees its marker.
+    """
+
+    return ((claim_key(store_id),), (store_id,))
+
+
+def claim_fill_sql(dialect: Dialect) -> str:
+    """Record a fill's claim (the time it began), replacing any older fill's claim."""
+
+    mark = _spelling(dialect).mark
+    return f"""
+        INSERT INTO cayu_artifact_index_stores (artifact_store_id, backfilled_at)
+        VALUES ({mark}, {mark})
+        ON CONFLICT (artifact_store_id) DO UPDATE SET backfilled_at = excluded.backfilled_at
+    """
+
+
+def claim_fill_params(dialect: Dialect, store_id: str, claimed_at: datetime) -> tuple[Any, ...]:
+    return (claim_key(store_id), _spelling(dialect).time(claimed_at))
+
+
+def release_claim_sql(dialect: Dialect) -> str:
+    """Take back a fill's claim if it is still the store's newest and nothing unfilled
+    the store since; a fill completes only when this removes a row."""
+
+    mark = _spelling(dialect).mark
+    return f"""
+        DELETE FROM cayu_artifact_index_stores
+        WHERE artifact_store_id = {mark} AND backfilled_at = {mark}
+    """
+
+
 def read_stores_sql(dialect: Dialect, store_ids: Sequence[str]) -> tuple[str, list[Any]]:
     clause, params = _spelling(dialect).any_of("artifact_store_id", store_ids)
     return (

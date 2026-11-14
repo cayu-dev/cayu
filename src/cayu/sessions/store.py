@@ -5389,7 +5389,23 @@ class SessionStore(ABC):
     async def mark_artifact_index_store(
         self, store_id: str, *, backfilled_at: datetime | None
     ) -> None:
-        """Record that the index was filled from the store (or, with None, that it needs filling)."""
+        """Record that the index was filled from the store (or, with None, that it needs filling).
+
+        Marking a store as needing filling forgets its row, so a fill that began
+        before it cannot complete (see ``complete_artifact_index_fill``).
+        """
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def claim_artifact_index_fill(self, store_id: str, *, claimed_at: datetime) -> None:
+        """Record that a fill of the store began at ``claimed_at``, replacing an older
+        fill's claim. A store that is filled stays filled."""
+        raise NotImplementedError("This session store has no artifact index.")
+
+    async def complete_artifact_index_fill(
+        self, store_id: str, *, claimed_at: datetime, backfilled_at: datetime
+    ) -> bool:
+        """Mark the store filled if the claim made at ``claimed_at`` is still the newest
+        and nothing marked the store as needing filling since. Returns whether it did."""
         raise NotImplementedError("This session store has no artifact index.")
 
     async def read_artifact_index_stores(

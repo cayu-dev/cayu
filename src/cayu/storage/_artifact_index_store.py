@@ -108,11 +108,48 @@ async def sqlite_mark_store(
 
     def write(connection: sqlite3.Connection) -> None:
         with connection:
+            if backfilled_at is None:
+                for params in sql.unfill_store_steps(store_id):
+                    connection.execute(sql.delete_store_row_sql(_SQLITE), params)
+            else:
+                connection.execute(
+                    sql.mark_store_sql(_SQLITE),
+                    sql.mark_store_params(_SQLITE, store_id, backfilled_at),
+                )
+
+    await run_write(write)
+
+
+async def sqlite_claim_fill(run_write: SQLiteRunner, store_id: str, claimed_at: datetime) -> None:
+    store_id = require_clean_nonblank(store_id, "store_id")
+
+    def write(connection: sqlite3.Connection) -> None:
+        with connection:
             connection.execute(
-                sql.mark_store_sql(_SQLITE), sql.mark_store_params(_SQLITE, store_id, backfilled_at)
+                sql.claim_fill_sql(_SQLITE), sql.claim_fill_params(_SQLITE, store_id, claimed_at)
             )
 
     await run_write(write)
+
+
+async def sqlite_complete_fill(
+    run_write: SQLiteRunner, store_id: str, claimed_at: datetime, backfilled_at: datetime
+) -> bool:
+    store_id = require_clean_nonblank(store_id, "store_id")
+
+    def write(connection: sqlite3.Connection) -> bool:
+        with connection:
+            released = connection.execute(
+                sql.release_claim_sql(_SQLITE), sql.claim_fill_params(_SQLITE, store_id, claimed_at)
+            )
+            if released.rowcount != 1:
+                return False
+            connection.execute(
+                sql.mark_store_sql(_SQLITE), sql.mark_store_params(_SQLITE, store_id, backfilled_at)
+            )
+            return True
+
+    return await run_write(write)
 
 
 async def sqlite_read_stores(
@@ -234,12 +271,51 @@ async def postgres_mark_store(
     store_id = require_clean_nonblank(store_id, "store_id")
 
     async def run(cursor: Any) -> None:
+        if backfilled_at is None:
+            for params in sql.unfill_store_steps(store_id):
+                await cursor.execute(cast("Any", sql.delete_store_row_sql(_POSTGRES)), params)
+            return
         await cursor.execute(
             cast("Any", sql.mark_store_sql(_POSTGRES)),
             sql.mark_store_params(_POSTGRES, store_id, backfilled_at),
         )
 
     await _postgres(connect, run)
+
+
+async def postgres_claim_fill(
+    connect: PostgresConnect, store_id: str, claimed_at: datetime
+) -> None:
+    store_id = require_clean_nonblank(store_id, "store_id")
+
+    async def run(cursor: Any) -> None:
+        await cursor.execute(
+            cast("Any", sql.claim_fill_sql(_POSTGRES)),
+            sql.claim_fill_params(_POSTGRES, store_id, claimed_at),
+        )
+
+    await _postgres(connect, run)
+
+
+async def postgres_complete_fill(
+    connect: PostgresConnect, store_id: str, claimed_at: datetime, backfilled_at: datetime
+) -> bool:
+    store_id = require_clean_nonblank(store_id, "store_id")
+
+    async def run(cursor: Any) -> bool:
+        await cursor.execute(
+            cast("Any", sql.release_claim_sql(_POSTGRES)),
+            sql.claim_fill_params(_POSTGRES, store_id, claimed_at),
+        )
+        if cursor.rowcount != 1:
+            return False
+        await cursor.execute(
+            cast("Any", sql.mark_store_sql(_POSTGRES)),
+            sql.mark_store_params(_POSTGRES, store_id, backfilled_at),
+        )
+        return True
+
+    return await _postgres(connect, run)
 
 
 async def postgres_read_stores(

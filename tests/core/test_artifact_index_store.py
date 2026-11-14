@@ -21,8 +21,11 @@ from cayu import RunRequest
 from cayu.artifacts import _index as artifact_index
 from cayu.artifacts import _scan as artifact_scan
 from cayu.artifacts._index import ArtifactIndexQuery, bind_artifact_index, reindex_artifact_store
+from cayu.artifacts._settlement import _settle_artifact_write
+from cayu.artifacts.aws_s3 import S3ArtifactStore
 from cayu.artifacts.base import ArtifactMetadata, ArtifactScope
 from cayu.artifacts.local import LocalArtifactStore
+from cayu.artifacts.settlement import ArtifactWriteSettlementStatus, artifact_write_settlements
 from cayu.sessions.records import SessionIdentity
 from cayu.storage.migrations import SchemaMode, SchemaTooOld
 from cayu.storage.sqlite import SQLiteSessionStore
@@ -151,7 +154,29 @@ async def test_rows_follow_writes_by_the_time_their_writer_observed_them(backend
         await store.mark_artifact_index_store("s", backfilled_at=NOW)
         assert await store.read_artifact_index_stores(["s", "t"]) == {"s": NOW}
         await store.mark_artifact_index_store("s", backfilled_at=None)
-        assert await store.read_artifact_index_stores(["s"]) == {"s": None}
+        assert await store.read_artifact_index_stores(["s"]) == {}
+        # A fill completes only if its claim is the newest and nothing unfilled the
+        # store since it began.
+        a, b, c = NOW + timedelta(4), NOW + timedelta(5), NOW + timedelta(6)
+        await store.claim_artifact_index_fill("s", claimed_at=a)
+        assert await store.read_artifact_index_stores(["s"]) == {}
+        assert await store.complete_artifact_index_fill("s", claimed_at=a, backfilled_at=b)
+        assert await store.read_artifact_index_stores(["s"]) == {"s": b}
+        assert not await store.complete_artifact_index_fill("s", claimed_at=a, backfilled_at=c)
+        await store.claim_artifact_index_fill("s", claimed_at=a)
+        assert await store.read_artifact_index_stores(["s"]) == {"s": b}
+        await store.mark_artifact_index_store("s", backfilled_at=None)
+        assert not await store.complete_artifact_index_fill("s", claimed_at=a, backfilled_at=c)
+        assert await store.read_artifact_index_stores(["s"]) == {}
+        # Fill a began, a late write unfilled the store, fill b began: a cannot
+        # complete on b's claim, and b can.
+        await store.claim_artifact_index_fill("s", claimed_at=a)
+        await store.mark_artifact_index_store("s", backfilled_at=None)
+        await store.claim_artifact_index_fill("s", claimed_at=b)
+        assert not await store.complete_artifact_index_fill("s", claimed_at=a, backfilled_at=c)
+        assert await store.read_artifact_index_stores(["s"]) == {}
+        assert await store.complete_artifact_index_fill("s", claimed_at=b, backfilled_at=c)
+        assert await store.read_artifact_index_stores(["s"]) == {"s": c}
     finally:
         await store.close()
 
@@ -270,6 +295,52 @@ async def test_search_reads_titles_that_follow_the_session(backend) -> None:
         await store.close()
 
 
+async def test_an_unfill_racing_a_completing_postgres_fill_leaves_the_store_unfilled(
+    request,
+) -> None:
+    import psycopg
+
+    from cayu.storage import _artifact_index_sql as index_sql
+    from cayu.storage.postgres import PostgresSessionStore
+
+    dsn = request.getfixturevalue("postgres_dsn")
+    store = PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE)
+    await store.ensure_schema()
+    try:
+        await store.claim_artifact_index_fill("race", claimed_at=NOW)
+        async with await psycopg.AsyncConnection.connect(dsn) as fill:
+            # The fill takes back its claim but has not committed yet.
+            await fill.execute(
+                cast("LiteralString", index_sql.release_claim_sql("postgres")),
+                index_sql.claim_fill_params("postgres", "race", NOW),
+            )
+            unfill = asyncio.create_task(
+                store.mark_artifact_index_store("race", backfilled_at=None)
+            )
+            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as watch:
+                for _ in range(200):
+                    cursor = await watch.execute(
+                        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                        " AND query LIKE 'DELETE FROM cayu_artifact_index_stores%%'"
+                    )
+                    row = await cursor.fetchone()
+                    if row is not None and row[0] > 0:
+                        break
+                    await asyncio.sleep(0.025)
+                else:
+                    pytest.fail("The unfill never waited on the fill's claim.")
+            # The fill writes its marker and commits while the unfill waits.
+            await fill.execute(
+                cast("LiteralString", index_sql.mark_store_sql("postgres")),
+                index_sql.mark_store_params("postgres", "race", NOW + timedelta(1)),
+            )
+            await fill.commit()
+        await unfill
+        assert await store.read_artifact_index_stores(["race"]) == {}
+    finally:
+        await store.close()
+
+
 async def test_migration_adds_the_index_to_an_older_store(backend) -> None:
     store = await backend.open()
     await store.close()
@@ -365,5 +436,121 @@ async def test_a_store_over_the_scan_bound_is_filled_from_its_whole_list(
         drift = await reindex_artifact_store(sessions, "big", artifacts)
         assert (drift.store_count, drift.drift) == (7, False)
         assert drift.backfilled_at is not None
+    finally:
+        await sessions.close()
+
+
+async def _filled_s3_store(tmp_path):
+    from tests.artifacts.test_aws_s3 import _BlockingMetadataCommitS3Client
+
+    sessions = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+    client = _BlockingMetadataCommitS3Client()
+    artifacts = S3ArtifactStore("bucket", client=client, store_id="s3")
+    bind_artifact_index(artifacts, sessions)
+    await reindex_artifact_store(sessions, "s3", artifacts)
+    assert (await sessions.read_artifact_index_stores(["s3"]))["s3"] is not None
+    return sessions, client, artifacts
+
+
+async def _cancel_during_commit(client, artifacts) -> asyncio.Task[Any]:
+    put = asyncio.create_task(artifacts.put_bytes(b"late", filename="late.txt", session_id="owner"))
+    assert await asyncio.to_thread(client.metadata_commit_started.wait, 2)
+    put.cancel("caller stopped")
+    return put
+
+
+async def test_a_write_that_commits_while_its_caller_is_cancelled_unfills_the_store(
+    tmp_path,
+) -> None:
+    sessions, client, artifacts = await _filled_s3_store(tmp_path)
+    try:
+        put = await _cancel_during_commit(client, artifacts)
+        client.release_metadata_commit.set()
+        with pytest.raises(asyncio.CancelledError, match="caller stopped") as raised:
+            await put
+        (evidence,) = artifact_write_settlements(raised.value)
+        assert evidence.status is ArtifactWriteSettlementStatus.COMMITTED
+        # Reads walk the store until the next fill, which finds the artifact.
+        assert await sessions.read_artifact_index_stores(["s3"]) == {}
+        drift = await reindex_artifact_store(sessions, "s3", artifacts)
+        assert drift.missing == (evidence.artifact_id,)
+    finally:
+        await sessions.close()
+
+
+async def test_a_write_still_settling_unfills_the_store_again_once_it_lands(
+    tmp_path, monkeypatch
+) -> None:
+    defaults = dict(_settle_artifact_write.__kwdefaults__ or {})
+    monkeypatch.setattr(
+        _settle_artifact_write, "__kwdefaults__", {**defaults, "settlement_timeout_s": 0.05}
+    )
+    sessions, client, artifacts = await _filled_s3_store(tmp_path)
+    try:
+        put = await _cancel_during_commit(client, artifacts)
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await put
+        (evidence,) = artifact_write_settlements(raised.value)
+        assert evidence.status is ArtifactWriteSettlementStatus.RECONCILIATION_REQUIRED
+        # A fill that finishes before the write lands misses it and marks the store filled.
+        await sessions.mark_artifact_index_store("s3", backfilled_at=datetime.now(UTC))
+        assert (await sessions.read_artifact_index_stores(["s3"]))["s3"] is not None
+        client.release_metadata_commit.set()
+        await asyncio.gather(*artifact_index._PENDING_REPAIRS)
+        assert await sessions.read_artifact_index_stores(["s3"]) == {}
+        drift = await reindex_artifact_store(sessions, "s3", artifacts)
+        assert drift.missing == (evidence.artifact_id,)
+    finally:
+        await sessions.close()
+
+
+async def test_a_fill_walking_the_store_when_a_late_write_lands_leaves_it_unfilled(
+    tmp_path, monkeypatch
+) -> None:
+    sessions, client, artifacts = await _filled_s3_store(tmp_path)
+    try:
+        client.release_metadata_commit.set()
+        await artifacts.put_bytes(b"late", filename="late.txt", session_id="owner")
+        await sessions.mark_artifact_index_store("s3", backfilled_at=None)
+        complete = sessions.complete_artifact_index_fill
+
+        async def after_a_late_write_lands(
+            store_id: str, *, claimed_at: datetime, backfilled_at: datetime
+        ) -> bool:
+            # A write that settles while the refill walks the store marks it unfilled
+            # (what the commit hook does once a late write lands).
+            await artifact_index._invalidate(artifacts)
+            return await complete(store_id, claimed_at=claimed_at, backfilled_at=backfilled_at)
+
+        monkeypatch.setattr(sessions, "complete_artifact_index_fill", after_a_late_write_lands)
+        refill = await reindex_artifact_store(sessions, "s3", artifacts)
+        assert refill.backfilled_at is None
+        assert await sessions.read_artifact_index_stores(["s3"]) == {}
+        monkeypatch.undo()
+        drift = await reindex_artifact_store(sessions, "s3", artifacts)
+        assert drift.backfilled_at is not None
+        assert (await sessions.read_artifact_index_stores(["s3"]))["s3"] is not None
+    finally:
+        await sessions.close()
+
+
+async def test_a_scoped_access_denial_keeps_the_store_filled(tmp_path) -> None:
+    from cayu.artifacts._index import _may_have_changed
+    from cayu.sessions.access import SessionAccessDenied
+
+    sessions, _, artifacts = await _filled_s3_store(tmp_path)
+    try:
+        assert not _may_have_changed(artifacts, "delete", SessionAccessDenied())
+        assert not _may_have_changed(artifacts, "put", SessionAccessDenied())
+    finally:
+        await sessions.close()
+
+
+async def test_a_rejected_write_keeps_the_store_filled(tmp_path) -> None:
+    sessions, _, artifacts = await _filled_s3_store(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            await artifacts.put_bytes(b"x", filename="", session_id="owner")
+        assert (await sessions.read_artifact_index_stores(["s3"]))["s3"] is not None
     finally:
         await sessions.close()

@@ -204,6 +204,12 @@ class _ArtifactWriteRegistry:
         with self._lock:
             return self._reservations + len(self._tasks)
 
+    def pending(self) -> tuple[asyncio.Task[object], ...]:
+        """The dispatched writes still running, late ones included."""
+
+        with self._lock:
+            return tuple(task for task in self._tasks if not task.done())
+
 
 def _committed_artifact_write(
     artifact: ArtifactMetadata,

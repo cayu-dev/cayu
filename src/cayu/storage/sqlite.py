@@ -7295,6 +7295,16 @@ class SQLiteSessionStore(
     ) -> None:
         await artifact_index_ops.sqlite_mark_store(self._run_write, store_id, backfilled_at)
 
+    async def claim_artifact_index_fill(self, store_id: str, *, claimed_at: datetime) -> None:
+        await artifact_index_ops.sqlite_claim_fill(self._run_write, store_id, claimed_at)
+
+    async def complete_artifact_index_fill(
+        self, store_id: str, *, claimed_at: datetime, backfilled_at: datetime
+    ) -> bool:
+        return await artifact_index_ops.sqlite_complete_fill(
+            self._run_write, store_id, claimed_at, backfilled_at
+        )
+
     async def read_artifact_index_stores(
         self, store_ids: Sequence[str]
     ) -> dict[str, datetime | None]:

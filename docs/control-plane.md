@@ -1544,7 +1544,13 @@ Artifact content is still read from the store, and only when a file is opened.
 - **Drift.** An artifact store is external storage, so its commit and the index row
   cannot share a transaction. Writes from processes outside Cayu, from older
   binaries, or a row that fails to land leave drift. A failed row marks the store
-  unfilled, so lists fall back to the store until the next fill.
+  unfilled, so lists fall back to the store until the next fill. So does a store
+  call that raises after it may have changed the store, such as a write that
+  commits while its caller is cancelled; a write still settling marks the store
+  unfilled again once it finishes. Each fill claims the store when it begins, and
+  marking the store unfilled forgets the claim: a fill already walking it still
+  writes its rows but leaves the store unfilled, so the next read fills it again and
+  finds the late write. Only the newest claim can mark the store filled.
   `cayu artifact reindex --check` reports artifacts with no row, rows with no
   artifact and rows whose metadata differs, and exits 1 on drift; without `--check`
   it repairs them.
