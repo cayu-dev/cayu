@@ -53,7 +53,11 @@ _COMPLETED = SessionStatus.COMPLETED.value
 
 
 def pending_action_counts_sql(
-    query: PendingActionQuery, *, placeholder: str, index_hint: str = ""
+    query: PendingActionQuery,
+    *,
+    placeholder: str,
+    dialect: Literal["sqlite", "postgres"],
+    index_hint: str = "",
 ) -> tuple[str, list[Any]]:
     """One statement returning ``approvals, questions, recovery`` for ``query``.
 
@@ -61,9 +65,16 @@ def pending_action_counts_sql(
     SQLite) and each one's session by key, so its cost follows waiting sessions,
     not retained ones.
 
+    An approval or a question whose round stopped on a tool a person must settle
+    is left out here: ``event_recovery_sessions_sql`` finds it and the caller
+    counts what the list builds for it. Nothing is taken back afterwards, so the
+    two statements need not read the same snapshot.
+
     ``query.kind``, ``cursor``, ``limit`` and ``q`` don't apply to a count; the
     caller rejects ``q``, which only the decoded items can match.
     """
+
+    waits = f"NOT {_stopped_for_recovery(dialect)}"
 
     where_sql, filter_params = _session_filters(
         query, placeholder, f"({_FLAGS} & {_DELEGATED | _WAKE}) = 0"
@@ -74,10 +85,11 @@ def pending_action_counts_sql(
         SELECT
             COALESCE(SUM(CASE
                 WHEN ({flags} & {_APPROVAL}) <> 0 AND cayu_sessions.status = {placeholder}
+                     AND {waits}
                 THEN 1 ELSE 0 END), 0) AS approvals,
             COALESCE(SUM(CASE
                 WHEN ({flags} & {_APPROVAL}) = 0 AND ({flags} & {_QUESTION}) <> 0
-                     AND cayu_sessions.status = {placeholder}
+                     AND cayu_sessions.status = {placeholder} AND {waits}
                 THEN 1 ELSE 0 END), 0) AS questions,
             COALESCE(SUM(CASE
                 WHEN ({flags} & {_APPROVAL | _QUESTION}) = 0 AND ({flags} & {_ROUND}) <> 0
@@ -93,11 +105,11 @@ def pending_action_counts_sql(
 def event_recovery_sessions_sql(
     query: PendingActionQuery, *, placeholder: str, dialect: Literal["sqlite", "postgres"]
 ) -> tuple[str, list[Any]]:
-    """Interrupted sessions whose events name a manual recovery, with their flags.
+    """Interrupted sessions whose events name a manual recovery.
 
     A sleep's flags are only the wake bit, so the count above leaves it out, and
-    an approval's or a question's flags count it as one. Any of these may instead
-    wait on a tool's recovery, which only their newest ``session.interrupted``
+    it leaves out an approval or a question that stopped this way. Any of these may
+    wait on a tool's recovery instead, which only their newest ``session.interrupted``
     event shows; the caller rebuilds them with
     ``query_pending_actions_for_sessions``. Each such session costs one backward
     read of its own events, which stops at its pause.
@@ -105,11 +117,6 @@ def event_recovery_sessions_sql(
 
     if SessionStatus.INTERRUPTED not in query.statuses:
         return "", []
-    required = (
-        "json_type(event.payload_json, '$.manual_recovery_required') = 'true'"
-        if dialect == "sqlite"
-        else "event.payload -> 'manual_recovery_required' = 'true'::jsonb"
-    )
     paused = f"({_FLAGS} & {_DELEGATED | _WAKE})"
     where_sql, params = _session_filters(
         query.model_copy(update={"statuses": frozenset({SessionStatus.INTERRUPTED})}),
@@ -117,42 +124,41 @@ def event_recovery_sessions_sql(
         f"{paused} = {_WAKE} OR ({paused} = 0 AND ({_FLAGS} & {_APPROVAL | _QUESTION}) <> 0)",
     )
     sql = f"""
-        SELECT cayu_checkpoints.session_id, {_FLAGS}
+        SELECT cayu_checkpoints.session_id
         FROM cayu_checkpoints
         CROSS JOIN cayu_sessions
         WHERE cayu_sessions.id = cayu_checkpoints.session_id AND {where_sql}
-          AND (
-              SELECT {required} FROM cayu_events AS event
-              WHERE event.session_id = cayu_checkpoints.session_id
-                AND event.event_type = 'session.interrupted'
-              ORDER BY event.sequence DESC
-              LIMIT 1
-          ) IS TRUE
+          AND {_stopped_for_recovery(dialect)}
         ORDER BY cayu_checkpoints.session_id
     """
     return sql, params
 
 
+def _stopped_for_recovery(dialect: Literal["sqlite", "postgres"]) -> str:
+    """Whether the checkpoint's session last stopped on a tool a person must settle."""
+
+    required = (
+        "json_type(event.payload_json, '$.manual_recovery_required') = 'true'"
+        if dialect == "sqlite"
+        else "event.payload -> 'manual_recovery_required' = 'true'::jsonb"
+    )
+    return f"""((
+              SELECT {required} FROM cayu_events AS event
+              WHERE event.session_id = cayu_checkpoints.session_id
+                AND event.event_type = 'session.interrupted'
+              ORDER BY event.sequence DESC
+              LIMIT 1
+          ) IS TRUE)"""
+
+
 async def count_event_recoveries(
     store: SessionStore,
     counts: dict[PendingActionKind, int],
-    sessions: Sequence[tuple[str, int]],
+    session_ids: Sequence[str],
     query: PendingActionQuery,
 ) -> dict[PendingActionKind, int]:
-    """Count these sessions by the actions the list builds for them.
+    """Add the actions the list builds for these sessions to ``counts``."""
 
-    ``sessions`` pairs each session with its flags. What the flags already
-    counted for a session is taken back first, so it is counted once.
-    """
-
-    for _, flags in sessions:
-        if flags & _WAKE:
-            continue
-        counted = (
-            PendingActionKind.TOOL_APPROVAL if flags & _APPROVAL else PendingActionKind.USER_INPUT
-        )
-        counts[counted] -= 1
-    session_ids = [session_id for session_id, _ in sessions]
     page_query = PendingActionQuery(
         statuses=frozenset({SessionStatus.INTERRUPTED}),
         agent_name=query.agent_name,

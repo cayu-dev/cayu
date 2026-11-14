@@ -7564,27 +7564,28 @@ class SQLiteSessionStore(
         sql, params = pending_action_counts_sql(
             query,
             placeholder="?",
+            dialect="sqlite",
             index_hint=f"INDEXED BY {SQLITE_PENDING_ACTION_COUNTS_INDEX}",
         )
-        woken_sql, woken_params = event_recovery_sessions_sql(
+        recovery_sql, recovery_params = event_recovery_sessions_sql(
             query, placeholder="?", dialect="sqlite"
         )
 
         def read(
             connection: sqlite3.Connection,
-        ) -> tuple[dict[PendingActionKind, int], list[tuple[str, int]]]:
+        ) -> tuple[dict[PendingActionKind, int], list[str]]:
             counts = pending_action_counts(connection.execute(sql, params).fetchone())
-            woken = (
-                [(str(row[0]), int(row[1])) for row in connection.execute(woken_sql, woken_params)]
-                if woken_sql
+            recovering = (
+                [str(row[0]) for row in connection.execute(recovery_sql, recovery_params)]
+                if recovery_sql
                 else []
             )
-            return counts, woken
+            return counts, recovering
 
-        counts, woken = await self._run_read(read)
-        if not woken:
+        counts, recovering = await self._run_read(read)
+        if not recovering:
             return counts
-        return await count_event_recoveries(self, counts, woken, query)
+        return await count_event_recoveries(self, counts, recovering, query)
 
     async def query_pending_actions_for_sessions(
         self,

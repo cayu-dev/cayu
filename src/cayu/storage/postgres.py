@@ -6903,20 +6903,20 @@ class PostgresSessionStore(
         query = PendingActionQuery() if query is None else query
         if type(query) is not PendingActionQuery:
             raise TypeError("Pending-action queries must be PendingActionQuery instances.")
-        sql, params = pending_action_counts_sql(query, placeholder="%s")
-        woken_sql, woken_params = event_recovery_sessions_sql(
+        sql, params = pending_action_counts_sql(query, placeholder="%s", dialect="postgres")
+        recovery_sql, recovery_params = event_recovery_sessions_sql(
             query, placeholder="%s", dialect="postgres"
         )
         async with self._ready_connection() as conn, conn.cursor() as cur:
             await cur.execute(cast("LiteralString", sql), params)
             counts = pending_action_counts(await cur.fetchone())
-            woken: list[tuple[str, int]] = []
-            if woken_sql:
-                await cur.execute(cast("LiteralString", woken_sql), woken_params)
-                woken = [(str(row[0]), int(row[1])) for row in await cur.fetchall()]
-        if not woken:
+            recovering: list[str] = []
+            if recovery_sql:
+                await cur.execute(cast("LiteralString", recovery_sql), recovery_params)
+                recovering = [str(row[0]) for row in await cur.fetchall()]
+        if not recovering:
             return counts
-        return await count_event_recoveries(self, counts, woken, query)
+        return await count_event_recoveries(self, counts, recovering, query)
 
     async def query_pending_actions_for_sessions(
         self,
