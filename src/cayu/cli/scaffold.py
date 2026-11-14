@@ -56,6 +56,7 @@ from cayu.cli.scaffold_plan import (
     CAPABILITIES,
     CI_CHOICES,
     PRESETS,
+    WEB_APP,
     ApplicationPlan,
     ScaffoldPlanError,
     capability_dependencies,
@@ -65,6 +66,7 @@ from cayu.cli.scaffold_plan import (
     preset_spec,
     removed_capability_files,
 )
+from cayu.cli.scaffold_web_app import web_app_project_files
 from cayu.workspaces.local import LocalWorkspace
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
@@ -3262,13 +3264,16 @@ def _rendered_preset_files(
                 plan=plan,
             )
         )
+        files.update(web_app_project_files(files=files, plan=plan))
         return files
     if plan.preset == "agent":
+        files.update(web_app_project_files(files=files, plan=plan))
         return files
     if plan.preset == "long-running":
         from cayu.cli.scaffold_long_running import long_running_project_files
 
         files.update(long_running_project_files(files=files, render=render, plan=plan))
+        files.update(web_app_project_files(files=files, plan=plan))
         return files
     if plan.preset == "b2b":
         from cayu.cli.scaffold_b2b import b2b_project_files
@@ -3784,6 +3789,8 @@ def _render_new_receipt(
         print("  Open: http://127.0.0.1:8000/cayu/")
     if plan.preset == "b2b":
         print("  Web interface for the organizations' people: http://127.0.0.1:8000/")
+    if WEB_APP in plan.capabilities:
+        print("  Web app for the Agent's operators: http://127.0.0.1:8000/")
     if plan.provider == "neutral":
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")
     else:

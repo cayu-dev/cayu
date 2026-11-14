@@ -49,6 +49,10 @@ def cayu_api_client(request: Request, *, timeout: float = 30.0) -> httpx.AsyncCl
         # routes' handling of a failed answer runs instead of the exception escaping.
         transport=httpx.ASGITransport(app=request.app, raise_app_exceptions=False),
         base_url=f"{request.url.scheme}://{request.url.netloc}{CAYU_API_PATH}",
-        headers={name: value for name, value in request.headers.items() if name.lower() in names},
+        headers={
+            name: value
+            for name, value in request.headers.items()
+            if name.lower() in names
+        },
         timeout=timeout,
     )

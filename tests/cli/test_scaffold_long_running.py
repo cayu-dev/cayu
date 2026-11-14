@@ -78,7 +78,7 @@ def test_long_running_project_passes_its_own_tests_eval_and_check(tmp_path: Path
 
     tests = _run(project, "-m", "pytest", "-q", "-p", "no:cacheprovider")
     assert tests.returncode == 0, tests.stdout + tests.stderr
-    assert "12 passed" in tests.stdout
+    assert "18 passed" in tests.stdout
 
     evaluation = _run(project, "-m", "cayu", "eval", "run")
     assert evaluation.returncode == 0, evaluation.stdout + evaluation.stderr

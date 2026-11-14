@@ -23,9 +23,13 @@ from cayu import CayuApp
 from fastapi import APIRouter
 
 from integrations.http.generated import inbox, overview, settings, task_runs, whoami
-from integrations.http.generated.overview import Metric, OverviewContext, OverviewMetrics
+from integrations.http.generated.overview import (
+    Metric,
+    OverviewContext,
+    OverviewMetrics,
+)
 from integrations.http.generated.settings import FixedSetting
-from integrations.http.generated.task_runs import RunKey, RunTitle
+from integrations.http.generated.task_runs import RunKey, RunTitle, TaskReader
 from integrations.http.generated.whoami import Person, PersonDependency
 
 
@@ -38,6 +42,7 @@ def build_generated_router(
     fixed_settings: Callable[[], Sequence[FixedSetting]] | None = None,
     run_key: RunKey | None = None,
     run_title: RunTitle | None = None,
+    read_tasks: TaskReader | None = None,
     agent_name: str | None = None,
     inbox_page: str | None = None,
 ) -> APIRouter:
@@ -46,12 +51,17 @@ def build_generated_router(
 
     ``agent_name`` is the Agent's specialist in Cayu; with it, `/app/inbox` serves its
     inbox and the Overview counts only its items. ``inbox_page`` is where the Overview sends a person to decide what waits: the
-    app's own Inbox (for example `/inbox`), or by default the Developer dashboard's."""
+    app's own Inbox (for example `/inbox`), or by default the Developer dashboard's.
+    ``read_tasks`` reads the tasks `/app/task-runs` groups: by default as the person, through
+    Cayu's resource-access policy; `task_runs.operator_tasks` reads every task, for an Agent
+    whose people are its operators."""
 
     routes = APIRouter()
     routes.include_router(whoami.router(person))
     routes.include_router(
-        settings.router(app, person=person, application=application, fixed=fixed_settings or tuple)
+        settings.router(
+            app, person=person, application=application, fixed=fixed_settings or tuple
+        )
     )
     routes.include_router(
         overview.router(
@@ -70,6 +80,7 @@ def build_generated_router(
             person=person,
             run_key=run_key or task_runs.default_run_key,
             run_title=run_title or task_runs.default_run_title,
+            read_tasks=read_tasks or task_runs.scoped_tasks,
         )
     )
     return routes

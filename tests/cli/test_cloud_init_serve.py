@@ -68,6 +68,43 @@ def test_init_leaves_a_servable_scaffold_unchanged(
     assert (tmp_path / "pyproject.toml").read_text() == original
 
 
+def test_init_sends_cloud_to_the_web_app_cayu_serve_serves_at_the_root(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scaffold, "_cayu_source_checkout", lambda: None)
+    monkeypatch.setattr(scaffold, "_installed_cayu_version", lambda: "0.16.3")
+    _write_scaffold(tmp_path, preset="agent")
+
+    status, output = _init(tmp_path, capsys)
+
+    assert status == 0
+    manifest = tomllib.loads((tmp_path / "cayu-cloud.toml").read_text())
+    # [tool.cayu.serve] ui: `cayu serve` serves the web app at /, and Cloud's operators sign in.
+    assert manifest["home"] == "/"
+    assert manifest["sign_in"] == {"mode": "cloud"}
+    assert any('home = "/"' in note for note in output["result"]["notes"])
+
+    # A home of the project's own is kept, and one without the web app gets none.
+    (tmp_path / "cayu-cloud.toml").write_text(
+        (tmp_path / "cayu-cloud.toml").read_text().replace('home = "/"', 'home = "/findings"')
+    )
+    assert main(["cloud", "init", str(tmp_path), "--force"]) == 0
+    capsys.readouterr()
+    assert tomllib.loads((tmp_path / "cayu-cloud.toml").read_text())["home"] == "/findings"
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for relative, content in project_files(
+        "smoke-agent", without_capabilities=("web-app",)
+    ).items():
+        (plain / relative).parent.mkdir(parents=True, exist_ok=True)
+        (plain / relative).write_text(content, encoding="utf-8")
+    status, _ = _init(plain, capsys)
+    assert status == 0
+    assert "home" not in tomllib.loads((plain / "cayu-cloud.toml").read_text())
+
+
 def test_init_does_not_add_serve_auth_to_a_public_service(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

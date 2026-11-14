@@ -72,8 +72,15 @@ def _assert_generated_configuration_boundary(project: Path) -> None:
     for path in project.rglob("*.py"):
         relative = path.relative_to(project)
         # Only pytest loads tests/ and the root conftest.py; the application never
-        # does. The root conftest lends the tests a memory evidence key.
-        if path == settings or relative.parts[0] == "tests" or relative == Path("conftest.py"):
+        # does. The root conftest lends the tests a memory evidence key. The web app's
+        # generated routes, the same in every project that has them, read only
+        # CAYU_PROXY_IDENTITY_HEADER, the header Cayu's own sign-in reads from there too.
+        if (
+            path == settings
+            or relative.parts[0] == "tests"
+            or relative == Path("conftest.py")
+            or relative.parts[:3] == ("integrations", "http", "generated")
+        ):
             continue
         source = path.read_text(encoding="utf-8")
         for marker in forbidden:

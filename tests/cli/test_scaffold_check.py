@@ -1310,9 +1310,9 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
                 (
                     'capabilities = ["approvals", "artifacts", "evals", '
                     '"human-input", "knowledge", "memory", "observability", '
-                    '"recovery", "tasks"]',
+                    '"recovery", "tasks", "web-app"]',
                     'capabilities = ["approvals", "artifacts", "evals", '
-                    '"human-input", "knowledge", "memory", "recovery", "tasks"]',
+                    '"human-input", "knowledge", "memory", "recovery", "tasks", "web-app"]',
                 ),
             ),
             "capabilities",
@@ -1323,7 +1323,7 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
                 (
                     'capabilities = ["approvals", "artifacts", "evals", '
                     '"human-input", "knowledge", "memory", "observability", '
-                    '"recovery", "tasks"]',
+                    '"recovery", "tasks", "web-app"]',
                     'capabilities = ["approvals", "evals", "observability", "tasks"]',
                 ),
             ),
@@ -1336,8 +1336,9 @@ def test_cli_check_rejects_metadata_only_preset_and_database_changes_before_impo
                 (
                     'capabilities = ["approvals", "artifacts", "evals", '
                     '"human-input", "knowledge", "memory", "observability", '
-                    '"recovery", "tasks"]',
-                    'capabilities = ["artifacts", "delegation", "evals", "human-input", "knowledge", "tasks"]',
+                    '"recovery", "tasks", "web-app"]',
+                    'capabilities = ["artifacts", "delegation", "evals", "human-input", "knowledge", '
+                    '"tasks", "web-app"]',
                 ),
             ),
             "execution",

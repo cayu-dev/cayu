@@ -30,6 +30,8 @@ CodingCommandAuthorityName = Literal["structured"]
 CiName = Literal["github", "none"]
 CI_CHOICES: tuple[CiName, ...] = ("github", "none")
 CapabilityStatus = Literal["selectable", "extension-only", "preset-owned"]
+# The web app for the Agent's own team (`scaffold_web_app.py`).
+WEB_APP = "web-app"
 
 
 class ScaffoldPlanError(ValueError):
@@ -138,6 +140,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "observability",
             "recovery",
             "tasks",
+            WEB_APP,
         ),
         supported_executions=("none", "docker"),
         environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
@@ -158,6 +161,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "delegation",
             "human-input",
             "evals",
+            WEB_APP,
         ),
         supported_executions=("none", "docker"),
         environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
@@ -175,6 +179,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "observability",
             "recovery",
             "tasks",
+            WEB_APP,
         ),
         environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
     ),
@@ -411,6 +416,30 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         ),
     ),
     CapabilitySpec(
+        name=WEB_APP,
+        summary=(
+            "A web app for the Agent's own team, which `cayu serve` serves at / beside the "
+            "Developer dashboard at /cayu/: Overview, Task runs, Settings and Cayu's Inbox. "
+            "Its people are the Agent's operators: Cayu Cloud's, with their Cloud roles, when "
+            "deployed, and you under `cayu serve --dev`. Leave it out with --without web-app."
+        ),
+        status="selectable",
+        supported_presets=("agent", "coding", "long-running"),
+        files=(
+            "web/",
+            "integrations/http/",
+            "tests/test_web_app.py",
+            "pyproject.toml",
+        ),
+        verification=(
+            "uv run --no-sync pytest -q tests/test_web_app.py",
+            "npm --prefix web ci",
+            "npm --prefix web run check:build",
+            "npm --prefix web/e2e ci",
+            "npm --prefix web/e2e test",
+        ),
+    ),
+    CapabilitySpec(
         name="remote-git-delivery",
         summary="Approved host-side commit and push of an exact patch-ready result.",
         status="selectable",
@@ -639,6 +668,14 @@ def normalize_application_plan(
         raise ScaffoldPlanError(
             "capability_conflict",
             "capabilities cannot be both included and excluded: " + ", ".join(overlap),
+        )
+
+    if preset == "b2b" and WEB_APP in (*requested, *excluded):
+        # b2b's app is its own, with the organizations its members sign in to.
+        raise ScaffoldPlanError(
+            "capability_required",
+            "preset 'b2b' always has its own web app, which its organizations' members use; "
+            "--with and --without web-app don't apply to it",
         )
 
     capabilities = set(selected_preset.default_capabilities)

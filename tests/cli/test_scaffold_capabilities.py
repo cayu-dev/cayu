@@ -536,7 +536,7 @@ def test_inspect_does_not_treat_invalid_capability_metadata_as_freeform(
     capsys.readouterr()
     project = tmp_path / "profile"
     config = project / "pyproject.toml"
-    config.write_text(config.read_text().replace('"tasks"]', '"unknown-capability"]'))
+    config.write_text(config.read_text().replace('"web-app"]', '"unknown-capability"]'))
     monkeypatch.chdir(project)
     assert main(["inspect", "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "SCAFFOLD_CONTRACT_INVALID"

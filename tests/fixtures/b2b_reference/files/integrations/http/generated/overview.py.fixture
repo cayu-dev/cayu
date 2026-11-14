@@ -26,7 +26,11 @@ from cayu.server.etag import tagged_json
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
-from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
+from integrations.http.generated.cayu_api import (
+    INBOX_CLOSED,
+    INBOX_SILENT,
+    cayu_api_client,
+)
 from integrations.http.generated.whoami import Person, PersonDependency
 
 logger = logging.getLogger(__name__)
@@ -119,7 +123,10 @@ async def inbox_counts(
     counts = answer.get("counts") or {}
     by_kind = [
         InboxKind(
-            kind=kind, label=label, count=counts.get(kind, 0), to=f"{inbox_page}?kind={kind}"
+            kind=kind,
+            label=label,
+            count=counts.get(kind, 0),
+            to=f"{inbox_page}?kind={kind}",
         )
         for kind, label in INBOX_KINDS.items()
         if counts.get(kind)
@@ -155,18 +162,27 @@ def router(
         response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
     ) -> OverviewView:
-        found = await metrics(OverviewContext(app=app, person=signed_in, request=request))
+        found = await metrics(
+            OverviewContext(app=app, person=signed_in, request=request)
+        )
         view = OverviewView(
             as_of=datetime.now(UTC).isoformat(),
             metrics=[
-                MetricView(label=item.label, value=item.value, description=item.description)
+                MetricView(
+                    label=item.label, value=item.value, description=item.description
+                )
                 for item in found
             ],
-            inbox=await inbox_counts(request, inbox_page=inbox_page, agent_name=agent_name),
+            inbox=await inbox_counts(
+                request, inbox_page=inbox_page, agent_name=agent_name
+            ),
         )
         # `as_of` changes on every read: tagged with it, the overview would never be unchanged.
         return tagged_json(
-            request, response, view, tagged=view.model_dump(mode="json", exclude={"as_of"})
+            request,
+            response,
+            view,
+            tagged=view.model_dump(mode="json", exclude={"as_of"}),
         )
 
     return routes

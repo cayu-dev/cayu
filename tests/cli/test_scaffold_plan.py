@@ -59,6 +59,7 @@ def test_dry_run_and_apply_use_the_same_normalized_plan(
         "observability",
         "recovery",
         "tasks",
+        "web-app",
     ]
     assert applied["plan"]["private_files"] == ["data/memory-evidence.key"]
     runtime = (tmp_path / "observed/configuration/runtime.py").read_text(encoding="utf-8")
@@ -117,6 +118,7 @@ def test_default_agent_plan_is_the_complete_safe_local_profile() -> None:
         "observability",
         "recovery",
         "tasks",
+        "web-app",
     )
     files = project_files("standard", application_plan=plan)
     assert "AutomaticRecallContextPolicy" in files["memory/context.py"]
@@ -294,6 +296,7 @@ def test_without_flags_disable_each_safe_default_deterministically(
         "observability",
         "recovery",
         "tasks",
+        "web-app",
     )
     command = ["new", "reduced", "--dir", str(tmp_path), "--json"]
     for capability in excluded:
@@ -307,6 +310,8 @@ def test_without_flags_disable_each_safe_default_deterministically(
     assert not (project / "data" / "artifacts").exists()
     assert not (project / "tests" / "test_memory.py").exists()
     assert not (project / "evals" / "agent.py").exists()
+    assert not (project / "web").exists()
+    assert not (project / "integrations" / "http").exists()
     pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
     assert "eval_target" not in pyproject
     assert "enable_logging=False" in (project / "configuration" / "runtime.py").read_text(
@@ -499,7 +504,10 @@ def test_served_plans_protect_cayu_serve_with_environment_operator_auth(preset: 
     pyproject = tomllib.loads(project_files("app", application_plan=plan)["pyproject.toml"])
 
     assert pyproject["tool"]["cayu"]["serve"] == {
-        "auth": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH"
+        "auth": "cayu.server.environment_auth:OPERATOR_BASIC_AUTH",
+        # The web app and its routes, served by `cayu serve` at / and under /app.
+        "routers": ["integrations.http:build_router"],
+        "ui": "web/static",
     }
     assert pyproject["dependency-groups"]["dev"][0] == "pytest"
     assert pyproject["project"]["optional-dependencies"]["dev"] == []

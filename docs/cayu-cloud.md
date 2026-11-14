@@ -2908,9 +2908,11 @@ ready-made `cayu.server.environment_auth:OPERATOR_BASIC_AUTH` or `OPERATOR_ONLY_
 target, and for a worker.
 It writes `mode = "own"` for a project with a `service_factory`, whose product and
 Developer dashboard access are its own, and for any other auth target; see
-[Initialize an Agent project](#initialize-an-agent-project). It writes no `home`,
-because init cannot know a page of the project's own. Add `home` yourself when the
-Agent serves one.
+[Initialize an Agent project](#initialize-an-agent-project). It writes `home = "/"` when
+`cayu serve` serves the project's web app there (`[tool.cayu.serve] ui`, as projects made
+with the `web-app` capability have), and otherwise no `home`, because init cannot know a
+page of the project's own. Add `home` yourself when the Agent serves one elsewhere; a
+`home` already in the file is kept.
 
 ## Webhooks to a sleeping Agent
 

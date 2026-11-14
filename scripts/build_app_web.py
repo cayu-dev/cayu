@@ -5,7 +5,9 @@ Their source lives in the package so `cayu new` can copy it: the generic app in
 `src/cayu/cli/scaffold_app_web.py` says. Installed packages must never land there, so each app
 is composed and built in a temporary folder:
 
-- the generic app on its own, which ships no build yet;
+- the generic app on its own, which ships no build;
+- the generic app with the operators layer, the `web-app` capability's, whose committed build
+  is the layer's `static/`;
 - the generic app with the organizations layer, the b2b preset's, whose committed build is
   the layer's `static/`.
 
@@ -47,7 +49,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     web = _composition()
-    apps = (("generic app", ()), ("b2b app", (web.ORGANIZATIONS,)))
+    apps = (
+        ("generic app", ()),
+        ("operator app", (web.OPERATORS,)),
+        ("b2b app", (web.ORGANIZATIONS,)),
+    )
     for label, layers in apps:
         print(f"== The {label} ({' + '.join((web.APP, *layers))})", flush=True)
         if not _build(web, layers, check=args.check):
@@ -58,9 +64,9 @@ def main(argv: list[str] | None = None) -> int:
 def _build(web, layers: tuple[str, ...], *, check: bool) -> bool:
     sources = web.layer_sources(TEMPLATES, layers)
     built = f"{web.BUILT}/"
-    # The folder whose static/ is this app's committed build, if it has one.
-    page = sources.get(f"{built}index.html")
-    owner = Path(str(page)).parents[1] if page is not None else None
+    # The folder whose static/ is this app's committed build: its last layer's. The generic
+    # app on its own has none.
+    owner = TEMPLATES / layers[-1] if layers else None
     with tempfile.TemporaryDirectory(prefix="cayu-app-web-") as directory:
         work = Path(directory) / "web"
         for path, source in sources.items():

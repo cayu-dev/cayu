@@ -23,7 +23,11 @@ import httpx
 from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
+from integrations.http.generated.cayu_api import (
+    INBOX_CLOSED,
+    INBOX_SILENT,
+    cayu_api_client,
+)
 from integrations.http.generated.whoami import PersonDependency
 
 logger = logging.getLogger(__name__)
@@ -46,8 +50,16 @@ def router(*, person: PersonDependency, agent_name: str) -> APIRouter:
         q: str | None = None,
         session_id: str | None = None,
     ) -> JSONResponse:
-        query = {"limit": limit, "cursor": cursor, "kind": kind, "q": q, "session_id": session_id}
-        return await _forward(request, "GET", "/inbox", params=_with_agent(query, agent_name))
+        query = {
+            "limit": limit,
+            "cursor": cursor,
+            "kind": kind,
+            "q": q,
+            "session_id": session_id,
+        }
+        return await _forward(
+            request, "GET", "/inbox", params=_with_agent(query, agent_name)
+        )
 
     @routes.get("/inbox/counts")
     async def inbox_counts(
@@ -56,7 +68,9 @@ def router(*, person: PersonDependency, agent_name: str) -> APIRouter:
         session_id: str | None = None,
     ) -> JSONResponse:
         query = {"q": q, "session_id": session_id}
-        return await _forward(request, "GET", "/inbox/counts", params=_with_agent(query, agent_name))
+        return await _forward(
+            request, "GET", "/inbox/counts", params=_with_agent(query, agent_name)
+        )
 
     @routes.post("/inbox/{item_id}/settle")
     async def settle(
@@ -81,7 +95,9 @@ def _with_agent(query: dict[str, Any], agent_name: str) -> dict[str, Any]:
     }
 
 
-async def _forward(request: Request, method: str, path: str, **kwargs: Any) -> JSONResponse:
+async def _forward(
+    request: Request, method: str, path: str, **kwargs: Any
+) -> JSONResponse:
     """Cayu's answer to the same request, as the person behind ``request``."""
 
     status, content = await _call(request, method, path, **kwargs)

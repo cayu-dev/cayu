@@ -33,27 +33,27 @@
     },
     "integrations/http/generated/__init__.py": {
       "reference_sha256": "a9ce5bfa133fa1adb44d33fa8aad22bd3a19cab7fc9afae3eac898a21e9a4f44",
-      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840). Its docstring says settings, overview and task-runs answer with an ETag (#4005)."
+      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840). Its docstring says settings, overview and task-runs answer with an ETag (#4005). Takes `read_tasks` for /app/task-runs, as the task-runs module does (#4022). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/cayu_api.py": {
       "reference_sha256": "12a1f7a97847913719a6bc68e61fa8ce44ffc59b65413c97f536120581d25ec3",
-      "deviation": "Holds the closed-inbox and no-answer sentences the Overview and /app/inbox share (review of #3840). Its in-process client returns Cayu's 500 as a response instead of raising the app's exception, so the Overview's fallback runs (review of #3839)."
+      "deviation": "Holds the closed-inbox and no-answer sentences the Overview and /app/inbox share (review of #3840). Its in-process client returns Cayu's 500 as a response instead of raising the app's exception, so the Overview's fallback runs (review of #3839). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/inbox.py": {
       "reference_sha256": "61da01208e2d026b32b02734de27f5888abaa606091700911e1d9bac0caec479",
-      "deviation": "The docstring no longer says the route is for an Inbox imported from the Developer dashboard. Only a 401 or Cayu's role_forbidden becomes the closed-inbox 403; another 403 keeps Cayu's reason. The person dependency is declared once on the router (review of #3840)."
+      "deviation": "The docstring no longer says the route is for an Inbox imported from the Developer dashboard. Only a 401 or Cayu's role_forbidden becomes the closed-inbox 403; another 403 keeps Cayu's reason. The person dependency is declared once on the router (review of #3840). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/overview.py": {
       "reference_sha256": "05ea3c3217d4d135d3b723059b4341a8a296e9bb18bc2ad06786e72209f909b7",
-      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840). Answers through cayu.server.etag's tagged_json with a tag of everything but as_of, so an unchanged overview costs a 304 (#4005)."
+      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840). Answers through cayu.server.etag's tagged_json with a tag of everything but as_of, so an unchanged overview costs a 304 (#4005). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/settings.py": {
       "reference_sha256": "82e9b0796e48772fdf774ddff908670b4ed11735e1fb750c9f0a392eda3b8228",
-      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304 (#4005)."
+      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304 (#4005). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/task_runs.py": {
       "reference_sha256": "819e7d268a76ace4bf8792d4c9000c71d8e984fa73499ec6f6370d3eb4c4a127",
-      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged runs cost a 304 (#4005)."
+      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged runs cost a 304 (#4005). Reads tasks with `read_tasks`: by default `scoped_tasks`, the person's through Cayu's resource-access policy, or `operator_tasks`, every task, for an Agent whose people are its operators (#4022). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
     },
     "integrations/http/generated/whoami.py": {
       "reference_sha256": "7083e16e60669c0f8ca957f9ac31f7de0059d6e3fb853f14cd955adbfda8b357",

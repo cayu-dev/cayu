@@ -4,8 +4,9 @@
 `/app/inbox`. Each file says `GENERATED.` in its first line: the generator owns it, and the
 Agent supplies what only it knows (who a request's person is, its overview metrics, the
 settings it reads from its environment, how its tasks group into runs) as arguments to
-`build_generated_router`. A preset that has people composes them into its own `/app` router;
-`cayu new --preset b2b` does (`scaffold_b2b.py`). The read routes the web app follows tag their
+`build_generated_router`. A preset that has people composes them into its own `/app` router:
+the `web-app` capability does with the Agent's operators (`scaffold_web_app.py`), and
+`cayu new --preset b2b` with its organizations' members (`scaffold_b2b.py`). The read routes the web app follows tag their
 answer with Cayu's `cayu.server.etag`, so a read of an unchanged answer costs a 304.
 """
 
@@ -39,9 +40,13 @@ from cayu import CayuApp
 from fastapi import APIRouter
 
 from integrations.http.generated import inbox, overview, settings, task_runs, whoami
-from integrations.http.generated.overview import Metric, OverviewContext, OverviewMetrics
+from integrations.http.generated.overview import (
+    Metric,
+    OverviewContext,
+    OverviewMetrics,
+)
 from integrations.http.generated.settings import FixedSetting
-from integrations.http.generated.task_runs import RunKey, RunTitle
+from integrations.http.generated.task_runs import RunKey, RunTitle, TaskReader
 from integrations.http.generated.whoami import Person, PersonDependency
 
 
@@ -54,6 +59,7 @@ def build_generated_router(
     fixed_settings: Callable[[], Sequence[FixedSetting]] | None = None,
     run_key: RunKey | None = None,
     run_title: RunTitle | None = None,
+    read_tasks: TaskReader | None = None,
     agent_name: str | None = None,
     inbox_page: str | None = None,
 ) -> APIRouter:
@@ -62,12 +68,17 @@ def build_generated_router(
 
     ``agent_name`` is the Agent's specialist in Cayu; with it, `/app/inbox` serves its
     inbox and the Overview counts only its items. ``inbox_page`` is where the Overview sends a person to decide what waits: the
-    app's own Inbox (for example `/inbox`), or by default the Developer dashboard's."""
+    app's own Inbox (for example `/inbox`), or by default the Developer dashboard's.
+    ``read_tasks`` reads the tasks `/app/task-runs` groups: by default as the person, through
+    Cayu's resource-access policy; `task_runs.operator_tasks` reads every task, for an Agent
+    whose people are its operators."""
 
     routes = APIRouter()
     routes.include_router(whoami.router(person))
     routes.include_router(
-        settings.router(app, person=person, application=application, fixed=fixed_settings or tuple)
+        settings.router(
+            app, person=person, application=application, fixed=fixed_settings or tuple
+        )
     )
     routes.include_router(
         overview.router(
@@ -86,6 +97,7 @@ def build_generated_router(
             person=person,
             run_key=run_key or task_runs.default_run_key,
             run_title=run_title or task_runs.default_run_title,
+            read_tasks=read_tasks or task_runs.scoped_tasks,
         )
     )
     return routes
@@ -153,7 +165,11 @@ def cayu_api_client(request: Request, *, timeout: float = 30.0) -> httpx.AsyncCl
         # routes' handling of a failed answer runs instead of the exception escaping.
         transport=httpx.ASGITransport(app=request.app, raise_app_exceptions=False),
         base_url=f"{request.url.scheme}://{request.url.netloc}{CAYU_API_PATH}",
-        headers={name: value for name, value in request.headers.items() if name.lower() in names},
+        headers={
+            name: value
+            for name, value in request.headers.items()
+            if name.lower() in names
+        },
         timeout=timeout,
     )
 '''
@@ -366,7 +382,10 @@ def settings_view(
         status=None if controller is None else controller.status,
     )
     return SettingsView(
-        settings=[_live(app, setting, cloud, application) for setting in app.managed_settings()],
+        settings=[
+            _live(app, setting, cloud, application)
+            for setting in app.managed_settings()
+        ],
         read_only=[_fixed(setting) for setting in fixed],
         managed=controller is not None,
         cloud=cloud,
@@ -391,7 +410,9 @@ def router(
     async def get_settings(request: Request, response: Response) -> SettingsView:
         # Unchanged settings cost a 304 with no body.
         return tagged_json(
-            request, response, settings_view(app, application=application, fixed=fixed())
+            request,
+            response,
+            settings_view(app, application=application, fixed=fixed()),
         )
 
     return routes
@@ -404,14 +425,19 @@ def _live(
     snapshot = None
     if controller is not None:
         # A restart setting applies the value read when the app was built.
-        snapshot = controller.build_snapshot if setting.applies == "restart" else controller.snapshot
+        snapshot = (
+            controller.build_snapshot
+            if setting.applies == "restart"
+            else controller.snapshot
+        )
     value = app.managed_setting_value(setting.key)
     error = None
     source: Literal["managed", "default"] = "default"
     if snapshot is not None:
         # A refused value can be missing from `values`: Cloud reports it only as a conflict.
         reason = next(
-            (item.reason for item in snapshot.conflicts if item.key == setting.key), None
+            (item.reason for item in snapshot.conflicts if item.key == setting.key),
+            None,
         )
         if reason is not None:
             error = f"The value set in Cayu Cloud is refused: {reason}."
@@ -421,14 +447,19 @@ def _live(
             else:
                 error = "The value set in Cayu Cloud is refused."
     quoted = shlex.quote(application)
-    shown = "VALUE" if value is None and setting.default is None else json.dumps(
-        value if value is not None else setting.default
+    shown = (
+        "VALUE"
+        if value is None and setting.default is None
+        else json.dumps(value if value is not None else setting.default)
     )
     return LiveSettingRow(
         name=setting.key,
         key=setting.key,
         env_var=None,
-        group=next((label for prefix, label in GROUPS if setting.key.startswith(prefix)), "Other"),
+        group=next(
+            (label for prefix, label in GROUPS if setting.key.startswith(prefix)),
+            "Other",
+        ),
         label=setting.label,
         help=setting.description or "",
         applies=APPLIES[setting.applies],
@@ -451,7 +482,11 @@ def _live(
 
 def _note(setting: ManagedSetting, source: str, cloud: CloudState) -> str:
     if cloud.state == "unreported":
-        why = " (Cloud has no schema for this release yet)" if cloud.status == "schema_missing" else ""
+        why = (
+            " (Cloud has no schema for this release yet)"
+            if cloud.status == "schema_missing"
+            else ""
+        )
         return (
             f"Cayu Cloud's settings couldn't be read{why}, so {setting.key} as set there, if it "
             "is, doesn't apply yet; this is the value without it."
@@ -464,7 +499,9 @@ def _note(setting: ManagedSetting, source: str, cloud: CloudState) -> str:
     if source == "managed":
         return f"Set in Cayu Cloud as {setting.key}.{stale}"
     if setting.default is None:
-        return f"Not set in the release; set {setting.key} in Cayu Cloud to set it.{stale}"
+        return (
+            f"Not set in the release; set {setting.key} in Cayu Cloud to set it.{stale}"
+        )
     return f"The release's value; set {setting.key} in Cayu Cloud to change it.{stale}"
 
 
@@ -484,7 +521,9 @@ def _fixed(setting: FixedSetting) -> FixedSettingRow:
         value=value,
         source=None
         if setting.env_var is None
-        else ("environment" if os.environ.get(setting.env_var, "").strip() else "default"),
+        else (
+            "environment" if os.environ.get(setting.env_var, "").strip() else "default"
+        ),
         needs="redeploy" if setting.env_var else "not a setting yet",
         why=setting.why,
         warning=problem or (setting.warn(value) if setting.warn else None),
@@ -519,7 +558,11 @@ from cayu.server.etag import tagged_json
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
-from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
+from integrations.http.generated.cayu_api import (
+    INBOX_CLOSED,
+    INBOX_SILENT,
+    cayu_api_client,
+)
 from integrations.http.generated.whoami import Person, PersonDependency
 
 logger = logging.getLogger(__name__)
@@ -612,7 +655,10 @@ async def inbox_counts(
     counts = answer.get("counts") or {}
     by_kind = [
         InboxKind(
-            kind=kind, label=label, count=counts.get(kind, 0), to=f"{inbox_page}?kind={kind}"
+            kind=kind,
+            label=label,
+            count=counts.get(kind, 0),
+            to=f"{inbox_page}?kind={kind}",
         )
         for kind, label in INBOX_KINDS.items()
         if counts.get(kind)
@@ -648,18 +694,27 @@ def router(
         response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
     ) -> OverviewView:
-        found = await metrics(OverviewContext(app=app, person=signed_in, request=request))
+        found = await metrics(
+            OverviewContext(app=app, person=signed_in, request=request)
+        )
         view = OverviewView(
             as_of=datetime.now(UTC).isoformat(),
             metrics=[
-                MetricView(label=item.label, value=item.value, description=item.description)
+                MetricView(
+                    label=item.label, value=item.value, description=item.description
+                )
                 for item in found
             ],
-            inbox=await inbox_counts(request, inbox_page=inbox_page, agent_name=agent_name),
+            inbox=await inbox_counts(
+                request, inbox_page=inbox_page, agent_name=agent_name
+            ),
         )
         # `as_of` changes on every read: tagged with it, the overview would never be unchanged.
         return tagged_json(
-            request, response, view, tagged=view.model_dump(mode="json", exclude={"as_of"})
+            request,
+            response,
+            view,
+            tagged=view.model_dump(mode="json", exclude={"as_of"}),
         )
 
     return routes
@@ -672,14 +727,16 @@ the Agent's work: when a worker is lost and the work runs again as a new task, b
 are the same run. The Agent says which run a task belongs to with `run_key` (by default the
 `run` its metadata names, else the task itself) and how a run is titled with `run_title`.
 
-Tasks are read as the signed-in person (`await app.access(subject)`), so the list holds
-only the tasks Cayu's resource-access policy lets them see. The list carries an ETag
-(`cayu.server.etag`), so a read of unchanged runs costs a 304 with no body.
+Tasks are read with `read_tasks`. By default that is as the signed-in person
+(`await app.access(subject)`), so the list holds only the tasks Cayu's resource-access policy
+lets them see. An Agent whose people are its operators, who see every task on the Developer
+dashboard, passes `operator_tasks`. The list carries an ETag (`cayu.server.etag`), so a read
+of unchanged runs costs a 304 with no body.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -722,6 +779,26 @@ _OPEN = (*_WAITING, *_ACTIVE, *_HELD, TaskStatus.NEEDS_ATTENTION)
 
 RunKey = Callable[[Task], str]
 RunTitle = Callable[[Sequence[Task]], str]
+# Reads the tasks a person may see: (app, subject, query) -> tasks.
+TaskReader = Callable[[CayuApp, str, TaskQuery], Awaitable[Sequence[Task]]]
+
+
+async def scoped_tasks(app: CayuApp, subject: str, query: TaskQuery) -> Sequence[Task]:
+    """The tasks Cayu's resource-access policy lets ``subject`` see."""
+
+    access = await app.access(subject)
+    return await access.tasks.list(query)
+
+
+async def operator_tasks(
+    app: CayuApp, subject: str, query: TaskQuery
+) -> Sequence[Task]:
+    """Every task, for an Agent whose people are its operators: the person dependency has
+    already checked who they are and their role."""
+
+    if app.task_store is None:
+        return []
+    return await app.task_store.list_tasks(query)
 
 
 def default_run_key(task: Task) -> str:
@@ -761,7 +838,10 @@ def run_status(tasks: Sequence[Task], now: datetime) -> RunStatus:
         return "paused"
     waiting = [task for task in tasks if task.status in _WAITING]
     if waiting:
-        later = all(task.available_at is not None and task.available_at > now for task in waiting)
+        later = all(
+            task.available_at is not None and task.available_at > now
+            for task in waiting
+        )
         return "scheduled" if later else "queued"
     # Every task has ended.
     if all(status is TaskStatus.COMPLETED for status in statuses):
@@ -772,7 +852,12 @@ def run_status(tasks: Sequence[Task], now: datetime) -> RunStatus:
 
 
 def run_row(
-    key: str, tasks: Sequence[Task], title: RunTitle, now: datetime, *, partial: bool = False
+    key: str,
+    tasks: Sequence[Task],
+    title: RunTitle,
+    now: datetime,
+    *,
+    partial: bool = False,
 ) -> TaskRun:
     first = tasks[0]
     status = run_status(tasks, now)
@@ -781,7 +866,11 @@ def run_row(
         status = "partial"
     # Tasks that overlap may end in another order than they started: the run ends with the last.
     completed = [task.completed_at for task in tasks if task.completed_at is not None]
-    ended = max(completed, default=None) if status in ("completed", "partly_failed", "failed") else None
+    ended = (
+        max(completed, default=None)
+        if status in ("completed", "partly_failed", "failed")
+        else None
+    )
     return TaskRun(
         id=key,
         title=title(tasks),
@@ -803,6 +892,7 @@ async def list_task_runs(
     limit: int = 50,
     run_key: RunKey = default_run_key,
     run_title: RunTitle = default_run_title,
+    read_tasks: TaskReader = scoped_tasks,
     now: datetime | None = None,
     window: int = TASK_WINDOW,
 ) -> list[TaskRun]:
@@ -819,23 +909,26 @@ async def list_task_runs(
     if app.task_store is None:
         # An Agent without a task store has no tasks.
         return []
-    access = await app.access(subject)
     tasks = list(
-        await access.tasks.list(
-            TaskQuery(type=task_type, order_by=TaskOrder.CREATED_AT_DESC, limit=window)
+        await read_tasks(
+            app,
+            subject,
+            TaskQuery(type=task_type, order_by=TaskOrder.CREATED_AT_DESC, limit=window),
         )
     )
     partial = len(tasks) >= window
     if partial:
         seen = {task.id for task in tasks}
         for status in _OPEN:
-            for task in await access.tasks.list(
+            for task in await read_tasks(
+                app,
+                subject,
                 TaskQuery(
                     type=task_type,
                     status=status,
                     order_by=TaskOrder.CREATED_AT_ASC,
                     limit=OPEN_TASK_READ,
-                )
+                ),
             ):
                 if task.id not in seen:
                     seen.add(task.id)
@@ -844,7 +937,8 @@ async def list_task_runs(
     for task in sorted(tasks, key=lambda item: item.created_at):
         groups.setdefault(run_key(task), []).append(task)
     rows = [
-        run_row(key, items, run_title, now, partial=partial) for key, items in groups.items()
+        run_row(key, items, run_title, now, partial=partial)
+        for key, items in groups.items()
     ]
     rows.sort(key=lambda row: row.started_at, reverse=True)
     return rows[:limit]
@@ -856,6 +950,7 @@ def router(
     person: PersonDependency,
     run_key: RunKey = default_run_key,
     run_title: RunTitle = default_run_title,
+    read_tasks: TaskReader = scoped_tasks,
 ) -> APIRouter:
     routes = APIRouter()
 
@@ -868,7 +963,13 @@ def router(
         limit: int = Query(default=50, ge=1, le=500),
     ) -> list[TaskRun]:
         runs = await list_task_runs(
-            app, signed_in.subject, task_type=type, limit=limit, run_key=run_key, run_title=run_title
+            app,
+            signed_in.subject,
+            task_type=type,
+            limit=limit,
+            run_key=run_key,
+            run_title=run_title,
+            read_tasks=read_tasks,
         )
         # Unchanged runs cost a 304 with no body.
         return tagged_json(request, response, runs)
@@ -905,7 +1006,11 @@ import httpx
 from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
+from integrations.http.generated.cayu_api import (
+    INBOX_CLOSED,
+    INBOX_SILENT,
+    cayu_api_client,
+)
 from integrations.http.generated.whoami import PersonDependency
 
 logger = logging.getLogger(__name__)
@@ -928,8 +1033,16 @@ def router(*, person: PersonDependency, agent_name: str) -> APIRouter:
         q: str | None = None,
         session_id: str | None = None,
     ) -> JSONResponse:
-        query = {"limit": limit, "cursor": cursor, "kind": kind, "q": q, "session_id": session_id}
-        return await _forward(request, "GET", "/inbox", params=_with_agent(query, agent_name))
+        query = {
+            "limit": limit,
+            "cursor": cursor,
+            "kind": kind,
+            "q": q,
+            "session_id": session_id,
+        }
+        return await _forward(
+            request, "GET", "/inbox", params=_with_agent(query, agent_name)
+        )
 
     @routes.get("/inbox/counts")
     async def inbox_counts(
@@ -938,7 +1051,9 @@ def router(*, person: PersonDependency, agent_name: str) -> APIRouter:
         session_id: str | None = None,
     ) -> JSONResponse:
         query = {"q": q, "session_id": session_id}
-        return await _forward(request, "GET", "/inbox/counts", params=_with_agent(query, agent_name))
+        return await _forward(
+            request, "GET", "/inbox/counts", params=_with_agent(query, agent_name)
+        )
 
     @routes.post("/inbox/{item_id}/settle")
     async def settle(
@@ -963,7 +1078,9 @@ def _with_agent(query: dict[str, Any], agent_name: str) -> dict[str, Any]:
     }
 
 
-async def _forward(request: Request, method: str, path: str, **kwargs: Any) -> JSONResponse:
+async def _forward(
+    request: Request, method: str, path: str, **kwargs: Any
+) -> JSONResponse:
     """Cayu's answer to the same request, as the person behind ``request``."""
 
     status, content = await _call(request, method, path, **kwargs)
@@ -1013,3 +1130,17 @@ def app_route_files() -> dict[str, str]:
             ("inbox.py", _INBOX_PY),
         )
     }
+
+
+def cloud_application_slug(name: str) -> str:
+    """The application slug `cayu cloud init` makes from a project's name, or the name itself
+    when it makes none (init then asks for another name): the application the Settings page's
+    `cayu cloud settings` commands name until Cayu Cloud says which it runs the Agent as."""
+
+    from cayu.cli._cloud_api import CloudApiError
+    from cayu.cli._cloud_project import _application_slug
+
+    try:
+        return _application_slug(name)
+    except CloudApiError:
+        return name

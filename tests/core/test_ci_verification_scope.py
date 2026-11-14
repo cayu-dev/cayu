@@ -103,6 +103,7 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
     # and checked in the dashboard job, which has Node, and ship in the package.
     for path in (
         "src/cayu/cli/templates/app_web/src/main.tsx",
+        "src/cayu/cli/templates/app_web_operators/src/agent/task-runs.tsx",
         "src/cayu/cli/templates/app_web_organizations/src/agent/members.tsx",
         "src/cayu/cli/scaffold_app_web.py",
     ):

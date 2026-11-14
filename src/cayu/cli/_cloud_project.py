@@ -1263,6 +1263,16 @@ def initialize_project(
         if isinstance(capabilities, list) and APP_DATABASE in capabilities
         else None
     )
+    home = cast("str | None", kept.get("home"))
+    serve = cayu.get("serve")
+    if home is None and web_command is not None and isinstance(serve, dict) and serve.get("ui"):
+        # `cayu serve` serves the project's web app at / ([tool.cayu.serve] ui), so opening
+        # the Agent from Cloud lands on it rather than on the Developer dashboard.
+        home = "/"
+        notes.append(
+            'Set home = "/", the web app `cayu serve` serves from [tool.cayu.serve] ui, so '
+            "opening the Agent from Cayu Cloud lands on it."
+        )
     content = _render_initial_manifest(
         application=application,
         name=name or application,
@@ -1271,7 +1281,7 @@ def initialize_project(
         worker_command=worker_command,
         sign_in=sign_in,
         database_migrate=database_migrate,
-        home=cast("str | None", kept.get("home")),
+        home=home,
     )
     replaced = _replaced_fields(existing, tomllib.loads(content)) if existing else ()
     content += _render_kept(kept)
@@ -1523,7 +1533,7 @@ def _render_initial_manifest(
         'environment = "python"',
         'compatibility = "cayu>=0.1,<1"',
         'policy_version = "cayu-egress-v1"',
-        # Kept by --force: init itself can't know a page of the project's own.
+        # Kept by --force, else / for a project whose `cayu serve` serves its web app there.
         *(() if home is None else (f"home = {_toml_value(home)}",)),
         "",
     ]
@@ -1531,8 +1541,7 @@ def _render_initial_manifest(
         values.extend(("[web]", f"command = {json.dumps(web_command)}", "port = 8000", ""))
     if worker_command is not None:
         values.extend(("[worker]", f"command = {json.dumps(worker_command)}", ""))
-    # No `home`: init cannot know a page of the project's own. A worker has no pages,
-    # so Cloud sign-in costs it nothing.
+    # A worker has no pages, so Cloud sign-in costs it nothing.
     values.extend(("[sign_in]", f"mode = {json.dumps(sign_in)}", ""))
     if database_migrate is not None:
         values.extend(("[database]", f"migrate = {json.dumps(database_migrate)}", ""))

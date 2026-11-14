@@ -383,9 +383,10 @@ def build_router(app, *, development, auth=None):  # [tool.cayu.serve] routers
 - **Roles.** By default every Cloud role (`admin`, `developer`, `member`) may read and
   decide (`may_decide`), and `admin` and `developer` may change things (`may_change`);
   any other role gets 403, as does a `member` under `OPERATOR_ONLY_AUTH`, where members
-  are the app's own users. Pass `rule=OperatorRoles(...)` to change which roles do which
-  (`decide=()` when nobody decides in this app), or any function from `AuthContext` to
-  your person. `OperatorRoles(person=Person)` builds the generated app's `Person`.
+  are the app's own users. Pass `rule=operator_roles(auth, decide=(), person=Person)` to
+  keep that and change only who decides (`decide=()` when nobody decides in this app) or
+  build the generated app's `Person`. `rule=OperatorRoles(...)`, or any function from
+  `AuthContext` to your person, replaces the rule whole, without the auth's roles.
 - **Writes.** A `POST` (or any method but `GET`, `HEAD` and `OPTIONS`) sent from another
   site gets 403, so a page elsewhere can't use the person's saved sign-in.
 - **Elsewhere.** With `mount_cayu`, pass the dependency you give `AuthenticatedAccess`,

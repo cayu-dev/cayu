@@ -34,6 +34,7 @@ from cayu.server.operator_sign_in import (
     may_change_dependency,
     operator_context_dependency,
     operator_person_dependency,
+    operator_roles,
 )
 
 _PROXY = DevelopmentIdentityProxy()
@@ -289,6 +290,48 @@ def test_people_the_developer_dashboard_refuses_are_not_operators(wrapped: bool)
         everyone.get("/app/whoami", headers=_PROXY.headers("mel", role="member")).json()["role"]
         == "member"
     )
+
+
+def test_operator_roles_keeps_the_dashboards_roles_with_another_decide_and_person() -> None:
+    """The generated app passes `operator_roles` to change who decides and build its own
+    person, and members the Developer dashboard refuses stay refused."""
+
+    @dataclass(frozen=True)
+    class Teammate:
+        subject: str
+        role: str
+        may_decide: bool
+        may_change: bool
+        name: str | None = None
+        email: str | None = None
+
+    auth = ProxyIdentityAuth(
+        issuer=_PROXY.issuer,
+        audience=_PROXY.audience,
+        signing_keys=_PROXY.signing_keys(),
+        fallback=_LOGIN,
+        control_plane_roles=ControlPlaneRoles(read_and_decide=()),
+    )
+    rule = operator_roles(auth, decide=(), person=Teammate)
+    client = _client(operator_person_dependency(auth, rule=rule))
+
+    assert (
+        client.get("/app/whoami", headers=_PROXY.headers("mel", role="member")).status_code == 403
+    )
+    developer = client.get("/app/whoami", headers=_PROXY.headers("dev", role="developer")).json()
+    assert (developer["role"], developer["may_decide"], developer["may_change"]) == (
+        "developer",
+        False,
+        True,
+    )
+    # Without the dashboard's roles it is Cayu Cloud's rule, with the same changes.
+    plain = operator_roles(None, decide=("admin",), person=Teammate)
+    assert (plain.roles, plain.decide, plain.change) == (
+        ("admin", "developer", "member"),
+        ("admin",),
+        ("admin", "developer"),
+    )
+    assert operator_roles(auth).person is OperatorPerson
 
 
 def test_a_dashboard_rule_without_operator_roles_needs_an_explicit_rule() -> None:

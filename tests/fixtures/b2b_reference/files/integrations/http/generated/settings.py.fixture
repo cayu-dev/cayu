@@ -135,7 +135,10 @@ def settings_view(
         status=None if controller is None else controller.status,
     )
     return SettingsView(
-        settings=[_live(app, setting, cloud, application) for setting in app.managed_settings()],
+        settings=[
+            _live(app, setting, cloud, application)
+            for setting in app.managed_settings()
+        ],
         read_only=[_fixed(setting) for setting in fixed],
         managed=controller is not None,
         cloud=cloud,
@@ -160,7 +163,9 @@ def router(
     async def get_settings(request: Request, response: Response) -> SettingsView:
         # Unchanged settings cost a 304 with no body.
         return tagged_json(
-            request, response, settings_view(app, application=application, fixed=fixed())
+            request,
+            response,
+            settings_view(app, application=application, fixed=fixed()),
         )
 
     return routes
@@ -173,14 +178,19 @@ def _live(
     snapshot = None
     if controller is not None:
         # A restart setting applies the value read when the app was built.
-        snapshot = controller.build_snapshot if setting.applies == "restart" else controller.snapshot
+        snapshot = (
+            controller.build_snapshot
+            if setting.applies == "restart"
+            else controller.snapshot
+        )
     value = app.managed_setting_value(setting.key)
     error = None
     source: Literal["managed", "default"] = "default"
     if snapshot is not None:
         # A refused value can be missing from `values`: Cloud reports it only as a conflict.
         reason = next(
-            (item.reason for item in snapshot.conflicts if item.key == setting.key), None
+            (item.reason for item in snapshot.conflicts if item.key == setting.key),
+            None,
         )
         if reason is not None:
             error = f"The value set in Cayu Cloud is refused: {reason}."
@@ -190,14 +200,19 @@ def _live(
             else:
                 error = "The value set in Cayu Cloud is refused."
     quoted = shlex.quote(application)
-    shown = "VALUE" if value is None and setting.default is None else json.dumps(
-        value if value is not None else setting.default
+    shown = (
+        "VALUE"
+        if value is None and setting.default is None
+        else json.dumps(value if value is not None else setting.default)
     )
     return LiveSettingRow(
         name=setting.key,
         key=setting.key,
         env_var=None,
-        group=next((label for prefix, label in GROUPS if setting.key.startswith(prefix)), "Other"),
+        group=next(
+            (label for prefix, label in GROUPS if setting.key.startswith(prefix)),
+            "Other",
+        ),
         label=setting.label,
         help=setting.description or "",
         applies=APPLIES[setting.applies],
@@ -220,7 +235,11 @@ def _live(
 
 def _note(setting: ManagedSetting, source: str, cloud: CloudState) -> str:
     if cloud.state == "unreported":
-        why = " (Cloud has no schema for this release yet)" if cloud.status == "schema_missing" else ""
+        why = (
+            " (Cloud has no schema for this release yet)"
+            if cloud.status == "schema_missing"
+            else ""
+        )
         return (
             f"Cayu Cloud's settings couldn't be read{why}, so {setting.key} as set there, if it "
             "is, doesn't apply yet; this is the value without it."
@@ -233,7 +252,9 @@ def _note(setting: ManagedSetting, source: str, cloud: CloudState) -> str:
     if source == "managed":
         return f"Set in Cayu Cloud as {setting.key}.{stale}"
     if setting.default is None:
-        return f"Not set in the release; set {setting.key} in Cayu Cloud to set it.{stale}"
+        return (
+            f"Not set in the release; set {setting.key} in Cayu Cloud to set it.{stale}"
+        )
     return f"The release's value; set {setting.key} in Cayu Cloud to change it.{stale}"
 
 
@@ -253,7 +274,9 @@ def _fixed(setting: FixedSetting) -> FixedSettingRow:
         value=value,
         source=None
         if setting.env_var is None
-        else ("environment" if os.environ.get(setting.env_var, "").strip() else "default"),
+        else (
+            "environment" if os.environ.get(setting.env_var, "").strip() else "default"
+        ),
         needs="redeploy" if setting.env_var else "not a setting yet",
         why=setting.why,
         warning=problem or (setting.warn(value) if setting.warn else None),

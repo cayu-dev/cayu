@@ -14,6 +14,10 @@ registry; never a `GENERATED.` file, a building block or the build tooling. A la
 whole: build output has hashed names, so another build's files can't stay beside it.
 `scripts/build_app_web.py` builds and checks each composition.
 
+`templates/app_web_operators/` is the layer of the `web-app` capability, for an Agent whose
+people are its operators: its Task runs area, and the smoke test in `e2e/`, which opens every
+area of the app `cayu serve --dev` serves.
+
 `templates/app_web_organizations/` is the organizations layer the b2b preset adds: member
 sign-in for `cayu serve --dev`, the Members area, the organization switcher, conversations
 scoped to an organization, and their calls to b2b's own routes.
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
     from importlib.resources.abc import Traversable
 
 APP = "app_web"
+OPERATORS = "app_web_operators"
 ORGANIZATIONS = "app_web_organizations"
 
 # The committed build `cayu serve` serves ([tool.cayu.serve] ui), relative to the app.

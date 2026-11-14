@@ -64,7 +64,15 @@ def test_agent_project_converts_to_a_fresh_docker_coding_scaffold(
         "preset": "coding",
         "provider": "openai",
         "execution": "docker",
-        "capabilities": ["artifacts", "delegation", "evals", "human-input", "knowledge", "tasks"],
+        "capabilities": [
+            "artifacts",
+            "delegation",
+            "evals",
+            "human-input",
+            "knowledge",
+            "tasks",
+            "web-app",
+        ],
     }
     operations = {edit["path"]: edit["operation"] for edit in planned["edits"]}
     assert operations["Dockerfile.coding"] == "create"

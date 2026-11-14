@@ -59,9 +59,17 @@ def test_every_preset_gets_a_pinned_workflow_that_needs_no_secrets(
     for name, value in plan.check_environment():
         assert f"          {name}: '{value}'\n" in workflow
     has_web = "web/package.json" in files
-    assert has_web == (preset == "b2b")
+    assert has_web == (preset == "b2b" or "web-app" in plan.capabilities)
+    # The `web-app` capability's smoke test runs after the check, against `cayu serve --dev`.
+    smoke = "web-app" in plan.capabilities
+    assert smoke == ("web/e2e/package.json" in files)
+    if smoke:
+        assert (
+            "        working-directory: web/e2e\n        run: |\n          npm ci\n"
+            "          npx playwright install --with-deps chromium\n          npm test\n"
+        ) in workflow
     web_commands = ["npm ci", "npm run lint", "npm run typecheck", "npm run check:build"]
-    assert commands[len(checks) :] == (web_commands if has_web else [])
+    assert commands[len(checks) :] == (["|"] if smoke else []) + (web_commands if has_web else [])
     assert ("memory" in plan.capabilities) == ("CAYU_MEMORY_EVIDENCE_KEY" in workflow)
     for guide in ("README.md", "AGENTS.md"):
         assert f"`{CI_WORKFLOW_PATH}` runs `uv sync`" in files[guide]

@@ -313,10 +313,12 @@ def build_router(app, *, development, auth=None):
   operator login without Cloud's identity header) is `admin`, since the auth target
   already gives it the whole Developer dashboard. Any other role gets 403, and so does a
   role the auth's `control_plane_roles` keeps off the Developer dashboard: under
-  `OPERATOR_ONLY_AUTH` a `member` is the application's own user, not an operator. Pass
-  `rule=OperatorRoles(roles=..., decide=..., change=...)`, or any function from
-  `AuthContext` to a person, to replace it; `may_change_dependency(person)` refuses
-  people who may not change things.
+  `OPERATOR_ONLY_AUTH` a `member` is the application's own user, not an operator.
+  `rule=operator_roles(auth, decide=..., person=...)` keeps that and changes only who
+  decides or what the person is built as. `rule=OperatorRoles(roles=..., decide=...,
+  change=...)`, or any function from `AuthContext` to a person, replaces it whole, without
+  the auth's roles; `may_change_dependency(person)` refuses people who may not change
+  things.
 - Under `cayu serve --dev`, `auth` is `None` and the person is the one running the
   server, `dev:<user>` as `admin` (`LocalOperator`), admitted only from a loopback
   client that addresses the server by a loopback name. Outside `--dev`, `auth=None` is

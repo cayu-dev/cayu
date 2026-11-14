@@ -52,6 +52,10 @@ The parts, each usable on its own:
   auth's ``control_plane_roles`` keeps off the Developer dashboard (a ``member`` under
   ``OPERATOR_ONLY_AUTH`` is the application's own user). Configure it, or pass any function
   from ``AuthContext`` to a person as ``rule``.
+- ``operator_roles(auth, decide=..., person=...)``: ``OperatorRoles`` limited to the roles
+  ``auth`` lets use the Developer dashboard, the default rule. Pass it as ``rule`` to change
+  only who decides or which class the person is; an ``OperatorRoles`` built by hand doesn't
+  look at ``auth``.
 - ``operator_person_dependency(auth, development=..., rule=...)``: the two together, the
   person behind the request (an ``OperatorPerson`` by default).
 - ``may_change_dependency(person)``: the same person, or 403 when their role may not change
@@ -88,6 +92,7 @@ __all__ = [
     "may_change_dependency",
     "operator_context_dependency",
     "operator_person_dependency",
+    "operator_roles",
 ]
 
 #: Cayu Cloud's operator roles. Each may use an operator Agent's routes and decide what
@@ -311,7 +316,7 @@ def operator_person_dependency(
     """
 
     context = operator_context_dependency(auth, development=development)
-    decide: Callable[[AuthContext], Any] = _default_rule(auth) if rule is None else rule
+    decide: Callable[[AuthContext], Any] = operator_roles(auth) if rule is None else rule
     if not callable(decide):
         raise ValueError("`rule` must turn an AuthContext into the person.")
 
@@ -334,12 +339,41 @@ def may_change_dependency(
     return changer
 
 
-def _default_rule(auth: AuthDependency | None) -> OperatorRoles[OperatorPerson]:
-    """Cayu Cloud's rule, limited to the roles ``auth`` lets use the Developer dashboard."""
+@overload
+def operator_roles(
+    auth: AuthDependency | None, *, decide: Iterable[str] | None = None
+) -> OperatorRoles[OperatorPerson]: ...
+
+
+@overload
+def operator_roles(
+    auth: AuthDependency | None,
+    *,
+    decide: Iterable[str] | None = None,
+    person: Callable[..., PersonT],
+) -> OperatorRoles[PersonT]: ...
+
+
+def operator_roles(
+    auth: AuthDependency | None,
+    *,
+    decide: Iterable[str] | None = None,
+    person: Callable[..., Any] = OperatorPerson,
+) -> OperatorRoles[Any]:
+    """Cayu Cloud's rule, limited to the roles ``auth`` lets use the Developer dashboard.
+
+    The default rule of ``operator_person_dependency``. When ``auth`` carries
+    ``control_plane_roles`` (a ``ProxyIdentityAuth``), only the roles it lets use the
+    dashboard are admitted: under ``OPERATOR_ONLY_AUTH`` a ``member`` is the application's
+    own user and gets 403. An
+    ``OperatorRoles(...)`` built by hand doesn't look at ``auth``, so pass this instead
+    when only ``decide`` or ``person`` should differ. ``decide`` names the roles that may
+    decide (``()`` for nobody); by default every admitted role does.
+    """
 
     dashboard = getattr(auth, "control_plane_roles", None)
     if not isinstance(dashboard, ControlPlaneRoles):
-        return OperatorRoles()
+        return OperatorRoles(decide=decide, person=person)
     admitted = {*dashboard.full_access, *dashboard.read_and_decide}
     roles = tuple(role for role in OPERATOR_ROLES if role in admitted)
     if not roles:
@@ -349,9 +383,13 @@ def _default_rule(auth: AuthDependency | None) -> OperatorRoles[OperatorPerson]:
         )
     return OperatorRoles(
         roles=roles,
+        decide=None
+        if decide is None
+        else [role for role in _role_names(decide, "decide") if role in roles],
         change=tuple(role for role in CHANGE_ROLES if role in admitted),
         role_claim=dashboard.role_claim,
         unnamed_role="admin" if "admin" in roles else None,
+        person=person,
     )
 
 

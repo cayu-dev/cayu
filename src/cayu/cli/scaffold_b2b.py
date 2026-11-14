@@ -13,7 +13,7 @@ from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
 )
-from cayu.cli.scaffold_app_routes import app_route_files
+from cayu.cli.scaffold_app_routes import app_route_files, cloud_application_slug
 from cayu.cli.scaffold_app_web import ORGANIZATIONS, web_app_files
 from cayu.cli.scaffold_plan import ApplicationPlan
 
@@ -2518,19 +2518,6 @@ _B2B_MULTI_USER = (
 )
 
 
-def _cloud_application(name: str) -> str:
-    """The application slug `cayu cloud init` makes from the project's name, or the name
-    itself when it makes none (init then asks for another name)."""
-
-    from cayu.cli._cloud_api import CloudApiError
-    from cayu.cli._cloud_project import _application_slug
-
-    try:
-        return _application_slug(name)
-    except CloudApiError:
-        return name
-
-
 def _agents_md(agents: str) -> str:
     for row, replacement in _AGENTS_ROWS.items():
         agents = agents.replace(row, replacement)
@@ -2606,7 +2593,7 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "integrations/sign_in.py": _SIGN_IN_PY,
         "integrations/http/__init__.py": _HTTP_PY.replace(
             "__AGENT_NAME__", plan.agent_name
-        ).replace("__CLOUD_APPLICATION__", _cloud_application(plan.name)),
+        ).replace("__CLOUD_APPLICATION__", cloud_application_slug(plan.name)),
         **app_route_files(),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,

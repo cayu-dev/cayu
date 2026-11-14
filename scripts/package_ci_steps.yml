@@ -271,7 +271,10 @@ steps:
   - name: Check built-wheel authoring contract
     groups: authoring
     run: |
-      uv pip install --python .release-venv/bin/python pytest
+      # A generated project depends on cayu[postgres,server]: its web app's routes and
+      # their tests need the server extra.
+      uv pip install --python .release-venv/bin/python pytest \
+        "cayu[server] @ file://$(realpath dist/first/*.whl)"
       .release-venv/bin/python -m cayu version
       project_root="$(mktemp -d "$RUNNER_TEMP/authoring.XXXXXX")"
       .release-venv/bin/cayu new proof --dir "$project_root"
@@ -414,7 +417,10 @@ steps:
   - name: Check built-wheel coding authoring contract
     groups: coding
     run: |
-      uv pip install --python .release-venv/bin/python pytest
+      # A generated project depends on cayu[postgres,server]: its web app's routes and
+      # their tests need the server extra.
+      uv pip install --python .release-venv/bin/python pytest \
+        "cayu[server] @ file://$(realpath dist/first/*.whl)"
       coding_root="$(mktemp -d "$RUNNER_TEMP/coding.XXXXXX")"
       "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-coding \
         --preset coding --dir "$coding_root"

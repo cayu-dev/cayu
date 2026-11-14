@@ -2,7 +2,7 @@
 
 ``--ci github`` (the default) writes a GitHub Actions workflow that runs the
 project's tests and ``cayu check`` on a fresh checkout, plus the web app's
-checks for a project that has one. It needs no secrets: the generated root
+checks and its smoke test for a project that has them. It needs no secrets: the generated root
 ``conftest.py`` gives the tests a throwaway memory evidence key and ``cayu
 check`` borrows one. ``--ci none`` writes no workflow.
 
@@ -115,6 +115,23 @@ _WEB_JOB = """
 """
 
 
+_SMOKE_STEP = """\
+      # Opens every area of the web app in a browser, served by `cayu serve --dev`
+      # (web/e2e/playwright.config.ts).
+      - uses: __SETUP_NODE__
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/e2e/package-lock.json
+      - name: Web app smoke test
+        working-directory: web/e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm test
+"""
+
+
 def ci_files(plan: ApplicationPlan, files: Mapping[str, str]) -> dict[str, str]:
     """The CI files for ``plan``, given every other file the project gets."""
 
@@ -145,6 +162,11 @@ def ci_guidance(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
         if _has_web_app(files)
         else ""
     )
+    if _has_smoke_test(files):
+        web += (
+            " After the check, the first job opens every area of the web app in a browser "
+            "(`web/e2e`)."
+        )
     image = (
         " Before the check it builds the coding image from the pins committed in "
         "`docker-coding-build.json`."
@@ -175,6 +197,10 @@ def _has_web_app(files: Mapping[str, str]) -> bool:
     return "web/package.json" in files and "web/package-lock.json" in files
 
 
+def _has_smoke_test(files: Mapping[str, str]) -> bool:
+    return "web/e2e/package.json" in files and "web/e2e/package-lock.json" in files
+
+
 def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     steps = [
         f"      - uses: {_CHECKOUT}\n",
@@ -203,6 +229,8 @@ def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
             + "".join(f"          {name}: {_yaml_string(value)}\n" for name, value in environment)
         )
     steps.append(check)
+    if _has_smoke_test(files):
+        steps.append(_SMOKE_STEP.replace("__SETUP_NODE__", _SETUP_NODE))
     if "evals" in plan.capabilities:
         steps.append(_evals_note(plan))
     workflow = _HEADER + "".join(steps)

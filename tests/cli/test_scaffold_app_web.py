@@ -25,7 +25,7 @@ import pytest
 
 from cayu.cli import scaffold
 from cayu.cli.scaffold import project_files
-from cayu.cli.scaffold_app_web import APP, ORGANIZATIONS, layer_sources, web_app_files
+from cayu.cli.scaffold_app_web import APP, OPERATORS, ORGANIZATIONS, layer_sources, web_app_files
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 TEMPLATES = REPOSITORY / "src/cayu/cli/templates"
@@ -81,8 +81,42 @@ def test_the_generic_app_names_no_organizations_members_or_departments() -> None
     assert "export const areas: AppArea[] = [overviewArea(" in registry
     assert "settingsArea]" in registry
     assert "export const shell: ShellParts = {};" in registry
-    # It ships no build of its own yet: the b2b app's is the organizations layer's.
+    # It ships no build of its own: each composition's is its last layer's.
     assert not (app / "static").exists()
+
+
+def test_the_operator_app_is_the_generic_app_with_the_operators_layer() -> None:
+    app = layer_sources(TEMPLATES)
+    composed = layer_sources(TEMPLATES, (OPERATORS,))
+    layer = TEMPLATES / OPERATORS
+
+    from_layer = {
+        path for path, source in composed.items() if Path(str(source)).is_relative_to(layer)
+    }
+    # The layer replaces only the area registry, and adds Task runs, the smoke test and the build.
+    assert from_layer & app.keys() == {"src/agent/index.tsx"}
+    assert {
+        "src/agent/task-runs.tsx",
+        "e2e/package.json",
+        "e2e/package-lock.json",
+        "e2e/playwright.config.ts",
+        "e2e/smoke.spec.ts",
+        "static/index.html",
+    } <= from_layer
+    registry = (layer / "src/agent/index.tsx").read_text(encoding="utf-8")
+    assert "export const shell: ShellParts = {};" in registry
+    assert "taskRunsArea," in registry
+    # Its people are the Agent's operators: it names no organizations, members or departments.
+    for path in sorted(from_layer - {"e2e/package-lock.json"}):
+        if not path.startswith("static/"):
+            text = (layer / path).read_text(encoding="utf-8")
+            assert not re.search(r"organi[sz]ation|department|\bmember|b2b", text, re.I), path
+    # Every preset with the `web-app` capability gets exactly this app.
+    files = project_files(PROJECT)
+    assert {f"web/{path}" for path in composed} == {
+        path for path in files if path.startswith("web/")
+    }
+    assert '"name": "web",' in files["web/package.json"]
 
 
 def test_the_b2b_app_is_the_generic_app_with_the_organizations_layer() -> None:
