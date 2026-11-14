@@ -6589,6 +6589,17 @@
       "identities": {},
       "present": []
     },
+    "cayu.server.operator_sign_in": {
+      "defined_in": {
+        "cayu.server.operator_sign_in": [
+          "OperatorPerson",
+          "may_change_dependency",
+          "operator_person_dependency"
+        ]
+      },
+      "identities": {},
+      "present": []
+    },
     "cayu.server.proxy_identity": {
       "defined_in": {},
       "identities": {},

@@ -106,7 +106,13 @@ class _CachedAuthContext:
 
 
 def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitable[AuthContext]]:
-    """Wrap a user auth callable so routes receive a validated AuthContext."""
+    """Wrap a user auth callable so routes receive a validated AuthContext.
+
+    When ``auth`` has an ``authenticate`` method (``ProxyIdentityAuth``: who is calling,
+    without its route rule), the wrapper has one too, returning a validated AuthContext,
+    and the same ``control_plane_roles``, so a project's own routes can tell which roles
+    the Developer dashboard admits.
+    """
 
     async def dependency(request: Request) -> AuthContext:
         cached = request.scope.get(_AUTH_CONTEXT_SCOPE_KEY)
@@ -128,6 +134,18 @@ def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitabl
             if not full_access and await has_decision_overrides(request):
                 raise _role_forbidden()
         return context.model_copy(deep=True)
+
+    # A dependency that can say who is calling without its route rule
+    # (`ProxyIdentityAuth.authenticate`) keeps saying so through the wrapper, so a project's
+    # own routes given it by `cayu serve` can apply their own rule instead.
+    identify = getattr(auth, "authenticate", None)
+    if callable(identify):
+
+        async def authenticate(request: Request) -> AuthContext:
+            return await resolve_auth_context(identify, request)
+
+        dependency.authenticate = authenticate  # ty: ignore[unresolved-attribute]
+        dependency.control_plane_roles = getattr(auth, "control_plane_roles", None)  # ty: ignore[unresolved-attribute]
 
     return dependency
 

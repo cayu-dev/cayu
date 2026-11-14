@@ -343,6 +343,57 @@ const stop = cayu.watchTasks(
   watch costs a `304` with no body. It never stops as idle; call the returned
   function when the page goes away.
 
+## Know who is signed in to your own routes
+
+When an Agent's people are its own team (Cayu Cloud's operators when deployed, you under
+`cayu serve --dev`), its own routes sign them in with the same auth as the Developer
+dashboard and get the person from `cayu.server.operator_sign_in`, instead of copying a
+sign-in file into every Agent:
+
+```python
+from fastapi import APIRouter, Depends
+
+from cayu.server.operator_sign_in import (
+    OperatorPerson,
+    may_change_dependency,
+    operator_person_dependency,
+)
+
+
+def build_router(app, *, development, auth=None):  # [tool.cayu.serve] routers
+    person = operator_person_dependency(auth, development=development)
+    router = APIRouter(prefix="/app")
+
+    @router.get("/me")
+    async def me(signed_in: OperatorPerson = Depends(person)):
+        return {"name": signed_in.name or signed_in.subject, "may_change": signed_in.may_change}
+
+    @router.post("/recheck")
+    async def recheck(signed_in: OperatorPerson = Depends(may_change_dependency(person))):
+        ...
+
+    return router
+```
+
+- **Who.** `cayu serve` passes `auth` (`--auth` over `[tool.cayu.serve].auth`) and
+  `development`. Cayu Cloud's people come with their `subject`, `role`, `name` and
+  `email`; the operator login without Cloud's identity header is `admin`; under `--dev`
+  it is you, as `dev:<user>` and `admin`, on a loopback address only. Without `auth`
+  outside `--dev` it refuses to build, so the routes never serve open.
+- **Roles.** By default every Cloud role (`admin`, `developer`, `member`) may read and
+  decide (`may_decide`), and `admin` and `developer` may change things (`may_change`);
+  any other role gets 403, as does a `member` under `OPERATOR_ONLY_AUTH`, where members
+  are the app's own users. Pass `rule=OperatorRoles(...)` to change which roles do which
+  (`decide=()` when nobody decides in this app), or any function from `AuthContext` to
+  your person. `OperatorRoles(person=Person)` builds the generated app's `Person`.
+- **Writes.** A `POST` (or any method but `GET`, `HEAD` and `OPTIONS`) sent from another
+  site gets 403, so a page elsewhere can't use the person's saved sign-in.
+- **Elsewhere.** With `mount_cayu`, pass the dependency you give `AuthenticatedAccess`,
+  or `None` with `development=True` beside `OpenAccess(trusted_local_development=True)`.
+  `operator_context_dependency` gives the verified `AuthContext` alone, without a role
+  rule. An app whose people are its customers signs them in with
+  `ProxyIdentityAuth.product_dependency()` instead (`cayu guide b2b`).
+
 ## Keep GET handlers read-only
 
 A GET handler in your app must not reconcile decisions, migrate data, backfill

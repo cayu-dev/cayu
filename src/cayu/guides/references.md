@@ -459,7 +459,11 @@ callers, since the Developer dashboard's target doesn't cover them. A function t
 takes `auth` gets the auth dependency `cayu serve` resolved (`--auth` over
 `[tool.cayu.serve].auth`, or `None` under `--dev`), adapted as for Cayu's routes so
 `Depends(auth)` gives an `AuthContext` and follows the same `--auth` as `/api`;
-functions without it get only the app and `development=`. Each route must start
+functions without it get only the app and `development=`. For routes whose people are
+the Agent's operators, `cayu.server.operator_sign_in.operator_person_dependency(auth,
+development=development)` gives the signed-in person with Cayu Cloud's roles (`cayu
+guide app-ui`); `Depends(auth)` alone also applies the Developer dashboard's route rule,
+which refuses a `member` outside Cayu's own read and decision routes. Each route must start
 with a fixed path segment that isn't one of Cayu's own (such as `/api` or `/cayu`), so a
 parameter or catch-all can't answer for Cayu's paths; the b2b preset serves its API under
 `/app` this way. A project with its own pages serves their build at `/` with

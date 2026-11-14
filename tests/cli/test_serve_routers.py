@@ -89,6 +89,21 @@ def protected(app, *, development, auth):
     return router
 
 
+def operator_routes(app, *, development, auth):
+    from fastapi import Depends
+
+    from cayu.server.operator_sign_in import operator_person_dependency
+
+    person = operator_person_dependency(auth, development=development)
+    router = APIRouter()
+
+    @router.get("/app/me")
+    async def me(signed_in=Depends(person)):
+        return {"subject": signed_in.subject, "role": signed_in.role}
+
+    return router
+
+
 def any_options(app, **options):
     router = APIRouter()
 
@@ -214,6 +229,65 @@ def test_a_router_taking_any_keyword_gets_auth_too(
         "options": ["auth", "development"],
         "auth": not development,
     }
+
+
+_PROXY_AUTH = """from cayu.server import BasicAuth, ProxyIdentityAuth
+from cayu.server.development_identity import registered_development_identity
+
+_proxy = registered_development_identity()
+AUTH = ProxyIdentityAuth(
+    issuer=_proxy.issuer,
+    audience=_proxy.audience,
+    signing_keys=_proxy.signing_keys(),
+    fallback=BasicAuth(username="operator", password="secret"),
+)
+"""
+
+
+@pytest.mark.parametrize("development", [True, False])
+def test_the_operator_sign_in_part_signs_in_cloud_members_under_cayu_serve(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launched: dict[str, Any],
+    development: bool,
+) -> None:
+    pytest.importorskip("jwt")
+    import getpass
+
+    from cayu.server.development_identity import DevelopmentIdentityProxy
+
+    proxy = DevelopmentIdentityProxy()
+    proxy.register()
+    try:
+        project = _project(
+            tmp_path,
+            'routers = ["project_routes:operator_routes"]\nauth = "project_proxy_auth:AUTH"\n',
+        )
+        (project / "project_proxy_auth.py").write_text(_PROXY_AUTH, encoding="utf-8")
+        monkeypatch.delitem(sys.modules, "project_proxy_auth", raising=False)
+        monkeypatch.chdir(project)
+
+        assert main(["serve", "--dev"] if development else ["serve", "--host", "127.0.0.1"]) == 0
+
+        client = TestClient(
+            launched["server"], base_url="http://127.0.0.1", client=("127.0.0.1", 50000)
+        )
+        if development:
+            # `auth` is None under --dev: the person running it, as admin.
+            assert client.get("/app/me").json() == {
+                "subject": f"dev:{getpass.getuser()}",
+                "role": "admin",
+            }
+        else:
+            # Cayu's route rule would refuse a member outside /api; the part asks only who.
+            member = proxy.headers("mel", role="member")
+            assert client.get("/app/me", headers=member).json() == {
+                "subject": "mel",
+                "role": "member",
+            }
+            assert client.get("/app/me").status_code == 401
+    finally:
+        proxy.unregister()
 
 
 @pytest.mark.parametrize(

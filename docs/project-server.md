@@ -276,6 +276,60 @@ subject its resource access policy resolves (see
 [resource access](resource-access.md#product-http-integration)). The header format and every check
 are in the [runtime contracts](runtime-contracts.md#trusted-proxy-identity).
 
+### Sign operators in to the project's own routes
+
+The project's own routes (`[tool.cayu.serve] routers`) sit outside the Developer
+dashboard's auth. When their people are the Agent's operators, as on a web app for its
+own team, `cayu.server.operator_sign_in` signs them in with the same auth and gives
+each request the person behind it:
+
+```python
+# project_routes.py, named in [tool.cayu.serve] routers = ["project_routes:build_router"]
+from fastapi import APIRouter, Depends
+
+from cayu.server.operator_sign_in import OperatorPerson, operator_person_dependency
+
+
+def build_router(app, *, development, auth=None):
+    person = operator_person_dependency(auth, development=development)
+    router = APIRouter(prefix="/app")
+
+    @router.get("/whoami")
+    async def whoami(signed_in: OperatorPerson = Depends(person)):
+        return {"subject": signed_in.subject, "role": signed_in.role, "name": signed_in.name}
+
+    return router
+```
+
+- `auth` is the dependency `cayu serve` resolved (`--auth` over `[tool.cayu.serve].auth`).
+  A `ProxyIdentityAuth` is asked only who is calling (`authenticate`), so its
+  control-plane route rule, which lets a `member` use only Cayu's read and decision
+  routes, doesn't refuse members on the project's routes. `Depends(auth)` on its own
+  applies that rule.
+- `OperatorPerson` has the `subject`, the `role`, `may_decide`, `may_change`, and the
+  `name` and `email` when Cayu Cloud's sign-in sends them. The default rule,
+  `OperatorRoles()`, is Cayu Cloud's: `admin`, `developer` and `member` may read and
+  decide, `admin` and `developer` may change things, and a caller with no role (the
+  operator login without Cloud's identity header) is `admin`, since the auth target
+  already gives it the whole Developer dashboard. Any other role gets 403, and so does a
+  role the auth's `control_plane_roles` keeps off the Developer dashboard: under
+  `OPERATOR_ONLY_AUTH` a `member` is the application's own user, not an operator. Pass
+  `rule=OperatorRoles(roles=..., decide=..., change=...)`, or any function from
+  `AuthContext` to a person, to replace it; `may_change_dependency(person)` refuses
+  people who may not change things.
+- Under `cayu serve --dev`, `auth` is `None` and the person is the one running the
+  server, `dev:<user>` as `admin` (`LocalOperator`), admitted only from a loopback
+  client that addresses the server by a loopback name. Outside `--dev`, `auth=None` is
+  refused when the routes are built.
+- A write (any method but `GET`, `HEAD` and `OPTIONS`) whose `Sec-Fetch-Site` or
+  `Origin` names another site gets 403. `ProxyIdentityAuth` checks one with its
+  identity itself, against the origin the proxy signed; for any other sign-in the
+  `Origin` host must be the request's `Host`.
+
+An application that mounts Cayu with `mount_cayu` uses the same part with the dependency
+it gives `AuthenticatedAccess`, or with `None` and `development=True` beside
+`OpenAccess(trusted_local_development=True)`.
+
 ### Sign in as a person locally
 
 `cayu serve --identity-proxy` runs a development stand-in for Cayu Cloud's router in

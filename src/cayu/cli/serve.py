@@ -82,7 +82,8 @@ class _ServeSettings:
     # function that also takes `auth=` gets the auth dependency `cayu serve` resolved
     # (`--auth` over `[tool.cayu.serve].auth`, as a dependency returning an
     # `AuthContext`; `None` under `--dev`), so its routes can use the same auth as
-    # Cayu's own. Functions without it get only the app and `development=`.
+    # Cayu's own; `cayu.server.operator_sign_in` turns it into the signed-in operator.
+    # Functions without it get only the app and `development=`.
     routers: tuple[str, ...] = ()
     # The project's built web app, served at / for every path no route answers.
     ui: Path | None = None
@@ -521,7 +522,9 @@ def _include_project_routers(
     authenticate their own callers (each ``ExternalEventSource`` does for its route).
     A router function that takes ``auth`` gets the dependency ``cayu serve`` resolved,
     adapted as for Cayu's routes to return an ``AuthContext`` (``None`` under
-    ``--dev``), so it can protect its routes the same way.
+    ``--dev``), so it can protect its routes the same way. The adapter keeps the
+    dependency's ``authenticate`` (who is calling, without Cayu's route rule), which
+    ``cayu.server.operator_sign_in`` uses.
     """
 
     from fastapi import APIRouter
