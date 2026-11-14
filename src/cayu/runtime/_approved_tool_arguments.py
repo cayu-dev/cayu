@@ -170,14 +170,11 @@ async def admit_approved_tool_arguments(
         tool_call=runtime_records.ToolCallRequest(
             id=call.tool_call_id, name=call.tool_name, arguments=arguments
         ),
-        request_metadata={
-            **request_metadata,
-            TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
-            APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY: True,
-        },
+        request_metadata=request_metadata,
         taint_labels=call.active_taint_labels,
         tool_round_id=approval.tool_round_id,
         recorded_scope=approval,
+        approved_arguments=True,
     )
     if result.decision is ToolPolicyDecision.DENY:
         raise ToolApprovalArgumentsRefused("Tool policy denied the approved arguments.")

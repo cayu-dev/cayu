@@ -180,7 +180,6 @@ from cayu.tools.gateway import (
 )
 from cayu.tools.policy import (
     TAINT_LABELS_METADATA_KEY,
-    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     ToolPolicyDecision,
     ToolPolicyResult,
 )
@@ -1021,12 +1020,10 @@ class ToolInvocation:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=effective_tool_call,
-                request_metadata={
-                    **request_metadata,
-                    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True,
-                },
+                request_metadata=request_metadata,
                 taint_labels=taint_labels,
                 tool_round_id=tool_round_id,
+                reauthorization=True,
             )
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
                 publication_snapshot = await publication.static_scope()

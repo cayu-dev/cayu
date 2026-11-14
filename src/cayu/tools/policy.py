@@ -42,6 +42,8 @@ TAINT_LABELS_METADATA_KEY = "cayu:taint_labels"
 # Set to True in a ToolPolicyRequest's metadata when a call is being re-authorized because a
 # before_tool_call hook modified the arguments. Stateful policies (rate limiters, counters, audit
 # sinks) can re-check the limit but skip re-incrementing so a hook-modified call counts once.
+# Also set when a person's changed arguments or a profile adoption re-check a paused call. The
+# runtime owns it: admission drops any caller-supplied value, and run and fork requests refuse it.
 TOOL_POLICY_REAUTHORIZATION_METADATA_KEY = "cayu:tool_policy_reauthorization"
 # Set to True in a ToolPolicyRequest's metadata only when ``CayuApp.preview_tool_call`` asks
 # what a call would be decided, so a stateful policy can skip counting it. The runtime owns it:

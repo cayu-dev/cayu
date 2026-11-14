@@ -88,7 +88,7 @@ from cayu.tools.exposure import (
     tool_capability_ceiling_from_session_metadata,
     validate_resolved_tool_exposure_authority,
 )
-from cayu.tools.policy import TOOL_POLICY_REAUTHORIZATION_METADATA_KEY, ToolPolicyDecision
+from cayu.tools.policy import ToolPolicyDecision
 from cayu.vaults.redaction import SecretRedactor
 
 # Adoption moves the paused invocation to the current profile. A model target is
@@ -356,10 +356,11 @@ async def revalidate_paused_tool_calls(
             tool_call=runtime_records.ToolCallRequest(
                 id=call.tool_call_id, name=name, arguments=arguments
             ),
-            request_metadata={**request_metadata, TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: True},
+            request_metadata=request_metadata,
             taint_labels=call.active_taint_labels,
             tool_round_id=approval.tool_round_id,
             recorded_scope=approval,
+            reauthorization=True,
         )
         if result.decision is ToolPolicyDecision.ALLOW:
             continue

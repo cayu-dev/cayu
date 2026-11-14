@@ -18,6 +18,7 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.agents import AgentSpec
+from cayu.approvals.authorization_grants import APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY
 from cayu.approvals.tools import (
     PendingToolApproval,
     PendingToolCallApproval,
@@ -133,6 +134,7 @@ from cayu.tools.grants import (
 from cayu.tools.patches import ApplyPatchTool
 from cayu.tools.policy import (
     TOOL_POLICY_DRY_RUN_METADATA_KEY,
+    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
     TaintAwareToolPolicy,
     ToolPolicy,
     ToolPolicyDecision,
@@ -154,6 +156,15 @@ class ToolApprovalRequired(Exception):
 
 
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
+# Policy-request markers only the runtime sets (``authorize`` arguments); a value in
+# request metadata, which callers and stored sessions supply, never reaches a policy.
+_RUNTIME_POLICY_REQUEST_MARKERS = frozenset(
+    {
+        TOOL_POLICY_DRY_RUN_METADATA_KEY,
+        TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
+        APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY,
+    }
+)
 
 
 def _require_matching_policy_round(
@@ -1146,12 +1157,16 @@ class ToolInvocationAdmission:
         tool_round_id: str | None = None,
         recorded_scope: PendingToolApproval | None = None,
         dry_run: bool = False,
+        reauthorization: bool = False,
+        approved_arguments: bool = False,
     ) -> ToolPolicyResult:
         """Authorize one call; ``recorded_scope`` replays a pause's own environment scope.
 
         A paused call's live environment may be an unallocated placeholder, so
         re-authorizing it uses the environment and workspace its pause recorded.
-        Only ``dry_run`` sets the policy's dry-run marker; request metadata can't.
+        Only ``dry_run`` sets the policy's dry-run marker, only ``reauthorization``
+        its re-check marker, and only ``approved_arguments`` (a re-check of
+        arguments a person approved) both re-check markers; request metadata can't.
         """
 
         registered_tool = registered_agent.executable_tool(tool_call.name)
@@ -1165,10 +1180,14 @@ class ToolInvocationAdmission:
         policy_metadata = {
             key: value
             for key, value in request_metadata.items()
-            if key != TOOL_POLICY_DRY_RUN_METADATA_KEY
+            if key not in _RUNTIME_POLICY_REQUEST_MARKERS
         }
         if dry_run:
             policy_metadata[TOOL_POLICY_DRY_RUN_METADATA_KEY] = True
+        if reauthorization or approved_arguments:
+            policy_metadata[TOOL_POLICY_REAUTHORIZATION_METADATA_KEY] = True
+        if approved_arguments:
+            policy_metadata[APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY] = True
         if taint_labels:
             policy_metadata = metadata_with_taint_labels(policy_metadata, taint_labels)
         request = ToolPolicyRequest(

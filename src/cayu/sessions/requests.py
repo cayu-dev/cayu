@@ -34,6 +34,7 @@ from cayu._validation import (
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu.approvals.actors import ResolutionActor, copy_resolution_actor
+from cayu.approvals.authorization_grants import APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY
 from cayu.budgets.base import BudgetLimit, copy_request_budget_limits
 from cayu.budgets.run_limits import RunLimits, copy_run_limits
 from cayu.build_provenance import RuntimeBuildProvenance
@@ -117,7 +118,10 @@ from cayu.tools.exposure import (
     copy_tool_capability_ceiling,
 )
 from cayu.tools.grants import TargetedToolGrant, validate_targeted_tool_grants
-from cayu.tools.policy import TOOL_POLICY_DRY_RUN_METADATA_KEY
+from cayu.tools.policy import (
+    TOOL_POLICY_DRY_RUN_METADATA_KEY,
+    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
+)
 
 # Compaction guidance can carry a domain glossary or a list of facts to keep.
 COMPACTION_INSTRUCTIONS_MAX_CHARS = 32_768
@@ -457,6 +461,8 @@ class RunRequest(BaseModel):
                     MODEL_SLOT_METADATA_KEY,
                     TOOL_CALL_PROPOSAL_METADATA_KEY,
                     TOOL_POLICY_DRY_RUN_METADATA_KEY,
+                    TOOL_POLICY_REAUTHORIZATION_METADATA_KEY,
+                    APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY,
                     SESSION_SETTINGS_METADATA_KEY,
                 )
                 if key in copied
@@ -491,6 +497,10 @@ class RunRequest(BaseModel):
                 authority_name = "tool-call-proposal authority"
             elif reserved_key == TOOL_POLICY_DRY_RUN_METADATA_KEY:
                 authority_name = "tool-policy dry-run authority"
+            elif reserved_key == TOOL_POLICY_REAUTHORIZATION_METADATA_KEY:
+                authority_name = "tool-policy reauthorization authority"
+            elif reserved_key == APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY:
+                authority_name = "approved-arguments reauthorization authority"
             elif reserved_key == SESSION_SETTINGS_METADATA_KEY:
                 authority_name = "session-settings authority"
             else:
@@ -958,6 +968,10 @@ class ForkSessionRequest(BaseModel):
             MODEL_SLOT_METADATA_KEY: "model-slot authority",
             TOOL_CALL_PROPOSAL_METADATA_KEY: "tool-call-proposal authority",
             TOOL_POLICY_DRY_RUN_METADATA_KEY: "tool-policy dry-run authority",
+            TOOL_POLICY_REAUTHORIZATION_METADATA_KEY: "tool-policy reauthorization authority",
+            APPROVED_ARGUMENTS_REAUTHORIZATION_METADATA_KEY: (
+                "approved-arguments reauthorization authority"
+            ),
             SESSION_SETTINGS_METADATA_KEY: "session-settings authority",
         }
         reserved_key = next(
