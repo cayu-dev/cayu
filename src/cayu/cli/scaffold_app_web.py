@@ -2,8 +2,9 @@
 
 `templates/app_web/` is the app every layer builds on, with nothing about who its people are
 beyond the role `GET /app/whoami` reports: the shell and its `@kit` layer, the generated
-Overview and Settings, the TaskRuns block, the status pages, the data layer and the build
-scripts. Its `src/agent/index.tsx` is the area registry: the Agent's areas in navigation order
+Overview and Settings, the TaskRuns block, the status pages, the data layer, the build
+scripts, and the smoke test's package and Playwright configuration in `e2e/`, which serves the
+app with `cayu serve --dev`. Its `src/agent/index.tsx` is the area registry: the Agent's areas in navigation order
 and what it adds to the shell (its sign-in page, items in the profile menu), which the
 generated shell reads.
 
@@ -15,16 +16,17 @@ whole: build output has hashed names, so another build's files can't stay beside
 `scripts/build_app_web.py` builds and checks each composition.
 
 `templates/app_web_operators/` is the layer of the `web-app` capability, for an Agent whose
-people are its operators: its Task runs area, and the smoke test in `e2e/`, which opens every
-area of the app `cayu serve --dev` serves.
+people are its operators: its Task runs area, and its smoke test (`e2e/smoke.spec.ts`), which
+opens every area of the app.
 
 `templates/app_web_conversations/` goes on top of the operators layer for an Agent people chat
 with (the agent preset): its Conversations area, through Cayu's own API at /api.
 
 `templates/app_web_organizations/` is the layer of the `organizations` capability (the b2b
 preset), on the generic app alone: member sign-in for `cayu serve --dev`, the Members area,
-the organization switcher, conversations scoped to an organization, and their calls to the
-organizations' own routes.
+the organization switcher, conversations scoped to an organization, their calls to the
+organizations' own routes, and a smoke test that signs a demonstration person in and opens
+every area.
 
 This module imports nothing from Cayu, so the build script loads it from its file.
 """

@@ -89,7 +89,8 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CAYU_DATABASE_", "CAYU_TEST_POSTGRES"))
+        # CI requires its own PostgreSQL tests; each run here says what it requires.
+        if not key.startswith(("CAYU_DATABASE_", "CAYU_TEST_POSTGRES", "CAYU_REQUIRE_POSTGRES"))
     }
     source_root = str(Path(__file__).resolve().parents[2] / "src")
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -119,6 +120,11 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
     offline = generated_suite({})
     assert offline.returncode == 0, offline.stdout + offline.stderr
     assert "SKIPPED" in offline.stdout
+    # Unless PostgreSQL is required, as in the generated CI: then they fail.
+    required = generated_suite({"CAYU_REQUIRE_POSTGRES_TESTS": "1"})
+    assert required.returncode != 0, required.stdout
+    assert "SKIPPED" not in required.stdout
+    assert "CAYU_REQUIRE_POSTGRES_TESTS is set" in required.stdout
 
     online = generated_suite({"CAYU_TEST_POSTGRES_DSN": _postgres_server_dsn})
     assert online.returncode == 0, online.stdout + online.stderr

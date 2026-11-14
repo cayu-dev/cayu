@@ -9,8 +9,8 @@
     "evals/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "evals/agent.py": "015861bc022b4babbba79944961869e477b63332aa90396c0538b2c677a0f99d",
     "pyproject.toml": "39a5dd3643ba890dd7412c11dd6363919897e15c1c84e4364879b6cdc0b36b7d",
-    "README.md": "eda714bb06d4575d230d6100c0e67ff56e836867ecfab5ed632cc93dcddceae3",
-    "AGENTS.md": "f8f2ffc2a25b5153bc741d2d41250b11fbc1ec62f9794b04613776820af2a365",
+    "README.md": "6f5d5837f04d62f8a0c4a29b0ffdaf3b8c13c8cad18a8e7cf9fe0c0a6d2727f3",
+    "AGENTS.md": "f9e5ceb65d26039e12267f0f752b5ef12079e4238afc213c4c253bf2896975d1",
     ".gitignore": "6f1207dec60bf258a313725ff62088684238cadb66d09c57ffe05cf2025353d3",
     "prompts/__init__.py": "8976b112f24bab9fad5523eb4f81dc2bb5fbc26f6cd60a9f6f88092ade9b83c3",
     "tools/__init__.py": "cb7d16f8eef087d6cb76b20b2f1b3199f0914f88cfb3df5ab601b7849d790ac4",
@@ -74,7 +74,7 @@
     "migrations/env.py": "e9c82f68ff64b0f76e8780e6af188e4a04868e11cf76eae762d738e608bf161a",
     "migrations/script.py.mako": "03d8ab5dd3743488bc57a6bf87eb002ed94ec7a609d923b07efa115ebd36bce4",
     "migrations/versions/0001_app_tables.py": "7b1f9f3e59fe6cdedbbf6aacf035a3536c64b83f34709cb6c17162041b4ffaab",
-    "tests/test_app_database.py": "e92440aab30694213a44372b62a58009847c3e1920aa3d0aa082281679709d07",
+    "tests/test_app_database.py": "ad98c93d4db11d4e8d1122155d98449342bac001cb43232cfc7f0122157ba883",
     "database/CAPABILITY.md": "3096de43958a35811bf0551d111f981d825a4c07a411f02f72a2da64ad56b611",
     "migrations/versions/0002_organizations.py": "a29a9cd033dd664e7331f11ab959962bdf9caade8fe985acab1d146f69b2e60b",
     "domain/organizations.py": "b3cc3ebea813e21d59d4efca170940f73396939e34dbdf05f1f6ee1705b232e8",
@@ -82,7 +82,7 @@
     "domain/sharing.py": "593950b52a09bed801cf1c0a1c3fb2fe3c866ffb9cf8aed6469d417332a8160e",
     "policies/access.py": "40c51983cd0ba925de7769d3c3a60f4362cbffd4839449ab013cf6489ffcbcb0",
     "operations/demo_seed.py": "05673a3cd8eba4d0864f3264cc6e448a4b497c35d5fb04cd18db7a63c2dd5cea",
-    "tests/conftest.py": "c5c0dd17d9cc82d4e20485cc8ff4ac296da44fa1d2078a8081a52f7ee9f11212",
+    "tests/conftest.py": "5b4c0c70de0f9b172b31eb57b75e51e98c3e26cecdb77fef281d4c5845a5d729",
     "tests/test_organizations.py": "e6b7d5dbd6c994f6042f4a4b8b328e39c27eac5e99c8dc0064fe87d0c749f115",
     "migrations/versions/0003_membership_roles.py": "31e36c05906d8c672f04abeac516ef89988c9c157319f89eff17c031fae64451",
     "integrations/sign_in.py": "24c09137c8d81fbe90ab542cf5de3a762877646803bd6d8c00e457904dd461a1",
@@ -192,6 +192,11 @@
     "tests/test_generated_routes.py": "65eb05ea822e28fd1e96aabb47d417721e021d35b60004ecba2aedd44c1a5eed",
     "tests/test_background_revocation.py": "6339ca444df8d6d0e9551be59fc7d1b15832796f4c51881207bfb298a6b71497",
     "cayu-objectives.toml": "21d1ff3185bebdcb45c4a0986d136357f50147891684b0ccbd7e28a8a59420ca",
-    ".github/workflows/ci.yml": "9923bf9e128073363e15c93b1e95228a5644462ce1a79102692e6ae29b663f78"
+    ".github/workflows/ci.yml": "a8ef5af294cdd487c0625042fe11657aa32746852a3397cb165f5aac6662a452",
+    "web/e2e/.gitignore": "a1b9b3aabbabe90958f5b13afee01981b529713cc1a54d5109e4ba88c5b0c77f",
+    "web/e2e/package-lock.json": "233dccc8a37d836435573d13a2863e1e3c729cbfdf3f7208257b35c4d045cb0d",
+    "web/e2e/package.json": "6fa3d926b1291fff647ec17b10650549342761481784074d5566ad87d7919868",
+    "web/e2e/playwright.config.ts": "0c3215a55ac655405f32ac7faf88f78b9eaa026641b409fad4a1ea8adfa3f5ee",
+    "web/e2e/smoke.spec.ts": "267db29f42b88c2aa7e56dbaabc46e3876cc99cf159401e7aed31bda406161be"
   }
 }

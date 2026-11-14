@@ -242,7 +242,8 @@ def downgrade() -> None:
 _TEST = '''"""Application tables: hermetic checks always, PostgreSQL checks with a test server.
 
 Set `CAYU_TEST_POSTGRES_DSN` to a server where you may create databases; each test
-creates its own and drops it afterwards.
+creates its own and drops it afterwards. Without it the PostgreSQL checks are skipped, unless
+`CAYU_REQUIRE_POSTGRES_TESTS=1` (as in the generated CI), which makes them fail instead.
 """
 
 from __future__ import annotations
@@ -261,7 +262,10 @@ from database.models import SCHEMA, Base, Note
 
 ALEMBIC = Config("alembic.ini")
 SERVER = os.environ.get("CAYU_TEST_POSTGRES_DSN", "")
-requires_postgres = pytest.mark.skipif(not SERVER, reason="CAYU_TEST_POSTGRES_DSN is not set")
+# Where a skipped check would hide a missing database, such as CI, they fail instead.
+REQUIRED = os.environ.get("CAYU_REQUIRE_POSTGRES_TESTS", "").strip() not in ("", "0")
+SKIPPED = "CAYU_TEST_POSTGRES_DSN is not set"
+requires_postgres = pytest.mark.skipif(not SERVER and not REQUIRED, reason=SKIPPED)
 
 
 def test_every_table_lives_in_the_app_schema() -> None:
@@ -283,6 +287,11 @@ def database(monkeypatch):
     from psycopg import sql
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+    if not SERVER:
+        pytest.fail(
+            "CAYU_REQUIRE_POSTGRES_TESTS is set, so this test needs PostgreSQL: set "
+            "CAYU_TEST_POSTGRES_DSN to a server where it may create databases."
+        )
     name = f"app_test_{uuid4().hex}"
     with psycopg.connect(SERVER, autocommit=True) as connection:
         connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))

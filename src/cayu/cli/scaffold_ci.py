@@ -4,7 +4,9 @@
 project's tests and ``cayu check`` on a fresh checkout, plus the web app's
 checks and its smoke test for a project that has them. It needs no secrets: the generated root
 ``conftest.py`` gives the tests a throwaway memory evidence key and ``cayu
-check`` borrows one. ``--ci none`` writes no workflow.
+check`` borrows one. A project with application tables gets a throwaway PostgreSQL server for
+the tests that need one, which fail rather than skip without it. ``--ci none`` writes no
+workflow.
 
 The workflow is an ordinary project file the application owns. It composes the
 same commands a person runs locally, so it can be changed, moved to another CI
@@ -15,7 +17,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from cayu.cli.scaffold_plan import ApplicationPlan, CiName
+from cayu.cli.scaffold_app_database import APP_DATABASE
+from cayu.cli.scaffold_plan import ORGANIZATIONS, ApplicationPlan, CiName
 
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 _GUIDANCE_MARKER = "\n## Continuous integration\n\n"
@@ -25,6 +28,11 @@ _CHECKOUT = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1"
 _SETUP_UV = "astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2"
 _SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0"
 _UV_VERSION = "0.9.28"
+# Pinned to a digest, as the actions are to commits.
+_POSTGRES_IMAGE = (
+    "postgres:17-alpine@sha256:d3244e8ce3f165ee3c93d9c4a4b1d0fe48b3a89e2287b717fdcbbde92d405065"
+)
+_POSTGRES_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
 
 _HEADER = """\
 # Runs the tests and `cayu check` on every pull request and every push to main.
@@ -115,6 +123,39 @@ _WEB_JOB = """
 """
 
 
+# A throwaway PostgreSQL server in the check job, for a project with application tables.
+_POSTGRES_SERVICE = """\
+    services:
+      # The tests that read and write the application's tables create their own databases
+      # here. Nothing on it outlives the job.
+      postgres:
+        image: __IMAGE__
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+"""
+
+_POSTGRES_TESTS_ENV = """\
+        env:
+          CAYU_TEST_POSTGRES_DSN: __URL__
+          # Fail, rather than skip, a test that needs PostgreSQL and finds no server.
+          CAYU_REQUIRE_POSTGRES_TESTS: "1"
+"""
+
+# The organizations' app reads its own tables, so its smoke test starts from a migrated
+# database with the demonstration organizations and people (operations/demo_seed.py).
+_DEMO_DATA_STEP = """\
+      - name: Demonstration data for the smoke test
+        env:
+          CAYU_DATABASE_URL: __URL__
+        run: |
+          uv run --no-sync cayu storage migrate
+          uv run --no-sync alembic upgrade head
+          uv run --no-sync python -m operations.demo_seed
+"""
+
 _SMOKE_STEP = """\
       # Opens every area of the web app in a browser, served by `cayu serve --dev`
       # (web/e2e/playwright.config.ts).
@@ -165,7 +206,17 @@ def ci_guidance(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     if _has_smoke_test(files):
         web += (
             " After the check, the first job opens every area of the web app in a browser "
-            "(`web/e2e`)."
+            "(`web/e2e`)"
+            + (
+                ", signed in as a demonstration person."
+                if ORGANIZATIONS in plan.capabilities
+                else "."
+            )
+        )
+    if APP_DATABASE in plan.capabilities:
+        web = (
+            " The tests that need PostgreSQL run against a throwaway server in the job, "
+            "and fail rather than skip without it (`CAYU_REQUIRE_POSTGRES_TESTS`)." + web
         )
     image = (
         " Before the check it builds the coding image from the pins committed in "
@@ -215,7 +266,11 @@ def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     )
     if "memory" in plan.capabilities:
         steps.append(_MEMORY_KEY_NOTE)
-    steps.append("      - name: Tests\n        run: uv run --no-sync pytest -q\n")
+    postgres = APP_DATABASE in plan.capabilities
+    steps.append(
+        "      - name: Tests\n        run: uv run --no-sync pytest -q\n"
+        + (_POSTGRES_TESTS_ENV.replace("__URL__", _POSTGRES_URL) if postgres else "")
+    )
     if _builds_coding_image(files):
         steps.append(_CODING_IMAGE_STEP)
     check = f"      - name: cayu check\n        run: {plan.check_command()}\n"
@@ -230,10 +285,24 @@ def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
         )
     steps.append(check)
     if _has_smoke_test(files):
-        steps.append(_SMOKE_STEP.replace("__SETUP_NODE__", _SETUP_NODE))
+        smoke = _SMOKE_STEP.replace("__SETUP_NODE__", _SETUP_NODE)
+        if ORGANIZATIONS in plan.capabilities:
+            steps.append(_DEMO_DATA_STEP.replace("__URL__", _POSTGRES_URL))
+            smoke = smoke.replace(
+                "        working-directory: web/e2e\n",
+                "        working-directory: web/e2e\n        env:\n"
+                f"          CAYU_DATABASE_URL: {_POSTGRES_URL}\n",
+            )
+        steps.append(smoke)
     if "evals" in plan.capabilities:
         steps.append(_evals_note(plan))
-    workflow = _HEADER + "".join(steps)
+    header = _HEADER
+    if postgres:
+        header = header.replace(
+            "    timeout-minutes: 20\n",
+            "    timeout-minutes: 20\n" + _POSTGRES_SERVICE.replace("__IMAGE__", _POSTGRES_IMAGE),
+        )
+    workflow = header + "".join(steps)
     if _has_web_app(files):
         workflow += _WEB_JOB.replace("__CHECKOUT__", _CHECKOUT).replace(
             "__SETUP_NODE__", _SETUP_NODE

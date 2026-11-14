@@ -79,6 +79,26 @@
       "reference_sha256": "154dd387935d5cc9575ac3820a7cba92421cbb1f49daf0b358b229ce96661db6",
       "same": true
     },
+    "web/e2e/.gitignore": {
+      "reference_sha256": null,
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+    },
+    "web/e2e/package-lock.json": {
+      "reference_sha256": null,
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+    },
+    "web/e2e/package.json": {
+      "reference_sha256": null,
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+    },
+    "web/e2e/playwright.config.ts": {
+      "reference_sha256": null,
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+    },
+    "web/e2e/smoke.spec.ts": {
+      "reference_sha256": null,
+      "deviation": "The reference has no smoke test. The organizations' app gets one like the operator app's (#4023): `cayu serve --dev` serves it, a demonstration person signs in, and every area in the navigation opens in a browser."
+    },
     "web/index.html": {
       "reference_sha256": "203705cd7ab3b497c8d64d5f79f9dc919ebc973a405ea7d8f2849c1860d4be33",
       "deviation": "Carries the page's img-src policy in a <meta> tag, since `cayu serve` sends only frame-ancestors. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."

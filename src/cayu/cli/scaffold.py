@@ -3774,6 +3774,12 @@ def _render_new_receipt(
             else ""
         )
         print(f"  {label}{command}")
+    if ORGANIZATIONS in plan.capabilities:
+        print(
+            "  The tests that check one organization can't see another's data need PostgreSQL: "
+            "CAYU_TEST_POSTGRES_DSN=postgresql://... uv run --no-sync pytest "
+            '(README, "Organizations and sharing")'
+        )
     if plan.preset == "coding" and plan.execution == "docker":
         print(f"  Toolchain profile: {coding_toolchain or 'python'}")
         print(

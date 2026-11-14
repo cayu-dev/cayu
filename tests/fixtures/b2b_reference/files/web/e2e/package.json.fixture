@@ -1,0 +1,16 @@
+{
+  "name": "web-smoke",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The web app's smoke test: `cayu serve --dev` serves the app, and every area opens in a browser. `npm ci`, `npx playwright install chromium`, then `npm test`.",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1"
+  }
+}

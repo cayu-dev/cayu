@@ -27,13 +27,19 @@ def _commands(workflow: str) -> list[str]:
 
 @pytest.mark.parametrize(
     ("preset", "execution"),
-    [(spec.name, "none") for spec in PRESETS] + [("coding", "docker"), ("agent", "docker")],
+    [(spec.name, "none") for spec in PRESETS]
+    + [("coding", "docker"), ("agent", "docker"), ("agent+app-database", "none")],
 )
 def test_every_preset_gets_a_pinned_workflow_that_needs_no_secrets(
     preset: str, execution: str
 ) -> None:
+    preset, _, extra = preset.partition("+")
     plan = normalize_application_plan(
-        name="app", agent_name="app", preset=preset, execution=execution
+        name="app",
+        agent_name="app",
+        preset=preset,
+        execution=execution,
+        with_capabilities=(extra,) if extra else (),
     )
     files = project_files("app", application_plan=plan)
     workflow = files[CI_WORKFLOW_PATH]
@@ -60,17 +66,34 @@ def test_every_preset_gets_a_pinned_workflow_that_needs_no_secrets(
         assert f"          {name}: '{value}'\n" in workflow
     has_web = "web/package.json" in files
     assert has_web == ("web-app" in plan.capabilities)
-    # The operator app's smoke test runs after the check, against `cayu serve --dev`.
-    # Organizations' members sign in to theirs, which has none yet.
-    smoke = "web-app" in plan.capabilities and "organizations" not in plan.capabilities
+    # The web app's smoke test runs after the check, against `cayu serve --dev`.
+    smoke = "web-app" in plan.capabilities
     assert smoke == ("web/e2e/package.json" in files)
+    # The organizations' app reads its own tables: the smoke test gets a migrated database
+    # with the demonstration people first.
+    organizations = "organizations" in plan.capabilities
     if smoke:
+        database = (
+            "        env:\n          CAYU_DATABASE_URL: "
+            "postgresql://postgres:postgres@localhost:5432/postgres\n"
+            if organizations
+            else ""
+        )
         assert (
-            "        working-directory: web/e2e\n        run: |\n          npm ci\n"
+            f"        working-directory: web/e2e\n{database}        run: |\n          npm ci\n"
             "          npx playwright install --with-deps chromium\n          npm test\n"
         ) in workflow
+    assert ("python -m operations.demo_seed" in workflow) == organizations
     web_commands = ["npm ci", "npm run lint", "npm run typecheck", "npm run check:build"]
-    assert commands[len(checks) :] == (["|"] if smoke else []) + (web_commands if has_web else [])
+    assert commands[len(checks) :] == (["|"] * (organizations + smoke)) + (
+        web_commands if has_web else []
+    )
+    # The tests that need PostgreSQL get a server, and fail rather than skip without one.
+    postgres = "app-database" in plan.capabilities
+    assert ("    services:\n      # The tests" in workflow) == postgres
+    assert ('CAYU_REQUIRE_POSTGRES_TESTS: "1"' in workflow) == postgres
+    if postgres:
+        assert re.search(r"image: postgres:[\w.-]+@sha256:[0-9a-f]{64}\n", workflow)
     assert ("memory" in plan.capabilities) == ("CAYU_MEMORY_EVIDENCE_KEY" in workflow)
     for guide in ("README.md", "AGENTS.md"):
         assert f"`{CI_WORKFLOW_PATH}` runs `uv sync`" in files[guide]

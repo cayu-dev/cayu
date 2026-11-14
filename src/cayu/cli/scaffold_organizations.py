@@ -599,11 +599,42 @@ if __name__ == "__main__":
     main()
 '''
 
-# The fixtures the PostgreSQL tests share, which tests/conftest.py imports.
-_CONFTEST_IMPORTS = (
-    "from test_app_database import database  # noqa: F401  (a fresh PostgreSQL database per test)\n"
-)
-_CONFTEST_PY = '"""Fixtures shared by the PostgreSQL tests."""\n\n' + _CONFTEST_IMPORTS
+_CONFTEST_DOC = '''"""Fixtures shared by the PostgreSQL tests, and what a run without PostgreSQL left out.
+
+The tests that read and write the application's tables need PostgreSQL
+(`CAYU_TEST_POSTGRES_DSN`); among them are the ones that check one organization can't see
+another's data. Without it they are skipped, and the run ends by naming them and saying how to
+run them. `CAYU_REQUIRE_POSTGRES_TESTS=1` makes them fail instead, as in the generated CI.
+"""
+'''
+# What tests/conftest.py imports for the PostgreSQL tests, and its summary of those skipped.
+_CONFTEST_IMPORTS = """# `database` gives each test a fresh PostgreSQL database.
+from test_app_database import SKIPPED, database  # noqa: F401
+"""
+_CONFTEST_HOOKS = """def pytest_terminal_summary(terminalreporter) -> None:
+    skipped = [
+        report
+        for report in terminalreporter.stats.get("skipped", [])
+        if SKIPPED in str(report.longrepr)
+    ]
+    if not skipped:
+        return
+    terminalreporter.write_sep(
+        "=",
+        f"{len(skipped)} tests that need PostgreSQL didn't run",
+        yellow=True,
+        bold=True,
+    )
+    for report in skipped:
+        terminalreporter.write_line(f"  {report.nodeid}")
+    terminalreporter.write_line(
+        "They include the checks that one organization can't see another's data. "
+        "Set CAYU_TEST_POSTGRES_DSN to a PostgreSQL server where they may create "
+        "databases and run pytest again (README, Organizations and sharing). "
+        "CAYU_REQUIRE_POSTGRES_TESTS=1 makes them fail instead of skipping."
+    )
+"""
+_CONFTEST_PY = f"{_CONFTEST_DOC}\n{_CONFTEST_IMPORTS}\n\n{_CONFTEST_HOOKS}"
 
 _TEST_ORGANIZATIONS_PY = '''"""Organizations share one database and agent; each person sees only what membership allows.
 
@@ -2468,6 +2499,14 @@ who belongs where; Cayu enforces it.
   b2b` walks through it.
   `tests/test_organizations.py`, `tests/test_http_api.py` and
   `tests/test_background_revocation.py` show each rule.
+- The tests that read and write the application's tables, among them the checks that one
+  organization can't see another's data, need a PostgreSQL server where they may create
+  databases. Without one they are skipped, and pytest ends by naming them. For a local
+  one, `docker run -d --name app-test-postgres -e POSTGRES_PASSWORD=postgres -p
+  127.0.0.1:5432:5432 postgres:17-alpine`, then
+  `CAYU_TEST_POSTGRES_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgres uv run
+  --no-sync pytest`. With `CAYU_REQUIRE_POSTGRES_TESTS=1` they fail instead of skipping;
+  the CI workflow `cayu new` writes sets it and gives them a server.
 
 ## The web app
 
@@ -2483,8 +2522,13 @@ first doc comment whether it is `GENERATED.` (the generator owns it and may rewr
 | `web/src/blocks/task-runs.tsx` | TaskRuns: an Agent's Cayu tasks, one row per run (`GET /app/task-runs`). This Agent queues no tasks yet, so no area uses it | A Cayu building block |
 | `web/src/agent/` | This Agent's own areas (Conversations, Members), its Overview sections, its sign-in page for `cayu serve --dev`, and `index.tsx`, which lists its areas | The Agent's |
 | `web/src/kit/shadcn/` | The component kit: stock shadcn (Base UI, base-nova) and the parts built from it | Generated |
+| `web/e2e/` | The smoke test: `cayu serve --dev` serves the app, a demonstration person signs in, and every area opens in a browser | The Agent's |
 | `integrations/http/generated/` | The routes the generated pages read | Generated |
 | `integrations/http/overview_metrics.py`, `fixed_settings.py` | This Agent's Overview metrics and the settings it reads at start-up | The Agent's |
+
+The smoke test needs the development database above (`CAYU_DATABASE_URL`, migrated and with
+the demonstration people): `npm --prefix web/e2e ci`, `npx --prefix web/e2e playwright install
+chromium` once, then `npm --prefix web/e2e test`.
 
 The app imports every component from `@kit/...`; `tsconfig.json` and `vite.config.ts` point
 `@kit` at `src/kit/shadcn`. Another kit is a folder next to it with the same entries; point
@@ -2544,7 +2588,7 @@ def _tests_conftest(existing: str | None) -> str:
     head, separator, rest = existing.partition("\n\n\n")
     if not separator:
         raise RuntimeError("tests/conftest.py isn't the one the agent preset generates.")
-    return f"{head}\n{_CONFTEST_IMPORTS}\n\n{rest}"
+    return f"{head}\n{_CONFTEST_IMPORTS}\n\n{rest.rstrip()}\n\n\n{_CONFTEST_HOOKS}"
 
 
 def _replace_once(text: str, old: str, new: str, path: str) -> str:

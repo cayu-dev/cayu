@@ -100,16 +100,15 @@ def test_the_operator_app_is_the_generic_app_with_the_operators_layer() -> None:
     from_layer = {
         path for path, source in composed.items() if Path(str(source)).is_relative_to(layer)
     }
-    # The layer replaces only the area registry, and adds Task runs, the smoke test and the build.
+    # The layer replaces only the area registry, and adds Task runs, its smoke test and the
+    # build. The smoke test's package and Playwright configuration are the generic app's.
     assert from_layer & app.keys() == {"src/agent/index.tsx"}
+    assert {"src/agent/task-runs.tsx", "e2e/smoke.spec.ts", "static/index.html"} <= from_layer
     assert {
-        "src/agent/task-runs.tsx",
         "e2e/package.json",
         "e2e/package-lock.json",
         "e2e/playwright.config.ts",
-        "e2e/smoke.spec.ts",
-        "static/index.html",
-    } <= from_layer
+    } <= app.keys()
     registry = (layer / "src/agent/index.tsx").read_text(encoding="utf-8")
     assert "export const shell: ShellParts = {};" in registry
     assert "taskRunsArea," in registry
@@ -174,6 +173,8 @@ def test_the_b2b_app_is_the_generic_app_with_the_organizations_layer() -> None:
         "src/agent/members.tsx",
         "src/agent/organization.tsx",
         "src/agent/sign-in.tsx",
+        # Its smoke test signs a demonstration person in first.
+        "e2e/smoke.spec.ts",
         "static/index.html",
     } <= from_layer
     files = project_files(PROJECT, preset="b2b")

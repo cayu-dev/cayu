@@ -109,7 +109,9 @@ def test_the_agent_presets_organizations_are_b2bs() -> None:
     assert {path: agent.get(path) for path in shared} == {path: b2b[path] for path in shared}
     # Its people are the members: the operator app's own files aren't there.
     assert "tests/test_web_app.py" not in agent
-    assert not any(path.startswith("web/e2e/") for path in agent)
+    # Its smoke test signs a demonstration person in first, as b2b's does.
+    assert agent["web/e2e/smoke.spec.ts"] == b2b["web/e2e/smoke.spec.ts"]
+    assert "Sign in" in agent["web/e2e/smoke.spec.ts"]
     assert "web/src/agent/task-runs.tsx" not in agent
     serve = tomllib.loads(agent["pyproject.toml"])["tool"]["cayu"]["serve"]
     assert serve == tomllib.loads(b2b["pyproject.toml"])["tool"]["cayu"]["serve"]
@@ -129,7 +131,9 @@ def test_the_docker_sandboxs_tests_stay_hermetic_with_organizations() -> None:
 
     # The sandbox's autouse fixture stays, and the PostgreSQL tests get their database.
     assert 'monkeypatch.setattr(sandbox, "START_CONTAINERS", False)' in conftest
-    assert "from test_app_database import database" in conftest
+    assert "from test_app_database import SKIPPED, database" in conftest
+    # And a run without PostgreSQL still names the tests it left out.
+    assert "def pytest_terminal_summary(" in conftest
     assert "\n\n\n\n" not in conftest
     compile(conftest, "tests/conftest.py", "exec")
 
@@ -184,7 +188,8 @@ def test_a_generated_project_passes_cayu_check_and_its_tests_on_postgres(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("CAYU_DATABASE_", "CAYU_TEST_POSTGRES"))
+        # CI requires its own PostgreSQL tests; each run here says what it requires.
+        if not key.startswith(("CAYU_DATABASE_", "CAYU_TEST_POSTGRES", "CAYU_REQUIRE_POSTGRES"))
     }
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(
