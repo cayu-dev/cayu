@@ -86,6 +86,11 @@ async function failure(response: Response, write: boolean): Promise<ApiError> {
  * The app's fetch wrapper: base URL, search params, JSON bodies, response
  * validation and typed failures. A write whose result is unknown is never a plain
  * failure: it may have been applied.
+ *
+ * Reads go through the browser's HTTP cache. A route that answers with an `ETag` and
+ * `Cache-Control: no-cache` (Cayu's `cayu.server.etag`, which the generated `/app` read
+ * routes use) is revalidated on every read: the browser sends `If-None-Match`, and turns
+ * the server's bodiless `304` into the answer it kept, so an unchanged read costs no body.
  */
 export function createRequester({
   baseUrl,

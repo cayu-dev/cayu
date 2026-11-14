@@ -13,6 +13,8 @@ import { overviewApi, type Overview, type OverviewApi } from "../../api/overview
 
 // Followed as Cayu's watches follow its API, with no timer of its own: every 15 seconds while
 // it changes, less often while it doesn't. `as_of` changes on every answer, so it isn't a change.
+// The route tags its answer without `as_of`, so an unchanged overview costs a 304, which the
+// browser answers with the overview it kept, `as_of` and all: the page says when it last read.
 export const overviewQuery = (api: OverviewApi) =>
   queryOptions({
     queryKey: ["overview"],
@@ -44,7 +46,7 @@ function OverviewPage({ description, sections }: { description: string; sections
           <AppPageTitle>Overview</AppPageTitle>
           <AppPageDescription>
             {description}
-            {overview.data ? ` As of ${formatDateTime(overview.data.as_of)}.` : null}
+            {overview.data ? ` As of ${formatDateTime(overview.dataUpdatedAt)}.` : null}
           </AppPageDescription>
         </div>
       </AppPageHeader>

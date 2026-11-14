@@ -6,7 +6,8 @@ are the same run. The Agent says which run a task belongs to with `run_key` (by 
 `run` its metadata names, else the task itself) and how a run is titled with `run_title`.
 
 Tasks are read as the signed-in person (`await app.access(subject)`), so the list holds
-only the tasks Cayu's resource-access policy lets them see.
+only the tasks Cayu's resource-access policy lets them see. The list carries an ETag
+(`cayu.server.etag`), so a read of unchanged runs costs a 304 with no body.
 """
 
 from __future__ import annotations
@@ -16,8 +17,9 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from cayu import CayuApp
+from cayu.server.etag import tagged_json
 from cayu.tasks import Task, TaskOrder, TaskQuery, TaskStatus
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.whoami import Person, PersonDependency
@@ -192,13 +194,17 @@ def router(
 
     @routes.get("/task-runs")
     async def get_task_runs(
+        request: Request,
+        response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
         type: str | None = Query(default=None, min_length=1, max_length=200),  # noqa: A002
         limit: int = Query(default=50, ge=1, le=500),
     ) -> list[TaskRun]:
-        return await list_task_runs(
+        runs = await list_task_runs(
             app, signed_in.subject, task_type=type, limit=limit, run_key=run_key, run_title=run_title
         )
+        # Unchanged runs cost a 304 with no body.
+        return tagged_json(request, response, runs)
 
     return routes
 

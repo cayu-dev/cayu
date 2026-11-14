@@ -303,7 +303,7 @@ async def _read_bare_task_items(
 
 async def read_tasks_by_ids(app, request, response, ids: list[str]):
     """``GET /tasks?ids=…``: each listed task's detail, in order, leaving out missing ones."""
-    from cayu.server._etag import tagged_json
+    from cayu.server.etag import tagged_json
     from cayu.server.routes import _serialize_task_detail
 
     if set(request.query_params.keys()) != {"ids"}:

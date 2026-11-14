@@ -7,6 +7,10 @@
   (`GET /api/inbox/counts`) in this process as the person (`cayu_api`), so the counts are
   the ones `cayu inbox list` and the Developer dashboard show them. When Cayu doesn't let
   the person read the inbox, or can't count it, `unavailable` says so instead of a total.
+
+The answer carries an ETag (`cayu.server.etag`) of everything but `as_of`, which changes on
+every read, so an overview that hasn't changed costs a 304 with no body. A client that gets
+the 304 keeps the answer it has, `as_of` included: `as_of` is when that answer was built.
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ from datetime import UTC, datetime
 
 import httpx
 from cayu import CayuApp
-from fastapi import APIRouter, Depends, Request
+from cayu.server.etag import tagged_json
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
@@ -147,16 +152,21 @@ def router(
     @routes.get("/overview")
     async def get_overview(
         request: Request,
+        response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
     ) -> OverviewView:
         found = await metrics(OverviewContext(app=app, person=signed_in, request=request))
-        return OverviewView(
+        view = OverviewView(
             as_of=datetime.now(UTC).isoformat(),
             metrics=[
                 MetricView(label=item.label, value=item.value, description=item.description)
                 for item in found
             ],
             inbox=await inbox_counts(request, inbox_page=inbox_page, agent_name=agent_name),
+        )
+        # `as_of` changes on every read: tagged with it, the overview would never be unchanged.
+        return tagged_json(
+            request, response, view, tagged=view.model_dump(mode="json", exclude={"as_of"})
         )
 
     return routes

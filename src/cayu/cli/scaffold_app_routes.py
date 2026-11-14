@@ -5,7 +5,8 @@
 Agent supplies what only it knows (who a request's person is, its overview metrics, the
 settings it reads from its environment, how its tasks group into runs) as arguments to
 `build_generated_router`. A preset that has people composes them into its own `/app` router;
-`cayu new --preset b2b` does (`scaffold_b2b.py`).
+`cayu new --preset b2b` does (`scaffold_b2b.py`). The read routes the web app follows tag their
+answer with Cayu's `cayu.server.etag`, so a read of an unchanged answer costs a 304.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ The Agent supplies what only it knows, as arguments to `build_generated_router`:
 request's person is and their role, its overview metrics, the settings it reads from its
 environment, and how its tasks group into runs. Each module's `router` is usable on its
 own, for an Agent that wants some of these routes and not others.
+
+`settings`, `overview` and `task-runs` answer with an ETag (`cayu.server.etag`), so a read
+of an unchanged answer costs a 304 with no body; the browser revalidates the page's reads.
 """
 
 from __future__ import annotations
@@ -249,7 +253,8 @@ from typing import Any, Literal
 
 from cayu import CayuApp
 from cayu.managed_settings import ManagedSetting
-from fastapi import APIRouter, Depends
+from cayu.server.etag import tagged_json
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.whoami import PersonDependency
@@ -383,8 +388,11 @@ def router(
     routes = APIRouter(dependencies=[Depends(person)])
 
     @routes.get("/settings")
-    async def get_settings() -> SettingsView:
-        return settings_view(app, application=application, fixed=fixed())
+    async def get_settings(request: Request, response: Response) -> SettingsView:
+        # Unchanged settings cost a 304 with no body.
+        return tagged_json(
+            request, response, settings_view(app, application=application, fixed=fixed())
+        )
 
     return routes
 
@@ -492,6 +500,10 @@ _OVERVIEW_PY = '''"""GENERATED. `GET /app/overview`: the Agent's metrics and wha
   (`GET /api/inbox/counts`) in this process as the person (`cayu_api`), so the counts are
   the ones `cayu inbox list` and the Developer dashboard show them. When Cayu doesn't let
   the person read the inbox, or can't count it, `unavailable` says so instead of a total.
+
+The answer carries an ETag (`cayu.server.etag`) of everything but `as_of`, which changes on
+every read, so an overview that hasn't changed costs a 304 with no body. A client that gets
+the 304 keeps the answer it has, `as_of` included: `as_of` is when that answer was built.
 """
 
 from __future__ import annotations
@@ -503,7 +515,8 @@ from datetime import UTC, datetime
 
 import httpx
 from cayu import CayuApp
-from fastapi import APIRouter, Depends, Request
+from cayu.server.etag import tagged_json
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.cayu_api import INBOX_CLOSED, INBOX_SILENT, cayu_api_client
@@ -632,16 +645,21 @@ def router(
     @routes.get("/overview")
     async def get_overview(
         request: Request,
+        response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
     ) -> OverviewView:
         found = await metrics(OverviewContext(app=app, person=signed_in, request=request))
-        return OverviewView(
+        view = OverviewView(
             as_of=datetime.now(UTC).isoformat(),
             metrics=[
                 MetricView(label=item.label, value=item.value, description=item.description)
                 for item in found
             ],
             inbox=await inbox_counts(request, inbox_page=inbox_page, agent_name=agent_name),
+        )
+        # `as_of` changes on every read: tagged with it, the overview would never be unchanged.
+        return tagged_json(
+            request, response, view, tagged=view.model_dump(mode="json", exclude={"as_of"})
         )
 
     return routes
@@ -655,7 +673,8 @@ are the same run. The Agent says which run a task belongs to with `run_key` (by 
 `run` its metadata names, else the task itself) and how a run is titled with `run_title`.
 
 Tasks are read as the signed-in person (`await app.access(subject)`), so the list holds
-only the tasks Cayu's resource-access policy lets them see.
+only the tasks Cayu's resource-access policy lets them see. The list carries an ETag
+(`cayu.server.etag`), so a read of unchanged runs costs a 304 with no body.
 """
 
 from __future__ import annotations
@@ -665,8 +684,9 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from cayu import CayuApp
+from cayu.server.etag import tagged_json
 from cayu.tasks import Task, TaskOrder, TaskQuery, TaskStatus
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.whoami import Person, PersonDependency
@@ -841,13 +861,17 @@ def router(
 
     @routes.get("/task-runs")
     async def get_task_runs(
+        request: Request,
+        response: Response,
         signed_in: Person = Depends(person),  # noqa: B008
         type: str | None = Query(default=None, min_length=1, max_length=200),  # noqa: A002
         limit: int = Query(default=50, ge=1, le=500),
     ) -> list[TaskRun]:
-        return await list_task_runs(
+        runs = await list_task_runs(
             app, signed_in.subject, task_type=type, limit=limit, run_key=run_key, run_title=run_title
         )
+        # Unchanged runs cost a 304 with no body.
+        return tagged_json(request, response, runs)
 
     return routes
 

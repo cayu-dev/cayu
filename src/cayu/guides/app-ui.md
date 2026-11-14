@@ -352,6 +352,55 @@ that work on the write path that changes the data, or in a durable event sink
 that reacts to the event once (`cayu guide human-attention` describes durable
 sinks and how to repair them).
 
+## Answer an unchanged read with a 304
+
+A route of your own that a page reads again and again should cost little while its
+answer doesn't change. Return the answer through `tagged_json`:
+
+```python
+from fastapi import APIRouter, Request, Response
+
+from cayu.server.etag import tagged_json
+
+router = APIRouter()
+
+
+@router.get("/app/reports")
+async def list_reports(request: Request, response: Response) -> list[dict[str, str]]:
+    reports = [{"id": "march", "status": "done"}]
+    return tagged_json(request, response, reports)
+```
+
+It sets a weak `ETag` of the answer and `Cache-Control: private, no-cache`. A request
+whose `If-None-Match` names that tag gets `304 Not Modified` with no body. A browser
+keeps the answer and revalidates it on each `fetch` by itself, so the page needs no code
+for it, and a watch that compares answers sees the same one.
+
+Keep out of the tag what changes on every read, such as an `as_of` time: pass the rest
+as `tagged` (for a Pydantic answer, `view.model_dump(mode="json", exclude={"as_of"})`),
+or the tag never matches. A client that gets the `304` keeps the answer it had, with its
+old `as_of`, so a page shows when it last read rather than the answer's `as_of`.
+
+A route that builds its own response uses the parts `tagged_json` is made of:
+
+```python
+from fastapi.responses import JSONResponse
+
+from cayu.server.etag import if_none_match_matches, json_body_etag
+
+
+@router.get("/app/summary")
+async def summary(request: Request) -> Response:
+    body = {"open": 3, "done": 12}
+    headers = {"ETag": json_body_etag(body), "Cache-Control": "private, no-cache"}
+    if if_none_match_matches(request.headers.get("if-none-match"), headers["ETag"]):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(body, headers=headers)
+```
+
+The routes `cayu new --preset b2b` generates under `/app` answer this way (`cayu guide
+b2b`).
+
 ## Use usage and cost, not event folds
 
 Do not compute tokens, cost, or other aggregates by folding a session's full

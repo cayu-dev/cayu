@@ -1744,6 +1744,27 @@ def test_the_overview_keeps_its_metrics_when_cayus_inbox_fails() -> None:
     assert answer["inbox"]["unavailable"] == "Cayu's inbox answered 500."
 
 
+def test_an_unchanged_answer_costs_a_304_with_no_body() -> None:
+    app = _app(task_store=InMemoryTaskStore())
+    server = create_server(app, config=ServerConfig(access=OpenAccess()))
+    alice = {"x-person": "alice"}
+    with _client(app, server=server) as client:
+        tags = {}
+        # The overview's `as_of` differs on each read; it isn't part of the tag.
+        for path in ("settings", "overview", "task-runs"):
+            first = client.get(f"/app/{path}", headers=alice)
+            assert first.headers["cache-control"] == "private, no-cache", path
+            tags[path] = first.headers["etag"]
+            again = client.get(f"/app/{path}", headers={**alice, "if-none-match": tags[path]})
+            assert again.status_code == 304 and again.content == b"", path
+            assert again.headers["etag"] == tags[path], path
+
+        _queue(app, client, "alice", ALICE, type="report", title="May")
+        changed = client.get("/app/task-runs", headers={**alice, "if-none-match": tags["task-runs"]})
+    assert changed.status_code == 200 and changed.headers["etag"] != tags["task-runs"]
+    assert [run["title"] for run in changed.json()] == ["May"]
+
+
 def _queue(app: CayuApp, client: TestClient, subject: str, membership: Membership, **task: Any) -> str:
     async def create() -> str:
         access = await app.access(subject)

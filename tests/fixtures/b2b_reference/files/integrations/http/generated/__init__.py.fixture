@@ -10,6 +10,9 @@ The Agent supplies what only it knows, as arguments to `build_generated_router`:
 request's person is and their role, its overview metrics, the settings it reads from its
 environment, and how its tasks group into runs. Each module's `router` is usable on its
 own, for an Agent that wants some of these routes and not others.
+
+`settings`, `overview` and `task-runs` answer with an ETag (`cayu.server.etag`), so a read
+of an unchanged answer costs a 304 with no body; the browser revalidates the page's reads.
 """
 
 from __future__ import annotations

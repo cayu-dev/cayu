@@ -33,7 +33,7 @@
     },
     "integrations/http/generated/__init__.py": {
       "reference_sha256": "a9ce5bfa133fa1adb44d33fa8aad22bd3a19cab7fc9afae3eac898a21e9a4f44",
-      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840)."
+      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840). Its docstring says settings, overview and task-runs answer with an ETag (#4005)."
     },
     "integrations/http/generated/cayu_api.py": {
       "reference_sha256": "12a1f7a97847913719a6bc68e61fa8ce44ffc59b65413c97f536120581d25ec3",
@@ -45,15 +45,15 @@
     },
     "integrations/http/generated/overview.py": {
       "reference_sha256": "05ea3c3217d4d135d3b723059b4341a8a296e9bb18bc2ad06786e72209f909b7",
-      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840)."
+      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840). Answers through cayu.server.etag's tagged_json with a tag of everything but as_of, so an unchanged overview costs a 304 (#4005)."
     },
     "integrations/http/generated/settings.py": {
       "reference_sha256": "82e9b0796e48772fdf774ddff908670b4ed11735e1fb750c9f0a392eda3b8228",
-      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839)."
+      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304 (#4005)."
     },
     "integrations/http/generated/task_runs.py": {
       "reference_sha256": "819e7d268a76ace4bf8792d4c9000c71d8e984fa73499ec6f6370d3eb4c4a127",
-      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839)."
+      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged runs cost a 304 (#4005)."
     },
     "integrations/http/generated/whoami.py": {
       "reference_sha256": "7083e16e60669c0f8ca957f9ac31f7de0059d6e3fb853f14cd955adbfda8b357",
@@ -65,7 +65,7 @@
     },
     "tests/test_generated_routes.py": {
       "reference_sha256": "84ee3465b174180c1ccc7645c6b9a78b8b96f4b722a545a691f5ceb6accb7142",
-      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839)."
+      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839). A test that settings, the Overview and task runs answer an unchanged read with a 304 and a changed one with a new tag (#4005)."
     },
     "tests/test_http_api.py": {
       "reference_sha256": "a74e7c077c6ca57065f2c0a0c7bb68df107d23b8fffaa3f3c01b89b2ede6edfc",
@@ -169,7 +169,7 @@
     },
     "web/src/generated/overview/index.tsx": {
       "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
-      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860)."
+      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860). Says when it last read the overview (dataUpdatedAt), since a 304 keeps the earlier answer's as_of (#4005)."
     },
     "web/src/generated/settings/index.tsx": {
       "reference_sha256": "27ec9dc65bf76e3c8a538b051286a71da4abcb0fec9c5369aa18689ae999922c",
@@ -309,7 +309,7 @@
     },
     "web/src/kit/shadcn/data.ts": {
       "reference_sha256": "83a7ec973d43d6030564f213c33150d4d93099ad24c4cf58ffc4a3c7cf6e5052",
-      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841). Adds watchInterval, a refetchInterval with Cayu's watch cadence for reads of /app (#3860)."
+      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841). Adds watchInterval, a refetchInterval with Cayu's watch cadence for reads of /app (#3860). The fetch wrapper's comment says reads revalidate through the browser's HTTP cache, which turns a 304 into the kept answer (#4005)."
     },
     "web/src/kit/shadcn/hooks/index.tsx": {
       "reference_sha256": "1641ceaa3daeed1ab5929b0d179d7e37c25a3a297e1e99ae2f47fc9b9e5a10c4",

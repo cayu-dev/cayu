@@ -123,6 +123,13 @@ Overview, the TaskRuns block's `taskRunsQuery`) follow their `/app` route with t
 seconds after the last, doubling while the answer doesn't change up to two minutes, and
 nothing while the tab is hidden. Give your own such query `refetchInterval: watchInterval()`.
 
+`GET /app/settings`, `/app/overview` and `/app/task-runs` answer with an `ETag`
+(`from cayu.server.etag import tagged_json`, `cayu guide app-ui`), so a read of an unchanged
+answer costs a `304` with no body. The browser revalidates the page's reads itself and hands
+the kit the answer it kept, so `@kit/data` needs no code for it. The Overview's tag leaves
+out `as_of`, which changes on every read, and the page says when it last read the overview
+rather than the kept answer's `as_of`. Answer a read route of your own the same way.
+
 A reply runs inside the request that streams it. Moving around the interface keeps it running,
 but closing the tab or losing the connection stops the agent's reply there; the conversation
 keeps what it had. Work that must outlive the page belongs in a task (`cayu guide

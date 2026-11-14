@@ -22,7 +22,8 @@ from typing import Any, Literal
 
 from cayu import CayuApp
 from cayu.managed_settings import ManagedSetting
-from fastapi import APIRouter, Depends
+from cayu.server.etag import tagged_json
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
 from integrations.http.generated.whoami import PersonDependency
@@ -156,8 +157,11 @@ def router(
     routes = APIRouter(dependencies=[Depends(person)])
 
     @routes.get("/settings")
-    async def get_settings() -> SettingsView:
-        return settings_view(app, application=application, fixed=fixed())
+    async def get_settings(request: Request, response: Response) -> SettingsView:
+        # Unchanged settings cost a 304 with no body.
+        return tagged_json(
+            request, response, settings_view(app, application=application, fixed=fixed())
+        )
 
     return routes
 

@@ -6540,6 +6540,17 @@
       "identities": {},
       "present": []
     },
+    "cayu.server.etag": {
+      "defined_in": {
+        "cayu.server.etag": [
+          "if_none_match_matches",
+          "json_body_etag",
+          "tagged_json"
+        ]
+      },
+      "identities": {},
+      "present": []
+    },
     "cayu.server.eval_report_auth": {
       "defined_in": {
         "cayu.server.eval_report_auth": [

@@ -194,7 +194,6 @@ from cayu.server._corpus_routes import (
 from cayu.server._data_volume_routes import register_data_volume_routes
 from cayu.server._diagnostics import SystemDiagnosticsSnapshot, inspect_system_diagnostics
 from cayu.server._environment_details import artifact_storage_kind, environment_activity_details
-from cayu.server._etag import tagged_json
 from cayu.server._eval_addition_routes import register_eval_addition_routes
 from cayu.server._eval_report_routes import reporting_router
 from cayu.server._eval_view_routes import register_eval_view_routes
@@ -355,6 +354,7 @@ from cayu.server.contracts import (
     UsageRollupResponse,
 )
 from cayu.server.contracts import PendingActionKind as ApiPendingActionKind
+from cayu.server.etag import if_none_match_matches, tagged_json
 from cayu.server.eval_report_auth import EvalReportingAccess
 from cayu.server.evals_registry import (
     EvalTargetRegistry,
@@ -3117,14 +3117,6 @@ def _session_usage_etag(snapshot: UsageAccountingSnapshot) -> str:
     # accounted sequence) or accounting evidence is deleted (advancing the
     # generation), so the pair identifies one exact summary.
     return f'"usage-{snapshot.generation}-{snapshot.through_sequence}"'
-
-
-def _if_none_match(header: str, etag: str) -> bool:
-    for candidate in header.split(","):
-        candidate = candidate.strip()
-        if candidate == "*" or candidate.removeprefix("W/") == etag:
-            return True
-    return False
 
 
 def _serialize_session_cursor(cayu_app: Any, cursor: str | None) -> str | None:
@@ -8428,7 +8420,7 @@ def create_router(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         headers = {"ETag": _session_usage_etag(snapshot), "Cache-Control": "private, no-cache"}
-        if if_none_match is not None and _if_none_match(if_none_match, headers["ETag"]):
+        if if_none_match_matches(if_none_match, headers["ETag"]):
             return Response(status_code=304, headers=headers)
         response.headers.update(headers)
         return snapshot.summary
