@@ -1008,6 +1008,8 @@ _TABLES = (
     "cayu_task_count_changes",
     "cayu_task_prerequisites",
     "cayu_usage_events",
+    "cayu_session_summary_dependencies",
+    "cayu_session_summaries",
     "cayu_knowledge_lookup_totals",
     "cayu_knowledge_lookup_removals",
     "cayu_knowledge_lookups",

@@ -46,6 +46,10 @@ from cayu.storage._product_operation_schema import POSTGRES_PRODUCT_OPERATION_DD
 from cayu.storage._retention_schema import POSTGRES_RETENTION_AUDIT_DDL
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL
+from cayu.storage._session_summary_schema import (
+    POSTGRES_SESSION_SUMMARIES_DDL,
+    SESSION_SUMMARY_REVISION,
+)
 from cayu.storage._task_graph_schema import POSTGRES_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
     POSTGRES_GROUP_EXECUTION_GENERATION_BACKFILL,
@@ -1030,6 +1034,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ARTIFACT_INDEX_REVISION: POSTGRES_ARTIFACT_INDEX_DDL,
     # The session trace reads a narrow trigger-maintained copy of each event.
     TRACE_EVENTS_REVISION: POSTGRES_TRACE_EVENTS_DDL,
+    # One summary row per session, kept by triggers on its overview's sources.
+    SESSION_SUMMARY_REVISION: POSTGRES_SESSION_SUMMARIES_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

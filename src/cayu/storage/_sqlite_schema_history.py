@@ -37,6 +37,10 @@ from cayu.storage._pending_action_counts_sql import SQLITE_PENDING_ACTION_COUNTS
 from cayu.storage._product_operation_schema import SQLITE_PRODUCT_OPERATION_DDL
 from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
+from cayu.storage._session_summary_schema import (
+    SESSION_SUMMARY_REVISION,
+    SQLITE_SESSION_SUMMARIES_DDL,
+)
 from cayu.storage._sqlite_closure_schema import SQLITE_CLOSURE_DDL
 from cayu.storage._task_graph_schema import SQLITE_TASK_GRAPH_DDL
 from cayu.storage._task_group_schema import (
@@ -816,6 +820,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     ARTIFACT_INDEX_REVISION: SQLITE_ARTIFACT_INDEX_DDL,
     # The session trace reads a narrow trigger-maintained copy of each event.
     TRACE_EVENTS_REVISION: SQLITE_TRACE_EVENTS_DDL,
+    # One summary row per session, kept by triggers on its overview's sources.
+    SESSION_SUMMARY_REVISION: SQLITE_SESSION_SUMMARIES_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

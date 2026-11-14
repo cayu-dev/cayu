@@ -194,6 +194,12 @@ from cayu.sessions.summaries import (
     SessionOutcome,
     SessionStepCounts,
 )
+from cayu.sessions.summary_rows import (
+    SessionSummaryRow,
+    SessionSummaryStamp,
+    SessionUsageDeltas,
+    SummarySettlement,
+)
 from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
 from cayu.sessions.terminal_evidence import TerminalSessionEvidence, TerminalSessionEvidenceLimits
 from cayu.sessions.topology import SessionTopologyQuery, SessionTopologyStoreResult
@@ -5438,6 +5444,57 @@ class SessionStore(ABC):
 
         sessions = await self.load_sessions(session_ids)
         return {session_id: session.instance_id for session_id, session in sessions.items()}
+
+    async def load_session_summaries(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryRow]:
+        """Each session's stored summary row; sessions without one are absent.
+
+        Native stores keep ``cayu_session_summaries`` with triggers. Other stores,
+        and reads under scoped access bounds, raise ``NotImplementedError``, and
+        callers derive overviews with ``SessionOverviewReader`` instead.
+        """
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def load_session_summary_stamps(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryStamp]:
+        """Each session's ``(instance_id, source_generation)``, ``None`` without a row."""
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def settle_session_summaries(
+        self, settlements: Sequence[SummarySettlement]
+    ) -> frozenset[str]:
+        """Store derived overviews whose rows are unchanged, in one transaction.
+
+        Each settlement is stored only if its row is still at ``instance_id`` and
+        ``generation``, together with the stamps its dependencies had before the
+        derivation read them. A stored overview is current only while every one
+        still holds, so a change to any of them, before or after the settlement,
+        makes the row unsettled. Returns the IDs stored. A read-only store
+        stores nothing.
+        """
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def read_session_usage_deltas(self, afters: Mapping[str, int]) -> SessionUsageDeltas:
+        """Usage of each session's events after its own sequence, in one read snapshot.
+
+        Each session's bound is its newest event in the snapshot. A session's
+        appends are serialized, so any later event of it has a higher sequence,
+        and reading again after the bound misses none.
+        """
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def page_session_summary_ids(
+        self, *, after: str | None = None, limit: int = 500, unsettled: bool = False
+    ) -> list[str]:
+        """Summary row session IDs after ``after`` in ID order, optionally only unsettled ones."""
+
+        raise NotImplementedError("This session store keeps no session summaries.")
 
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Load the latest checkpoint of several sessions; sessions without one are absent."""

@@ -516,6 +516,16 @@ class SessionOverviewReader:
             sessions, self._usage_cache, USAGE_BEARING_EVENT_TYPES, (), read
         )
 
+    async def costs(self, sessions: Sequence[Session]) -> dict[str, SessionCostTotals]:
+        """Each session's cost totals under the reader's price book.
+
+        Empty without a price book; sessions without cost-bearing events are
+        absent. With a ``cost_cache``, only sessions whose cost-bearing events
+        changed since it last priced them are priced again.
+        """
+
+        return await self._costs(sessions)
+
     async def _costs(self, sessions: Sequence[Session]) -> dict[str, SessionCostTotals]:
         """Each session's cost totals; sessions without cost-bearing events are absent."""
 

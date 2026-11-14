@@ -48,8 +48,15 @@ from cayu.sessions.messaging import (
     SessionMessageSource,
 )
 from cayu.sessions.records import update_session_annotations
+from cayu.sessions.summary_rows import (
+    SessionSummaryRow,
+    SessionSummaryStamp,
+    SessionUsageDeltas,
+    SummarySettlement,
+)
 from cayu.storage import _artifact_index_store as artifact_index_ops
 from cayu.storage import _creation_fence
+from cayu.storage import _session_summary_rows as summary_rows
 from cayu.storage import _sqlite_context_views as context_view_ops
 from cayu.storage import _sqlite_event_delivery as event_delivery_ops
 from cayu.storage import _sqlite_event_publication as event_publication_ops
@@ -74,6 +81,7 @@ from cayu.storage._external_wait_sqlite import SQLiteExternalWaitMixin
 from cayu.storage._phase_timing import TimedStoreLock, TimedStoreReadQueue
 from cayu.storage._read_lanes import ReadLane, current_read_lane
 from cayu.storage._session_execution import SQLiteSessionExecutionMixin
+from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage.targets import require_sqlite_store_allowed
 
@@ -446,7 +454,9 @@ from cayu.tools.grants import (
 )
 
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = max(ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION)
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = max(
+    ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION, SESSION_SUMMARY_REVISION
+)
 _T = TypeVar("_T")
 # Read-only connections per file-backed session store. Interactive reads (one
 # session, a transcript, state) lease the first set; bulk-lane reads (dashboard
@@ -2212,6 +2222,52 @@ class SQLiteSessionStore(
             return await super().load_session_instance_ids(page)
         return await self._run_read(
             lambda connection: page_read_ops.load_session_instance_ids(connection, page)
+        )
+
+    async def load_session_summaries(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryRow]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_summaries(page)
+        return await self._run_read(lambda connection: summary_rows.sqlite_load(connection, page))
+
+    async def load_session_summary_stamps(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryStamp]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_summary_stamps(page)
+        return await self._run_read(lambda connection: summary_rows.sqlite_stamps(connection, page))
+
+    async def settle_session_summaries(
+        self, settlements: Sequence[SummarySettlement]
+    ) -> frozenset[str]:
+        if self._read_only or not settlements:
+            return frozenset()
+        return await self._run_write(
+            lambda connection: summary_rows.sqlite_settle(connection, settlements)
+        )
+
+    async def read_session_usage_deltas(self, afters: Mapping[str, int]) -> SessionUsageDeltas:
+        if await page_reads.page_reads_are_bounded():
+            return await super().read_session_usage_deltas(afters)
+        return await self._run_read(
+            lambda connection: summary_rows.sqlite_usage_deltas(connection, afters)
+        )
+
+    async def page_session_summary_ids(
+        self, *, after: str | None = None, limit: int = 500, unsettled: bool = False
+    ) -> list[str]:
+        if await page_reads.page_reads_are_bounded():
+            return await super().page_session_summary_ids(
+                after=after, limit=limit, unsettled=unsettled
+            )
+        limit = min(limit, summary_rows.MAX_SUMMARY_PAGE)
+        return await self._run_read(
+            lambda connection: summary_rows.sqlite_page(
+                connection, after=after, limit=limit, unsettled=unsettled
+            )
         )
 
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:

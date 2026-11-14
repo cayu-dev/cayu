@@ -24,6 +24,7 @@ from enum import StrEnum
 
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
+from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 
@@ -665,6 +666,12 @@ REVISIONS: tuple[Revision, ...] = (
     # included, and the migration copies retained events. Session stores
     # require it.
     Revision(revision=TRACE_EVENTS_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # cayu_session_summaries keeps one row per session: copies of its list
+    # columns, kept by triggers on every source of its overview for every writer,
+    # older binaries included, and the overview the reference reader derived,
+    # served while the stamps it was derived from are unchanged. The migration
+    # adds a row for every retained session. Session stores require it.
+    Revision(revision=SESSION_SUMMARY_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

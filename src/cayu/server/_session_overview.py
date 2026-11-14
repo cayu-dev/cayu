@@ -17,10 +17,12 @@ from pydantic import ValidationError
 
 from cayu._time_buckets import BucketUnit, TimeSeriesSpec
 from cayu.artifacts.base import ArtifactStore, ArtifactStoreUnavailableError
-from cayu.budgets.pricing import PriceBook
+from cayu.budgets.pricing import PriceBook, SessionCostTotals
+from cayu.budgets.usage import SessionUsageSummary
 from cayu.messages import Message, MessageRole, TextPart
 from cayu.server._artifact_index_reads import ArtifactIndexReads
 from cayu.server._session_overview_query import SessionOverviewSelection
+from cayu.server._session_summaries import SessionSummaries, SummaryDocument
 from cayu.server.contracts import (
     MAX_SESSION_FIRST_MESSAGE_LENGTH,
     SessionOverviewCost,
@@ -81,6 +83,7 @@ class SessionOverviewService:
         # changed since an earlier page read them.
         self._cost_cache = SessionCostCache()
         self._usage_cache = SessionUsageCache()
+        self.summaries = SessionSummaries(store, uses_browser=uses_browser)
 
     async def read(
         self,
@@ -88,6 +91,73 @@ class SessionOverviewService:
         *,
         selection: SessionOverviewSelection | None = None,
     ) -> tuple[list[Session], list[SessionOverviewResponse]]:
+        """Overviews of the listed sessions, from their stored summary rows.
+
+        A store without summary rows, or a read under scoped access bounds, is
+        read with the reference reader instead, as ``read_reference``.
+        """
+
+        selection = SessionOverviewSelection() if selection is None else selection
+        documents = await self.summaries.documents(sessions)
+        if documents is None:
+            return await self.read_reference(sessions, selection=selection)
+        selected: list[tuple[Session, SummaryDocument]] = []
+        for session in sessions:
+            document = documents.get(session.id)
+            if document is None:
+                continue
+            if (not selection.include_eval and is_eval_trial(session)) or (
+                not selection.include_forks and document.forked
+            ):
+                continue
+            if not document.pending_complete:
+                raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
+            if selection.states and document.state not in selection.states:
+                continue
+            selected.append((session, document))
+        if not selected:
+            return [], []
+        listed = [session for session, _ in selected]
+        # TODO: price from cayu_session_usage, as the summary
+        # row's per-session totals, instead of reading cost-bearing events here.
+        costs = await SessionOverviewReader(
+            self.store, pricing=self.pricing, cost_cache=self._cost_cache
+        ).costs(listed)
+        # TODO: read artifact_count from the summary row
+        # once the artifact index keeps it.
+        artifacts = await self._artifact_counts(tuple(session.id for session in listed))
+        current = await self._current(listed)
+        kept = [(session, document) for session, document in selected if session.id in current]
+        return (
+            [session for session, _ in kept],
+            [
+                self._project_values(
+                    session,
+                    status=document.state,
+                    reason=document.reason,
+                    error=document.error,
+                    ended_at=document.ended_at,
+                    usage=document.usage,
+                    cost=costs.get(session.id),
+                    forked=document.forked,
+                    uses=SessionOverviewUses(
+                        browser=document.browser,
+                        subagents=document.subagents,
+                        artifacts=artifacts[session.id],
+                    ),
+                )
+                for session, document in kept
+            ],
+        )
+
+    async def read_reference(
+        self,
+        sessions: list[Session],
+        *,
+        selection: SessionOverviewSelection | None = None,
+    ) -> tuple[list[Session], list[SessionOverviewResponse]]:
+        """``read`` from the reference reader, without summary rows."""
+
         selection = SessionOverviewSelection() if selection is None else selection
         facts = await SessionOverviewReader(
             self.store,
@@ -143,7 +213,7 @@ class SessionOverviewService:
 
     async def _uses(self, sessions: list[Session]) -> dict[str, SessionOverviewUses]:
         session_ids = tuple(session.id for session in sessions)
-        browser = await self._uses_browser(sessions)
+        browser = await uses_browser(self.store, sessions)
         subagents = await self.store.count_child_runs(sessions)
         artifacts = await self._artifact_counts(session_ids)
         return {
@@ -154,32 +224,6 @@ class SessionOverviewService:
             )
             for session in sessions
         }
-
-    async def _uses_browser(self, sessions: list[Session]) -> dict[str, bool]:
-        session_ids = tuple(session.id for session in sessions)
-        with browser_control_checkpoint_read_scope(*session_ids):
-            checkpoints = await self.store.load_checkpoint_fields(
-                session_ids, (BROWSER_CONTROLS_CHECKPOINT_KEY,)
-            )
-        uses: dict[str, bool] = {}
-        for session in sessions:
-            checkpoint = checkpoints.get(session.id)
-            raw = None if checkpoint is None else checkpoint.get(BROWSER_CONTROLS_CHECKPOINT_KEY)
-            if raw is None:
-                continue
-            try:
-                controls = BrowserControlCheckpoint.model_validate(raw)
-            except ValidationError:
-                raise SessionOverviewUnavailable("Browser usage evidence is unavailable.") from None
-            if any(
-                record.identity.session_id == session.id
-                and record.identity.session_instance_id == session.instance_id
-                for record in controls.records
-            ):
-                uses[session.id] = True
-        unsettled = [session for session in sessions if session.id not in uses]
-        uses.update(await retained_browser_usage(self.store, unsettled))
-        return uses
 
     async def _artifact_counts(self, session_ids: tuple[str, ...]) -> dict[str, int]:
         # Registration owner deduplicates the same store shared by environments
@@ -315,15 +359,39 @@ class SessionOverviewService:
     def _project(
         self, facts: SessionOverviewFacts, uses: SessionOverviewUses
     ) -> SessionOverviewResponse:
-        session, usage, cost = facts.session, facts.usage, facts.cost
+        error = facts.outcome.details.get("error")
+        return self._project_values(
+            facts.session,
+            status=facts.status,
+            reason=facts.outcome.reason,
+            error=error if type(error) is str else None,
+            ended_at=facts.ended_at,
+            usage=facts.usage,
+            cost=facts.cost,
+            forked=facts.forked,
+            uses=uses,
+        )
+
+    def _project_values(
+        self,
+        session: Session,
+        *,
+        status: SessionOverviewStatus,
+        reason: str,
+        error: str | None,
+        ended_at: datetime | None,
+        usage: SessionUsageSummary | None,
+        cost: SessionCostTotals | None,
+        forked: bool,
+        uses: SessionOverviewUses,
+    ) -> SessionOverviewResponse:
         metrics = None if usage is None else usage.usage
         tone = session.metadata.get(SUMMARY_TONE_METADATA_KEY)
-        reason = self._text(facts.outcome.reason, limit=1024) or "unknown"
-        if facts.status == "failed":
+        reason = self._text(reason, limit=1024) or "unknown"
+        if status == "failed":
             # Runtime outcome codes remain stable. Only this public display
             # projection explains the error, after redacting the complete value
             # so truncation cannot expose a prefix of a registered secret.
-            error = facts.outcome.details.get("error")
             error = self.redact(error) if type(error) is str else None
             text = " ".join(error.split()) if type(error) is str else ""
             if len(text) > 1024:
@@ -335,7 +403,7 @@ class SessionOverviewService:
         return SessionOverviewResponse(
             session_id=self.project_session(session.id),
             run_id=session_run_id(session),
-            state=facts.status,
+            state=status,
             reason=reason,
             title=self.project_title(session),
             summary=self._text(
@@ -343,7 +411,7 @@ class SessionOverviewService:
             ),
             summary_tone=tone if type(tone) is str and tone in SUMMARY_TONES else None,
             started_at=session.created_at,
-            ended_at=facts.ended_at,
+            ended_at=ended_at,
             last_activity_at=session.last_activity_at,
             model_steps=0 if usage is None else usage.model_steps,
             tool_calls=0 if usage is None else usage.tool_calls,
@@ -362,8 +430,37 @@ class SessionOverviewService:
             ),
             uses=uses,
             eval=is_eval_trial(session),
-            forked=facts.forked,
+            forked=forked,
         )
+
+
+async def uses_browser(store: Any, sessions: list[Session]) -> dict[str, bool]:
+    """Whether each session used the browser: its checkpoint's controls or a retained receipt."""
+
+    session_ids = tuple(session.id for session in sessions)
+    with browser_control_checkpoint_read_scope(*session_ids):
+        checkpoints = await store.load_checkpoint_fields(
+            session_ids, (BROWSER_CONTROLS_CHECKPOINT_KEY,)
+        )
+    uses: dict[str, bool] = {}
+    for session in sessions:
+        checkpoint = checkpoints.get(session.id)
+        raw = None if checkpoint is None else checkpoint.get(BROWSER_CONTROLS_CHECKPOINT_KEY)
+        if raw is None:
+            continue
+        try:
+            controls = BrowserControlCheckpoint.model_validate(raw)
+        except ValidationError:
+            raise SessionOverviewUnavailable("Browser usage evidence is unavailable.") from None
+        if any(
+            record.identity.session_id == session.id
+            and record.identity.session_instance_id == session.instance_id
+            for record in controls.records
+        ):
+            uses[session.id] = True
+    unsettled = [session for session in sessions if session.id not in uses]
+    uses.update(await retained_browser_usage(store, unsettled))
+    return uses
 
 
 def _with_preview(overview: SessionOverviewResponse, text: str | None) -> SessionOverviewResponse:

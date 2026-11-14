@@ -255,6 +255,14 @@ def add_session_parser(subparsers: Any) -> None:
     _add_target_options(show_parser)
     add_output_options(show_parser, formats=FORMAT_CHOICES)
 
+    from cayu.cli._session_overview_check import add_session_overview_parser
+
+    add_session_overview_parser(
+        commands,
+        _add_target_options,
+        lambda parser: add_output_options(parser, formats=FORMAT_CHOICES),
+    )
+
     from cayu.cli._runtime_timing import add_runtime_timing_parser
 
     add_runtime_timing_parser(commands)
@@ -922,6 +930,14 @@ async def _run_session_command(
             return await _list_sessions(args, reader)
         if args.session_command == "show":
             return await _show_session(args, reader)
+        if args.session_command == "overview":
+            from cayu.cli._session_overview_check import run_session_overview
+
+            if not isinstance(reader, StoreSessionReader):
+                raise ValueError("Session summary rows are read from a local session store.")
+            payload = await run_session_overview(args, reader.store)
+            _render_detail(args.output_format, {"schema_version": CLI_SCHEMA_VERSION, **payload})
+            return 0 if payload.get("matches", True) else 1
         if args.session_command == "rollup":
             return await _session_rollup(args, reader)
         if args.session_command == "workflow":

@@ -21562,6 +21562,43 @@ browser tool owner publishes that reserved receipt atomically with its durable
 operation. Generic operation publishers cannot create or replace it.
 Cloud's existing content-free summaries do not gain display metadata.
 
+Since storage revision 155, SQLite and PostgreSQL keep `cayu_session_summaries`,
+one row per session, and the control plane serves `include=overview` from it.
+Triggers in the writing transaction, for every writer including older binaries,
+copy the session row's list columns (agent, environment, provider, model, parent,
+status, times, raw `cayu:title`, the eval mark), and advance `source_generation`
+on every write to the session's row, events, checkpoint, receipt ledgers or
+operations, and on a child's creation, deletion or relineage. On PostgreSQL a
+row advances at most once per writing transaction, so a transaction that writes
+many of a session's events updates its summary row once. The overview itself
+(state, outcome, usage, fork lineage, waits, browser and subagent use) is
+derived by `SessionOverviewReader` and stored with the generation it read first
+and the `(instance_id, source_generation)` stamp of every other session of its
+lineage tree the derivation read, through a store view that refuses any read it
+cannot attribute to a session. A stored overview is served only while its
+generation and every recorded stamp are unchanged; the stamps are compared when
+the row is read, so a writer never updates another session's summary row and
+writers to related sessions never wait on each other. A page's other rows are
+derived again together, in one reference read, one read of their new usage
+(`read_session_usage_deltas`) and one settlement
+(`settle_session_summaries`, a compare-and-set on each row's generation that
+stores the stamps with the overview), so a page costs the same number of store
+reads however many of its rows are stale, and a write committed meanwhile
+leaves a row to be derived on the next read. Usage is extended with only the
+events after the stored sequence, each session read through its own newest
+event (its appends are serialized, so no later event can land below it), until
+one of the session's events is changed or deleted (`usage_epoch`). Cost is
+still priced at read time from cost-bearing events, and artifact counts are read
+from artifact stores. `SessionStore.load_session_summaries`,
+`load_session_summary_stamps`, `settle_session_summaries`,
+`read_session_usage_deltas` and `page_session_summary_ids` expose the rows;
+custom stores and reads under scoped access bounds raise `NotImplementedError`,
+and the control plane then reads with the reference reader as before.
+`cayu session overview SESSION --recompute` (or `--all`) compares the served
+overview with a full recompute from the event log and exits 1 when they differ;
+a session that keeps changing while it is checked is reported as `changing`
+instead.
+
 An overview page reads its sessions a page at a time, so a page costs a fixed
 number of store reads however many sessions it holds. `SessionStore` page reads
 take up to 1000 session IDs: `load_sessions`, `load_checkpoints`,

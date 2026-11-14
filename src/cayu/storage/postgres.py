@@ -48,6 +48,12 @@ from cayu.sessions.messaging import (
     SessionMessageSource,
 )
 from cayu.sessions.records import update_session_annotations
+from cayu.sessions.summary_rows import (
+    SessionSummaryRow,
+    SessionSummaryStamp,
+    SessionUsageDeltas,
+    SummarySettlement,
+)
 from cayu.storage import _artifact_index_store as artifact_index_ops
 from cayu.storage import _creation_fence
 from cayu.storage import _postgres_alias_checks as alias_checks
@@ -71,6 +77,7 @@ from cayu.storage import _postgres_terminal_evidence as terminal_evidence_ops
 from cayu.storage import _postgres_tool_grants as tool_grants_ops
 from cayu.storage import _postgres_transcript as transcript_ops
 from cayu.storage import _postgres_transcript_content as transcript_content
+from cayu.storage import _session_summary_rows as summary_rows
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._context_selection_fence import PostgresContextSelectionFenceMixin
 from cayu.storage._creation_fence import PostgresCreationFenceMixin
@@ -78,6 +85,7 @@ from cayu.storage._diagnostic_inspection import alias_keyring_optional
 from cayu.storage._external_wait_postgres import PostgresExternalWaitMixin
 from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
+from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
@@ -455,7 +463,9 @@ from cayu.tools.grants import (
     targeted_tool_grant_with_active_reference,
 )
 
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = max(ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION)
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = max(
+    ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION, SESSION_SUMMARY_REVISION
+)
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
 
@@ -1688,6 +1698,58 @@ class PostgresSessionStore(
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             return await page_read_ops.load_session_instance_ids(cur, page)
+
+    async def load_session_summaries(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryRow]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_summaries(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_rows.postgres_load(cur, page)
+
+    async def load_session_summary_stamps(
+        self, session_ids: Sequence[str]
+    ) -> dict[str, SessionSummaryStamp]:
+        page = page_reads.page_session_ids(session_ids)
+        if await page_reads.page_reads_are_bounded():
+            return await super().load_session_summary_stamps(page)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_rows.postgres_stamps(cur, page)
+
+    async def settle_session_summaries(
+        self, settlements: Sequence[SummarySettlement]
+    ) -> frozenset[str]:
+        if self._read_only or not settlements:
+            return frozenset()
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_rows.postgres_settle(cur, settlements)
+
+    async def read_session_usage_deltas(self, afters: Mapping[str, int]) -> SessionUsageDeltas:
+        if await page_reads.page_reads_are_bounded():
+            return await super().read_session_usage_deltas(afters)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_rows.postgres_usage_deltas(cur, afters)
+
+    async def page_session_summary_ids(
+        self, *, after: str | None = None, limit: int = 500, unsettled: bool = False
+    ) -> list[str]:
+        if await page_reads.page_reads_are_bounded():
+            return await super().page_session_summary_ids(
+                after=after, limit=limit, unsettled=unsettled
+            )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_rows.postgres_page(
+                cur,
+                after=after,
+                limit=min(limit, summary_rows.MAX_SUMMARY_PAGE),
+                unsettled=unsettled,
+            )
 
     async def load_checkpoints(self, session_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         page = page_reads.page_session_ids(session_ids)

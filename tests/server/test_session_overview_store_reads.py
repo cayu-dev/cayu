@@ -55,6 +55,25 @@ def _count_calls(target: object, calls: Counter, prefix: str) -> None:
         setattr(target, name, counted)
 
 
+async def _unsettle_every_row(case, store) -> None:
+    """Advance every summary row's generation, as writes to every session would."""
+
+    statement = "UPDATE cayu_session_summaries SET source_generation = source_generation + 1"
+    if case[0] == "sqlite":
+
+        def advance(connection) -> None:
+            with connection:
+                connection.execute(statement)
+
+        await store._run_write(advance)
+    elif case[0] == "postgres":
+        import psycopg
+
+        async with await psycopg.AsyncConnection.connect(case[2]) as conn:
+            await conn.execute(statement)
+            await conn.commit()
+
+
 async def _family(app, artifacts, index: int, page: str) -> None:
     """A root with a child run and a fork, a question, and an approval."""
 
@@ -81,7 +100,13 @@ async def _family(app, artifacts, index: int, page: str) -> None:
 
 
 @pytest.mark.store_semantics
-def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_case, tmp_path):
+@pytest.mark.parametrize("stale", [False, True], ids=["settled", "stale"])
+def test_overview_page_store_reads_stay_fixed_as_the_page_grows(
+    session_store_case, tmp_path, stale
+):
+    if stale and session_store_case[0] == "memory":
+        pytest.skip("The in-memory store keeps no summary rows.")
+
     async def page_reads(families: int) -> tuple[Counter, Counter, dict, dict]:
         kind, _, dsn = session_store_case
         (tmp_path / f"store-{families}").mkdir()
@@ -114,6 +139,8 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
                 assert before.status_code == 200, before.text
                 counts_before = await client.get("/api/sessions/overview/counts")
                 assert counts_before.status_code == 200, counts_before.text
+                if stale:
+                    await _unsettle_every_row(session_store_case, store)
                 _count_calls(store, calls, "sessions")
                 _count_calls(artifacts, calls, "artifacts")
                 response = await client.get("/api/sessions", params=params)
@@ -167,24 +194,15 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
         assert small_totals["total_count"] == "8" and large_totals["total_count"] == "24"
         assert large_totals["counts_by_state"]["waiting_input"] == "6"
         assert large_totals["counts_by_state"]["waiting_approval"] == "6"
-        # Each read the overview needs is made once for the whole page.
-        for name in (
+        reference_reads = (
             "sessions.summarize_outcomes",
             "sessions.query_pending_actions_for_sessions",
             "sessions.query_latest_events",
             "sessions.load_checkpoint_fields",
             "sessions.load_session_operations",
             "sessions.count_child_runs",
-            "sessions.query_first_transcript_records",
-            artifact_count,
-        ):
-            assert large[name] >= 1, (name, large)
-        # The listed rows are summarized as listed. Each fence after a group of
-        # reads (the reader's, the projection's and the route's) reads only the
-        # incarnations, and only browser controls are read from checkpoints.
-        assert large["sessions.list_sessions"] == 1, large
-        assert large["sessions.load_session_instance_ids"] == 3, large
-        for name in (
+        )
+        never = (
             "sessions.load_sessions",
             "sessions.load_checkpoints",
             "sessions.load",
@@ -196,7 +214,40 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(session_store_ca
             "artifacts.list",
             "artifacts.scan_metadata",
             *(("artifacts.count_session_artifacts",) if indexed else ()),
+        )
+        assert large["sessions.list_sessions"] == 1, large
+        for name in (
+            "sessions.query_first_transcript_records",
+            artifact_count,
         ):
+            assert large[name] >= 1, (name, large)
+        if session_store_case[0] == "memory":
+            # Without summary rows each read the overview needs is made once for
+            # the whole page. The listed rows are summarized as listed. Each fence
+            # after a group of reads (the reader's, the projection's and the
+            # route's) reads only the incarnations, and only browser controls are
+            # read from checkpoints.
+            for name in reference_reads:
+                assert large[name] >= 1, (name, large)
+            assert large["sessions.load_session_instance_ids"] == 3, large
+        elif stale:
+            # Every row is stale, so the page derives them all in one reference
+            # read, one read of their new usage and one settlement.
+            for name in reference_reads:
+                assert large[name] >= 1, (name, large)
+            assert large["sessions.load_session_summaries"] == 1, large
+            assert large["sessions.read_session_usage_deltas"] == 1, large
+            assert large["sessions.settle_session_summaries"] == 1, large
+            never = tuple(name for name in never if name != "sessions.load_sessions")
+            assert large["sessions.load_sessions"] == 1, large
+        else:
+            # The first page settled every summary row, so the second reads the
+            # page's rows once and none of the reference reader's reads. The
+            # service's and the route's fences read only the incarnations.
+            assert large["sessions.load_session_summaries"] == 1, large
+            assert large["sessions.load_session_instance_ids"] == 2, large
+            never = (*never, *reference_reads)
+        for name in never:
             assert large[name] == 0, (name, large)
         for rows in (small_rows, large_rows):
             assert rows["root-0"]["uses"] == {"browser": False, "subagents": "1", "artifacts": "1"}

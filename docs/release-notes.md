@@ -1,5 +1,27 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: Storage revision 154 is additive; run `cayu storage migrate` before
+restarting. It adds `cayu_session_summaries` and a row for every retained session
+with one `INSERT ... SELECT`, which took under a second for the 7,882 sessions and
+997,415 events of a production store (the migration's usual copy and integrity
+check of the database file dominate the upgrade time). Overviews are derived on
+first read and stored, so the first dashboard page after the upgrade costs what
+every page cost before, once; `cayu session overview --all` checks every row.
+
+### Breaking changes
+
+None.
+
+### Changes
+
+- Session overviews are served from `cayu_session_summaries`, a row per session
+  kept by triggers in the writing transaction, instead of being rebuilt from the
+  event log on every request.
+- `cayu session overview SESSION --recompute` (or `--all`) compares the stored
+  overview with a full recompute and exits 1 when they differ.
+
 ## v0.19.1
 
 Upgrade: No additional storage or manifest migration is required from v0.19.0.

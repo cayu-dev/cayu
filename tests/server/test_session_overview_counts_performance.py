@@ -463,6 +463,10 @@ async def _delegated_replacement_scenario(
                 "overview": ("/api/sessions", {"ids": "root", "include": "overview"}, {}),
                 "cloud": ("/api/cloud/v1/activity", {}, _bearer(TOKEN)),
             }[consumer]
+            if consumer == "overview" and case[0] != "memory":
+                # The listing above stored every overview; a write to the root makes
+                # its summary row unsettled, so this read derives it again.
+                await store.update_metadata("root", {"unsettle": True})
             request = asyncio.create_task(client.get(path, params=params, headers=headers))
             await asyncio.wait_for(reached.wait(), 5)
             # Do not hold the replacement writer inside the reader's test barrier.
