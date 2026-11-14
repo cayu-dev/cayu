@@ -18,7 +18,9 @@ jobs:
   test-collection:
     name: Test collection
     runs-on: ${{ fromJSON(vars.CI_RUNNER_ANCILLARY || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
+    # Match the shared collection gate: serial all-store collection can take
+    # over four minutes before setup and teardown on a loaded runner.
+    timeout-minutes: 10
     env:
       CAYU_TEST_STORES: all
     steps:

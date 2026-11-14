@@ -158,7 +158,21 @@ def test_expired_attached_nested_model_without_environment_is_interrupted(
                     for reservation in original_reservations
                 )
             original = await stores.session_store.load("scan")
-            await stores.task_store.cancel_task("job")
+            task = await stores.task_store.load_task("job")
+            assert task is not None
+            assert task.worker_id == "lost-worker"
+            # The short worker lease can expire while the child is still
+            # entering its crash point, leaving durable cancellation intent.
+            # Request against that exact claim; replay must preserve the fence.
+            cancellation = await stores.task_store.request_claimed_task_cancellation(
+                "job", task.worker_id, claim_generation=task.claim_generation
+            )
+            assert (
+                await stores.task_store.request_claimed_task_cancellation(
+                    "job", task.worker_id, claim_generation=task.claim_generation
+                )
+                == cancellation
+            )
             async with asyncio.timeout(10):
                 while not await stores.task_store.list_expired_interrupted_task_handoff_candidates(
                     limit=10

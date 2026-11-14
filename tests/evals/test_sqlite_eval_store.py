@@ -276,6 +276,15 @@ def test_sqlite_terminal_watchers_do_not_starve_checkpoint_or_result_publication
 
 
 def test_sqlite_eval_writers_retry_across_store_instances(tmp_path, caplog) -> None:
+    async def wait_for_retry(operation):
+        async with asyncio.timeout(5):
+            while not any(
+                getattr(record, "eval_operation", None) == operation
+                and getattr(record, "cayu_eval_store_event", None) == "sqlite_writer.retry"
+                for record in caplog.records
+            ):
+                await asyncio.sleep(0)
+
     async def exercise() -> None:
         corpus = _corpus(trials=1)
         result, checkpoint = await _result_with_checkpoint(corpus)
@@ -319,7 +328,7 @@ def test_sqlite_eval_writers_retry_across_store_instances(tmp_path, caplog) -> N
                 )
                 for store, lease in zip(stores, leases, strict=True)
             ]
-            await asyncio.sleep(0.1)
+            await wait_for_retry("save_trial_checkpoint")
             blocker.commit()
             await asyncio.wait_for(asyncio.gather(*checkpoint_tasks), timeout=2)
 
@@ -328,7 +337,7 @@ def test_sqlite_eval_writers_retry_across_store_instances(tmp_path, caplog) -> N
                 asyncio.create_task(_publish_result(store, lease.claim, result))
                 for store, lease in zip(stores, leases, strict=True)
             ]
-            await asyncio.sleep(0.1)
+            await wait_for_retry("publish_result")
             blocker.commit()
             completed = await asyncio.wait_for(asyncio.gather(*publication_tasks), timeout=2)
             assert all(record.status is EvalRunStatus.COMPLETED for record in completed)

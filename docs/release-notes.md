@@ -1,33 +1,149 @@
 # Release notes
 
-## Unreleased
+## v0.20.0
 
-Upgrade: Storage revision 154 is additive; run `cayu storage migrate` before
-restarting. It adds `cayu_session_summaries` and a row for every retained session
-with one `INSERT ... SELECT`, which took under a second for the 7,882 sessions and
-997,415 events of a production store (the migration's usual copy and integrity
-check of the database file dominate the upgrade time). Overviews are derived on
-first read and stored, so the first dashboard page after the upgrade costs what
-every page cost before, once; `cayu session overview --all` checks every row.
+Upgrade: Stop workers and servers that open the database, take a restorable
+backup, and run `cayu storage migrate` before restarting. Storage revision
+advances from 148 to 157 with additive usage-event, alias-key history, task
+index/count, knowledge lookup/order, artifact-index, trace-event, session-summary,
+evaluation-summary, and stored usage/tool-total tables; the compatibility floor
+remains 146 and no additional breaking-revision
+acknowledgement is required from v0.19.1. App manifest schema remains 18. Server
+contract advances from 90 to 91; upgrade independently deployed clients and
+dashboards to the matching contract. The bundled dashboard and parts package
+already match. When upgrading from v0.18.0, also follow the v0.19.0 migration
+instructions below. Applications using GitHub connections need the corresponding
+GitHub App connection support in Cayu Cloud.
+
+When regenerating an existing b2b project, replace `integrations/web.py` and its
+router registration with `ui = "web/static"` in `[tool.cayu.serve]`, move
+`integrations/http.py` into the generated `integrations/http/` package, and move
+custom `web/src/app.tsx` changes into an area under `web/src/agent/` before
+replacing the web shell.
 
 ### Breaking changes
 
-None.
+- Server contract 91 adds human-review requirements and purpose to app info.
+  Regenerate OpenAPI clients and rebuild independently deployed dashboards and
+  applications against the matching contract. Older contract-bound dashboards
+  must not be used with the new server.
 
 ### Changes
 
-- Session overviews are served from `cayu_session_summaries`, a row per session
-  kept by triggers in the writing transaction, instead of being rebuilt from the
-  event log on every request.
-- `cayu session overview SESSION --recompute` (or `--all`) compares the stored
-  overview with a full recompute and exits 1 when they differ.
-- `cayu check --deploy` reads the `[worker]` command in `cayu-cloud.toml` and
-  reports `WORKER_SINGLE_PROCESS_REQUIRED` when the worker passes
-  `reconcile_abandoned_after_s` but would start more than one process, including
-  `cayu worker`'s default of one process per CPU, and `WORKER_COMMAND_INVALID` for
-  a command `cayu worker` would refuse. A Cloud manifest that ran such a worker as
-  `cayu worker NAME` on v0.18 needs `--processes 1` (or `NAME = 1` under
-  `[tool.cayu.worker_processes]`) from v0.19.0 on, or its worker exits at startup.
+- Give freshly scaffolded memory-enabled project tests a temporary evidence key
+  when CI has no configured key or local key file. Keep deployed applications
+  dependent on their own configured key and leave the key file untouched.
+- Refresh generated b2b task and overview pages from scoped task-list changes
+  instead of fixed page timers. Add `cayu task list` filtering by exact input
+  and metadata values, using the same value-matching contract as server reads.
+- Refuse deployment checks when a worker requires one process but its Cloud
+  command would launch several. Set `--processes 1` or configure the worker's
+  process count explicitly; report invalid worker commands before deployment.
+- Read Usage rollups, session token totals, and tool totals from trigger-maintained
+  rows introduced by revision 157. Compare stored accounting with source events
+  using `cayu usage rollup --recompute` or `POST /usage/rollup/recompute`.
+- Bound dashboard polling with shared query defaults, ETag revalidation, scoped
+  session refreshes, and backoff for unchanged pages. Cancel requests when their
+  last observer leaves and refresh paginated lists without resetting their
+  full-refresh interval.
+- Read trace and event-head pages from narrow trigger-maintained event rows,
+  load transcript payloads on demand, and page large histories. Revision 154
+  backfills retained trace events; `cayu storage check-trace SESSION_ID` compares
+  projections with their source events.
+- Read session overviews from trigger-maintained summary rows and extend usage
+  incrementally while source generations remain current. Revision 155 fills
+  retained session rows; derived overviews populate on first read. Compare
+  stored overviews with `cayu session overview SESSION --recompute` or `--all`.
+- Read evaluation catalogs, results, cases, trials, and comparison history from
+  maintained summaries introduced by revision 156. Refresh newly published
+  runs and page large result sets within response limits.
+- Page and search artifacts through a maintained metadata index, including
+  redacted visible-value filtering and indexed session counts. Revision 153
+  adds the index; run `cayu artifact reindex` to refresh artifacts written by
+  older binaries or outside the indexed store path.
+- Decode trusted stored events without repeating payload validation, reuse
+  unchanged stored payload text when copying events, and read narrow usage rows.
+  Keep validation at ingestion boundaries and provide `cayu storage verify-events`
+  to check retained rows without displaying their payloads.
+- Upgrade ejected dashboards with `cayu dashboard upgrade`, preview source
+  updates, and refuse conflicting local edits. Report dashboard source drift
+  during project checks and skip inaccessible project directories safely.
+- Filter, sort, keyset-page, and count task lists in SQL. Maintain task counts
+  and prerequisites with database triggers, add batched task detail reads, and
+  expose count consistency checks through the CLI. Revision 151 backfills the
+  existing tasks without raising the storage compatibility floor.
+- Read Inbox counts and knowledge lookups from stored totals maintained with
+  database triggers. Revalidate unchanged Inbox counts with ETags, batch title
+  and receipt reads, and page knowledge without counting all entries. Revision
+  152 backfills lookup totals and entry ordering; `cayu knowledge lookups check`
+  compares the stored totals with retained events. Empty hidden pages offer
+  "Continue scanning" instead of scanning ahead automatically.
+- Share the Inbox and protected human review as application components through
+  an injected parts host. Vendor the matching `@cayu-tech/dashboard-parts` package
+  with `cayu dashboard parts`, then run `npm install` and rebuild the application.
+  Report drift between the installed parts package and the Runtime version.
+- Register proposal-only tools without exposing them to model calls. Preview and
+  submit explicit tool proposals through the CLI, then read their persisted
+  outcomes with the existing policy, approval, and recovery checks.
+- Exercise deployed sign-in locally with `cayu serve --identity-proxy`. Expose a
+  subject-scoped inbox through resource routes and CLI commands while preserving
+  tenant access checks. Development identity settings are refused in deployments.
+- Add connection-backed GitHub clients, typed pull-request facts, and connector
+  tools with approval for writes. Comment and issue creation can recover without
+  duplicating a write, and pull-request readers report divergence from their
+  recorded head.
+- Add list and map managed settings with environment defaults. Keep a restart
+  setting's environment value stable for the lifetime of the process.
+- Route tool calls through per-tool policies with `ToolPolicyRouter`, and read
+  policy decisions from enum or map settings with `SettingToolPolicy`. Invalid
+  settings fall back to restrictive decisions and surface configuration findings.
+- Serve application web apps from the root path, pass configured authentication
+  into project routers, and verify generated b2b applications against reference
+  fixtures. Explain unavailable providers and local store keys in diagnostics.
+- Expose task failure summaries, individual task fields, deployed task and
+  session readers, and Arena enrollment schemas through the CLI. Validate Cloud
+  manifests locally and preserve hand-written schedule settings.
+- Claim several task types in one worker query, read the latest tasks and the
+  latest result per key, and queue work once per retry key. Add matching task
+  list and latest readers to the CLI and server.
+- Add a zero-cost demonstration provider with scripted turns and marked canned
+  responses, available for local development without a model service. Start
+  sessions and answer inbox questions through the CLI.
+- Watch filtered task lists through the browser client, using input and metadata
+  filters, ETag revalidation, and visibility-aware polling.
+- Speed up dashboard usage and overview reads with narrow event rows and bounded
+  aggregate reads. Simplify conversation headers and tool summaries.
+
+### Fixes
+
+- Keep independent PostgreSQL event writers from waiting on an uncommitted shared
+  price identity. Retain each event's actual identity binding so concurrent
+  deletion, rewriting, and projection rebuilding preserve accounting totals.
+- Invalidate artifact indexes when writes may have committed during cancellation
+  or failure. Fence refill completion against concurrent invalidation, including
+  PostgreSQL marker changes, so retained artifacts cannot stay hidden.
+- Open PostgreSQL task stores read-only for CLI queries and count consistency
+  checks. Include pending count changes without compacting them on a read-only
+  connection.
+- Accept postponed variable annotations during project import checks while
+  continuing to inspect assigned values and annotations used by runtime class
+  machinery.
+- Keep grouped latest-task reads bounded and exclude groups derived from hidden
+  input values. Reject task-filter keys containing an equals sign before sending
+  a browser-client request.
+- Capture the selected agent's next-session settings when a fork changes agents,
+  keeping authorization decisions stable after environment changes.
+- Recover retained work after worker loss and preserve handler failures,
+  cancellation ownership, terminal decisions, and environment disposal during
+  interrupted recovery.
+- Bind local alias resets to the validated database file, preserve encoded path
+  delimiters, and report writes with uncertain outcomes conservatively.
+- Synchronize preparation expiry, recovery claims, and hold-heartbeat tests at
+  their intended ownership boundaries, and expire attached recovery claims after
+  the worker is killed. Preserve injected lookup failures inside
+  concurrent exception groups, and make sealed-cursor tampering deterministic.
+- Update certificate trust, PDF parsing, and dashboard serialization dependency
+  requirements to patched releases.
 
 ## v0.19.1
 

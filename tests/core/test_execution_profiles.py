@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import sqlite3
@@ -3877,6 +3878,9 @@ def test_egress_authority_identity_rejects_workload_secrets_before_persistence(
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
+        # Collect abandoned fixtures before observing this operation's warnings.
+        # Otherwise GC can report earlier tests' SQLite connections here.
+        gc.collect()
         with (
             warnings.catch_warnings(record=True) as emitted,
             pytest.raises(ValueError) as caught,
@@ -3896,6 +3900,7 @@ def test_egress_authority_identity_rejects_workload_secrets_before_persistence(
         assert await store.query_events() == []
         assert provider.requests == []
         assert adapter.create_calls == 0
+        await app.aclose()
         return caught.value, emitted
 
     with caplog.at_level(logging.WARNING):

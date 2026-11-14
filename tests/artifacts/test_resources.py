@@ -2430,29 +2430,42 @@ def test_dispatched_thread_remains_fenced_until_drain(tmp_path, monkeypatch, can
     )
     cmd = command(resource_ref, artifact.id, store=store)
     asyncio.run(competitor.authorize(cmd, permit=preparation_permit(cmd)))
-    dispatched, finish = threading.Event(), threading.Event()
+    finish = threading.Event()
     original = local._change_resource_pin
     calls = []
 
-    def blocked(*args):
-        original(*args)
-        if args[-1]:
-            calls.append(args)
-            dispatched.set()
-            if not finish.wait(10):
-                raise AssertionError("test worker was not released")
-
-    monkeypatch.setattr(local, "_change_resource_pin", blocked)
     original_timeout = resources.RESOURCE_FOREGROUND_TIMEOUT_S
+    original_wait = resources.await_shielded_task_outcome
 
     async def run():
+        loop = asyncio.get_running_loop()
+        dispatched = asyncio.Event()
+
+        def blocked(*args):
+            original(*args)
+            if args[-1]:
+                calls.append(args)
+                loop.call_soon_threadsafe(dispatched.set)
+                if not finish.wait(30):
+                    raise AssertionError("test worker was not released")
+
+        async def expire_after_dispatch(pending, **kwargs):
+            if kwargs.get("timeout_s") is not None:
+                # Expire the real observer only after the filesystem effect has
+                # started. A short wall-clock deadline can expire before dispatch
+                # on a loaded runner and never exercise retained-worker fencing.
+                await asyncio.wait_for(dispatched.wait(), 10)
+                kwargs["timeout_s"] = 0.0
+            return await original_wait(pending, **kwargs)
+
+        monkeypatch.setattr(local, "_change_resource_pin", blocked)
         await resource.authorize(cmd, permit=preparation_permit(cmd))
-        monkeypatch.setattr(resources, "RESOURCE_FOREGROUND_TIMEOUT_S", 5.0 if cancel else 0.1)
+        monkeypatch.setattr(resources, "RESOURCE_FOREGROUND_TIMEOUT_S", 30.0)
+        if not cancel:
+            monkeypatch.setattr(resources, "await_shielded_task_outcome", expire_after_dispatch)
         task = asyncio.create_task(resource.acquire(cmd))
         try:
-            async with asyncio.timeout(5):
-                while not dispatched.is_set():
-                    await asyncio.sleep(0.001)
+            await asyncio.wait_for(dispatched.wait(), 10)
             if cancel:
                 task.cancel("first")
                 task.cancel("second")
@@ -2475,6 +2488,7 @@ def test_dispatched_thread_remains_fenced_until_drain(tmp_path, monkeypatch, can
                 await store.delete(artifact.id)
             assert len(calls) == 1
         finally:
+            monkeypatch.setattr(resources, "await_shielded_task_outcome", original_wait)
             monkeypatch.setattr(resources, "RESOURCE_FOREGROUND_TIMEOUT_S", original_timeout)
             finish.set()
             with pytest.raises(ResourceOwnerUnavailable, match="observer stopped"):

@@ -122,10 +122,20 @@ def test_crash_only_reclaims_dead_letter_without_another_handler_attempt(watcher
 
 
 def test_renewal_fences_expired_or_replaced_claims_and_replays_exact_settlement(
-    watcher_store_factory,
+    watcher_store_factory, monkeypatch
 ):
     async def run():
         store = watcher_store_factory()
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        clock_store = store.delegate if isinstance(store, CustomStore) else store
+        if isinstance(clock_store, (InMemoryEventWatcherStore, SQLiteEventWatcherStore)):
+            monkeypatch.setattr(clock_store, "_clock", lambda: now[0])
+        else:
+
+            async def database_now(_cursor):
+                return now[0]
+
+            monkeypatch.setattr(clock_store, "_watcher_database_now", database_now)
         name = f"fence-{uuid4()}"
         try:
             first = await store.claim_event(
@@ -134,11 +144,14 @@ def test_renewal_fences_expired_or_replaced_claims_and_replays_exact_settlement(
             assert isinstance(first, EventWatcherClaim)
             renewed = await store.renew_claim(first, lease_seconds=0.2)
             assert renewed.claim_id == first.claim_id
-            await asyncio.sleep(0.09)
+            # Advance the authority's clock, independent of runner scheduling:
+            # the original lease is expired but the renewed lease remains live.
+            now[0] = first.lease_expires_at + timedelta(microseconds=1)
+            assert now[0] < renewed.lease_expires_at
             assert (
                 await store.claim_event(watcher_name=name, record=record(), lease_seconds=1) is None
             )
-            await asyncio.sleep(0.15)
+            now[0] = renewed.lease_expires_at
             with pytest.raises(EventWatcherLeaseLost):
                 await store.renew_claim(first, lease_seconds=1)
             with pytest.raises(EventWatcherLeaseLost):
