@@ -1857,7 +1857,10 @@ _MEMORY_KEY_GUIDANCE = """- Deployments must set `CAYU_MEMORY_EVIDENCE_KEY`. The
   `data/memory-evidence.key` is git-ignored and never reaches a deployment.
   Where neither exists, such as a CI checkout, the root `conftest.py` gives the
   tests a throwaway key, and `cayu check` and `cayu inspect` borrow one and say
-  so, so all of them run without setup. `cayu eval run` needs a real key.
+  so, so all of them run without setup.
+  `cayu eval run` borrows one only while `CAYU_DATABASE_URL` is unset and
+  `data/cayu.db` holds no sessions yet; otherwise it needs that store's stable
+  key and refuses with `MEMORY_EVIDENCE_KEY_REQUIRED`.
 """
 
 

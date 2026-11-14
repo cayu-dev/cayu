@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from cayu.budgets.pricing import PriceBook
 from cayu.build_provenance import current_runtime_build_provenance
+from cayu.cli._eval_memory_key import MEMORY_EVIDENCE_KEY_METADATA
 from cayu.cli._eval_process_reporting import (
     ReportedProcessEvalRun,
     combine_worker_reports,
@@ -70,7 +71,7 @@ def _worker_price_book(plan: EvalPlan) -> PriceBook | None:
 async def _plan_identity(plan: EvalPlan, price_book: PriceBook | None) -> dict:
     if plan.suite is None or plan.corpus_target is not None:
         raise ValueError("Process execution currently requires a native direct EvalSuite.")
-    for key in (_METADATA_KEY, "cayu_launch_scheduling"):
+    for key in (_METADATA_KEY, "cayu_launch_scheduling", MEMORY_EVIDENCE_KEY_METADATA):
         if key in plan.suite.metadata:
             raise ValueError(f"Suite metadata reserves {key!r} for process provenance.")
     target = plan.workflow_target

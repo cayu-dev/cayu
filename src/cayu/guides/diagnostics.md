@@ -42,6 +42,36 @@ before the tests, for example the output of
 `cayu check --deploy` the finding also says a deployment needs its own stable
 key: Cayu Cloud sets it for a deployed Agent; elsewhere, store one as a secret.
 
+## memory-evidence-key-required
+
+`cayu eval run` runs the Agent, and with automatic memory it writes recall
+evidence fingerprinted with the memory evidence key into the project's store:
+the database `CAYU_DATABASE_URL` names, or else `data/cayu.db`, the same one the
+app, `cayu session` and `cayu serve` use. So in a project made by `cayu new`
+with the `memory` capability, when `CAYU_MEMORY_EVIDENCE_KEY` is unset and
+`data/memory-evidence.key` doesn't exist, as in a fresh checkout or a CI job:
+
+- If `CAYU_DATABASE_URL` is unset and the local SQLite database doesn't exist
+  or holds no sessions yet (as when `cayu check` just created it), no evidence
+  depends on a key, so `cayu eval run` lends a throwaway key for this run only.
+  It says so on standard error, and a direct suite's result records
+  `"cayu_memory_evidence_key": {"source": "throwaway"}` in its `metadata`. With
+  `--processes`, the key reaches every worker process through the environment,
+  so they all use the same one. If the run stores sessions in the local
+  database, it says that too: later runs without a key refuse to use it.
+- Otherwise it refuses before loading the eval target and exits 2: when
+  `CAYU_DATABASE_URL` is set, when the local database holds sessions or recall
+  evidence, or can't be read. In `--json` output the error code is
+  `MEMORY_EVIDENCE_KEY_REQUIRED`, and the message names the store. Records
+  written with a throwaway key could never be verified by a later run, so set
+  `CAYU_MEMORY_EVIDENCE_KEY` to the key that store was written with. In CI, keep
+  it as a secret and set it before `cayu eval run`.
+
+With a real key, nothing is lent, and the result's `metadata` records
+`"source": "environment"` or `"source": "project_file"`. A corpus run
+(`--corpus`) gets the same key and refusal, but its result has no free-form
+metadata, so only standard error says a key was lent.
+
 ## human-review-keyring-missing
 
 `HUMAN_REVIEW_KEYRING_MISSING` is informational: project source imports

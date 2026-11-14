@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from cayu.applications import CayuApp
+from cayu.cli._eval_memory_key import (
+    MEMORY_EVIDENCE_KEY_METADATA,
+    MemoryEvidenceKeyRequired,
+    eval_memory_evidence_key,
+)
 from cayu.cli._output import add_output_options, terminal_safe
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
@@ -340,11 +345,12 @@ def run_eval_command(args: argparse.Namespace) -> int:
             return _merge_corpora(args)
     except Exception as exc:
         if getattr(args, "output_format", None) == "json":
+            code = exc.code if isinstance(exc, MemoryEvidenceKeyRequired) else "EVAL_COMMAND_FAILED"
             print(
                 json.dumps(
                     {
                         "schema_version": "1",
-                        "error": {"code": "EVAL_COMMAND_FAILED", "message": str(exc)},
+                        "error": {"code": code, "message": str(exc)},
                     },
                     sort_keys=True,
                 )
@@ -509,7 +515,10 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
         if args.target is not None
         else f"Configured eval target from {project.root / 'pyproject.toml'}"
     )
-    with project_context(project.root):
+    with (
+        project_context(project.root),
+        eval_memory_evidence_key(project.root) as memory_key,
+    ):
         report_request = prepare_report_request(args)
         # Relative eval paths are interpreted from the resolved project root,
         # so collision checks must run in that same filesystem context.
@@ -565,6 +574,7 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
                 run, projected = process_result.run, process_result.report
             else:
                 run, projected = process_result, None
+            run.metadata = _with_memory_key(run.metadata, memory_key)
             _write_or_print(eval_run_to_json(run), args.output)
             if args.html_output is not None:
                 Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
@@ -578,8 +588,10 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
         if getattr(args, "process_directory", None) is not None:
             raise ValueError("--process-directory requires --processes greater than one.")
         plan = await _load_eval_plan(project.target, label=label)
-        if plan.suite is not None and "cayu_launch_scheduling" in plan.suite.metadata:
-            raise ValueError("Suite metadata reserves cayu_launch_scheduling for CLI evidence.")
+        if plan.suite is not None:
+            for key in ("cayu_launch_scheduling", MEMORY_EVIDENCE_KEY_METADATA):
+                if key in plan.suite.metadata:
+                    raise ValueError(f"Suite metadata reserves {key} for CLI evidence.")
         if args.corpus is None:
             if plan.corpus_target is not None or (
                 plan.workflow_target is not None and plan.suite is None
@@ -598,10 +610,13 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
             )
             if type(run) is not EvalRun:
                 raise TypeError("Direct EvalPlan returned an unexpected corpus result.")
-            run.metadata = {
-                **run.metadata,
-                "cayu_launch_scheduling": admission.evidence().model_dump(mode="json"),
-            }
+            run.metadata = _with_memory_key(
+                {
+                    **run.metadata,
+                    "cayu_launch_scheduling": admission.evidence().model_dump(mode="json"),
+                },
+                memory_key,
+            )
             output = eval_run_to_json(run)
             _write_or_print(output, args.output)
             if args.html_output is not None:
@@ -643,6 +658,14 @@ async def _run_with_admission(args: argparse.Namespace, admission: LaunchAdmissi
             report_request, result, program_key=project.target, plan=plan
         )
         return _status_exit_code(result.run.status) if reported else 2
+
+
+def _with_memory_key(metadata: dict[str, Any], source: str | None) -> dict[str, Any]:
+    """Record which memory evidence key a memory project's run used."""
+
+    if source is None:
+        return metadata
+    return {**metadata, MEMORY_EVIDENCE_KEY_METADATA: {"source": source}}
 
 
 async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:

@@ -394,6 +394,17 @@ revision conflict by default, validates the complete result, and atomically
 replaces the destination. `--replace-conflicts` deliberately selects the last
 conflicting definition in command-line order.
 
+In a fresh checkout of a project made by `cayu new` with automatic memory, such
+as a CI job, there is no memory evidence key: `CAYU_MEMORY_EVIDENCE_KEY` is unset
+and `data/memory-evidence.key` is git-ignored. When the run's store holds no
+sessions yet either (no `CAYU_DATABASE_URL`, and `data/cayu.db` is missing or,
+like the one `cayu check` creates, empty), `cayu eval run` lends a throwaway key
+for that run, including its `--processes` workers, and says so. When the store
+holds sessions or is external it refuses with
+`MEMORY_EVIDENCE_KEY_REQUIRED` and exit 2, because evidence written with a
+throwaway key couldn't be verified later. See
+`cayu guide diagnostics#memory-evidence-key-required`.
+
 For opt-in dashboard publication, scoped CI credentials, saved exact retries and
 GitHub metadata, see [CI eval reporting](recipes/ci-eval-reporting.md). Reporting
 failure preserves completed result output and returns exit 2.
