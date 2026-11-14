@@ -7,6 +7,7 @@ describes source generation only; a scaffold plan is never runtime authority.
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -26,6 +27,8 @@ ProviderName = Literal[
 ExecutionName = Literal["none", "docker"]
 CodingToolchainName = Literal["python"]
 CodingCommandAuthorityName = Literal["structured"]
+CiName = Literal["github", "none"]
+CI_CHOICES: tuple[CiName, ...] = ("github", "none")
 CapabilityStatus = Literal["selectable", "extension-only", "preset-owned"]
 
 
@@ -446,29 +449,40 @@ class ApplicationPlan:
     coding_toolchain: CodingToolchainName | None = None
     coding_command_authority: CodingCommandAuthorityName | None = None
     convention: int = SCAFFOLD_CONVENTION_VERSION
+    # Which CI workflow `cayu new` writes. Only generation reads it; it isn't
+    # recorded in [tool.cayu.scaffold].
+    ci: CiName = "github"
 
     @property
     def provider_alias(self) -> str | None:
         return None if self.provider == "neutral" else self.provider
 
-    def verification_commands(self) -> tuple[str, ...]:
-        check = (
-            "uv run --no-sync cayu check --deploy --fail-on warning --json"
-            if self.preset == "service"
-            else "uv run --no-sync cayu check --fail-on warning --json"
+    def check_command(self) -> str:
+        """The `cayu check` that proves a fresh checkout of this plan, without `--json`."""
+
+        deploy = " --deploy" if self.preset == "service" else ""
+        return f"uv run --no-sync cayu check{deploy} --fail-on warning"
+
+    def check_environment(self) -> tuple[tuple[str, str], ...]:
+        """Throwaway local values `check_command` needs; a deployment sets its own."""
+
+        if self.preset != "service":
+            return ()
+        return (
+            (
+                "PRODUCT_AUTH_TOKENS_JSON",
+                '{"local-customer-token":{"tenant_id":"local-tenant","subject_id":"local-user"}}',
+            ),
+            ("CAYU_OPERATOR_BEARER_TOKEN", "local-operator-token"),
         )
-        check_environment: list[str] = []
-        if self.preset == "service":
-            check_environment.extend(
-                (
-                    "PRODUCT_AUTH_TOKENS_JSON="
-                    '\'{"local-customer-token":{"tenant_id":"local-tenant",'
-                    '"subject_id":"local-user"}}\'',
-                    "CAYU_OPERATOR_BEARER_TOKEN=local-operator-token",
-                )
+
+    def verification_commands(self) -> tuple[str, ...]:
+        check = " ".join(
+            (
+                *(f"{name}={shlex.quote(value)}" for name, value in self.check_environment()),
+                self.check_command() + " --json",
             )
-        if check_environment:
-            check = " ".join((*check_environment, check))
+        )
         focused_test = {
             "agent": "uv run --no-sync pytest",
             "service": "uv run --no-sync pytest -q tests/test_public_service_security.py",
@@ -573,8 +587,12 @@ def normalize_application_plan(
     coding_command_authority: str | None = None,
     with_capabilities: tuple[str, ...] = (),
     without_capabilities: tuple[str, ...] = (),
+    ci: str = "github",
 ) -> ApplicationPlan:
     """Resolve and validate every generator choice before rendering or writing."""
+
+    if ci not in CI_CHOICES:
+        raise ScaffoldPlanError("unknown_ci", "ci must be one of: " + ", ".join(CI_CHOICES))
 
     selected_preset = preset_spec(preset)
     provider_spec = _adapter("provider", provider)
@@ -699,6 +717,7 @@ def normalize_application_plan(
         capabilities=tuple(sorted(capabilities)),
         coding_toolchain=resolved_coding_toolchain,
         coding_command_authority=resolved_coding_command_authority,
+        ci=cast("CiName", ci),
     )
 
 

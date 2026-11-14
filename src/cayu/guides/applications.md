@@ -352,6 +352,19 @@ generated with every choice, and `plan.file_groups` in `--json` output carries t
 same grouping. A preset keeps the homes of capabilities it doesn't enable by
 default, such as `memory/` in the coding preset, so they can be wired in later.
 
+`--ci github`, the default, writes `.github/workflows/ci.yml`: a GitHub Actions
+workflow that runs `uv sync`, the tests and `cayu check --fail-on warning` (with
+`--deploy` and throwaway local credentials for the service preset) on every pull
+request and push to `main`. A Docker coding project first builds its coding
+image from the pins committed in `docker-coding-build.json`, and a preset with a
+web app also runs `npm ci`, lint, type checks and `check:build`. It needs no
+secrets and pins its actions to commits. `cayu eval run` is a commented step
+until evals run in a fresh checkout without a memory evidence key. The workflow
+is an ordinary project file, and `--ci none` leaves it out. `cayu generate preset`
+reads the choice from the "Continuous integration" section of AGENTS.md: it
+updates the workflow only in a project generated with it, and leaves alone one a
+project added itself.
+
 Service profiles require `tasks`; Docker coding profiles require `artifacts` for
 their durable product results. Excluding either produces `CAPABILITY_REQUIRED`
 before writing files. Coding includes artifacts in its declared defaults; local

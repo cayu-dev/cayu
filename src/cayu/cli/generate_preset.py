@@ -51,6 +51,7 @@ from cayu.cli.scaffold import (
     project_files,
 )
 from cayu.cli.scaffold_check import _scaffold_contract
+from cayu.cli.scaffold_ci import generated_ci_choice
 from cayu.cli.scaffold_convention import _creation_command, local_database_path
 from cayu.cli.scaffold_plan import (
     ADAPTERS,
@@ -228,7 +229,15 @@ def plan_preset_conversion(
     if not _NAME_RE.fullmatch(agent_name):
         raise ValueError(f"invalid agent name {agent_name!r}")
     try:
-        source = _declared_plan(contract, name=name, agent_name=declared_agent_name)
+        agents_md = _read_regular_file(root, "AGENTS.md")
+    except ValueError:
+        agents_md = None
+    # The project keeps the `cayu new --ci` choice it was generated with.
+    ci = generated_ci_choice(
+        None if agents_md is None else agents_md.decode("utf-8", errors="replace")
+    )
+    try:
+        source = _declared_plan(contract, name=name, agent_name=declared_agent_name, ci=ci)
     except ScaffoldPlanError as exc:
         return _manual(f"the declared scaffold plan is invalid: {exc}")
     try:
@@ -240,6 +249,7 @@ def plan_preset_conversion(
             execution=execution or source.execution,
             with_capabilities=with_capabilities,
             without_capabilities=without_capabilities,
+            ci=ci,
         )
     except ScaffoldPlanError as exc:
         raise ValueError(str(exc)) from None
@@ -425,7 +435,7 @@ def render_preset_conversion(plan: PresetConversionPlan, *, applied: bool) -> st
 
 
 def _declared_plan(
-    contract: Mapping[str, object], *, name: str, agent_name: str
+    contract: Mapping[str, object], *, name: str, agent_name: str, ci: str
 ) -> ApplicationPlan:
     for field in ("preset", "provider", "execution"):
         if type(contract.get(field)) is not str:
@@ -444,6 +454,7 @@ def _declared_plan(
         execution=cast("str", contract["execution"]),
         with_capabilities=tuple(sorted(selected - defaults)),
         without_capabilities=tuple(sorted(defaults - selected)),
+        ci=ci,
     )
     if list(plan.capabilities) != recorded:
         raise ScaffoldPlanError(

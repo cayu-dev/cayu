@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO, cast
+from typing import TextIO, cast
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -43,6 +43,7 @@ from cayu.cli._guarded_tree_publication import (
 from cayu.cli._identity import identity_markdown
 from cayu.cli._release_check import newer_release
 from cayu.cli.scaffold_app_database import APP_DATABASE, app_database_files
+from cayu.cli.scaffold_ci import CI_WORKFLOW_PATH, ci_files, ci_guidance
 from cayu.cli.scaffold_convention import (
     application_guidance,
     capability_card,
@@ -53,6 +54,7 @@ from cayu.cli.scaffold_convention import (
 from cayu.cli.scaffold_plan import (
     ADAPTERS,
     CAPABILITIES,
+    CI_CHOICES,
     PRESETS,
     ApplicationPlan,
     ScaffoldPlanError,
@@ -2793,6 +2795,15 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument(
+        "--ci",
+        choices=CI_CHOICES,
+        help=(
+            "CI workflow to write (default: github, a GitHub Actions workflow at "
+            f"{CI_WORKFLOW_PATH} that runs the tests and `cayu check` without secrets). "
+            "none writes no workflow."
+        ),
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help="Prompt for omitted choices when attached to a terminal.",
@@ -2963,19 +2974,7 @@ def project_file_paths(plan: ApplicationPlan) -> frozenset[str]:
     )
 
 
-def _rendered_project_files(name: str, **options: Any) -> dict[str, str]:
-    files = _rendered_preset_files(name, **options)
-    if "evals/agent.py" in files:
-        # Compass judges proposed changes by these objectives; the floor names the
-        # suite the preset's own eval defines.
-        suite = re.search(r'EvalSuite\(\s*id="([^"]+)"', files["evals/agent.py"])
-        if suite is None:
-            raise ValueError("evals/agent.py defines no EvalSuite id for the objectives file.")
-        files[_OBJECTIVES_PATH] = _OBJECTIVES_TOML.replace("__SUITE_ID__", suite.group(1))
-    return files
-
-
-def _rendered_preset_files(
+def _rendered_project_files(
     name: str,
     *,
     agent_name: str | None = None,
@@ -2988,11 +2987,10 @@ def _rendered_preset_files(
     without_capabilities: tuple[str, ...] = (),
     application_plan: ApplicationPlan | None = None,
 ) -> dict[str, str]:
-    resolved_agent_name = name if agent_name is None else agent_name
     if application_plan is None:
         application_plan = normalize_application_plan(
             name=name,
-            agent_name=resolved_agent_name,
+            agent_name=name if agent_name is None else agent_name,
             preset=preset or "agent",
             provider=provider or "neutral",
             execution=execution or "none",
@@ -3001,6 +2999,34 @@ def _rendered_preset_files(
             with_capabilities=with_capabilities,
             without_capabilities=without_capabilities,
         )
+    files = _rendered_preset_files(
+        name,
+        coding_toolchain=coding_toolchain,
+        coding_command_authority=coding_command_authority,
+        application_plan=application_plan,
+    )
+    if "evals/agent.py" in files:
+        # Compass judges proposed changes by these objectives; the floor names the
+        # suite the preset's own eval defines.
+        suite = re.search(r'EvalSuite\(\s*id="([^"]+)"', files["evals/agent.py"])
+        if suite is None:
+            raise ValueError("evals/agent.py defines no EvalSuite id for the objectives file.")
+        files[_OBJECTIVES_PATH] = _OBJECTIVES_TOML.replace("__SUITE_ID__", suite.group(1))
+    # Last, so the workflow sees every file the preset added, such as a web app.
+    guidance = ci_guidance(application_plan, files)
+    for guidance_name in ("README.md", "AGENTS.md"):
+        files[guidance_name] += guidance
+    files.update(ci_files(application_plan, files))
+    return files
+
+
+def _rendered_preset_files(
+    name: str,
+    *,
+    coding_toolchain: str | None,
+    coding_command_authority: str | None,
+    application_plan: ApplicationPlan,
+) -> dict[str, str]:
     plan = application_plan
     resolved_agent_name = plan.agent_name
     provider = plan.provider_alias
@@ -3281,6 +3307,7 @@ def _plan_without(plan: ApplicationPlan, names: tuple[str, ...]) -> ApplicationP
             execution=plan.execution,
             with_capabilities=tuple(sorted(remaining - defaults)),
             without_capabilities=tuple(sorted(defaults - remaining)),
+            ci=plan.ci,
         )
     except ScaffoldPlanError:
         return None
@@ -3561,6 +3588,7 @@ def _resolve_new_plan(args: argparse.Namespace, *, name: str) -> ApplicationPlan
         coding_command_authority=args.coding_command_authority,
         with_capabilities=tuple(args.with_capabilities),
         without_capabilities=tuple(args.without_capabilities),
+        ci=args.ci or "github",
     )
 
 
@@ -3714,6 +3742,8 @@ def _render_new_receipt(
         print("  Private runtime state: data/memory-evidence.key (ignored; mode 0600 on POSIX)")
     print("  Agent instructions: AGENTS.md (CLAUDE.md imports the same contract)")
     print("  Scaffold contract: pyproject.toml [tool.cayu.scaffold]")
+    if plan.ci == "github":
+        print(f"  CI: {CI_WORKFLOW_PATH} (GitHub Actions; tests and `cayu check`, no secrets)")
     source_checkout = _cayu_source_checkout()
     if source_checkout is not None and _uses_cayu_source_checkout(plan):
         print(f"  Cayu source: {source_checkout.root} (local checkout, editable)")
@@ -3772,6 +3802,7 @@ def _new_command_arguments(args: argparse.Namespace, *, name: str) -> list[str]:
         ("--execution", args.execution),
         ("--coding-toolchain", args.coding_toolchain),
         ("--coding-command-authority", args.coding_command_authority),
+        ("--ci", args.ci),
     ):
         if value is not None:
             arguments += [flag, value]

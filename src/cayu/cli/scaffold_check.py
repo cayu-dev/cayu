@@ -99,9 +99,10 @@ _COMPLETE_REQUIRED_PATHS = (
     "tests/test_application.py",
     "tests/test_agent.py",
     "tests/test_architecture.py",
-    "data",
 )
-_REQUIRED_DIRECTORY_PATHS = frozenset({"data", "knowledge/seeds"})
+# Not `data/`: it holds local runtime state, is git-ignored, and is created when first
+# written, so a fresh checkout such as a CI job doesn't have it.
+_REQUIRED_DIRECTORY_PATHS = frozenset({"knowledge/seeds"})
 _APPLICATION_SOURCE_DIRECTORIES = (
     "configuration",
     "agents",
