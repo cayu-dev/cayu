@@ -14,9 +14,11 @@ _ROOT = Path(__file__).parents[2]
 _RUNNER = runpy.run_path(str(_ROOT / "scripts" / "run_ci.py"))
 CommandEvidence = _RUNNER["CommandEvidence"]
 LocalCiRunner = _RUNNER["LocalCiRunner"]
+StepFailed = _RUNNER["StepFailed"]
 VerificationScope = _RUNNER["VerificationScope"]
 PackageStep = _RUNNER["PackageStep"]
 _ensure_exact_head = _RUNNER["_ensure_exact_head"]
+_install_playwright_chromium = _RUNNER["_install_playwright_chromium"]
 _isolated_execution_worktree = _RUNNER["_isolated_execution_worktree"]
 _load_package_steps = _RUNNER["_load_package_steps"]
 _package_temporary_parent = _RUNNER["_package_temporary_parent"]
@@ -509,6 +511,53 @@ def test_system_node_is_accepted_without_mise() -> None:
     _validate_node_environment(runner)
 
     assert observed == [("node", "--version"), ("npm", "--version")]
+
+
+def _attempt_failing_launcher(tmp_path: Path, failures: int) -> tuple[str, ...]:
+    # Exit like apt does on a held dpkg lock for the first ``failures`` attempts.
+    attempts = tmp_path / "attempts"
+    script = (
+        f"printf x >> {shlex.quote(str(attempts))}; "
+        f'test "$(wc -c < {shlex.quote(str(attempts))})" -gt {failures} || exit 100'
+    )
+    return ("sh", "-c", script, "sh")
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_playwright_install_retries_a_failed_attempt(
+    tmp_path: Path, monkeypatch, failures: int
+) -> None:
+    monkeypatch.setitem(
+        _install_playwright_chromium.__globals__, "_PLAYWRIGHT_INSTALL_RETRY_DELAYS_S", (0.0, 0.0)
+    )
+    runner = LocalCiRunner(root=tmp_path, dry_run=False, keep_going=False)
+
+    _install_playwright_chromium(
+        runner, launcher=_attempt_failing_launcher(tmp_path, failures), label="Browser"
+    )
+
+    statuses = [(item.label, item.status) for item in runner.evidence]
+    assert statuses == [
+        ("Browser", "RETRY"),
+        *([("Browser (attempt 2/3)", "RETRY")] if failures == 2 else []),
+        (f"Browser (attempt {failures + 1}/3)", "PASS"),
+    ]
+    assert not runner.failed
+
+
+def test_playwright_install_fails_after_its_last_attempt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setitem(
+        _install_playwright_chromium.__globals__, "_PLAYWRIGHT_INSTALL_RETRY_DELAYS_S", (0.0, 0.0)
+    )
+    runner = LocalCiRunner(root=tmp_path, dry_run=False, keep_going=False)
+
+    with pytest.raises(StepFailed, match="Browser \\(attempt 3/3\\) failed with exit code 100"):
+        _install_playwright_chromium(
+            runner, launcher=_attempt_failing_launcher(tmp_path, 3), label="Browser"
+        )
+
+    assert [item.status for item in runner.evidence] == ["RETRY", "RETRY", "FAIL"]
+    assert runner.failed
 
 
 def test_proof_distinguishes_publication_policy_and_skipped_commands(

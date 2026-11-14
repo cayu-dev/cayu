@@ -68,6 +68,10 @@ _ALL_SPECIALIST_LANES = tuple(
 )
 _SQLITE_PYTHON_VERSIONS = ("3.11", "3.12", "3.13", "3.14")
 _MINIMUM_NODE_VERSION = (22, 18, 0)
+# On Linux, `playwright install --with-deps` runs apt, which exits 100 when
+# another apt process (such as unattended-upgrades on a fresh runner) holds the
+# dpkg lock. Retry after these delays so the lock holder can finish.
+_PLAYWRIGHT_INSTALL_RETRY_DELAYS_S = (30.0, 90.0)
 
 # Run once on every supported Python after the canonical nodes. The general lanes run
 # 3.14 only, and these depend on each version's Task.uncancel() and cancellation delivery.
@@ -245,7 +249,13 @@ class LocalCiRunner:
         show_env: bool = True,
         proof_command: str | None = None,
         output_tail_lines: int = 80,
+        retryable: bool = False,
     ) -> bool:
+        """Run one command and record its evidence.
+
+        A failed ``retryable`` command is recorded as ``RETRY`` and returns
+        False without failing the run; the caller runs it again.
+        """
         cwd = cwd or self.root
         command_text = command if isinstance(command, str) else shlex.join(command)
         recorded_command = proof_command or command_text
@@ -300,7 +310,7 @@ class LocalCiRunner:
             output_tail.append(line.rstrip("\n"))
         returncode = process.wait()
         duration = time.monotonic() - started
-        status = "PASS" if returncode == 0 else "FAIL"
+        status = "PASS" if returncode == 0 else "RETRY" if retryable else "FAIL"
         self.evidence.append(
             CommandEvidence(
                 label=label,
@@ -314,6 +324,8 @@ class LocalCiRunner:
         )
         print(f"<== {status} ({duration:.1f}s)")
         if returncode != 0:
+            if retryable:
+                return False
             self.failed = True
             if not self.keep_going:
                 raise StepFailed(f"{label} failed with exit code {returncode}")
@@ -719,7 +731,18 @@ def _install_playwright_chromium(
     if platform.system() == "Linux":
         playwright_command.append("--with-deps")
     playwright_command.append("chromium")
-    runner.run(label, tuple(playwright_command), cwd=cwd)
+    attempts = len(_PLAYWRIGHT_INSTALL_RETRY_DELAYS_S) + 1
+    for attempt, delay_s in enumerate((*_PLAYWRIGHT_INSTALL_RETRY_DELAYS_S, None), start=1):
+        attempt_label = label if attempt == 1 else f"{label} (attempt {attempt}/{attempts})"
+        if (
+            runner.run(
+                attempt_label, tuple(playwright_command), cwd=cwd, retryable=delay_s is not None
+            )
+            or delay_s is None
+        ):
+            return
+        print(f"{label} failed; retrying in {delay_s:g}s.")
+        time.sleep(delay_s)
 
 
 def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
@@ -1101,7 +1124,7 @@ def _write_proof(
 ) -> None:
     status_counts = {
         status_name: sum(item.status == status_name for item in evidence)
-        for status_name in ("PASS", "FAIL", "SKIP", "PLANNED")
+        for status_name in ("PASS", "FAIL", "RETRY", "SKIP", "PLANNED")
     }
     lines = [
         "# Local PR CI proof",
@@ -1123,7 +1146,8 @@ def _write_proof(
         "runner or its separate-machine topology",
         "- Command counts: "
         f"`{status_counts['PASS']} passed`, `{status_counts['FAIL']} failed`, "
-        f"`{status_counts['SKIP']} skipped`, `{status_counts['PLANNED']} planned`",
+        f"`{status_counts['SKIP']} skipped`, `{status_counts['PLANNED']} planned`, "
+        f"`{status_counts['RETRY']} retried`",
         "",
         "## Selected scope",
         "",

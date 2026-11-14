@@ -215,9 +215,12 @@ async def scan(app, stop):
     await app.create_task(TaskCreate(task_id="job", type="scan", restartable=True))
     async def handler(_app, task, worker_id):
         await run()
+    # The test waits out this lease after the crash, so keep it short, but a
+    # one-second lease could expire between the claim and the worker's first
+    # heartbeat on a loaded runner, failing the worker before it dispatched.
     await run_task_worker(
         app, app.task_store, handler, worker_id="lost-worker", max_tasks=1,
-        lease_seconds=1, reclaim=False, stop=stop,
+        lease_seconds=5, reclaim=False, stop=stop,
     )
 
 async def repair(app, stop):
