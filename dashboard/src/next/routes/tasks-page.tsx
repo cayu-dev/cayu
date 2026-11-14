@@ -10,6 +10,7 @@ import { useViewer } from "@/components/dashboard/viewer"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import type { TaskItem } from "../api/types"
+import { firstOccurrences } from "../app/first-page-refresh"
 import { useSpecialists, useTaskTypes } from "../app/queries"
 import { useNow, useServices } from "../app/services"
 import { constantColumns, relativeTime } from "../app/session-model"
@@ -63,11 +64,10 @@ export function TasksPage() {
   }, [search.task_id, go])
   const set = (patch: Partial<Filters>) =>
     go({ to: "/tasks", search: { ...search, ...patch }, replace: true, resetScroll: false })
-  const all = [
-    ...new Map(
-      (tasks.data?.pages.flatMap((page) => page.items) ?? []).map((task) => [task.id, task]),
-    ).values(),
-  ]
+  const all = firstOccurrences(
+    tasks.data?.pages.flatMap((page) => page.items) ?? [],
+    (task) => task.id,
+  )
   const failedDetails = useTaskLinks(
     all.filter((task) => task.status === "failed").map((task) => task.id),
   )

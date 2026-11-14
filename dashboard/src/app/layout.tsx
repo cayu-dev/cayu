@@ -53,7 +53,7 @@ import { Kbd, ShellContext } from "../next/routes/common"
 export function Layout() {
   const contract = useQuery({
     queryKey: ["server-contract"],
-    queryFn: fetchServerContract,
+    queryFn: ({ signal }) => fetchServerContract(signal),
     refetchInterval: false,
     staleTime: Number.POSITIVE_INFINITY,
   })
@@ -104,7 +104,7 @@ function IdentityGate() {
   })
   const identity = useQuery({
     queryKey: ["dashboard-identity"],
-    queryFn: fetchDashboardIdentitySnapshot,
+    queryFn: ({ signal }) => fetchDashboardIdentitySnapshot(signal),
     enabled: capability.enabled,
     retry: false,
   })

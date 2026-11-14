@@ -5,13 +5,14 @@
  */
 import "./legacy-config"
 import "./next.css"
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
+import { QueryClientProvider } from "@tanstack/react-query"
 import { createHashHistory, RouterProvider } from "@tanstack/react-router"
 import { StrictMode, useMemo, useState } from "react"
 import { createRoot } from "react-dom/client"
 import { ServerContractProvider } from "@/components/dashboard/server-contract"
 import { ViewerProvider } from "@/components/dashboard/viewer"
 import type { AppInfoResponse } from "@/lib/generated/server-api"
+import { createDashboardQueryClient } from "@/lib/query-client"
 import { DashboardPartsHost } from "./app/parts-host"
 import { createDashboardRouter } from "./app/routes"
 import { ServicesProvider } from "./app/services"
@@ -22,12 +23,7 @@ import { CONTRACT } from "./mock/legacy/contract"
 const api = createMockApi()
 // Today's unchanged pages call /api through fetch; answer them from the same seed.
 installLegacyApi(api)
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: { staleTime: 10_000, retry: 1, refetchOnWindowFocus: false },
-    mutations: { retry: 0 },
-  },
-})
+const queryClient = createDashboardQueryClient()
 const router = createDashboardRouter(createHashHistory())
 
 function App() {

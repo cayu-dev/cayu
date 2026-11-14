@@ -6,11 +6,14 @@ export type DashboardIdentitySnapshot =
   | { identity: null; error: string }
 
 /** Permanent rejection replaces cached authority; transport failures keep the last snapshot. */
-export async function fetchDashboardIdentitySnapshot(): Promise<DashboardIdentitySnapshot> {
+export async function fetchDashboardIdentitySnapshot(
+  signal?: AbortSignal,
+): Promise<DashboardIdentitySnapshot> {
   try {
-    return { identity: await fetchDashboardIdentity(), error: null }
+    return { identity: await fetchDashboardIdentity(signal), error: null }
   } catch (error) {
     if (
+      signal?.aborted ||
       error instanceof TypeError ||
       (error instanceof ApiClientError &&
         (error.status === 408 ||

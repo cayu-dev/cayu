@@ -11,6 +11,7 @@ import {
   type TranscriptHistoryQuery,
   type TranscriptPageParam,
 } from "@/lib/session-history"
+import { useUnchangedBackoff } from "../../parts/backoff"
 import { overviewForDisplay } from "../api/overview"
 import {
   EVENT_WAIT_SECONDS,
@@ -20,6 +21,7 @@ import {
 } from "../api/paging"
 import type { Session, SessionOverview, SessionTranscriptPage } from "../api/types"
 import { isLive as isLiveRun } from "./eval-model"
+import { firstOccurrences, singlePageOnly, useFirstPageRefresh } from "./first-page-refresh"
 import { useApi, useServices } from "./services"
 import { loadSessionList } from "./session-list-loader"
 import { isActive } from "./session-model"
@@ -29,6 +31,10 @@ import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
 export { useInbox, useInboxCounts } from "../../parts/inbox/queries"
 
 const ACTIVE_POLL_MS = 1500
+/** Home is a summary; while something runs its lists and counts refresh every 10 s. */
+export const HOME_ACTIVE_POLL_MS = 10_000
+/** Tools totals and latest calls, while they keep changing. */
+export const TOOL_POLL_MS = 15_000
 
 export type SessionRow = { session: Session; overview: SessionOverview | null; title?: string }
 
@@ -39,7 +45,7 @@ export function useApp() {
   const api = useApi()
   return useQuery({
     queryKey: ["app"],
-    queryFn: () => api.app(),
+    queryFn: ({ signal }) => api.app(signal),
     staleTime: Number.POSITIVE_INFINITY,
   })
 }
@@ -56,14 +62,20 @@ export function useSessionRows(filter: { agent?: string; q?: string; label?: str
   const api = useApi()
   return useQuery({
     queryKey: ["sessions", filter],
-    queryFn: async () => {
-      const page = await api.sessions({
-        limit: 200,
-        agent_name: filter.agent || undefined,
-        q: filter.q || undefined,
-        label: filter.label ? [filter.label] : undefined,
-      })
-      const overviews = await api.overviews(page.sessions.map((s) => s.id))
+    queryFn: async ({ signal }) => {
+      const page = await api.sessions(
+        {
+          limit: 200,
+          agent_name: filter.agent || undefined,
+          q: filter.q || undefined,
+          label: filter.label ? [filter.label] : undefined,
+        },
+        signal,
+      )
+      const overviews = await api.overviews(
+        page.sessions.map((s) => s.id),
+        signal,
+      )
       const byId = new Map(overviews.map((o) => [o.session_id, o]))
       const rows: SessionRow[] = page.sessions.map((session) => ({
         session,
@@ -78,14 +90,17 @@ export function useSessionRows(filter: { agent?: string; q?: string; label?: str
 
 export function useSessionDetail(id: string) {
   const api = useApi()
-  return useQuery({ queryKey: ["session", id], queryFn: () => api.session(id) })
+  return useQuery({
+    queryKey: ["session", id],
+    queryFn: ({ signal }) => api.session(id, signal),
+  })
 }
 
 export function useOverview(id: string, poll = true) {
   const api = useApi()
   return useQuery({
     queryKey: ["overview", id],
-    queryFn: async () => (await api.overviews([id]))[0] ?? null,
+    queryFn: async ({ signal }) => (await api.overviews([id], signal))[0] ?? null,
     refetchInterval: (query) =>
       poll && isActive(query.state.data?.state) ? ACTIVE_POLL_MS : false,
   })
@@ -135,8 +150,8 @@ export function useEvents(id: string, enabled: boolean, active = false) {
   const queryKey = ["events", id]
   const query = useQuery({
     queryKey,
-    queryFn: async (): Promise<EventHistory> => {
-      const read = (q: Parameters<typeof api.events>[1]) => api.events(id, q)
+    queryFn: async ({ signal }): Promise<EventHistory> => {
+      const read = (q: Parameters<typeof api.events>[1]) => api.events(id, q, signal)
       const cached = queryClient.getQueryData<EventHistory>(queryKey)
       if (!cached) return loadEventHistory(read)
       const started = Date.now()
@@ -168,21 +183,30 @@ export function useEvents(id: string, enabled: boolean, active = false) {
 
 export function useTaskTypes() {
   const api = useApi()
-  return useQuery({ queryKey: ["task-types"], queryFn: () => api.taskTypes() })
+  return useQuery({
+    queryKey: ["task-types"],
+    queryFn: ({ signal }) => api.taskTypes(signal),
+  })
 }
 
 export function useSessionState(id: string, enabled: boolean) {
   const api = useApi()
-  return useQuery({ queryKey: ["state", id], queryFn: () => api.state(id), enabled })
+  return useQuery({
+    queryKey: ["state", id],
+    queryFn: ({ signal }) => api.state(id, signal),
+    enabled,
+  })
 }
 
 export function useToolUsage(enabled = true) {
   const api = useApi()
+  // Totals change only while tools run: 15 s, then up to a minute while they stay the same.
+  const backoff = useUnchangedBackoff(TOOL_POLL_MS)
   return useQuery({
     queryKey: ["tool-usage"],
     enabled,
     queryFn: ({ signal }) => api.toolUsage(signal),
-    refetchInterval: TASK_POLL_MS,
+    refetchInterval: backoff,
     retry: false,
   })
 }
@@ -192,7 +216,7 @@ export function useTasks() {
   const api = useApi()
   return useQuery({
     queryKey: ["tasks"],
-    queryFn: () => api.tasks(),
+    queryFn: ({ signal }) => api.tasks(signal),
     refetchInterval: (query) =>
       query.state.data?.some((t) => LIVE_TASK.has(t.status)) ? TASK_POLL_MS : false,
   })
@@ -271,55 +295,67 @@ export function useEvalSettings() {
 export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
   const api = useApi()
   const { overviewFirstMessageEnabled } = useServices()
+  const queryKey = ["home", "sessions", scope, overviewFirstMessageEnabled === true]
+  const readPage = async (pageParam: string | null, signal: AbortSignal) => {
+    const result = await loadSessionList(
+      {
+        include: ["overview"],
+        include_eval: false,
+        include_forks: false,
+        overview_state:
+          scope === "waiting"
+            ? ["waiting_approval", "waiting_input", "needs_recovery"]
+            : scope === "failed"
+              ? ["failed"]
+              : undefined,
+        limit: 20,
+        cursor: pageParam,
+        order_by: "updated_at_desc",
+      },
+      (params, signal) => api.sessions(params, signal),
+      (id, params, signal) => api.transcript(id, params, signal),
+      signal,
+      { firstMessage: overviewFirstMessageEnabled },
+    )
+    return {
+      rows: result.rows.map((row) => ({
+        session: row.session,
+        overview: overviewForDisplay(row.overview),
+        title: row.title,
+      })),
+      next_cursor: result.page.next_cursor,
+      searchPaused: result.searchPaused,
+    }
+  }
+  type HomePage = Awaited<ReturnType<typeof readPage>>
+  const interval = (pages: readonly HomePage[]) =>
+    activityPollInterval(
+      firstOccurrences(
+        pages.flatMap((page) => page.rows),
+        (row) => row.session.id,
+      ).some((row) => row.overview?.state === "running"),
+      HOME_ACTIVE_POLL_MS,
+    )
   const query = useInfiniteQuery({
-    queryKey: ["home", "sessions", scope, overviewFirstMessageEnabled === true],
+    queryKey,
     initialPageParam: null as string | null,
-    queryFn: async ({ pageParam, signal }) => {
-      const result = await loadSessionList(
-        {
-          include: ["overview"],
-          include_eval: false,
-          include_forks: false,
-          overview_state:
-            scope === "waiting"
-              ? ["waiting_approval", "waiting_input", "needs_recovery"]
-              : scope === "failed"
-                ? ["failed"]
-                : undefined,
-          limit: 20,
-          cursor: pageParam,
-          order_by: "updated_at_desc",
-        },
-        (params, signal) => api.sessions(params, signal),
-        (id, params, signal) => api.transcript(id, params, signal),
-        signal,
-        { firstMessage: overviewFirstMessageEnabled },
-      )
-      return {
-        rows: result.rows.map((row) => ({
-          session: row.session,
-          overview: overviewForDisplay(row.overview),
-          title: row.title,
-        })),
-        next_cursor: result.page.next_cursor,
-        searchPaused: result.searchPaused,
-      }
-    },
+    queryFn: ({ pageParam, signal }) => readPage(pageParam, signal),
     getNextPageParam: (page) => page.next_cursor ?? undefined,
-    refetchInterval: (query) =>
-      activityPollInterval(
-        query.state.data?.pages.some((page) =>
-          page.rows.some((row) => row.overview?.state === "running"),
-        ) ?? false,
-        5000,
-      ),
+    refetchInterval: singlePageOnly(interval),
+  })
+  useFirstPageRefresh({
+    queryKey,
+    data: query.data,
+    dataUpdatedAt: query.dataUpdatedAt,
+    fetchFirst: (signal) => readPage(null, signal),
+    interval,
+    rowKeys: (page) => page.rows.map((row) => row.session.id),
   })
   return {
     ...query,
-    rows: [
-      ...new Map(
-        (query.data?.pages.flatMap((page) => page.rows) ?? []).map((row) => [row.session.id, row]),
-      ).values(),
-    ],
+    rows: firstOccurrences(
+      query.data?.pages.flatMap((page) => page.rows) ?? [],
+      (row) => row.session.id,
+    ),
   }
 }

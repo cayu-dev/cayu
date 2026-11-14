@@ -215,11 +215,11 @@ export type OverviewCountsQuery = {
 }
 
 export type Api = {
-  app(): Promise<AppInfo>
+  app(signal?: AbortSignal): Promise<AppInfo>
   specialists(signal?: AbortSignal): Promise<AgentsPage>
   sessions(query?: SessionListQuery, signal?: AbortSignal): Promise<SessionsPage>
-  session(id: string): Promise<SessionDetail>
-  overviews(ids: string[]): Promise<SessionOverview[]>
+  session(id: string, signal?: AbortSignal): Promise<SessionDetail>
+  overviews(ids: string[], signal?: AbortSignal): Promise<SessionOverview[]>
   transcript(
     id: string,
     query?: SessionTranscriptQuery,
@@ -243,7 +243,7 @@ export type Api = {
   /** One transcript message whole; absent in the prototype, whose parts are never cut. */
   transcriptMessage?(id: string, index: number, signal?: AbortSignal): Promise<ApiTranscriptMessage>
   /** `GET /api/tasks`, every task including Cayu's own (`cayu.*` types). */
-  tasks(): Promise<TaskItem[]>
+  tasks(signal?: AbortSignal): Promise<TaskItem[]>
   taskList(query: TaskIndexQuery & { offset?: number }, signal?: AbortSignal): Promise<TaskItem[]>
   taskIndex(query: TaskIndexQuery, signal?: AbortSignal): Promise<ApiTaskIndex>
   taskDependents(id: string, cursor?: string, signal?: AbortSignal): Promise<ApiTaskIndex>
@@ -261,7 +261,10 @@ export type Api = {
   /** `POST /api/tasks/{id}/resume`: back to pending. */
   resumeTask(id: string): Promise<TaskInfo>
   inbox(query?: InboxQuery, signal?: AbortSignal): Promise<InboxPage>
-  inboxCounts(query?: Pick<InboxQuery, "session_id" | "agent_name" | "q">): Promise<InboxCounts>
+  inboxCounts(
+    query?: Pick<InboxQuery, "session_id" | "agent_name" | "q">,
+    signal?: AbortSignal,
+  ): Promise<InboxCounts>
   overviewCounts(
     query: OverviewCountsQuery,
     signal?: AbortSignal,
@@ -296,9 +299,9 @@ export type Api = {
     options?: MutationExecutionOptions,
   ): Promise<MutationTransportSnapshot | undefined>
   /** `GET /api/sessions/{id}/state`: execution state, snapshots, interruption cascade. */
-  state(id: string): Promise<SessionStateRecord>
+  state(id: string, signal?: AbortSignal): Promise<SessionStateRecord>
   /** Declared task types from the current worker-owned runtime catalog. */
-  taskTypes(): Promise<TaskType[]>
+  taskTypes(signal?: AbortSignal): Promise<TaskType[]>
   /** Exact operation identity is retained by the creating form across retries. */
   createTask(
     body: { type: string; input: Record<string, unknown> },

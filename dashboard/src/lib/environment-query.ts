@@ -11,9 +11,9 @@ export function useEnvironments(enabled = true) {
     enabled,
     staleTime: 15_000,
     retry: (count, error) => count < 3 && !readDenied(error),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       try {
-        return await fetchEnvironments()
+        return await fetchEnvironments(signal)
       } catch (error) {
         if (readDenied(error)) {
           // Clearing the shared cache is permanent until a successful authorized read.

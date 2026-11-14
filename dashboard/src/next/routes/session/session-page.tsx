@@ -77,6 +77,11 @@ import {
 } from "../../app/session-model"
 import { type SessionMutationKind, useSessionMutation } from "../../app/session-mutation"
 import { useSessionProgress } from "../../app/session-progress"
+import {
+  planForProgress,
+  refreshSessionViews,
+  SessionTickRefresher,
+} from "../../app/session-progress-refresh"
 import { useSessionRelations } from "../../app/session-relations"
 import { toolSpanId } from "../../app/trace-model"
 import {
@@ -259,35 +264,36 @@ export function SessionPage({
     void queryClient.invalidateQueries({ queryKey: inboxKeys.all })
     void queryClient.invalidateQueries({ queryKey: partKeys.sessionRecoveries() })
   }
+  // Ticks refresh only this session's views, never global lists: what changes its state
+  // and the view on screen at most every 2 s, the rest at most every 10 s.
+  const followTicks = useRef({ following: false, conversation: false })
+  followTicks.current.following = pinned && navigation.current === null
+  followTicks.current.conversation = conversation
+  const ticks = useRef<SessionTickRefresher | null>(null)
+  useEffect(() => {
+    const throttle = new SessionTickRefresher((views) =>
+      refreshSessionViews(queryClient, sessionId, views, followTicks.current.following),
+    )
+    ticks.current = throttle
+    return () => {
+      throttle.dispose()
+      if (ticks.current === throttle) ticks.current = null
+    }
+  }, [queryClient, sessionId])
   const progress = useSessionProgress({
     sessionId,
     enabled: !services.prototype,
     active: state === "running",
     mutationActive: mutation.busy || interruptMutation.busy,
-    onProgress: async () => {
-      const following = pinned && navigation.current === null
-      if (!following) setNewActivity(true)
-      await Promise.all([
-        ...[
-          "session",
-          "overview",
-          "state",
-          "session-state",
-          "session-children",
-          "session-parent",
-          "session-messages",
-        ].map((key) => queryClient.invalidateQueries({ queryKey: [key, sessionId] })),
-        queryClient.invalidateQueries({ queryKey: partKeys.sessionRecoveries(sessionId) }),
-        queryClient.invalidateQueries({ queryKey: inboxKeys.all }),
-        queryClient.invalidateQueries({ queryKey: ["trace", sessionId] }),
-        queryClient.invalidateQueries({
-          queryKey: ["trace-events", sessionId],
-          predicate: (query) => query.meta?.sessionProgress !== false,
-        }),
-        ...(following
-          ? [queryClient.invalidateQueries({ queryKey: ["transcript", sessionId] })]
-          : []),
-      ])
+    onProgress: async (progress) => {
+      if (!followTicks.current.following) setNewActivity(true)
+      // A tick refreshes what its event types change (progress and the overview when it
+      // has none); a drain refreshes everything.
+      const plan = planForProgress(progress.eventTypes, progress.terminalDrain)
+      const throttle = ticks.current
+      await (progress.terminalDrain
+        ? throttle?.drain(plan.urgent)
+        : throttle?.tick(plan, followTicks.current.conversation))
     },
   })
   const reply = useMutation({

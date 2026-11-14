@@ -4,7 +4,7 @@ import { fetchTasks, type Task } from "@/lib/api"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
 import { activityPollInterval, taskStatusIsActive } from "@/lib/polling"
 import { cn } from "@/lib/utils"
-import { useTasks } from "../app/queries"
+import { HOME_ACTIVE_POLL_MS, useTasks } from "../app/queries"
 import { useNow, useServices } from "../app/services"
 import { GROUP_DOT, GROUP_TEXT, groupOf, statusLine, taskName } from "../app/task-model"
 import { ErrorState, NavLink } from "./common"
@@ -31,11 +31,11 @@ function RuntimeTasks() {
   const tasks = useQuery({
     queryKey: ["home", "tasks"],
     enabled: capability.enabled,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const [recent, ...attentionPages] = await Promise.all([
-        fetchTasks({ limit: 8, order_by: "updated_at_desc" }),
+        fetchTasks({ limit: 8, order_by: "updated_at_desc" }, signal),
         ...(["blocked", "needs_attention", "failed"] as const).map((status) =>
-          fetchTasks({ status, limit: 8, order_by: "updated_at_desc" }),
+          fetchTasks({ status, limit: 8, order_by: "updated_at_desc" }, signal),
         ),
       ])
       return {
@@ -49,7 +49,7 @@ function RuntimeTasks() {
     refetchInterval: (query) =>
       activityPollInterval(
         query.state.data?.recent.some((task) => taskStatusIsActive(task.status)) ?? false,
-        5000,
+        HOME_ACTIVE_POLL_MS,
       ),
   })
   if (!capability.enabled)

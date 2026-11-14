@@ -1,3 +1,4 @@
+import { conditionalGets } from "./conditional-get.ts"
 import { apiUrl } from "./config.ts"
 import { parseDashboardIdentity, roleForbiddenMessage } from "./dashboard-access.ts"
 import type {
@@ -360,7 +361,7 @@ async function requestResponse(path: string, init: RequestInit = {}): Promise<Re
   if (init.body !== undefined && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json")
   }
-  const res = await fetch(apiUrl(path), {
+  const res = await conditionalGets.fetch(apiUrl(path), {
     ...init,
     headers,
     credentials: init.credentials ?? "same-origin",
@@ -412,12 +413,12 @@ export function isSupportedServerContract(contract: ServerContract): boolean {
   return contract.contract_version === SUPPORTED_SERVER_CONTRACT_VERSION
 }
 
-export async function fetchDashboardIdentity() {
-  return parseDashboardIdentity(await requestJson<unknown>("/app"))
+export async function fetchDashboardIdentity(signal?: AbortSignal) {
+  return parseDashboardIdentity(await requestJson<unknown>("/app", { signal }))
 }
 
-export async function fetchServerContract(): Promise<ServerContract> {
-  return requestJson<ServerContract>("/contract")
+export async function fetchServerContract(signal?: AbortSignal): Promise<ServerContract> {
+  return requestJson<ServerContract>("/contract", { signal })
 }
 
 export async function fetchSystemDiagnostics(signal?: AbortSignal): Promise<SystemDiagnostics> {
@@ -433,8 +434,8 @@ export async function fetchAgents(signal?: AbortSignal): Promise<AgentsPage> {
   return pageObject as AgentsPage
 }
 
-export async function fetchEnvironments(): Promise<EnvironmentsPage> {
-  const page = await requestJson<unknown>("/environments")
+export async function fetchEnvironments(signal?: AbortSignal): Promise<EnvironmentsPage> {
+  const page = await requestJson<unknown>("/environments", { signal })
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.environments)) {
     throw new Error("Unexpected /environments response.")
@@ -1146,8 +1147,11 @@ export async function fetchSessionTranscript(
   )
 }
 
-export async function fetchSessionSummary(id: string): Promise<SessionSummary> {
-  return requestJson<SessionSummary>(`/sessions/${encodeURIComponent(id)}/summary`)
+export async function fetchSessionSummary(
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionSummary> {
+  return requestJson<SessionSummary>(`/sessions/${encodeURIComponent(id)}/summary`, { signal })
 }
 
 export async function fetchSessionTaskReplay(
@@ -1168,8 +1172,8 @@ export async function replayTask(
   })
 }
 
-export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
-  const tasks = await requestJson<unknown>(`/tasks${queryString(query)}`)
+export async function fetchTasks(query: TaskListQuery = {}, signal?: AbortSignal): Promise<Task[]> {
+  const tasks = await requestJson<unknown>(`/tasks${queryString(query)}`, { signal })
   if (!Array.isArray(tasks)) {
     throw new Error("Unexpected /tasks response.")
   }
@@ -1226,8 +1230,13 @@ export async function fetchPendingKnowledge(
   return pageObject as KnowledgePendingPage
 }
 
-export async function fetchPendingKnowledgeEntry(entryId: string): Promise<KnowledgeEntryDetail> {
-  return requestJson<KnowledgeEntryDetail>(`/knowledge/pending/${encodeURIComponent(entryId)}`)
+export async function fetchPendingKnowledgeEntry(
+  entryId: string,
+  signal?: AbortSignal,
+): Promise<KnowledgeEntryDetail> {
+  return requestJson<KnowledgeEntryDetail>(`/knowledge/pending/${encodeURIComponent(entryId)}`, {
+    signal,
+  })
 }
 
 export async function approveKnowledge(entryId: string): Promise<KnowledgeEntry> {

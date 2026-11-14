@@ -4,9 +4,15 @@ import type { TaskStatus, TaskStatusCounts } from "@/lib/generated/server-api"
 import { activityPollInterval } from "@/lib/polling"
 import { TASK_BATCH_MAX, type TaskIndexQuery } from "../api/tasks"
 import type { Api, TaskInfo } from "../api/types"
+import {
+  firstOccurrences,
+  firstPageOnly,
+  singlePageOnly,
+  useFirstPageRefresh,
+} from "./first-page-refresh"
 import { useApi, useServices } from "./services"
 import { taskGroupStatuses, taskTypeFilter } from "./task-index-model"
-import { LIVE_TASK, TASK_POLL_MS } from "./task-polling"
+import { LIVE_TASK, TASK_POLL_MS, taskCanChange } from "./task-polling"
 
 // Foreground observation refreshes only the explicitly loaded window. React Query owns
 // cancellation, serial cursor reconstruction and overlapping-read suppression.
@@ -38,37 +44,62 @@ export function useTaskIndex(search: TaskFilters) {
   const services = useServices()
   const native = !!services.prototype || services.taskIndexEnabled === true
   const query = taskFiltersQuery(search)
-  return useInfiniteQuery({
-    queryKey: ["tasks", "index", query, native],
+  const queryKey = ["tasks", "index", query, native]
+  const readPage = async (pageParam: string | undefined, signal: AbortSignal) => {
+    if (native) return api.taskIndex({ ...query, cursor: pageParam }, signal)
+    const offset = Number(pageParam ?? 0)
+    const items = await api.taskList({ ...query, offset }, signal)
+    return {
+      items,
+      total_count: null,
+      counts_by_status: null as TaskStatusCounts | null,
+      as_of: null,
+      next_cursor: items.length === 50 ? String(offset + 50) : null,
+    }
+  }
+  type TaskPage = Awaited<ReturnType<typeof readPage>>
+  const interval = (pages: readonly TaskPage[]) =>
+    activityPollInterval(
+      firstOccurrences(
+        pages.flatMap((page) => page.items),
+        (task) => task.id,
+      ).some((task) => LIVE_TASK.has(task.status)),
+      TASK_POLL_MS,
+    )
+  const result = useInfiniteQuery({
+    queryKey,
     initialPageParam: undefined as string | undefined,
-    queryFn: async ({ pageParam, signal }) => {
-      if (native) return api.taskIndex({ ...query, cursor: pageParam }, signal)
-      const offset = Number(pageParam ?? 0)
-      const items = await api.taskList({ ...query, offset }, signal)
-      return {
-        items,
-        total_count: null,
-        counts_by_status: null as TaskStatusCounts | null,
-        as_of: null,
-        next_cursor: items.length === 50 ? String(offset + 50) : null,
-      }
-    },
+    queryFn: ({ pageParam, signal }) => readPage(pageParam, signal),
     getNextPageParam: (page, _pages, _param, params) =>
       page.next_cursor && !params.includes(page.next_cursor) ? page.next_cursor : undefined,
-    refetchInterval: (query) =>
-      activityPollInterval(
-        query.state.data?.pages.some((page) =>
-          page.items.some((task) => LIVE_TASK.has(task.status)),
-        ) ?? false,
-        TASK_POLL_MS,
-      ),
+    // Only page 1 is re-read on the interval; older pages keep what was loaded.
+    refetchInterval: singlePageOnly(interval),
   })
+  useFirstPageRefresh({
+    queryKey,
+    data: result.data,
+    dataUpdatedAt: result.dataUpdatedAt,
+    fetchFirst: (signal) => readPage(undefined, signal),
+    interval,
+    rowKeys: (page) => page.items.map((task) => task.id),
+  })
+  return result
 }
-export function useTaskRelationPage(id: string, kind: "children" | "dependents", enabled: boolean) {
+/** Relations poll while the task, or a related task, hasn't finished. */
+export function useTaskRelationPage(
+  id: string,
+  kind: "children" | "dependents",
+  enabled: boolean,
+  live = true,
+) {
   const api = useApi()
   return useInfiniteQuery({
     queryKey: ["tasks", id, kind],
-    refetchInterval: TASK_POLL_MS,
+    refetchInterval: firstPageOnly<Awaited<ReturnType<typeof api.taskIndex>>>((pages) =>
+      live || pages.some((page) => page.items.some((task) => taskCanChange(task.status)))
+        ? TASK_POLL_MS
+        : false,
+    ),
     enabled,
     initialPageParam: undefined as string | undefined,
     queryFn: ({ pageParam, signal }) =>
@@ -82,22 +113,36 @@ export function useTaskRelationPage(id: string, kind: "children" | "dependents",
       page.next_cursor && !params.includes(page.next_cursor) ? page.next_cursor : undefined,
   })
 }
+type TaskLinks = { rows: TaskInfo[]; issues: { id: string; error: unknown }[] }
+type TaskAttempts = { rows: TaskInfo[]; incomplete: boolean }
+
 export function useTaskLinks(ids: string[], enabled = true, observe = false) {
   const api = useApi()
   return useQuery({
     queryKey: ["tasks", "links", ids],
-    refetchInterval: observe ? TASK_POLL_MS : false,
+    // Observed links stop polling once every linked task has finished; a held one can resume.
+    refetchInterval: (query: { state: { data: TaskLinks | undefined } }) =>
+      observe &&
+      (query.state.data === undefined ||
+        query.state.data.issues.length > 0 ||
+        query.state.data.rows.some((task) => taskCanChange(task.status)))
+        ? TASK_POLL_MS
+        : false,
     enabled: enabled && ids.length > 0,
-    queryFn: ({ signal }) => readTasks(api, ids, signal),
+    queryFn: ({ signal }): Promise<TaskLinks> => readTasks(api, ids, signal),
   })
 }
 export function useTaskAttempts(id: string, enabled: boolean, limit: number) {
   const api = useApi()
   return useQuery({
     queryKey: ["tasks", id, "attempts", limit],
-    refetchInterval: TASK_POLL_MS,
+    // A retry series grows only while one of its attempts can still change.
+    refetchInterval: (query: { state: { data: TaskAttempts | undefined } }) =>
+      query.state.data?.rows.some((task) => taskCanChange(task.status)) === false
+        ? false
+        : TASK_POLL_MS,
     enabled,
-    queryFn: async ({ signal }) => {
+    queryFn: async ({ signal }): Promise<TaskAttempts> => {
       const first = await api.task(id, signal)
       const rows = [first],
         seen = new Set([first.id])

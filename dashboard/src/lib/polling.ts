@@ -3,7 +3,7 @@ import { sumCounts } from "./format.ts"
 
 // Pages poll on their fast interval only while the runtime is doing work, back off
 // while they wait on a human, and otherwise rely on focus refetches and slow polling.
-export const IDLE_POLL_INTERVAL_MS = 30_000
+export const IDLE_POLL_INTERVAL_MS = 60_000
 const WAITING_POLL_CAP_MS = 60_000
 export const WAITING_POLL_BACKOFF_MS = [5_000, 10_000, 30_000, WAITING_POLL_CAP_MS] as const
 

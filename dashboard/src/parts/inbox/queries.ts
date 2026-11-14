@@ -5,17 +5,20 @@
  */
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useEffect, useMemo, useRef, useState } from "react"
+import { useUnchangedBackoff } from "../backoff"
 import { type InboxCountsQuery, useInboxHost } from "../host"
 import type { InboxQuery } from "../types"
 import { inboxKeys } from "./keys"
 
 /**
  * One page of the Inbox. `poll` refreshes the newest page while it shows: every
- * `pollMs` (default 5 s), and on each change `api.watch` reports when the host passes it.
+ * `pollMs` (default 10 s) while it changes, backing off to a minute while it stays the
+ * same, and on each change `api.watch` reports when the host passes it.
  */
 export function useInbox(query: InboxQuery = {}, poll = true) {
-  const { api, pollMs = 5000 } = useInboxHost().inbox
+  const { api, pollMs = 10_000 } = useInboxHost().inbox
   const client = useQueryClient()
+  const backoff = useUnchangedBackoff(pollMs)
   const key = useMemo(
     () =>
       inboxKeys.list({
@@ -40,7 +43,7 @@ export function useInbox(query: InboxQuery = {}, poll = true) {
     queryKey: [...key, current.cursor],
     queryFn: ({ signal }) => api.list({ limit: 50, ...query, cursor: current.cursor }, signal),
     retry: false,
-    refetchInterval: poll && current.cursor === null ? pollMs : false,
+    refetchInterval: (query) => (poll && current.cursor === null ? backoff(query) : false),
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   })
@@ -99,6 +102,9 @@ export function useInbox(query: InboxQuery = {}, poll = true) {
   }
 }
 
+/** How often the Inbox counts (the shell's badge) are read while they show. */
+export const INBOX_COUNTS_POLL_MS = 60_000
+
 /** Exact counts are separate from list pagination and may deliberately be unavailable. */
 export function useInboxCounts(query: InboxCountsQuery = {}) {
   const { api, enabled } = useInboxHost().inbox
@@ -106,6 +112,8 @@ export function useInboxCounts(query: InboxCountsQuery = {}) {
     enabled,
     queryKey: inboxKeys.counts(query),
     queryFn: ({ signal }) => api.counts(query, signal),
-    refetchInterval: 30000,
+    // The badge: once a minute (a 304 when the server sends an ETag), and on focus.
+    refetchInterval: INBOX_COUNTS_POLL_MS,
+    refetchOnWindowFocus: true,
   })
 }

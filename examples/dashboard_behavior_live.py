@@ -6225,7 +6225,8 @@ async def _exercise_idle_overview_polling(
             endpoint: len(await requests.read_times(*endpoint))
             for endpoint in POLLING_IDLE_OVERVIEW_PATHS
         }
-        await _advance_page_clock(page, requests, 62_000, step_ms=1_000)
+        # Idle Home reads poll once a minute; focus doesn't refetch them (only the badge).
+        await _advance_page_clock(page, requests, 122_000, step_ms=1_000)
         observed: dict[str, list[int]] = {}
         for endpoint in POLLING_IDLE_OVERVIEW_PATHS:
             times = await requests.read_times(*endpoint)
@@ -6246,7 +6247,7 @@ async def _exercise_idle_overview_polling(
             )
             observed[endpoint[1]] = _require_read_gaps(
                 [batch[0] for batch in batches],
-                (30_000, 30_000),
+                (60_000, 60_000),
                 f"an idle dashboard home {endpoint[1]}",
             )
         return observed

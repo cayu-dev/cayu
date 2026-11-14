@@ -4,10 +4,11 @@ import { Bot, ChevronDown, Play, Search } from "lucide-react"
 import { useState } from "react"
 import { useViewer } from "@/components/dashboard/viewer"
 import type { AgentSummary } from "@/lib/api"
+import { useUnchangedBackoff } from "../../parts/backoff"
 import { useSpecialists } from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import { relativeTime } from "../app/session-model"
-import { TASK_POLL_MS } from "../app/task-polling"
+import { useSpecialistActivity } from "../app/specialist-activity"
 import {
   EmptyState,
   ErrorState,
@@ -27,6 +28,8 @@ export function SpecialistsPage({
   tasksEnabled?: boolean
 } = {}) {
   const specialists = useSpecialists()
+  // Cards don't poll; this one read refreshes the cards whose agent has new activity.
+  useSpecialistActivity(recentEnabled || tasksEnabled)
   const search = useSearch({ strict: false }) as { q?: string }
   const go = useGo()
   const q = search.q ?? ""
@@ -96,6 +99,7 @@ function SpecialistCard({
   tasksEnabled: boolean
 }) {
   const [open, setOpen] = useState(false)
+  const tasksBackoff = useUnchangedBackoff(30_000)
   const api = useApi()
   const now = useNow()
   const { prototype, executionEnabled } = useServices()
@@ -103,7 +107,6 @@ function SpecialistCard({
   const recent = useQuery({
     queryKey: ["specialist-recent", agent.name],
     enabled: recentEnabled,
-    refetchInterval: TASK_POLL_MS,
     queryFn: ({ signal }) =>
       api.sessions(
         {
@@ -119,7 +122,9 @@ function SpecialistCard({
   const tasks = useQuery({
     queryKey: ["specialist-tasks", agent.name],
     enabled: open && tasksEnabled,
-    refetchInterval: TASK_POLL_MS,
+    // A task can be queued or cancelled without any session changing, so an open card
+    // keeps a slow refresh of its own.
+    refetchInterval: tasksBackoff,
     queryFn: ({ signal }) =>
       api.taskList(
         { assigned_agent_name: agent.name, limit: 5, order_by: "updated_at_desc" },

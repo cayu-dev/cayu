@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useCallback, useState } from "react"
+import { useUnchangedBackoff } from "../../parts/backoff"
 import { useApi } from "./services"
 
 const firstPage = { cursor: null as string | null, visited: [] as string[], number: 1 }
@@ -9,13 +10,14 @@ export function useKeptKnowledge(enabled: boolean) {
   const api = useApi()
   const client = useQueryClient()
   const [position, setPosition] = useState(firstPage)
+  const backoff = useUnchangedBackoff(position.cursor === null ? 10_000 : false)
   const key = ["knowledge", "kept", position.cursor]
   const result = useQuery({
     queryKey: key,
     enabled,
     queryFn: ({ signal }) => api.knowledge({ limit: 50, cursor: position.cursor }, signal),
     retry: false,
-    refetchInterval: position.cursor === null ? 5000 : false,
+    refetchInterval: backoff,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   })

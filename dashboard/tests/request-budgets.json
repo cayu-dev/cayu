@@ -1,0 +1,85 @@
+{
+  "description": "Most API requests each Developer dashboard page may start in one minute after it settles, idle and with one session making a model step and a tool call every second. tests/server/test_dashboard_request_budget.py enforces these.",
+  "windowSeconds": 60,
+  "cheapRevalidation": "A 304 or an If-None-Match/If-Modified-Since request counts toward the budget but never fails the re-requested-unchanged rule.",
+  "pages": {
+    "home": {
+      "path": "/",
+      "idle": 10,
+      "running": 30
+    },
+    "sessions": {
+      "path": "/sessions",
+      "idle": 6,
+      "running": 20
+    },
+    "session": {
+      "path": "/sessions/{session}",
+      "idle": 5,
+      "running": 150,
+      "note": "Trace view. Idle: a finished session is still followed, backing off from 5 s to a minute, so its page notices a resume. Running: about 60 are the follower's own reads, one a second while events arrive. The trace and the overview (which carries the session's state) refresh every 2 s, the children and the transcript every 10 s. Once the follower reports event types, the overview refreshes urgently only on lifecycle events."
+    },
+    "sessionConversation": {
+      "path": "/sessions/{session}?view=conversation",
+      "idle": 5,
+      "running": 170,
+      "note": "Conversation view. Each transcript refresh is a size probe plus the tail page, every 2 s while following; the overview every 2 s; the trace and children every 10 s."
+    },
+    "inbox": {
+      "path": "/inbox",
+      "idle": 6,
+      "running": 12
+    },
+    "tasks": {
+      "path": "/tasks",
+      "idle": 6,
+      "running": 12
+    },
+    "tools": {
+      "path": "/tools",
+      "idle": 6,
+      "running": 12
+    },
+    "specialists": {
+      "path": "/agents",
+      "idle": 6,
+      "running": 12
+    },
+    "knowledge": {
+      "path": "/knowledge",
+      "idle": 6,
+      "running": 12
+    },
+    "usage": {
+      "path": "/usage",
+      "idle": 6,
+      "running": 12
+    },
+    "environments": {
+      "path": "/environments",
+      "idle": 6,
+      "running": 12
+    },
+    "artifacts": {
+      "path": "/artifacts",
+      "idle": 2,
+      "running": 2
+    },
+    "system": {
+      "path": "/system",
+      "idle": 2,
+      "running": 2
+    },
+    "evals": {
+      "path": "/evals",
+      "idle": 2,
+      "running": 2
+    },
+    "evalRun": {
+      "path": "/evals/runs/{evalRun}",
+      "idle": null,
+      "running": 40,
+      "note": "A live eval run. Not measured by tests/server/test_dashboard_request_budget.py, whose fixture has no eval run."
+    }
+  }
+}

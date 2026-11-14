@@ -1,25 +1,31 @@
 import { useQuery } from "@tanstack/react-query"
 import { useState } from "react"
 import { fetchPendingActions } from "@/lib/api"
+import { useUnchangedBackoff } from "../../parts/backoff"
 import { ErrorState, NavLink, sessionRoute } from "./common"
 
 /** Delegated actions are inspected in their session; they are not Inbox settlements. */
 export function ChildActions({ sessionId, agentName }: { sessionId?: string; agentName?: string }) {
   const [search, setSearch] = useState("")
   const [cursor, setCursor] = useState<string | undefined>()
+  const backoff = useUnchangedBackoff(10_000)
   const query = useQuery({
     queryKey: ["child-actions", search, cursor, sessionId, agentName],
-    queryFn: () =>
-      fetchPendingActions({
-        kind: "delegated_action",
-        session_id: sessionId,
-        agent_name: agentName,
-        q: search || undefined,
-        limit: 25,
-        cursor,
-      }),
+    queryFn: ({ signal }) =>
+      fetchPendingActions(
+        {
+          kind: "delegated_action",
+          session_id: sessionId,
+          agent_name: agentName,
+          q: search || undefined,
+          limit: 25,
+          cursor,
+        },
+        signal,
+      ),
     retry: false,
-    refetchInterval: 5000,
+    // Only the first page is live; it backs off while the actions stay the same.
+    refetchInterval: (query) => (cursor ? false : backoff(query)),
   })
   return (
     <section className="mt-8 space-y-3 border-t border-border pt-4">

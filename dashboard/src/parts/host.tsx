@@ -58,12 +58,15 @@ export interface InboxApi {
    */
   settle(itemId: string, body: InboxSettleRequest): Promise<InboxItemState>
   /** Titles for the sessions items belong to. Without it, an item shows its session's ID. */
-  sessionTitles?(ids: string[]): Promise<{ session_id: string; title?: string | null }[]>
+  sessionTitles?(
+    ids: string[],
+    signal?: AbortSignal,
+  ): Promise<{ session_id: string; title?: string | null }[]>
   /**
    * A knowledge proposal's full text, which the person reads before keeping or dropping it.
    * Without it, the card shows the summary the inbox lists and decides from that.
    */
-  knowledgeEntry?(entryId: string): Promise<PendingKnowledgeDetailResponse>
+  knowledgeEntry?(entryId: string, signal?: AbortSignal): Promise<PendingKnowledgeDetailResponse>
   /** The exact pending recovery behind a recovery item, for recovering it in its session. */
   sessionRecovery?(
     sessionId: string,
@@ -111,7 +114,10 @@ export interface InboxHost {
   fullAccess: boolean
   /** When the deployment configures protected human review. */
   ProtectedReview?: ProtectedReview
-  /** Refresh of the newest page, in ms; false when `api.watch` pushes changes. Default 5000. */
+  /**
+   * Refresh of the newest page while it changes, in ms; it backs off to a minute while the
+   * page stays the same. False when `api.watch` pushes changes. Default 10000.
+   */
   pollMs?: number | false
 }
 

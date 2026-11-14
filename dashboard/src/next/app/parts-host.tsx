@@ -59,9 +59,9 @@ export function DashboardPartsHost({ children }: { children: ReactNode }) {
   const host = useMemo<PartsHost>(() => {
     const inboxApi: InboxApi = {
       list: (query, signal) => api.inbox(query, signal),
-      counts: (query) => api.inboxCounts(query),
+      counts: (query, signal) => api.inboxCounts(query, signal),
       settle: (id, body) => api.settle(id, body),
-      sessionTitles: (ids) => api.overviews(ids),
+      sessionTitles: (ids, signal) => api.overviews(ids, signal),
     }
     return {
       now,

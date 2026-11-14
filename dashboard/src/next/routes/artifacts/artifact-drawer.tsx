@@ -60,8 +60,8 @@ export function ArtifactDrawer({
   const overview = useQuery({
     queryKey: ["overview", sessionId],
     enabled: overviewQueriesEnabled && !!sessionId,
-    queryFn: async (): Promise<SessionOverview | null> =>
-      (await api.overviews([sessionId!]))[0] ?? null,
+    queryFn: async ({ signal }): Promise<SessionOverview | null> =>
+      (await api.overviews([sessionId!], signal))[0] ?? null,
   })
   const kind = artifact ? kindOf(artifact) : null
   const content = artifact

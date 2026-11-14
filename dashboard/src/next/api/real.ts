@@ -63,23 +63,23 @@ const query = (params: Record<string, string | number | string[] | null | undefi
 }
 
 export const realApi: Api = {
-  app: fetchDashboardIdentity,
+  app: (signal) => fetchDashboardIdentity(signal),
   specialists: (signal) => fetchAgents(signal),
   sessions: (q, signal) => fetchSessionsPage({ include: ["overview"], ...q }, signal),
-  session: (id) => fetchSession(id),
-  async overviews(ids) {
+  session: (id, signal) => fetchSession(id, signal),
+  async overviews(ids, signal) {
     const wanted = [...new Set(ids)]
     const result: SessionOverview[] = []
     for (let offset = 0; offset < wanted.length; offset += 200) {
-      const page = await fetchSessionsPage({
-        ids: wanted.slice(offset, offset + 200),
-        include: ["overview"],
-      })
+      const page = await fetchSessionsPage(
+        { ids: wanted.slice(offset, offset + 200), include: ["overview"] },
+        signal,
+      )
       result.push(...(page.overviews ?? []).map(overviewForDisplay))
     }
     return result
   },
-  inboxCounts: (q = {}) => json(`/inbox/counts${query(q)}`),
+  inboxCounts: (q = {}, signal) => json(`/inbox/counts${query(q)}`, { signal }),
   overviewCounts: (q, signal) => json(`/sessions/overview/counts${query(q)}`, { signal }),
   transcript: (id, q, signal) => fetchSessionTranscript(id, q, signal),
   trace: (id, q, signal) => fetchSessionTrace(id, q, signal),
@@ -87,7 +87,7 @@ export const realApi: Api = {
   events: (id, q, signal) => fetchSessionEvents(id, q, signal),
   eventHeads: (id, q, signal) => fetchSessionEventHeads(id, q, signal),
   transcriptMessage: (id, index, signal) => fetchSessionTranscriptMessage(id, index, signal),
-  tasks: () => fetchTasks({ limit: 200, order_by: "updated_at_desc" }),
+  tasks: (signal) => fetchTasks({ limit: 200, order_by: "updated_at_desc" }, signal),
   task: (id, signal) => json(`/tasks/${encodeURIComponent(id)}`, { signal }),
   tasksByIds: fetchTasksByIds,
   taskIndex: fetchTaskIndex,
@@ -169,10 +169,11 @@ export const realApi: Api = {
   async interrupt(id, reason, options) {
     return executeInterruptMutation(id, reason ? { reason } : {}, options)
   },
-  state: (id) => fetchSessionState(id),
-  taskTypes: async () => {
+  state: (id, signal) => fetchSessionState(id, signal),
+  taskTypes: async (signal) => {
     const result = await json<{ task_types: import("@/lib/generated/server-api").TaskTypeSpec[] }>(
       "/task-types",
+      { signal },
     )
     return result.task_types.map((type) => ({
       ...type,

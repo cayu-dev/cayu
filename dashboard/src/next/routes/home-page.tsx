@@ -10,7 +10,12 @@ import { CapabilityRoute } from "@/components/dashboard/server-contract"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "@/lib/dashboard-capabilities"
 import { activityPollInterval } from "@/lib/polling"
 import { cn } from "@/lib/utils"
-import { type SessionRow, useHomeSessionRows, useInboxCounts } from "../app/queries"
+import {
+  HOME_ACTIVE_POLL_MS,
+  type SessionRow,
+  useHomeSessionRows,
+  useInboxCounts,
+} from "../app/queries"
 import { useApi, useNow, useServices } from "../app/services"
 import { isWaiting, relativeTime } from "../app/session-model"
 import {
@@ -97,9 +102,9 @@ function HomeOverview() {
   const counts = useQuery({
     queryKey: ["home", "counts", window],
     placeholderData: keepPreviousData,
-    queryFn: () => api.overviewCounts(window),
+    queryFn: ({ signal }) => api.overviewCounts(window, signal),
     refetchInterval: (query) =>
-      activityPollInterval(Number(query.state.data?.running_now ?? 0) > 0, 5000),
+      activityPollInterval(Number(query.state.data?.running_now ?? 0) > 0, HOME_ACTIVE_POLL_MS),
   })
 
   const attention = [...waiting.rows, ...failures.rows.filter((row) => activity(row) > now() - DAY)]

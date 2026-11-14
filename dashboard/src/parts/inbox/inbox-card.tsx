@@ -72,7 +72,7 @@ export function InboxCard({
   const readsKnowledge = !!api.knowledgeEntry
   const knowledgeSource = useQuery({
     queryKey: partKeys.knowledgeEntry(item.knowledge?.entry_id, item.knowledge?.revision),
-    queryFn: () => api.knowledgeEntry!(item.knowledge!.entry_id),
+    queryFn: ({ signal }) => api.knowledgeEntry!(item.knowledge!.entry_id, signal),
     enabled: readsKnowledge && item.kind === "knowledge" && !!item.knowledge,
   })
   const knowledgeReady =

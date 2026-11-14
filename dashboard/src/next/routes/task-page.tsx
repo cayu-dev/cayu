@@ -24,6 +24,7 @@ import {
   taskName,
   when,
 } from "../app/task-model"
+import { taskCanChange } from "../app/task-polling"
 import { useTaskAttempts, useTaskLinks, useTaskRelationPage } from "../app/task-queries"
 import {
   ActionsMenu,
@@ -140,12 +141,19 @@ function TaskPageView({ taskId }: { taskId: string }) {
     true,
   )
   const relatedSupported = !!services.prototype || services.taskIndexEnabled === true
+  const live = !!detail.data && taskCanChange(detail.data.status)
   const dependentsRead = useTaskRelationPage(
     taskId,
     "dependents",
     !!detail.data && relatedSupported,
+    live,
   )
-  const childrenRead = useTaskRelationPage(taskId, "children", !!detail.data && relatedSupported)
+  const childrenRead = useTaskRelationPage(
+    taskId,
+    "children",
+    !!detail.data && relatedSupported,
+    live,
+  )
   const retryRead = useTaskAttempts(taskId, !!detail.data?.retry_series, relationLimit)
   const task: TaskInfo | undefined = detail.data
   const schedule = useTaskScheduleEvents(taskId, !!task?.schedule)

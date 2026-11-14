@@ -32,9 +32,10 @@ export function InboxList({ search, pageSize = 50 }: { search: InboxSearch; page
   ]
   const sessions = useQuery({
     queryKey: inboxKeys.sessionTitles(ids),
-    queryFn: () => api.sessionTitles!(ids),
+    queryFn: ({ signal }) => api.sessionTitles!(ids, signal),
     enabled: ids.length > 0 && !!api.sessionTitles,
-    refetchInterval: 5000,
+    // Titles change with the listed items (a new key), not on a timer.
+    staleTime: 60_000,
   })
   const titles = new Map(
     (sessions.data ?? []).map((row) => [row.session_id, row.title ?? row.session_id]),

@@ -9,7 +9,7 @@ import type { Api, TaskInfo } from "../api/types"
 import { useServices } from "../app/services"
 import { FINISHED_STATUSES, replayUnavailableText } from "../app/task-model"
 import { TaskOperation } from "../app/task-operation"
-import { TASK_POLL_MS } from "../app/task-polling"
+import { TASK_POLL_MS, taskCanChange } from "../app/task-polling"
 import { ErrorState, taskRoute, useGo } from "./common"
 
 const replayOwners = new WeakMap<Api, Map<string, TaskOperation>>()
@@ -78,7 +78,8 @@ export function TaskActions({ task }: { task: TaskInfo }) {
     queryKey: ["tasks", task.id, "replay"],
     enabled: creatable,
     queryFn: ({ signal }) => readTaskReplay(task.id, signal),
-    refetchInterval: TASK_POLL_MS,
+    // Replay becomes available when the task finishes; a finished task's answer stays.
+    refetchInterval: taskCanChange(task.status) ? TASK_POLL_MS : false,
   })
   const [operation, setOperation] = useState<{
     id: string

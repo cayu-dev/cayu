@@ -76,6 +76,8 @@ export function useTraceHistory(sessionId: string, enabled: boolean, expectedIns
       return { page: owner.page, hasMore: owner.more }
     },
     retry: false,
+    // The paging owner lives in this component, so a remount must read again to rebuild it.
+    staleTime: 0,
   })
   const loadMore = async () => {
     if (loadingMore || !api.trace) return

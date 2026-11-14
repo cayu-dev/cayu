@@ -8,11 +8,11 @@ import { ChevronRight, Search } from "lucide-react"
 import { Fragment, useMemo, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import { useUnchangedBackoff } from "../../parts/backoff"
 import type { ToolApproval, ToolSource, ToolUsage, ToolWithDisplay } from "../api/types"
-import { useSpecialists, useToolUsage } from "../app/queries"
+import { TOOL_POLL_MS, useSpecialists, useToolUsage } from "../app/queries"
 import { useApi, useNow } from "../app/services"
 import { relativeTime } from "../app/session-model"
-import { TASK_POLL_MS } from "../app/task-polling"
 import { EmptyState, ErrorState, NavLink, PageBody, sessionRoute, TopBar, useGo } from "./common"
 
 type ToolRow = {
@@ -278,6 +278,8 @@ function ToolDetail({
   const api = useApi()
   const { tool, usage } = row
   const client = useQueryClient()
+  const callsBackoff = useUnchangedBackoff(TOOL_POLL_MS)
+  const latestBackoff = useUnchangedBackoff(TOOL_POLL_MS)
   const calls = useInfiniteQuery({
     queryKey: ["tool-calls", tool.name],
     enabled: usageEnabled && !!api.toolCalls,
@@ -285,7 +287,8 @@ function ToolDetail({
     queryFn: ({ pageParam, signal }) => api.toolCalls!(tool.name, pageParam, signal),
     getNextPageParam: (page) => page.next_cursor ?? undefined,
     // Only the first window is live. Explicit older pages retain their snapshot.
-    refetchInterval: (query) => ((query.state.data?.pages.length ?? 0) <= 1 ? TASK_POLL_MS : false),
+    refetchInterval: (query) =>
+      (query.state.data?.pages.length ?? 0) <= 1 ? callsBackoff(query) : false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
     refetchOnMount: false,
@@ -296,7 +299,7 @@ function ToolDetail({
     queryKey: ["tool-calls-latest", tool.name],
     enabled: usageEnabled && !!api.toolCalls && historical,
     queryFn: ({ signal }) => api.toolCalls!(tool.name, undefined, signal),
-    refetchInterval: TASK_POLL_MS,
+    refetchInterval: latestBackoff,
     retry: false,
   })
   const visibleCalls = [

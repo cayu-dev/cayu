@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { activityPollInterval } from "@/lib/polling"
+import { shouldRetryQuery } from "@/lib/query-client"
 import { sessionIndexErrorState } from "@/lib/session-index-error"
 import { type SessionIndexSearch, sessionOverviewQuery } from "@/lib/session-index-search"
 import { useApi, useServices } from "./services"
@@ -26,8 +27,9 @@ export function useSessionList(search: SessionIndexSearch) {
         signal,
         { firstMessage: overviewFirstMessageEnabled },
       ),
-    gcTime: 0,
-    retry: (count, error) => count < 3 && sessionIndexErrorState(error).retryable,
+    retry: (count, error) =>
+      shouldRetryQuery(count, error) && sessionIndexErrorState(error).retryable,
+    refetchOnWindowFocus: true,
     refetchInterval: (query) =>
       activityPollInterval(
         query.state.data?.rows.some((row) => row.overview.state === "running") ?? false,
