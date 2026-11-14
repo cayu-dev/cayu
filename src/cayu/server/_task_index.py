@@ -183,35 +183,30 @@ async def read_task_index(
         )
 
     try:
-        if _native_read(app, query, values):
-            # Every filter matches stored values exactly as it matches public ones,
-            # so the store filters, pages and counts them in SQL.
+        native = _native_read(app, query, values)
+        index_query = TaskIndexQuery(
+            # Natively, every filter matches stored values exactly as it matches public
+            # ones. Otherwise these selectors refer to the public projection, not raw
+            # store values: preserve native scope/order while matching them only
+            # through the predicate above. Native SDK queries stay raw.
+            filters=(
+                query
+                if native
+                else query.model_copy(update={field: None for field in (*filtered_fields, "types")})
+            ),
+            include_internal=include_internal,
+            prerequisite_task_id=prerequisite_task_id,
+            after=after,
+            statuses=statuses,
+        )
+        if native:
+            # The store filters, pages and counts them in SQL.
             result = await app.task_store.query_task_index(
-                TaskIndexQuery(
-                    filters=query,
-                    include_internal=include_internal,
-                    prerequisite_task_id=prerequisite_task_id,
-                    after=after,
-                    statuses=statuses,
-                ),
+                index_query,
                 search=None if needle is None else _search_match(needle, _public_text(app)),
             )
         else:
-            result = await app.task_store.query_task_index(
-                TaskIndexQuery(
-                    # These selectors refer to the public projection, not raw store
-                    # values. Preserve native scope/order while matching them only
-                    # through the predicate above. Native SDK queries stay raw.
-                    filters=query.model_copy(
-                        update={field: None for field in (*filtered_fields, "types")}
-                    ),
-                    include_internal=include_internal,
-                    prerequisite_task_id=prerequisite_task_id,
-                    after=after,
-                    statuses=statuses,
-                ),
-                matches=matches,
-            )
+            result = await app.task_store.query_task_index(index_query, matches=matches)
     except NotImplementedError:
         if allow_offset:
             return {

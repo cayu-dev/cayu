@@ -2001,6 +2001,38 @@ def _consented_preflight():
     }
 
 
+class _RetryCloud:
+    """Answer `deployment retry dep_old` with the release Cloud returns for it."""
+
+    def __init__(self, release):
+        self.release = release
+        self.requests = []
+
+    def request(self, method, path, **kwargs):
+        self.requests.append((method, path, kwargs))
+        if method == "GET" and path == "/v1/applications":
+            return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
+        assert (method, path) == (
+            "POST",
+            "/v1/applications/session-agent/deployments/dep_old/retry",
+        )
+        return self.release
+
+
+def _retry_with_wait_arguments():
+    return cloud._build_parser().parse_args(
+        [
+            "deployment",
+            "retry",
+            "dep_old",
+            "--application",
+            "session-agent",
+            "--session-policy",
+            "wait",
+        ]
+    )
+
+
 class ConsentCloud(RefusedReleaseClient):
     """Record real deployment readbacks without replacing any CLI policy owner."""
 
@@ -2194,32 +2226,8 @@ def test_consent_cli_retry_requires_positive_explicit_wait_provenance(capsys, so
     if source is not None:
         stored["source"] = source
 
-    class RetryCloud:
-        def __init__(self):
-            self.requests = []
-
-        def request(self, method, path, **kwargs):
-            self.requests.append((method, path, kwargs))
-            if method == "GET" and path == "/v1/applications":
-                return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
-            assert (method, path) == (
-                "POST",
-                "/v1/applications/session-agent/deployments/dep_old/retry",
-            )
-            return {"id": "dep_new", "status": "accepted", "session_policy": stored}
-
-    client = RetryCloud()
-    arguments = cloud._build_parser().parse_args(
-        [
-            "deployment",
-            "retry",
-            "dep_old",
-            "--application",
-            "session-agent",
-            "--session-policy",
-            "wait",
-        ]
-    )
+    client = _RetryCloud({"id": "dep_new", "status": "accepted", "session_policy": stored})
+    arguments = _retry_with_wait_arguments()
     if source == "explicit":
         output = cloud._deployment(arguments, client=client)
         assert output["operation"] == "deployment.retry"
@@ -2307,34 +2315,17 @@ def test_retry_replayed_matching_explicit_policy_checks_publication_receipt(caps
     stored = {"mode": "wait", "wait_seconds": 900, "acknowledge_sessions": [], "source": "explicit"}
     preflight = _consented_preflight()
 
-    class RetryCloud:
-        def request(self, method, path, **kwargs):
-            if method == "GET" and path == "/v1/applications":
-                return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
-            assert (method, path) == (
-                "POST",
-                "/v1/applications/session-agent/deployments/dep_old/retry",
-            )
-            assert kwargs["payload"] == {"session_policy": "wait"}
-            return {
-                "id": "dep_old",
-                "status": "promoted",
-                "session_policy": stored,
-                "session_preflight": preflight,
-            }
-
-    arguments = cloud._build_parser().parse_args(
-        [
-            "deployment",
-            "retry",
-            "dep_old",
-            "--application",
-            "session-agent",
-            "--session-policy",
-            "wait",
-        ]
+    client = _RetryCloud(
+        {
+            "id": "dep_old",
+            "status": "promoted",
+            "session_policy": stored,
+            "session_preflight": preflight,
+        }
     )
-    output = cloud._deployment(arguments, client=RetryCloud())
+    output = cloud._deployment(_retry_with_wait_arguments(), client=client)
+    (retry,) = _posts(client, "/retry")
+    assert retry["payload"] == {"session_policy": "wait"}
     assert output["result"]["session_preflight"] == preflight
     assert output["not_applied"]["confirmed"] is True
     assert output["not_applied"]["more_permissive"] is True
@@ -2517,33 +2508,8 @@ def test_equal_wait_reports_receipt_and_provenance_with_distinct_authority(
         def command():
             return _deploy(client, project, tmp_path, "--session-policy", "wait")["result"]
     else:
-
-        class RetryCloud:
-            def __init__(self):
-                self.requests = []
-
-            def request(self, method, path, **kwargs):
-                self.requests.append((method, path, kwargs))
-                if method == "GET" and path == "/v1/applications":
-                    return {"items": [{"id": "session-agent", "name": "Session Agent"}]}
-                assert (method, path) == (
-                    "POST",
-                    "/v1/applications/session-agent/deployments/dep_old/retry",
-                )
-                return {"id": "dep_old", **release}
-
-        client = RetryCloud()
-        arguments = cloud._build_parser().parse_args(
-            [
-                "deployment",
-                "retry",
-                "dep_old",
-                "--application",
-                "session-agent",
-                "--session-policy",
-                "wait",
-            ]
-        )
+        client = _RetryCloud({"id": "dep_old", **release})
+        arguments = _retry_with_wait_arguments()
 
         def command():
             return cloud._deployment(arguments, client=client)

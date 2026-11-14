@@ -45,6 +45,20 @@ class EnvironmentExitOwnership:
         if not session_store_survives_restart(session_store):
             self.declare_process_local_session_store()
 
+    @staticmethod
+    def _preserved_allocation_key(
+        session_id: str,
+        session_instance_id: str,
+        environment_name: str,
+        reconnect_metadata: dict[str, Any],
+    ) -> tuple[str, str, str, bytes]:
+        return (
+            session_id,
+            session_instance_id,
+            environment_name,
+            canonical_durable_json_bytes(reconnect_metadata, "reconnect_metadata"),
+        )
+
     def _remember_preserved_factory_runner(
         self,
         session_id: str,
@@ -55,11 +69,8 @@ class EnvironmentExitOwnership:
     ) -> None:
         if not isinstance(runner, Runner):
             return
-        key = (
-            session_id,
-            session_instance_id,
-            environment_name,
-            canonical_durable_json_bytes(reconnect_metadata, "reconnect_metadata"),
+        key = self._preserved_allocation_key(
+            session_id, session_instance_id, environment_name, reconnect_metadata
         )
         self._preserved_factory_runners.setdefault(key, {})[id(runner)] = runner
 
@@ -73,11 +84,8 @@ class EnvironmentExitOwnership:
         """Forget the backstop only for the allocation disposed or transferred."""
 
         self._preserved_factory_runners.pop(
-            (
-                session_id,
-                session_instance_id,
-                environment_name,
-                canonical_durable_json_bytes(reconnect_metadata, "reconnect_metadata"),
+            self._preserved_allocation_key(
+                session_id, session_instance_id, environment_name, reconnect_metadata
             ),
             None,
         )

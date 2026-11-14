@@ -467,15 +467,24 @@ def _checks(facts: PullRequestFacts, limit: int) -> dict[str, Any]:
         "complete": checks.complete,
         "passed": sum(1 for check in checks.ci if check.finished and not check.failed),
     }
-    running = [_name(name, limit) for name in sorted({check.name for check in checks.running})]
-    for kind, items in (
-        ("failed", [_failed_check(check, limit) for check in checks.failed]),
-        ("running", running),
-        ("reviewer", [_reviewer_check(check, limit) for check in checks.reviewer]),
+    failed = checks.failed
+    running = sorted({check.name for check in checks.running})
+    for kind, total, items in (
+        (
+            "failed",
+            len(failed),
+            [_failed_check(check, limit) for check in failed[:_LISTED_CHECKS]],
+        ),
+        ("running", len(running), [_name(name, limit) for name in running[:_LISTED_CHECKS]]),
+        (
+            "reviewer",
+            len(checks.reviewer),
+            [_reviewer_check(check, limit) for check in checks.reviewer[:_LISTED_CHECKS]],
+        ),
     ):
-        answer[kind] = items[:_LISTED_CHECKS]
-        answer[f"{kind}_total"] = len(items)
-        if len(items) > _LISTED_CHECKS:
+        answer[kind] = items
+        answer[f"{kind}_total"] = total
+        if total > _LISTED_CHECKS:
             answer[f"{kind}_note"] = (
                 f"Only the first {_LISTED_CHECKS} are listed; {kind}_total counts all."
             )

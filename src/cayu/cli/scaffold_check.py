@@ -1537,7 +1537,7 @@ def _import_side_effect_diagnostic(
             "calls, so importing the application stays side-effect free."
         )
     elif _is_zone_construction(unsafe_node):
-        # Refused on purpose (#2778): a zone missing from the system database is
+        # Refused on purpose: a zone missing from the system database is
         # loaded from the `tzdata` package, which project source can shadow.
         reason = "unsupported_expression"
         message = (

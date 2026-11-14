@@ -6128,7 +6128,6 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         _advance_cleanup_environment(setup_owner, bound_registered_environment)
         # Capture the initial source baseline before tools can mutate the guest.
         # This is private recovery state, not a completion or publication receipt.
-
         if (
             type(binding) is DockerCodingWorkspaceBinding
             and command_recovery is None

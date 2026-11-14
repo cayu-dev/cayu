@@ -644,18 +644,6 @@ def build_router(app, *, development, auth):
     return router
 """
 
-_CLOUD_SIGN_IN_AUTH = """from cayu.server import BasicAuth, ProxyIdentityAuth
-from cayu.server.development_identity import registered_development_identity
-
-_proxy = registered_development_identity()
-AUTH = ProxyIdentityAuth(
-    issuer=_proxy.issuer,
-    audience=_proxy.audience,
-    signing_keys=_proxy.signing_keys(),
-    fallback=BasicAuth(username="operator", password="secret"),
-)
-"""
-
 
 def test_a_router_with_its_own_role_rule_signs_in_cloud_members(
     tmp_path: Path,
@@ -673,7 +661,7 @@ def test_a_router_with_its_own_role_rule_signs_in_cloud_members(
             'routers = ["own_role_rule_routes:build_router"]\nauth = "cloud_sign_in_auth:AUTH"\n',
         )
         (project / "own_role_rule_routes.py").write_text(_OWN_ROLE_RULE_ROUTES, encoding="utf-8")
-        (project / "cloud_sign_in_auth.py").write_text(_CLOUD_SIGN_IN_AUTH, encoding="utf-8")
+        (project / "cloud_sign_in_auth.py").write_text(_PROXY_AUTH, encoding="utf-8")
         for module in ("own_role_rule_routes", "cloud_sign_in_auth"):
             monkeypatch.delitem(sys.modules, module, raising=False)
         monkeypatch.chdir(project)

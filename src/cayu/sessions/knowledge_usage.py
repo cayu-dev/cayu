@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from datetime import UTC, datetime
 from typing import NamedTuple
 
@@ -37,6 +37,22 @@ async def fold_knowledge_lookup_totals(
     totals: dict[tuple[str, str], tuple[int, datetime | None]] = {
         identity: (0, None) for identity in identities
     }
+
+    def add(identity: tuple[str, str], _session_id: str, at: datetime) -> None:
+        if identity not in totals:
+            return
+        count, last = totals[identity]
+        totals[identity] = count + 1, at if last is None else max(last, at)
+
+    return totals, await _walk_knowledge_lookups(store, add)
+
+
+async def _walk_knowledge_lookups(
+    store: SessionStore, visit: Callable[[tuple[str, str], str, datetime], None]
+) -> int:
+    """Call ``visit`` with each returned entry, its session and UTC time, lookup by lookup,
+    from one retained snapshot; returns the snapshot's sequence."""
+
     after = 0
 
     def consume(page: list[EventRecord]) -> None:
@@ -52,18 +68,13 @@ async def fold_knowledge_lookup_totals(
             at = record.event.timestamp
             at = at.replace(tzinfo=UTC) if at.tzinfo is None else at.astimezone(UTC)
             for entry_id in ids:
-                identity = namespace, entry_id
-                if identity not in totals:
-                    continue
-                count, last = totals[identity]
-                totals[identity] = count + 1, at if last is None else max(last, at)
+                visit((namespace, entry_id), record.event.session_id, at)
 
-    through = await store.fold_event_snapshot(
+    return await store.fold_event_snapshot(
         EventQuery(after_sequence=0, limit=100, event_type=EventType.KNOWLEDGE_LOOKUP),
         consume,
         max_bytes=16 * 1024 * 1024,
     )
-    return totals, through
 
 
 class KnowledgeLookupMismatch(NamedTuple):
@@ -83,30 +94,13 @@ async def recompute_knowledge_lookup_totals(
     """
 
     folded: dict[tuple[str, str], tuple[int, set[str], datetime]] = {}
-    after = 0
 
-    def consume(page: list[EventRecord]) -> None:
-        nonlocal after
-        for record in page:
-            if record.sequence <= after:
-                raise ValueError("Knowledge usage snapshot did not advance.")
-            after = record.sequence
-            contribution = knowledge_usage_contribution(record.event)
-            if contribution is None:
-                continue
-            namespace, ids = contribution
-            at = record.event.timestamp
-            at = at.replace(tzinfo=UTC) if at.tzinfo is None else at.astimezone(UTC)
-            for entry_id in ids:
-                count, sessions, last = folded.get((namespace, entry_id), (0, set(), at))
-                sessions.add(record.event.session_id)
-                folded[(namespace, entry_id)] = count + 1, sessions, max(last, at)
+    def add(identity: tuple[str, str], session_id: str, at: datetime) -> None:
+        count, sessions, last = folded.get(identity, (0, set(), at))
+        sessions.add(session_id)
+        folded[identity] = count + 1, sessions, max(last, at)
 
-    through = await store.fold_event_snapshot(
-        EventQuery(after_sequence=0, limit=100, event_type=EventType.KNOWLEDGE_LOOKUP),
-        consume,
-        max_bytes=16 * 1024 * 1024,
-    )
+    through = await _walk_knowledge_lookups(store, add)
     return {
         identity: KnowledgeLookupTotal(count, len(sessions), last)
         for identity, (count, sessions, last) in folded.items()

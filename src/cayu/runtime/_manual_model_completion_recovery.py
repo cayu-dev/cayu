@@ -446,14 +446,12 @@ class ManualModelCompletionRecovery:
 
         async def require_owned_outcome(
             current_checkpoint: dict[str, Any] | None,
-            transition: InteractionTransitionSpec | None = None,
         ) -> None:
             if owned_terminal is None:
                 return
             owed = invocation_terminal_decision_from_checkpoint(current_checkpoint) or (
                 settled_invocation_terminal_decision_from_checkpoint(current_checkpoint)
             )
-            expected_event_id = recovery_event_id
             if (
                 owed is None
                 or owed.session_id != session.id
@@ -462,7 +460,7 @@ class ManualModelCompletionRecovery:
                 or owed.profile_interaction_id != active_profile.interaction_id
                 or owed.execution_profile_fingerprint != active_profile.profile.fingerprint
                 or owed.interaction_id != interaction_id
-                or owed.interaction_event_id != expected_event_id
+                or owed.interaction_event_id != recovery_event_id
                 or owed.outcome.value != request.terminal_status.value
                 or owed.terminal_event_id != owned_terminal.event_id
                 or owed.terminal_payload != owned_terminal.payload
@@ -479,23 +477,19 @@ class ManualModelCompletionRecovery:
                 raise SessionModelCompletionStageConflict(
                     "Claimed model recovery conflicts with its durable terminal obligation."
                 )
-            if transition is None:
-                # Reconstruct only from the existing immutable receipt owner;
-                # current checkpoint equality cannot authenticate an old claim.
-                retained = (
-                    await self.session_store._load_interaction_transition_receipt_by_event_id(
-                        session.id,
-                        event_id=expected_event_id,
-                        expected_session_instance_id=session.instance_id,
-                        expected_active_invocation_profile=active_profile,
-                    )
-                )
-                if retained is None:
-                    raise SessionRunFenced("Claimed model recovery lost its settlement receipt.")
-                transition = retained.transition
+            # Reconstruct only from the existing immutable receipt owner;
+            # current checkpoint equality cannot authenticate an old claim.
+            retained = await self.session_store._load_interaction_transition_receipt_by_event_id(
+                session.id,
+                event_id=recovery_event_id,
+                expected_session_instance_id=session.instance_id,
+                expected_active_invocation_profile=active_profile,
+            )
+            if retained is None:
+                raise SessionRunFenced("Claimed model recovery lost its settlement receipt.")
             receipt = await self.session_store.load_interaction_transition_receipt(
                 session.id,
-                transition=transition,
+                transition=retained.transition,
                 expected_recovery_claim_id=recovery_claim_id,
             )
             if receipt is None:

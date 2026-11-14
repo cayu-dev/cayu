@@ -1014,10 +1014,10 @@ def _ref_compare(repository: Repository, base: str, head: str) -> dict[str, int]
     ref), from the pull's ``behind_by`` and ``ahead_by``; ``None`` for a head of no pull on
     ``base``."""
 
-    if head.removeprefix("refs/heads/") == base:
+    branch = head.removeprefix("refs/heads/")
+    if branch == base:
         return {"aheadBy": 0, "behindBy": 0}
     number = _PULL_REF.fullmatch(head)
-    branch = head.removeprefix("refs/heads/")
     pull = next(
         (
             pull

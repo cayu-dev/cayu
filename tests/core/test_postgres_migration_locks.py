@@ -1,11 +1,9 @@
 """Postgres migrations wait for live writers instead of deadlocking with them.
 
-Revisions 152 and 157 used to lock ``cayu_events`` weakly, copy retained rows,
-and then ask for ACCESS EXCLUSIVE to replace triggers. An event writer that had
-read ``cayu_events`` before the revision started and inserted after the weak
-lock deadlocked with that upgrade (cayu-tech/cayu#4033). The revisions now take
-ACCESS EXCLUSIVE first, so such a writer finishes and the revision then runs.
-The migration runner also bounds each lock wait with ``lock_timeout`` and runs a
+Revisions 152 and 157 take ACCESS EXCLUSIVE on ``cayu_events`` before copying
+retained rows and replacing triggers, so an event writer that read
+``cayu_events`` before the revision started finishes and the revision then runs.
+The migration runner bounds each lock wait with ``lock_timeout`` and runs a
 transaction again after a deadlock or a lock timeout, a bounded number of times.
 """
 

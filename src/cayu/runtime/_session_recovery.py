@@ -797,9 +797,9 @@ class SessionRecovery:
         async def settle_abandoned_model(
             session: Session, context: InvocationContext
         ) -> tuple[Event, ...]:
-            return await self._settle_abandoned_model_dispatch_hook(
+            return await self._settle_abandoned_model_dispatch(
                 session,
-                context,
+                invocation_context=context,
                 interruption_reason=request.reason,
             )
 
@@ -838,19 +838,6 @@ class SessionRecovery:
                 invocation_context=retained_invocation_context,
             )
         return await self._reap_shared_allocations(reconciled)
-
-    async def _settle_abandoned_model_dispatch_hook(
-        self,
-        session: Session,
-        invocation_context: InvocationContext,
-        *,
-        interruption_reason: str | None = None,
-    ) -> tuple[Event, ...]:
-        return await self._settle_abandoned_model_dispatch(
-            session,
-            invocation_context=invocation_context,
-            interruption_reason=interruption_reason,
-        )
 
     async def settle_released_open_interaction(self, session_id: str) -> Event | None:
         """Fail the interaction a lost run left open, once its session failed for good.

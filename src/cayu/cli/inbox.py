@@ -885,7 +885,7 @@ def _has_review(item: dict[str, Any], inbox: InboxClient) -> bool:
     if item.get("kind") not in {"approval", "question"} or not item.get("session_id"):
         return False
     # A question's item doesn't say whether there is a policy; the local application does.
-    if getattr(inbox, "reviews_configured", None) is False:
+    if inbox.reviews_configured is False:
         return False
     return item.get("arguments_unavailable_reason") != "no_review_policy"
 

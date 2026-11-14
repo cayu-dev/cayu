@@ -22,11 +22,9 @@ from cayu.runtime import _model_step_executor
 @pytest.mark.parametrize("as_frame", [False, True], ids=["raised", "error-frame"])
 def test_overflow_rebuild_does_not_restart_exhausted_retry_time_budget(monkeypatch, as_frame):
     elapsed_s = 0.0
-    waits = []
 
     async def advance_retry_clock(delay):
         nonlocal elapsed_s
-        waits.append(delay)
         elapsed_s += delay
         await asyncio.sleep(0)
 

@@ -798,7 +798,6 @@ def test_cursor_structured_search_keeps_first_matches_without_implicit_window(
 
 def test_newest_scan_budget_retains_latest_matches_and_coverage(
     cloud: Callable[..., _Cloud],
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Advance time at real request dispatch, rather than expiring before the search starts.
