@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import sqlite3
+from contextlib import closing
 
 import pytest
 from PIL import Image
@@ -198,15 +199,57 @@ def test_retention_deletion_and_wrong_scope(tmp_path):
             png=png(),
         )
         await store.finish(recording, owner=owner)
-        with sqlite3.connect(store.path) as db:
+        with closing(sqlite3.connect(store.path)) as db, db:
             db.execute("UPDATE recordings SET expires=0")
         with pytest.raises(BrowserRecordingUnavailable):
             await store.media(recording, 0)
         await store.purge_expired()
-        with sqlite3.connect(store.path) as db:
+        with closing(sqlite3.connect(store.path)) as db:
             assert db.execute("SELECT COUNT(*) FROM segments").fetchone()[0] == 0
 
     asyncio.run(check())
+
+
+class _SetupFailure(sqlite3.Connection):
+    def execute(self, sql, *args):
+        if sql.startswith("PRAGMA secure_delete"):
+            raise sqlite3.OperationalError("injected setup failure")
+        return super().execute(sql, *args)
+
+
+def test_store_closes_every_connection_it_opens(tmp_path, monkeypatch):
+    # An unclosed connection held by a failure's traceback outlives the test and
+    # its ResourceWarning lands in whichever later test is recording warnings.
+    opened: list[sqlite3.Connection] = []
+    fail_setup = False
+    connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        # Store connections open in worker threads; checked here from the test's.
+        kwargs["check_same_thread"] = False
+        if fail_setup:
+            kwargs["factory"] = _SetupFailure
+        connection = connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+
+    async def check():
+        nonlocal fail_setup
+        store, selected, _, recording, owner = await prepared(tmp_path)
+        with pytest.raises(BrowserRecordingUnavailable):
+            await store.begin(selected, identity(session_id="other"))
+        await store.finish(recording, owner=owner)
+        fail_setup = True
+        with pytest.raises(BrowserRecordingUnavailable):
+            await store.manifest(recording)
+
+    asyncio.run(check())
+    assert len(opened) > 4
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
 
 
 @pytest.mark.parametrize(

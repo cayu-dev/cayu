@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import TypeVar
 
@@ -231,7 +232,8 @@ class BrowserRecordingStore:
         self.max_storage_bytes = max_storage_bytes
         self.max_recordings = max_recordings
         self.ffmpeg = ffmpeg
-        with self._connect() as db:
+        # sqlite3's own context manager only commits; closing() releases the file.
+        with closing(self._connect()) as db, db:
             db.executescript("""
                 PRAGMA journal_mode=DELETE;
                 PRAGMA synchronous=FULL;
@@ -254,17 +256,21 @@ class BrowserRecordingStore:
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=0)
-        db.execute("PRAGMA busy_timeout=0")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA secure_delete=ON")
-        # Bound the database itself, including free pages and indexes. Rollback
-        # journals may temporarily consume up to one additional database bound.
-        db.execute(f"PRAGMA max_page_count={self.max_storage_bytes // (4 * 4096)}")
+        try:
+            db.execute("PRAGMA busy_timeout=0")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA secure_delete=ON")
+            # Bound the database itself, including free pages and indexes. Rollback
+            # journals may temporarily consume up to one additional database bound.
+            db.execute(f"PRAGMA max_page_count={self.max_storage_bytes // (4 * 4096)}")
+        except BaseException:
+            db.close()
+            raise
         return db
 
     async def _transaction(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
         def run() -> _T:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 return operation(db)
 

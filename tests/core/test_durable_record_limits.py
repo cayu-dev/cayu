@@ -115,8 +115,9 @@ def test_public_metadata_models_share_exact_limit(
     assert accepted.model_dump(mode="python")["metadata"] == exact
     canary = "private-metadata-canary"
     oversized = {**exact, canary: canary}
-    # Collect garbage from earlier tests first: a connection one of them left
-    # unclosed warns when the collector finalizes it, which is not this model.
+    # This test records every warning, so collect earlier tests' garbage first.
+    # Anything they leave for the collector, such as an unclosed SQLite
+    # connection, warns when finalized, and that warning is not this model's.
     gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
