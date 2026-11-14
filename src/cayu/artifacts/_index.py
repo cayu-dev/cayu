@@ -185,16 +185,20 @@ class ArtifactIndexCursor:
 
     It names only that row; the index reads the row's sort value when the next
     page is asked for, so a cursor never carries a filename or other metadata
-    that reads redact.
+    that reads redact. A page ordered by the filenames a reader is shown also
+    carries the row's ``shown_key``, the sort value of the filename as that
+    reader saw it, so the next page is found after the row is deleted.
     """
 
     order_by: str
     store_id: str
     artifact_id: str
+    shown_key: str | None = None
 
     def encode(self) -> str:
         raw = json.dumps(
-            [self.order_by, self.store_id, self.artifact_id],
+            [self.order_by, self.store_id, self.artifact_id]
+            + ([] if self.shown_key is None else [self.shown_key]),
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode()
@@ -209,16 +213,16 @@ class ArtifactIndexCursor:
             raise ValueError("Artifact cursor is invalid.") from None
         if (
             type(decoded) is not list
-            or len(decoded) != 3
+            or len(decoded) not in (3, 4)
             or decoded[0] != order_by
-            or type(decoded[1]) is not str
-            or type(decoded[2]) is not str
+            or any(type(value) is not str for value in decoded[1:])
         ):
             raise ValueError("Artifact cursor is invalid for this order.")
         return cls(
             order_by,
             require_clean_nonblank(decoded[1], "artifact_store_id"),
             require_clean_nonblank(decoded[2], "artifact_id"),
+            decoded[3] if len(decoded) == 4 else None,
         )
 
     @classmethod

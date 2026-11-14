@@ -270,3 +270,80 @@ def test_searches_and_cursors_never_reveal_redacted_text(indexed, monkeypatch):
     offset = client.get("/api/artifacts", params={"q": "file-", "limit": 5, "offset": 20}).json()
     assert (offset["total_count"], len(offset["artifacts"]), offset["next_cursor"]) == (24, 4, None)
     assert calls == Counter()
+
+
+@pytest.mark.parametrize("hidden", ["ABCDEF123456", "ZBCDEF123456"])
+def test_filename_order_follows_the_shown_names_not_redacted_text(indexed, monkeypatch, hidden):
+    from cayu.vaults.redaction import SecretRedactor
+
+    client, app, (local, _), _, calls = indexed
+    secret = f"sk-live-{hidden}"
+
+    async def save():
+        await local.put_bytes(b"k", filename=f"key-{secret}.txt", session_id="owner")
+        await local.put_bytes(b"k", filename="key-sk-live-M.txt", session_id="owner")
+
+    client.portal.call(save)
+    client.post("/api/artifacts/index/reindex", json={})
+    monkeypatch.setattr(app, "_secret_redactor", SecretRedactor([secret]))
+    calls.clear()
+
+    # Wherever the secret sorts against a known name, the redacted name is placed
+    # by what is shown, so the order says nothing about the secret.
+    params: dict[str, Any] = {"q": "key-", "order_by": "filename_asc"}
+    body = client.get("/api/artifacts", params=params).json()
+    names = [row["filename"] for row in body["artifacts"]]
+    assert names == ["key-[REDACTED_SECRET].txt", "key-sk-live-M.txt"]
+    assert body["total_count"] == 2
+
+    # Pages by cursor and by offset walk the same shown order, both ways.
+    for order, expected in (
+        ("filename_asc", sorted(["key-[redacted_secret].txt", "key-sk-live-m.txt"])),
+        ("filename_desc", sorted(["key-[redacted_secret].txt", "key-sk-live-m.txt"])[::-1]),
+    ):
+        walked, cursor = [], None
+        while True:
+            params = {"q": "key-", "limit": 1, "order_by": order}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = client.get("/api/artifacts", params=params).json()
+            assert page["total_count"] == 2
+            walked.extend(row["filename"].lower() for row in page["artifacts"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert walked == expected
+        second = client.get(
+            "/api/artifacts", params={"q": "key-", "limit": 1, "offset": 1, "order_by": order}
+        ).json()
+        assert [row["filename"].lower() for row in second["artifacts"]] == expected[1:]
+
+    # A cursor still finds its place after its row is deleted, and carries only
+    # the name as shown.
+    first = client.get(
+        "/api/artifacts", params={"q": "key-", "limit": 1, "order_by": "filename_asc"}
+    )
+    cursor = first.json()["next_cursor"]
+    assert (
+        hidden.lower()
+        not in base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode().lower()
+    )
+    gone = first.json()["artifacts"][0]
+
+    async def delete():
+        await local.delete(gone["id"])
+
+    client.portal.call(delete)
+    rest = client.get(
+        "/api/artifacts",
+        params={"q": "key-", "limit": 1, "order_by": "filename_asc", "cursor": cursor},
+    )
+    assert rest.status_code == 200
+    assert [row["filename"] for row in rest.json()["artifacts"]] == ["key-sk-live-M.txt"]
+    calls.clear()
+
+    # The whole list, unsearched, is ordered by shown names as well.
+    everything = client.get("/api/artifacts", params={"order_by": "filename_asc"}).json()
+    listed = [row["filename"] for row in everything["artifacts"]]
+    assert listed == sorted(listed, key=str.lower) and everything["total_count"] == 25
+    assert calls == Counter()

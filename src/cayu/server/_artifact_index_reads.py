@@ -160,7 +160,9 @@ def _title(redact: Callable[[Any], Any], title: str | None) -> str | None:
         return None
 
 
-def _shown_match(needle: str, row: ArtifactIndexRow, redact: Callable[[Any], Any]) -> bool:
+def _shown_match(needle: str | None, row: ArtifactIndexRow, redact: Callable[[Any], Any]) -> bool:
+    if needle is None:
+        return True
     artifact = row.artifact
     title = _title(redact, row.title) if artifact.session_id is not None else None
     values = artifact_search_values(
@@ -187,11 +189,11 @@ async def _index_page(sessions: SessionStore, query: ArtifactIndexQuery) -> Arti
 async def _shown_matches(
     sessions: SessionStore,
     query: ArtifactIndexQuery,
-    needle: str,
+    needle: str | None,
     redact: Callable[[Any], Any],
     after: ArtifactIndexCursor | None,
 ) -> AsyncGenerator[ArtifactIndexRow, None]:
-    """The rows the index matched whose shown values still match, in order."""
+    """The rows the index matched whose shown values still match, in the index's order."""
 
     read = 0
     while True:
@@ -208,7 +210,7 @@ async def _shown_matches(
         if page.next_cursor is None:
             return
         if read >= ARTIFACT_QUERY_SCAN_MAX:
-            raise HTTPException(503, "Artifact search matches too many artifacts; narrow it.")
+            raise HTTPException(503, "Artifact query matches too many artifacts; narrow it.")
         after = page.next_cursor
 
 
@@ -251,6 +253,49 @@ async def _redacted_search_page(
     return ArtifactIndexPage(rows=tuple(rows), total_count=total, next_cursor=next_cursor)
 
 
+async def _shown_filename_page(
+    sessions: SessionStore,
+    query: ArtifactIndexQuery,
+    redact: Callable[[Any], Any],
+    shown_filename: Callable[[ArtifactIndexRow], str],
+) -> ArtifactIndexPage:
+    """A page in the order of the filenames a reader is shown, with its total.
+
+    The index orders by stored filenames, which may hold a configured secret. A
+    redacted filename placed by its stored text would tell a reader how the
+    secret compares with the names around it, so the matching rows are ordered
+    here by what is shown, as the store walk orders them.
+    """
+
+    keyed = []
+    unordered = replace(query, order_by="created_at_desc", after=None, offset=0)
+    async with aclosing(_shown_matches(sessions, unordered, query.q, redact, None)) as matches:
+        async for row in matches:
+            keyed.append(((shown_filename(row).lower(), row.store_id, row.artifact.id), row))
+    keyed.sort(key=lambda entry: entry[0], reverse=query.descending)
+    start = query.offset
+    after = query.after
+    if after is not None and after.shown_key is not None:
+        # The rows up to the cursor's place, whether or not its row is still listed.
+        anchor = (after.shown_key, after.store_id, after.artifact_id)
+        start = sum(1 for key, _ in keyed if (key >= anchor if query.descending else key <= anchor))
+    elif after is not None:
+        # A cursor from a page the index ordered names a row and no shown place.
+        named = (after.store_id, after.artifact_id)
+        position = next((index for index, (key, _) in enumerate(keyed) if key[1:] == named), None)
+        if position is None:
+            raise HTTPException(409, "The artifact this cursor names is gone; start again.")
+        start = position + 1
+    page = keyed[start : start + query.limit]
+    next_cursor = None
+    if start + query.limit < len(keyed):
+        key, last = page[-1]
+        next_cursor = replace(ArtifactIndexCursor.after(query.order_by, last), shown_key=key[0])
+    return ArtifactIndexPage(
+        rows=tuple(row for _, row in page), total_count=len(keyed), next_cursor=next_cursor
+    )
+
+
 async def query_indexed_artifacts(
     sessions: SessionStore,
     store_ids: Sequence[str],
@@ -269,7 +314,8 @@ async def query_indexed_artifacts(
     """A page of artifacts from the index, in the response shape of the store walk.
 
     ``redacts_secrets`` says whether the app redacts any configured secret; only
-    then can a search's stored match differ from what a reader is shown.
+    then can a search's stored match, or a filename's stored place in the order,
+    differ from what a reader is shown.
     """
 
     try:
@@ -288,7 +334,14 @@ async def query_indexed_artifacts(
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, str(exc)) from None
-    if query.q is not None and redacts_secrets:
+    if redacts_secrets and query.sort_column == "filename_key":
+        page = await _shown_filename_page(
+            sessions,
+            query,
+            redact,
+            lambda row: serialize(row.artifact, row.store_id)["filename"],
+        )
+    elif query.q is not None and redacts_secrets:
         page = await _redacted_search_page(sessions, query, query.q, redact)
     else:
         page = await _index_page(sessions, query)

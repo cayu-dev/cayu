@@ -1563,11 +1563,17 @@ Artifact content is still read from the store, and only when a file is opened.
   scans the index table, which stays narrow. When the app redacts secrets, every
   match is rechecked against the values as shown, and the page and `total_count`
   count only matches that survive, as the store walk did, so a search never
-  confirms a guess at a secret.
+  confirms a guess at a secret. For the same reason a `filename_asc` or
+  `filename_desc` list is then ordered by the filenames as shown: the matching
+  rows are read from the index, up to 100,000, and sorted, so a redacted filename's
+  place never follows its hidden text.
 - **Paging.** Index-served pages return `next_cursor`; pass it back as `cursor` for
   keyset paging at any depth. A cursor names only the last row's store and id; the
-  index reads that row's sort value, so a cursor never carries a filename. `offset`
-  keeps working up to 10,000.
+  index reads that row's sort value, so a cursor never carries a stored filename.
+  `offset` keeps working up to 10,000. A filename-ordered list in an app that
+  redacts secrets is the exception to "any depth": each page reads and sorts the
+  matching rows, answers 503 above 100,000 of them, and its cursor also carries
+  the last row's filename as shown, so paging goes on after that row is deleted.
 
 ```sh
 cayu artifact reindex --server-url http://localhost:8000 --check
