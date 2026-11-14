@@ -4,44 +4,40 @@ import type {
   EvalReportedRunDetail,
   EvalReportedSuiteDetail,
   EvalRunViewDetail,
+  EvalRunViewPollV1,
   EvalSuiteViewDetail,
   EvalSuiteViewIdentity,
   EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView,
 } from "@/lib/generated/server-api"
-import { isApiPayloadTooLarge, queryString, requestJson } from "../../lib/api.ts"
+import { ApiClientError, isApiPayloadTooLarge, queryString, requestJson } from "../../lib/api.ts"
 import { suiteSelector } from "../app/eval-view-model.ts"
 export type EvalCaseFilter = "regressed" | "improved" | "failing" | "flaky"
 
 const VIEW_BYTE_LIMIT = 8 * 1024 * 1024
 
-/** Page sizes are not cursor authority; selectors and every query scope stay fixed. */
+/**
+ * One request per view. A view over the byte budget is not retried with smaller
+ * pages: each retry costs the server as much as the first. The page says so and
+ * names the CLI command that reads it instead.
+ */
 async function requestViewPage<T>(
   path: string,
-  query: Record<string, string | undefined>,
-  initialLimits: Record<string, number>,
+  query: Record<string, string | number | undefined>,
+  command: string,
   signal?: AbortSignal,
 ): Promise<T> {
-  const scope = { ...query }
-  let limits = { ...initialLimits }
-  for (;;) {
-    try {
-      return await requestJson<T>(
-        `${path}${queryString({ ...scope, ...limits, max_result_bytes: VIEW_BYTE_LIMIT })}`,
-        { signal },
-      )
-    } catch (error) {
-      if (
-        signal?.aborted ||
-        !isApiPayloadTooLarge(error) ||
-        Object.values(limits).every((limit) => limit === 1)
-      )
-        throw error
-      // Suite details include two independent pages in the same byte envelope.
-      // Reduce both so either cases or run history can reach its minimum size.
-      limits = Object.fromEntries(
-        Object.entries(limits).map(([key, limit]) => [key, Math.max(1, Math.floor(limit / 2))]),
-      )
-    }
+  try {
+    return await requestJson<T>(
+      `${path}${queryString({ ...query, max_result_bytes: VIEW_BYTE_LIMIT })}`,
+      { signal },
+    )
+  } catch (error) {
+    if (!isApiPayloadTooLarge(error)) throw error
+    throw new ApiClientError(
+      `This view is too large to show here. Read it with \`${command}\`.`,
+      error.status,
+      error.detail,
+    )
   }
 }
 
@@ -51,8 +47,8 @@ export function fetchSuiteViews(
 ) {
   return requestViewPage<EvalViewPageUnionEvalSuiteViewSummaryEvalReportedSuiteView>(
     "/evals/suite-views",
-    query,
-    { limit: 25 },
+    { ...query, limit: 25 },
+    "cayu eval suites list",
     signal,
   )
 }
@@ -63,8 +59,8 @@ export function fetchSuiteView(
 ) {
   return requestViewPage<EvalSuiteViewDetail | EvalReportedSuiteDetail>(
     `/evals/suite-views/${encodeURIComponent(id)}`,
-    query,
-    { cases_limit: 25, runs_limit: 20 },
+    { ...query, cases_limit: 25, runs_limit: 20 },
+    "cayu eval suites show SUITE",
     signal,
   )
 }
@@ -80,10 +76,20 @@ export function fetchRunView(
 ) {
   return requestViewPage<EvalRunViewDetail | EvalReportedRunDetail>(
     `/evals/run-views/${encodeURIComponent(id)}`,
-    query,
-    { cases_limit: 25 },
+    { ...query, cases_limit: 25 },
+    "cayu eval runs show RUN_ID",
     signal,
   )
+}
+
+/**
+ * What a live run page polls: one run row and a version of its view. The response
+ * carries an ETag, so an unchanged run answers 304 and keeps the same data.
+ */
+export function fetchRunViewStatus(id: string, signal?: AbortSignal) {
+  return requestJson<EvalRunViewPollV1>(`/evals/run-views/${encodeURIComponent(id)}/status`, {
+    signal,
+  })
 }
 
 /** Corpus links may omit the target; catalog visibility is not existence. */

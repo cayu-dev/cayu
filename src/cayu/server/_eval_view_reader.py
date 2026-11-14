@@ -1,19 +1,31 @@
-"""Read orchestration for suite views; no worker or baseline mutation authority."""
+"""Read orchestration for suite views; no worker or baseline mutation authority.
+
+Pages read the store's summary tables (revision 154): the suite catalog, result
+summaries, case outcomes, trial checkpoint summaries and recorded comparisons.
+A whole result document is decoded only when a store keeps no summary of it,
+and then the reader derives the same rows with the functions the store's
+writers use and records them. Pass ``use_summaries=False`` to read every value
+from the documents instead; that is the reference the summaries are checked
+against.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 from fastapi import HTTPException
 from pydantic import BaseModel
 
-from cayu.evals.corpus import EvalCorpusDocument, eval_suite_trial_policy
+from cayu.evals.corpus import EvalCorpusDocument, EvalSuiteSpec, eval_suite_trial_policy
 from cayu.evals.execution import CorpusExecutionResult
 from cayu.evals.published import _validate_published_eval_run_for_corpus
 from cayu.evals.read_views import (
     EvalCaseHistoryQuery,
     EvalCaseResultReference,
+    EvalCaseResultView,
     EvalCaseView,
     EvalReportedRunView,
     EvalRunCaseFilter,
@@ -25,6 +37,7 @@ from cayu.evals.read_views import (
     EvalSuiteViewDetail,
     EvalSuiteViewIdentity,
     EvalSuiteViewSummary,
+    EvalViewComparison,
     EvalViewIndexPage,
     EvalViewPage,
     EvalViewQuery,
@@ -34,8 +47,11 @@ from cayu.evals.read_views import (
     validate_view_index,
 )
 from cayu.evals.reported import EvalReportedSeriesSelector
-from cayu.evals.result_presentation import present_eval_result
-from cayu.evals.results import CapturedEvaluationResultV1, validate_captured_result_for_corpus
+from cayu.evals.results import (
+    CapturedEvaluationResultV1,
+    EvalResultOrigin,
+    validate_captured_result_for_corpus,
+)
 from cayu.evals.store import (
     EvalBaselineKey,
     EvalBaselineRecord,
@@ -44,14 +60,34 @@ from cayu.evals.store import (
     _exact_model,
 )
 from cayu.evals.suite_authoring import _validated_eval_suite_document
+from cayu.evals.view_comparison import (
+    EvalViewComparisonData,
+    compare_view_results,
+    comparison_from_record,
+    comparison_record,
+    pending_comparison,
+)
+from cayu.evals.view_summaries import (
+    EvalCaseOutcomePage,
+    EvalCaseOutcomeQuery,
+    EvalCaseOutcomeV1,
+    EvalResultViewRows,
+    EvalResultViewSummaryV1,
+    page_case_outcomes,
+    summarize_result,
+)
 from cayu.server._eval_report_views import EvalReportViewReader, report_comparison
 from cayu.server._eval_result_loader import load_catalog_eval_result
-from cayu.server._eval_view_comparison import EvalViewComparisonData, compare_view_results
 from cayu.server._eval_view_projection import (
+    EvalCaseDefinitionData,
     EvalRunViewData,
+    case_cursor,
+    case_cursor_after,
+    case_definition,
+    case_definitions,
+    case_outcome_query,
     case_page,
     case_results,
-    case_view,
     run_metadata,
     run_progress,
 )
@@ -62,6 +98,19 @@ if TYPE_CHECKING:
 
 
 ViewModel = TypeVar("ViewModel", bound=BaseModel)
+_RECORD_MISMATCH = "Eval result catalog metadata does not match its stored document."
+_LOGGER = logging.getLogger(__name__)
+SuiteData = tuple[EvalSuiteSpec, tuple[EvalCaseDefinitionData, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RunRead:
+    run: EvalRunViewSummary
+    data: EvalRunViewData
+    comparison: EvalViewComparisonData
+    compared_run: EvalRunViewMetadata | None
+    previous: EvalRunViewData | None
+    selected: str | None
 
 
 def enforce_view_bytes(value: ViewModel, maximum: int) -> ViewModel:
@@ -71,15 +120,24 @@ def enforce_view_bytes(value: ViewModel, maximum: int) -> ViewModel:
 
 
 class EvalViewReader:
-    def __init__(self, store: EvalStore, registry: EvalTargetRegistry):
+    def __init__(
+        self,
+        store: EvalStore,
+        registry: EvalTargetRegistry,
+        *,
+        use_summaries: bool | None = None,
+    ):
         self.store = store
         self.registry = registry
         self.reports = EvalReportViewReader(store, registry)
+        self.use_summaries = store.view_summaries if use_summaries is None else use_summaries
+        if self.use_summaries and not store.view_summaries:
+            raise ValueError("This EvalStore keeps no view summaries.")
         self._baseline_snapshots: dict[tuple[str, str, str], EvalBaselineRecord | None] = {}
         self._baseline_results: dict[str, EvalRunViewMetadata | None] = {}
-        self._detail_snapshots: dict[
-            tuple[str, str | None, str | None, int, EvalRunCaseFilter | None], EvalRunViewDetail
-        ] = {}
+        self._run_data: dict[str, EvalRunViewData] = {}
+        self._view_rows: dict[str, EvalResultViewRows] = {}
+        self._suites: dict[tuple[str, str, str | None], SuiteData] = {}
         self._corpus_documents: dict[tuple[str, str], EvalCorpusDocument] = {}
 
     async def index(self, query: EvalViewQuery) -> EvalViewIndexPage:
@@ -90,6 +148,9 @@ class EvalViewReader:
         if target is None:
             raise HTTPException(status_code=404, detail="Eval target not found.")
         return target
+
+    def specialist(self, identity: EvalSuiteViewIdentity) -> str:
+        return self.target(identity.target_key).request_base.agent_name
 
     async def resolve_corpus_suite(
         self, revision: str, suite_id: str, target_key: str | None
@@ -110,6 +171,7 @@ class EvalViewReader:
         )
 
     async def suite_document(self, identity):
+        """The suite spec and case specs from the stored document itself."""
         if not isinstance(identity, EvalSuiteViewIdentity):
             raise HTTPException(
                 status_code=422, detail="Reported series has no native suite document."
@@ -128,6 +190,30 @@ class EvalViewReader:
         if suite is None:
             raise HTTPException(status_code=404, detail="Eval suite not found.")
         return suite, tuple(case for case in document.cases if case.suite_id == identity.suite_id)
+
+    async def suite_data(self, identity: EvalSuiteViewIdentity) -> SuiteData:
+        """The suite spec and what views need of its cases, from the catalog when kept."""
+        key = (identity.target_key, identity.revision, identity.suite_id)
+        if key in self._suites:
+            return self._suites[key]
+        self.target(identity.target_key)
+        value = None
+        if self.use_summaries and identity.source == "corpus":
+            assert identity.suite_id is not None
+            catalog = await self.store.load_suite_catalog(((identity.revision, identity.suite_id),))
+            entry = catalog.get((identity.revision, identity.suite_id))
+            if entry is not None:
+                if entry.target_key != identity.target_key:
+                    raise HTTPException(status_code=409, detail="Eval suite identity mismatch.")
+                suite = await asyncio.to_thread(EvalSuiteSpec.model_validate, entry.suite)
+                if suite.id != identity.suite_id or suite.revision != entry.suite_revision:
+                    raise HTTPException(status_code=409, detail="Eval suite identity mismatch.")
+                value = suite, tuple(case_definition(case) for case in entry.cases)
+        if value is None:
+            suite, cases = await self.suite_document(identity)
+            value = suite, case_definitions(cases)
+        self._suites[key] = value
+        return value
 
     async def corpus_document(self, identity: EvalSuiteViewIdentity) -> EvalCorpusDocument:
         self.target(identity.target_key)
@@ -169,45 +255,104 @@ class EvalViewReader:
         baseline = await self.baseline(identity)
         value = None
         if baseline is not None:
-            selector = run_view_id("result", baseline.result_revision)
-            data = await self.run_data(selector)
+            data = await self.run_data(run_view_id("result", baseline.result_revision))
             if data.identity != identity:
                 raise HTTPException(
                     status_code=409, detail="Eval baseline result identity mismatch."
                 )
-            value = run_metadata(
-                data,
-                baseline=baseline,
-                specialist=self.target(identity.target_key).request_base.agent_name,
-            )
+            value = run_metadata(data, baseline=baseline, specialist=self.specialist(identity))
         self._baseline_results[identity.id] = value
         return value
 
-    async def result(
-        self, revision: str, identity: EvalSuiteViewIdentity
-    ) -> tuple[EvalResultRecord, CorpusExecutionResult | CapturedEvaluationResultV1]:
-        record, result = await load_catalog_eval_result(revision, self.store, self.registry)
-        if (
-            record.target.target_key != identity.target_key
-            or record.corpus_revision != identity.revision
-            or record.suite_id != identity.suite_id
-        ):
-            raise HTTPException(status_code=409, detail="Eval result suite identity mismatch.")
-        suite, _ = await self.suite_document(identity)
-        if record.suite_revision != suite.revision:
-            raise HTTPException(status_code=409, detail="Eval result suite revision mismatch.")
-        return record, result
+    async def result_record(self, revision: str) -> EvalResultRecord:
+        if not self.store.captured_results:
+            raise HTTPException(status_code=409, detail="Eval result catalog is unavailable.")
+        try:
+            record = await self.store.load_result_record(revision)
+        except NotImplementedError as exc:
+            raise HTTPException(
+                status_code=409, detail="Eval result catalog is unavailable."
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid eval result revision.") from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail="Eval result not found.")
+        try:
+            record = await asyncio.to_thread(_exact_model, record, EvalResultRecord, "record")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=_RECORD_MISMATCH) from exc
+        if record.revision != revision:
+            raise HTTPException(status_code=409, detail=_RECORD_MISMATCH)
+        if self.registry.get(record.target.target_key) is None:
+            raise HTTPException(status_code=404, detail="Eval result not found.")
+        return record
+
+    async def view_rows(
+        self, record: EvalResultRecord, identity: EvalSuiteViewIdentity
+    ) -> EvalResultViewRows:
+        """Derive a result's rows from its document, checked against its corpus."""
+        if record.revision in self._view_rows:
+            return self._view_rows[record.revision]
+        loaded, result = await load_catalog_eval_result(record.revision, self.store, self.registry)
+        if loaded != record:
+            raise HTTPException(status_code=409, detail=_RECORD_MISMATCH)
+        corpus = await self.corpus_document(identity)
+        try:
+            if type(result) is CorpusExecutionResult:
+                await asyncio.to_thread(_validate_published_eval_run_for_corpus, corpus, result.run)
+            elif type(result) is CapturedEvaluationResultV1:
+                await asyncio.to_thread(validate_captured_result_for_corpus, result, corpus)
+            else:
+                raise TypeError("Unsupported eval result document.")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409, detail="Eval result contradicts its corpus contract."
+            ) from exc
+        rows = await asyncio.to_thread(summarize_result, result)
+        if self.use_summaries:
+            # The rows are a function of the immutable result, so recording them
+            # here is the same as the writer having recorded them.
+            await self._record(self.store.save_result_view_rows(rows))
+        if len(self._view_rows) == 4:
+            self._view_rows.pop(next(iter(self._view_rows)))
+        self._view_rows[record.revision] = rows
+        return rows
+
+    async def result_summary(
+        self, record: EvalResultRecord, identity: EvalSuiteViewIdentity
+    ) -> EvalResultViewSummaryV1:
+        if self.use_summaries:
+            stored = await self.store.load_result_view_summaries((record.revision,))
+            summary = stored.get(record.revision)
+            if summary is not None:
+                if not summary.describes(record):
+                    raise HTTPException(status_code=409, detail=_RECORD_MISMATCH)
+                return summary
+        return (await self.view_rows(record, identity)).summary
+
+    async def case_outcomes(
+        self, data: EvalRunViewData, query: EvalCaseOutcomeQuery
+    ) -> EvalCaseOutcomePage:
+        assert data.record is not None
+        if self.use_summaries and data.record.revision not in self._view_rows:
+            page = await self.store.list_case_outcomes(query)
+            if page is not None:
+                return page
+        rows = await self.view_rows(data.record, data.identity)
+        return page_case_outcomes(rows.outcomes, query)
 
     async def run_data(self, selector: str) -> EvalRunViewData:
+        if selector in self._run_data:
+            return self._run_data[selector]
         source, revision = decode_run_view(selector)
-        record = result = snapshot = None
+        record = snapshot = None
         if source == "run":
             snapshot = await self.store.load_run_view_snapshot(revision)
             if snapshot is None:
                 raise HTTPException(status_code=404, detail="Eval run not found.")
         else:
-            record, result = await load_catalog_eval_result(revision, self.store, self.registry)
-            if type(result) is CorpusExecutionResult:
+            record = await self.result_record(revision)
+            if record.origin is EvalResultOrigin.FRESH_EXECUTION:
                 snapshot = await self.store.load_result_run_view_snapshot(revision)
         if snapshot is not None:
             snapshot = await asyncio.to_thread(
@@ -224,11 +369,11 @@ class EvalViewReader:
                 revision=run.spec.corpus_revision,
                 suite_id=run.spec.suite_id,
             )
-            suite, cases = await self.suite_document(identity)
+            suite, definitions = await self.suite_data(identity)
             if run.spec.suite_revision != suite.revision:
                 raise HTTPException(status_code=409, detail="Eval run suite identity mismatch.")
-            if run.result is not None:
-                record, result = await self.result(run.result.revision, identity)
+            if run.result is not None and record is None:
+                record = await self.result_record(run.result.revision)
         else:
             assert record is not None
             identity = EvalSuiteViewIdentity(
@@ -237,72 +382,79 @@ class EvalViewReader:
                 revision=record.corpus_revision,
                 suite_id=record.suite_id,
             )
-            suite, cases = await self.suite_document(identity)
-            if record.suite_revision != suite.revision:
+            suite, definitions = await self.suite_data(identity)
+        summary = None
+        if record is not None:
+            # The record must describe its document before it may place the run.
+            summary = await self.result_summary(record, identity)
+            if (
+                record.target.target_key != identity.target_key
+                or record.corpus_revision != identity.revision
+                or record.suite_id != identity.suite_id
+            ):
                 raise HTTPException(status_code=409, detail="Eval result suite identity mismatch.")
-        if result is not None:
-            corpus = await self.corpus_document(identity)
-            try:
-                if type(result) is CorpusExecutionResult:
-                    await asyncio.to_thread(
-                        _validate_published_eval_run_for_corpus, corpus, result.run
-                    )
-                elif type(result) is CapturedEvaluationResultV1:
-                    await asyncio.to_thread(validate_captured_result_for_corpus, result, corpus)
-                else:
-                    raise TypeError("Unsupported eval result document.")
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=409, detail="Eval result contradicts its corpus contract."
-                ) from exc
-        presentation = (
-            None if result is None else await asyncio.to_thread(present_eval_result, result)
+            if record.suite_revision != suite.revision:
+                raise HTTPException(status_code=409, detail="Eval result suite revision mismatch.")
+        data = EvalRunViewData(
+            selector=selector,
+            snapshot=snapshot,
+            record=record,
+            identity=identity,
+            suite=suite,
+            definitions=definitions,
+            summary=summary,
+            fresh=record is not None and record.origin is EvalResultOrigin.FRESH_EXECUTION,
         )
-        return EvalRunViewData(
-            selector, snapshot, record, result, identity, suite, cases, presentation
-        )
+        if len(self._run_data) == 64:
+            self._run_data.pop(next(iter(self._run_data)))
+        self._run_data[selector] = data
+        return data
 
-    async def run_detail(
-        self,
-        selector: str,
-        *,
-        compared_with: str | None = None,
-        case_filter: EvalRunCaseFilter | None = None,
-        cases_cursor: str | None = None,
-        cases_limit: int = 50,
-    ) -> EvalRunViewDetail:
-        if decode_run_view(selector)[0] == "report":
-            return await self.reports.run_detail(
-                selector,
-                compared_with=compared_with,
-                case_filter=case_filter,
-                cases_cursor=cases_cursor,
-                cases_limit=cases_limit,
+    async def comparison(
+        self, data: EvalRunViewData, previous: EvalRunViewData | None, selected: str | None
+    ) -> EvalViewComparisonData:
+        if data.record is None or (
+            selected is not None and (previous is None or previous.record is None)
+        ):
+            return pending_comparison(
+                data.snapshot,
+                None if previous is None else previous.snapshot,
+                current_has_result=data.record is not None,
+                selected=selected,
             )
-        key = (selector, compared_with, cases_cursor, cases_limit, case_filter)
-        if key in self._detail_snapshots:
-            return self._detail_snapshots[key]
-        value = await self._read_run_detail(
-            selector,
-            compared_with=compared_with,
-            case_filter=case_filter,
-            cases_cursor=cases_cursor,
-            cases_limit=cases_limit,
+        if previous is None or previous.record is None:
+            return EvalViewComparisonData(EvalViewComparison(state="no_baseline"))
+        current, before = data.record.revision, previous.record.revision
+        if self.use_summaries:
+            record = await self.store.load_result_comparison(current, before)
+            if record is not None:
+                return comparison_from_record(record, selected)
+        _, current_result = await load_catalog_eval_result(current, self.store, self.registry)
+        _, previous_result = await load_catalog_eval_result(before, self.store, self.registry)
+        value = await asyncio.to_thread(
+            compare_view_results,
+            current_result,
+            data.snapshot,
+            previous_result,
+            previous.snapshot,
+            selected,
         )
-        if len(self._detail_snapshots) == 2:
-            self._detail_snapshots.pop(next(iter(self._detail_snapshots)))
-        self._detail_snapshots[key] = value
+        if self.use_summaries:
+            await self._record(
+                self.store.save_result_comparison(current, before, comparison_record(value))
+            )
         return value
 
-    async def _read_run_detail(
-        self,
-        selector: str,
-        *,
-        compared_with: str | None = None,
-        case_filter: EvalRunCaseFilter | None = None,
-        cases_cursor: str | None = None,
-        cases_limit: int = 50,
-    ) -> EvalRunViewDetail:
+    @staticmethod
+    async def _record(write) -> None:
+        """Record a derived row; a store that cannot write (read-only) still serves reads."""
+        try:
+            await write
+        except Exception:
+            _LOGGER.warning("Could not record an eval view summary row.", exc_info=True)
+
+    async def run_summary(self, selector: str, *, compared_with: str | None = None) -> _RunRead:
+        """A run's summary row with its comparison, without any of its cases."""
         if compared_with is not None:
             decode_run_view(compared_with)
         data = await self.run_data(selector)
@@ -310,12 +462,12 @@ class EvalViewReader:
         selected = compared_with or (
             run_view_id("result", baseline.result_revision) if baseline else None
         )
-        external_comparison = selected is not None and decode_run_view(selected)[0] == "report"
-        if external_comparison:
+        external = selected is not None and decode_run_view(selected)[0] == "report"
+        previous = None
+        if external:
             await self.reports.record(selected)
-        previous = (
-            None if selected is None or external_comparison else await self.run_data(selected)
-        )
+        elif selected is not None:
+            previous = await self.run_data(selected)
         compared_run = None
         if previous is not None:
             if compared_with is None and previous.identity != data.identity:
@@ -325,7 +477,7 @@ class EvalViewReader:
             compared_run = run_metadata(
                 previous,
                 baseline=await self.baseline(previous.identity),
-                specialist=self.target(previous.identity.target_key).request_base.agent_name,
+                specialist=self.specialist(previous.identity),
             )
             if (
                 baseline is not None
@@ -334,46 +486,110 @@ class EvalViewReader:
                 and previous.record.revision == baseline.result_revision
             ):
                 self._baseline_results[data.identity.id] = compared_run
-        comparison = await asyncio.to_thread(
-            compare_view_results,
-            data.result,
-            data.snapshot,
-            None if previous is None else previous.result,
-            None if previous is None else previous.snapshot,
-            selected,
-        )
-        if external_comparison:
+        if external:
             comparison = EvalViewComparisonData(report_comparison(selected))
-        metadata = run_metadata(
-            data,
-            baseline=baseline,
-            specialist=self.target(data.identity.target_key).request_base.agent_name,
-        )
-        return EvalRunViewDetail(
-            run=EvalRunViewSummary(
-                **metadata.model_dump(mode="python"),
-                comparison=comparison.summary,
-                baseline_result=await self.baseline_result(data.identity),
-            ),
-            compared_run=compared_run,
+        else:
+            comparison = await self.comparison(data, previous, selected)
+        metadata = run_metadata(data, baseline=baseline, specialist=self.specialist(data.identity))
+        summary = EvalRunViewSummary(
+            **metadata.model_dump(mode="python"),
             comparison=comparison.summary,
-            progress=run_progress(data),
-            results=case_page(
-                case_results(data, previous, comparison, case_filter=case_filter),
-                scope=[
-                    selector,
-                    None if data.record is None else data.record.revision,
-                    selected,
-                    None
-                    if previous is None or previous.record is None
-                    else previous.record.revision,
-                    None if baseline is None else [baseline.result_revision, baseline.generation],
-                    case_filter,
-                ],
-                cursor=cases_cursor,
-                limit=cases_limit,
-            ),
+            baseline_result=await self.baseline_result(data.identity),
         )
+        return _RunRead(summary, data, comparison, compared_run, previous, selected)
+
+    async def run_detail(
+        self,
+        selector: str,
+        *,
+        compared_with: str | None = None,
+        case_filter: EvalRunCaseFilter | None = None,
+        cases_cursor: str | None = None,
+        cases_limit: int = 50,
+        max_bytes: int | None = None,
+    ) -> EvalRunViewDetail:
+        if decode_run_view(selector)[0] == "report":
+            return await self.reports.run_detail(
+                selector,
+                compared_with=compared_with,
+                case_filter=case_filter,
+                cases_cursor=cases_cursor,
+                cases_limit=cases_limit,
+            )
+        read = await self.run_summary(selector, compared_with=compared_with)
+        summary, data, comparison, previous = read.run, read.data, read.comparison, read.previous
+        selected, baseline = read.selected, summary.baseline
+        scope = [
+            selector,
+            data.result_revision,
+            selected,
+            None if previous is None else previous.result_revision,
+            None if baseline is None else [baseline.result_revision, baseline.generation],
+            case_filter,
+        ]
+        after = case_cursor_after(cases_cursor, scope)
+        query = case_outcome_query(
+            data, comparison, case_filter=case_filter, after=after, limit=cases_limit
+        )
+        rows: list[EvalCaseResultView] = []
+        total, more = 0, False
+        if query is not None:
+            page = await self.case_outcomes(data, query)
+            compared: dict[str, EvalCaseOutcomeV1] = {}
+            if (
+                page.items
+                and comparison.summary.state == "compared"
+                and previous is not None
+                and previous.record is not None
+            ):
+                compared_page = await self.case_outcomes(
+                    previous,
+                    EvalCaseOutcomeQuery(
+                        revision=previous.record.revision,
+                        case_ids=tuple(item.case_id for item in page.items),
+                    ),
+                )
+                compared = {item.case_id: item for item in compared_page.items}
+            rows = case_results(data, page.items, compared, comparison)
+            total, more = page.total, page.has_more
+
+        def detail(kept: list[EvalCaseResultView], has_more: bool) -> EvalRunViewDetail:
+            return EvalRunViewDetail(
+                run=summary,
+                compared_run=read.compared_run,
+                comparison=comparison.summary,
+                progress=run_progress(data),
+                results=EvalViewPage(
+                    items=tuple(kept),
+                    total=total,
+                    has_more=has_more,
+                    next_cursor=case_cursor(scope, kept[-1].case.id) if has_more else None,
+                ),
+            )
+
+        result = detail(rows, more)
+        if max_bytes is None:
+            return result
+        # A page over the byte budget keeps the cases that fit and pages on to the
+        # rest, so a run with large evidence still opens; only a single case over
+        # the budget is too large to show.
+        size = len(result.model_dump_json().encode())
+        while size > max_bytes and len(rows) > 1:
+            excess = size - max_bytes
+            while len(rows) > 1 and excess > 0:
+                excess -= len(rows.pop().model_dump_json().encode())
+            result = detail(rows, True)
+            size = len(result.model_dump_json().encode())
+        return enforce_view_bytes(result, max_bytes)
+
+    async def history_run(self, item, identity: EvalSuiteViewIdentity):
+        selector = run_view_id(item.source, item.revision)
+        if item.source == "report":
+            # A corpus suite's history includes the reports associated with it.
+            run = self.reports.summary(await self.reports.record(selector))
+        else:
+            run = (await self.run_summary(selector)).run
+        return await self.with_history_scope(run, identity)
 
     async def with_history_scope(self, run: EvalRunViewMetadata, identity: EvalSuiteViewIdentity):
         if type(run) is EvalReportedRunView:
@@ -426,24 +642,18 @@ class EvalViewReader:
     async def suite_summary(self, identity: EvalSuiteViewIdentity) -> EvalSuiteViewSummary:
         if identity.source == "reported":
             return await self.reports.suite_summary(identity)
-        suite, cases = await self.suite_document(identity)
+        suite, cases = await self.suite_data(identity)
         history = await self.index(
             EvalViewQuery(target_key=identity.target_key, suite=identity, limit=1)
         )
-        last = None
-        if history.items:
-            item = history.items[0]
-            last = (
-                await self.run_detail(run_view_id(item.source, item.revision), cases_limit=1)
-            ).run
-            last = await self.with_history_scope(last, identity)
+        last = await self.history_run(history.items[0], identity) if history.items else None
         return EvalSuiteViewSummary(
             id=identity.id,
             identity=identity,
             source=identity.source,
             name=suite.name,
             description=suite.description,
-            specialist=self.target(identity.target_key).request_base.agent_name,
+            specialist=self.specialist(identity),
             case_count=len(cases),
             trials=eval_suite_trial_policy(suite),
             baseline=await self.baseline(identity),
@@ -487,6 +697,27 @@ class EvalViewReader:
             items=tuple(items), next_cursor=page.next_cursor, has_more=page.has_more
         )
 
+    async def latest_case_outcome(
+        self, item: EvalCaseResultReference, identity: EvalSuiteViewIdentity
+    ):
+        selector = run_view_id(item.source, item.revision)
+        cached = self._run_data.get(selector)
+        if cached is not None and cached.record is None:
+            # The latest-result query can see a publication after history cached
+            # this run as live. Refresh that snapshot before loading its outcome.
+            self._run_data.pop(selector)
+        await self.with_history_scope((await self.run_summary(selector)).run, identity)
+        data = await self.run_data(selector)
+        if data.record is None or data.summary is None:
+            return None
+        page = await self.case_outcomes(
+            data,
+            EvalCaseOutcomeQuery(
+                revision=data.record.revision, case_ids=(item.case_id,), include_evidence=False
+            ),
+        )
+        return page.items[0].presentation if page.items else None
+
     async def suite_detail(
         self,
         identity: EvalSuiteViewIdentity,
@@ -501,18 +732,15 @@ class EvalViewReader:
                 identity, runs_cursor=runs_cursor, runs_limit=runs_limit
             )
         summary = await self.suite_summary(identity)
-        _, definitions = await self.suite_document(identity)
+        _, definitions = await self.suite_data(identity)
         history = await self.index(
             EvalViewQuery(
                 target_key=identity.target_key, suite=identity, cursor=runs_cursor, limit=runs_limit
             )
         )
-        runs = []
-        for item in history.items:
-            detail = await self.run_detail(run_view_id(item.source, item.revision), cases_limit=1)
-            runs.append(await self.with_history_scope(detail.run, identity))
+        runs = [await self.history_run(item, identity) for item in history.items]
         page = case_page(
-            [case_view(case) for case in definitions],
+            [case.view for case in definitions],
             scope=identity.id,
             cursor=cases_cursor,
             limit=cases_limit,
@@ -540,18 +768,7 @@ class EvalViewReader:
             item = latest_by_id.get(case.id)
             outcome = None
             if item is not None:
-                detail = await self.run_detail(
-                    run_view_id(item.source, item.revision), cases_limit=1000
-                )
-                await self.with_history_scope(detail.run, identity)
-                outcome = next(
-                    (
-                        item.presentation
-                        for item in detail.results.items
-                        if item.presentation.case_id == case.id
-                    ),
-                    None,
-                )
+                outcome = await self.latest_case_outcome(item, identity)
                 if outcome is None:
                     raise HTTPException(
                         status_code=409, detail="Eval case history identity mismatch."

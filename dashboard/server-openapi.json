@@ -21259,6 +21259,63 @@
         "title": "EvalRunViewMetadata",
         "type": "object"
       },
+      "EvalRunViewPollV1": {
+        "additionalProperties": false,
+        "description": "What a live run view polls: the run's lifecycle and a version of its view.\n\n``version`` changes whenever anything a run view shows about the run can\nchange: its status, times, result, trial checkpoints or scenario progress.",
+        "properties": {
+          "completed_trials": {
+            "minimum": 0.0,
+            "title": "Completed Trials",
+            "type": "integer"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Revision"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EvalRunStatus"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "target_key",
+          "corpus_revision",
+          "suite_id",
+          "status",
+          "completed_trials",
+          "result_revision",
+          "version"
+        ],
+        "title": "EvalRunViewPollV1",
+        "type": "object"
+      },
       "EvalRunViewSummary": {
         "additionalProperties": false,
         "properties": {
@@ -54943,6 +55000,54 @@
           }
         },
         "summary": "Get Run View"
+      }
+    },
+    "/api/evals/run-views/{run_key}/status": {
+      "get": {
+        "description": "A live run view's poll: one run row, answered with 304 while it is unchanged.",
+        "operationId": "get_run_view_status_api_evals_run_views__run_key__status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_key",
+            "required": true,
+            "schema": {
+              "title": "Run Key",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunViewPollV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "304": {
+            "description": "The run view is unchanged."
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Run View Status"
       }
     },
     "/api/evals/runs": {

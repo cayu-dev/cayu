@@ -28,6 +28,7 @@ from cayu.evals.store import (
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
 )
+from cayu.evals.view_comparison import record_suite_baseline_comparisons
 from cayu.server._eval_result_loader import (
     _eval_result_record_matches_document as _eval_result_record_matches_document,
 )
@@ -56,6 +57,10 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.evals.store import EvalStore
     from cayu.server.evals_registry import EvalTargetRegistry
+
+
+#: Comparison warm-ups started by baseline selections, kept until they finish.
+_BACKGROUND: set[asyncio.Task[int]] = set()
 
 
 def register_evaluation_result_routes(
@@ -263,4 +268,11 @@ def register_evaluation_result_routes(
         baseline = await captured_eval_store.load_baseline(key)
         if baseline is None:
             raise RuntimeError("Committed eval baseline is unavailable.")
+        # The suite's pages now compare its latest runs with this baseline. Record
+        # those comparisons after answering, so the pages need not derive them.
+        warm = asyncio.get_running_loop().create_task(
+            record_suite_baseline_comparisons(captured_eval_store, key)
+        )
+        _BACKGROUND.add(warm)
+        warm.add_done_callback(_BACKGROUND.discard)
         return EvalBaselineSelectionResponse(baseline=baseline, mutation=mutation)

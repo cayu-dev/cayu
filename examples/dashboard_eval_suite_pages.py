@@ -143,14 +143,20 @@ async def exercise_large_suite_pages(page, base, target, selected):
             runs.append(run_selector)
             async with asyncio.timeout(90):
                 while True:
+                    # Poll the bounded lifecycle endpoint until publication;
+                    # the complete view is exercised below after it settles.
                     result = await page.request.get(
-                        f"{base}/api/evals/run-views/{run_selector}?cases_limit=1&max_result_bytes=8388608"
+                        f"{base}/api/evals/run-views/{run_selector}/status"
                     )
                     assert result.ok, await result.text()
-                    run = (await result.json())["run"]
-                    status = run["status"]
+                    status = (await result.json())["status"]
                     if status in ("completed", "failed", "cancelled"):
                         assert status == "completed", (kind, status)
+                        detail = await page.request.get(
+                            f"{base}/api/evals/run-views/{run_selector}?cases_limit=1&max_result_bytes=8388608"
+                        )
+                        assert detail.ok, await detail.text()
+                        run = (await detail.json())["run"]
                         execution_suites.append(_eval_view_selector("suite", run["suite"]))
                         break
                     await asyncio.sleep(0.1)
@@ -197,6 +203,8 @@ async def exercise_large_suite_pages(page, base, target, selected):
             )
             await expect(page.locator(f'table a[href$="/runs/{runs[1]}"]')).to_be_visible()
             await page.goto(f"{base}/cayu/evals/runs/{runs[1]}", wait_until="networkidle")
+            # Comparison history loads when the operator opens the selector.
+            await page.get_by_label("Compared with", exact=True).focus()
             await page.get_by_role("button", name="More runs", exact=True).click()
             await expect(page.locator(f'#compare-run option[value="{runs[0]}"]')).to_have_count(1)
             async with page.expect_response(

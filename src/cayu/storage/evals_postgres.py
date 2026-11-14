@@ -41,7 +41,6 @@ from cayu.evals.read_views import (
     EvalCaseHistoryQuery,
     EvalCaseResultReference,
     EvalRunViewSnapshot,
-    EvalTrialViewOutcome,
     EvalViewIndexEntry,
     EvalViewIndexPage,
     EvalViewQuery,
@@ -61,6 +60,7 @@ from cayu.evals.scenario import (
 from cayu.evals.store import (
     EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES,
     EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS,
+    EVAL_STORE_MAX_PAGE_SIZE,
     TERMINAL_EVAL_RUN_STATUSES,
     EvalAuthoredSuiteCatalogEntry,
     EvalAuthoredSuiteCatalogPage,
@@ -169,15 +169,28 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.evals.view_comparison import record_baseline_comparison
+from cayu.evals.view_summaries import (
+    EvalCaseOutcomePage,
+    EvalCaseOutcomeQuery,
+    EvalResultViewRows,
+    EvalResultViewSummaryV1,
+    EvalRunViewPollV1,
+    EvalSuiteCatalogEntryV1,
+    EvalViewComparisonRecordV1,
+    run_view_version,
+    summarize_result,
+)
+from cayu.storage import _postgres_eval_view_summaries as summary_sql
 from cayu.storage._eval_trial_slot_schema import (
-    EVAL_RUN_TRIAL_SLOTS_REVISION,
     EVAL_RUN_TRIAL_SLOTS_TABLE,
 )
 from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
+from cayu.storage._eval_view_summary_schema import EVAL_VIEW_SUMMARIES_REVISION
 from cayu.storage._postgres_base import _configure_store_connection, _PostgresStoreBase
 from cayu.storage._postgres_verified_work import PostgresMutationMixin
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = EVAL_RUN_TRIAL_SLOTS_REVISION
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = EVAL_VIEW_SUMMARIES_REVISION
 
 logger = logging.getLogger(__name__)
 
@@ -513,6 +526,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
     trial_distribution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
+    view_summaries: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_EVAL_MIN_REQUIRED_REVISION
 
     async def save_corpus(
@@ -1391,27 +1405,9 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
             row = await cur.fetchone()
             if row is None:
                 return None
-            await cur.execute(
-                "SELECT case_id, trial_number, "
-                "checkpoint_json::jsonb #>> '{result,status}', "
-                "(checkpoint_json::jsonb #>> '{result,score}')::double precision, "
-                "checkpoint_json::jsonb #>> '{public_data,diagnostic_code}' "
-                "FROM cayu_eval_run_trial_checkpoints WHERE run_id = %s",
-                (run_id,),
-            )
-            outcomes = await cur.fetchall()
             return EvalRunViewSnapshot(
                 run=_run_record_from_row(row),
-                terminal_trials=tuple(
-                    EvalTrialViewOutcome(
-                        case_id=item[0],
-                        trial_number=item[1],
-                        status=item[2],
-                        score=item[3],
-                        diagnostic_code=item[4],
-                    )
-                    for item in outcomes
-                ),
+                terminal_trials=await summary_sql.load_trial_outcomes(cur, run_id),
             )
 
     async def load_result_run_view_snapshot(self, revision: str) -> EvalRunViewSnapshot | None:
@@ -1432,6 +1428,119 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
         ):
             raise EvalRunStateConflict("Eval result run linkage mismatch.")
         return snapshot
+
+    async def load_result_view_summaries(
+        self, revisions: tuple[str, ...]
+    ) -> dict[str, EvalResultViewSummaryV1]:
+        revisions = tuple(_sha256_revision(item, "revision") for item in revisions)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_sql.load_summaries(cur, revisions)
+
+    async def list_case_outcomes(self, query: EvalCaseOutcomeQuery) -> EvalCaseOutcomePage | None:
+        query = _exact_model(query, EvalCaseOutcomeQuery, "query")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_sql.list_case_outcomes(cur, query)
+
+    async def save_result_view_rows(self, rows: EvalResultViewRows) -> bool:
+        if type(rows) is not EvalResultViewRows:
+            raise TypeError("rows must be EvalResultViewRows.")
+        revision = _sha256_revision(rows.summary.revision, "revision")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_eval_result_records WHERE revision = %s FOR SHARE",
+                        (revision,),
+                    )
+                    written = await cur.fetchone() is not None and (
+                        await summary_sql.write_view_rows(cur, revision, rows)
+                    )
+                await conn.commit()
+                return written
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_result_comparison(
+        self, current_revision: str, previous_revision: str
+    ) -> EvalViewComparisonRecordV1 | None:
+        current = _sha256_revision(current_revision, "current_revision")
+        previous = _sha256_revision(previous_revision, "previous_revision")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_sql.load_comparison(cur, current, previous)
+
+    async def save_result_comparison(
+        self,
+        current_revision: str,
+        previous_revision: str,
+        record: EvalViewComparisonRecordV1,
+    ) -> None:
+        current = _sha256_revision(current_revision, "current_revision")
+        previous = _sha256_revision(previous_revision, "previous_revision")
+        record = _exact_model(record, EvalViewComparisonRecordV1, "record")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await summary_sql.save_comparison(cur, current, previous, record)
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_suite_catalog(
+        self, keys: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], EvalSuiteCatalogEntryV1]:
+        keys = tuple(
+            (_sha256_revision(revision, "corpus_revision"), _store_identifier(suite, "suite_id"))
+            for revision, suite in keys
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            return await summary_sql.load_catalog(cur, keys)
+
+    async def list_results_without_view_summaries(self, limit: int) -> tuple[str, ...]:
+        if type(limit) is not int or not 1 <= limit <= EVAL_STORE_MAX_PAGE_SIZE:
+            raise ValueError("limit must be a page size.")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """SELECT records.revision FROM cayu_eval_result_records AS records
+                WHERE NOT EXISTS (SELECT 1 FROM cayu_eval_result_summaries AS summaries
+                                  WHERE summaries.revision = records.revision)
+                ORDER BY records.created_at ASC, records.revision COLLATE "C" ASC LIMIT %s""",
+                (limit,),
+            )
+            return tuple(str(row[0]) for row in await cur.fetchall())
+
+    async def load_run_view_poll(self, run_id: str) -> EvalRunViewPollV1 | None:
+        run_id = _store_identifier(run_id, "run_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT status, started_at, finished_at, cancel_requested_at, result_revision, "
+                "failure_code, trial_checkpoint_count, trial_checkpoint_bytes, "
+                "scenario_progress_json, target_key, corpus_revision, suite_id "
+                "FROM cayu_eval_runs WHERE run_id = %s",
+                (run_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return EvalRunViewPollV1(
+            run_id=run_id,
+            status=EvalRunStatus(row[0]),
+            completed_trials=row[6],
+            result_revision=row[4],
+            target_key=row[9],
+            corpus_revision=row[10],
+            suite_id=row[11],
+            version=run_view_version(*tuple(row)),
+        )
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
@@ -2514,6 +2623,17 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
+        published, validated = await self._publish_result(claim, result, redact_json=redact_json)
+        await record_baseline_comparison(self, validated)
+        return published
+
+    async def _publish_result(
+        self,
+        claim: EvalRunClaim,
+        result: CorpusExecutionResult,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> tuple[EvalRunRecord, CorpusExecutionResult]:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         result, result_document = await asyncio.to_thread(
             _prepare_result_for_store,
@@ -2531,6 +2651,9 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
             request,
             result,
             corpus,
+        )
+        view_rows = await asyncio.to_thread(
+            summarize_result, validated, document_bytes=len(result_document)
         )
         async with self._connection() as conn:
             try:
@@ -2554,7 +2677,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                             and existing[1] == result_text
                         ):
                             await conn.commit()
-                            return _run_record_from_row(row)
+                            return _run_record_from_row(row), validated
                         raise EvalRunStateConflict("Eval run already has another terminal result.")
                     now = await _database_now(cur)
                     self._require_live_claim(row, claim, now)
@@ -2586,6 +2709,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                         document_bytes=result_bytes,
                         created_at=now,
                         fresh_run_id=claim.run_id,
+                        view_rows=view_rows,
                     )
                     await cur.execute(
                         """
@@ -2611,7 +2735,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                     await _delete_trial_checkpoints(cur, claim.run_id)
                     updated = await self._require_run_row(cur, claim.run_id)
                 await conn.commit()
-                return _run_record_from_row(updated)
+                return _run_record_from_row(updated), validated
             except BaseException:
                 await conn.rollback()
                 raise
@@ -2781,6 +2905,15 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
             prepare_addition_documents, prepared, record, redact_json=redact_json
         )
         record = documents.record
+        captured_rows = (
+            None
+            if documents.captured is None
+            else await asyncio.to_thread(
+                summarize_result,
+                documents.captured[0],
+                document_bytes=len(documents.captured[1]),
+            )
+        )
         await self._ensure_ready()
 
         async def publish(conn, cur):
@@ -2843,7 +2976,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                     cases=cases,
                     created_at=now,
                 )
-            if documents.captured is not None:
+            if documents.captured is not None and captured_rows is not None:
                 result, payload = documents.captured
                 await self._save_result_in_transaction(
                     cur,
@@ -2852,6 +2985,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                     document_bytes=len(payload),
                     created_at=now,
                     fresh_run_id=None,
+                    view_rows=captured_rows,
                 )
             if record.receipt.plan.mode == "case":
                 destination = record.receipt.plan.destination.id
@@ -2883,6 +3017,17 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalResultRecord:
+        record = await self._save_captured_result(corpus, result, redact_json=redact_json)
+        await record_baseline_comparison(self, result)
+        return record
+
+    async def _save_captured_result(
+        self,
+        corpus: EvalCorpusDocument,
+        result: CapturedEvaluationResultV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalResultRecord:
         corpus, corpus_document, inspection, suites, cases = await asyncio.to_thread(
             _prepare_corpus_catalog_for_store,
             corpus,
@@ -2896,6 +3041,9 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
         )
         corpus_text = corpus_document.decode("utf-8")
         result_text = result_document.decode("utf-8")
+        view_rows = await asyncio.to_thread(
+            summarize_result, result, document_bytes=len(result_document)
+        )
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -2918,6 +3066,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                         document_bytes=len(result_document),
                         created_at=now,
                         fresh_run_id=None,
+                        view_rows=view_rows,
                     )
                 await conn.commit()
                 return record
@@ -3303,6 +3452,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
         document_bytes: int,
         created_at: datetime,
         fresh_run_id: str | None,
+        view_rows: EvalResultViewRows,
     ) -> EvalResultRecord:
         record = eval_result_record(
             result,
@@ -3338,6 +3488,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                 raise EvalResultConflict(
                     f"Eval result revision {record.revision} has conflicting content."
                 )
+            await summary_sql.write_view_rows(cur, record.revision, view_rows)
             return existing
         captured_document = (
             document_text if record.origin is EvalResultOrigin.CAPTURED_SESSION else None
@@ -3371,6 +3522,7 @@ class PostgresEvalStore(PostgresMutationMixin, _PostgresStoreBase, EvalStore):
                 created_at,
             ),
         )
+        await summary_sql.write_view_rows(cur, record.revision, view_rows)
         return record
 
     @staticmethod

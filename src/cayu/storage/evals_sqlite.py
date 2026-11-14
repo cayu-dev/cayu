@@ -46,7 +46,6 @@ from cayu.evals.read_views import (
     EvalCaseHistoryQuery,
     EvalCaseResultReference,
     EvalRunViewSnapshot,
-    EvalTrialViewOutcome,
     EvalViewIndexEntry,
     EvalViewIndexPage,
     EvalViewQuery,
@@ -66,6 +65,7 @@ from cayu.evals.scenario import (
 from cayu.evals.store import (
     EVAL_RUN_TRIAL_CHECKPOINTS_MAX_BYTES,
     EVAL_RUN_TRIAL_CHECKPOINTS_MAX_ITEMS,
+    EVAL_STORE_MAX_PAGE_SIZE,
     TERMINAL_EVAL_RUN_STATUSES,
     EvalAuthoredSuiteCatalogEntry,
     EvalAuthoredSuiteCatalogPage,
@@ -175,20 +175,33 @@ from cayu.evals.suite_authoring import (
     EvalSuiteDocument,
     eval_suite_document_from_json,
 )
+from cayu.evals.view_comparison import record_baseline_comparison
+from cayu.evals.view_summaries import (
+    EvalCaseOutcomePage,
+    EvalCaseOutcomeQuery,
+    EvalResultViewRows,
+    EvalResultViewSummaryV1,
+    EvalRunViewPollV1,
+    EvalSuiteCatalogEntryV1,
+    EvalViewComparisonRecordV1,
+    run_view_version,
+    summarize_result,
+)
 from cayu.storage import _sqlite_connection as sqlite_connection
+from cayu.storage import _sqlite_eval_view_summaries as summary_sql
 from cayu.storage import _sqlite_records as sqlite_records
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._eval_trial_slot_schema import (
-    EVAL_RUN_TRIAL_SLOTS_REVISION,
     EVAL_RUN_TRIAL_SLOTS_TABLE,
 )
 from cayu.storage._eval_view_queries import latest_case_results_sql, view_index_sql
+from cayu.storage._eval_view_summary_schema import EVAL_VIEW_SUMMARIES_REVISION
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
 from cayu.storage.targets import require_sqlite_store_allowed
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = EVAL_RUN_TRIAL_SLOTS_REVISION
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = EVAL_VIEW_SUMMARIES_REVISION
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +516,7 @@ class SQLiteEvalStore(EvalStore):
     trial_distribution: ClassVar[bool] = True
     suite_authoring: ClassVar[bool] = True
     judge_calibrations: ClassVar[bool] = True
+    view_summaries: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -921,7 +935,7 @@ class SQLiteEvalStore(EvalStore):
                 raise RuntimeError("Immutable eval corpus disappeared during a read.")
             return row["document_json"]
 
-        document = await self._run(operation)
+        document = await self._run_read(operation)
         if document is None:
             return None
         return await asyncio.to_thread(eval_corpus_from_json, document)
@@ -964,7 +978,7 @@ class SQLiteEvalStore(EvalStore):
             items = [self._corpus_entry_from_row(row) for row in rows]
             return _bounded_corpus_page(items, query)
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def save_scenario(
         self,
@@ -1056,7 +1070,7 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalStoreResultTooLarge(max_bytes)
             return row["document_json"]
 
-        document = await self._run(operation)
+        document = await self._run_read(operation)
         if document is None:
             return None
         return await asyncio.to_thread(eval_scenario_from_json, document)
@@ -1104,7 +1118,7 @@ class SQLiteEvalStore(EvalStore):
                 query,
             )
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     def _inherit_case_addition_sources(
         self,
@@ -1270,7 +1284,7 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalStoreResultTooLarge(max_bytes)
             return row["document_json"]
 
-        payload = await self._run(operation)
+        payload = await self._run_read(operation)
         if payload is None:
             return None
         return await asyncio.to_thread(eval_suite_document_from_json, payload)
@@ -1321,7 +1335,7 @@ class SQLiteEvalStore(EvalStore):
                 query,
             )
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def save_judge_calibration(
         self,
@@ -1409,7 +1423,7 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalStoreResultTooLarge(max_bytes)
             return row["report_json"]
 
-        stored = await self._run(operation)
+        stored = await self._run_read(operation)
         if stored is None:
             return None
         return await asyncio.to_thread(eval_judge_calibration_report_from_json, stored)
@@ -1438,7 +1452,7 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalStoreResultTooLarge(max_bytes)
             return row["report_json"]
 
-        stored = await self._run(operation)
+        stored = await self._run_read(operation)
         if stored is None:
             return None
         return await asyncio.to_thread(eval_judge_calibration_report_from_json, stored)
@@ -1470,7 +1484,7 @@ class SQLiteEvalStore(EvalStore):
                 query,
             )
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def list_cases(self, query: EvalCaseCatalogQuery) -> EvalCaseCatalogPage:
         query = _copy_query(query, EvalCaseCatalogQuery)
@@ -1508,7 +1522,7 @@ class SQLiteEvalStore(EvalStore):
                 query,
             )
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def admit_run(
         self,
@@ -1621,7 +1635,7 @@ class SQLiteEvalStore(EvalStore):
             return None if row is None else _run_record_from_row(row)
 
         try:
-            return await self._run(operation)
+            return await self._run_read(operation)
         finally:
             logger.debug(
                 "SQLite eval run fully rehydrated.",
@@ -1719,19 +1733,9 @@ class SQLiteEvalStore(EvalStore):
                 if row is None:
                     connection.commit()
                     return None
-                outcomes = connection.execute(
-                    "SELECT case_id, trial_number, "
-                    "json_extract(checkpoint_json, '$.result.status') AS status, "
-                    "json_extract(checkpoint_json, '$.result.score') AS score, "
-                    "json_extract(checkpoint_json, '$.public_data.diagnostic_code') AS diagnostic_code "
-                    "FROM cayu_eval_run_trial_checkpoints WHERE run_id = ?",
-                    (run_id,),
-                ).fetchall()
                 snapshot = EvalRunViewSnapshot(
                     run=_run_record_from_row(row),
-                    terminal_trials=tuple(
-                        EvalTrialViewOutcome.model_validate(dict(item)) for item in outcomes
-                    ),
+                    terminal_trials=summary_sql.load_trial_outcomes(connection, run_id),
                 )
                 connection.commit()
                 return snapshot
@@ -1760,6 +1764,114 @@ class SQLiteEvalStore(EvalStore):
         ):
             raise EvalRunStateConflict("Eval result run linkage mismatch.")
         return snapshot
+
+    async def load_result_view_summaries(
+        self, revisions: tuple[str, ...]
+    ) -> dict[str, EvalResultViewSummaryV1]:
+        revisions = tuple(_sha256_revision(item, "revision") for item in revisions)
+        return await self._run_read(
+            lambda connection: summary_sql.load_summaries(connection, revisions)
+        )
+
+    async def list_case_outcomes(self, query: EvalCaseOutcomeQuery) -> EvalCaseOutcomePage | None:
+        query = _exact_model(query, EvalCaseOutcomeQuery, "query")
+        return await self._run_read(
+            lambda connection: summary_sql.list_case_outcomes(connection, query)
+        )
+
+    async def save_result_view_rows(self, rows: EvalResultViewRows) -> bool:
+        if type(rows) is not EvalResultViewRows:
+            raise TypeError("rows must be EvalResultViewRows.")
+        revision = _sha256_revision(rows.summary.revision, "revision")
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            with sqlite_connection._transaction(connection):
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM cayu_eval_result_records WHERE revision = ?", (revision,)
+                    ).fetchone()
+                    is None
+                ):
+                    return False
+                return summary_sql.write_view_rows(connection, revision, rows)
+
+        return await self._run(operation)
+
+    async def load_result_comparison(
+        self, current_revision: str, previous_revision: str
+    ) -> EvalViewComparisonRecordV1 | None:
+        current = _sha256_revision(current_revision, "current_revision")
+        previous = _sha256_revision(previous_revision, "previous_revision")
+        return await self._run_read(
+            lambda connection: summary_sql.load_comparison(connection, current, previous)
+        )
+
+    async def save_result_comparison(
+        self,
+        current_revision: str,
+        previous_revision: str,
+        record: EvalViewComparisonRecordV1,
+    ) -> None:
+        current = _sha256_revision(current_revision, "current_revision")
+        previous = _sha256_revision(previous_revision, "previous_revision")
+        record = _exact_model(record, EvalViewComparisonRecordV1, "record")
+
+        def operation(connection: sqlite3.Connection) -> None:
+            with sqlite_connection._transaction(connection):
+                summary_sql.save_comparison(connection, current, previous, record)
+
+        await self._run(operation)
+
+    async def load_suite_catalog(
+        self, keys: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], EvalSuiteCatalogEntryV1]:
+        keys = tuple(
+            (_sha256_revision(revision, "corpus_revision"), _store_identifier(suite, "suite_id"))
+            for revision, suite in keys
+        )
+        return await self._run_read(lambda connection: summary_sql.load_catalog(connection, keys))
+
+    async def list_results_without_view_summaries(self, limit: int) -> tuple[str, ...]:
+        if type(limit) is not int or not 1 <= limit <= EVAL_STORE_MAX_PAGE_SIZE:
+            raise ValueError("limit must be a page size.")
+        return await self._run_read(
+            lambda connection: tuple(
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT records.revision FROM cayu_eval_result_records AS records
+                    WHERE NOT EXISTS (SELECT 1 FROM cayu_eval_result_summaries AS summaries
+                                      WHERE summaries.revision = records.revision)
+                    ORDER BY records.created_at ASC, records.revision ASC LIMIT ?""",
+                    (limit,),
+                )
+            )
+        )
+
+    async def load_run_view_poll(self, run_id: str) -> EvalRunViewPollV1 | None:
+        run_id = _store_identifier(run_id, "run_id")
+
+        def operation(connection: sqlite3.Connection) -> EvalRunViewPollV1 | None:
+            row = connection.execute(
+                "SELECT status, started_at, finished_at, cancel_requested_at, result_revision, "
+                "failure_code, trial_checkpoint_count, trial_checkpoint_bytes, "
+                "scenario_progress_json, target_key, corpus_revision, suite_id "
+                "FROM cayu_eval_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return EvalRunViewPollV1(
+                run_id=run_id,
+                status=EvalRunStatus(row[0]),
+                completed_trials=row[6],
+                result_revision=row[4],
+                target_key=row[9],
+                corpus_revision=row[10],
+                suite_id=row[11],
+                version=run_view_version(*tuple(row)),
+            )
+
+        return await self._run_read(operation)
 
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
@@ -1803,7 +1915,7 @@ class SQLiteEvalStore(EvalStore):
             ).fetchall()
             return _bounded_run_page([_run_record_from_row(row) for row in rows], query)
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def claim_run(
         self,
@@ -2320,7 +2432,7 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def load_trial_evidence_links(self, run_id: str) -> tuple[EvalTrialEvidenceLinkV1, ...]:
         run_id = _store_identifier(run_id, "run_id")
@@ -2340,7 +2452,7 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def save_trial_checkpoint(
         self,
@@ -2917,6 +3029,9 @@ class SQLiteEvalStore(EvalStore):
             result,
             corpus,
         )
+        view_rows = await asyncio.to_thread(
+            summarize_result, validated, document_bytes=len(document)
+        )
 
         def operation(connection: sqlite3.Connection) -> EvalRunRecord:
             try:
@@ -2971,6 +3086,7 @@ class SQLiteEvalStore(EvalStore):
                     document_bytes=len(document),
                     created_at=now,
                     fresh_run_id=claim.run_id,
+                    view_rows=view_rows,
                 )
                 connection.execute(
                     """
@@ -3000,11 +3116,13 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run_eval_writer(
+        published = await self._run_eval_writer(
             operation,
             operation_name="publish_result",
             run_id=claim.run_id,
         )
+        await record_baseline_comparison(self, validated)
+        return published
 
     async def fail_run(
         self,
@@ -3116,7 +3234,7 @@ class SQLiteEvalStore(EvalStore):
                 raise RuntimeError("Immutable eval result disappeared during a read.")
             return row["result_json"]
 
-        document = await self._run(operation)
+        document = await self._run_read(operation)
         if document is None:
             return None
         return await asyncio.to_thread(corpus_execution_result_from_json, document)
@@ -3175,6 +3293,15 @@ class SQLiteEvalStore(EvalStore):
             prepare_addition_documents, prepared, record, redact_json=redact_json
         )
         record = documents.record
+        captured_rows = (
+            None
+            if documents.captured is None
+            else await asyncio.to_thread(
+                summarize_result,
+                documents.captured[0],
+                document_bytes=len(documents.captured[1]),
+            )
+        )
 
         def operation(connection):
             with sqlite_connection._transaction(connection):
@@ -3227,7 +3354,7 @@ class SQLiteEvalStore(EvalStore):
                         cases=cases,
                         created_at=now,
                     )
-                if documents.captured is not None:
+                if documents.captured is not None and captured_rows is not None:
                     result, payload = documents.captured
                     self._save_result_in_transaction(
                         connection,
@@ -3236,6 +3363,7 @@ class SQLiteEvalStore(EvalStore):
                         document_bytes=len(payload),
                         created_at=now,
                         fresh_run_id=None,
+                        view_rows=captured_rows,
                     )
                 connection.execute(
                     "INSERT INTO cayu_eval_session_additions (operation_id, destination_selector, case_id, case_revision, result_revision, record_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3292,6 +3420,9 @@ class SQLiteEvalStore(EvalStore):
         )
         corpus_text = corpus_document.decode("utf-8")
         result_text = result_document.decode("utf-8")
+        view_rows = await asyncio.to_thread(
+            summarize_result, result, document_bytes=len(result_document)
+        )
 
         def operation(connection: sqlite3.Connection) -> EvalResultRecord:
             try:
@@ -3314,6 +3445,7 @@ class SQLiteEvalStore(EvalStore):
                     document_bytes=len(result_document),
                     created_at=now,
                     fresh_run_id=None,
+                    view_rows=view_rows,
                 )
                 connection.commit()
                 return record
@@ -3321,7 +3453,9 @@ class SQLiteEvalStore(EvalStore):
                 connection.rollback()
                 raise
 
-        return await self._run(operation)
+        record = await self._run(operation)
+        await record_baseline_comparison(self, result)
+        return record
 
     async def load_result_by_revision(
         self,
@@ -3362,7 +3496,7 @@ class SQLiteEvalStore(EvalStore):
                 raise RuntimeError("Immutable eval result document is unavailable.")
             return origin, document
 
-        loaded = await self._run(operation)
+        loaded = await self._run_read(operation)
         if loaded is None:
             return None
         origin, document = loaded
@@ -3380,7 +3514,7 @@ class SQLiteEvalStore(EvalStore):
             ).fetchone()
             return None if row is None else _result_record_from_row(row)
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def list_results(self, query: EvalResultQuery) -> EvalResultPage:
         query = _exact_model(query, EvalResultQuery, "query")
@@ -3415,7 +3549,7 @@ class SQLiteEvalStore(EvalStore):
                 query,
             )
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def set_baseline(
         self,
@@ -3540,7 +3674,7 @@ class SQLiteEvalStore(EvalStore):
             ).fetchone()
             return None if row is None else _baseline_record_from_row(row)
 
-        return await self._run(operation)
+        return await self._run_read(operation)
 
     async def load_baseline_mutation(
         self,
@@ -3675,6 +3809,7 @@ class SQLiteEvalStore(EvalStore):
         document_bytes: int,
         created_at: datetime,
         fresh_run_id: str | None,
+        view_rows: EvalResultViewRows,
     ) -> EvalResultRecord:
         record = eval_result_record(
             result,
@@ -3704,6 +3839,7 @@ class SQLiteEvalStore(EvalStore):
                 raise EvalResultConflict(
                     f"Eval result revision {record.revision} has conflicting content."
                 )
+            summary_sql.write_view_rows(connection, record.revision, view_rows)
             return existing
         captured_document = (
             document_text if record.origin is EvalResultOrigin.CAPTURED_SESSION else None
@@ -3737,6 +3873,7 @@ class SQLiteEvalStore(EvalStore):
                 _format_datetime(created_at),
             ),
         )
+        summary_sql.write_view_rows(connection, record.revision, view_rows)
         return record
 
     @staticmethod

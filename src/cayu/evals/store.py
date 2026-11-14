@@ -3229,6 +3229,15 @@ if TYPE_CHECKING:
     )
     from cayu.evals.reported import EvalReport, EvalReportRecord
     from cayu.evals.session_additions import EvalAdditionRecord, PreparedEvalAddition
+    from cayu.evals.view_summaries import (
+        EvalCaseOutcomePage,
+        EvalCaseOutcomeQuery,
+        EvalResultViewRows,
+        EvalResultViewSummaryV1,
+        EvalRunViewPollV1,
+        EvalSuiteCatalogEntryV1,
+        EvalViewComparisonRecordV1,
+    )
     from cayu.storage.retention import (
         EvalRetentionPolicy,
         RetentionAuditRecord,
@@ -3330,6 +3339,72 @@ class EvalStore(ABC):
         by scanning history or matching content. The linked run must publish revision.
         """
         raise NotImplementedError("This EvalStore does not support suite views.")
+
+    #: The store keeps the revision-153 summaries the Evals pages read. Readers of
+    #: a store without them derive the same values from whole documents.
+    view_summaries: ClassVar[bool] = False
+
+    async def load_result_view_summaries(
+        self, revisions: tuple[str, ...]
+    ) -> dict[str, EvalResultViewSummaryV1]:
+        """Stored summaries of these results; a result without one is left out."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def list_case_outcomes(self, query: EvalCaseOutcomeQuery) -> EvalCaseOutcomePage | None:
+        """A keyset page of one result's case outcomes, or None without stored rows."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def save_result_view_rows(self, rows: EvalResultViewRows) -> bool:
+        """Record a result's summary and case outcomes; False when it already has them."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def load_result_comparison(
+        self, current_revision: str, previous_revision: str
+    ) -> EvalViewComparisonRecordV1 | None:
+        """The recorded comparison of two results, if any reader recorded it."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def save_result_comparison(
+        self,
+        current_revision: str,
+        previous_revision: str,
+        record: EvalViewComparisonRecordV1,
+    ) -> None:
+        """Record the comparison of two stored results; a pure function of the pair."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def load_suite_catalog(
+        self, keys: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], EvalSuiteCatalogEntryV1]:
+        """Catalog rows of these (corpus revision, suite ID) pairs."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def list_results_without_view_summaries(self, limit: int) -> tuple[str, ...]:
+        """Revisions of results, oldest first, that have no stored summary yet."""
+        raise NotImplementedError("This EvalStore does not keep view summaries.")
+
+    async def load_run_view_poll(self, run_id: str) -> EvalRunViewPollV1 | None:
+        """The run's lifecycle and view version.
+
+        Stores with view summaries read the run row alone. This default derives it
+        from the run view snapshot, so it works for any store with suite views.
+        """
+        from cayu.evals.view_summaries import EvalRunViewPollV1, run_view_version
+
+        snapshot = await self.load_run_view_snapshot(run_id)
+        if snapshot is None:
+            return None
+        run = snapshot.run
+        return EvalRunViewPollV1(
+            run_id=run.id,
+            target_key=run.spec.target_key,
+            corpus_revision=run.spec.corpus_revision,
+            suite_id=run.spec.suite_id,
+            status=run.status,
+            completed_trials=len(snapshot.terminal_trials),
+            result_revision=None if run.result is None else run.result.revision,
+            version=run_view_version(snapshot.model_dump(mode="json")),
+        )
 
     @abstractmethod
     async def close(self) -> None:

@@ -134,6 +134,7 @@
   "GET /api/evals/suite-views/resolve-corpus name=resolve_corpus_suite_view class=_AuthenticatedBoundedEvalsRoute GET=resolve_corpus_suite_view_api_evals_suite_views_resolve_corpus_get",
   "GET /api/evals/suite-views/{suite_key} name=get_suite_view class=_AuthenticatedBoundedEvalsRoute GET=get_suite_view_api_evals_suite_views__suite_key__get",
   "GET /api/evals/run-views/{run_key} name=get_run_view class=_AuthenticatedBoundedEvalsRoute GET=get_run_view_api_evals_run_views__run_key__get",
+  "GET /api/evals/run-views/{run_key}/status name=get_run_view_status class=_AuthenticatedBoundedEvalsRoute GET=get_run_view_status_api_evals_run_views__run_key__status_get",
   "GET /api/evals/reports/{run_key}/download name=download_report class=_AuthenticatedBoundedEvalsRoute GET=download_report_api_evals_reports__run_key__download_get",
   "GET /api/evals/targets name=list_eval_targets class=_AuthenticatedBoundedEvalsRoute GET=list_eval_targets_api_evals_targets_get",
   "POST /api/evals/judge-calibrations/preview name=preview_eval_judge_calibration class=_AuthenticatedBoundedEvalsRoute POST=preview_eval_judge_calibration_api_evals_judge_calibrations_preview_post",

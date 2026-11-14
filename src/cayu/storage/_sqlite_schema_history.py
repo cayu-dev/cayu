@@ -25,6 +25,10 @@ from cayu.storage._completion_verifier_dispatch_schema import (
     SQLITE_COMPLETION_VERIFIER_DISPATCH_DDL,
 )
 from cayu.storage._eval_trial_slot_schema import SQLITE_EVAL_RUN_TRIAL_SLOT_DDL
+from cayu.storage._eval_view_summary_schema import (
+    EVAL_VIEW_SUMMARIES_REVISION,
+    SQLITE_EVAL_VIEW_SUMMARIES_DDL,
+)
 from cayu.storage._external_wait_schema import SQLITE_EXTERNAL_WAIT_DDL
 from cayu.storage._knowledge_lookup_schema import (
     KNOWLEDGE_LOOKUP_TOTALS_REVISION,
@@ -822,6 +826,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     TRACE_EVENTS_REVISION: SQLITE_TRACE_EVENTS_DDL,
     # One summary row per session, kept by triggers on its overview's sources.
     SESSION_SUMMARY_REVISION: SQLITE_SESSION_SUMMARIES_DDL,
+    # Summary tables the Evals pages read instead of whole documents.
+    EVAL_VIEW_SUMMARIES_REVISION: SQLITE_EVAL_VIEW_SUMMARIES_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

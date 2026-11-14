@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useParams, useSearch } from "@tanstack/react-router"
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { PayloadViewer } from "@/components/dashboard/layout"
 import { Button } from "@/components/ui/button"
 import {
@@ -26,11 +26,11 @@ import {
 import {
   evalProcessLocalIdentityText,
   evalRunCanCancel,
-  evalRunIsActive,
+  evalStatusIsActive,
 } from "@/lib/evals-dashboard"
 import { evalResultRevisionIsValid } from "@/lib/evals-search"
 import type { EvalCaseResultView, EvalScenarioTrialProgress } from "@/lib/generated/server-api"
-import { fetchRunView, fetchSuiteView } from "../../api/eval-views"
+import { fetchRunView, fetchRunViewStatus, fetchSuiteView } from "../../api/eval-views"
 import {
   comparisonLabel,
   evalCaseFilter,
@@ -240,6 +240,8 @@ export function EvalRunViewPage() {
   )
   const [compareCursor, setCompareCursor] = useState<string>()
   const [metadataOpen, setMetadataOpen] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [compareOptionsOpen, setCompareOptionsOpen] = useState(false)
   const [comparisonOpen, setComparisonOpen] = useState(false)
   const [comparisonRevision, setComparisonRevision] = useState("")
   const baselineOperations = useRef(new Map<string, string>())
@@ -256,14 +258,32 @@ export function EvalRunViewPage() {
         },
         signal,
       ),
-    refetchInterval: (q) =>
-      ["running", "queued", "cancelling"].includes(q.state.data?.run.status ?? "") ? 1500 : false,
-    refetchIntervalInBackground: false,
   })
   const data = query.data
   const reported = isReportedRunDetail(data) ? data : undefined
   const detail = isNativeRunDetail(data) ? data : undefined
   const r = detail?.run
+  // A live run page polls one small status row (304 while unchanged) and reloads
+  // the run view and run record only when its version changes.
+  const live = !!r?.native_run_id && evalStatusIsActive(r.status)
+  const status = useQuery({
+    queryKey: ["evals", "run-view-status", runId],
+    queryFn: ({ signal }) => fetchRunViewStatus(runId, signal),
+    enabled: live,
+    refetchInterval: (q) =>
+      q.state.data && !evalStatusIsActive(q.state.data.status) ? false : 1500,
+    refetchIntervalInBackground: false,
+  })
+  const liveVersion = status.data?.version
+  const seenVersion = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (liveVersion === undefined) return
+    // The first version also reloads: it was not read with the run view, so the run
+    // may have moved on (or finished) in between.
+    if (seenVersion.current !== liveVersion)
+      void client.invalidateQueries({ queryKey: ["evals", "run-view", runId] })
+    seenVersion.current = liveVersion
+  }, [client, liveVersion, runId])
   const comparedRevision = detail?.compared_run?.result_revision
   const technicalComparison = useQuery({
     queryKey: ["evals", "technical-comparison", comparedRevision, r?.result_revision],
@@ -271,27 +291,29 @@ export function EvalRunViewPage() {
     enabled: canReadDetails && comparisonOpen && !!comparedRevision && !!r?.result_revision,
   })
   const native = useQuery({
-    queryKey: ["evals", "run", r?.native_run_id],
+    queryKey: ["evals", "run", r?.native_run_id, liveVersion],
     queryFn: ({ signal }) => fetchEvalRun(r?.native_run_id ?? "", signal),
     enabled: canReadDetails && !!r?.native_run_id,
-    refetchInterval: (q) => (evalRunIsActive(q.state.data) ? 1500 : false),
-    refetchIntervalInBackground: false,
+    placeholderData: (previous) => previous,
   })
+  // Whole results load only when Details is open, or for a case's trace links.
   const result = useQuery({
     queryKey: ["evals", "result-detail", r?.result_revision],
     queryFn: ({ signal }) => fetchEvalResultDetail(r?.result_revision ?? "", signal),
-    enabled: canReadDetails && !!r?.result_revision,
+    enabled: canReadDetails && detailsOpen && !r?.native_run_id && !!r?.result_revision,
   })
   const nativeResult = useQuery({
     queryKey: ["evals", "result", r?.native_run_id],
     queryFn: ({ signal }) => fetchEvalResult(r?.native_run_id ?? "", signal),
-    enabled: canReadDetails && !!r?.native_run_id && !!r.result_revision,
+    enabled:
+      canReadDetails && (detailsOpen || !!search.case) && !!r?.native_run_id && !!r.result_revision,
   })
+  // The suite's run history only fills the comparison picker, once it is used.
   const history = useQuery({
     queryKey: ["evals", "compare-options", r?.suite, compareCursor],
     queryFn: ({ signal }) =>
       fetchSuiteView(suiteSelector(r!.suite), { runs_cursor: compareCursor }, signal),
-    enabled: !!r,
+    enabled: !!r && compareOptionsOpen,
   })
   const refresh = async () => {
     setCursor(undefined)
@@ -529,6 +551,8 @@ export function EvalRunViewPage() {
                 id="compare-run"
                 className={`${FIELD_CLASS} max-w-full flex-1 sm:max-w-md`}
                 value={search.compare ?? ""}
+                onFocus={() => setCompareOptionsOpen(true)}
+                onPointerDown={() => setCompareOptionsOpen(true)}
                 onChange={(e) =>
                   changeSearch({ compare: e.target.value || undefined, case: undefined })
                 }
@@ -692,7 +716,10 @@ export function EvalRunViewPage() {
             >
               Eval run status: {r.status}.
             </span>
-            <details className="mt-8 rounded-xl border border-border p-4">
+            <details
+              className="mt-8 rounded-xl border border-border p-4"
+              onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
+            >
               <summary className="cursor-pointer text-sm font-medium">Details</summary>
               <div className="mt-4 space-y-5">
                 {!canReadDetails && (

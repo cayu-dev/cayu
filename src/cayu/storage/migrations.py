@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
+from cayu.storage._eval_view_summary_schema import EVAL_VIEW_SUMMARIES_REVISION
 from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
 from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
@@ -672,6 +673,15 @@ REVISIONS: tuple[Revision, ...] = (
     # served while the stamps it was derived from are unchanged. The migration
     # adds a row for every retained session. Session stores require it.
     Revision(revision=SESSION_SUMMARY_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # The Evals pages read summary tables instead of whole results, corpora and
+    # trial checkpoints: a suite catalog and trial checkpoint summaries kept by
+    # triggers, result summaries and case outcomes written with each result,
+    # and a record of result comparisons. Older binaries ignore the tables; a
+    # result they publish has no summary, and readers derive it. Eval stores
+    # require it.
+    Revision(
+        revision=EVAL_VIEW_SUMMARIES_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146
+    ),
 )
 
 #: The revision an empty database is initialized to.

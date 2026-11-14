@@ -2179,9 +2179,11 @@ async def _exercise_eval_launch_navigation(page: Page, base_url: str) -> None:
             release.set()
             await page.wait_for_timeout(250)
             await expect(page).to_have_url(f"{base_url}/cayu/sessions")
-            detail = await (
-                await page.request.get(f"{base_url}/api/evals/suite-views/{destination}")
-            ).json()
+            detail_response = await page.request.get(
+                f"{base_url}/api/evals/suite-views/{destination}"
+            )
+            require(detail_response.ok, await detail_response.text())
+            detail = await detail_response.json()
             require(
                 any(item["native_run_id"] == run_ids[-1] for item in detail["runs"]["items"]),
                 "leaving the view does not cancel or hide the accepted run",
@@ -3503,6 +3505,7 @@ async def _exercise_captured_evaluation(
         "two explicit dashboard launches must create distinct durable runs",
     )
     baseline_selector = _eval_view_selector("run", baseline_run_id)
+    await page.get_by_label("Compared with", exact=True).focus()
     await page.get_by_label("Compared with", exact=True).select_option(baseline_selector)
     await expect(page.get_by_role("heading", name="No change", exact=True)).to_be_visible()
     await _open_eval_details(page)

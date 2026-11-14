@@ -189,6 +189,9 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
     )
     show.add_argument("run_id", metavar="RUN_ID")
     _add_target_options(show, render_run_detail)
+    from cayu.cli._eval_run_summaries import add_run_summary_parsers
+
+    add_run_summary_parsers(run_actions)
     cancel = run_actions.add_parser(
         "cancel",
         help="Cancel an eval run.",
@@ -363,6 +366,11 @@ def add_curation_parsers(commands: argparse._SubParsersAction[argparse.ArgumentP
 
 def run_curation_command(args: argparse.Namespace) -> int:
     """Run one of the commands and print its JSON envelope, or its text with ``--table``."""
+
+    from cayu.cli import _eval_run_summaries as run_summaries
+
+    if args.eval_command == "runs" and args.eval_runs_command in run_summaries.COMMANDS:
+        return run_summaries.run_run_summary_command(args)
 
     from cayu.cli._cloud_api import CloudApiError
     from cayu.cli._cloud_auth import CloudAuthError

@@ -10239,6 +10239,46 @@ export type EvalRunViewMetadata = {
 };
 
 /**
+ * EvalRunViewPollV1
+ *
+ * What a live run view polls: the run's lifecycle and a version of its view.
+ *
+ * ``version`` changes whenever anything a run view shows about the run can
+ * change: its status, times, result, trial checkpoints or scenario progress.
+ */
+export type EvalRunViewPollV1 = {
+    /**
+     * Completed Trials
+     */
+    completed_trials: number;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Result Revision
+     */
+    result_revision: string | null;
+    /**
+     * Run Id
+     */
+    run_id: string;
+    status: EvalRunStatus;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Version
+     */
+    version: string;
+};
+
+/**
  * EvalRunViewSummary
  */
 export type EvalRunViewSummary = {
@@ -28146,6 +28186,50 @@ export type GetRunViewApiEvalsRunViewsRunKeyGetResponses = {
 };
 
 export type GetRunViewApiEvalsRunViewsRunKeyGetResponse = GetRunViewApiEvalsRunViewsRunKeyGetResponses[keyof GetRunViewApiEvalsRunViewsRunKeyGetResponses];
+
+export type GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Key
+         */
+        run_key: string;
+    };
+    query?: never;
+    url: '/api/evals/run-views/{run_key}/status';
+};
+
+export type GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalRunViewPollV1;
+};
+
+export type GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetResponse = GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetResponses[keyof GetRunViewStatusApiEvalsRunViewsRunKeyStatusGetResponses];
 
 export type ListEvalRunsApiEvalsRunsGetData = {
     body?: never;

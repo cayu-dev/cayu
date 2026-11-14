@@ -4091,6 +4091,47 @@ case. Run snapshots must atomically observe lifecycle and unique terminal
 Stores without this extension remain explicitly unavailable; the server does
 not scan their complete histories as a fallback.
 
+#### Summary tables (storage revision 154)
+
+Suite views read summary rows, not whole documents. A result document holds
+every trial's evidence and can reach 40 MB, so decoding results, corpora and
+trial checkpoints on every request made the Evals pages take seconds. Since
+storage revision 154, SQLite and PostgreSQL eval stores (`view_summaries = True`)
+keep:
+
+- `cayu_eval_suite_catalog`: each corpus suite's specification and its cases'
+  specifications, cut out of the corpus document by a trigger on
+  `cayu_eval_suites`.
+- `cayu_eval_trial_checkpoint_summaries`: each trial checkpoint's status, score,
+  diagnostic code and size, kept by triggers on the checkpoints, so a live run
+  view never parses a checkpoint.
+- `cayu_eval_result_summaries` and `cayu_eval_case_outcomes`: a result's counts,
+  scores, usage and catalog metadata, and each case's canonical presentation and
+  evidence. The store writes them in the same transaction as the result record.
+- `cayu_eval_result_comparisons`: the comparison of two results, a pure function
+  of the pair. Publication records a result's comparison with its suite baseline,
+  selecting a baseline records the suite's latest 20 runs' comparisons in the
+  background, and a reader records any other pair the first time it compares it.
+
+Summary rows are deleted with the result, checkpoint or suite they summarize.
+The migration fills the catalog and checkpoint summaries from existing data.
+A result published before revision 154, or by an older binary, has no result
+summary; a run view then derives it from the document and records it. Write
+them ahead of time with `cayu eval runs rebuild-summaries --write`, and check a
+run's stored summary against a recompute from its result with
+`cayu eval runs check RUN_ID` (exit status 1 when they differ). Both take
+`--sqlite PATH` or `--postgres DSN`, or read the project's store. A page's
+values are the same either way: `cayu.server._eval_view_reader.EvalViewReader`
+with `use_summaries=False` derives every value from the documents, and the
+tests compare the two on random histories.
+
+`GET /run-views/{run_key}/status` is what a live run page polls: one run row
+with `status`, `completed_trials` and an opaque `version` that changes whenever
+anything the run view shows can change (lifecycle, result, trial checkpoints,
+scenario progress, the suite baseline). It answers with an `ETag`, and with an
+empty `304` to a matching `If-None-Match`. The dashboard reloads the run view
+only when the version changes.
+
 ### First-class dashboard Evals area
 
 The **Evals** navigation area is available when `surfaces.eval_suite_views.read`

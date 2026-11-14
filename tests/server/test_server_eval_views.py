@@ -911,6 +911,13 @@ def test_run_read_rejects_mutated_result_without_diagnostic_leaks(
             result = await run_corpus_suite(target, corpus, corpus.suites[0].id, max_concurrency=1)
             lease = await store.claim_run(lease_seconds=300)
             await store.publish_result(lease.claim, result, redact_json=target.app.redact_json)
+            # A run view reads the result's stored summary. Without one, it derives
+            # the summary from the document, which this test forges.
+            import sqlite3
+
+            with sqlite3.connect(tmp_path / "forged-result.db") as raw:
+                raw.execute("PRAGMA foreign_keys = ON")
+                raw.execute("DELETE FROM cayu_eval_result_summaries")
             load = store.load_result_by_revision
 
             async def forged(revision):

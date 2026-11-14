@@ -34,6 +34,10 @@ from cayu.storage._completion_verifier_dispatch_schema import (
     POSTGRES_COMPLETION_VERIFIER_DISPATCH_DDL,
 )
 from cayu.storage._eval_trial_slot_schema import POSTGRES_EVAL_RUN_TRIAL_SLOT_DDL
+from cayu.storage._eval_view_summary_schema import (
+    EVAL_VIEW_SUMMARIES_REVISION,
+    POSTGRES_EVAL_VIEW_SUMMARIES_DDL,
+)
 from cayu.storage._external_wait_schema import POSTGRES_EXTERNAL_WAIT_DDL
 from cayu.storage._knowledge_lookup_schema import (
     KNOWLEDGE_LOOKUP_TOTALS_REVISION,
@@ -1036,6 +1040,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     TRACE_EVENTS_REVISION: POSTGRES_TRACE_EVENTS_DDL,
     # One summary row per session, kept by triggers on its overview's sources.
     SESSION_SUMMARY_REVISION: POSTGRES_SESSION_SUMMARIES_DDL,
+    # Summary tables the Evals pages read instead of whole documents.
+    EVAL_VIEW_SUMMARIES_REVISION: POSTGRES_EVAL_VIEW_SUMMARIES_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

@@ -24,8 +24,12 @@ export const EVAL_RESULT_QUERY_RETENTION = Object.freeze({
   staleTime: Number.POSITIVE_INFINITY,
 })
 
+export function evalStatusIsActive(status: string): boolean {
+  return (ACTIVE_EVAL_STATUSES as ReadonlySet<string>).has(status)
+}
+
 export function evalRunIsActive(run: EvalRun | undefined): boolean {
-  return run !== undefined && ACTIVE_EVAL_STATUSES.has(run.status)
+  return run !== undefined && evalStatusIsActive(run.status)
 }
 
 export function evalRunCanCancel(run: EvalRun | undefined): boolean {

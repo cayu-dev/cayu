@@ -465,7 +465,24 @@ async def _exercise_large_results(page, base, target):
     assert run["status"] == "completed", run
     selector = _eval_view_selector("run", run_id)
     response = await page.request.get(f"{base}/api/evals/run-views/{selector}?cases_limit=25")
-    assert response.status == 413, await response.text()
+    assert response.ok, await response.text()
+    first_page = (await response.json())["results"]
+    assert 0 < len(first_page["items"]) < 25, first_page
+    assert first_page["has_more"] and first_page["next_cursor"], first_page
+    assert first_page["total"] == 26, first_page
+    seen = [item["case"]["id"] for item in first_page["items"]]
+    cursor = first_page["next_cursor"]
+    while cursor is not None:
+        response = await page.request.get(
+            f"{base}/api/evals/run-views/{selector}",
+            params={"cases_limit": 25, "cases_cursor": cursor},
+        )
+        assert response.ok, await response.text()
+        results = (await response.json())["results"]
+        seen.extend(item["case"]["id"] for item in results["items"])
+        assert results["items"] and len(seen) <= 26, results
+        cursor = results["next_cursor"]
+    assert seen == [f"case-{index:02d}" for index in range(26)], seen
     await page.goto(f"{base}/cayu/evals/runs/{selector}", wait_until="networkidle")
     await expect(page.get_by_text("Large case 00", exact=True)).to_be_visible(timeout=20000)
     await page.get_by_text("Large case 00", exact=True).click()

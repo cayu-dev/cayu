@@ -3408,6 +3408,8 @@
     "validated_row_cache.<locals>.wrapped"
   ],
   "cayu.storage.evals_postgres:_database_now": [
+    "PostgresEvalStore._publish_result",
+    "PostgresEvalStore._save_captured_result",
     "PostgresEvalStore._save_prepared_authored_suite_in_transaction",
     "PostgresEvalStore._terminalize_without_result",
     "PostgresEvalStore.admit_run",
@@ -3420,10 +3422,8 @@
     "PostgresEvalStore.initialize_scenario_progress",
     "PostgresEvalStore.load_trial_checkpoints",
     "PostgresEvalStore.open_run_trials",
-    "PostgresEvalStore.publish_result",
     "PostgresEvalStore.release_run",
     "PostgresEvalStore.request_cancel",
-    "PostgresEvalStore.save_captured_result",
     "PostgresEvalStore.save_claimed_trial_checkpoint",
     "PostgresEvalStore.save_corpus",
     "PostgresEvalStore.save_judge_calibration",
@@ -3435,7 +3435,7 @@
     "PostgresEvalStore.update_scenario_trial"
   ],
   "cayu.storage.evals_postgres:validate_result_for_run": [
-    "PostgresEvalStore.publish_result"
+    "PostgresEvalStore._publish_result"
   ],
   "cayu.storage.evals_sqlite:_SQLITE_EVAL_MIN_REQUIRED_REVISION": [
     "SQLiteEvalStore.__init__"

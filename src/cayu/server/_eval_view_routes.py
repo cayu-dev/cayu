@@ -6,7 +6,8 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from cayu.evals.read_views import (
     EvalReportedRunDetail,
@@ -19,6 +20,7 @@ from cayu.evals.read_views import (
     EvalSuiteViewSummary,
     EvalViewPage,
     EvalViewQuery,
+    decode_run_view,
     decode_suite_view,
 )
 from cayu.evals.store import (
@@ -26,8 +28,10 @@ from cayu.evals.store import (
     EVAL_STORE_MAX_CURSOR_BYTES,
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
+    EvalBaselineKey,
     EvalStoreResultTooLarge,
 )
+from cayu.evals.view_summaries import EvalRunViewPollV1, run_view_version
 from cayu.server._eval_view_reader import EvalViewReader, enforce_view_bytes
 from cayu.server.contracts import EVALS_ENDPOINT_RESPONSES
 
@@ -148,6 +152,7 @@ def register_eval_view_routes(
                 case_filter=case_filter,
                 cases_cursor=cases_cursor,
                 cases_limit=cases_limit,
+                max_bytes=max_result_bytes,
             )
             if placement is not None:
                 identity = decode_suite_view(placement)
@@ -159,6 +164,48 @@ def register_eval_view_routes(
                     }
                 )
             return enforce_view_bytes(result, max_result_bytes)
+
+    @router.get(
+        "/evals/run-views/{run_key}/status",
+        response_model=EvalRunViewPollV1,
+        responses={**EVALS_ENDPOINT_RESPONSES, 304: {"description": "The run view is unchanged."}},
+        dependencies=protected,
+    )
+    async def get_run_view_status(run_key: str, request: Request):
+        """A live run view's poll: one run row, answered with 304 while it is unchanged."""
+        with _view_errors():
+            view_reader = reader()
+            source, run_id = decode_run_view(run_key)
+            if source != "run":
+                raise HTTPException(status_code=422, detail="Only native runs have a live status.")
+            poll = await view_reader.store.load_run_view_poll(run_id)
+            if poll is None:
+                raise HTTPException(status_code=404, detail="Eval run not found.")
+            view_reader.target(poll.target_key)
+            baseline = await view_reader.store.load_baseline(
+                EvalBaselineKey(
+                    target_key=poll.target_key,
+                    corpus_revision=poll.corpus_revision,
+                    suite_id=poll.suite_id,
+                )
+            )
+            poll = poll.model_copy(
+                update={
+                    "version": run_view_version(
+                        poll.version,
+                        None
+                        if baseline is None
+                        else [baseline.result_revision, baseline.generation],
+                    )
+                }
+            )
+            etag = f'"{poll.version.removeprefix("sha256:")}"'
+            headers = {"ETag": etag, "Cache-Control": "private, no-cache"}
+            if etag in {
+                item.strip() for item in request.headers.get("if-none-match", "").split(",")
+            }:
+                return Response(status_code=304, headers=headers)
+            return JSONResponse(poll.model_dump(mode="json"), headers=headers)
 
     @router.get("/evals/reports/{run_key}/download", dependencies=protected)
     async def download_report(run_key: str):

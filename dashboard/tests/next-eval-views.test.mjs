@@ -108,150 +108,55 @@ test("view HTTP entrances preserve opaque selectors, independent cursors and rea
   }
 })
 
-test("oversized run pages shrink without changing cursor, comparison, placement or filter authority", async () => {
+test("an oversized view is requested once and names the CLI command that reads it", async () => {
   const api = await import("../src/next/api/eval-views.ts")
   const originalFetch = globalThis.fetch
   const calls = []
-  const scope = {
-    compared_with: "baseline",
-    placement: "suite",
-    cases_cursor: "position",
-    case_filter: "flaky",
-  }
   globalThis.fetch = async (url) => {
-    const query = new URL(url, "http://local").searchParams
-    calls.push(query)
-    if (
-      Number(query.get("max_result_bytes")) < 8 * 1024 * 1024 ||
-      Number(query.get("cases_limit")) > 3
-    )
-      return new Response(JSON.stringify({ detail: "Too large" }), { status: 413 })
-    return Response.json({ results: { items: ["matching case"], next_cursor: "next-position" } })
+    calls.push(new URL(url, "http://local").searchParams)
+    return Response.json({ detail: "Too large" }, { status: 413 })
   }
   try {
-    const result = await api.fetchRunView("run", scope)
-    assert.equal(result.results.next_cursor, "next-position")
-    assert.deepEqual(
-      calls.map((q) => Number(q.get("cases_limit"))),
-      [25, 12, 6, 3],
-    )
-    for (const query of calls) {
-      for (const [key, value] of Object.entries(scope)) assert.equal(query.get(key), value)
-      assert.equal(query.get("max_result_bytes"), String(8 * 1024 * 1024))
+    for (const [request, command] of [
+      [() => api.fetchSuiteViews({ target_key: "target" }), "cayu eval suites list"],
+      [() => api.fetchSuiteView("suite", { runs_cursor: "runs" }), "cayu eval suites show SUITE"],
+      [() => api.fetchRunView("run", { case_filter: "flaky" }), "cayu eval runs show RUN_ID"],
+    ]) {
+      calls.length = 0
+      await assert.rejects(request(), (error) => {
+        assert.equal(error.status, 413)
+        assert.match(error.message, /too large to show here/)
+        assert.ok(error.message.includes(command))
+        return true
+      })
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].get("max_result_bytes"), "8388608")
     }
-    calls.length = 0
-    globalThis.fetch = async (url) => {
-      calls.push(new URL(url, "http://local").searchParams)
-      return new Response(JSON.stringify({ detail: "One case is too large" }), { status: 413 })
-    }
-    await assert.rejects(api.fetchRunView("run", scope), { status: 413 })
-    assert.deepEqual(
-      calls.map((q) => Number(q.get("cases_limit"))),
-      [25, 12, 6, 3, 1],
-    )
     calls.length = 0
     globalThis.fetch = async () => {
       calls.push(1)
       return new Response("{}", { status: 422 })
     }
-    await assert.rejects(api.fetchRunView("run", scope), { status: 422 })
+    await assert.rejects(api.fetchRunView("run", {}), { status: 422 })
     assert.equal(calls.length, 1)
   } finally {
     globalThis.fetch = originalFetch
   }
 })
 
-test("oversized suite pages shrink both independent dimensions without changing their cursors", async () => {
-  const api = await import("../src/next/api/eval-views.ts")
-  const originalFetch = globalThis.fetch
-  const calls = []
-  const scope = { cases_cursor: "case-position", runs_cursor: "run-position" }
-  const expectedScope = { ...scope }
-  const dimensions = (query) => [Number(query.get("cases_limit")), Number(query.get("runs_limit"))]
-  globalThis.fetch = async (url) => {
-    const query = new URL(url, "http://local").searchParams
-    calls.push(query)
-    const [cases, runs] = dimensions(query)
-    if (calls.length === 1) {
-      scope.cases_cursor = "changed-by-caller"
-      scope.runs_cursor = "changed-by-caller"
-    }
-    if (Number(query.get("max_result_bytes")) !== 8388608 || cases > 3 || runs > 2)
-      return Response.json({ detail: "Too large" }, { status: 413 })
-    return Response.json({ cases: { next_cursor: "next-case" }, runs: { next_cursor: "next-run" } })
-  }
-  try {
-    const result = await api.fetchSuiteView("exact-suite", scope)
-    assert.equal(result.cases.next_cursor, "next-case")
-    assert.equal(result.runs.next_cursor, "next-run")
-    assert.deepEqual(calls.map(dimensions), [
-      [25, 20],
-      [12, 10],
-      [6, 5],
-      [3, 2],
-    ])
-    for (const query of calls) {
-      for (const [key, value] of Object.entries(expectedScope)) assert.equal(query.get(key), value)
-      assert.equal(query.get("max_result_bytes"), "8388608")
-    }
-    calls.length = 0
-    globalThis.fetch = async (url) => {
-      calls.push(new URL(url, "http://local").searchParams)
-      return Response.json({ detail: "Minimum page too large" }, { status: 413 })
-    }
-    await assert.rejects(api.fetchSuiteView("exact-suite", scope), { status: 413 })
-    assert.deepEqual(calls.map(dimensions), [
-      [25, 20],
-      [12, 10],
-      [6, 5],
-      [3, 2],
-      [1, 1],
-    ])
-    calls.length = 0
-    globalThis.fetch = async () => {
-      calls.push(1)
-      return new Response("{}", { status: 422 })
-    }
-    await assert.rejects(api.fetchSuiteView("exact-suite", scope), { status: 422 })
-    assert.equal(calls.length, 1)
-    const controller = new AbortController()
-    calls.length = 0
-    globalThis.fetch = async () => {
-      calls.push(1)
-      controller.abort()
-      return new Response("{}", { status: 413 })
-    }
-    await assert.rejects(api.fetchSuiteView("exact-suite", scope, controller.signal), {
-      status: 413,
-    })
-    assert.equal(calls.length, 1)
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-test("catalog page byte adaptation preserves target and continuation scope", async () => {
+test("a live run page polls one small status row", async () => {
   const api = await import("../src/next/api/eval-views.ts")
   const originalFetch = globalThis.fetch
   const calls = []
   globalThis.fetch = async (url) => {
-    const query = new URL(url, "http://local").searchParams
-    calls.push(query)
-    return Number(query.get("limit")) > 6 || query.get("max_result_bytes") !== "8388608"
-      ? new Response("{}", { status: 413 })
-      : Response.json({ items: [], next_cursor: "next-suite" })
+    calls.push(url)
+    return Response.json({ run_id: "live", status: "running", version: "sha256:1" })
   }
   try {
-    const result = await api.fetchSuiteViews({ target_key: "target", cursor: "suite-position" })
-    assert.equal(result.next_cursor, "next-suite")
-    assert.deepEqual(
-      calls.map((q) => Number(q.get("limit"))),
-      [25, 12, 6],
-    )
-    for (const query of calls) {
-      assert.equal(query.get("target_key"), "target")
-      assert.equal(query.get("cursor"), "suite-position")
-    }
+    const status = await api.fetchRunViewStatus("opaque/run")
+    assert.equal(status.version, "sha256:1")
+    assert.equal(calls.length, 1)
+    assert.match(calls[0], /\/evals\/run-views\/opaque%2Frun\/status$/)
   } finally {
     globalThis.fetch = originalFetch
   }

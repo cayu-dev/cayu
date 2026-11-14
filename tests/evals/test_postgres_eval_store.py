@@ -296,7 +296,7 @@ def test_postgres_eval_store_requires_and_migrates_revision_seventy_four(
 
         validating = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(SchemaTooOld, match="requires >= 138"):
+            with pytest.raises(SchemaTooOld, match="requires >= 156"):
                 await validating.list_corpora()
         finally:
             await validating.close()
@@ -451,6 +451,11 @@ def test_postgres_eval_store_creates_revision_sixty_eight_schema(postgres_dsn) -
                 "cayu_eval_results",
                 "cayu_eval_run_trial_checkpoints",
                 "cayu_eval_run_trial_slots",
+                "cayu_eval_case_outcomes",
+                "cayu_eval_result_comparisons",
+                "cayu_eval_result_summaries",
+                "cayu_eval_suite_catalog",
+                "cayu_eval_trial_checkpoint_summaries",
                 "cayu_eval_runs",
                 "cayu_eval_scenarios",
                 "cayu_eval_suites",
@@ -902,6 +907,13 @@ def test_postgres_revision_forty_seven_indexes_existing_fresh_results(postgres_d
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
             conn.cursor() as cur,
         ):
+            # Revision 156's summary tables reference the result records.
+            for table in (
+                "cayu_eval_case_outcomes",
+                "cayu_eval_result_comparisons",
+                "cayu_eval_result_summaries",
+            ):
+                await cur.execute(f"DROP TABLE {table}")
             await cur.execute("DROP TABLE cayu_eval_baseline_mutations")
             await cur.execute("DROP TABLE cayu_eval_baselines")
             await cur.execute("DROP TABLE cayu_eval_result_records")
