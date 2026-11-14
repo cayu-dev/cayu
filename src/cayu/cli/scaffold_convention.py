@@ -1856,7 +1856,8 @@ __APPLICATION_TABLES__- `data/` locally and `/data` in a deployment hold files: 
 _MEMORY_KEY_GUIDANCE = """- Deployments must set `CAYU_MEMORY_EVIDENCE_KEY`. The local
   `data/memory-evidence.key` is git-ignored and never reaches a deployment.
   Where neither exists, such as a CI checkout, the root `conftest.py` gives the
-  tests a throwaway key and `cayu check` borrows one, so both run without setup.
+  tests a throwaway key, and `cayu check` and `cayu inspect` borrow one and say
+  so, so all of them run without setup. `cayu eval run` needs a real key.
 """
 
 

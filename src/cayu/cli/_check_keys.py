@@ -1,8 +1,9 @@
 """`cayu check` findings about keys a local run or a fresh checkout doesn't have.
 
 A project made with automatic memory reads ``CAYU_MEMORY_EVIDENCE_KEY`` or its
-git-ignored ``data/memory-evidence.key``; a CI checkout has neither, and the
-check only describes the app, so it lends the factory a throwaway key. A
+git-ignored ``data/memory-evidence.key``; a CI checkout has neither, and
+`cayu check` and `cayu inspect` only describe the app, so they lend the factory
+a throwaway key. A
 ``ToolArgumentReview`` needs the public authority alias keyring, which a local
 run usually lacks, so the check says what the approver sees without it.
 """
@@ -73,7 +74,9 @@ def _reads_memory_evidence_key(root: Path) -> bool:
     )
 
 
-def lent_memory_key_diagnostic(*, deploy: bool) -> ProjectDiagnostic:
+def lent_memory_key_diagnostic(*, deploy: bool, command: str = "cayu check") -> ProjectDiagnostic:
+    """The finding that ``command`` built the app with a lent throwaway key."""
+
     return ProjectDiagnostic(
         code="MEMORY_EVIDENCE_KEY_UNSET",
         severity=DiagnosticSeverity.INFO,
@@ -81,7 +84,7 @@ def lent_memory_key_diagnostic(*, deploy: bool) -> ProjectDiagnostic:
         path=_LOCAL_MEMORY_KEY.as_posix(),
         message=(
             f"{MEMORY_EVIDENCE_KEY_ENV} is unset and {_LOCAL_MEMORY_KEY.as_posix()} doesn't "
-            "exist, so the check built the application with a throwaway memory evidence "
+            f"exist, so `{command}` built the application with a throwaway memory evidence "
             "key. The app itself still needs one, and so do tests that build it."
         ),
         hint=(
@@ -102,7 +105,7 @@ def lent_memory_key_diagnostic(*, deploy: bool) -> ProjectDiagnostic:
         tags=("configuration", "deploy") if deploy else ("configuration",),
         parameters={"deploy": deploy},
         documentation_anchor="cayu guide diagnostics#memory-evidence-key-unset",
-        verification_command="cayu check --json",
+        verification_command=f"{command} --json",
     )
 
 

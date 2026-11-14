@@ -24,9 +24,14 @@ attributes retain `AttributeError`. No removed route loads its former object.
 ## memory-evidence-key-unset
 
 `MEMORY_EVIDENCE_KEY_UNSET` is informational: `CAYU_MEMORY_EVIDENCE_KEY` is unset
-and `data/memory-evidence.key` doesn't exist, so `cayu check` built the
-application with a throwaway memory evidence key. Describing the app derives no
-evidence, so the check doesn't need the real key. `cayu new` creates the file,
+and `data/memory-evidence.key` doesn't exist, so `cayu check` or `cayu inspect`
+built the application with a throwaway memory evidence key. Describing the app
+and reading its task store derive no evidence, so these commands don't need the
+real key. `cayu check --json` lists the finding with its other diagnostics.
+`cayu inspect --json` adds a `diagnostics` list holding it to its output, also
+with `--retry-key` and `--fenced-tasks`, and `cayu inspect --table` prints it as
+a note on stderr. Commands that run the Agent, such as `cayu eval run`, store
+memory evidence and still need a real, stable key. `cayu new` creates the file,
 but it is git-ignored, so a fresh checkout such as a CI job has none. The root
 `conftest.py` of a project made by `cayu new` then gives the tests a throwaway
 key for the pytest run. In a project without that conftest, tests that build the

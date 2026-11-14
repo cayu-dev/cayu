@@ -6,9 +6,11 @@ import json
 import sys
 from typing import Any
 
+from cayu.cli._check_keys import lent_memory_evidence_key, lent_memory_key_diagnostic
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
 from cayu.cli.scaffold_check import check_scaffold_capabilities
+from cayu.runtime.checks import ProjectDiagnostic
 from cayu.runtime.manifest import APP_MANIFEST_SCHEMA_VERSION, AppManifest
 
 # The most fenced tasks `cayu inspect --fenced-tasks` lists.
@@ -63,12 +65,18 @@ def run_inspect(args: argparse.Namespace) -> int:
 def _run_inspect(args: argparse.Namespace) -> int:
     try:
         project = resolve_project(args.target, command="cayu inspect")
-        with project_context(project.root):
+        # Describing the app and reading its task store derive no memory evidence,
+        # so a fresh checkout without a memory evidence key gets a throwaway one.
+        with (
+            project_context(project.root),
+            lent_memory_evidence_key(project.root) as lent_memory_key,
+        ):
             app = build_project_app(project.target, command="Inspect")
+            notices = _lent_key_notices(lent_memory_key, args.output_format)
             if args.retry_key is not None:
-                return _inspect_retry_key(app, args.retry_key, args.output_format)
+                return _inspect_retry_key(app, args.retry_key, args.output_format, notices)
             if args.fenced_tasks:
-                return _inspect_fenced_tasks(app, args.output_format)
+                return _inspect_fenced_tasks(app, args.output_format, notices)
             manifest = app.describe(project_root=project.root)
     except Exception as exc:
         if args.output_format == "json":
@@ -91,11 +99,10 @@ def _run_inspect(args: argparse.Namespace) -> int:
     filtered, error = _filter_manifest(manifest, args)
     if error is not None:
         if args.output_format == "json":
-            print(
-                json.dumps(
-                    {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error},
-                    sort_keys=True,
-                )
+            _print_json(
+                {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error},
+                notices,
+                sort_keys=True,
             )
         else:
             print(f"error: {error['message']}", file=sys.stderr)
@@ -104,33 +111,65 @@ def _run_inspect(args: argparse.Namespace) -> int:
     diagnostics = check_scaffold_capabilities(project.root, manifest)
     if diagnostics:
         if args.output_format == "json":
-            print(
-                json.dumps(
-                    {
-                        "schema_version": APP_MANIFEST_SCHEMA_VERSION,
-                        "error": {
-                            "code": diagnostics[0].code,
-                            "message": "Declared capabilities disagree with the constructed application.",
-                        },
-                        "diagnostics": [item.model_dump(mode="json") for item in diagnostics],
-                        "manifest": filtered.model_dump(mode="json"),
+            _print_json(
+                {
+                    "schema_version": APP_MANIFEST_SCHEMA_VERSION,
+                    "error": {
+                        "code": diagnostics[0].code,
+                        "message": "Declared capabilities disagree with the constructed application.",
                     },
-                    sort_keys=True,
-                )
+                    "diagnostics": [item.model_dump(mode="json") for item in diagnostics],
+                    "manifest": filtered.model_dump(mode="json"),
+                },
+                notices,
+                sort_keys=True,
             )
         else:
             for item in diagnostics:
                 print(f"{item.code}: {item.path}: {item.message}", file=sys.stderr)
         return 1
 
-    if args.output_format == "json":
+    if args.output_format == "json" and notices:
+        _print_json(filtered.model_dump(mode="json"), notices, indent=2)
+    elif args.output_format == "json":
         print(filtered.model_dump_json(indent=2))
     else:
         print(_render_human(filtered))
     return 0
 
 
-def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
+def _lent_key_notices(lent: bool, output_format: str) -> tuple[ProjectDiagnostic, ...]:
+    """Say when the app was built with a lent memory evidence key, so nobody takes it
+    for a configured one: on stderr for a person, as a diagnostic in JSON."""
+
+    if not lent:
+        return ()
+    notice = lent_memory_key_diagnostic(deploy=False, command="cayu inspect")
+    if output_format != "json":
+        print(
+            f"note: {notice.message} See `{notice.documentation_anchor}`.",
+            file=sys.stderr,
+        )
+    return (notice,)
+
+
+def _print_json(
+    document: dict[str, Any], notices: tuple[ProjectDiagnostic, ...], **options: Any
+) -> None:
+    if notices:
+        document = {
+            **document,
+            "diagnostics": [
+                *document.get("diagnostics", ()),
+                *(item.model_dump(mode="json") for item in notices),
+            ],
+        }
+    print(json.dumps(document, **options))
+
+
+def _inspect_retry_key(
+    app: Any, retry_key: str, output_format: str, notices: tuple[ProjectDiagnostic, ...]
+) -> int:
     async def load() -> Any:
         try:
             if app.task_store is None or not app.task_store.supports_task_retry_keys:
@@ -151,17 +190,16 @@ def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
             "path": f"retry_keys.{retry_key}",
         }
         if output_format == "json":
-            print(json.dumps({"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error}))
+            _print_json({"schema_version": APP_MANIFEST_SCHEMA_VERSION, "error": error}, notices)
         else:
             print(f"error: {error['message']}", file=sys.stderr)
         return 1
     if output_format == "json":
-        print(
-            json.dumps(
-                {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "retry_key": state.inspection()},
-                indent=2,
-                sort_keys=True,
-            )
+        _print_json(
+            {"schema_version": APP_MANIFEST_SCHEMA_VERSION, "retry_key": state.inspection()},
+            notices,
+            indent=2,
+            sort_keys=True,
         )
         return 0
     budget = state.budget
@@ -186,7 +224,9 @@ def _inspect_retry_key(app: Any, retry_key: str, output_format: str) -> int:
     return 0
 
 
-def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
+def _inspect_fenced_tasks(
+    app: Any, output_format: str, notices: tuple[ProjectDiagnostic, ...]
+) -> int:
     from cayu.tasks.abandoned import (
         abandoned_task_settlement,
         has_cancellation_fence,
@@ -216,30 +256,29 @@ def _inspect_fenced_tasks(app: Any, output_format: str) -> int:
     tasks = [task for task in asyncio.run(load()) if held_after_worker_loss(task)]
     complete = len(tasks) < _FENCED_TASK_LIMIT
     if output_format == "json":
-        print(
-            json.dumps(
-                {
-                    "schema_version": APP_MANIFEST_SCHEMA_VERSION,
-                    "fenced_tasks": [
-                        {
-                            "task_id": task.id,
-                            "type": task.type,
-                            "status": task.status.value,
-                            "status_reason": task.status_reason,
-                            "worker_id": task.worker_id,
-                            "lease_expires_at": task.lease_expires_at.isoformat(),
-                            "error_code": _fence_error_code(task),
-                            "session_id": task.session_id,
-                            "retry_series": task.retry_series is not None,
-                            "settle": abandoned_task_settlement(task),
-                        }
-                        for task in tasks
-                    ],
-                    "complete": complete,
-                },
-                indent=2,
-                sort_keys=True,
-            )
+        _print_json(
+            {
+                "schema_version": APP_MANIFEST_SCHEMA_VERSION,
+                "fenced_tasks": [
+                    {
+                        "task_id": task.id,
+                        "type": task.type,
+                        "status": task.status.value,
+                        "status_reason": task.status_reason,
+                        "worker_id": task.worker_id,
+                        "lease_expires_at": task.lease_expires_at.isoformat(),
+                        "error_code": _fence_error_code(task),
+                        "session_id": task.session_id,
+                        "retry_series": task.retry_series is not None,
+                        "settle": abandoned_task_settlement(task),
+                    }
+                    for task in tasks
+                ],
+                "complete": complete,
+            },
+            notices,
+            indent=2,
+            sort_keys=True,
         )
         return 0
     if not tasks:
