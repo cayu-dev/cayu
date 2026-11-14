@@ -1068,7 +1068,8 @@ yourself, use the Cayu feature that already does it:
 | Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
 __CODING_CONVERSION_ROW__| Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
 | Spending or usage limits | Budgets and run limits | `cayu guide references#cost-control` |
-| A public or multi-user product | `cayu new NAME --preset service` | `cayu guide references#server` |
+| People from separate organizations (customers, client firms) sharing one deployment, each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web app with organizations and member sign-in | `cayu guide b2b` |
+| A product whose own frontend or other systems call the agent over an authenticated API for their end users | `cayu new NAME --preset service` | `cayu guide references#server` |
 
 Run every `cayu guide` command as `uv run --no-sync cayu guide ...`.
 
@@ -1095,9 +1096,11 @@ as the Agent's `[worker]` and never sleeps, and work on a timetable in
 `[[schedules]]`. Don't try to stop the web process from sleeping in the
 manifest: `idle_timeout_seconds` can't turn sleep off.
 
-If the requested application is public or multi-user, regenerate with
-`cayu new NAME --preset service` or adopt Cayu's maintained service contract;
-do not improvise product authorization around raw Cayu routes.
+If people outside your own team will use the application, do not improvise
+product authorization around raw Cayu routes. When people from separate
+organizations share one deployment, regenerate with `cayu new NAME --preset b2b`;
+when your own product or other systems call the agent over an API, use
+`cayu new NAME --preset service` or adopt Cayu's maintained service contract.
 
 ## Project commands
 
@@ -2759,10 +2762,15 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         "--preset",
         choices=tuple(spec.name for spec in PRESETS),
         help=(
-            "Coherent application shape: agent (default), service, coding, "
-            "long-running (approval, waits, timers, spend cap and restart tests), or b2b "
-            "(the web app plus organizations: several businesses' departments and members "
-            "sharing one deployment)."
+            "Application shape; choose it by the work. agent (default): an agent one person "
+            "or team runs. coding: it edits a code repository and runs its tests. "
+            "long-running: work that spans hours or days (approval, waits, timers, spend cap "
+            "and restart tests). service: your own product or other systems call it over an "
+            "authenticated API; API only. Every preset but service comes with a web app for "
+            "your team; --without web-app leaves it out. b2b: the web app plus "
+            "organizations; choose it (or --with organizations on agent) only when people "
+            "from separate organizations share one deployment and each must see only their "
+            "own organization's data. See --list-presets."
         ),
     )
     # Deprecated: every project now selects its database at runtime through
@@ -2794,8 +2802,8 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         default=[],
         metavar="CAPABILITY",
         help=(
-            "Turn off a default preset capability and leave out the files only it uses; "
-            "--dry-run groups the files by the flag that removes them."
+            "Turn off a default preset capability, such as web-app, and leave out the files "
+            "only it uses; --dry-run groups the files by the flag that removes them."
         ),
     )
     parser.add_argument(
@@ -3525,9 +3533,9 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
-            print("Cayu application presets:")
+            print("Cayu application presets (cayu new NAME --preset PRESET):")
             for spec in PRESETS:
-                print(f"  {spec.name:<10} {spec.summary}")
+                print(f"  {spec.name:<12} {spec.summary}")
         return 0
     if args.list_capabilities:
         payload = {
@@ -3555,6 +3563,9 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
         print(f"{spec.name} ({spec.status})")
         print(spec.summary)
         print("Supported presets: " + ", ".join(spec.supported_presets))
+        defaults = [preset.name for preset in PRESETS if spec.name in preset.default_capabilities]
+        if defaults:
+            print("On by default in: " + ", ".join(defaults))
         if spec.extension_presets:
             print("Explicit extension presets: " + ", ".join(spec.extension_presets))
             print("Declaration: [tool.cayu.scaffold].extensions (owning-module wiring required)")

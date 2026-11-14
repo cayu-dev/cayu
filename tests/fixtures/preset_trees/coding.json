@@ -10,7 +10,7 @@
     "evals/agent.py": "da3badf7fd30d8aff5f129befc7e751472bd48fbb5fa43bbda0527411a009197",
     "pyproject.toml": "99e010dc2c7037266e769ef95b0756bfec9281e4ee8a7ff93d1a2f9001607c6b",
     "README.md": "63850f7449da3c9f590b4ce665ef2dd7e519824b79851618dae526a89db765d8",
-    "AGENTS.md": "6eb6fad4a96203b0750df5db88be50cfd3629b00da4c7159e293316ad4a41082",
+    "AGENTS.md": "e37814f6360c7b4cc11fd32cff4d0fb7553b3035bbd0944d8f1feeb89c4a0e5c",
     ".gitignore": "5445abda44e437cf821fe71cb903c0b165f63bdf7e331e75d93b8e0f83daca92",
     "prompts/__init__.py": "8976b112f24bab9fad5523eb4f81dc2bb5fbc26f6cd60a9f6f88092ade9b83c3",
     "tools/__init__.py": "cb7d16f8eef087d6cb76b20b2f1b3199f0914f88cfb3df5ab601b7849d790ac4",

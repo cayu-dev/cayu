@@ -2551,19 +2551,24 @@ _AGENTS_ROWS = {
         '`GENERATED.` files to the generator (README "The web app"). Not `client.js`: it calls '
         "the operator API, which people signed in as members can't use. | `cayu guide b2b` |"
     ),
-    "| A public or multi-user product | `cayu new NAME --preset service` | "
-    "`cayu guide references#server` |": (
+    "| People from separate organizations (customers, client firms) sharing one deployment, "
+    "each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web "
+    "app with organizations and member sign-in | `cayu guide b2b` |\n"
+    "| A product whose own frontend or other systems call the agent over an authenticated API "
+    "for their end users | `cayu new NAME --preset service` | `cayu guide references#server` |": (
         "| Another organization, department or member | `add_member` in "
         "`database/memberships.py`, or an admin on the Members page | `cayu guide b2b` |"
     ),
 }
 
 
-# This preset is already the multi-user application that paragraph sends people to.
+# This preset is already the organizations' application that paragraph sends people to.
 _MULTI_USER_ADVICE = (
-    "If the requested application is public or multi-user, regenerate with\n"
-    "`cayu new NAME --preset service` or adopt Cayu's maintained service contract;\n"
-    "do not improvise product authorization around raw Cayu routes."
+    "If people outside your own team will use the application, do not improvise\n"
+    "product authorization around raw Cayu routes. When people from separate\n"
+    "organizations share one deployment, regenerate with `cayu new NAME --preset b2b`;\n"
+    "when your own product or other systems call the agent over an API, use\n"
+    "`cayu new NAME --preset service` or adopt Cayu's maintained service contract."
 )
 _B2B_MULTI_USER = (
     "This application is multi-user: its people reach their data only through `/app`, which\n"

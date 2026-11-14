@@ -187,6 +187,8 @@ The scaffold is credential-free and includes:
 
 - a composition-only `app.py` with a process-scoped `build_app()` factory;
 - one model-only agent with no required tools;
+- a web app for your team, which `cayu serve` serves at `/` beside the Developer
+  dashboard at `/cayu/` (`--without web-app` leaves it out; `cayu guide app-ui`);
 - complete tracked homes for prompts, tools, policies, environments, workflows,
   operations, knowledge, memory, integrations, observability, and domain code;
 - explicit provider, storage, runtime, and agent-registration seams;
@@ -233,8 +235,24 @@ run requires a clean committed Git source baseline. It also requires `git`,
 application construction. Its local workspace and runner are trusted-host
 development adapters, not a hostile-code sandbox. The default scaffold is the
 complete Cayu application convention. Select `--preset agent`, `--preset service`,
-`--preset coding`, or `--preset long-running`; optional capabilities share the same
-application layout. The long-running preset is a small working example of
+`--preset coding`, `--preset long-running`, or `--preset b2b`; optional capabilities
+share the same application layout.
+
+Choose the preset by the work. Every preset but service comes with a web app for
+your team, and `--without web-app` leaves it out:
+
+| Preset | Choose when | Web app |
+| --- | --- | --- |
+| `agent` (default) | One person or one team runs the agent. | For your team, with Conversations and Task runs. |
+| `coding` | The agent edits a code repository and runs its tests. | For your team. |
+| `long-running` | Work spans hours or days: approval, a waited-for reply, reminder and deadline timers, a spend cap, restart tests. | For your team. |
+| `service` | Your own product or other systems call the agent over an authenticated API for their end users. | None; API only. |
+| `b2b` | People from separate organizations (customers, client firms, households) share one deployment and each must see only their own organization's data. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |
+
+Choose b2b only for separate organizations. `--preset agent --with organizations
+--without knowledge,memory` adds the same organizations to the agent preset.
+
+The long-running preset is a small working example of
 approval before a side effect, a waited-for reply, reminder and deadline timers,
 a per-session spend cap, and restart tests; `cayu guide long-running` explains
 each part on one page.
@@ -681,11 +699,13 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   Generated API documentation is a separate exposure decision.
 - Public or multi-user product routes need a separate customer authorization
   boundary; Developer dashboard authentication does not make the raw Cayu surface
-  tenant-scoped. Start new services with
+  tenant-scoped. Start new API services with
   `cayu new NAME --preset service`, then require both
   `cayu check --deploy --fail-on warning --json` and the generated
   `tests/test_public_service_security.py`. Cayu reports arbitrary host-owned
-  ASGI routes outside that maintained factory as unverified.
+  ASGI routes outside that maintained factory as unverified. When people from
+  separate organizations sign in to the web app, start from
+  `cayu new NAME --preset b2b` (`cayu guide b2b`).
 - When embedding with `mount_cayu(..., path="/your/path")` or the lower-level
   `mount_dashboard(...)`, use `/your/path/` as the canonical dashboard URL.
   Cayu redirects an exact GET or HEAD of the slashless non-root mount after a
@@ -723,8 +743,8 @@ Start with the document that matches the job:
 | Notify people about durable questions, approvals, and recovery gates | `cayu guide human-attention` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/human-attention.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/human_attention/)) |
 | Reconstruct service-backed tools with stable identities and scoped knowledge | `cayu guide durable-service-tools` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/durable-service-tools.md), [example](https://github.com/cayu-dev/cayu/tree/main/examples/durable_service_tools/)) |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
-| Build a browser UI that follows sessions without hot polling | `cayu guide app-ui` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/app-ui.md)) |
-| Share one agent between several businesses, with a web interface for their people | `cayu guide b2b` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/b2b.md)) |
+| Extend the generated web app, or build a browser UI that follows sessions without hot polling | `cayu guide app-ui` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/app-ui.md)) |
+| Let people from separate organizations share one deployment, each seeing only their own organization's data | `cayu guide b2b` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/b2b.md)) |
 | Run Claude Code or Codex as Cayu sessions with tokens, cost, deadlines and secret scrubbing | `cayu guide external-agents` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/external-agents.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |

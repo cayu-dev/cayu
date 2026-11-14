@@ -20,8 +20,8 @@ authoritative only where a maintained guide points to the implementation or the
 - [Long-running jobs](../src/cayu/guides/long-running.md) (`cayu guide long-running`): approvals, outside replies, timers, spend caps and restart tests
 - [Task handlers that survive a lost worker](../src/cayu/guides/lost-worker.md) (`cayu guide lost-worker`): restart after worker loss, reuse finished sessions and saved steps, and repeatable external effects
 - [Human-attention notifications](../src/cayu/guides/human-attention.md) (`cayu guide human-attention`)
-- [Application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
-- [A B2B application: several businesses on one agent](../src/cayu/guides/b2b.md) (`cayu guide b2b`)
+- [The generated web app and application UIs over sessions](../src/cayu/guides/app-ui.md) (`cayu guide app-ui`)
+- [Organizations on one deployment: the b2b preset](../src/cayu/guides/b2b.md) (`cayu guide b2b`)
 - [Durable service-backed tools](../src/cayu/guides/durable-service-tools.md) (`cayu guide durable-service-tools`)
 - [Verified work](../src/cayu/guides/verified-work.md) (`cayu guide verified-work`)
 - [External agents source pointer](external-agents.md): redirects to the packaged guide

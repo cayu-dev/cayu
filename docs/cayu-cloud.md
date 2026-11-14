@@ -337,9 +337,10 @@ for custom authentication.
 Init also writes `[sign_in]` and reports its mode as `result.sign_in`. It writes
 `mode = "cloud"`, so Cayu Cloud signs people in to the Agent's pages once its router
 sign-in ships, when `[tool.cayu.serve].auth` is (or init sets it to)
-`cayu.server.environment_auth:OPERATOR_BASIC_AUTH` or `OPERATOR_ONLY_AUTH` (the b2b
-preset's, which keeps people signed in as Cloud members off the Developer dashboard), both of
-which accept Cloud's sign-in, and for a worker, which has no pages. Otherwise it writes `mode = "own"`: a project with a
+`cayu.server.environment_auth:OPERATOR_BASIC_AUTH` or `OPERATOR_ONLY_AUTH` (the
+organizations capability's, as in the b2b preset, which keeps people signed in as Cloud
+members off the Developer dashboard), both of which accept Cloud's sign-in, and for a
+worker, which has no pages. Otherwise it writes `mode = "own"`: a project with a
 `service_factory`, an auth target of the project's own, or the generated
 `server_auth.py` keeps its own sign-in. See
 [Sign-in and home page](#sign-in-and-home-page).

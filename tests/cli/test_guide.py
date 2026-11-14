@@ -904,10 +904,31 @@ def test_package_shipped_app_ui_guide_states_the_request_rules(capsys) -> None:
         "under 1% of a 0.5 vCPU web process",
         "cayu diagnostics requests --budget-idle-cpu 0.01 --vcpu 0.5",
         "## Example: a progress panel",
+        # The web app every preset but service generates.
+        "## The generated web app",
+        "`cayu new NAME --without web-app` leaves it out",
+        "`web/src/agent/index.tsx`",
+        "### Add an area",
+        "### The `@kit` alias",
+        "`cayu.server.operator_sign_in`",
+        "`OPERATOR_ONLY_AUTH`",
     ):
         assert rule in content, rule
-
     root = Path(__file__).resolve().parents[2]
+    # The area example uses the generated app's own names.
+    templates = root / "src/cayu/cli/templates/app_web/src"
+    example = guide["content"].split("```tsx\n", 1)[1].split("```", 1)[0]
+    for name, source in (
+        ("useAreaApi", "app/services.tsx"),
+        ("AppArea", "app/area.ts"),
+        ("watchInterval", "kit/shadcn/data.ts"),
+        ("Requester", "kit/shadcn/data.ts"),
+    ):
+        assert name in example, name
+        assert re.search(
+            rf"export (type|function|const) {name}\b", (templates / source).read_text()
+        )
+
     assert "cayu guide app-ui" in (root / "src/cayu/guides/application-anatomy.md").read_text()
     control_plane = (root / "docs/control-plane.md").read_text()
     bring_your_own_ui = control_plane.split("## Bring your own UI", 1)[1].split("\n## ", 1)[0]
@@ -926,6 +947,8 @@ def test_b2b_guide_runs_the_generated_application(capsys) -> None:
         "npm --prefix web run build",
         "`APP_SIGN_IN`",
         "`OPERATOR_ONLY_AUTH`",
+        "Every preset but service already comes with a web app for your own team",
+        "`cayu new NAME --with organizations --without knowledge,memory`",
     ):
         assert statement in content, statement
     # Every person the guide demonstrates is one the seed adds.

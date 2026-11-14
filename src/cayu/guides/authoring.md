@@ -71,7 +71,9 @@ only when the requested behavior requires it.
 | Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
 | An HTTP API and the Developer dashboard | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
-| A public or multi-user agent product | `cayu new NAME --preset service`, maintained tenant-safe service factory | `cayu guide references#server` |
+| A web app for your team, to see what the agent did and what waits for a person | `web/` from `cayu new` on every preset but service; add an area in `web/src/agent/` | `cayu guide app-ui` |
+| People from separate organizations (customers, client firms, households) sharing one deployment, each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web app plus organizations and member sign-in | `cayu guide b2b` |
+| A product whose own frontend or other systems call the agent over an authenticated API for their end users | `cayu new NAME --preset service`, maintained tenant-safe service factory with no web app | `cayu guide references#server` |
 | A maintained repository-coding starter | `cayu new NAME --preset coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
 | A product API around repository coding | application-owned authentication, durable intake, workers and independent acceptance | `cayu guide authoring#coding-product-host` |
 | Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
@@ -149,7 +151,13 @@ Selecting this composition chooses implementations; it does not grant authority.
 Its exposure policy separately controls model-visible tools, and its ordinary
 tool policy, approval policy, and runtime gates independently authorize calls.
 
-For a public or multi-user product, start with
+Choose a preset by the work, not by whether you want a web app: every preset
+but service comes with one for your team (`cayu guide app-ui`), and
+`--without web-app` leaves it out. When people from separate organizations
+(customers, client firms, households) sign in to one deployment and each must see
+only their own organization's data, start with `cayu new NAME --preset b2b`, which
+adds organizations and member sign-in to that web app; see `cayu guide b2b`. For a
+product whose own frontend or other systems call the agent over an API, start with
 `cayu new NAME --preset service`. That template keeps customer authentication,
 tenant-qualified application storage, public identifiers, allow-listed product
 responses, and the separately protected `/cayu/` Developer dashboard in one maintained service

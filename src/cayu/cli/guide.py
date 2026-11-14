@@ -19,11 +19,13 @@ _GUIDES = {
     "anatomy": ("application-anatomy.md", "Application lifecycle and process roles."),
     "app-ui": (
         "app-ui.md",
-        "Browser UIs over sessions: client.js, polling rules, and the idle budget.",
+        "The generated web app (areas, @kit, sign-in) and browser UIs over sessions: "
+        "client.js, polling rules, and the idle budget.",
     ),
     "b2b": (
         "b2b.md",
-        "Several businesses on one agent: organizations, sharing, sign-in and a web interface.",
+        "Separate organizations sharing one deployment, each seeing only its own data: "
+        "memberships, sharing and member sign-in to the web app.",
     ),
     "applications": (
         "applications.md",

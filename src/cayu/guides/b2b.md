@@ -1,10 +1,27 @@
-# A B2B application: several businesses on one agent
+# Organizations on one deployment: the b2b preset
 
-`cayu new NAME --preset b2b` generates an agent that several businesses share on one
-deployment, one database and one agent. Each business is an organization with departments
-and members. People sign in to the application, see their own conversations, their
-department's and their organization's, and nothing of another organization. The
-organization's admins manage its members from the application's web interface.
+`cayu new NAME --preset b2b` generates an agent that people from separate organizations
+share on one deployment, one database and one agent. Each organization (a customer, a client
+firm, a household) has departments and members. People sign in to the application's web
+app, see their own conversations, their department's and their organization's, and nothing
+of another organization. The organization's admins manage its members in the web app.
+
+Choose it only for that. Every preset but service already comes with a web app for your own
+team (`cayu guide app-ui`), so an Agent that only you and your colleagues use doesn't need
+b2b to get one. b2b is that web app plus the `organizations` capability, with the
+application database it needs:
+
+- The `organizations` capability makes the web app's people the organizations' members
+  instead of your team: member sign-in, Members, an organization switcher, and
+  conversations scoped to each organization. Operators keep the Developer dashboard at
+  `/cayu/`.
+- `--without organizations` and `--without web-app` are refused on b2b. For an Agent
+  without organizations, choose another preset.
+- The agent preset takes the same organizations with `cayu new NAME --with organizations
+  --without knowledge,memory`. Organizations can't be combined with knowledge or memory:
+  the agent reads one knowledge store in every conversation, so what it learned in one
+  organization's conversation would reach another's. The coding, long-running and service
+  presets don't take organizations.
 
 ## Who decides what
 
@@ -52,12 +69,13 @@ next step is refused.
 The demonstration login exists only under `cayu serve --dev`, for the people
 `operations/demo_seed.py` adds.
 
-## The web interface
+## The web app
 
-`web/` holds the interface's source (React, TypeScript, Tailwind CSS), and `web/static` the
+`web/` holds the app's source (React, TypeScript, Tailwind CSS), and `web/static` the
 built files `cayu serve` serves at `/` (`[tool.cayu.serve] ui = "web/static"`).
 
-It is the app shell every Agent's app is generated with, and b2b's own pages as areas in it:
+It is the app every preset but service generates (`cayu guide app-ui`), with the
+organizations' pages as areas in it and their member sign-in in place of operator sign-in:
 
 - **The shell** (`web/src/app/`, `web/src/main.tsx`): a sidebar with the Agent's areas, a
   Runtime group linking to Cayu's Inbox and Developer dashboard, a profile menu with the
@@ -88,15 +106,15 @@ isn't the build of `web/src`; run it in CI, since a deployment ships the committ
 build reads only `web/src`, never the previous build, so the same source always builds the
 same files.
 
-`npm --prefix web run dev` serves the interface with live reload and sends `/app`, `/api` and
+`npm --prefix web run dev` serves the app with live reload and sends `/app`, `/api` and
 `/cayu` to `cayu serve --dev` on port 8000.
 
 The built files load from `/`, and every `GET` that no route answers gets the page, so the
-interface can route in the browser and a reload or a shared link opens the same page. The
+app can route in the browser and a reload or a shared link opens the same page. The
 API under `/app`, Cayu's `/api` and the Developer dashboard at `/cayu` answer first, and an
 unknown path under them, or a missing file under `/assets/`, is still a 404.
 
-The interface calls only the application's API under `/app`, never Cayu's `/api`:
+The app calls only the application's API under `/app`, never Cayu's `/api`:
 
 | Route | What it does |
 | --- | --- |
@@ -115,7 +133,7 @@ the Agent supplies its people, metrics and start-up settings to `build_generated
 `integrations/http/__init__.py`. Each module's `router(...)` also works on its own.
 
 It doesn't use `/cayu/client.js` (`cayu guide app-ui`): that client calls Cayu's operator
-API, which `OPERATOR_ONLY_AUTH` keeps from the application's members. The interface reads a
+API, which `OPERATOR_ONLY_AUTH` keeps from the application's members. The app reads a
 conversation's transcript when it opens it, and follows a reply through the stream its own
 `runs` or `resume` request returns. Pages that show something that changes on its own (the
 Overview, the TaskRuns block's `taskRunsQuery`) follow their `/app` route with the kit's
@@ -130,7 +148,7 @@ the kit the answer it kept, so `@kit/data` needs no code for it. The Overview's 
 out `as_of`, which changes on every read, and the page says when it last read the overview
 rather than the kept answer's `as_of`. Answer a read route of your own the same way.
 
-A reply runs inside the request that streams it. Moving around the interface keeps it running,
+A reply runs inside the request that streams it. Moving around the app keeps it running,
 but closing the tab or losing the connection stops the agent's reply there; the conversation
 keeps what it had. Work that must outlive the page belongs in a task (`cayu guide
 references#background-work`).
@@ -146,7 +164,7 @@ Without `--dev`, `APP_SIGN_IN` selects how people sign in:
   each person.
 - `oidc`: an OIDC bearer token, with `CAYU_OIDC_ISSUER` and `CAYU_OIDC_AUDIENCE`.
 
-Until one is configured, the application's API answers 503. The web interface signs people
+Until one is configured, the application's API answers 503. The web app signs people
 in with a cookie, so it works with Cayu Cloud's sign-in and the demonstration login; with
 `oidc`, the API is for clients that send their own bearer token.
 

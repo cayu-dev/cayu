@@ -1,13 +1,175 @@
-# Building an application UI over Cayu sessions
+# The web app and browser UIs over Cayu sessions
 
-This guide is for a custom browser UI (a "bring your own UI" app) that shows
-Cayu sessions: a list of runs, a live timeline, a progress panel, token usage.
+`cayu new` gives an Agent on every preset but service a web app. The first part of
+this guide covers that app: its parts, its areas, the `@kit` alias, and who signs
+in to it.
+
+The rest is for any browser UI that shows Cayu sessions, the generated app or one
+of your own: a list of runs, a live timeline, a progress panel, token usage.
 Most of the work in such a UI is watching sessions change, and the easy way to
 write that (a short fixed timer that never stops) is what makes these apps
 expensive. One idle tab written that way made about 1,600 requests an hour and
-used a third of a 0.5 vCPU web task.
+used a third of a 0.5 vCPU web task. Follow the rules from
+[Follow live sessions with client.js](#follow-live-sessions-with-clientjs) on. The
+first one removes most of the others.
 
-Follow the rules below. The first one removes most of the others.
+## The generated web app
+
+The web app is the `web-app` capability, on by default in every preset but
+service, which has none; `cayu new NAME --without web-app` leaves it out. `cayu serve` serves its committed build at `/`
+(`[tool.cayu.serve] ui = "web/static"`), the Agent's routes under `/app`
+(`routers = ["integrations.http:build_router"]`) and the Developer dashboard at
+`/cayu/`. `uv run --no-sync cayu serve --dev` serves all three at
+`http://127.0.0.1:8000/`.
+
+Each file says in its first doc comment whether it is `GENERATED.` (the generator
+owns it and may rewrite it) or `THE AGENT'S OWN.` (yours).
+
+| Path | What it is |
+| --- | --- |
+| `web/src/main.tsx`, `web/src/app/` | The shell: browser routes, the area type, the layout with its navigation and profile menu, the status pages, and the requester for `/app`. Generated. |
+| `web/src/generated/`, `web/src/api/` | The Overview and Settings areas, and typed clients for the generated routes. Generated. |
+| `web/src/blocks/task-runs.tsx` | TaskRuns, a building block: the Agent's Cayu tasks, one row per run (`GET /app/task-runs`). |
+| `web/src/agent/` | The Agent's own areas, and `index.tsx`, which lists them. Yours. |
+| `web/src/kit/shadcn/` | The component kit every page imports through `@kit`. Generated. |
+| `web/e2e/` | The smoke test: `cayu serve --dev` serves the app, and every area opens in a browser. Yours. |
+| `integrations/http/__init__.py` | The routes under `/app`. The Agent's own go on its `router`, behind the same sign-in. Yours. |
+| `integrations/http/generated/` | The routes the generated pages read: `/app/whoami`, `/app/settings`, `/app/overview`, `/app/task-runs` and `/app/inbox`. Generated. |
+
+Every app has the generated Overview and Settings, and its navigation links to
+Cayu's Inbox (`/cayu/inbox`), where approvals and questions are decided, and to the
+Developer dashboard. What `web/src/agent/` adds depends on the preset: the agent
+preset has Conversations, which start and continue the agent's sessions through
+Cayu's API at `/api`, and Task runs; coding and long-running have Task runs; with
+organizations it has Conversations and Members, scoped to the person's
+organizations (`cayu guide b2b`).
+
+After changing `web/src`, run `npm --prefix web ci` and `npm --prefix web run build`,
+and commit `web/static`, so running and deploying need no Node.
+`npm --prefix web run check:build` fails when `web/static` isn't the build of
+`web/src`, and `npm --prefix web run dev` reloads the app live against
+`cayu serve --dev`.
+
+### Areas
+
+An area is a part of the app with its own navigation entry and routes: an `AppArea`
+(`web/src/app/area.ts`) with an `id`, a `label`, an `icon`, the `path` its entry
+opens, and `routes`, its React Router routes under the app's layout.
+`web/src/agent/index.tsx` exports what the shell shows for this Agent:
+
+- `identity`: its name and what it does;
+- `areas`: its areas, in navigation order;
+- `shell`: an optional `SignIn` page for when nobody is signed in (without one, the
+  app asks a person whose sign-in ended to reload and sign in again), and
+  `ProfileItems` for the end of the profile menu.
+
+### Add an area
+
+Add the route under `/app` in `integrations/http/__init__.py`, on `router` and
+behind the same sign-in. A route that changes the Agent's state takes
+`Depends(may_change_dependency(person))` instead, which refuses a role that may not
+change things.
+
+```python
+    @router.get("/findings")
+    async def findings(signed_in: Person = Depends(person)) -> list[dict[str, str]]:
+        return [{"id": "disk", "title": "The disk is almost full"}]
+```
+
+Write the page as an area of its own, in `web/src/agent/findings.tsx`:
+
+```tsx
+import { queryOptions, useQuery } from "@tanstack/react-query";
+import { z } from "zod";
+import { type Requester, watchInterval } from "@kit/data";
+import { Alert02Icon } from "@kit/icons";
+import { AppPageHeader, AppPageTitle } from "@kit/layouts/app";
+import type { AppArea } from "../app/area";
+import { useAreaApi } from "../app/services";
+
+const finding = z.object({ id: z.string(), title: z.string() });
+type Finding = z.infer<typeof finding>;
+
+function findingsApi(request: Requester) {
+  return { list: (signal?: AbortSignal) => request("findings", { signal, schema: z.array(finding) }) };
+}
+
+/** THE AGENT'S OWN. Findings: what the Agent found, from `GET /app/findings`. */
+export const findingsArea: AppArea = {
+  id: "findings",
+  label: "Findings",
+  icon: Alert02Icon,
+  path: "/findings",
+  routes: () => [{ path: "findings", Component: FindingsPage }],
+};
+
+function FindingsPage() {
+  const api = useAreaApi(findingsApi);
+  const findings = useQuery(
+    queryOptions({
+      queryKey: ["findings"],
+      queryFn: ({ signal }) => api.list(signal),
+      refetchInterval: watchInterval<Finding[]>(),
+    }),
+  );
+  return (
+    <div className="flex flex-col gap-page-section" data-origin="own">
+      <AppPageHeader description="What the Agent found.">
+        <AppPageTitle>Findings</AppPageTitle>
+      </AppPageHeader>
+      <ul>
+        {findings.data?.map((item) => (
+          <li key={item.id}>{item.title}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+Then list it in `web/src/agent/index.tsx`, where it should appear in the navigation,
+and rebuild:
+
+```tsx
+export const areas: AppArea[] = [overviewArea({ description: "..." }), findingsArea, taskRunsArea, settingsArea];
+```
+
+The page reads its route with the kit's `watchInterval`, the cadence `client.js`
+keeps (below), instead of a timer of its own; answer the route with `tagged_json`
+([Answer an unchanged read with a 304](#answer-an-unchanged-read-with-a-304)) so a
+read of an unchanged answer costs a `304`. Add the area's page to the smoke test in
+`web/e2e/` too.
+
+### The `@kit` alias
+
+Pages import components from `@kit/...` (`@kit/ui`, `@kit/data`, `@kit/icons`,
+`@kit/patterns`, `@kit/layouts/app`), never from `web/src/kit/shadcn/` by path.
+`const kit` in `web/vite.config.ts` and `@kit/*` in `web/tsconfig.json` point the
+alias at `src/kit/shadcn`: stock shadcn components on Base UI, and the parts built
+from them. Another kit is a folder next to it with the same entries (`ui`, `data`,
+`lib`, `hooks`, `icons`, `patterns`, `layouts/app`, `layouts/app/router` and
+`styles.css`); point both at it, and no page changes.
+
+### Who signs in: operators or members
+
+Without organizations, the app's people are the Agent's operators, who sign in as
+they do to the Developer dashboard (`[tool.cayu.serve].auth` is
+`OPERATOR_BASIC_AUTH`). Deployed on Cayu Cloud, they are Cloud's operators with
+their Cloud roles: every role reads and decides what waits in the inbox, and
+`admin` and `developer` change things. Under `cayu serve --dev` it is you, on a
+loopback address only. The routes get the person from
+`cayu.server.operator_sign_in`
+([Know who is signed in to your own routes](#know-who-is-signed-in-to-your-own-routes)).
+
+With organizations (the b2b preset, or `--with organizations` on the agent preset),
+the app's people are the organizations' members instead. `integrations/sign_in.py`
+signs them in: under `cayu serve --dev` as a demonstration person from
+`operations/demo_seed.py`, on the app's own sign-in page; deployed, through Cayu
+Cloud's sign-in (`APP_SIGN_IN=cloud`, the default). `APP_SIGN_IN=oidc` instead
+accepts an OIDC bearer token from API clients that send their own; the web app has no
+OIDC sign-in in the browser. `[tool.cayu.serve].auth` is `OPERATOR_ONLY_AUTH`, which keeps
+the Developer dashboard and Cayu's `/api` for operators, so members reach their data
+only through `/app` (`cayu guide b2b`).
 
 ## Follow live sessions with client.js
 
@@ -450,8 +612,8 @@ async def summary(request: Request) -> Response:
     return JSONResponse(body, headers=headers)
 ```
 
-The routes `cayu new --preset b2b` generates under `/app` answer this way (`cayu guide
-b2b`).
+The routes every generated web app reads under `/app` (`/app/settings`,
+`/app/overview` and `/app/task-runs`) answer this way.
 
 ## Use usage and cost, not event folds
 

@@ -133,7 +133,10 @@ class CapabilitySpec:
 PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="agent",
-        summary="Batteries-included local Cayu agent with explicit safe capability wiring.",
+        summary=(
+            "The default. An agent one person or one team runs, with a web app for that team "
+            "beside the Developer dashboard at /cayu/."
+        ),
         default_capabilities=(
             "approvals",
             "artifacts",
@@ -151,13 +154,19 @@ PRESETS: tuple[PresetSpec, ...] = (
     ),
     PresetSpec(
         name="service",
-        summary="Maintained authenticated multi-user product-service shape.",
+        summary=(
+            "Choose when your own product or other systems call the agent over an "
+            "authenticated API for their end users. API only: it has no web app."
+        ),
         default_capabilities=("tasks", "approvals", "observability", "evals"),
         environment=("PRODUCT_AUTH_TOKENS_JSON", "CAYU_OPERATOR_BEARER_TOKEN"),
     ),
     PresetSpec(
         name="coding",
-        summary="Maintained trusted-repository coding composition.",
+        summary=(
+            "Choose when the agent edits a code repository and runs its tests. Comes with "
+            "the web app for your team."
+        ),
         default_capabilities=(
             "artifacts",
             "knowledge",
@@ -173,8 +182,9 @@ PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="long-running",
         summary=(
-            "Agent example with approval, a waited-for reply, reminder and deadline "
-            "timers, a spend cap, and restart tests."
+            "Choose when work spans hours or days: approval, a waited-for reply, reminder "
+            "and deadline timers, a spend cap, and restart tests. Comes with the web app "
+            "for your team."
         ),
         default_capabilities=(
             "approvals",
@@ -190,10 +200,13 @@ PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="b2b",
         summary=(
-            "The web app plus organizations, for an Agent several businesses share on one "
-            "deployment: organizations, departments and members in its own tables, turned "
-            "into Cayu resource-access grants. Choose it only when people from separate "
-            "organizations use the same deployment."
+            "The web app plus organizations. Choose it only when people from separate "
+            "organizations (customers, client firms, households) share one deployment and "
+            "each must see only their own organization's data: organizations, departments "
+            "and members in its own tables, turned into Cayu resource-access grants. Every "
+            "preset but service already has a web app for your own team. The agent preset "
+            "takes the same organizations with --with organizations --without "
+            "knowledge,memory."
         ),
         default_capabilities=(
             "app-database",

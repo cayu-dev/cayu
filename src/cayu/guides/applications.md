@@ -38,6 +38,7 @@ Normal agent, service, coding, and long-running presets share these ownership bo
 | Context, recall, compaction, and memory attribution | `memory/` |
 | Business rules | `domain/` |
 | External protocols and MCP adapters | `integrations/` |
+| The web app and the Agent's routes under `/app` (every preset but service) | `web/`, `integrations/http/` |
 | Behavioral evidence | `evals/` |
 | Event sinks and tracing | `observability/` |
 | Final construction and registration only | `app.py` |
@@ -440,13 +441,31 @@ initializes that repository only for new projects. Then follow the printed
 verification commands, which build the coding image for Docker execution.
 
 All presets use the same application convention. Use `--preset` and `--execution`
-to select the application and execution environment. `--preset long-running` is
+to select the application and execution environment.
+
+Choose the preset by the work. Every preset but service comes with a web app for
+your team (the `web-app` capability, `cayu guide app-ui`), and `--without web-app`
+leaves it out:
+
+| Preset | Choose when | Web app |
+| --- | --- | --- |
+| `agent` (default) | One person or one team runs the agent. | For your team, with Conversations and Task runs. |
+| `coding` | The agent edits a code repository and runs its tests. | For your team. |
+| `long-running` | Work spans hours or days: approval, a waited-for reply, reminder and deadline timers, a spend cap, restart tests. | For your team. |
+| `service` | Your own product or other systems call the agent over an authenticated API for their end users. | None; API only. |
+| `b2b` | People from separate organizations (customers, client firms, households) share one deployment and each must see only their own organization's data. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |
+
+`--preset long-running` is
 the agent layout plus a worked example of approval, a waited-for reply,
 reminder and deadline timers, a spend cap, and restart tests; see
 `cayu guide long-running`.
 
-`--preset b2b` is the agent layout for an application several businesses share
-on one deployment, with one database and one agent. Organizations, departments
+`--preset b2b` is the web app plus the `organizations` capability, for an
+application people from separate organizations share on one deployment, with one
+database and one agent; choose it only for that. `--preset agent --with
+organizations --without knowledge,memory` adds the same organizations to the agent
+preset (organizations can't be combined with knowledge or memory, and the coding,
+long-running and service presets don't take them). Organizations, departments
 and memberships are application tables (it always includes `app-database`), and
 `policies/access.py` turns each person's current membership into Cayu
 resource-access grants: everyone sees their own conversations, their department's
