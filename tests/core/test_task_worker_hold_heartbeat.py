@@ -58,7 +58,10 @@ def test_worker_continues_when_heartbeat_observes_handler_hold(
                     store,
                     handler,
                     worker_id="owner",
-                    lease_seconds=1,
+                    # Exercise the hold heartbeat without racing native claim
+                    # setup against a one-second lease on a loaded runner. The
+                    # worker caps its heartbeat interval at one second.
+                    lease_seconds=300,
                     max_tasks=2,
                     poll_interval_s=0.01,
                     reclaim=False,

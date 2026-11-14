@@ -12,7 +12,10 @@ from cayu.messages import Message
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.requests import RunRequest
 from cayu.storage.sqlite import SQLiteTaskStore
-from cayu.tasks.dispatch import TaskStoreDispatcher
+from cayu.tasks.dispatch import (
+    TaskStoreDispatcher,
+    _dispatch_exception_graph_contains_identity,
+)
 from cayu.tasks.memory import InMemoryTaskStore
 from cayu.tasks.records import TaskStatus
 
@@ -78,6 +81,7 @@ async def test_cancelled_dispatch_settles_after_one_fence_read_failure(
     read_attempted = asyncio.Event()
     original_load = tasks.load_task
     failures = 0
+    fence_failure = ConnectionError("temporary cancellation-fence lookup failure")
 
     async def load_with_one_failed_fence_read(identity):
         nonlocal failures
@@ -85,7 +89,7 @@ async def test_cancelled_dispatch_settles_after_one_fence_read_failure(
             read_attempted.set()
             if fail_fence_read:
                 failures += 1
-                raise ConnectionError("temporary cancellation-fence lookup failure")
+                raise fence_failure
         return await original_load(identity)
 
     try:
@@ -97,8 +101,12 @@ async def test_cancelled_dispatch_settles_after_one_fence_read_failure(
         provider.release.set()
         with pytest.raises(asyncio.CancelledError) as cancelled:
             await asyncio.wait_for(processing, 10)
-        if fail_fence_read:
-            assert isinstance(cancelled.value.__cause__, ConnectionError)
+        # Durable cancellation intent can contribute TaskClaimLost concurrently.
+        # The exact injected read failure must survive, whether alone or grouped.
+        assert (
+            _dispatch_exception_graph_contains_identity(cancelled.value, fence_failure)
+            == fail_fence_read
+        )
         assert len(provider.requests) == 1
         assert failures == int(fail_fence_read)
         assert (await sessions.load(session_id)).status.value == "completed"

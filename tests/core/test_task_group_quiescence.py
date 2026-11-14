@@ -935,11 +935,17 @@ async def test_drained_preparation_retains_settlement_before_election(store, mon
 async def test_successful_preparation_retains_proof_before_admission(
     store, monkeypatch, failure, commit_ack
 ):
+    from datetime import timedelta
+
     from tests.core.test_verified_task_worker import (
         _contract,
         _draining_reports,
         _RecordingProvider,
         _StaticHandler,
+    )
+    from tests.core.test_work_attempt_lifecycle import (
+        _advance_lifecycle_clock,
+        _lifecycle_clock_now,
     )
 
     from cayu import AgentSpec
@@ -952,6 +958,9 @@ async def test_successful_preparation_retains_proof_before_admission(
             self.calls += 1
             return await super().prepare(context)
 
+    clock = [await _lifecycle_clock_now(store)]
+    if not isinstance(store, PostgresTaskStore):
+        monkeypatch.setattr(store, "_ownership_clock", lambda: clock[0])
     app = CayuApp(task_store=store, enable_logging=False)
     provider, handler = _RecordingProvider(), Handler()
     app.register_provider(provider, default=True)
@@ -985,7 +994,9 @@ async def test_successful_preparation_retains_proof_before_admission(
         handler,
         worker_id="preparer",
         query=TaskQuery(type="b"),
-        lease_seconds=1,
+        # Reaching the injected boundary must not race a one-second lease.
+        # Expiry is controlled explicitly below, after preparation is retained.
+        lease_seconds=5,
         callback_timeout_seconds=0.9,
     )
     entered, release = asyncio.Event(), asyncio.Event()
@@ -1068,7 +1079,9 @@ async def test_successful_preparation_retains_proof_before_admission(
                 # before the DRAINING assertion below.
         assert owner._preparation_settlement is retained
         assert await store.load_latest_work_attempt_admission("b") is None
-        await asyncio.sleep(1.1)
+        await _advance_lifecycle_clock(
+            store, clock, retained.started.lease_expires_at + timedelta(milliseconds=10)
+        )
         await store.complete_task("a", {})
         assert (await app.reconcile_task_group("race")).quiescence.status is (
             TaskGroupQuiescenceStatus.DRAINING
