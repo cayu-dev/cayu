@@ -7552,10 +7552,10 @@ class SQLiteSessionStore(
     ) -> dict[PendingActionKind, int]:
         from cayu.storage._pending_action_counts_sql import (
             SQLITE_PENDING_ACTION_COUNTS_INDEX,
-            count_woken_recoveries,
+            count_event_recoveries,
+            event_recovery_sessions_sql,
             pending_action_counts,
             pending_action_counts_sql,
-            woken_recovery_sessions_sql,
         )
 
         query = PendingActionQuery() if query is None else query
@@ -7566,14 +7566,16 @@ class SQLiteSessionStore(
             placeholder="?",
             index_hint=f"INDEXED BY {SQLITE_PENDING_ACTION_COUNTS_INDEX}",
         )
-        woken_sql, woken_params = woken_recovery_sessions_sql(
+        woken_sql, woken_params = event_recovery_sessions_sql(
             query, placeholder="?", dialect="sqlite"
         )
 
-        def read(connection: sqlite3.Connection) -> tuple[dict[PendingActionKind, int], list[str]]:
+        def read(
+            connection: sqlite3.Connection,
+        ) -> tuple[dict[PendingActionKind, int], list[tuple[str, int]]]:
             counts = pending_action_counts(connection.execute(sql, params).fetchone())
             woken = (
-                [str(row[0]) for row in connection.execute(woken_sql, woken_params)]
+                [(str(row[0]), int(row[1])) for row in connection.execute(woken_sql, woken_params)]
                 if woken_sql
                 else []
             )
@@ -7582,7 +7584,7 @@ class SQLiteSessionStore(
         counts, woken = await self._run_read(read)
         if not woken:
             return counts
-        return await count_woken_recoveries(self, counts, woken, query)
+        return await count_event_recoveries(self, counts, woken, query)
 
     async def query_pending_actions_for_sessions(
         self,

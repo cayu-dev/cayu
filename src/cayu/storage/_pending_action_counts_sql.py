@@ -11,11 +11,13 @@ The flags classify a checkpoint the way the list does: an approval comes
 before a question, and a question before a tool round's recovery. Approvals and
 questions wait only in interrupted sessions, and a completed session's leftover
 round is an issue, not a recovery item. A delegated wait or a sleep is not an
-inbox item, with one exception the flags can't show: a handed-over wake whose
-continuation stopped on a tool a person must settle (``session.interrupted``
-with ``manual_recovery_required``) is that tool's recovery. Those few sessions
-are found by their events and rebuilt the way the list builds them
-(``count_woken_recoveries``).
+inbox item. The flags can't show one thing: a round that stopped on a tool a
+person must settle (``session.interrupted`` with ``manual_recovery_required``)
+is that tool's recovery, whatever the checkpoint still waits on. That is a
+handed-over wake whose continuation stopped there, and an approval or question
+round whose tool started and recorded no result. Those few sessions are found
+by their events and rebuilt the way the list builds them
+(``count_event_recoveries``).
 
 The count doesn't re-check the event ledger otherwise, so a tool round whose
 every call finished, or a checkpoint whose pending state doesn't decode, still
@@ -88,16 +90,17 @@ def pending_action_counts_sql(
     return sql, params
 
 
-def woken_recovery_sessions_sql(
+def event_recovery_sessions_sql(
     query: PendingActionQuery, *, placeholder: str, dialect: Literal["sqlite", "postgres"]
 ) -> tuple[str, list[Any]]:
-    """Interrupted, woken sessions whose events name a manual recovery.
+    """Interrupted sessions whose events name a manual recovery, with their flags.
 
-    A sleep's flags are only the wake bit, so the count above leaves it out.
-    These sessions may instead wait on a tool's recovery, which only their newest
-    ``session.interrupted`` event shows (``woken_round_needs_manual_recovery``);
-    the caller rebuilds them with ``query_pending_actions_for_sessions``. A plain
-    sleeper costs one backward read of its own events, which stops at its pause.
+    A sleep's flags are only the wake bit, so the count above leaves it out, and
+    an approval's or a question's flags count it as one. Any of these may instead
+    wait on a tool's recovery, which only their newest ``session.interrupted``
+    event shows; the caller rebuilds them with
+    ``query_pending_actions_for_sessions``. Each such session costs one backward
+    read of its own events, which stops at its pause.
     """
 
     if SessionStatus.INTERRUPTED not in query.statuses:
@@ -107,13 +110,14 @@ def woken_recovery_sessions_sql(
         if dialect == "sqlite"
         else "event.payload -> 'manual_recovery_required' = 'true'::jsonb"
     )
+    paused = f"({_FLAGS} & {_DELEGATED | _WAKE})"
     where_sql, params = _session_filters(
         query.model_copy(update={"statuses": frozenset({SessionStatus.INTERRUPTED})}),
         placeholder,
-        f"({_FLAGS} & {_DELEGATED | _WAKE}) = {_WAKE}",
+        f"{paused} = {_WAKE} OR ({paused} = 0 AND ({_FLAGS} & {_APPROVAL | _QUESTION}) <> 0)",
     )
     sql = f"""
-        SELECT cayu_checkpoints.session_id
+        SELECT cayu_checkpoints.session_id, {_FLAGS}
         FROM cayu_checkpoints
         CROSS JOIN cayu_sessions
         WHERE cayu_sessions.id = cayu_checkpoints.session_id AND {where_sql}
@@ -129,14 +133,26 @@ def woken_recovery_sessions_sql(
     return sql, params
 
 
-async def count_woken_recoveries(
+async def count_event_recoveries(
     store: SessionStore,
     counts: dict[PendingActionKind, int],
-    session_ids: Sequence[str],
+    sessions: Sequence[tuple[str, int]],
     query: PendingActionQuery,
 ) -> dict[PendingActionKind, int]:
-    """Add the actions the list builds for these woken sessions to ``counts``."""
+    """Count these sessions by the actions the list builds for them.
 
+    ``sessions`` pairs each session with its flags. What the flags already
+    counted for a session is taken back first, so it is counted once.
+    """
+
+    for _, flags in sessions:
+        if flags & _WAKE:
+            continue
+        counted = (
+            PendingActionKind.TOOL_APPROVAL if flags & _APPROVAL else PendingActionKind.USER_INPUT
+        )
+        counts[counted] -= 1
+    session_ids = [session_id for session_id, _ in sessions]
     page_query = PendingActionQuery(
         statuses=frozenset({SessionStatus.INTERRUPTED}),
         agent_name=query.agent_name,

@@ -6894,29 +6894,29 @@ class PostgresSessionStore(
         self, query: PendingActionQuery | None = None
     ) -> dict[PendingActionKind, int]:
         from cayu.storage._pending_action_counts_sql import (
-            count_woken_recoveries,
+            count_event_recoveries,
+            event_recovery_sessions_sql,
             pending_action_counts,
             pending_action_counts_sql,
-            woken_recovery_sessions_sql,
         )
 
         query = PendingActionQuery() if query is None else query
         if type(query) is not PendingActionQuery:
             raise TypeError("Pending-action queries must be PendingActionQuery instances.")
         sql, params = pending_action_counts_sql(query, placeholder="%s")
-        woken_sql, woken_params = woken_recovery_sessions_sql(
+        woken_sql, woken_params = event_recovery_sessions_sql(
             query, placeholder="%s", dialect="postgres"
         )
         async with self._ready_connection() as conn, conn.cursor() as cur:
             await cur.execute(cast("LiteralString", sql), params)
             counts = pending_action_counts(await cur.fetchone())
-            woken: list[str] = []
+            woken: list[tuple[str, int]] = []
             if woken_sql:
                 await cur.execute(cast("LiteralString", woken_sql), woken_params)
-                woken = [str(row[0]) for row in await cur.fetchall()]
+                woken = [(str(row[0]), int(row[1])) for row in await cur.fetchall()]
         if not woken:
             return counts
-        return await count_woken_recoveries(self, counts, woken, query)
+        return await count_event_recoveries(self, counts, woken, query)
 
     async def query_pending_actions_for_sessions(
         self,

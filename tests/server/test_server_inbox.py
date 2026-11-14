@@ -1298,6 +1298,16 @@ def test_assigned_sibling_recovery_keeps_scope_and_decider(store_kind, tmp_path)
             )
             [action] = page.actions
             assert action.kind is PendingActionKind.MANUAL_RECOVERY
+            if store_kind == "sqlite":
+                # The stored counts agree: the question round is a recovery, counted once.
+                counts = await app.session_store.count_pending_actions(
+                    PendingActionQuery(session_id="crashed")
+                )
+                assert counts == {
+                    PendingActionKind.TOOL_APPROVAL: 0,
+                    PendingActionKind.USER_INPUT: 0,
+                    PendingActionKind.MANUAL_RECOVERY: 1,
+                }
             records = await app.session_store.query_events(EventQuery(session_id="crashed"))
             started = next(
                 record
