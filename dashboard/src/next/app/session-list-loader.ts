@@ -5,7 +5,6 @@ import type {
   SessionTranscriptQuery,
 } from "../../lib/api"
 import type { SessionOverviewResponse } from "../../lib/generated/server-api"
-import { loadSessionIndexPage } from "../../lib/session-index-pages.ts"
 import type { Session } from "../api/types"
 import { sessionDisplayTitle } from "./session-model.ts"
 
@@ -21,7 +20,7 @@ export type SessionListOptions = {
   firstMessage?: boolean
 }
 
-/** Read one visible candidate window; bounded transcript fallbacks never define search membership. */
+/** Read one page; the server fills it unless the list ends. Bounded transcript fallbacks never define search membership. */
 export async function loadSessionList(
   query: SessionListQuery,
   readPage: (query: SessionListQuery, signal: AbortSignal) => Promise<SessionsPage>,
@@ -38,9 +37,10 @@ export async function loadSessionList(
     firstMessage && !query.include?.includes("first_message")
       ? { ...query, include: [...(query.include ?? []), "first_message"] }
       : query
-  const result = await loadSessionIndexPage(selection, readPage, signal)
-  const byId = new Map(result.page.overviews?.map((overview) => [overview.session_id, overview]))
-  const rows: SessionListRow[] = result.page.sessions.map((session) => {
+  const page = await readPage(selection, signal)
+  signal.throwIfAborted()
+  const byId = new Map(page.overviews?.map((overview) => [overview.session_id, overview]))
+  const rows: SessionListRow[] = page.sessions.map((session) => {
     const overview = byId.get(session.id)
     if (!overview) throw new Error("Session overview is unavailable. Refresh the list.")
     return {
@@ -85,5 +85,5 @@ export async function loadSessionList(
     }),
   )
   signal.throwIfAborted()
-  return { ...result, rows }
+  return { page, rows }
 }

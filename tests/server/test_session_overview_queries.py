@@ -55,8 +55,9 @@ def test_filtered_pages_continue_through_empty_windows_after_reopen(session_stor
             ]
             cursor = None
             pages = []
-            for index in range(4):
-                if index == 2:
+            for index in range(5):
+                if index == 1:
+                    # The continuation survives reopening the store.
                     store = await _reopen_store(session_store_case, store)
                     app = _app(store)
                 async with client_for(app) as client:
@@ -72,8 +73,15 @@ def test_filtered_pages_continue_through_empty_windows_after_reopen(session_stor
                 ]
                 pages.append([item["id"] for item in body["sessions"]])
                 cursor = body["next_cursor"]
-                assert (cursor is not None) == (index < 3)
-            assert pages == [[], ["two"], [], ["four"]]
+                if cursor is None:
+                    break
+            assert cursor is None
+            if session_store_case[0] == "memory":
+                # Without summary rows each request checks one candidate page.
+                assert pages == [[], ["two"], [], ["four"]]
+            else:
+                # Summary rows fill each page until the list ends.
+                assert pages == [["two"], ["four"]]
         finally:
             await _close_store(store)
 
@@ -135,7 +143,7 @@ def test_filtered_cursor_binds_every_query_field_and_normalizes_state_order():
             assert [row["id"] for row in reordered.json()["sessions"]] == ["two"]
             unfiltered = await client.get("/api/sessions", params={"cursor": cursor})
             assert unfiltered.status_code == 422
-            native = await client.get("/api/sessions", params={"limit": 1})
+            native = await client.get("/api/sessions", params={"limit": 1, "include": "total"})
             assert native.json()["total_count"] == 2
             wrong_mode = await client.get(
                 "/api/sessions", params={**base, "cursor": native.json()["next_cursor"]}
@@ -573,7 +581,13 @@ def test_public_title_search_uses_current_redaction_before_membership_and_pagina
                         assert first.json()["sessions"] == []
                         assert first.json()["total_count"] is None
                         cursor = first.json()["next_cursor"]
-                        assert cursor
+                        # A store that checks one candidate page per request returns a
+                        # continuation; one that scans to the end returns none. Either
+                        # way the position can't depend on hidden text.
+                        if cursor is None:
+                            positions.append(None)
+                            assert secret not in first.text
+                            continue
                         document = json.loads(
                             base64.urlsafe_b64decode(cursor.removeprefix("sessionquery_"))
                         )

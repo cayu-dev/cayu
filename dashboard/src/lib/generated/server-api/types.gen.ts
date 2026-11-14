@@ -31022,7 +31022,7 @@ export type ListSessionsApiSessionsGetData = {
         /**
          * Include
          */
-        include?: Array<'usage' | 'execution_profile' | 'overview' | 'first_message'> | null;
+        include?: Array<'usage' | 'execution_profile' | 'overview' | 'first_message' | 'total'> | null;
     };
     url: '/api/sessions';
 };

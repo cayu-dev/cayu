@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import json
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from cayu.runtime.public_authority import (
@@ -526,6 +527,53 @@ async def resolve_public_authority_alias(
             field_name=field_name,
             scope_session_id=scope_session_id,
         )
+
+    return await run_read(query)
+
+
+async def resolve_public_authority_aliases(
+    run_read: SQLiteOperationRunner,
+    public_aliases: Sequence[str],
+    *,
+    field_name: str,
+    codec: PublicAuthorityAliasCodec | None,
+) -> dict[str, str]:
+    """``resolve_public_authority_alias`` for several unscoped aliases in one statement."""
+
+    keys = {
+        alias: _public_authority_alias_store_key(
+            alias, field_name=field_name, private_value=None, scope_session_id=None
+        )
+        for alias in dict.fromkeys(public_aliases)
+    }
+    if not keys:
+        return {}
+    stored_field, scope_key, _ = next(iter(keys.values()))
+
+    def query(connection: sqlite3.Connection) -> dict[str, str]:
+        rows = connection.execute(
+            """
+                SELECT public_alias, private_value
+                FROM cayu_public_authority_aliases
+                WHERE field_name = ?
+                  AND scope_session_id = ?
+                  AND public_alias IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+                """,
+            (stored_field, scope_key, json.dumps([key[2] for key in keys.values()])),
+        ).fetchall()
+        found = {row["public_alias"]: row["private_value"] for row in rows}
+        resolved: dict[str, str] = {}
+        for alias, (_, _, stored_alias) in keys.items():
+            private = _authenticated_public_authority_alias_private_value(
+                codec,
+                stored_alias,
+                found.get(stored_alias),
+                field_name=field_name,
+                scope_session_id=None,
+            )
+            if private is not None:
+                resolved[alias] = private
+        return resolved
 
     return await run_read(query)
 

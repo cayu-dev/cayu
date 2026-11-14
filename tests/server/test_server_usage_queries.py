@@ -1646,6 +1646,7 @@ def test_server_sessions_summary_filters_debug_states_before_pagination() -> Non
         params={
             "debug_state": "tool_issue",
             "order_by": "created_at_asc",
+            "include": "total",
         },
     )
     assert list_response.status_code == 200

@@ -178,12 +178,19 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(
         # Counts read a store page of sessions at a time, the same reads however
         # many sessions the page holds.
         assert small_counts == large_counts, (small_counts, large_counts)
-        for name in (
-            "sessions.load_sessions",
-            "sessions.query_pending_actions_for_sessions",
-            "sessions.read_session_usage_totals",
-        ):
-            assert large_counts[name] >= 1, (name, large_counts)
+        if session_store_case[0] == "memory":
+            for name in (
+                "sessions.load_sessions",
+                "sessions.query_pending_actions_for_sessions",
+                "sessions.read_session_usage_totals",
+            ):
+                assert large_counts[name] >= 1, (name, large_counts)
+        else:
+            # Native stores count settled summary rows in one grouped read and
+            # read usage only for the window's sessions that have any.
+            assert large_counts["sessions.read_session_summary_counts"] == 1, large_counts
+            assert large_counts["sessions.read_session_usage_totals"] >= 1, large_counts
+            assert large_counts["sessions.query_pending_actions_for_sessions"] == 0, large_counts
         for name in (
             "sessions.load",
             "sessions.query_pending_actions",

@@ -96,9 +96,51 @@ class SessionUsageDeltas:
     summaries: dict[str, SessionUsageSummary]
 
 
+@dataclass(frozen=True, slots=True)
+class SessionOverviewFilter:
+    """Overview conditions a session list applies in SQL on summary rows.
+
+    ``states`` are ``SessionOverviewStatus`` values; empty means any state.
+    Eval trials are excluded exactly. Rows whose overview is not settled are
+    kept as candidates whatever their stored state or fork lineage, so a
+    caller derives them and applies the same conditions itself.
+
+    Text search is never narrowed here: stored titles, labels and private IDs can
+    differ from what a viewer is shown, and candidates (and so continuation
+    positions) must not depend on hidden text. The caller matches text on the
+    public projection.
+    """
+
+    states: frozenset[str] = frozenset()
+    include_eval: bool = True
+    include_forks: bool = True
+
+    @property
+    def active(self) -> bool:
+        return bool(self.states) or not self.include_eval or not self.include_forks
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryCounts:
+    """What one snapshot of settled summary rows says about a counts window.
+
+    ``unsettled`` names the candidate rows whose overview must be derived before
+    it can be counted, each with whether it recorded usage in the window.
+    """
+
+    by_state: dict[str, int]
+    running: int
+    incomplete: int
+    buckets: dict[int, tuple[int, int]]
+    usage_session_ids: tuple[str, ...]
+    unsettled: tuple[tuple[str, bool, bool], ...]
+
+
 __all__ = [
+    "SessionOverviewFilter",
     "SessionSummaryRow",
     "SessionSummaryStamp",
     "SessionUsageDeltas",
+    "SummaryCounts",
     "SummarySettlement",
 ]

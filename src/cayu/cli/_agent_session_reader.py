@@ -76,7 +76,14 @@ class AgentSessionReader:
             "order_by": query.order_by.value,
             "created_since": _instant(query.created_since),
             "created_before": _instant(query.created_before),
-            "include": ["overview", "first_message"] if overview else None,
+            # The total is opt-in on the API; ask only when the caller wants it.
+            "include": (
+                [
+                    *(["overview", "first_message"] if overview else []),
+                    *(["total"] if query.include_total_count else []),
+                ]
+                or None
+            ),
         }
         previews = overview
         windowed = query.created_since is not None or query.created_before is not None
@@ -94,12 +101,14 @@ class AgentSessionReader:
             try:
                 body = self.api.get("/sessions", query=_query(params), resource="sessions")
             except CayuApiError as exc:
-                if not previews or exc.category != "request_rejected":
+                asked_total = "total" in (params["include"] or [])
+                if exc.category != "request_rejected" or not (previews or asked_total):
                     raise
-                # An Agent whose Cayu predates first-message previews rejects them;
-                # list the overviews without them.
+                # An Agent whose Cayu predates first-message previews or the opt-in total
+                # rejects them; it lists overviews without previews and always returns
+                # the total.
                 previews = False
-                params["include"] = ["overview"]
+                params["include"] = ["overview"] if overview else None
                 body = self.api.get("/sessions", query=_query(params), resource="sessions")
             sessions = body.get("sessions")
             if not isinstance(sessions, list):

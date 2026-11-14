@@ -25,6 +25,7 @@ from enum import StrEnum
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
 from cayu.storage._eval_view_summary_schema import EVAL_VIEW_SUMMARIES_REVISION
 from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISION
+from cayu.storage._session_list_index_schema import SESSION_LIST_INDEX_REVISION
 from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
@@ -689,6 +690,10 @@ REVISIONS: tuple[Revision, ...] = (
     # each event's agent and environment names. The migration fills them from
     # the retained events. Session stores require it.
     Revision(revision=USAGE_PROJECTION_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # Session lists sort and page by keyset on indexes over cayu_sessions'
+    # update, creation and activity times, alone and after agent, environment
+    # and parent. PostgreSQL builds them concurrently. Session stores require it.
+    Revision(revision=SESSION_LIST_INDEX_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

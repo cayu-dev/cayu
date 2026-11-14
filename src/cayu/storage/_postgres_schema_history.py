@@ -50,6 +50,10 @@ from cayu.storage._product_operation_schema import POSTGRES_PRODUCT_OPERATION_DD
 from cayu.storage._retention_schema import POSTGRES_RETENTION_AUDIT_DDL
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL
+from cayu.storage._session_list_index_schema import (
+    SESSION_LIST_INDEX_REVISION,
+    SESSION_LIST_INDEXES,
+)
 from cayu.storage._session_summary_schema import (
     POSTGRES_SESSION_SUMMARIES_DDL,
     SESSION_SUMMARY_REVISION,
@@ -1055,6 +1059,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     EVAL_VIEW_SUMMARIES_REVISION: POSTGRES_EVAL_VIEW_SUMMARIES_DDL,
     # Usage and Tools read trigger-maintained stored totals.
     USAGE_PROJECTION_REVISION: POSTGRES_USAGE_PROJECTION_DDL,
+    # The session list indexes are built CONCURRENTLY; see _CONCURRENT_INDEX_MIGRATIONS.
+    SESSION_LIST_INDEX_REVISION: (),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
@@ -4940,6 +4946,18 @@ class _ConcurrentIndexMigration:
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    # Session lists sort and page by keyset on these indexes.
+    SESSION_LIST_INDEX_REVISION: tuple(
+        _ConcurrentIndexMigration(
+            index_name=name,
+            table_name="cayu_sessions",
+            key_definitions=columns,
+            predicate_definition=None,
+            create_statement=f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON cayu_sessions({keys})",
+            drop_statement=f"DROP INDEX CONCURRENTLY IF EXISTS {name}",
+        )
+        for name, keys, columns in SESSION_LIST_INDEXES
+    ),
     # Recovery lists the sessions whose checkpoint holds an unsettled invocation
     # terminal decision from this index instead of scanning every checkpoint.
     143: (

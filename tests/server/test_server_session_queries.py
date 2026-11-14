@@ -1513,14 +1513,20 @@ def test_server_lists_sessions_with_cursor_pagination() -> None:
 
     _, client = _lifecycle_store_and_client(seed)
 
-    page1 = client.get("/api/sessions?limit=2&order_by=created_at_asc").json()
+    # The total is opt-in.
+    page1 = client.get("/api/sessions?limit=2&order_by=created_at_asc&include=total").json()
     assert [session["id"] for session in page1["sessions"]] == ["sess_0", "sess_1"]
     assert page1["total_count"] == 3
     assert page1["next_cursor"] is not None
 
     page2 = client.get(
         "/api/sessions",
-        params={"limit": 2, "order_by": "created_at_asc", "cursor": page1["next_cursor"]},
+        params={
+            "limit": 2,
+            "order_by": "created_at_asc",
+            "cursor": page1["next_cursor"],
+            "include": "total",
+        },
     ).json()
     assert [session["id"] for session in page2["sessions"]] == ["sess_2"]
     assert page2["total_count"] == 3

@@ -19,6 +19,7 @@ from tests.core.test_cloud_reporting import _app, _delegating_app, _drain, _star
 
 from cayu.budgets.pricing import default_price_book
 from cayu.server import ServerConfig, create_server
+from cayu.server._session_summaries import SessionSummaries
 from cayu.server.config import DashboardConfig
 from cayu.sessions import ForkSessionRequest
 from cayu.sessions._run_identity import eval_trial_scope
@@ -31,6 +32,22 @@ from cayu.sessions.requests import RunRequest
 
 __all__ = ["conformance_postgres_dsn", "session_store_case"]
 PATH = "/api/sessions/overview/counts"
+
+
+@pytest.fixture(autouse=True)
+def _reference_counts(monkeypatch):
+    """Route overview counts through the reference reader in this module.
+
+    These tests pin the reference reader's own rules (fencing a replaced session,
+    refusing incomplete pending evidence, skipping presentation reads). Stores
+    with summary rows answer counts from them instead; tests/server/
+    test_session_list_sql.py checks those counts against this reader.
+    """
+
+    async def no_summary_counts(self, **_arguments):
+        return None
+
+    monkeypatch.setattr(SessionSummaries, "counts", no_summary_counts)
 
 
 def _client(app, *, pricing=None):

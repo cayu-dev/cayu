@@ -39672,7 +39672,8 @@
                       "usage",
                       "execution_profile",
                       "overview",
-                      "first_message"
+                      "first_message",
+                      "total"
                     ],
                     "type": "string"
                   },

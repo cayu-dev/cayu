@@ -71,7 +71,6 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
   // The canonical server returns a cost object iff a price book is configured.
   const priced = rows.some((row) => row.overview.cost !== null)
   const next = sessions.data?.page.next_cursor
-  const paused = sessions.data?.searchPaused
   const hasFilters = sessionIndexFilterCount(search) > 0
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -247,8 +246,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
           <div className="mt-4">
             <EmptyState
               title={
-                paused
-                  ? "No matches in the pages scanned yet"
+                // A search can stop at its per-request limit with more sessions to check.
+                next
+                  ? "No matches in the sessions checked so far"
                   : search.cursor
                     ? "No more sessions match these filters"
                     : hasFilters
@@ -256,11 +256,6 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                       : "No sessions yet"
               }
             />
-            {paused && (
-              <p className="pt-2 text-sm text-muted-foreground">
-                Continue searching to scan the next pages.
-              </p>
-            )}
           </div>
         )}
         {rows.length > 0 && (
@@ -405,7 +400,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                     go({ to: "/sessions", search: sessionIndexSearchWithCursor(search, next) })
                   }
                 >
-                  {paused ? "Continue searching" : "Next page"}
+                  Next page
                 </Button>
               )}
             </div>

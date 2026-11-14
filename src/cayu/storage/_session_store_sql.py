@@ -79,6 +79,20 @@ class SqlClause:
     params: tuple[object, ...] = ()
 
 
+def combine_clauses(*clauses: SqlClause | None) -> SqlClause | None:
+    """AND the given clauses together, or ``None`` when there are none."""
+
+    present = [clause for clause in clauses if clause is not None]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    return SqlClause(
+        " AND ".join(f"({clause.sql})" for clause in present),
+        tuple(param for clause in present for param in clause.params),
+    )
+
+
 @dataclass(frozen=True)
 class EventQuerySqlPlan:
     where_sql: str

@@ -242,6 +242,7 @@ from cayu.server._session_events import (
     next_replay_poll_interval as _next_replay_poll_interval,
 )
 from cayu.server._session_events import register_session_events
+from cayu.server._session_ids import resolve_public_session_ids
 from cayu.server._session_overview import (
     SessionOverviewService,
     overview_http_error,
@@ -7827,7 +7828,8 @@ def create_router(
         include_eval: bool = True,
         include_forks: bool = True,
         include: Annotated[
-            list[Literal["usage", "execution_profile", "overview", "first_message"]] | None,
+            list[Literal["usage", "execution_profile", "overview", "first_message", "total"]]
+            | None,
             Query(),
         ] = None,
     ):
@@ -7847,6 +7849,8 @@ def create_router(
         if include is not None and "first_message" in include and "overview" not in include:
             raise HTTPException(422, detail="include=first_message requires include=overview.")
         query_binding = ""
+        # Overviews the filtered page already read; an ID batch reads them below.
+        listed = None
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
         (
@@ -7881,17 +7885,13 @@ def create_router(
             )
         try:
             if ids is not None:
-                selected = []
-                for public_id in dict.fromkeys(ids):
-                    try:
-                        private_id = await cayu_app._resolve_public_session_id(public_id)
-                    except PublicSessionAliasNotFound:
-                        continue
-                    except ValueError as exc:
-                        raise HTTPException(status_code=409, detail=str(exc)) from exc
-                    session = await session_store.load(private_id)
-                    if session is not None:
-                        selected.append(session)
+                try:
+                    private_ids = await resolve_public_session_ids(session_store, ids)
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                unique_ids = list(dict.fromkeys(private_ids))
+                loaded = await session_store.load_sessions(unique_ids)
+                selected = [loaded[i] for i in unique_ids if i in loaded]
                 result = SessionListResult(sessions=selected, total_count=len(selected))
             else:
                 requested_query = SessionQuery(
@@ -7915,24 +7915,31 @@ def create_router(
                     limit=limit,
                     offset=offset,
                     cursor=None,
-                    include_total_count=not selection.active,
+                    include_total_count=include is not None and "total" in include,
                     order_by=order_by,
                 )
-                result, query_binding = await selection.read_page(
+                result, query_binding, listed = await selection.read_page(
                     session_store,
                     requested_query,
                     cursor=cursor,
                     include=include,
                     project_session=partial(_serialize_session_base, cayu_app),
                     project_title=overview_service.project_title,
+                    overviews=partial(overview_service.read, selection=selection)
+                    if include is not None and "overview" in include
+                    else None,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (SessionOverviewUnavailable, NotImplementedError, OSError) as exc:
+            raise overview_http_error(exc) from exc
         overviews = None
         if include is not None and "overview" in include:
             try:
-                sessions, overviews = await overview_service.read(
-                    result.sessions, selection=selection
+                sessions, overviews = (
+                    (result.sessions, listed)
+                    if listed is not None
+                    else await overview_service.read(result.sessions, selection=selection)
                 )
                 if "first_message" in include:
                     overviews = await overview_service.with_first_messages(sessions, overviews)
@@ -8288,7 +8295,7 @@ def create_router(
             causal_budget_id=causal_budget_id,
         )
         try:
-            result, query_binding = await selection.read_page(
+            result, query_binding, _ = await selection.read_page(
                 session_store,
                 SessionQuery(
                     q=_clean_optional_query_value(q, "q"),

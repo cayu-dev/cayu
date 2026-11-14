@@ -324,7 +324,6 @@ export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
         title: row.title,
       })),
       next_cursor: result.page.next_cursor,
-      searchPaused: result.searchPaused,
     }
   }
   type HomePage = Awaited<ReturnType<typeof readPage>>

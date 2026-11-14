@@ -10,25 +10,23 @@ test("reads parallel authoritative overviews and only bounded title fallbacks fo
   const calls = []
   const result = await loadSessionList(
     { include_eval: false },
-    async (query) =>
-      query.cursor
-        ? {
-            sessions: [
-              session("authored"),
-              session("labels", { x: "y" }),
-              session("message"),
-              session("empty"),
-            ],
-            overviews: [
-              overview("authored", "Report"),
-              overview("labels"),
-              overview("message"),
-              overview("empty"),
-            ],
-            next_cursor: null,
-            total_count: null,
-          }
-        : { sessions: [], overviews: [], next_cursor: "next", total_count: null },
+    // The server fills each page, so one read returns it.
+    async () => ({
+      sessions: [
+        session("authored"),
+        session("labels", { x: "y" }),
+        session("message"),
+        session("empty"),
+      ],
+      overviews: [
+        overview("authored", "Report"),
+        overview("labels"),
+        overview("message"),
+        overview("empty"),
+      ],
+      next_cursor: null,
+      total_count: null,
+    }),
     async (id, query) => {
       calls.push([id, query])
       return {

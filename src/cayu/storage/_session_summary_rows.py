@@ -15,13 +15,17 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
+from cayu.budgets.usage import USAGE_BEARING_EVENT_TYPES
 from cayu.sessions.summary_rows import (
+    SessionOverviewFilter,
     SessionSummaryRow,
     SessionSummaryStamp,
     SessionUsageDeltas,
+    SummaryCounts,
     SummarySettlement,
 )
 from cayu.storage import _sqlite_records as sqlite_records
+from cayu.storage._session_store_sql import SqlClause, combine_clauses
 from cayu.storage._session_summary_schema import dependencies_current_sql
 
 SUMMARY_COLUMNS = (
@@ -38,6 +42,31 @@ def _loaded_columns(*, postgres: bool) -> str:
     return f"{SUMMARY_COLUMNS}, {current} AS dependencies_current"
 
 
+def _stale_dependencies_sql(*, postgres: bool) -> str:
+    """The summary rows whose dependencies moved, as one uncorrelated subquery."""
+
+    distinct = "IS DISTINCT FROM" if postgres else "IS NOT"
+    return (
+        "SELECT dependency.session_id FROM cayu_session_summary_dependencies AS dependency "
+        "LEFT JOIN cayu_session_summaries AS other ON other.session_id = dependency.depends_on "
+        f"WHERE other.instance_id {distinct} dependency.instance_id "
+        f"OR other.source_generation {distinct} dependency.source_generation"
+    )
+
+
+def _listed_unsettled_sql(*, postgres: bool) -> str:
+    """``_unsettled_sql`` for set reads: the dependency check is one uncorrelated subquery.
+
+    A correlated check per row keeps list and count reads from using their indexes.
+    """
+
+    return (
+        "(summary.derived_generation IS NULL "
+        "OR summary.derived_generation <> summary.source_generation "
+        f"OR summary.session_id IN ({_stale_dependencies_sql(postgres=postgres)}))"
+    )
+
+
 def _unsettled_sql(*, postgres: bool) -> str:
     return (
         "(summary.derived_generation IS NULL "
@@ -46,6 +75,7 @@ def _unsettled_sql(*, postgres: bool) -> str:
     )
 
 
+_USAGE_BEARING = tuple(str(event_type) for event_type in USAGE_BEARING_EVENT_TYPES)
 #: Session IDs per page of an ``--all`` walk or a backfill.
 MAX_SUMMARY_PAGE = 500
 
@@ -107,6 +137,61 @@ def _ordered(found: dict[str, Any], session_ids: Sequence[str]) -> dict[str, Any
 
 def _derived_text(derived: dict[str, Any]) -> str:
     return json.dumps(derived, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def overview_filter_clause(overview: SessionOverviewFilter, *, postgres: bool) -> SqlClause:
+    """The ``cayu_sessions`` condition a session list adds for ``overview``.
+
+    The summary's eval mark is copied from the session row, so it is exact. A
+    stored state or fork lineage counts only on a settled row; an unsettled row
+    stays a candidate for the caller to derive.
+    """
+
+    mark = "%s" if postgres else "?"
+    false = "false" if postgres else "0"
+    conditions: list[str] = []
+    params: list[object] = []
+    if overview.states:
+        states = sorted(overview.states)
+        conditions.append(f"summary.state IN ({', '.join(mark for _ in states)})")
+        params.extend(states)
+    if not overview.include_forks:
+        conditions.append(f"summary.forked = {false}")
+    derived = " AND ".join(conditions)
+    eval_only = "" if overview.include_eval else f" AND summary.eval = {false}"
+    clauses = []
+    if derived:
+        # Three indexed selections: unsettled rows (a partial index), rows whose
+        # dependencies moved, and settled rows matching the stored columns.
+        if postgres:
+            # PostgreSQL filters an ordered index scan by one hashed subquery.
+            candidates = (
+                "SELECT summary.session_id FROM cayu_session_summaries AS summary "
+                f"WHERE ({_listed_unsettled_sql(postgres=True)} OR ({derived})){eval_only}"
+            )
+            return SqlClause(f"cayu_sessions.id IN ({candidates})", tuple(params))
+        stale = _stale_dependencies_sql(postgres=False)
+        candidates = (
+            "SELECT summary.session_id FROM cayu_session_summaries AS summary "
+            "WHERE (summary.derived_generation IS NULL "
+            f"OR summary.derived_generation <> summary.source_generation){eval_only} "
+            "UNION SELECT summary.session_id FROM cayu_session_summaries AS summary "
+            f"WHERE summary.session_id IN ({stale}){eval_only} "
+            "UNION SELECT summary.session_id FROM cayu_session_summaries AS summary "
+            f"WHERE {derived}{eval_only}"
+        )
+        # A membership test (the unary plus keeps SQLite from driving the list from
+        # the candidates), so pages still read in sort-index order.
+        clauses.append(SqlClause(f"+cayu_sessions.id IN ({candidates})", tuple(params)))
+    elif not overview.include_eval:
+        clauses.append(
+            SqlClause(
+                "cayu_sessions.id IN (SELECT summary.session_id "
+                f"FROM cayu_session_summaries AS summary WHERE summary.eval = {false})",
+                (),
+            )
+        )
+    return combine_clauses(*clauses) or SqlClause("1 = 1")
 
 
 # SQLite
@@ -437,3 +522,127 @@ async def postgres_page(cur: Any, *, after: str | None, limit: int, unsettled: b
         ("" if after is None else after, limit),
     )
     return [row[0] for row in await cur.fetchall()]
+
+
+# Overview counts
+
+
+_ACTIVE_STATUSES = ("pending", "running", "interrupting")
+
+
+def counts_statements(
+    *,
+    where_sql: str,
+    where_params: tuple[object, ...],
+    include_eval: bool,
+    include_forks: bool,
+    since: object,
+    until: object,
+    bucket_starts: Sequence[object],
+    postgres: bool,
+) -> tuple[tuple[str, tuple[object, ...]], ...]:
+    """The statements ``read_counts`` runs, in one read snapshot.
+
+    Candidates are the sessions matching the filter created in [since, until),
+    and the older ones counts can still include: active ones, interrupted ones
+    waiting on a subagent, and ones with usage-bearing events in the window.
+    """
+
+    mark = "%s" if postgres else "?"
+    false = "false" if postgres else "0"
+    if postgres:
+        complete = "COALESCE((summary.derived_json ->> 'pending_complete')::boolean, false)"
+        delegated = (
+            "COALESCE((summary.derived_json -> 'waiting' ->> 'delegated_action')::bigint, 0)"
+        )
+    else:
+        complete = "COALESCE(json_extract(summary.derived_json, '$.pending_complete'), 0) = 1"
+        delegated = "COALESCE(json_extract(summary.derived_json, '$.waiting.delegated_action'), 0)"
+    settled = f"(NOT {_listed_unsettled_sql(postgres=postgres)})"
+    usage_types = ", ".join(f"'{event_type}'" for event_type in _USAGE_BEARING)
+    used = (
+        "summary.session_id IN (SELECT usage.session_id FROM cayu_usage_events AS usage "
+        f"WHERE usage.event_type IN ({usage_types}) "
+        f"AND usage.timestamp >= {mark} AND usage.timestamp < {mark})"
+    )
+    active = ", ".join(f"'{status}'" for status in _ACTIVE_STATUSES)
+    eval_sql = "" if include_eval else f" AND summary.eval = {false}"
+    fork_ok = "TRUE" if include_forks else f"forked = {false}"
+    # The filter's columns are the session row's; it selects session IDs on its own.
+    session_filter = (
+        f"AND summary.session_id IN (SELECT cayu_sessions.id FROM cayu_sessions {where_sql})"
+        if where_sql.strip()
+        else ""
+    )
+    base = f"""
+        WITH candidates AS (
+            SELECT
+                summary.session_id,
+                summary.created_at >= {mark} AS in_window,
+                summary.status,
+                summary.state,
+                summary.forked,
+                summary.created_at,
+                {settled} AS settled,
+                {complete} AS complete,
+                {used} AS used
+            FROM cayu_session_summaries AS summary
+            WHERE summary.created_at < {mark}{eval_sql}
+              {session_filter}
+              AND (
+                  summary.created_at >= {mark}
+                  OR summary.status IN ({active})
+                  OR (summary.status = 'interrupted' AND (NOT {settled} OR {delegated} > 0))
+                  OR {used}
+              )
+        )
+    """
+    params = (since, since, until, until, *where_params, since, since, until)
+    counted = f"settled AND {fork_ok}"
+    statements: list[tuple[str, tuple[object, ...]]] = [
+        (
+            base + f"SELECT in_window, state, COUNT(*), "
+            f"SUM(CASE WHEN complete THEN 0 ELSE 1 END) FROM candidates WHERE {counted} "
+            "GROUP BY in_window, state",
+            params,
+        ),
+        (base + "SELECT session_id, in_window, used FROM candidates WHERE NOT settled", params),
+        (base + f"SELECT session_id FROM candidates WHERE {counted} AND used", params),
+    ]
+    if bucket_starts:
+        cases = " ".join(
+            f"WHEN created_at < {mark} THEN {index}" for index in range(len(bucket_starts) - 1)
+        )
+        bucket = f"CASE {cases} ELSE {len(bucket_starts) - 1} END" if cases else "0"
+        statements.append(
+            (
+                base + f"SELECT {bucket} AS bucket, COUNT(*), "
+                "SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) "
+                f"FROM candidates WHERE {counted} AND in_window GROUP BY 1",
+                (*params, *bucket_starts[1:]),
+            )
+        )
+    return tuple(statements)
+
+
+def summary_counts_from_rows(rows: Sequence[Sequence[Sequence[Any]]]) -> SummaryCounts:
+    grouped, unsettled, used, *bucketed = rows
+    by_state: dict[str, int] = {}
+    running = incomplete = 0
+    for in_window, state, count, missing in grouped:
+        incomplete += int(missing or 0)
+        if state == "running":
+            running += int(count)
+        if in_window:
+            by_state[state] = by_state.get(state, 0) + int(count)
+    buckets = {
+        int(row[0]): (int(row[1]), int(row[2] or 0)) for row in (bucketed[0] if bucketed else ())
+    }
+    return SummaryCounts(
+        by_state=by_state,
+        running=running,
+        incomplete=incomplete,
+        buckets=buckets,
+        usage_session_ids=tuple(row[0] for row in used),
+        unsettled=tuple((row[0], bool(row[1]), bool(row[2])) for row in unsettled),
+    )

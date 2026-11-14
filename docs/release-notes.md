@@ -1,5 +1,25 @@
 # Release notes
 
+## Unreleased
+
+Upgrade: Storage revision 158 is additive; run `cayu storage migrate` before
+restarting. It adds sort indexes on `cayu_sessions`; PostgreSQL builds them
+concurrently.
+
+### Breaking changes
+
+- `GET /api/sessions` returns `total_count` only for `include=total`. It was
+  returned for every unfiltered list and cost a full count on each request.
+
+### Changes
+
+- Session lists filtered by overview state and eval or fork lineage filter in SQL
+  on the summary rows and return full pages until the list ends. Text search is
+  matched on the public projection of each candidate, up to 10,000 per request.
+  The dashboard no longer follows up to 25 empty pages.
+- `GET /api/sessions/overview/counts` groups summary rows by state.
+- `sessions?ids=` resolves public aliases and loads sessions in one read each.
+
 ## v0.20.0
 
 Upgrade: Stop workers and servers that open the database, take a restorable

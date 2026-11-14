@@ -41,6 +41,10 @@ from cayu.storage._pending_action_counts_sql import SQLITE_PENDING_ACTION_COUNTS
 from cayu.storage._product_operation_schema import SQLITE_PRODUCT_OPERATION_DDL
 from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
+from cayu.storage._session_list_index_schema import (
+    SESSION_LIST_INDEX_REVISION,
+    SQLITE_SESSION_LIST_INDEX_DDL,
+)
 from cayu.storage._session_summary_schema import (
     SESSION_SUMMARY_REVISION,
     SQLITE_SESSION_SUMMARIES_DDL,
@@ -835,6 +839,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     EVAL_VIEW_SUMMARIES_REVISION: SQLITE_EVAL_VIEW_SUMMARIES_DDL,
     # Usage and Tools read trigger-maintained stored totals.
     USAGE_PROJECTION_REVISION: SQLITE_USAGE_PROJECTION_DDL,
+    # Session lists sort and page by keyset on these indexes.
+    SESSION_LIST_INDEX_REVISION: SQLITE_SESSION_LIST_INDEX_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

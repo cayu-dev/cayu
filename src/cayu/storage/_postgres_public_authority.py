@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hmac
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -107,6 +107,52 @@ async def resolve_public_authority_alias(
             field_name=field_name,
             scope_session_id=scope_session_id,
         )
+
+
+async def resolve_public_authority_aliases(
+    connect: PostgresConnection,
+    public_aliases: Sequence[str],
+    *,
+    field_name: str,
+    codec: PublicAuthorityAliasCodec | None,
+    ensure_ready: Callable[[], Awaitable[None]],
+) -> dict[str, str]:
+    """``resolve_public_authority_alias`` for several unscoped aliases in one statement."""
+
+    keys = {
+        alias: _public_authority_alias_store_key(
+            alias, field_name=field_name, private_value=None, scope_session_id=None
+        )
+        for alias in dict.fromkeys(public_aliases)
+    }
+    if not keys:
+        return {}
+    stored_field, scope_key, _ = next(iter(keys.values()))
+    await ensure_ready()
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+                SELECT public_alias, private_value
+                FROM cayu_public_authority_aliases
+                WHERE field_name = %s
+                  AND scope_session_id = %s
+                  AND public_alias = ANY(%s::text[])
+                """,
+            (stored_field, scope_key, [key[2] for key in keys.values()]),
+        )
+        found = {str(row[0]): str(row[1]) for row in await cur.fetchall()}
+    resolved: dict[str, str] = {}
+    for alias, (_, _, stored_alias) in keys.items():
+        private = _authenticated_public_authority_alias_private_value(
+            codec,
+            stored_alias,
+            found.get(stored_alias),
+            field_name=field_name,
+            scope_session_id=None,
+        )
+        if private is not None:
+            resolved[alias] = private
+    return resolved
 
 
 async def public_authority_private_value_exists(

@@ -530,15 +530,25 @@ def register_session_overview_counts(
                 labels=parse_label_filters(label),
                 label_selectors=parse_label_selectors(label_selector),
             )
-            counts = await SessionOverviewReader(service.store, pricing=service.pricing).counts(
+            series = (
+                None if bucket_unit is None else TimeSeriesSpec(unit=bucket_unit, timezone=timezone)
+            )
+            # Summary rows answer with one grouped read; other stores derive every session.
+            counts = await service.summaries.counts(
                 since=since,
                 until=until,
                 include_eval=include_eval,
                 include_forks=include_forks,
                 filters=filters,
-                series=None
-                if bucket_unit is None
-                else TimeSeriesSpec(unit=bucket_unit, timezone=timezone),
+                series=series,
+                pricing=service.pricing,
+            ) or await SessionOverviewReader(service.store, pricing=service.pricing).counts(
+                since=since,
+                until=until,
+                include_eval=include_eval,
+                include_forks=include_forks,
+                filters=filters,
+                series=series,
             )
         except ValueError:
             raise HTTPException(

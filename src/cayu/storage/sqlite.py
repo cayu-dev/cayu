@@ -49,6 +49,7 @@ from cayu.sessions.messaging import (
 )
 from cayu.sessions.records import update_session_annotations
 from cayu.sessions.summary_rows import (
+    SessionOverviewFilter,
     SessionSummaryRow,
     SessionSummaryStamp,
     SessionUsageDeltas,
@@ -1475,6 +1476,16 @@ class SQLiteSessionStore(
             field_name=field_name,
             private_value=private_value,
             scope_session_id=scope_session_id,
+            codec=self.public_authority_alias_codec,
+        )
+
+    async def resolve_public_authority_aliases(
+        self, public_aliases: Sequence[str], *, field_name: str
+    ) -> dict[str, str]:
+        return await public_authority_ops.resolve_public_authority_aliases(
+            self._run_read,
+            public_aliases,
+            field_name=field_name,
             codec=self.public_authority_alias_codec,
         )
 
@@ -7289,6 +7300,62 @@ class SQLiteSessionStore(
             ownership_clock=self._ownership_clock,
             query=query,
             checkpoint_marker=None,
+        )
+
+    async def read_session_summary_counts(
+        self,
+        query: SessionQuery,
+        *,
+        since: datetime,
+        until: datetime,
+        include_eval: bool,
+        include_forks: bool,
+        bucket_starts: Sequence[datetime] = (),
+    ) -> summary_rows.SummaryCounts:
+        if await page_reads.page_reads_are_bounded():
+            return await super().read_session_summary_counts(
+                query,
+                since=since,
+                until=until,
+                include_eval=include_eval,
+                include_forks=include_forks,
+                bucket_starts=bucket_starts,
+            )
+        dialect = session_queries.SQL_DIALECT
+        plan = session_store_sql.build_session_query_sql(query, dialect=dialect)
+        statements = summary_rows.counts_statements(
+            where_sql=plan.filter_where_sql,
+            where_params=plan.filter_params,
+            include_eval=include_eval,
+            include_forks=include_forks,
+            since=dialect.datetime_param(since),
+            until=dialect.datetime_param(until),
+            bucket_starts=[dialect.datetime_param(start) for start in bucket_starts],
+            postgres=False,
+        )
+
+        def read(connection: sqlite3.Connection) -> summary_rows.SummaryCounts:
+            connection.execute("BEGIN")
+            try:
+                return summary_rows.summary_counts_from_rows(
+                    [connection.execute(sql, params).fetchall() for sql, params in statements]
+                )
+            finally:
+                connection.rollback()
+
+        return await self._run_read(read)
+
+    async def list_session_overview_candidates(
+        self, query: SessionQuery, overview: SessionOverviewFilter
+    ) -> SessionListResult:
+        if await page_reads.page_reads_are_bounded():
+            return await super().list_session_overview_candidates(query, overview)
+        return await session_queries.list_sessions(
+            self._run_read,
+            ownership_clock=self._ownership_clock,
+            query=query,
+            checkpoint_marker=None,
+            extra_clause=summary_rows.overview_filter_clause(overview, postgres=False),
         )
 
     async def query_session_topology(

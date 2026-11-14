@@ -530,25 +530,32 @@ summaries and arbitrary metadata are not searched. Hidden title substrings
 cannot affect membership, totals, or continuation positions. Redaction is
 applied when searching, including when stored titles predate the current policy.
 
-Text search uses bounded candidate paging on both `GET /api/sessions` (with or
-without `include=overview`) and `POST /api/sessions/summary`. It requires cursor
-paging rather than a nonzero offset, returns `total_count: null`, and can return
-empty pages with a continuation. Summary usage and costs cover only the selected
-rows on that page. The shipped Sessions page automatically follows empty
-continuation pages while showing a searching state. It stops at a match or
-confirmed exhaustion; after 25 candidate pages it pauses with an explicit
-Continue searching action. Query changes cancel the previous traversal, and
-repeated cursors fail rather than looping. Native SDK store queries retain their store-data search
-semantics; they are not the public control-plane exposure boundary.
+Text search requires cursor paging rather than a nonzero offset and returns
+`total_count: null`. Summary usage and costs cover only the selected rows on
+that page. Native SDK store queries retain their store-data search semantics;
+they are not the public control-plane exposure boundary.
 
-A filtered request reads at most one native candidate page of `limit` rows,
-then selects rows using the public text projection and/or shared overview facts. It can return fewer than
-`limit` matches, including an empty `sessions` array with a non-null
-`next_cursor`. Continue until `next_cursor` is null to traverse all matching
-candidates. Filtered `total_count` is always null: display a loaded-result count,
-not an exact matching total. The separate overview counts endpoint retains its
-exact-count contract. This bounded list design does not promise snapshot
-pagination when sessions change during traversal.
+SQLite and PostgreSQL stores narrow a filtered list in SQL on the stored session
+summary rows (overview state, eval mark, fork lineage). The server fills the page
+from following candidate pages, so a filtered page holds `limit` rows unless the
+list ends: an empty page means no more matches. Text search is never narrowed in
+SQL, because stored titles, labels and private ids can differ from what a viewer
+is shown: each candidate's public, redacted projection is checked, at most
+10,000 candidates per request, after which the page is returned with its
+continuation. Candidates and continuation positions therefore never depend on
+hidden text, and a public session alias matches as shown. Stores without summary
+rows, and reads under scoped access bounds, keep the
+earlier behavior: at most one candidate page of `limit` rows per request, which
+can come back short or empty with a non-null `next_cursor`. The shipped
+dashboard no longer follows empty pages on its own.
+
+`total_count` is opt-in: pass `include=total` to count every matching session.
+Without it, and on every filtered list, `total_count` is null; display a loaded
+count or a "load more" action instead. The separate overview counts endpoint
+retains its exact-count contract and, on native stores, groups the stored
+summary rows by state instead of reading every session in the window. This
+list design does not promise snapshot pagination when sessions change during
+traversal.
 
 Filtered cursors are opaque, portable across server restarts, and bound to the
 normalized query, inclusion flags, requested representations, order, and page

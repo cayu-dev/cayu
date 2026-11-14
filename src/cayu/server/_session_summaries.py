@@ -29,15 +29,24 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
+from cayu._time_buckets import TimeSeriesSpec, bucket_index, time_buckets
+from cayu.budgets.pricing import PriceBook, add_cost_amounts
 from cayu.budgets.usage import SessionUsageSummary, combine_session_usage_summaries
+from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.overview import (
+    SessionOverviewCounts,
     SessionOverviewFacts,
     SessionOverviewReader,
     SessionOverviewStatus,
+    SessionOverviewUnavailable,
+    SessionStartBucket,
+    SessionStartSeries,
 )
+from cayu.sessions.queries import SessionAggregateFilter, session_query_from_aggregate_filter
 from cayu.sessions.records import PendingActionKind, Session
 from cayu.sessions.store import SessionStore
 from cayu.sessions.summary_rows import (
@@ -51,7 +60,11 @@ from cayu.sessions.summary_rows import (
 SUMMARY_DOCUMENT_VERSION = 1
 
 # Fields that depend on how a document was computed, not on what it says.
+
 _BOOKKEEPING = frozenset({"version", "usage_through", "usage_epoch", "instance_id"})
+
+# Sessions per usage read, and per derivation batch, of a counts window.
+_USAGE_PAGE = 200
 
 UsesBrowser = Callable[[SessionStore, list[Session]], Awaitable[dict[str, bool]]]
 
@@ -518,6 +531,149 @@ class SessionSummaries:
         document["usage_through"] = deltas.through_sequences.get(session_id, 0)
         document["usage_epoch"] = None
         return document
+
+    async def counts(
+        self,
+        *,
+        since: datetime | None,
+        until: datetime | None,
+        include_eval: bool,
+        include_forks: bool,
+        filters: SessionAggregateFilter,
+        series: TimeSeriesSpec | None,
+        pricing: PriceBook | None,
+    ) -> SessionOverviewCounts | None:
+        """``SessionOverviewReader.counts`` from summary rows, ``None`` without them.
+
+        Settled rows are counted by the store in one grouped read; only the
+        rows it reports unsettled are derived here. Tokens come from
+        the stored per-session usage totals of the sessions that have any.
+        """
+
+        until = datetime.now(UTC) if until is None else until
+        since = until - timedelta(days=1) if since is None else since
+        if any(t.tzinfo is None or t.utcoffset() is None for t in (since, until)) or since >= until:
+            raise ValueError("Overview counts require aware since < until.")
+        query = session_query_from_aggregate_filter(filters)
+        buckets = () if series is None else tuple(time_buckets(since, until, series))
+        starts = tuple(bucket.start_at for bucket in buckets)
+        try:
+            tally = await self._store.read_session_summary_counts(
+                query,
+                since=since,
+                until=until,
+                include_eval=include_eval,
+                include_forks=include_forks,
+                bucket_starts=starts,
+            )
+        except NotImplementedError:
+            return None
+        if tally.incomplete:
+            raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
+        by_state = dict.fromkeys(SessionOverviewStatus, 0)
+        for state, count in tally.by_state.items():
+            by_state[SessionOverviewStatus(state)] += count
+        running = tally.running
+        totals = [tally.buckets.get(index, (0, 0)) for index in range(len(buckets))]
+        usage_ids = list(tally.usage_session_ids)
+        unsettled = {
+            session_id: (in_window, used) for session_id, in_window, used in tally.unsettled
+        }
+        # Unsettled rows are derived a batch at a time; a page read takes at most
+        # 1,000 sessions, and a window can hold many more never-listed sessions.
+        rows: dict[str, SessionSummaryRow] = {}
+        derived: dict[str, dict[str, Any]] = {}
+        pending = tuple(unsettled)
+        for offset in range(0, len(pending), _USAGE_PAGE):
+            batch = await self._store.load_session_summaries(pending[offset : offset + _USAGE_PAGE])
+            rows.update(batch)
+            derived.update((await self._derive(list(batch.values()))).documents)
+        for session_id, row in rows.items():
+            document = derived.get(session_id)
+            if document is None or (not include_forks and document["forked"]):
+                continue
+            in_window, used = unsettled[session_id]
+            delegating = document["waiting"][PendingActionKind.DELEGATED_ACTION.value] > 0
+            if (
+                not in_window
+                and not used
+                and row.status not in ("pending", "running", "interrupting")
+                and not (row.status == "interrupted" and delegating)
+            ):
+                continue
+            if not document["pending_complete"]:
+                raise SessionOverviewUnavailable("Pending session evidence is unavailable.")
+            state = SessionOverviewStatus(document["state"])
+            running += int(state is SessionOverviewStatus.RUNNING)
+            if in_window:
+                by_state[state] += 1
+                if buckets:
+                    index = bucket_index(starts, row.created_at)
+                    count, failed = totals[index]
+                    totals[index] = (count + 1, failed + int(state is SessionOverviewStatus.FAILED))
+            if used:
+                usage_ids.append(session_id)
+        return SessionOverviewCounts(
+            since,
+            until,
+            running,
+            by_state,
+            *await self._window_usage(usage_ids, since, until, pricing),
+            None
+            if series is None
+            else SessionStartSeries(
+                unit=series.unit,
+                timezone=series.timezone,
+                buckets=tuple(
+                    SessionStartBucket(
+                        start_at=bucket.start_at,
+                        end_at=bucket.end_at,
+                        total_count=count,
+                        failed=failed,
+                    )
+                    for bucket, (count, failed) in zip(buckets, totals, strict=True)
+                ),
+            ),
+        )
+
+    async def _window_usage(
+        self,
+        session_ids: Sequence[str],
+        since: datetime,
+        until: datetime,
+        pricing: PriceBook | None,
+    ) -> tuple[int, int, int, bool, Decimal | None, bool]:
+        """Tokens, completeness and cost of the sessions' usage in the window."""
+
+        input_tokens = output_tokens = cached_tokens = 0
+        tokens_complete = cost_complete = True
+        cost = None if pricing is None else Decimal(0)
+        ids = list(dict.fromkeys(session_ids))
+        for offset in range(0, len(ids), _USAGE_PAGE):
+            query = EventQuery(
+                session_ids=tuple(ids[offset : offset + _USAGE_PAGE]), since=since, until=until
+            )
+            # Tokens come from the store's per-session totals (stored rows on
+            # native stores); cost is priced at read time. A session replaced while
+            # its usage is read must not lend the new incarnation's usage to the old.
+            before = await self._store.load_session_instance_ids(query.session_ids)
+            per_session = await self._store.read_session_usage_totals(
+                query.session_ids, since=since, until=until
+            )
+            summary = combine_session_usage_summaries("overview", list(per_session.values()))
+            input_tokens += summary.usage.input_tokens
+            output_tokens += summary.usage.output_tokens
+            cached_tokens += summary.usage.cache.read_tokens
+            tokens_complete = tokens_complete and summary.unmeasured_model_attempts == 0
+            if pricing is not None and cost is not None:
+                totals = (await self._store.read_cost_accounting(query, pricing)).totals
+                cost = add_cost_amounts(cost, totals.total_cost)
+                cost_complete = cost_complete and (
+                    totals.unpriced_model_steps == 0 and totals.unpriced_auxiliary_attempts == 0
+                )
+            if await self._store.load_session_instance_ids(query.session_ids) != before:
+                raise SessionOverviewUnavailable("Session changed during accounting.")
+        return input_tokens, output_tokens, cached_tokens, tokens_complete, cost, cost_complete
 
 
 @dataclass(frozen=True, slots=True)

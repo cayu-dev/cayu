@@ -49,7 +49,8 @@ def test_overview_rows_match_between_a_local_store_and_the_agent(agent, capsys) 
     # The Agent served the overview and the previews in the list request itself.
     listed = [request for request in seen if request.url.path.endswith("/api/sessions")]
     assert listed and all(
-        request.url.params.get_list("include") == ["overview", "first_message"]
+        # The CLI also asks for the opt-in total it prints.
+        request.url.params.get_list("include") == ["overview", "first_message", "total"]
         for request in listed
     )
 

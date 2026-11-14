@@ -1869,6 +1869,7 @@ async def list_sessions(
     *,
     checkpoint_marker: str | None,
     access_bounds: SessionReadBounds | None = None,
+    extra_clause: session_store_sql.SqlClause | None = None,
 ) -> SessionListResult:
     if checkpoint_marker is None:
         session_source_sql = "cayu_sessions"
@@ -1905,10 +1906,11 @@ async def list_sessions(
         plan = session_store_sql.build_session_query_sql(
             resolved_query,
             dialect=SQL_DIALECT,
-            access_clause=(
+            access_clause=session_store_sql.combine_clauses(
                 None
                 if access_bounds is None
-                else session_store_sql.session_access_clause(access_bounds, dialect=SQL_DIALECT)
+                else session_store_sql.session_access_clause(access_bounds, dialect=SQL_DIALECT),
+                extra_clause,
             ),
         )
         # Interpolations are trusted: SESSION_COLUMNS is a constant, order_sql is

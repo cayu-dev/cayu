@@ -195,9 +195,11 @@ from cayu.sessions.summaries import (
     SessionStepCounts,
 )
 from cayu.sessions.summary_rows import (
+    SessionOverviewFilter,
     SessionSummaryRow,
     SessionSummaryStamp,
     SessionUsageDeltas,
+    SummaryCounts,
     SummarySettlement,
 )
 from cayu.sessions.supervision_events import SupervisionEventPage, SupervisionEventQuery
@@ -827,6 +829,23 @@ class SessionStore(ABC):
         raise NotImplementedError(
             "This SessionStore does not support durable public authority aliases."
         )
+
+    async def resolve_public_authority_aliases(
+        self, public_aliases: Sequence[str], *, field_name: str
+    ) -> dict[str, str]:
+        """``resolve_public_authority_alias`` for several unscoped aliases.
+
+        Each alias that resolves maps to its private value; the others are
+        absent. Native stores answer with one statement; the default resolves
+        each alias in turn.
+        """
+
+        resolved: dict[str, str] = {}
+        for alias in dict.fromkeys(public_aliases):
+            private = await self.resolve_public_authority_alias(alias, field_name=field_name)
+            if private is not None:
+                resolved[alias] = private
+        return resolved
 
     async def resolve_public_authority_alias(
         self,
@@ -5549,6 +5568,43 @@ class SessionStore(ABC):
         Each session's bound is its newest event in the snapshot. A session's
         appends are serialized, so any later event of it has a higher sequence,
         and reading again after the bound misses none.
+        """
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def read_session_summary_counts(
+        self,
+        query: SessionQuery,
+        *,
+        since: datetime,
+        until: datetime,
+        include_eval: bool,
+        include_forks: bool,
+        bucket_starts: Sequence[datetime] = (),
+    ) -> SummaryCounts:
+        """One snapshot of the settled summary rows an overview counts window covers.
+
+        The rows are those matching ``query``'s filters created in ``[since,
+        until)``, and older ones counts may include: active, interrupted while
+        waiting on a subagent, or with usage-bearing events in the window.
+        Settled rows are counted by state (window rows) and as running (all);
+        ``bucket_starts`` groups the window's rows by creation time. Unsettled
+        rows are named for the caller to derive. Stores without summary rows,
+        and reads under scoped access bounds, raise ``NotImplementedError``.
+        """
+
+        raise NotImplementedError("This session store keeps no session summaries.")
+
+    async def list_session_overview_candidates(
+        self, query: SessionQuery, overview: SessionOverviewFilter
+    ) -> SessionListResult:
+        """``list_sessions`` narrowed in SQL by ``overview`` on summary rows.
+
+        Every session matching both is listed. Rows whose overview is not
+        settled are listed whatever their stored state, so the caller derives
+        them and applies ``overview`` itself; a page can hold such rows that
+        turn out not to match. Stores without summary rows, and reads under
+        scoped access bounds, raise ``NotImplementedError``.
         """
 
         raise NotImplementedError("This session store keeps no session summaries.")
