@@ -7827,6 +7827,15 @@ def create_router(
         overview_state: Annotated[list[SessionOverviewStatus] | None, Query(max_length=32)] = None,
         include_eval: bool = True,
         include_forks: bool = True,
+        include_tool_proposals: Annotated[
+            bool,
+            Query(
+                description=(
+                    "False leaves out tool-call proposal sessions, which each proposed "
+                    "tool call runs as."
+                )
+            ),
+        ] = True,
         include: Annotated[
             list[Literal["usage", "execution_profile", "overview", "first_message", "total"]]
             | None,
@@ -7916,6 +7925,7 @@ def create_router(
                     offset=offset,
                     cursor=None,
                     include_total_count=include is not None and "total" in include,
+                    include_tool_proposals=include_tool_proposals,
                     order_by=order_by,
                 )
                 result, query_binding, listed = await selection.read_page(

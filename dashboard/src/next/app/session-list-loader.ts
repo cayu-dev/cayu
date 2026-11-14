@@ -54,18 +54,11 @@ export async function loadSessionList(
           : undefined,
       ),
       titleUnavailable:
-        firstMessage &&
-        overview.first_message_unavailable === true &&
-        !overview.title?.trim() &&
-        Object.keys(session.labels).length === 0,
+        firstMessage && overview.first_message_unavailable === true && !overview.title?.trim(),
     }
   })
   // The server already answered for every row; older servers need one bounded read per row.
-  const missing = firstMessage
-    ? []
-    : rows.filter(
-        (row) => !row.overview.title?.trim() && Object.keys(row.session.labels).length === 0,
-      )
+  const missing = firstMessage ? [] : rows.filter((row) => !row.overview.title?.trim())
   let index = 0
   await Promise.all(
     Array.from({ length: Math.min(4, missing.length) }, async () => {

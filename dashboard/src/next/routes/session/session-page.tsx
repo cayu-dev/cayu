@@ -158,11 +158,7 @@ export function SessionPage({
     queryKey: ["session-list-first-user", sessionId],
     queryFn: ({ signal }) =>
       api.transcript(sessionId, { role: "user", offset: 0, limit: 1 }, signal),
-    enabled:
-      !!detail.data &&
-      overview.isSuccess &&
-      !overview.data?.title?.trim() &&
-      Object.keys(detail.data.labels).length === 0,
+    enabled: !!detail.data && overview.isSuccess && !overview.data?.title?.trim(),
     staleTime: 30_000,
     retry: false,
   })

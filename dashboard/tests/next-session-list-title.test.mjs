@@ -4,13 +4,17 @@ import { sessionDisplayTitle, shortSessionTitle } from "../src/next/app/session-
 
 const user = (content) => ({ role: "user", content })
 
-test("session title precedence is authored title, labels, first user text, then ID", () => {
+test("session title precedence is authored title, first user text, specialist, then ID", () => {
   const record = { id: "session-1", labels: { tenant: "acme", case: "17" } }
   const message = user([{ type: "text", text: "Inspect the report" }])
   assert.equal(sessionDisplayTitle(record, "Quarterly review", message), "Quarterly review")
-  assert.equal(sessionDisplayTitle(record, null, message), "tenant=acme · case=17")
-  assert.equal(sessionDisplayTitle({ ...record, labels: {} }, null, message), "Inspect the report")
-  assert.equal(sessionDisplayTitle({ ...record, labels: {} }, null, null), "session-1")
+  // Labels are shown beside the title, never as it.
+  assert.equal(sessionDisplayTitle(record, null, message), "Inspect the report")
+  assert.equal(
+    sessionDisplayTitle({ ...record, agent_name: "scout-ranker" }, null, null),
+    "scout-ranker session",
+  )
+  assert.equal(sessionDisplayTitle(record, null, null), "session-1")
 })
 
 test("fallback uses only text from the first user message, never other roles or tool payloads", () => {

@@ -42522,6 +42522,11 @@
             ],
             "title": "Environment Name"
           },
+          "include_tool_proposals": {
+            "default": true,
+            "title": "Include Tool Proposals",
+            "type": "boolean"
+          },
           "label_selectors": {
             "items": {
               "$ref": "#/components/schemas/LabelSelectorRequirement"
@@ -59802,6 +59807,18 @@
             }
           },
           {
+            "description": "False leaves out tool-call proposal sessions, which each proposed tool call runs as.",
+            "in": "query",
+            "name": "include_tool_proposals",
+            "required": false,
+            "schema": {
+              "default": true,
+              "description": "False leaves out tool-call proposal sessions, which each proposed tool call runs as.",
+              "title": "Include Tool Proposals",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "query",
             "name": "include",
             "required": false,
@@ -59950,6 +59967,16 @@
             "schema": {
               "default": false,
               "title": "Include Forks",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_tool_proposals",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Tool Proposals",
               "type": "boolean"
             }
           },

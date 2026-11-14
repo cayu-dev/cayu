@@ -364,19 +364,16 @@ export function shortSessionTitle(text: string): string {
 }
 
 /**
- * Authored title first; callers fetch only the first user record when labels are absent. A
- * title taken from the first message is shortened, since the conversation shows it in full.
+ * A session's display title: its own title, else its first user message (shortened, since
+ * the conversation shows it in full), else its specialist, else its ID. Labels are never
+ * the title; lists show them beside it.
  */
 export function sessionDisplayTitle(
-  session: { id: string; labels: Record<string, string> },
+  session: { id: string; agent_name?: string | null },
   title: string | null | undefined,
   firstUser: { role: string; content: Record<string, unknown>[] } | null | undefined,
 ): string {
   if (title?.trim()) return title
-  const labels = Object.entries(session.labels)
-    .map(([key, value]) => `${key}=${value}`)
-    .join(" · ")
-  if (labels) return labels
   const text =
     firstUser?.role === "user"
       ? firstUser.content
@@ -385,5 +382,6 @@ export function sessionDisplayTitle(
           .join("")
           .trim()
       : ""
-  return text ? shortSessionTitle(text) : session.id
+  if (text) return shortSessionTitle(text)
+  return session.agent_name?.trim() ? `${session.agent_name} session` : session.id
 }

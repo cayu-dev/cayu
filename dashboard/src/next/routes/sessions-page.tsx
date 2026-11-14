@@ -152,6 +152,16 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
             />
             Include forks
           </label>
+          <label className="flex h-8 items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={search.include_tool_proposals === true}
+              onChange={(event) =>
+                set({ include_tool_proposals: event.target.checked ? true : undefined })
+              }
+            />
+            Include tool proposals
+          </label>
           {hasFilters && (
             <Button
               variant="ghost"
@@ -269,16 +279,17 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
                   <th className="px-3 py-2 font-medium">Session</th>
+                  <th className="px-3 py-2 font-medium">State</th>
+                  <th className="px-3 py-2 text-right font-medium">Updated</th>
+                  <th className="px-3 py-2 text-right font-medium">Duration</th>
+                  <th className="px-3 py-2 text-right font-medium">Tool calls</th>
+                  <th className="px-3 py-2 text-right font-medium">{priced ? "Cost" : "Tokens"}</th>
+                  {/* Columns that differ between rows; often the same on every page. */}
                   {varying.map((column) => (
                     <th key={column} className="px-3 py-2 font-medium">
                       {column}
                     </th>
                   ))}
-                  <th className="px-3 py-2 font-medium">State</th>
-                  <th className="px-3 py-2 text-right font-medium">Duration</th>
-                  <th className="px-3 py-2 text-right font-medium">Tool calls</th>
-                  <th className="px-3 py-2 text-right font-medium">{priced ? "Cost" : "Tokens"}</th>
-                  <th className="px-3 py-2 text-right font-medium">Updated</th>
                 </tr>
               </thead>
               <tbody>
@@ -293,7 +304,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                       onClick={rowClick(sessionRoute(row.session.id))}
                       className={ROW_CLASS}
                     >
-                      <td className="max-w-[28rem] px-3 py-2">
+                      <td className="min-w-[16rem] max-w-[36rem] px-3 py-2">
                         <div className="flex min-w-0 items-center gap-2">
                           <NavLink
                             {...sessionRoute(row.session.id)}
@@ -304,29 +315,19 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                           {o.eval && <EvalTrialTag />}
                           {o.forked && <span className="text-xs text-muted-foreground">Fork</span>}
                         </div>
-                        <div className="mt-0.5 flex min-w-0 items-center gap-2">
-                          <span className="truncate font-mono text-[11px] text-muted-foreground">
-                            {row.session.id}
-                          </span>
-                          <LabelChips
-                            labels={row.session.labels}
-                            className="flex-nowrap overflow-hidden"
-                          />
-                        </div>
+                        <p
+                          className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground"
+                          title={row.session.id}
+                        >
+                          {row.session.id}
+                        </p>
+                        <LabelChips labels={row.session.labels} limit={3} className="mt-1" />
                         {row.titleUnavailable && (
                           <span className="text-xs text-muted-foreground">
                             Message title unavailable
                           </span>
                         )}
                       </td>
-                      {varying.map((column) => (
-                        <td
-                          key={column}
-                          className="px-3 py-2 whitespace-nowrap text-muted-foreground"
-                        >
-                          {COLUMNS[column]?.(row) ?? "–"}
-                        </td>
-                      ))}
                       <td className="max-w-sm px-3 py-2">
                         <StateBadge overview={overviewForDisplay(o)} />
                         {o.summary && (
@@ -342,6 +343,9 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                             {o.summary}
                           </p>
                         )}
+                      </td>
+                      <td className="px-3 py-2 text-right whitespace-nowrap tabular-nums text-muted-foreground">
+                        {relativeTime(Date.parse(o.last_activity_at), now())}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">
                         {formatDuration(duration)}
@@ -367,9 +371,14 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
                           formatCount(sumCounts(o.tokens.input, o.tokens.output))
                         )}
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                        {relativeTime(Date.parse(o.last_activity_at), now())}
-                      </td>
+                      {varying.map((column) => (
+                        <td
+                          key={column}
+                          className="px-3 py-2 whitespace-nowrap text-muted-foreground"
+                        >
+                          {COLUMNS[column]?.(row) ?? "–"}
+                        </td>
+                      ))}
                     </tr>
                   )
                 })}

@@ -102,7 +102,8 @@ function HomeOverview() {
   const counts = useQuery({
     queryKey: ["home", "counts", window],
     placeholderData: keepPreviousData,
-    queryFn: ({ signal }) => api.overviewCounts(window, signal),
+    queryFn: ({ signal }) =>
+      api.overviewCounts({ ...window, include_tool_proposals: "false" }, signal),
     refetchInterval: (query) =>
       activityPollInterval(Number(query.state.data?.running_now ?? 0) > 0, HOME_ACTIVE_POLL_MS),
   })

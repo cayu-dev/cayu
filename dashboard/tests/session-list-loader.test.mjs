@@ -38,9 +38,11 @@ test("reads parallel authoritative overviews and only bounded title fallbacks fo
   )
   assert.deepEqual(
     result.rows.map((row) => row.title),
-    ["Report", "x=y", "Question", "empty"],
+    // Labels are never the title, so an untitled labelled row reads its first message too.
+    ["Report", "labels", "Question", "empty"],
   )
   assert.deepEqual(calls, [
+    ["labels", { role: "user", limit: 1 }],
     ["message", { role: "user", limit: 1 }],
     ["empty", { role: "user", limit: 1 }],
   ])
@@ -96,7 +98,7 @@ test("first_message from the overview replaces per-row transcript reads when the
     overviews: [
       { ...overview("message"), first_message: "Question\nwith details" },
       { ...overview("empty"), first_message: null },
-      { ...overview("labels"), first_message: "Ignored" },
+      { ...overview("labels"), first_message: "Labelled question" },
     ],
     next_cursor: null,
     total_count: null,
@@ -119,7 +121,7 @@ test("first_message from the overview replaces per-row transcript reads when the
   assert.deepEqual(queries[0].include, ["overview", "first_message"])
   assert.deepEqual(
     result.rows.map((row) => row.title),
-    ["Question", "empty", "x=y"],
+    ["Question", "empty", "Labelled question"],
   )
   assert.equal(result.rows[0].titleUnavailable, false)
   assert.deepEqual(reads, [])
@@ -133,6 +135,7 @@ test("first_message from the overview replaces per-row transcript reads when the
   assert.deepEqual(reads, [
     ["message", { role: "user", limit: 1 }],
     ["empty", { role: "user", limit: 1 }],
+    ["labels", { role: "user", limit: 1 }],
   ])
 })
 
@@ -164,10 +167,10 @@ test("overview preview failures stay local to untitled rows", async () => {
   )
   assert.deepEqual(
     result.rows.map((row) => row.titleUnavailable),
-    [true, false, false, false],
+    [true, false, false, true],
   )
   assert.deepEqual(
     result.rows.map((row) => row.title),
-    ["unavailable", "empty", "Saved title", "x=y"],
+    ["unavailable", "empty", "Saved title", "labelled"],
   )
 })

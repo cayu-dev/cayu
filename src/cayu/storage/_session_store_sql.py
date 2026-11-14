@@ -10,6 +10,7 @@ from cayu.events import EventType
 from cayu.session_metadata import TASK_METADATA_KEY, TITLE_METADATA_KEY
 from cayu.sessions.event_queries import EventOrder, EventQuery, copy_event_query
 from cayu.sessions.queries import (
+    TOOL_PROPOSAL_PROVIDER_NAME,
     LabelSelectorOperator,
     LabelSelectorRequirement,
     SessionDebugState,
@@ -321,6 +322,9 @@ def build_session_query_sql(
         column="provider_name",
         value=query.provider_name,
     )
+    if not query.include_tool_proposals:
+        clauses.append(f"provider_name <> {dialect.placeholder}")
+        params.append(TOOL_PROPOSAL_PROVIDER_NAME)
     _append_session_field_filter(
         clauses,
         params,

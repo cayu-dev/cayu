@@ -302,6 +302,7 @@ export function useHomeSessionRows(scope: "waiting" | "failed" | "recent") {
         include: ["overview"],
         include_eval: false,
         include_forks: false,
+        include_tool_proposals: false,
         overview_state:
           scope === "waiting"
             ? ["waiting_approval", "waiting_input", "needs_recovery"]

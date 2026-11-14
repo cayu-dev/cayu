@@ -32,6 +32,7 @@ test("overview query preserves every old filter and excludes evals and forks by 
     overview_state: ["waiting_approval", "waiting_input", "needs_recovery"],
     include_eval: false,
     include_forks: false,
+    include_tool_proposals: false,
   })
 })
 

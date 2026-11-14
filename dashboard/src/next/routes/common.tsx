@@ -178,22 +178,31 @@ export function SessionSummary({
 export function LabelChips({
   labels,
   className,
+  limit,
 }: {
   labels: Record<string, string>
   className?: string
+  /** Show at most this many chips, then "+N" naming the rest on hover. */
+  limit?: number
 }) {
   const entries = Object.entries(labels)
   if (!entries.length) return null
+  const shown = entries.slice(0, limit)
+  const hidden = entries.slice(shown.length)
+  const chip =
+    "max-w-full shrink-0 truncate whitespace-nowrap rounded-md border border-border px-1.5 py-px font-mono text-[11px] text-muted-foreground"
   return (
     <span className={cn("flex flex-wrap gap-1", className)}>
-      {entries.map(([k, v]) => (
-        <span
-          key={k}
-          className="rounded-md border border-border px-1.5 py-px font-mono text-[11px] text-muted-foreground"
-        >
+      {shown.map(([k, v]) => (
+        <span key={k} className={chip} title={`${k}=${v}`}>
           {k}={v}
         </span>
       ))}
+      {hidden.length > 0 && (
+        <span className={chip} title={hidden.map(([k, v]) => `${k}=${v}`).join("\n")}>
+          +{hidden.length}
+        </span>
+      )}
     </span>
   )
 }

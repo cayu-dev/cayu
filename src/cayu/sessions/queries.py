@@ -36,6 +36,10 @@ MAX_SESSION_QUERY_AGENT_NAMES = 100
 _SESSION_CURSOR_VERSION = 1
 
 
+#: The placeholder provider every tool-call proposal session runs under.
+TOOL_PROPOSAL_PROVIDER_NAME = "cayu-tool-proposal"
+
+
 def _require_bounded_session_list_cursor(value: str, field_name: str) -> str:
     value = require_clean_nonblank(value, field_name)
     if len(value.encode("utf-8")) > MAX_SESSION_LIST_CURSOR_BYTES:
@@ -172,6 +176,9 @@ class SessionQuery(BaseModel):
     offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     cursor: str | None = None
     include_total_count: StrictBool = False
+    # False leaves out tool-call proposal sessions: each proposed tool call runs as
+    # its own session under the placeholder provider ``cayu-tool-proposal``.
+    include_tool_proposals: StrictBool = True
     order_by: SessionOrder = SessionOrder.UPDATED_AT_DESC
 
     @field_validator("cursor")
@@ -279,6 +286,8 @@ class SessionAggregateFilter(BaseModel):
         default_factory=tuple,
         max_length=MAX_AGGREGATE_LABEL_SELECTORS,
     )
+    #: False leaves out tool-call proposal sessions, as ``SessionQuery`` does.
+    include_tool_proposals: StrictBool = True
 
     @field_validator(
         "agent_name",
@@ -379,6 +388,7 @@ def copy_session_query(query: SessionQuery | None) -> SessionQuery:
         offset=query.offset,
         cursor=query.cursor,
         include_total_count=query.include_total_count,
+        include_tool_proposals=query.include_tool_proposals,
         order_by=query.order_by,
     )
 
@@ -404,6 +414,7 @@ def session_query_from_aggregate_filter(filters: SessionAggregateFilter) -> Sess
         causal_budget_id=filters.causal_budget_id,
         labels=filters.labels,
         label_selectors=filters.label_selectors,
+        include_tool_proposals=filters.include_tool_proposals,
     )
 
 
@@ -417,6 +428,8 @@ def _session_matches(session: Session, query: SessionQuery) -> bool:
     if query.agent_name is not None and session.agent_name != query.agent_name:
         return False
     if query.agent_names and session.agent_name not in query.agent_names:
+        return False
+    if not query.include_tool_proposals and session.provider_name == TOOL_PROPOSAL_PROVIDER_NAME:
         return False
     if query.provider_name is not None and session.provider_name != query.provider_name:
         return False

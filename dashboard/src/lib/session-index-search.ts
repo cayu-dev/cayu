@@ -45,6 +45,7 @@ export type SessionIndexSearch = {
   state?: (typeof SESSION_LIST_STATES)[number]
   include_eval?: true
   include_forks?: true
+  include_tool_proposals?: true
   q?: string
   status?: SessionIndexStatus
   debug_state?: SessionIndexDebugState
@@ -93,6 +94,9 @@ export function validateSessionIndexSearch(search: Record<string, unknown>): Ses
       : {}),
     ...(search.include_forks === true || search.include_forks === "true"
       ? { include_forks: true as const }
+      : {}),
+    ...(search.include_tool_proposals === true || search.include_tool_proposals === "true"
+      ? { include_tool_proposals: true as const }
       : {}),
     q: optionalSearchValue(search.q),
     status: allowedValue(search.status, SESSION_INDEX_STATUSES),
@@ -157,6 +161,7 @@ export function sessionIndexFilterCount(search: SessionIndexSearch): number {
     search.state,
     search.include_eval,
     search.include_forks,
+    search.include_tool_proposals,
     search.status,
     search.debug_state,
     search.agent_name,
@@ -199,5 +204,6 @@ export function sessionOverviewQuery(search: SessionIndexSearch): SessionListQue
           : undefined,
     include_eval: search.include_eval === true,
     include_forks: search.include_forks === true,
+    include_tool_proposals: search.include_tool_proposals === true,
   }
 }

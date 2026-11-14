@@ -212,6 +212,8 @@ export type OverviewCountsQuery = {
   label_selector?: string[]
   bucket_unit?: "hour" | "day" | "week"
   timezone?: string
+  /** False leaves out tool-call proposal sessions; older servers ignore it. */
+  include_tool_proposals?: "true" | "false"
 }
 
 export type Api = {

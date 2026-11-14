@@ -500,6 +500,7 @@ def register_session_overview_counts(
         until: datetime | None = None,
         include_eval: bool = False,
         include_forks: bool = False,
+        include_tool_proposals: bool = True,
         agent_name: str | None = None,
         environment_name: str | None = None,
         provider_name: str | None = None,
@@ -529,6 +530,7 @@ def register_session_overview_counts(
                 causal_budget_id=causal_budget_id,
                 labels=parse_label_filters(label),
                 label_selectors=parse_label_selectors(label_selector),
+                include_tool_proposals=include_tool_proposals,
             )
             series = (
                 None if bucket_unit is None else TimeSeriesSpec(unit=bucket_unit, timezone=timezone)

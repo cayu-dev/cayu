@@ -51,6 +51,8 @@ _SUPERVISION_EVENT_CURSOR_KEYS = frozenset({"version", "query_sha256", "after_se
 _SUPERVISION_EVENT_PAGE_FIELDS = frozenset({"cursor", "limit", "max_bytes"})
 # Filters added after cursors were first issued.
 _SUPERVISION_EVENT_FILTERS_DIGESTED_WHEN_SET = frozenset({"release_id"})
+#: Session-filter fields added after cursors were first issued, with their defaults.
+_SESSION_FILTER_FIELDS_DIGESTED_WHEN_SET: dict[str, object] = {"include_tool_proposals": True}
 _LOWER_HEX_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _ASCII_PATTERN = r"^[\x21-\x7e]+$"
 _LOWER_HEX_SHA256 = re.compile(_LOWER_HEX_SHA256_PATTERN)
@@ -317,9 +319,20 @@ def supervision_event_query_fingerprint(
             if getattr(query, field_name) is None
         ),
     }
+    exclude: dict[str, Any] = dict.fromkeys(undigested, True)
+    # Session filters added later are digested only when set, like the query's own.
+    sessions = getattr(query, "sessions", None)
+    if sessions is not None and "sessions" not in undigested:
+        unset = {
+            name
+            for name, default in _SESSION_FILTER_FIELDS_DIGESTED_WHEN_SET.items()
+            if getattr(sessions, name) == default
+        }
+        if unset:
+            exclude["sessions"] = dict.fromkeys(unset, True)
     material = {
         "domain": _SUPERVISION_EVENT_CURSOR_DOMAIN,
-        "query": query.model_dump(mode="json", exclude=undigested),
+        "query": query.model_dump(mode="json", exclude=exclude),
         "include_content": include_content,
         "audience": audience,
     }

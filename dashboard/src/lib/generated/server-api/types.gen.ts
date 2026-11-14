@@ -21076,6 +21076,10 @@ export type SessionAggregateFilter = {
      */
     environment_name?: string | null;
     /**
+     * Include Tool Proposals
+     */
+    include_tool_proposals?: boolean;
+    /**
      * Label Selectors
      */
     label_selectors?: Array<LabelSelectorRequirement>;
@@ -31020,6 +31024,12 @@ export type ListSessionsApiSessionsGetData = {
          */
         include_forks?: boolean;
         /**
+         * Include Tool Proposals
+         *
+         * False leaves out tool-call proposal sessions, which each proposed tool call runs as.
+         */
+        include_tool_proposals?: boolean;
+        /**
          * Include
          */
         include?: Array<'usage' | 'execution_profile' | 'overview' | 'first_message' | 'total'> | null;
@@ -31095,6 +31105,10 @@ export type GetSessionOverviewCountsApiSessionsOverviewCountsGetData = {
          * Include Forks
          */
         include_forks?: boolean;
+        /**
+         * Include Tool Proposals
+         */
+        include_tool_proposals?: boolean;
         /**
          * Agent Name
          */

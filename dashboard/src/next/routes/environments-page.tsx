@@ -565,7 +565,12 @@ function EnvironmentDetail({ env, stale }: { env: EnvironmentSummary; stale: boo
         action={
           <NavLink
             to="/sessions"
-            search={{ environment_name: env.name, include_eval: true, include_forks: true }}
+            search={{
+              environment_name: env.name,
+              include_eval: true,
+              include_forks: true,
+              include_tool_proposals: true,
+            }}
             className={linkClass}
           >
             All sessions here

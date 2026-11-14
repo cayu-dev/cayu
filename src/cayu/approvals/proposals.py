@@ -249,6 +249,24 @@ def _require_unredacted_proposal_message(redactor: SecretRedactor, request: RunR
                 )
 
 
+# Arguments that name what a proposal is about, in the order they are looked for.
+_TITLE_ARGUMENTS = ("title", "name", "subject", "summary")
+
+
+def _proposal_title(tool_name: str, arguments: Mapping[str, Any]) -> str:
+    """``Proposed <tool>``, followed by the call's own title when its arguments carry one."""
+
+    for key in _TITLE_ARGUMENTS:
+        value = arguments.get(key)
+        if not isinstance(value, str):
+            continue
+        # A title takes no control characters (an ANSI escape, a bell); drop them.
+        text = " ".join("".join(c if c.isprintable() else " " for c in value).split())
+        if text:
+            return f"Proposed {tool_name}: {text}"
+    return f"Proposed {tool_name}"
+
+
 def tool_call_proposal_request(
     agent_name: str,
     tool_name: str,
@@ -279,7 +297,9 @@ def tool_call_proposal_request(
     message = proposal_message(
         tool_name=tool_name, arguments=copied_arguments, tool_call_id=call_id
     )
-    request_fields.setdefault("title", f"Proposed {tool_name}"[:MAX_SESSION_TITLE_LENGTH])
+    request_fields.setdefault(
+        "title", _proposal_title(tool_name, copied_arguments)[:MAX_SESSION_TITLE_LENGTH]
+    )
     request = RunRequest(
         agent_name=agent_name,
         messages=[message],

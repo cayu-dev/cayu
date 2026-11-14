@@ -31,9 +31,10 @@ from cayu.providers.base import (
     ModelStreamEvent,
     UsageDialect,
 )
+from cayu.sessions.queries import TOOL_PROPOSAL_PROVIDER_NAME
 from cayu.vaults.redaction import REDACTED_SECRET
 
-TOOL_CALL_PROPOSAL_PROVIDER_NAME = "cayu-tool-proposal"
+TOOL_CALL_PROPOSAL_PROVIDER_NAME = TOOL_PROPOSAL_PROVIDER_NAME
 TOOL_CALL_PROPOSAL_MODEL = "tool-proposal"
 # The runtime-owned zero-priced identity shared with native tool dispatch.
 _BILLING_PROVIDER_NAME = "cayu-tool-dispatch"

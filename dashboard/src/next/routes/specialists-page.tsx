@@ -233,7 +233,12 @@ function SpecialistCard({
             ))}
             <NavLink
               to="/sessions"
-              search={{ agent_name: agent.name, include_eval: true, include_forks: true }}
+              search={{
+                agent_name: agent.name,
+                include_eval: true,
+                include_forks: true,
+                include_tool_proposals: true,
+              }}
               className="mt-2 inline-block text-sm underline"
             >
               All sessions
