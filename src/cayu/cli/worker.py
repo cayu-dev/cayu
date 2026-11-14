@@ -9,7 +9,7 @@ import inspect
 import os
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -69,7 +69,9 @@ class WorkerError(ValueError):
 
 
 @dataclass(frozen=True)
-class _WorkerProject:
+class WorkerProject:
+    """A worker declared in ``[tool.cayu.workers]`` and the project that declares it."""
+
     root: Path
     factory_target: str
     worker_target: str
@@ -78,7 +80,7 @@ class _WorkerProject:
 
 
 @dataclass(frozen=True)
-class _ProcessRequest:
+class WorkerProcessRequest:
     """How many processes were asked for (``None``: one per CPU) and where."""
 
     count: int | None
@@ -87,6 +89,30 @@ class _ProcessRequest:
     @property
     def explicit_several(self) -> bool:
         return self.count is not None and self.count > 1
+
+
+@dataclass(frozen=True)
+class WorkerProcessPlan:
+    """How many processes `cayu worker NAME` starts, decided before it counts CPUs.
+
+    ``reconciles``: the command or environment declares a single worker
+    (``--reconcile-abandoned-after-seconds`` or ``CAYU_RECONCILE_ABANDONED_AFTER_S``).
+    """
+
+    requested: WorkerProcessRequest
+    reconciles: bool
+    until_idle: bool
+
+    @property
+    def count(self) -> int | None:
+        """1 for a declared single worker or a run until idle, else the request.
+
+        ``None`` means one process per CPU the worker may use, known only where it runs.
+        """
+
+        if self.reconciles or self.until_idle:
+            return 1
+        return self.requested.count
 
 
 def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -98,6 +124,32 @@ def add_worker_parser(subparsers: argparse._SubParsersAction) -> None:
             "worker until it completes or receives a cooperative stop request."
         ),
     )
+    add_worker_arguments(parser)
+
+
+class _WorkerArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise WorkerError(f"cayu worker: {message}")
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        raise WorkerError(message or f"cayu worker exited with status {status}.")
+
+
+def parse_worker_arguments(arguments: Sequence[str]) -> argparse.Namespace:
+    """Parse the arguments after `cayu worker` exactly as the command does.
+
+    Raises `WorkerError` instead of exiting, so a tool that only reads a `cayu worker`
+    command line, such as a deploy check, sees the same options and errors.
+    """
+
+    parser = _WorkerArgumentParser(prog="cayu worker", add_help=False)
+    add_worker_arguments(parser)
+    return parser.parse_args(list(arguments))
+
+
+def add_worker_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the `cayu worker` arguments to `parser`."""
+
     parser.add_argument("name", help="Worker name from [tool.cayu.workers].")
     parser.add_argument(
         "--processes",
@@ -187,40 +239,17 @@ def run_worker(args: argparse.Namespace) -> int:
 
 def _run_worker(args: argparse.Namespace) -> int:
     try:
-        project = _resolve_worker_project(args.name)
-        requested = _requested_processes(getattr(args, "processes", None), project)
+        project = resolve_worker_project(args.name)
+        plan = worker_process_plan(args, project, os.environ)
+        requested, until_idle = plan.requested, plan.until_idle
         reconcile_after = getattr(args, "reconcile_abandoned_after_seconds", None)
-        reconciles = reconcile_after is not None or bool(
-            os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
-        )
-        if reconciles and requested.explicit_several:
-            raise WorkerError(
-                f"--reconcile-abandoned-after-seconds and {RECONCILE_ABANDONED_AFTER_ENV} "
-                f"declare a single worker and can't be combined with {requested.source}."
-            )
-        until_idle = getattr(args, "until_idle", False)
-        if until_idle and requested.explicit_several and requested.source == "--processes":
-            raise WorkerError("--until-idle can't be combined with --processes.")
-        # A declared single worker and a run until idle use one process; otherwise
-        # the request, or one process per CPU where several processes are supported.
-        if reconciles or until_idle:
-            processes = 1
-        elif requested.count is not None:
-            processes = requested.count
+        # The plan's count, or one process per CPU where several processes are supported.
+        if plan.count is not None:
+            processes = plan.count
         else:
             processes = min(available_cpu_count(), 256) if os.name == "posix" else 1
         restart_abandoned = getattr(args, "restart_abandoned", False)
         max_restarts = getattr(args, "max_abandoned_restarts", None)
-        if restart_abandoned and (
-            reconcile_after is None
-            and not os.environ.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
-        ):
-            raise WorkerError(
-                "--restart-abandoned needs --reconcile-abandoned-after-seconds: only a "
-                "declared single worker settles fenced tasks itself."
-            )
-        if max_restarts is not None and not restart_abandoned:
-            raise WorkerError("--max-abandoned-restarts needs --restart-abandoned.")
         if reconcile_after is not None:
             # run_task_worker reads it when the worker doesn't pass the option itself.
             os.environ[RECONCILE_ABANDONED_AFTER_ENV] = repr(reconcile_after)
@@ -326,7 +355,38 @@ def _worker_evals(root: Path, name: str, app: CayuApp) -> WorkerEvals | None:
     return worker_evals(root, name, app)
 
 
-def _resolve_worker_project(name: str) -> _WorkerProject:
+def worker_process_plan(
+    args: argparse.Namespace, project: WorkerProject, environment: Mapping[str, str]
+) -> WorkerProcessPlan:
+    """How many processes `cayu worker` with ``args`` starts in ``environment``.
+
+    Raises `WorkerError` for the combinations the command refuses.
+    """
+
+    requested = _requested_processes(getattr(args, "processes", None), project, environment)
+    reconciles = getattr(args, "reconcile_abandoned_after_seconds", None) is not None or bool(
+        environment.get(RECONCILE_ABANDONED_AFTER_ENV, "").strip()
+    )
+    if reconciles and requested.explicit_several:
+        raise WorkerError(
+            f"--reconcile-abandoned-after-seconds and {RECONCILE_ABANDONED_AFTER_ENV} "
+            f"declare a single worker and can't be combined with {requested.source}."
+        )
+    until_idle = getattr(args, "until_idle", False)
+    if until_idle and requested.explicit_several and requested.source == "--processes":
+        raise WorkerError("--until-idle can't be combined with --processes.")
+    restart_abandoned = getattr(args, "restart_abandoned", False)
+    if restart_abandoned and not reconciles:
+        raise WorkerError(
+            "--restart-abandoned needs --reconcile-abandoned-after-seconds: only a "
+            "declared single worker settles fenced tasks itself."
+        )
+    if getattr(args, "max_abandoned_restarts", None) is not None and not restart_abandoned:
+        raise WorkerError("--max-abandoned-restarts needs --restart-abandoned.")
+    return WorkerProcessPlan(requested=requested, reconciles=reconciles, until_idle=until_idle)
+
+
+def resolve_worker_project(name: str, *, start: Path | None = None) -> WorkerProject:
     discovered = _discover_configured_project(
         command="cayu worker",
         configuration_example=(
@@ -335,6 +395,7 @@ def _resolve_worker_project(name: str) -> _WorkerProject:
         ),
         explicit_target_example=None,
         discovery_keys=("workers", "factory"),
+        start=start,
     )
     workers_value = discovered.config.get("workers")
     if not isinstance(workers_value, dict):
@@ -348,7 +409,7 @@ def _resolve_worker_project(name: str) -> _WorkerProject:
         raise WorkerError(
             f"{discovered.pyproject}: [tool.cayu.workers].{name} must be a non-empty string."
         )
-    return _WorkerProject(
+    return WorkerProject(
         root=discovered.root,
         factory_target=discovered.factory_target,
         worker_target=target.strip(),
@@ -388,27 +449,29 @@ def _declared_processes(
     return value if value is None or type(value) is int else _AUTO
 
 
-def _requested_processes(flag: int | str | None, project: _WorkerProject) -> _ProcessRequest:
+def _requested_processes(
+    flag: int | str | None, project: WorkerProject, environment: Mapping[str, str]
+) -> WorkerProcessRequest:
     """The process count asked for: --processes, the environment, pyproject, or auto."""
 
-    def request(value: int | str, source: str) -> _ProcessRequest:
-        return _ProcessRequest(None if value == _AUTO else cast("int", value), source)
+    def request(value: int | str, source: str) -> WorkerProcessRequest:
+        return WorkerProcessRequest(None if value == _AUTO else cast("int", value), source)
 
     if flag is not None:
         return request(flag, "--processes")
-    environment = os.environ.get(WORKER_PROCESSES_ENV, "").strip()
-    if environment:
+    declared = environment.get(WORKER_PROCESSES_ENV, "").strip()
+    if declared:
         try:
-            value = _process_count(environment)
+            value = _process_count(declared)
         except argparse.ArgumentTypeError as exc:
             raise WorkerError(f"{WORKER_PROCESSES_ENV}: {exc}") from None
         return request(value, WORKER_PROCESSES_ENV)
     if project.processes is not None:
         return request(project.processes, f"[tool.cayu.{_PROCESSES_TABLE}]")
-    return _ProcessRequest(None, "auto")
+    return WorkerProcessRequest(None, "auto")
 
 
-def _processes_notice(name: str, processes: int, requested: _ProcessRequest) -> str:
+def _processes_notice(name: str, processes: int, requested: WorkerProcessRequest) -> str:
     reason = "one per CPU" if requested.count is None else f"from {requested.source}"
     return (
         f"Worker {name!r} is starting {processes} processes ({reason}); "

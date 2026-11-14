@@ -241,10 +241,21 @@ def require_single_process_worker(operation: str) -> None:
     if count is not None and count.strip() == "1" and (index is None or index == "0"):
         return
     raise ValueError(
-        f"{operation} requires a single worker process. Run cayu worker with --processes 1 "
-        "or set this worker to 1 in [tool.cayu.worker_processes]. "
+        f"{single_process_worker_requirement(operation)} "
         "Supervisor metadata must declare CAYU_WORKER_COUNT=1 and, when present, "
         "CAYU_WORKER_INDEX=0; do not override metadata in a multi-process worker."
+    )
+
+
+def single_process_worker_requirement(operation: str) -> str:
+    """What :func:`require_single_process_worker` says ``operation`` needs, and the fixes.
+
+    ``cayu check --deploy`` reports the same rule before a worker starts.
+    """
+
+    return (
+        f"{operation} requires a single worker process. Run cayu worker with --processes 1 "
+        "or set this worker to 1 in [tool.cayu.worker_processes]."
     )
 
 

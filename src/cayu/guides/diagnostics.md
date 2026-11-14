@@ -104,6 +104,47 @@ The check does not infer event identity, require a particular deadline, or
 change runtime behavior. Dynamic calls and policies passed through `**kwargs`
 are not analyzed. A creation that is never retried needs no event budget.
 
+## worker-single-process-required
+
+`WORKER_SINGLE_PROCESS_REQUIRED` is a `cayu check --deploy` error: the `[worker]`
+command in `cayu-cloud.toml` would start more than one process, but its worker
+passes `reconcile_abandoned_after_s` to `run_task_worker`, which declares it the
+only worker for its tasks. Each process would exit at startup with
+"reconcile_abandoned_after_s requires a single worker process", and the
+platform would restart the worker into the same error. The check resolves the
+count as `cayu worker` does: `--processes`, then `CAYU_WORKER_PROCESSES` in
+`[env]`, then `[tool.cayu.worker_processes]`, then one process per CPU. Since
+it can't know how many CPUs the worker gets where it runs, it treats one per
+CPU as several. Pin the worker to one process: add `--processes 1` to the
+command (`cayu worker NAME --processes 1`), or set `NAME = 1` in
+`[tool.cayu.worker_processes]` when neither the flag nor the environment sets
+a count. `--reconcile-abandoned-after-seconds` and `--until-idle` already run
+one process.
+
+The check reads the worker's entrypoint module without importing it: the
+entrypoint function and the functions of that module it calls by name. It sees
+the option as a keyword argument or a dictionary key whose value can't be
+`None`: a number, arithmetic on numbers, `int(...)` or `float(...)`, or a name
+the module assigns once at top level to one of those. A value known only at run
+time, such as a parameter or a setting, may be `None`, which turns recovery off,
+so it isn't counted. Options passed from another module, and Cloud secrets such
+as a `CAYU_WORKER_PROCESSES` set with `cayu cloud env set`, aren't seen.
+
+On Cloud, one process per CPU isn't one process for a `cpu_millis` of 1000 or
+less: Cloud can round CPU up for the memory size, and a worker with
+`cpu_millis = 1000` and `memory_mb = 2048` has started two. The check doesn't
+rely on `cpu_millis`.
+
+## worker-command-invalid
+
+`WORKER_COMMAND_INVALID` is a `cayu check --deploy` error: `cayu worker` would
+refuse the `[worker]` command in `cayu-cloud.toml` before running anything,
+for example because it names a worker `[tool.cayu.workers]` doesn't declare,
+passes an option `cayu worker` doesn't take, combines several processes with
+`--reconcile-abandoned-after-seconds`, or `[tool.cayu.worker_processes]` holds
+something other than a count from 1 to 256 or `"auto"`. The message is the
+error `cayu worker` would print. Fix the command or the configuration it names.
+
 ## app-no-agents
 
 `APP_NO_AGENTS` means the factory returned an app with no registered specialist.

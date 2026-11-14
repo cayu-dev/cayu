@@ -21,6 +21,13 @@ None.
   event log on every request.
 - `cayu session overview SESSION --recompute` (or `--all`) compares the stored
   overview with a full recompute and exits 1 when they differ.
+- `cayu check --deploy` reads the `[worker]` command in `cayu-cloud.toml` and
+  reports `WORKER_SINGLE_PROCESS_REQUIRED` when the worker passes
+  `reconcile_abandoned_after_s` but would start more than one process, including
+  `cayu worker`'s default of one process per CPU, and `WORKER_COMMAND_INVALID` for
+  a command `cayu worker` would refuse. A Cloud manifest that ran such a worker as
+  `cayu worker NAME` on v0.18 needs `--processes 1` (or `NAME = 1` under
+  `[tool.cayu.worker_processes]`) from v0.19.0 on, or its worker exits at startup.
 
 ## v0.19.1
 

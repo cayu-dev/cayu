@@ -137,7 +137,7 @@ def _run_check(args: argparse.Namespace) -> int:
             # Auth resolution can import project code; preserve the source-safety stop.
             and not import_blocking_findings(report.diagnostics)
         ):
-            report = _with_diagnostics(report, _cloud_serve_findings(project.root))
+            report = _with_diagnostics(report, _cloud_manifest_findings(project.root))
     except Exception as exc:
         message = (
             str(exc)
@@ -290,8 +290,9 @@ def serve_inbox_access_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
     )
 
 
-def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
-    """Check the same local web command and upload inputs as Cloud init/deploy.
+def _cloud_manifest_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
+    """Check the same local web command and upload inputs as Cloud init/deploy, and
+    that the `[worker]` command starts as many processes as its worker accepts.
 
     Keep this at the CLI entrance: Cloud's service check itself calls
     ``check_project``, and Doctor/non-deploy checks do not check a Cloud manifest.
@@ -301,6 +302,7 @@ def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
     from cayu.cli._cloud_deploy_check import check_serve_can_start
     from cayu.cli._cloud_project import CloudProjectManifest
     from cayu.cli._serve_readiness import is_cayu_serve_command
+    from cayu.cli._worker_process_check import worker_command_findings
 
     path = root / "cayu-cloud.toml"
     if not path.exists() and not path.is_symlink():
@@ -309,12 +311,19 @@ def _cloud_serve_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
         manifest = CloudProjectManifest.load(path)
     except CloudApiError as exc:
         raise ProjectError(str(exc)) from exc
+    findings: tuple[ProjectDiagnostic, ...] = ()
+    if manifest.worker is not None:
+        findings += worker_command_findings(
+            root, manifest.worker.command, manifest.runtime_environment or {}
+        )
     if manifest.web is None or not is_cayu_serve_command(manifest.web.command):
-        return ()
-    findings, reason = check_serve_can_start(root, manifest.web.command, check_auth_source=True)
-    if reason is not None and not findings:
+        return findings
+    serve_findings, reason = check_serve_can_start(
+        root, manifest.web.command, check_auth_source=True
+    )
+    if reason is not None and not serve_findings:
         raise ProjectError(reason)
-    return findings
+    return findings + serve_findings
 
 
 def check_project(

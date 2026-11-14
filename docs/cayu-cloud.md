@@ -2134,6 +2134,19 @@ available, the standalone command returns an invocation error instead of claimin
 success. If scaffold source checks block
 imports, their findings take precedence and custom auth is not imported.
 
+When the manifest's `[worker]` command is `cayu worker NAME`, `cayu check --deploy` also
+resolves how many processes it would start, as `cayu worker` does: `--processes`, then
+`CAYU_WORKER_PROCESSES` in `[env]`, then `[tool.cayu.worker_processes]`, then one per
+CPU, which counts as several since the CPUs Cloud gives the worker aren't known locally.
+`WORKER_SINGLE_PROCESS_REQUIRED` is an error when the worker's entrypoint passes
+`reconcile_abandoned_after_s` and the command doesn't run one process: the worker would
+exit at startup and keep restarting. Add `--processes 1` to the command or set
+`NAME = 1` under `[tool.cayu.worker_processes]`. `WORKER_COMMAND_INVALID` is an error
+for a command `cayu worker` would refuse, such as an undeclared worker name. The check
+reads the entrypoint's source without importing it; see
+`cayu guide diagnostics#worker-single-process-required` for what it sees.
+`cayu cloud deploy`'s own check doesn't run these yet.
+
 ## Agent environment variables
 
 Cloud-managed variables belong to the long-lived Agent, not to one immutable release.

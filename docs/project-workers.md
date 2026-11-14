@@ -200,8 +200,10 @@ under `[tool.cayu.worker_processes]`. This applies both to cancellation and to
 refuse this recovery mode before accessing the task store when their supervisor
 reports multiple processes or incomplete/invalid process metadata. The error
 explains how to select one process; it does not silently change the process
-count. Outside Cayu supervision the option remains your declaration that no
-other process or deployment claims the same tasks.
+count. `cayu check --deploy` reports the same mistake in a `cayu-cloud.toml`
+`[worker]` command before a deploy (`WORKER_SINGLE_PROCESS_REQUIRED`). Outside
+Cayu supervision the option remains your declaration that no other process or
+deployment claims the same tasks.
 
 A cancelled task that runs an agent session usually needs neither. Its session
 fences the old worker's run, so once the dead worker's lease expires, the next
