@@ -82,7 +82,7 @@ def lent_memory_key_diagnostic(*, deploy: bool) -> ProjectDiagnostic:
         message=(
             f"{MEMORY_EVIDENCE_KEY_ENV} is unset and {_LOCAL_MEMORY_KEY.as_posix()} doesn't "
             "exist, so the check built the application with a throwaway memory evidence "
-            "key. Tests that build the app, and the app itself, still need one."
+            "key. The app itself still needs one, and so do tests that build it."
         ),
         hint=(
             (
@@ -92,7 +92,9 @@ def lent_memory_key_diagnostic(*, deploy: bool) -> ProjectDiagnostic:
                 if deploy
                 else ""
             )
-            + f"In CI, set {MEMORY_EVIDENCE_KEY_ENV} to a throwaway value of at least 32 bytes "
+            + "The root conftest.py of a project made by `cayu new` gives its tests a "
+            "throwaway key. Without it, in CI, set "
+            f"{MEMORY_EVIDENCE_KEY_ENV} to a throwaway value of at least 32 bytes "
             "before the tests, for example the output of `python -c 'import secrets; "
             "print(secrets.token_urlsafe(48))'`. Locally, `cayu new` created "
             f"{_LOCAL_MEMORY_KEY.as_posix()}; it is git-ignored, so a fresh checkout has none."

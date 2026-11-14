@@ -2643,10 +2643,10 @@ _ROOT_CONFTEST_PY = '''"""Stop early when pytest runs without Cayu installed.
 
 When the project's own pytest is missing from .venv, a pytest from elsewhere on
 PATH can run instead, and every test then fails with "No module named 'cayu'".
-"""
+__MEMORY_KEY_DOC__"""
 
 import importlib.util
-import sys
+__MEMORY_KEY_IMPORTS__import sys
 from pathlib import Path
 
 import pytest
@@ -2673,7 +2673,42 @@ def pytest_plugin_registered(plugin: object) -> None:
                 "Run `uv sync` to install the project's test tools (its `dev` "
                 "dependency group), then `uv run --no-sync pytest`."
             )
-'''
+__MEMORY_KEY_HOOK__'''
+
+_ROOT_CONFTEST_MEMORY_KEY_DOC = """
+With automatic memory, building the app needs a memory evidence key. A fresh
+checkout, such as a CI job, has neither CAYU_MEMORY_EVIDENCE_KEY nor the
+git-ignored data/memory-evidence.key, so the tests get a throwaway key for this
+pytest run. Nothing deployed runs this file: a deployment still needs its own key.
+"""
+
+# A hook rather than module code: importing a conftest has no side effects.
+_ROOT_CONFTEST_MEMORY_KEY_HOOK = """
+
+def pytest_configure(config: pytest.Config) -> None:
+    # configuration/settings.py reads CAYU_MEMORY_EVIDENCE_KEY first, then this file.
+    local_key = Path(__file__).resolve().parent / "data" / "memory-evidence.key"
+    if "CAYU_MEMORY_EVIDENCE_KEY" in os.environ or local_key.is_file():
+        return
+    environment = pytest.MonkeyPatch()
+    environment.setenv("CAYU_MEMORY_EVIDENCE_KEY", secrets.token_urlsafe(48))
+    config.add_cleanup(environment.undo)
+"""
+
+
+def _root_conftest(plan: ApplicationPlan) -> str:
+    """The root conftest.py; with memory it also lends the tests a throwaway key."""
+
+    memory = "memory" in plan.capabilities
+    parts = {
+        "__MEMORY_KEY_DOC__": _ROOT_CONFTEST_MEMORY_KEY_DOC if memory else "",
+        "__MEMORY_KEY_IMPORTS__": "import os\nimport secrets\n" if memory else "",
+        "__MEMORY_KEY_HOOK__": _ROOT_CONFTEST_MEMORY_KEY_HOOK if memory else "",
+    }
+    source = _ROOT_CONFTEST_PY
+    for token, text in parts.items():
+        source = source.replace(token, text)
+    return source
 
 
 def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -3147,7 +3182,7 @@ def _rendered_preset_files(
 
     files = {
         "run.py": _RUN_PY,
-        "conftest.py": _ROOT_CONFTEST_PY,
+        "conftest.py": _root_conftest(plan),
         "agents/__init__.py": "",
         "tests/test_agent.py": render(_TEST_PY),
         "evals/__init__.py": "",

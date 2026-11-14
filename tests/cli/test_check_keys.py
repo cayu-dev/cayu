@@ -72,7 +72,8 @@ def test_check_loads_the_app_without_a_memory_evidence_key(
         item for item in report["diagnostics"] if item["code"] == "MEMORY_EVIDENCE_KEY_UNSET"
     ]
     assert finding["severity"] == "info"
-    assert "In CI, set CAYU_MEMORY_EVIDENCE_KEY" in finding["hint"]
+    assert "in CI, set CAYU_MEMORY_EVIDENCE_KEY" in finding["hint"]
+    assert "conftest.py" in finding["hint"]
     assert "Cayu Cloud" not in finding["hint"]
     # The throwaway key was only lent while the factory ran.
     assert "CAYU_MEMORY_EVIDENCE_KEY" not in os.environ

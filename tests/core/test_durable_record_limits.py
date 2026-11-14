@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import warnings
 from typing import Any
@@ -114,6 +115,9 @@ def test_public_metadata_models_share_exact_limit(
     assert accepted.model_dump(mode="python")["metadata"] == exact
     canary = "private-metadata-canary"
     oversized = {**exact, canary: canary}
+    # Collect garbage from earlier tests first: a connection one of them left
+    # unclosed warns when the collector finalizes it, which is not this model.
+    gc.collect()
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
         with pytest.raises(ValidationError) as caught:

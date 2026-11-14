@@ -27,10 +27,12 @@ attributes retain `AttributeError`. No removed route loads its former object.
 and `data/memory-evidence.key` doesn't exist, so `cayu check` built the
 application with a throwaway memory evidence key. Describing the app derives no
 evidence, so the check doesn't need the real key. `cayu new` creates the file,
-but it is git-ignored, so a fresh checkout such as a CI job has none, and tests
-that build the app fail there with "automatic memory requires
-CAYU_MEMORY_EVIDENCE_KEY". In CI, set `CAYU_MEMORY_EVIDENCE_KEY` to a throwaway
-value of at least 32 bytes before the tests, for example the output of
+but it is git-ignored, so a fresh checkout such as a CI job has none. The root
+`conftest.py` of a project made by `cayu new` then gives the tests a throwaway
+key for the pytest run. In a project without that conftest, tests that build the
+app fail there with "automatic memory requires CAYU_MEMORY_EVIDENCE_KEY"; set
+`CAYU_MEMORY_EVIDENCE_KEY` in CI to a throwaway value of at least 32 bytes
+before the tests, for example the output of
 `python -c 'import secrets; print(secrets.token_urlsafe(48))'`. Under
 `cayu check --deploy` the finding also says a deployment needs its own stable
 key: Cayu Cloud sets it for a deployed Agent; elsewhere, store one as a secret.

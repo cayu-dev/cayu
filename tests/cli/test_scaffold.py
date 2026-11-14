@@ -71,7 +71,9 @@ def _assert_generated_configuration_boundary(project: Path) -> None:
     )
     for path in project.rglob("*.py"):
         relative = path.relative_to(project)
-        if path == settings or relative.parts[0] == "tests":
+        # Only pytest loads tests/ and the root conftest.py; the application never
+        # does. The root conftest lends the tests a memory evidence key.
+        if path == settings or relative.parts[0] == "tests" or relative == Path("conftest.py"):
             continue
         source = path.read_text(encoding="utf-8")
         for marker in forbidden:
@@ -3361,6 +3363,47 @@ def test_generated_conftest_names_the_missing_test_environment(
     result = _pytest_without_cayu(project, "targets/sample")
     assert result.returncode == 0, result.stdout + result.stderr
     assert _pytest_without_cayu(target).returncode == 0
+
+
+def test_generated_tests_run_in_a_fresh_checkout_without_a_memory_evidence_key(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A CI checkout has neither the git-ignored key file nor the variable.
+    assert main(["new", "checkout", "--dir", str(tmp_path)]) == 0
+    assert main(["new", "forgetful", "--without", "memory", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "checkout"
+    (project / "data" / "memory-evidence.key").unlink()
+    formatted = subprocess.run(
+        [sys.executable, "-m", "ruff", "format", "--isolated", "--check", "-"],
+        input=(project / "conftest.py").read_text(encoding="utf-8"),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert formatted.returncode == 0, formatted.stdout + formatted.stderr
+    environment = os.environ.copy()
+    for name in ("CAYU_MEMORY_EVIDENCE_KEY", "CAYU_PROVIDER", "OPENAI_API_KEY"):
+        environment.pop(name, None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # The key lasted only for the pytest run; nothing was written for later.
+    assert not (project / "data" / "memory-evidence.key").exists()
+    # Without memory the app reads no key, so the conftest lends none.
+    conftest = (tmp_path / "forgetful" / "conftest.py").read_text(encoding="utf-8")
+    assert "CAYU_MEMORY_EVIDENCE_KEY" not in conftest
 
 
 def test_generated_agent_test_closes_the_app_it_builds(tmp_path: Path) -> None:
