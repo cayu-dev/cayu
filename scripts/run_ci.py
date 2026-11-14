@@ -932,7 +932,7 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
     runner.run("Dashboard prototype pages", ("npm", "run", "test:prototype"), cwd=dashboard)
     # An app installs the packed parts with the generator's kit, builds, and drives them.
     runner.run("Dashboard parts consumer", ("node", "tests/dashboard_parts_consumer/run.mjs"))
-    runner.run("B2B web interface", ("python3", "scripts/build_b2b_web.py", "--check"))
+    runner.run("Web app templates", ("python3", "scripts/build_app_web.py", "--check"))
     # The browser client served by mount_cayu is plain JavaScript outside the
     # dashboard package; its behavior tests need only Node's built-in runner.
     runner.run("Browser client tests", ("node", "--test", "tests/browser_client/*.test.mjs"))

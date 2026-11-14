@@ -72,12 +72,14 @@ _FAULT_INJECTION_PREFIXES = (
 )
 _DASHBOARD_EXACT_PATHS = {
     ".gitattributes",
-    "scripts/build_b2b_web.py",
+    "scripts/build_app_web.py",
     "scripts/build_dashboard.py",
     "scripts/generate_dashboard_api_types.py",
     "src/cayu/_dashboard_artifacts.py",
     "src/cayu/_server_contract_version.py",
     "src/cayu/_validation.py",
+    # How the web app templates compose, which scripts/build_app_web.py builds.
+    "src/cayu/cli/scaffold_app_web.py",
 }
 _RELEASE_EXACT_PATHS = {
     ".gitattributes",
@@ -185,7 +187,9 @@ def _affects_dashboard(path: str) -> bool:
         + (
             "dashboard/",
             "src/cayu/artifacts/",
-            "src/cayu/cli/templates/b2b_web/",
+            # The web app templates: the generic app and the layers on top of it.
+            "src/cayu/cli/templates/app_web/",
+            "src/cayu/cli/templates/app_web_organizations/",
             "src/cayu/core/",
             "src/cayu/data/dashboard_parts/",
             "src/cayu/evals/",

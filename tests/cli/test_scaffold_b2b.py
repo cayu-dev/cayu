@@ -15,6 +15,7 @@ import pytest
 
 from cayu.cli import main
 from cayu.cli.scaffold import project_files
+from cayu.cli.scaffold_app_web import ORGANIZATIONS, layer_sources, templates
 
 B2B_FILES = (
     "integrations/sign_in.py",
@@ -89,17 +90,19 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
 
 def test_the_web_interface_is_copied_with_its_source_and_build() -> None:
     files = project_files("acme-desk", preset="b2b")
-    template = Path(__file__).resolve().parents[2] / "src/cayu/cli/templates/b2b_web"
+    # The generic app with the organizations layer on top (tests/cli/test_scaffold_app_web.py).
+    sources = layer_sources(templates(), (ORGANIZATIONS,))
     packaged = {
-        f"web/{path.relative_to(template).as_posix()}": path.read_text(encoding="utf-8")
-        for path in template.rglob("*")
-        if path.is_file()
+        f"web/{path}": source.read_text(encoding="utf-8") for path, source in sources.items()
     }
 
-    # Copied as they are, but for the pages' title: the project's name, which the app shows.
+    # Copied as they are, but for the pages' title, the project's name, which the app shows,
+    # and the npm package's name.
     for page in ("web/index.html", "web/static/index.html"):
         assert "<title>Agent</title>" in packaged[page]
         packaged[page] = packaged[page].replace("<title>Agent</title>", "<title>acme-desk</title>")
+    for package in ("web/package.json", "web/package-lock.json"):
+        packaged[package] = packaged[package].replace('"name": "web",', '"name": "b2b-web",')
     assert packaged == {name: text for name, text in files.items() if name.startswith("web/")}
     # The page names the built files it loads, so they're served as they were built.
     built = {name for name in packaged if name.startswith("web/static/assets/")}

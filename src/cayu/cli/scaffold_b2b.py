@@ -9,14 +9,12 @@ result on every read, listing and background step.
 
 from __future__ import annotations
 
-import html
-from importlib.resources import files as package_files
-
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
 )
 from cayu.cli.scaffold_app_routes import app_route_files
+from cayu.cli.scaffold_app_web import ORGANIZATIONS, web_app_files
 from cayu.cli.scaffold_plan import ApplicationPlan
 
 _MODELS_APPEND = '''
@@ -2490,35 +2488,6 @@ the signed-in person, for an Inbox page of the app's own.
 """
 
 
-# The page's title in the template, and in its build: the app shows it as the Agent's name.
-_WEB_TITLE = "<title>Agent</title>"
-
-
-def _web_files(name: str) -> dict[str, str]:
-    """The web app for `web/`: its source, which a project rebuilds with
-    `npm --prefix web run build`, and the built files in `web/static` it serves.
-
-    Both pages are titled with the project's name. Vite copies the title as it is, and the
-    page isn't named by its content, so a fresh build still matches `web/static`."""
-
-    found: dict[str, str] = {}
-
-    def walk(node, prefix: str) -> None:
-        for child in sorted(node.iterdir(), key=lambda item: item.name):
-            if child.is_dir():
-                walk(child, f"{prefix}{child.name}/")
-            else:
-                found[f"web/{prefix}{child.name}"] = child.read_text(encoding="utf-8")
-
-    walk(package_files("cayu.cli").joinpath("templates", "b2b_web"), "")
-    title = f"<title>{html.escape(name)}</title>"
-    for page in ("web/index.html", "web/static/index.html"):
-        if found[page].count(_WEB_TITLE) != 1:
-            raise RuntimeError(f"{page} in the b2b web template has no {_WEB_TITLE}")
-        found[page] = found[page].replace(_WEB_TITLE, title)
-    return found
-
-
 # The agent preset's routing rows this preset answers differently.
 _AGENTS_ROWS = {
     "| A web UI that shows progress or live results | `mount_cayu(...)` and `connect()` from "
@@ -2641,7 +2610,7 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         **app_route_files(),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
-        **_web_files(plan.name),
+        **web_app_files(plan.name, layers=(ORGANIZATIONS,), package_name="b2b-web"),
         "tests/test_http_api.py": _TEST_HTTP_API_PY,
         "tests/test_generated_routes.py": _TEST_GENERATED_ROUTES_PY,
         "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(

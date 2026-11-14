@@ -8,7 +8,7 @@ reference's file byte for byte (with the reference file's SHA-256) or why it dif
 of the reference and records new ones.
 
 `web/static` isn't compared: it is the build of the `web/` source compared here, which
-`scripts/build_b2b_web.py --check` and the project's own `npm run check:build` verify.
+`scripts/build_app_web.py --check` and the project's own `npm run check:build` verify.
 """
 
 from __future__ import annotations

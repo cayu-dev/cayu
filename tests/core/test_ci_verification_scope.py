@@ -99,14 +99,17 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
     assert select_pull_request_jobs(["tests/browser_client/client.test.mjs"]) == dashboard_only
     assert select_pull_request_jobs(["src/cayu/server/browser_client/client.js"]) == dashboard_only
-    # The B2B preset's web interface is built and checked in the dashboard job, which has Node,
-    # and ships in the package.
-    assert select_pull_request_jobs(
-        ["src/cayu/cli/templates/b2b_web/src/app.tsx"]
-    ) == VerificationScope(
-        dashboard=True, release_artifacts=True, sqlite_cancellation=False, fault_injection=False
-    )
-    assert select_pull_request_jobs(["scripts/build_b2b_web.py"]) == dashboard_only
+    # The web app templates, the generic app and its layers, and how they compose, are built
+    # and checked in the dashboard job, which has Node, and ship in the package.
+    for path in (
+        "src/cayu/cli/templates/app_web/src/main.tsx",
+        "src/cayu/cli/templates/app_web_organizations/src/agent/members.tsx",
+        "src/cayu/cli/scaffold_app_web.py",
+    ):
+        assert select_pull_request_jobs([path]) == VerificationScope(
+            dashboard=True, release_artifacts=True, sqlite_cancellation=False, fault_injection=False
+        )
+    assert select_pull_request_jobs(["scripts/build_app_web.py"]) == dashboard_only
     assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
         dashboard=True,
         release_artifacts=True,

@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repo = resolve(here, "../..")
-const template = join(repo, "src/cayu/cli/templates/b2b_web")
+const template = join(repo, "src/cayu/cli/templates/app_web")
 const args = process.argv.slice(2)
 const keep = args.includes("--keep")
 const tarball = resolve(
