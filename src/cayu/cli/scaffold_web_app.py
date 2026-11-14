@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from cayu._operator_credentials import ENVIRONMENT_OPERATOR_AUTH_TARGET
 from cayu.cli.scaffold_app_routes import app_route_files, cloud_application_slug
-from cayu.cli.scaffold_app_web import OPERATORS, web_app_files
+from cayu.cli.scaffold_app_web import CONVERSATIONS, OPERATORS, web_app_files
 from cayu.cli.scaffold_plan import WEB_APP, ApplicationPlan
 
 # What `cayu serve` reads to serve the Agent's routes and the app.
@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from cayu import CayuApp
 from cayu.server.operator_sign_in import operator_person_dependency, operator_roles
@@ -89,6 +89,13 @@ def build_router(app: CayuApp, *, development: bool, auth: Any = None) -> APIRou
             agent_name=AGENT_NAME,
         )
     )
+
+    @router.get("/agent")
+    async def agent(signed_in: Person = Depends(person)) -> dict[str, str]:
+        """The agent the web app's Conversations and Inbox are about."""
+
+        return {"name": AGENT_NAME}
+
     # The Agent's own routes, behind the same sign-in:
     #
     #     @router.get("/findings")
@@ -220,7 +227,7 @@ from cayu.server.auth import AuthContext
 from cayu.server.proxy_identity import ControlPlaneRoles
 from cayu.sessions import InMemorySessionStore
 from cayu.tasks import InMemoryTaskStore, TaskCreate
-from integrations.http import build_router
+from integrations.http import AGENT_NAME, build_router
 
 # The built web app, `[tool.cayu.serve] ui` in pyproject.toml.
 WEB = Path(__file__).resolve().parents[1] / "web" / "static"
@@ -329,6 +336,7 @@ def test_the_overview_settings_and_task_runs_answer() -> None:
         # Operators see every task, one row per run.
         (run,) = client.get("/app/task-runs").json()
         assert run["title"] == "Weekly digest"
+        assert client.get("/app/agent").json() == {"name": AGENT_NAME}
 
 
 def test_the_web_app_is_served_at_the_root_with_only_its_built_files() -> None:
@@ -364,16 +372,16 @@ may rewrite it) or `THE AGENT'S OWN.` (yours).
 | `web/src/main.tsx`, `web/src/app/` | The shell: browser routes at `/`, the area pattern, the layout with its navigation and profile menu, the status pages, the API requester | Generated |
 | `web/src/api/`, `web/src/generated/` | Typed clients for the generated routes, and the Overview and Settings areas | Generated |
 | `web/src/blocks/task-runs.tsx` | TaskRuns: the Agent's Cayu tasks, one row per run (`GET /app/task-runs`) | A Cayu building block |
-| `web/src/agent/` | This Agent's own areas (Task runs) and `index.tsx`, which lists its areas | The Agent's |
+| `web/src/agent/` | This Agent's own areas (__OWN_AREAS__) and `index.tsx`, which lists its areas | The Agent's |
 | `web/src/kit/shadcn/` | The component kit: stock shadcn (Base UI, base-nova) and the parts built from it | Generated |
 | `web/e2e/` | The smoke test: `cayu serve --dev` serves the app, and every area opens in a browser | The Agent's |
 | `integrations/http/__init__.py` | The routes under `/app`, signed in with `cayu.server.operator_sign_in`; add the Agent's own here | The Agent's |
 | `integrations/http/generated/` | The routes the generated pages read | Generated |
 | `integrations/http/overview_metrics.py`, `fixed_settings.py` | This Agent's Overview metrics and the settings it reads at start-up | The Agent's |
 
-- Add an area in `web/src/agent/` and list it in `web/src/agent/index.tsx`; the app calls
-  only `/app`, so add its routes in `integrations/http/__init__.py`.
-- The navigation links to Cayu's Inbox (`/cayu/inbox`), where approvals and questions are
+- Add an area in `web/src/agent/` and list it in `web/src/agent/index.tsx`, and its routes
+  in `integrations/http/__init__.py`.
+__CONVERSATIONS__- The navigation links to Cayu's Inbox (`/cayu/inbox`), where approvals and questions are
   decided, and to the Developer dashboard (`/cayu/`).
 - After changing `web/src`, run `npm --prefix web ci` and `npm --prefix web run build`, and
   commit `web/static`; running and deploying need no Node. `npm --prefix web run
@@ -384,6 +392,13 @@ may rewrite it) or `THE AGENT'S OWN.` (yours).
 - `uv run --no-sync cayu cloud init` sets `home = "/"` in `cayu-cloud.toml`, so opening the
   Agent from Cayu Cloud lands on the app. `cayu guide app-ui` covers the app's parts.
 - To leave the app out, generate with `cayu new NAME --without web-app`.
+"""
+
+_CONVERSATIONS_GUIDANCE = """\
+- Conversations (`web/src/agent/conversations.tsx`) start, read and continue the agent's
+  sessions through Cayu's own API at `/api` (`web/src/agent/cayu.ts`), as the Developer
+  dashboard does, so Cayu checks each request: every role reads them, and `admin` and
+  `developer` start and continue them. `GET /app/agent` names the agent.
 """
 
 # The agent preset's routing row this capability answers differently.
@@ -404,13 +419,18 @@ def web_app_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> di
 
     if WEB_APP not in plan.capabilities:
         return {}
+    # People chat with the agent preset's agent, so its app has Conversations too.
+    chats = plan.preset == "agent"
+    guidance = _GUIDANCE.replace(
+        "__OWN_AREAS__", "Conversations, Task runs" if chats else "Task runs"
+    ).replace("__CONVERSATIONS__", _CONVERSATIONS_GUIDANCE if chats else "")
     serve = f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"\n'
     if files["pyproject.toml"].count(serve) != 1:
         raise RuntimeError("pyproject.toml has no [tool.cayu.serve] auth for the web app's routes.")
     return {
         "pyproject.toml": files["pyproject.toml"].replace(serve, serve + SERVE_ROUTERS),
-        "README.md": files["README.md"] + _GUIDANCE,
-        "AGENTS.md": files["AGENTS.md"].replace(_AGENTS_WEB_ROW, _AGENTS_WEB_APP_ROW) + _GUIDANCE,
+        "README.md": files["README.md"] + guidance,
+        "AGENTS.md": files["AGENTS.md"].replace(_AGENTS_WEB_ROW, _AGENTS_WEB_APP_ROW) + guidance,
         # Installed packages and build output of web/ and of a Developer dashboard ejected
         # with `cayu dashboard eject`, which writes no .gitignore of its own.
         ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
@@ -421,6 +441,6 @@ def web_app_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> di
         **app_route_files(),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
-        **web_app_files(plan.name, layers=(OPERATORS,)),
+        **web_app_files(plan.name, layers=(OPERATORS, CONVERSATIONS) if chats else (OPERATORS,)),
         "tests/test_web_app.py": _TEST_WEB_APP_PY,
     }

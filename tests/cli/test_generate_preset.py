@@ -8,6 +8,7 @@ import pytest
 
 from cayu.cli import main
 from cayu.cli.scaffold import project_files
+from cayu.cli.scaffold_app_web import CONVERSATIONS, OPERATORS, layer_sources, templates
 from cayu.cli.scaffold_plan import normalize_application_plan
 
 
@@ -77,10 +78,17 @@ def test_agent_project_converts_to_a_fresh_docker_coding_scaffold(
     operations = {edit["path"]: edit["operation"] for edit in planned["edits"]}
     assert operations["Dockerfile.coding"] == "create"
     assert operations["app.py"] == "update_region"
+    # The coding preset's web app has no Conversations: their files and build go.
+    conversations = sorted(
+        f"web/{path}"
+        for path in layer_sources(templates(), (OPERATORS, CONVERSATIONS)).keys()
+        - layer_sources(templates(), (OPERATORS,)).keys()
+    )
     assert [item["path"] for item in planned["removals"]] == [
         "observability/CAPABILITY.md",
         "tests/test_memory.py",
         "tests/test_standard_capabilities.py",
+        *conversations,
     ]
     assert _source_files(project) == before
 

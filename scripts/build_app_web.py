@@ -8,6 +8,8 @@ is composed and built in a temporary folder:
 - the generic app on its own, which ships no build;
 - the generic app with the operators layer, the `web-app` capability's, whose committed build
   is the layer's `static/`;
+- that app with the conversations layer, the agent preset's, whose committed build is the
+  conversations layer's `static/`;
 - the generic app with the organizations layer, the b2b preset's, whose committed build is
   the layer's `static/`.
 
@@ -52,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     apps = (
         ("generic app", ()),
         ("operator app", (web.OPERATORS,)),
+        ("operator app with conversations", (web.OPERATORS, web.CONVERSATIONS)),
         ("b2b app", (web.ORGANIZATIONS,)),
     )
     for label, layers in apps:

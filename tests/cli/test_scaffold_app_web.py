@@ -25,7 +25,14 @@ import pytest
 
 from cayu.cli import scaffold
 from cayu.cli.scaffold import project_files
-from cayu.cli.scaffold_app_web import APP, OPERATORS, ORGANIZATIONS, layer_sources, web_app_files
+from cayu.cli.scaffold_app_web import (
+    APP,
+    CONVERSATIONS,
+    OPERATORS,
+    ORGANIZATIONS,
+    layer_sources,
+    web_app_files,
+)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 TEMPLATES = REPOSITORY / "src/cayu/cli/templates"
@@ -111,12 +118,43 @@ def test_the_operator_app_is_the_generic_app_with_the_operators_layer() -> None:
         if not path.startswith("static/"):
             text = (layer / path).read_text(encoding="utf-8")
             assert not re.search(r"organi[sz]ation|department|\bmember|b2b", text, re.I), path
-    # Every preset with the `web-app` capability gets exactly this app.
+    # The coding and long-running presets get exactly this app.
+    for preset in ("coding", "long-running"):
+        files = project_files(PROJECT, preset=preset)
+        assert {f"web/{path}" for path in composed} == {
+            path for path in files if path.startswith("web/")
+        }
+        assert '"name": "web",' in files["web/package.json"]
+
+
+def test_the_agent_presets_app_adds_conversations_through_cayus_api() -> None:
+    operators = layer_sources(TEMPLATES, (OPERATORS,))
+    composed = layer_sources(TEMPLATES, (OPERATORS, CONVERSATIONS))
+    layer = TEMPLATES / CONVERSATIONS
+
+    from_layer = {
+        path for path, source in composed.items() if Path(str(source)).is_relative_to(layer)
+    }
+    # It replaces the area registry and the build, and adds the Conversations area.
+    replaced = {path for path in from_layer & operators.keys() if not path.startswith("static/")}
+    assert replaced == {"src/agent/index.tsx"}
+    assert not any(path.startswith("static/") for path in composed.keys() - from_layer)
+    assert {
+        "src/agent/conversations.tsx",
+        "src/agent/cayu.ts",
+        "src/agent/markdown.tsx",
+        "static/index.html",
+    } <= from_layer
+    registry = (layer / "src/agent/index.tsx").read_text(encoding="utf-8")
+    assert "conversationsArea,\n  taskRunsArea," in registry
+    # Conversations go through Cayu's own API, which applies its role rules, not /app.
+    client = (layer / "src/agent/cayu.ts").read_text(encoding="utf-8")
+    assert 'new URL("/api/", window.location.origin)' in client
+    assert "fetch(`/api/${path}`" in client
     files = project_files(PROJECT)
     assert {f"web/{path}" for path in composed} == {
         path for path in files if path.startswith("web/")
     }
-    assert '"name": "web",' in files["web/package.json"]
 
 
 def test_the_b2b_app_is_the_generic_app_with_the_organizations_layer() -> None:

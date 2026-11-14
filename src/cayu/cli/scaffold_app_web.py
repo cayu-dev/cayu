@@ -18,6 +18,9 @@ whole: build output has hashed names, so another build's files can't stay beside
 people are its operators: its Task runs area, and the smoke test in `e2e/`, which opens every
 area of the app `cayu serve --dev` serves.
 
+`templates/app_web_conversations/` goes on top of the operators layer for an Agent people chat
+with (the agent preset): its Conversations area, through Cayu's own API at /api.
+
 `templates/app_web_organizations/` is the organizations layer the b2b preset adds: member
 sign-in for `cayu serve --dev`, the Members area, the organization switcher, conversations
 scoped to an organization, and their calls to b2b's own routes.
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
 
 APP = "app_web"
 OPERATORS = "app_web_operators"
+CONVERSATIONS = "app_web_conversations"
 ORGANIZATIONS = "app_web_organizations"
 
 # The committed build `cayu serve` serves ([tool.cayu.serve] ui), relative to the app.
