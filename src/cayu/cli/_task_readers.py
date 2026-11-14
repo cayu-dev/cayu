@@ -11,21 +11,23 @@ time breakdown and the event-loop lag recorded on them. ``StoreTaskReader`` take
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound
 from cayu.cli.store_targets import SessionStoreBackend, SessionStoreTarget
+from cayu.sessions._call_inspection import redact_inspection_value
 from cayu.sessions._event_loop_lag import read_sessions_event_loop_lag
 from cayu.sessions._rollup import session_timing
 from cayu.sessions.event_queries import EventQuery
 from cayu.sessions.queries import SessionOrder, SessionQuery
 from cayu.sessions.records import EventRecord
 from cayu.sessions.store import SessionStore
-from cayu.tasks.index import TaskCountsCheck
+from cayu.tasks._value_filters import TaskValueFilters
+from cayu.tasks.index import TaskCountsCheck, TaskIndexQuery
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus, task_error_code, task_error_summary
 from cayu.tasks.store import TaskStore
@@ -50,12 +52,24 @@ class TaskListRequest:
     agent: str | None = None
     session_id: str | None = None
     parent_task_id: str | None = None
+    # Only tasks whose input (or metadata) has each of these top-level values, as the
+    # task's detail shows them: text as is, numbers by value, booleans as true or false.
+    # A run's tasks are ``metadata={"run": RUN}``.
+    input: Mapping[str, str] = field(default_factory=dict)
+    metadata: Mapping[str, str] = field(default_factory=dict)
     limit: int = 50
     offset: int = 0
 
     def __post_init__(self) -> None:
         if self.type is not None and self.types:
             raise ValueError("Give type or types, not both.")
+        # Refuse malformed value filters when the request is made, not when it is read.
+        TaskValueFilters.of(self.input, self.metadata)
+
+    @property
+    def values(self) -> TaskValueFilters:
+        """The ``input`` and ``metadata`` filters."""
+        return TaskValueFilters.of(self.input, self.metadata)
 
     @property
     def matched_types(self) -> tuple[str, ...]:
@@ -127,19 +141,50 @@ class StoreTaskReader:
         self.source = source
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
-        tasks = await self._store.list_tasks(
-            TaskQuery(
-                status=request.status,
-                types=request.matched_types or None,
-                assigned_agent_name=request.agent,
-                session_id=request.session_id,
-                parent_task_id=request.parent_task_id,
-                limit=request.limit,
-                offset=request.offset,
-                order_by=TaskOrder.UPDATED_AT_DESC,
-            )
+        query = TaskQuery(
+            status=request.status,
+            types=request.matched_types or None,
+            assigned_agent_name=request.agent,
+            session_id=request.session_id,
+            parent_task_id=request.parent_task_id,
+            limit=request.limit,
+            offset=request.offset,
+            order_by=TaskOrder.UPDATED_AT_DESC,
         )
-        return [task_projection(task) for task in tasks]
+        if not request.values:
+            return [task_projection(task) for task in await self._store.list_tasks(query)]
+        # The store can't filter by input or metadata values, so its task index visits
+        # every task in one read snapshot (a page can't shift between reads) and keeps the
+        # ones the predicate matches, as the server's filtered task list does. With a
+        # predicate the index leaves the type, agent, session and parent filters to it.
+        values = request.values
+        types = request.matched_types
+
+        def matches(task: Task) -> bool:
+            return (
+                (not types or task.type in types)
+                and (request.agent is None or task.assigned_agent_name == request.agent)
+                and (request.session_id is None or task.session_id == request.session_id)
+                and (
+                    request.parent_task_id is None or task.parent_task_id == request.parent_task_id
+                )
+                and values.matches(task, _redacted)
+            )
+
+        result = await self._store.query_task_index(
+            TaskIndexQuery(
+                filters=query.model_copy(
+                    update={
+                        "types": None,
+                        "assigned_agent_name": None,
+                        "session_id": None,
+                        "parent_task_id": None,
+                    }
+                )
+            ),
+            matches=matches,
+        )
+        return [task_projection(task) for task in result.items]
 
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         task = await self._store.load_task(task_id)
@@ -212,6 +257,10 @@ class ApiTaskReader:
             }.items()
             if value is not None
         }
+        if request.values:
+            self._require_value_filters()
+            query["input"] = [f"{key}={value}" for key, value in request.values.input]
+            query["metadata"] = [f"{key}={value}" for key, value in request.values.metadata]
         body = self._task_list(self._api.get("/tasks", query=query, resource="tasks"))
         if types and any(row["type"] not in types for row in body):
             # A server that predates `types` ignores it and lists every type.
@@ -221,6 +270,18 @@ class ApiTaskReader:
                 "list one --type at a time.",
             )
         return body
+
+    def _require_value_filters(self) -> None:
+        # A server without them ignores the filters and lists other tasks.
+        capability = self._api.get("/contract", resource="server capabilities")
+        for key in ("capabilities", "surfaces", "task_value_filters", "read", "enabled"):
+            capability = capability.get(key) if isinstance(capability, dict) else None
+        if capability is not True:
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} can't filter tasks by input, metadata or run; "
+                "its Cayu predates those filters.",
+            )
 
     async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
         query: dict[str, str | list[str]] = {
@@ -407,6 +468,13 @@ def _session_store(target: SessionStoreTarget) -> SessionStore:
     return PostgresSessionStore(
         target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
     )
+
+
+def _redacted(value: Any, _field: str) -> Any:
+    """A local task's input or metadata as `cayu task show` prints it, so a hidden value
+    never selects a task."""
+
+    return redact_inspection_value(value)
 
 
 def task_projection(task: Task, *, detail: bool = False) -> dict[str, Any]:

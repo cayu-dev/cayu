@@ -1,11 +1,11 @@
 import type * as React from "react";
 import { Link } from "react-router";
-import type { UseQueryResult } from "@tanstack/react-query";
+import { queryOptions, type UseQueryResult } from "@tanstack/react-query";
 import { z } from "zod";
 import { DataTable } from "@kit/patterns";
 import { defineStatuses } from "@kit/ui";
 import { formatDateTime, formatDuration, formatRelative } from "@kit/lib";
-import { queryTableProps } from "@kit/data";
+import { queryTableProps, type Requester, watchInterval } from "@kit/data";
 
 /**
  * BUILDING BLOCK. A list of an Agent's Cayu tasks, one row per run of its work,
@@ -24,6 +24,28 @@ export const taskRun = z.object({
   tasks: z.number(),
 });
 export type TaskRun = z.infer<typeof taskRun>;
+
+/** `GET /app/task-runs` (integrations/http/generated/task_runs.py): the newest runs first. */
+export function taskRunsApi(request: Requester) {
+  return {
+    list: (filter: { type?: string; limit?: number } = {}, signal?: AbortSignal) =>
+      request("task-runs", { query: filter, signal, schema: z.array(taskRun) }),
+  };
+}
+export type TaskRunsApi = ReturnType<typeof taskRunsApi>;
+
+/**
+ * The runs, followed with no timer of the page's own: a run can be queued, start or end at
+ * any time, so the list is read as Cayu's watches read its API (`watchInterval`), every 15
+ * seconds while it changes and less often while it doesn't. A route of the Agent's own that
+ * returns runs is followed the same way, with `refetchInterval: watchInterval()`.
+ */
+export const taskRunsQuery = (api: TaskRunsApi, filter: { type?: string; limit?: number } = {}) =>
+  queryOptions({
+    queryKey: ["task-runs", filter.type ?? null, filter.limit ?? null],
+    queryFn: ({ signal }) => api.list(filter, signal),
+    refetchInterval: watchInterval<TaskRun[]>(),
+  });
 
 export const taskRunStatus = defineStatuses<string>({
   queued: { label: "Queued", tone: "neutral" },

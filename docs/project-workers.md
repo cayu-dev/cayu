@@ -283,6 +283,7 @@ the project's configured or canonical store), read-only, or reads a Cayu Cloud A
 cayu task list --status running
 cayu task list --application my-agent --type scan --limit 20
 cayu task list --type pass,recheck
+cayu task list --type pass --input repository=acme/api --run round-12
 cayu task show TASK_ID --json
 cayu task latest --type digest --json
 cayu task latest --type pass --by input.repository --json
@@ -292,6 +293,12 @@ cayu task wait TASK_ID --application my-agent --wait-seconds 3600
 `--type` takes several types, repeated or separated by commas. A Cayu server older
 than `types` on `GET /api/tasks` would list every type, so the CLI refuses its answer
 and says to list one type at a time.
+
+`--input KEY=VALUE` and `--metadata KEY=VALUE` keep only tasks whose input or metadata has
+that top-level value, as `cayu task show` prints it (numbers match by value, booleans as
+`true` or `false`), and `--run RUN` is `--metadata run=RUN`. They are the filters
+`client.js`'s `watchTasks` follows; a server older than them is refused instead of listing
+other tasks.
 
 `latest` shows the newest task that completed (`--status failed`, `cancelled`,
 `dependency_skipped` or `any` for others), newest first by completion time, with its

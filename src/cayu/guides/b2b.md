@@ -117,7 +117,11 @@ the Agent supplies its people, metrics and start-up settings to `build_generated
 It doesn't use `/cayu/client.js` (`cayu guide app-ui`): that client calls Cayu's operator
 API, which `OPERATOR_ONLY_AUTH` keeps from the application's members. The interface reads a
 conversation's transcript when it opens it, and follows a reply through the stream its own
-`runs` or `resume` request returns.
+`runs` or `resume` request returns. Pages that show something that changes on its own (the
+Overview, the TaskRuns block's `taskRunsQuery`) follow their `/app` route with the kit's
+`watchInterval` (`@kit/data`) instead of a timer: the cadence `client.js` keeps, a read 15
+seconds after the last, doubling while the answer doesn't change up to two minutes, and
+nothing while the tab is hidden. Give your own such query `refetchInterval: watchInterval()`.
 
 A reply runs inside the request that streams it. Moving around the interface keeps it running,
 but closing the tab or losing the connection stops the agent's reply there; the conversation

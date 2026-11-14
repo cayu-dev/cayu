@@ -165,11 +165,11 @@
     },
     "web/src/blocks/task-runs.tsx": {
       "reference_sha256": "0c5d2e7283eb0a0a2bdb3b4d8ea3db1502a397ca64dc987604a2320d0633f56c",
-      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839)."
+      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839). Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval (#3860)."
     },
     "web/src/generated/overview/index.tsx": {
       "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
-      "same": true
+      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860)."
     },
     "web/src/generated/settings/index.tsx": {
       "reference_sha256": "27ec9dc65bf76e3c8a538b051286a71da4abcb0fec9c5369aa18689ae999922c",
@@ -309,7 +309,7 @@
     },
     "web/src/kit/shadcn/data.ts": {
       "reference_sha256": "83a7ec973d43d6030564f213c33150d4d93099ad24c4cf58ffc4a3c7cf6e5052",
-      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841)."
+      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841). Adds watchInterval, a refetchInterval with Cayu's watch cadence for reads of /app (#3860)."
     },
     "web/src/kit/shadcn/hooks/index.tsx": {
       "reference_sha256": "1641ceaa3daeed1ab5929b0d179d7e37c25a3a297e1e99ae2f47fc9b9e5a10c4",

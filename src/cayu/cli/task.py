@@ -36,6 +36,7 @@ from cayu.cli._task_readers import (
 from cayu.cli.session import _redact_sensitive, print_timing_totals
 from cayu.sessions._event_loop_lag import event_loop_lag_text
 from cayu.sessions._rollup import SessionTiming, add_session_timings
+from cayu.tasks._value_filters import TaskValueFilters
 from cayu.tasks.cancellation import (
     TaskCancellationReconciliationEventType,
     TaskRetryCancellationReconciliationEventType,
@@ -264,6 +265,32 @@ def add_task_parser(subparsers: Any) -> None:
         "--parent", metavar="TASK_ID", help="Only tasks whose parent is this task."
     )
     list_parser.add_argument(
+        "--input",
+        action="append",
+        dest="input_filters",
+        default=[],
+        type=_value_filter_argument,
+        metavar="KEY=VALUE",
+        help=(
+            "Only tasks whose input has this top-level value, as `cayu task show` prints it, "
+            "such as --input repository=acme/api. Numbers match by value, booleans as true "
+            "or false. Repeat for several; every one must match."
+        ),
+    )
+    list_parser.add_argument(
+        "--metadata",
+        action="append",
+        dest="metadata_filters",
+        default=[],
+        type=_value_filter_argument,
+        metavar="KEY=VALUE",
+        help="Only tasks whose metadata has this top-level value, matched as --input is.",
+    )
+    list_parser.add_argument(
+        "--run",
+        help="Only tasks of this run: their metadata's `run` (the same as --metadata run=RUN).",
+    )
+    list_parser.add_argument(
         "--limit",
         type=_page_limit,
         default=50,
@@ -424,6 +451,24 @@ def _task_types_argument(value: str) -> list[str]:
     return types
 
 
+def _value_filter_argument(value: str) -> tuple[str, str]:
+    key, separator, text = value.partition("=")
+    if not separator or not key or key != key.strip():
+        raise argparse.ArgumentTypeError("give KEY=VALUE, such as repository=acme/api")
+    return key, text
+
+
+def _value_filters(pairs: list[tuple[str, str]], flag: str) -> dict[str, str]:
+    """``--input`` or ``--metadata`` (with ``--run``) values by key. A key given twice is
+    refused, since no task has two values for it."""
+
+    keys = [key for key, _value in pairs]
+    repeated = sorted({key for key in keys if keys.count(key) > 1})
+    if repeated:
+        raise ValueError(f"Give each {flag} key once: {', '.join(repeated)}.")
+    return dict(pairs)
+
+
 def run_task(args: argparse.Namespace) -> int:
     if args.task_command in _ACTIONS:
         from cayu.cli._control_plane_actions import run_action
@@ -432,6 +477,16 @@ def run_task(args: argparse.Namespace) -> int:
     if getattr(args, "raw", False) and args.field is None:
         print("error: --raw prints one field; add --field PATH.", file=sys.stderr)
         return 2
+    if args.task_command == "list":
+        metadata = [*args.metadata_filters, *([] if args.run is None else [("run", args.run)])]
+        try:
+            args.input_values = _value_filters(args.input_filters, "--input")
+            args.metadata_values = _value_filters(metadata, "--metadata (or --run)")
+            # At most eight of each, as the server takes.
+            TaskValueFilters.of(args.input_values, args.metadata_values)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     return run_read_command(
         args,
         _run_task_command,
@@ -494,6 +549,8 @@ async def _list_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
             agent=args.agent,
             session_id=args.session,
             parent_task_id=args.parent,
+            input=args.input_values,
+            metadata=args.metadata_values,
             # One more than asked says whether another page follows.
             limit=args.limit + 1,
             offset=args.offset,

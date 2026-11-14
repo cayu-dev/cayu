@@ -96,7 +96,8 @@ Do not hand-write polling loops for session events or session lists. If
 `client.js` calls Cayu's operator API, so it is for operators and for applications
 whose users may use that API. An interface for an application's own users, who
 reach only what a resource-access policy grants them, calls the application's
-scoped routes instead; `cayu guide b2b` shows one.
+scoped routes instead; `cayu guide b2b` shows one, whose pages follow those routes
+with the rules below (its kit's `watchInterval`).
 
 ## If you must poll
 

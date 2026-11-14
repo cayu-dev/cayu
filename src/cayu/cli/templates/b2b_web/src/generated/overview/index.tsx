@@ -5,13 +5,20 @@ import { AppPageDescription, AppPageHeader, AppPageSection, AppPageTitle, Metric
 import { AsyncContent, DataTable } from "@kit/patterns";
 import { Alert, AlertDescription, AlertTitle, Skeleton } from "@kit/ui";
 import { formatDateTime } from "@kit/lib";
-import { queryContentProps } from "@kit/data";
+import { queryContentProps, watchInterval } from "@kit/data";
 import { DashboardSquare01Icon } from "@kit/icons";
 import type { AppArea } from "../../app/area";
 import { useAreaApi } from "../../app/services";
 import { overviewApi, type Overview, type OverviewApi } from "../../api/overview";
 
-export const overviewQuery = (api: OverviewApi) => queryOptions({ queryKey: ["overview"], queryFn: ({ signal }) => api.get(signal), refetchInterval: 30_000 });
+// Followed as Cayu's watches follow its API, with no timer of its own: every 15 seconds while
+// it changes, less often while it doesn't. `as_of` changes on every answer, so it isn't a change.
+export const overviewQuery = (api: OverviewApi) =>
+  queryOptions({
+    queryKey: ["overview"],
+    queryFn: ({ signal }) => api.get(signal),
+    refetchInterval: watchInterval<Overview>({ key: (data) => JSON.stringify([data.metrics, data.inbox]) }),
+  });
 
 /**
  * GENERATED. The Overview area. Every Agent's app has it: the Agent's metrics, what waits

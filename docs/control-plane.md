@@ -925,7 +925,10 @@ after the first `=` is the value, so a key cannot hold one, and `client.js` refu
 a filter whose key does. Cursors stay bound to these filters too.
 The contract's `task_value_filters` surface says the server supports them; a
 server without it ignores the parameters, so `client.js` refuses to send them
-there.
+there. `cayu task list` takes the same filters as `--input KEY=VALUE`,
+`--metadata KEY=VALUE` and `--run RUN` (and `TaskListRequest` as `input` and
+`metadata` mappings); against a server it checks that surface first, and on a
+local store it matches each task's values as `cayu task show` prints them.
 
 Every task list response carries a weak `ETag`; send it back as `If-None-Match`
 and an unchanged list answers `304` with no body. `client.js`'s `watchTasks`

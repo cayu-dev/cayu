@@ -158,6 +158,43 @@ export function createQueryClient({
   });
 }
 
+/** No watched read comes sooner than this after the last one: Cayu's `client.js` floor. */
+export const WATCH_INTERVAL_MS = 15_000;
+/** How far a quiet watch's spacing doubles by default, as `client.js` does. */
+export const WATCH_MAX_INTERVAL_MS = 120_000;
+
+type WatchState = { at: number; key: string; interval: number };
+// Per cached query, so a page that builds its query options on every render keeps its spacing.
+const watched = new WeakMap<object, WatchState>();
+
+/**
+ * A query's `refetchInterval` that follows it the way Cayu's `client.js` watches Cayu's API
+ * (`cayu guide app-ui`), for reads of the app's own routes, which `client.js` doesn't call:
+ * a read 15 seconds after the last at first, doubling while the answer doesn't change up to
+ * `maxIntervalMs`, and back to 15 seconds once it does. React Query reads nothing while the
+ * tab is hidden and reads again when it shows. `key` says what counts as a change, such as
+ * everything but an `as_of`; by default the whole answer.
+ */
+export function watchInterval<T>({
+  key = (data) => JSON.stringify(data),
+  intervalMs = WATCH_INTERVAL_MS,
+  maxIntervalMs = WATCH_MAX_INTERVAL_MS,
+}: { key?: (data: T) => string; intervalMs?: number; maxIntervalMs?: number } = {}) {
+  const base = Math.max(WATCH_INTERVAL_MS, intervalMs);
+  const ceiling = Math.max(base, maxIntervalMs);
+  return (query: { state: { data: T | undefined; dataUpdatedAt: number } }): number => {
+    const { data, dataUpdatedAt } = query.state;
+    if (data === undefined) return base;
+    const last = watched.get(query);
+    // React Query asks several times per answer; each answer is counted once.
+    if (last?.at === dataUpdatedAt) return last.interval;
+    const now = key(data);
+    const interval = last !== undefined && last.key === now ? Math.min(ceiling, last.interval * 2) : base;
+    watched.set(query, { at: dataUpdatedAt, key: now, interval });
+    return interval;
+  };
+}
+
 /** The parts of a `useQuery` result the content helpers read. */
 export type QueryView = {
   isPending: boolean;

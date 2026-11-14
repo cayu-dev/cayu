@@ -256,7 +256,11 @@ from cayu.server._suite_launch_routes import register_suite_launch_routes
 from cayu.server._task_catalog_routes import register_task_catalog_routes
 from cayu.server._task_controls_routes import register_task_controls_routes
 from cayu.server._task_failure_scrub_routes import register_task_failure_scrub_routes
-from cayu.server._task_index import TaskValueFilters, read_task_index, read_tasks_by_ids
+from cayu.server._task_index import (
+    parse_task_value_filters,
+    read_task_index,
+    read_tasks_by_ids,
+)
 from cayu.server._task_latest_routes import register_task_latest_route
 from cayu.server._transcript_parts import (
     MIN_PART_BYTES,
@@ -9234,7 +9238,7 @@ def create_router(
         response.headers["Cache-Control"] = "private, no-store"
         if ids is not None:
             return await read_tasks_by_ids(cayu_app, http_request, response, ids)
-        values = TaskValueFilters.parse(input_filter, metadata_filter)
+        values = parse_task_value_filters(input_filter, metadata_filter)
         if task_store is None:
             if include == "counts":
                 raise HTTPException(501, "Task index is unavailable.")
