@@ -65,6 +65,10 @@ from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
 from cayu.storage._trace_event_schema import POSTGRES_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
+from cayu.storage._usage_projection_schema import (
+    POSTGRES_USAGE_PROJECTION_DDL,
+    USAGE_PROJECTION_REVISION,
+)
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
 # but uses Postgres-native types: TEXT ids, JSONB payloads, TIMESTAMPTZ times,
@@ -1042,6 +1046,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     SESSION_SUMMARY_REVISION: POSTGRES_SESSION_SUMMARIES_DDL,
     # Summary tables the Evals pages read instead of whole documents.
     EVAL_VIEW_SUMMARIES_REVISION: POSTGRES_EVAL_VIEW_SUMMARIES_DDL,
+    # Usage and Tools read trigger-maintained stored totals.
+    USAGE_PROJECTION_REVISION: POSTGRES_USAGE_PROJECTION_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

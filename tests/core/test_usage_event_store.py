@@ -22,6 +22,7 @@ from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.queries import SessionAggregateFilter
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.usage import UsageRollupQuery
+from cayu.storage._usage_projection_schema import POSTGRES_PENDING_TABLES, PROJECTION_TABLES
 from cayu.storage.migrations import SchemaMode, SchemaTooOld
 from cayu.storage.sqlite import SQLiteSessionStore
 
@@ -244,7 +245,13 @@ async def test_migration_copies_events_retained_before_it(backend) -> None:
     on_table = "" if backend.name == "sqlite" else " ON cayu_events"
     for trigger in ("insert", "delete", "update"):
         await backend.execute(f"DROP TRIGGER cayu_usage_events_{trigger}{on_table}")
-    await backend.execute("DROP TABLE cayu_usage_events")
+    # The stored totals of the usage-projection revision go too; on Postgres its
+    # functions take a cayu_usage_events row, so they drop with the table.
+    cascade = "" if backend.name == "sqlite" else " CASCADE"
+    await backend.execute(f"DROP TABLE cayu_usage_events{cascade}")
+    stored = PROJECTION_TABLES + (() if backend.name == "sqlite" else POSTGRES_PENDING_TABLES)
+    for table in stored:
+        await backend.execute(f"DROP TABLE {table}")
     # Back to revision 148, as before the usage copy and every later revision.
     await backend.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 149")
     with pytest.raises(SchemaTooOld, match="requires >= "):

@@ -48,7 +48,10 @@ def test_postgres_cross_session_costs_include_visible_spend_and_late_lower_seque
     from cayu.runtime._run_limits import SessionUsageTracker
 
     async def run():
-        store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        store = PostgresSessionStore(
+            psycopg.conninfo.make_conninfo(postgres_dsn, options="-c lock_timeout=3000"),
+            schema_mode=SchemaMode.CREATE,
+        )
         try:
             causal_id = f"causal-{uuid4()}"
             earlier, later = (

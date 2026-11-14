@@ -9,6 +9,7 @@
   "GET /api/diagnostics/requests name=get_request_cost_diagnostics class=APIRoute GET=get_request_cost_diagnostics_api_diagnostics_requests_get",
   "POST /api/operations/snapshot name=get_operational_snapshot class=APIRoute POST=get_operational_snapshot_api_operations_snapshot_post",
   "POST /api/usage/rollup name=get_usage_rollup class=_BoundedUsageRollupRoute POST=get_usage_rollup_api_usage_rollup_post",
+  "POST /api/usage/rollup/recompute name=recompute_usage_rollup class=_BoundedUsageRollupRoute POST=recompute_usage_rollup_api_usage_rollup_recompute_post",
   "POST /api/supervision-events/query name=query_supervision_events class=_BoundedSupervisionEventsRoute POST=query_supervision_events_api_supervision_events_query_post",
   "POST /api/sessions/{session_id}/compact name=compact_session class=APIRoute POST=compact_session_api_sessions__session_id__compact_post",
   "GET /api/sessions/{session_id}/human-review name=inspect_human_review class=APIRoute GET=inspect_human_review_api_sessions__session_id__human_review_get",

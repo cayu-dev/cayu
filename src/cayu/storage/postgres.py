@@ -87,6 +87,7 @@ from cayu.storage._receipt_ledger_rows import join_receipt_ledger
 from cayu.storage._session_execution import PostgresSessionExecutionMixin
 from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
+from cayu.storage._usage_projection_schema import USAGE_PROJECTION_REVISION
 from cayu.storage.budget_postgres import PostgresBudgetLedger as PostgresBudgetLedger
 from cayu.storage.event_watchers_postgres import (
     PostgresEventWatcherStore as PostgresEventWatcherStore,
@@ -101,6 +102,7 @@ from cayu.storage.work_context_postgres import (
 )
 
 if TYPE_CHECKING:
+    from cayu.budgets.usage import SessionUsageSummary
     from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._zero_work_interruption import (
         ZeroWorkInterruptionPublication,
@@ -109,7 +111,7 @@ if TYPE_CHECKING:
     from cayu.sessions._access_rules import SessionReadBounds, _SessionAccessBounds
     from cayu.sessions._temporary_continuation import TemporaryServiceAdmission
     from cayu.sessions.exports import SessionExportLimits, SessionExportSnapshot
-    from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.tool_usage import ToolCallHeads, ToolUsageTally
     from cayu.sessions.trace_events import TraceEvent, TranscriptToolCall
     from cayu.storage._stored_event_verification import StoredEventVerificationPage
     from cayu.storage.retention import (
@@ -464,7 +466,10 @@ from cayu.tools.grants import (
 )
 
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = max(
-    ARTIFACT_INDEX_REVISION, TRACE_EVENTS_REVISION, SESSION_SUMMARY_REVISION
+    ARTIFACT_INDEX_REVISION,
+    TRACE_EVENTS_REVISION,
+    SESSION_SUMMARY_REVISION,
+    USAGE_PROJECTION_REVISION,
 )
 
 _SESSION_LABELS_QUERY = locked_reads.SESSION_LABELS_QUERY
@@ -6391,8 +6396,41 @@ class PostgresSessionStore(
     ) -> dict[tuple[str, str], KnowledgeLookupTotal]:
         return await session_queries.stored_knowledge_lookup_totals(self._ready_connection)
 
-    async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
-        return await session_queries.tool_usage_totals(self._ready_connection)
+    async def tool_usage_totals(
+        self, *, from_events: bool = False
+    ) -> tuple[dict[str, ToolUsageTally], int]:
+        return await session_queries.tool_usage_totals(
+            self._ready_connection, from_events=from_events
+        )
+
+    async def read_session_usage_totals(
+        self,
+        session_ids: Sequence[str],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, SessionUsageSummary]:
+        """Sum stored ``cayu_session_usage`` totals; see ``SessionStore``."""
+
+        summaries, fallback = await session_queries.read_session_usage_totals(
+            self._ready_connection, tuple(dict.fromkeys(session_ids)), since=since, until=until
+        )
+        if fallback:
+            summaries.update(
+                await super().read_session_usage_totals(sorted(fallback), since=since, until=until)
+            )
+        return summaries
+
+    async def tool_call_heads(
+        self,
+        raw_names: tuple[str, ...] | None,
+        *,
+        before_sequence: int | None,
+        limit: int,
+    ) -> ToolCallHeads:
+        return await session_queries.tool_call_heads(
+            self._ready_connection, raw_names, before_sequence=before_sequence, limit=limit
+        )
 
     async def query_events_bounded_many(
         self,
@@ -6720,8 +6758,12 @@ class PostgresSessionStore(
             accuracy=EXACT_AGGREGATE.model_copy(),
         )
 
-    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
-        return await session_queries.aggregate_usage(self._ready_connection, query)
+    async def aggregate_usage(
+        self, query: UsageRollupQuery, *, from_events: bool = False
+    ) -> UsageRollupStoreResult:
+        return await session_queries.aggregate_usage(
+            self._ready_connection, query, from_events=from_events
+        )
 
     async def list_sessions_with_pending_interruption_cascade(
         self,

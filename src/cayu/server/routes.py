@@ -263,6 +263,7 @@ from cayu.server._transcript_parts import (
     register_transcript_message,
     truncate_message_parts,
 )
+from cayu.server._usage_recompute_routes import read_usage_rollup, register_usage_recompute_route
 from cayu.server.auth import (
     AuthContext,
     AuthDependency,
@@ -3080,15 +3081,6 @@ def _require_safe_session_topology_authority(
             )
 
 
-async def _read_usage_rollup(
-    store: SessionStore, query: UsageRollupQuery
-) -> UsageRollupStoreResult:
-    result = await store.aggregate_usage(query)
-    if type(result) is not UsageRollupStoreResult:
-        raise UsageRollupInconsistent("Usage aggregate stores must return UsageRollupStoreResult.")
-    return result.validate_for_query(query)
-
-
 def _require_safe_usage_session_authority(
     cayu_app: Any,
     result: UsageRollupStoreResult,
@@ -5436,7 +5428,7 @@ def create_router(
         unavailable_reason = None
         try:
             try:
-                result = await _read_usage_rollup(session_store, query)
+                result = await read_usage_rollup(session_store, query)
             except UsageRollupResultTooLarge:
                 if not query.include_cost_candidates:
                     raise
@@ -5444,7 +5436,7 @@ def create_router(
                 # bounded token projection. Never combine two snapshots.
                 query = query.model_copy(update={"include_cost_candidates": False})
                 unavailable_reason = "candidate_byte_limit"
-                result = await _read_usage_rollup(session_store, query)
+                result = await read_usage_rollup(session_store, query)
         except NotImplementedError as exc:
             raise HTTPException(
                 status_code=501,
@@ -5547,6 +5539,13 @@ def create_router(
             "authentication does not add tenant filtering."
         ),
         route_class_override=_BoundedUsageRollupRoute,
+    )
+    register_usage_recompute_route(
+        router,
+        session_store=session_store,
+        dependencies=heavy_read(),
+        route_class=_BoundedUsageRollupRoute,
+        redact=lambda value: _redact_control_plane_json(cayu_app, value, "usage_recompute"),
     )
 
     async def query_supervision_events(

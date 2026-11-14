@@ -158,11 +158,15 @@ def test_tool_usage_counts_real_repeated_calls_and_returns_exact_recent_links(
                 long_name = "🙂" * 4096
                 empty = (await client.get("/api/tools/calls", params={"name": long_name})).json()
                 assert empty["calls"] == []
-                assert len(empty["next_cursor"]) < 8192
-                continued = await client.get(
-                    "/api/tools/calls", params={"name": long_name, "cursor": empty["next_cursor"]}
-                )
-                assert continued.status_code == 200, continued.text
+                # Indexed stores know no tool has the name, so there is nothing to
+                # continue; a scanning store hands back a bounded cursor.
+                if empty["next_cursor"] is not None:
+                    assert len(empty["next_cursor"]) < 8192
+                    continued = await client.get(
+                        "/api/tools/calls",
+                        params={"name": long_name, "cursor": empty["next_cursor"]},
+                    )
+                    assert continued.status_code == 200, continued.text
 
                 assert not {"arguments", "result", "tool_call_id", "model_step_id"}.intersection(
                     item
@@ -848,7 +852,8 @@ def test_recent_calls_use_bounded_identity_and_safe_cutoff(
                 response = await client.get("/api/tools/calls")
                 assert response.status_code == 200, response.text
                 assert len(response.json()["calls"]) == 2
-                assert cutoffs == [*folded, 1]
+                # Native stores read call heads by index; the portable default scans.
+                assert cutoffs == ([None, 1] if folded else [])
         finally:
             await app.aclose()
 
@@ -1210,7 +1215,7 @@ def test_sqlite_http_usage_counts_one_retained_snapshot(tmp_path):
             # The newest-sequence read opens the snapshot; a deletion that
             # commits before the grouped tally must not change what it counts.
             def before_tally(statement):
-                if "FROM cayu_usage_events AS cayu_events" in statement and not entered.is_set():
+                if "FROM cayu_tool_usage" in statement and not entered.is_set():
                     loop.call_soon_threadsafe(entered.set)
                     release.wait(10)
 

@@ -10777,6 +10777,49 @@ unchanged, and a rollup no longer reads event content, which on a large store wa
 most of its cost. Session stores require revision 149, so
 run `cayu storage migrate` before starting the upgraded application.
 
+Since storage revision 157, rollups no longer add up one row per event either.
+Triggers on `cayu_usage_events`, in the same transaction as each event write,
+keep three tables of totals: `cayu_session_usage` (per session, UTC hour, event
+type, price identity and input-token band), `cayu_usage_hourly` (per UTC hour,
+event agent, event environment, event type, price identity and band) and
+`cayu_tool_usage` (calls, failures, approvals and the newest call per tool name,
+event agent and UTC hour). `cayu_usage_price_identities` keeps normalized
+price identities: an event's normalized usage metrics with every valid
+counter reduced to 0 or 1, plus its billing identity, so rows that share one fall
+into one price group and cost priced at read time from their summed counters
+equals cost priced event by event. PostgreSQL reuses visible identity rows and
+allows equivalent rows from concurrent uncommitted writers, so independent
+sessions do not wait on a global identity uniqueness constraint. Each copied
+usage event retains the identity it used; deletion and rewriting reverse that
+same projection group, including before a rebuild. A rollup reads stored rows for the whole UTC
+hours of its window and events only for its partial edge hours and for any hour
+a series bucket boundary cuts (a time zone with a half-hour offset), adding both
+in one snapshot. Rows are split at the input-token tier boundaries of the price
+books Cayu ships; when a request's price book has another boundary inside a
+row's input-token range, that rollup prices from events. Deleting events keeps
+a row's recorded input-token range (it still covers every remaining event, so
+at worst a rollup prices from events) and flags a row whose first event is
+gone. SQLite counters
+saturate at the int64 maximum and mark the row, and such a rollup reads events.
+Cost stays priced at read time with the request's price book, so price-book
+changes need no backfill. The event-level rollup stays the reference:
+`SessionStore.aggregate_usage(query, from_events=True)` and
+`SessionStore.tool_usage_totals(from_events=True)` read it, and
+`POST /usage/rollup/recompute` and `cayu usage rollup --recompute` compare it
+with the stored totals for a window, listing every difference as a path and
+leaf values (lists and objects by kind and length), redacted like the rollup
+(the two reads are separate snapshots, so writes between them show up as
+differences).
+`SessionStore.read_session_usage_totals(session_ids, since=, until=)` returns
+each session's `SessionUsageSummary` from the same rows, equal to
+`read_usage_accounting(by_session=True)` except that a session whose only
+usage-bearing events are hosted calls still in progress is absent; sessions
+with model steps that lack normalized metrics, saturated counters or a flagged
+row are read from events. The
+migration copies each retained event's agent and environment names into
+`cayu_usage_events` and fills the totals from it. Session stores require
+revision 157.
+
 Cost reporting additionally accepts public `session_order="cost"`. Native
 stores advertise `supports_usage_cost_details` (custom-store default false),
 covering bounded complete candidates and snapshot session display metadata.
@@ -21893,8 +21936,14 @@ which tallies calls, failures, approvals and the newest call time by raw tool na
 inside one snapshot and returns the snapshot's newest sequence of any event type.
 Its default folds every retained tool event through `fold_event_snapshot`, so a
 custom store stays correct without overriding it. SQLite and PostgreSQL answer it
-with one grouped query over `cayu_usage_events`, reading payload members only for
-hosted web searches, so the read no longer loads each tool event's content.
+with one grouped query over the trigger-kept `cayu_tool_usage` totals (since
+storage revision 157; `from_events=True` counts `cayu_usage_events` instead), so
+the read no longer touches events at all. `GET /tools/calls?name=` reads call
+heads through `SessionStore.tool_call_heads`, newest first by
+`(tool_name, sequence)` index, and loads the full events of only the calls it
+returns in one batch, so a rarely used tool's page is as cheap as a common
+one's. A store without `tool_call_heads` keeps the older scan of the newest
+retained tool events.
 
 The kept-knowledge listing reads a page's lookup totals, source sessions and
 activation receipts through three batch methods: `SessionStore.knowledge_lookup_totals`,

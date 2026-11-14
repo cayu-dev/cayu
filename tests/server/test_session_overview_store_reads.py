@@ -181,7 +181,7 @@ def test_overview_page_store_reads_stay_fixed_as_the_page_grows(
         for name in (
             "sessions.load_sessions",
             "sessions.query_pending_actions_for_sessions",
-            "sessions.read_usage_accounting",
+            "sessions.read_session_usage_totals",
         ):
             assert large_counts[name] >= 1, (name, large_counts)
         for name in (

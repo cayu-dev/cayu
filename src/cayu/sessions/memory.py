@@ -6931,7 +6931,10 @@ class InMemorySessionStore(
             self._read_session_query_state, filters
         )
 
-    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+    async def aggregate_usage(
+        self, query: UsageRollupQuery, *, from_events: bool = False
+    ) -> UsageRollupStoreResult:
+        del from_events  # The in-memory store always reads its events.
         return await memory_session_queries.aggregate_usage(self._read_session_query_state, query)
 
     async def list_sessions_with_pending_interruption_cascade(

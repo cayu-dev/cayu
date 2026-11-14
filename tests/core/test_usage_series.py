@@ -258,10 +258,12 @@ def test_sqlite_many_buckets_use_one_additional_aggregate_scan(tmp_path, monkeyp
         store = SQLiteSessionStore(tmp_path / "bounded.sqlite")
         try:
             start = datetime(2026, 1, 1, tzinfo=UTC)
+            # The event-level reference; stored totals read cayu_usage_hourly.
             result = await store.aggregate_usage(
                 UsageRollupQuery(
                     start_at=start, end_at=start + timedelta(hours=512), series={"unit": "hour"}
-                )
+                ),
+                from_events=True,
             )
             assert len(result.series.buckets) == 512
             assert len(statements) == 1

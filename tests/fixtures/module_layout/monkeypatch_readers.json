@@ -3247,7 +3247,7 @@
     "session_pricing_input_statement"
   ],
   "cayu.storage._sqlite_aggregates:usage_series_statement": [
-    "aggregate_session_usage"
+    "_aggregate_events"
   ],
   "cayu.storage._sqlite_connection:connect": [
     "cayu.cli.storage:_migrate_sqlite_locked",

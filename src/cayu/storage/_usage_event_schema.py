@@ -131,11 +131,14 @@ _SQLITE_PROJECTION_COLUMNS = (
 )
 
 
-def _sqlite_copy(row: str) -> str:
+def _sqlite_copy(row: str, *, attributed: bool = False) -> str:
     """Copy ``row`` of ``cayu_events``, storing each rollup projection of its payload.
 
     SQLite reparses JSON text for every member it reads, so the projections run
     once here, over the reduced payload, instead of in every rollup statement.
+    ``attributed`` copies the event's agent and environment names too, which the
+    usage-projection copy keeps for the usage projections (see
+    ``_usage_projection_schema``); revision 149's copy has no such columns.
     """
 
     projections = _sqlite_projections()
@@ -145,24 +148,71 @@ def _sqlite_copy(row: str) -> str:
         raise RuntimeError("SQLite usage-event projections do not match the copy's columns.")
     names = ", ".join(name for name, _ in projections)
     expressions = ",\n            ".join(expression for _, expression in projections)
+    attribution = ", agent_name, environment_name" if attributed else ""
+    attribution_values = ", event.agent_name, event.environment_name" if attributed else ""
+    attribution_source = (
+        f"{row}.agent_name AS agent_name, {row}.environment_name AS environment_name,"
+        if attributed
+        else ""
+    )
     return f"""INSERT OR REPLACE INTO cayu_usage_events (
             sequence, session_id, event_id, event_type, timestamp, tool_name, payload_json,
-            {names}
+            {names}{attribution}
         )
         SELECT
             event.sequence, event.session_id, event.event_id, event.event_type,
             event.timestamp, event.tool_name, event.payload_json,
-            {expressions}
+            {expressions}{attribution_values}
         FROM (
             SELECT
                 {row}.sequence AS sequence, {row}.session_id AS session_id,
                 {row}.event_id AS event_id, {row}.event_type AS event_type,
                 {row}.timestamp AS timestamp, {row}.tool_name AS tool_name,
+                {attribution_source}
                 {sqlite_usage_payload(f"{row}.payload_json", f"{row}.event_type")}
                     AS payload_json"""
 
 
 _SQLITE_COLUMN_DDL = ",\n    ".join(f"{name} {kind}" for name, kind in _SQLITE_PROJECTION_COLUMNS)
+
+
+def sqlite_usage_event_triggers(*, attributed: bool) -> str:
+    """The ``cayu_events`` triggers that keep ``cayu_usage_events`` in step."""
+
+    update_columns = (
+        "sequence, session_id, event_id, event_type, timestamp, tool_name, payload_json"
+        + (", agent_name, environment_name" if attributed else "")
+    )
+    return f"""
+CREATE TRIGGER IF NOT EXISTS cayu_usage_events_insert
+AFTER INSERT ON cayu_events
+FOR EACH ROW
+WHEN NEW.event_type IN ({_USAGE_TYPES_SQL})
+BEGIN
+    {_sqlite_copy("NEW", attributed=attributed)}
+        ) AS event;
+END;
+
+CREATE TRIGGER IF NOT EXISTS cayu_usage_events_delete
+AFTER DELETE ON cayu_events
+FOR EACH ROW
+WHEN OLD.event_type IN ({_USAGE_TYPES_SQL})
+BEGIN
+    DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
+END;
+
+CREATE TRIGGER IF NOT EXISTS cayu_usage_events_update
+AFTER UPDATE OF {update_columns}
+ON cayu_events
+FOR EACH ROW
+WHEN OLD.event_type IN ({_USAGE_TYPES_SQL}) OR NEW.event_type IN ({_USAGE_TYPES_SQL})
+BEGIN
+    DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
+    {_sqlite_copy("NEW", attributed=attributed)}
+            WHERE NEW.event_type IN ({_USAGE_TYPES_SQL})
+        ) AS event;
+END;
+"""
 
 
 SQLITE_USAGE_EVENTS_DDL = f"""
@@ -179,36 +229,7 @@ CREATE TABLE IF NOT EXISTS cayu_usage_events (
 
 CREATE INDEX IF NOT EXISTS idx_cayu_usage_events_type_timestamp
     ON cayu_usage_events(event_type, timestamp);
-
-CREATE TRIGGER IF NOT EXISTS cayu_usage_events_insert
-AFTER INSERT ON cayu_events
-FOR EACH ROW
-WHEN NEW.event_type IN ({_USAGE_TYPES_SQL})
-BEGIN
-    {_sqlite_copy("NEW")}
-        ) AS event;
-END;
-
-CREATE TRIGGER IF NOT EXISTS cayu_usage_events_delete
-AFTER DELETE ON cayu_events
-FOR EACH ROW
-WHEN OLD.event_type IN ({_USAGE_TYPES_SQL})
-BEGIN
-    DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
-END;
-
-CREATE TRIGGER IF NOT EXISTS cayu_usage_events_update
-AFTER UPDATE OF sequence, session_id, event_id, event_type, timestamp, tool_name, payload_json
-ON cayu_events
-FOR EACH ROW
-WHEN OLD.event_type IN ({_USAGE_TYPES_SQL}) OR NEW.event_type IN ({_USAGE_TYPES_SQL})
-BEGIN
-    DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
-    {_sqlite_copy("NEW")}
-            WHERE NEW.event_type IN ({_USAGE_TYPES_SQL})
-        ) AS event;
-END;
-
+{sqlite_usage_event_triggers(attributed=False)}
 {_sqlite_copy("source")}
             FROM cayu_events AS source
             WHERE source.event_type IN ({_USAGE_TYPES_SQL})
@@ -232,6 +253,64 @@ def postgres_usage_payload(source: str, event_type: str) -> str:
     END"""
 
 
+def postgres_usage_event_function(*, attributed: bool) -> str:
+    """The trigger function that keeps ``cayu_usage_events`` in step."""
+
+    columns = "sequence, session_id, event_id, event_type, timestamp, tool_name, payload"
+    values = (
+        "NEW.sequence, NEW.session_id, NEW.event_id, NEW.event_type,\n"
+        "                NEW.timestamp, NEW.tool_name,\n"
+        f"                {postgres_usage_payload('NEW.payload', 'NEW.event_type')}"
+    )
+    updates = """session_id = EXCLUDED.session_id,
+                event_id = EXCLUDED.event_id,
+                event_type = EXCLUDED.event_type,
+                timestamp = EXCLUDED.timestamp,
+                tool_name = EXCLUDED.tool_name,
+                payload = EXCLUDED.payload"""
+    if attributed:
+        columns += ", agent_name, environment_name"
+        values += ",\n                NEW.agent_name, NEW.environment_name"
+        updates += """,
+                agent_name = EXCLUDED.agent_name,
+                environment_name = EXCLUDED.environment_name"""
+    return f"""
+    CREATE OR REPLACE FUNCTION cayu_track_usage_event()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF TG_OP IN ('UPDATE', 'DELETE') THEN
+            DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
+        END IF;
+        IF TG_OP IN ('INSERT', 'UPDATE') AND NEW.event_type IN ({_USAGE_TYPES_SQL}) THEN
+            INSERT INTO cayu_usage_events (
+                {columns}
+            )
+            VALUES (
+                {values}
+            )
+            ON CONFLICT (sequence) DO UPDATE SET
+                {updates};
+        END IF;
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql
+    """
+
+
+def postgres_usage_event_update_trigger(*, attributed: bool) -> str:
+    columns = "sequence, session_id, event_id, event_type, timestamp, tool_name, payload" + (
+        ", agent_name, environment_name" if attributed else ""
+    )
+    return f"""
+    CREATE TRIGGER cayu_usage_events_update
+    AFTER UPDATE OF {columns}
+    ON cayu_events
+    FOR EACH ROW
+    WHEN (OLD.event_type IN ({_USAGE_TYPES_SQL}) OR NEW.event_type IN ({_USAGE_TYPES_SQL}))
+    EXECUTE FUNCTION cayu_track_usage_event()
+    """
+
+
 POSTGRES_USAGE_EVENTS_DDL: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS cayu_usage_events (
@@ -248,34 +327,7 @@ POSTGRES_USAGE_EVENTS_DDL: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_cayu_usage_events_type_timestamp
         ON cayu_usage_events(event_type, timestamp)
     """,
-    f"""
-    CREATE OR REPLACE FUNCTION cayu_track_usage_event()
-    RETURNS TRIGGER AS $$
-    BEGIN
-        IF TG_OP IN ('UPDATE', 'DELETE') THEN
-            DELETE FROM cayu_usage_events WHERE sequence = OLD.sequence;
-        END IF;
-        IF TG_OP IN ('INSERT', 'UPDATE') AND NEW.event_type IN ({_USAGE_TYPES_SQL}) THEN
-            INSERT INTO cayu_usage_events (
-                sequence, session_id, event_id, event_type, timestamp, tool_name, payload
-            )
-            VALUES (
-                NEW.sequence, NEW.session_id, NEW.event_id, NEW.event_type,
-                NEW.timestamp, NEW.tool_name,
-                {postgres_usage_payload("NEW.payload", "NEW.event_type")}
-            )
-            ON CONFLICT (sequence) DO UPDATE SET
-                session_id = EXCLUDED.session_id,
-                event_id = EXCLUDED.event_id,
-                event_type = EXCLUDED.event_type,
-                timestamp = EXCLUDED.timestamp,
-                tool_name = EXCLUDED.tool_name,
-                payload = EXCLUDED.payload;
-        END IF;
-        RETURN NULL;
-    END;
-    $$ LANGUAGE plpgsql
-    """,
+    postgres_usage_event_function(attributed=False),
     "DROP TRIGGER IF EXISTS cayu_usage_events_insert ON cayu_events",
     f"""
     CREATE TRIGGER cayu_usage_events_insert
@@ -293,14 +345,7 @@ POSTGRES_USAGE_EVENTS_DDL: tuple[str, ...] = (
     EXECUTE FUNCTION cayu_track_usage_event()
     """,
     "DROP TRIGGER IF EXISTS cayu_usage_events_update ON cayu_events",
-    f"""
-    CREATE TRIGGER cayu_usage_events_update
-    AFTER UPDATE OF sequence, session_id, event_id, event_type, timestamp, tool_name, payload
-    ON cayu_events
-    FOR EACH ROW
-    WHEN (OLD.event_type IN ({_USAGE_TYPES_SQL}) OR NEW.event_type IN ({_USAGE_TYPES_SQL}))
-    EXECUTE FUNCTION cayu_track_usage_event()
-    """,
+    postgres_usage_event_update_trigger(attributed=False),
     f"""
     INSERT INTO cayu_usage_events (
         sequence, session_id, event_id, event_type, timestamp, tool_name, payload

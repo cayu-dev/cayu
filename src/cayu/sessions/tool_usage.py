@@ -21,6 +21,8 @@ from cayu.sessions.store import SessionStore
 from cayu.tool_inventory import TOOL_USAGE_EVENT_TYPES, tool_usage_contribution
 
 _PAGE = 100
+# Pages of call heads an all-tools listing reads to fill one page of registered tools.
+_ALL_TOOL_HEAD_PAGES = 5
 _BYTES = 16 * 1024 * 1024
 
 
@@ -54,6 +56,28 @@ class _Cursor(BaseModel):
             return result
         except (ValueError, binascii.Error, ValidationError):
             raise InvalidToolUsageQuery("Invalid tool-call cursor.") from None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallHead:
+    """One retained tool event that may be a terminal call, without its payload.
+
+    ``tool_name`` is the raw name the call counts under (``openai_web_search``
+    for a hosted web search).
+    """
+
+    sequence: int
+    session_id: str
+    event_id: str
+    tool_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallHeads:
+    """Newest-first call heads and the newest event sequence of the same snapshot."""
+
+    heads: tuple[ToolCallHead, ...]
+    newest_sequence: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +187,74 @@ class ToolUsageReader:
             position.store != store_id or position.name_sha256 != name_sha256
         ):
             raise ToolUsageConflict("Tool-call cursor no longer matches this listing.")
+        try:
+            heads, newest, consumed, more = await self._indexed_heads(name, position, limit)
+        except NotImplementedError:
+            heads, newest, consumed, more = await self._scanned_heads(name, position, limit)
+        if position is not None and position.through > newest:
+            raise ToolUsageConflict("Tool-call cursor no longer matches this listing.")
+        through = newest if position is None else position.through
+        calls = await self._calls(heads)
+        next_cursor = (
+            _Cursor(
+                store=store_id, through=through, before=consumed, name_sha256=name_sha256
+            ).encode()
+            if more and consumed is not None and consumed > 1
+            else None
+        )
+        return {"calls": calls, "through_sequence": through, "next_cursor": next_cursor}
+
+    def _public_name(self, head: ToolCallHead) -> str | None:
+        return None if head.tool_name is None else self.names.get(head.tool_name)
+
+    async def _indexed_heads(
+        self, name: str | None, position: _Cursor | None, limit: int
+    ) -> tuple[list[ToolCallHead], int, int | None, bool]:
+        """Up to ``limit`` call heads newest first, read by tool name from the store's index.
+
+        Returns the heads, the snapshot's newest sequence, the oldest sequence
+        read, and whether older calls may follow.
+        """
+
+        before = position.before if position is not None else None
+        if name is not None:
+            raw_names = tuple(sorted(raw for raw, public in self.names.items() if public == name))
+            result = await self.store.tool_call_heads(
+                raw_names, before_sequence=before, limit=limit
+            )
+            heads = list(result.heads)
+            return (
+                heads,
+                result.newest_sequence,
+                heads[-1].sequence if heads else None,
+                len(heads) == limit,
+            )
+        # Listing every tool can meet calls of unregistered names; read a few
+        # pages of heads to fill the page.
+        heads = []
+        newest = 0
+        consumed = None
+        more = False
+        for _ in range(_ALL_TOOL_HEAD_PAGES):
+            result = await self.store.tool_call_heads(None, before_sequence=before, limit=_PAGE)
+            newest = max(newest, result.newest_sequence)
+            more = len(result.heads) == _PAGE
+            for head in result.heads:
+                consumed = before = head.sequence
+                if self._public_name(head) is None:
+                    continue
+                heads.append(head)
+                if len(heads) == limit:
+                    return heads, newest, consumed, True
+            if not more:
+                break
+        return heads, newest, consumed, more
+
+    async def _scanned_heads(
+        self, name: str | None, position: _Cursor | None, limit: int
+    ) -> tuple[list[ToolCallHead], int, int | None, bool]:
+        """One page of retained tool events, filtered, for stores without call heads."""
+
         page: list[EventRecord] = []
         newest = await self.store.fold_event_snapshot(
             EventQuery(
@@ -175,47 +267,65 @@ class ToolUsageReader:
             max_bytes=_BYTES,
             max_pages=1,
         )
-        if position is not None and position.through > newest:
-            raise ToolUsageConflict("Tool-call cursor no longer matches this listing.")
-        through = newest if position is None else position.through
-        calls: list[dict[str, Any]] = []
-        # Every request owns a stable snapshot. Continuations bound sequence,
-        # not cross-request visibility: retained events can change between calls.
+        heads: list[ToolCallHead] = []
         consumed = None
         for record in page:
             consumed = record.sequence
+            contribution = tool_usage_contribution(record.event)
+            if contribution is None or not contribution.calls:
+                continue
+            head = ToolCallHead(
+                sequence=record.sequence,
+                session_id=record.event.session_id,
+                event_id=record.event.id,
+                tool_name=contribution.name,
+            )
+            public = self._public_name(head)
+            if public is None or (name is not None and public != name):
+                continue
+            heads.append(head)
+            if len(heads) == limit:
+                break
+        return heads, newest, consumed, consumed is not None and consumed > 1
+
+    async def _calls(self, heads: list[ToolCallHead]) -> list[dict[str, Any]]:
+        """Load and project the calls of ``heads``, checking each session before and after.
+
+        An old head may outlive deletion and recreation of its session, so each
+        event is read again inside the current incarnation before it gets a link.
+        """
+
+        session_ids = list(dict.fromkeys(head.session_id for head in heads))
+        before = {
+            session_id: await self.store.load_invocation_snapshot(session_id)
+            for session_id in session_ids
+        }
+        records = await self._load(heads) if heads else []
+        for session_id, snapshot in before.items():
+            after = await self.store.load_invocation_snapshot(session_id)
+            if (
+                snapshot is None
+                or after is None
+                or after.session_instance_id != snapshot.session_instance_id
+            ):
+                raise ToolUsageConflict("Session changed while reading tool calls.")
+        calls: list[dict[str, Any]] = []
+        for record in records:
             contribution = tool_usage_contribution(record.event)
             if (
                 contribution is None
                 or not contribution.calls
                 or contribution.name not in self.names
             ):
-                continue
-            public_name = self.names[contribution.name]
-            if name is not None and public_name != name:
-                continue
-            session = await self.store.load_invocation_snapshot(record.event.session_id)
-            if session is None:
                 raise ToolUsageConflict("Session changed while reading tool calls.")
-            # An old batch may outlive deletion/recreation. Resolve its exact
-            # event inside the currently loaded session before assigning a link.
-            current_events = await self._query(
-                EventQuery(session_id=session.id, event_id=record.event.id, limit=1),
-            )
-            current = await self.store.load_invocation_snapshot(session.id)
-            if (
-                current is None
-                or current.session_instance_id != session.session_instance_id
-                or len(current_events) != 1
-                or current_events[0].sequence != record.sequence
-            ):
-                raise ToolUsageConflict("Session changed while reading tool calls.")
+            snapshot = before[record.event.session_id]
+            assert snapshot is not None
             public = self.project_event(record)
             calls.append(
                 {
-                    "name": public_name,
+                    "name": self.names[contribution.name],
                     "session_id": public["session_id"],
-                    "session_instance_id": session.session_instance_id,
+                    "session_instance_id": snapshot.session_instance_id,
                     "event_id": public["id"],
                     "sequence": record.sequence,
                     "timestamp": record.event.timestamp,
@@ -226,14 +336,23 @@ class ToolUsageReader:
                     else contribution.outcome,
                 }
             )
-            if len(calls) == limit:
-                break
-        more = consumed is not None and consumed > 1
-        next_cursor = (
-            _Cursor(
-                store=store_id, through=through, before=consumed, name_sha256=name_sha256
-            ).encode()
-            if more
-            else None
+        return calls
+
+    async def _load(self, heads: list[ToolCallHead]) -> list[EventRecord]:
+        """The full events of ``heads``, read in one store call."""
+
+        results = await self.store.query_events_bounded_many(
+            [
+                EventQuery(session_id=head.session_id, event_id=head.event_id, limit=1)
+                for head in heads
+            ],
+            max_bytes=_BYTES,
         )
-        return {"calls": calls, "through_sequence": through, "next_cursor": next_cursor}
+        records: list[EventRecord] = []
+        for head, result in zip(heads, results, strict=True):
+            if isinstance(result, EventQueryResultTooLarge):
+                raise result
+            if len(result) != 1 or result[0].sequence != head.sequence:
+                raise ToolUsageConflict("Session changed while reading tool calls.")
+            records.append(result[0])
+        return records

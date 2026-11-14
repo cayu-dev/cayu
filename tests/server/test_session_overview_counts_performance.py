@@ -227,7 +227,7 @@ def test_counts_fence_replacement_across_actual_await(session_store_case, monkey
             method = (
                 "query_pending_actions_for_sessions"
                 if phase == "selection"
-                else "read_usage_accounting"
+                else "read_session_usage_totals"
             )
             original = getattr(store, method)
             reached, release = asyncio.Event(), asyncio.Event()
@@ -271,7 +271,7 @@ def test_cancelled_counts_read_does_not_publish_or_poison_next_request(
         try:
             app = _app(store)
             await _start(app, "safe", "writer")
-            original = store.read_usage_accounting
+            original = store.read_session_usage_totals
             reached, release = asyncio.Event(), asyncio.Event()
 
             async def paused(*args, **kwargs):
@@ -280,7 +280,7 @@ def test_cancelled_counts_read_does_not_publish_or_poison_next_request(
                 await release.wait()
                 return result
 
-            monkeypatch.setattr(store, "read_usage_accounting", paused)
+            monkeypatch.setattr(store, "read_session_usage_totals", paused)
             async with _client(app) as client:
                 request = asyncio.create_task(client.get(PATH))
                 await asyncio.wait_for(reached.wait(), 5)

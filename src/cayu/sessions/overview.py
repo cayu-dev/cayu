@@ -27,7 +27,12 @@ from cayu._time_buckets import (
 )
 from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
 from cayu.budgets.pricing import PriceBook, SessionCostTotals, add_cost_amounts
-from cayu.budgets.usage import USAGE_BEARING_EVENT_TYPES, AggregateCount, SessionUsageSummary
+from cayu.budgets.usage import (
+    USAGE_BEARING_EVENT_TYPES,
+    AggregateCount,
+    SessionUsageSummary,
+    combine_session_usage_summaries,
+)
 from cayu.releases import recorded_release_identity
 from cayu.sessions._foreground_child_checkpoint import (
     MAX_FOREGROUND_CHAIN_DEPTH,
@@ -1087,10 +1092,23 @@ class SessionOverviewReader:
             session_ids=tuple(session.id for session in counted), since=since, until=until
         )
         try:
-            usage = await self._store.read_usage_accounting(accounting_query)
-            summary = revalidate_model_input(usage.summary, SessionUsageSummary)
-            if not isinstance(summary, SessionUsageSummary):
+            # Tokens come from the store's per-session totals (stored rows on
+            # native stores), summed across the page.
+            per_session = await self._store.read_session_usage_totals(
+                accounting_query.session_ids, since=since, until=until
+            )
+            if not isinstance(per_session, dict) or not set(per_session) <= set(
+                accounting_query.session_ids
+            ):
+                raise TypeError("Invalid accounting summaries.")
+            # Each summary is checked before it is added up, so a malformed
+            # value cannot pass as a number.
+            summaries = [
+                revalidate_model_input(value, SessionUsageSummary) for value in per_session.values()
+            ]
+            if not all(isinstance(value, SessionUsageSummary) for value in summaries):
                 raise TypeError("Invalid accounting summary.")
+            summary = combine_session_usage_summaries("overview", summaries)
             priced = (
                 None
                 if self._pricing is None

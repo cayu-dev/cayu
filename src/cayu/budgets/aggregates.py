@@ -1010,8 +1010,78 @@ class BoundedUsagePricingInputAccumulator:
 
         if self.truncated:
             return
+        self._fold(
+            event_type=event_type,
+            session_id=session_id,
+            effective_on=effective_on,
+            occurrences=occurrences,
+            metrics=metrics,
+            counters=None
+            if metrics is None
+            else tuple(value * occurrences for value in _usage_pricing_counters(metrics)),
+            input_range=None if metrics is None else (metrics.input_tokens, metrics.input_tokens),
+        )
+
+    def spans_tier(self, min_input_tokens: int, max_input_tokens: int) -> bool:
+        """Whether input-token counts in [min, max] fall in more than one tier band."""
+
+        return bisect_left(self.tier_boundaries, min_input_tokens) != bisect_left(
+            self.tier_boundaries, max_input_tokens
+        )
+
+    def add_metrics_totals(
+        self,
+        *,
+        event_type: UsagePricingEventType,
+        session_id: str | None = None,
+        effective_on: date,
+        occurrences: int,
+        metrics: UsageMetrics | None,
+        counters: tuple[int, ...],
+        min_input_tokens: int,
+        max_input_tokens: int,
+    ) -> None:
+        """Fold stored totals of ``occurrences`` events that share one price group.
+
+        ``metrics`` carries the group's identity (any one event's metrics with its
+        counters reduced to 0 or 1, or ``None`` when the events have none), and
+        ``counters`` the events' summed counters in ``_usage_pricing_counters``
+        order. The result equals adding each event with ``add_metrics``. Every
+        input-token count must lie in one tier band (``spans_tier``).
+        """
+
+        if self.truncated:
+            return
+        if metrics is not None and self.spans_tier(min_input_tokens, max_input_tokens):
+            raise ValueError("Stored pricing totals span an input-token tier boundary.")
+        if len(counters) != 13 or any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("counters must be 13 nonnegative integers.")
+        self._fold(
+            event_type=event_type,
+            session_id=session_id,
+            effective_on=effective_on,
+            occurrences=occurrences,
+            metrics=metrics,
+            counters=None if metrics is None else counters,
+            input_range=None if metrics is None else (min_input_tokens, max_input_tokens),
+        )
+
+    def _fold(
+        self,
+        *,
+        event_type: UsagePricingEventType,
+        session_id: str | None,
+        effective_on: date,
+        occurrences: int,
+        metrics: UsageMetrics | None,
+        counters: tuple[int, ...] | None,
+        input_range: tuple[int, int] | None,
+    ) -> None:
+        if isinstance(effective_on, str):
+            # SQLite rows carry the date as ISO text; fold it with date values.
+            effective_on = date.fromisoformat(effective_on)
         group_key = usage_pricing_group_key(metrics)
-        band = 0 if metrics is None else bisect_left(self.tier_boundaries, metrics.input_tokens)
+        band = 0 if input_range is None else bisect_left(self.tier_boundaries, input_range[0])
         key = (session_id, effective_on, event_type, group_key, band)
         group = self._groups.get(key)
         if group is None:
@@ -1039,10 +1109,10 @@ class BoundedUsagePricingInputAccumulator:
             self._groups[key] = group
             self._retained_bytes += retained_bytes
         group.occurrences += occurrences
-        if metrics is None:
+        if counters is None or input_range is None:
             return
-        for index, value in enumerate(_usage_pricing_counters(metrics)):
-            group.counters[index] += value * occurrences
+        for index, value in enumerate(counters):
+            group.counters[index] += value
             if group.counters[index] > MAX_AGGREGATE_USAGE_COUNTER:
                 self._truncate(
                     group_count=len(self._groups),
@@ -1050,11 +1120,11 @@ class BoundedUsagePricingInputAccumulator:
                     limit=None,
                 )
                 return
-        input_tokens = metrics.input_tokens
-        if group.min_input_tokens is None or input_tokens < group.min_input_tokens:
-            group.min_input_tokens = input_tokens
-        if group.max_input_tokens is None or input_tokens > group.max_input_tokens:
-            group.max_input_tokens = input_tokens
+        low, high = input_range
+        if group.min_input_tokens is None or low < group.min_input_tokens:
+            group.min_input_tokens = low
+        if group.max_input_tokens is None or high > group.max_input_tokens:
+            group.max_input_tokens = high
 
     def add_payload(
         self,

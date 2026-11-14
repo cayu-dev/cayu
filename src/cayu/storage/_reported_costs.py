@@ -40,10 +40,14 @@ def reported_cost_statement(where: str, dialect: Literal["sqlite", "postgres"]) 
         if dialect == "sqlite"
         else "event.payload #> '{usage,cost_status}' IS NOT NULL"
     )
+    # Without statistics SQLite prefers the (event_type, timestamp) index and reads
+    # every completed step in the window; the partial index holds only the steps
+    # that report a cost.
+    indexed = "INDEXED BY idx_cayu_usage_events_reported_cost " if dialect == "sqlite" else ""
     return f"""
         WITH matched AS (SELECT id FROM cayu_sessions {where})
         SELECT event.session_id, event.event_id, event.timestamp, {", ".join(fields)}
-        FROM cayu_usage_events AS event JOIN matched ON matched.id = event.session_id
+        FROM cayu_usage_events AS event {indexed}JOIN matched ON matched.id = event.session_id
         WHERE event.event_type = 'model.completed' AND {present}
           AND event.timestamp >= {marker} AND event.timestamp < {marker}
         ORDER BY event.timestamp DESC, event.session_id DESC, event.event_id DESC

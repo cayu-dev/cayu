@@ -105,11 +105,12 @@ from cayu.storage import _tool_usage_sql as tool_usage_sql
 from cayu.storage._sqlite_connection import SQLiteOperationRunner
 
 if TYPE_CHECKING:
+    from cayu.budgets.usage import SessionUsageSummary
     from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
-    from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.tool_usage import ToolCallHeads, ToolUsageTally
 
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
@@ -984,11 +985,14 @@ async def stored_knowledge_lookup_totals(
 
 async def tool_usage_totals(
     run_read: SQLiteOperationRunner,
+    *,
+    from_events: bool = False,
 ) -> tuple[dict[str, ToolUsageTally], int]:
     """Tally retained tool usage in one grouped statement inside one read snapshot.
 
-    Matches ``fold_tool_usage_totals`` from the narrow ``cayu_usage_events`` copy
-    instead of loading event payloads.
+    Sums the trigger-kept ``cayu_tool_usage`` rows. ``from_events`` counts the
+    narrow ``cayu_usage_events`` copy instead, the reference the stored totals
+    match; both match ``fold_tool_usage_totals`` without loading event payloads.
     """
 
     from cayu.sessions.tool_usage import ToolUsageTally
@@ -1013,7 +1017,11 @@ async def tool_usage_totals(
                 """,
                 statements.newest.params,
             ).fetchone()
-            rows = connection.execute(statements.totals_sql, statements.totals_params).fetchall()
+            rows = (
+                connection.execute(statements.totals_sql, statements.totals_params).fetchall()
+                if from_events
+                else connection.execute(tool_usage_sql.STORED_TOOL_USAGE_TOTALS_SQL).fetchall()
+            )
         finally:
             connection.rollback()
         return (
@@ -1028,6 +1036,82 @@ async def tool_usage_totals(
                 for row in rows
             },
             0 if newest is None else int(newest[0]),
+        )
+
+    return await run_read(read)
+
+
+async def read_session_usage_totals(
+    run_read: SQLiteOperationRunner,
+    session_ids: tuple[str, ...],
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[dict[str, SessionUsageSummary], set[str]]:
+    """Stored per-session usage, and the sessions to read from events instead."""
+
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    statements = [
+        projection_reads.session_totals_statement(
+            "sqlite", session_ids=session_ids[offset : offset + 1000], since=since, until=until
+        )
+        for offset in range(0, len(session_ids), 1000)
+    ]
+
+    def read(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+        connection.execute("BEGIN")
+        try:
+            return [
+                row
+                for sql, params in statements
+                if sql
+                for row in connection.execute(sql, params).fetchall()
+            ]
+        finally:
+            connection.rollback()
+
+    return projection_reads.session_summaries_from_rows(await run_read(read))
+
+
+async def tool_call_heads(
+    run_read: SQLiteOperationRunner,
+    raw_names: tuple[str, ...] | None,
+    *,
+    before_sequence: int | None,
+    limit: int,
+) -> ToolCallHeads:
+    """Newest terminal call heads by raw tool name, from indexed ``cayu_usage_events``."""
+
+    from cayu.sessions.tool_usage import ToolCallHead, ToolCallHeads
+
+    sql, params = tool_usage_sql.tool_call_heads_sql(
+        dialect=SQL_DIALECT,
+        raw_names=raw_names,
+        before_sequence=before_sequence,
+        limit=limit,
+        payload_text=lambda key: f"json_extract(payload_json, '$.{key}')",
+        payload_is_string=lambda key: f"json_type(payload_json, '$.{key}') = 'text'",
+    )
+
+    def read(connection: sqlite3.Connection) -> ToolCallHeads:
+        connection.execute("BEGIN")
+        try:
+            newest = connection.execute("SELECT MAX(sequence) FROM cayu_events").fetchone()[0]
+            rows = connection.execute(sql, params).fetchall() if params else []
+        finally:
+            connection.rollback()
+        return ToolCallHeads(
+            heads=tuple(
+                ToolCallHead(
+                    sequence=int(row["sequence"]),
+                    session_id=row["session_id"],
+                    event_id=row["event_id"],
+                    tool_name=row["tool_name"],
+                )
+                for row in rows
+            ),
+            newest_sequence=int(newest or 0),
         )
 
     return await run_read(read)
@@ -1622,7 +1706,7 @@ async def aggregate_environment_activity(
 
 
 async def aggregate_usage(
-    run_read: SQLiteOperationRunner, query: UsageRollupQuery
+    run_read: SQLiteOperationRunner, query: UsageRollupQuery, *, from_events: bool = False
 ) -> UsageRollupStoreResult:
     query = copy_usage_rollup_query(query)
     plan = session_store_sql.build_session_query_sql(
@@ -1635,6 +1719,7 @@ async def aggregate_usage(
             connection,
             session_plan=plan,
             query=query,
+            from_events=from_events,
         )
 
     return await run_read(query_aggregate)

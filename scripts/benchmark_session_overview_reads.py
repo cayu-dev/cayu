@@ -41,6 +41,11 @@ from cayu.server import ServerConfig, create_server
 from cayu.server.config import DashboardConfig
 from cayu.sessions.records import SessionIdentity, SessionStatus
 from cayu.storage import SQLiteSessionStore
+from cayu.storage._sqlite_catalog import _iter_statements
+from cayu.storage._usage_projection_schema import (
+    PROJECTION_TABLES,
+    SQLITE_USAGE_PROJECTION_REBUILD,
+)
 from cayu.tools.base import ToolContext
 
 SESSIONS = 8_000
@@ -173,7 +178,7 @@ def _session_tables(connection: sqlite3.Connection) -> list[_Table]:
     ).fetchall():
         info = connection.execute(f'PRAGMA table_info("{name}")').fetchall()
         columns = tuple(row[1] for row in info)
-        if name in _UNREAD_TABLES:
+        if name in _UNREAD_TABLES or name in PROJECTION_TABLES:
             continue
         if name == "cayu_sessions":
             key = "id"
@@ -208,7 +213,8 @@ def _clone(path: Path, *, sessions: int, templates: int, days: int, now: datetim
     The store's triggers guard runtime-owned writes, so they are set aside for
     the copy and restored unchanged. Every table the triggers maintain is copied
     as rows, except full-text indexes and ``_UNREAD_TABLES``, which the measured
-    reads do not use. The copy is written without a journal, then the store's
+    reads do not use, and the stored usage totals, rebuilt from the copied usage
+    events. The copy is written without a journal, then the store's
     write-ahead log is restored.
     """
 
@@ -300,6 +306,9 @@ def _clone(path: Path, *, sessions: int, templates: int, days: int, now: datetim
                     "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
                     (top, table.name),
                 )
+            # Stored usage totals are rebuilt from the copied usage events.
+            for statement in _iter_statements(SQLITE_USAGE_PROJECTION_REBUILD):
+                connection.execute(statement)
             for _name, sql in triggers:
                 connection.execute(sql)
         except BaseException:

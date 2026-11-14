@@ -61,6 +61,11 @@ from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
 from cayu.storage._trace_event_schema import SQLITE_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import SQLITE_USAGE_EVENTS_DDL
+from cayu.storage._usage_projection_schema import (
+    SQLITE_USAGE_EVENT_ADDED_COLUMNS,
+    SQLITE_USAGE_PROJECTION_DDL,
+    USAGE_PROJECTION_REVISION,
+)
 
 # Baseline-revision (ADR 0001 revision 1) DDL. Every table carries the cayu_ prefix
 # (Decision 5) so Cayu state never collides with an app's own tables. The
@@ -828,6 +833,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     SESSION_SUMMARY_REVISION: SQLITE_SESSION_SUMMARIES_DDL,
     # Summary tables the Evals pages read instead of whole documents.
     EVAL_VIEW_SUMMARIES_REVISION: SQLITE_EVAL_VIEW_SUMMARIES_DDL,
+    # Usage and Tools read trigger-maintained stored totals.
+    USAGE_PROJECTION_REVISION: SQLITE_USAGE_PROJECTION_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL
@@ -4513,6 +4520,7 @@ CREATE INDEX IF NOT EXISTS idx_cayu_side_effect_outstanding
 # They run before the revision's _MIGRATION_STEPS DDL so indexes on the new
 # columns are created only after the columns exist.
 _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
+    USAGE_PROJECTION_REVISION: SQLITE_USAGE_EVENT_ADDED_COLUMNS,
     142: (
         (
             "cayu_tasks",

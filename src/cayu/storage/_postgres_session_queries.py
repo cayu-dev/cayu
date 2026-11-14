@@ -114,11 +114,12 @@ from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _tool_usage_sql as tool_usage_sql
 
 if TYPE_CHECKING:
+    from cayu.budgets.usage import SessionUsageSummary
     from cayu.knowledge.usage import KnowledgeLookupTotal
     from cayu.runtime._cost_accounting_refresh import CostAccountingAuthority
     from cayu.runtime._usage_accounting import SessionUsageCache
     from cayu.sessions._access_rules import SessionReadBounds
-    from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.tool_usage import ToolCallHeads, ToolUsageTally
 
 
 PostgresConnection = Callable[[], AbstractAsyncContextManager[Any]]
@@ -989,17 +990,40 @@ async def knowledge_lookup_totals(
 
 
 @runtime_session_query
+async def compact_usage_projection(connect: PostgresConnection) -> None:
+    """Fold pending hourly and tool deltas into their shared rows, if no one else is.
+
+    Event writers append deltas instead of updating shared rows, so they never
+    wait on each other; reads add pending deltas either way, so this only keeps
+    the pending tables short.
+    """
+
+    async with connect() as conn:
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT cayu_compact_usage_projection()")
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+
 async def tool_usage_totals(
     connect: PostgresConnection,
+    *,
+    from_events: bool = False,
 ) -> tuple[dict[str, ToolUsageTally], int]:
     """Tally retained tool usage in one grouped statement inside one snapshot.
 
-    Matches ``fold_tool_usage_totals`` from the narrow ``cayu_usage_events`` copy
-    instead of loading event documents.
+    Sums the trigger-kept ``cayu_tool_usage`` rows. ``from_events`` counts the
+    narrow ``cayu_usage_events`` copy instead, the reference the stored totals
+    match; both match ``fold_tool_usage_totals`` without loading event documents.
     """
 
     from cayu.sessions.tool_usage import ToolUsageTally
 
+    if not from_events:
+        await compact_usage_projection(connect)
     statements = tool_usage_sql.tool_usage_totals_sql(
         dialect=SQL_DIALECT,
         payload_text=lambda key: f"(cayu_events.payload ->> '{key}')",
@@ -1022,7 +1046,20 @@ async def tool_usage_totals(
             statements.newest.params,
         )
         newest = await cur.fetchone()
-        await cur.execute(cast("LiteralString", statements.totals_sql), statements.totals_params)
+        if not from_events:
+            await cur.execute(cast("LiteralString", tool_usage_sql.POSTGRES_TOOL_USAGE_RECHECK_SQL))
+            recheck = await cur.fetchone()
+            # A call removed after the last compaction leaves a newest-call time
+            # only events can give.
+            from_events = bool(recheck and recheck[0])
+        if from_events:
+            await cur.execute(
+                cast("LiteralString", statements.totals_sql), statements.totals_params
+            )
+        else:
+            await cur.execute(
+                cast("LiteralString", tool_usage_sql.POSTGRES_STORED_TOOL_USAGE_TOTALS_SQL)
+            )
         rows = await cur.fetchall()
     return (
         {
@@ -1036,6 +1073,76 @@ async def tool_usage_totals(
             for tool, calls, failures, approved, rejected, last in rows
         },
         0 if newest is None else int(newest[0]),
+    )
+
+
+async def read_session_usage_totals(
+    connect: PostgresConnection,
+    session_ids: tuple[str, ...],
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[dict[str, SessionUsageSummary], set[str]]:
+    """Stored per-session usage, and the sessions to read from events instead."""
+
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    rows: list[dict[str, Any]] = []
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        for offset in range(0, len(session_ids), 1000):
+            sql, params = projection_reads.session_totals_statement(
+                "postgres",
+                session_ids=session_ids[offset : offset + 1000],
+                since=since,
+                until=until,
+            )
+            if not sql:
+                continue
+            await cur.execute(cast("LiteralString", sql), params)
+            names = [column.name for column in cur.description]
+            rows.extend(dict(zip(names, row, strict=True)) for row in await cur.fetchall())
+    return projection_reads.session_summaries_from_rows(rows)
+
+
+async def tool_call_heads(
+    connect: PostgresConnection,
+    raw_names: tuple[str, ...] | None,
+    *,
+    before_sequence: int | None,
+    limit: int,
+) -> ToolCallHeads:
+    """Newest terminal call heads by raw tool name, from indexed ``cayu_usage_events``."""
+
+    from cayu.sessions.tool_usage import ToolCallHead, ToolCallHeads
+
+    sql, params = tool_usage_sql.tool_call_heads_sql(
+        dialect=SQL_DIALECT,
+        raw_names=raw_names,
+        before_sequence=before_sequence,
+        limit=limit,
+        payload_text=lambda key: f"(payload ->> '{key}')",
+        payload_is_string=lambda key: f"jsonb_typeof(payload -> '{key}') = 'string'",
+    )
+    async with connect() as conn, conn.cursor() as cur:
+        await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        await cur.execute("SELECT MAX(sequence) FROM cayu_events")
+        newest_row = await cur.fetchone()
+        rows: list[Any] = []
+        if params:
+            await cur.execute(cast("LiteralString", sql), params)
+            rows = list(await cur.fetchall())
+    return ToolCallHeads(
+        heads=tuple(
+            ToolCallHead(
+                sequence=int(sequence),
+                session_id=session_id,
+                event_id=event_id,
+                tool_name=tool_name,
+            )
+            for sequence, session_id, event_id, tool_name in rows
+        ),
+        newest_sequence=0 if newest_row is None or newest_row[0] is None else int(newest_row[0]),
     )
 
 
@@ -1683,13 +1790,15 @@ async def aggregate_environment_activity(
 
 
 async def aggregate_usage(
-    connect: PostgresConnection, query: UsageRollupQuery
+    connect: PostgresConnection, query: UsageRollupQuery, *, from_events: bool = False
 ) -> UsageRollupStoreResult:
     query = copy_usage_rollup_query(query)
     plan = session_store_sql.build_session_query_sql(
         session_query_from_aggregate_filter(query.sessions),
         dialect=SQL_DIALECT,
     )
+    if not from_events:
+        await compact_usage_projection(connect)
     async with connect() as conn:
         try:
             async with conn.cursor() as cur:
@@ -1703,6 +1812,7 @@ async def aggregate_usage(
                 session_plan=plan,
                 query=query,
                 as_of=as_of_row[0],
+                from_events=from_events,
             )
             await conn.commit()
         except Exception:

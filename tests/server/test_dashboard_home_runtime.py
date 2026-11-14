@@ -360,20 +360,21 @@ def test_daily_accounting_refuses_changed_incarnation(store_kind, tmp_path, monk
     runtime = usage_app(
         None if store_kind == "memory" else SQLiteSessionStore(tmp_path / "replaced.db")
     )
-    original = runtime.session_store.read_usage_accounting
+    # Overview tokens come from the store's per-session totals.
+    original = runtime.session_store.read_session_usage_totals
     changed = False
 
-    async def replace_then_read(query, **kwargs):
+    async def replace_then_read(session_ids, **kwargs):
         nonlocal changed
         if not changed:
             changed = True
             await runtime.session_store.delete_session("reused")
             await _start(runtime, "reused", "writer")
-        return await original(query, **kwargs)
+        return await original(session_ids, **kwargs)
 
     with TestClient(create_server(runtime, config=ServerConfig.local_development())) as client:
         client.portal.call(_start, runtime, "reused", "writer")
-        monkeypatch.setattr(runtime.session_store, "read_usage_accounting", replace_then_read)
+        monkeypatch.setattr(runtime.session_store, "read_session_usage_totals", replace_then_read)
         response = client.get("/api/sessions/overview/counts")
         assert response.status_code == 503, response.text
         assert "tokens" not in response.json()
@@ -500,18 +501,18 @@ def test_daily_accounting_rejects_mutated_summary_without_diagnostics(
             return canary
 
     runtime = usage_app()
-    original = runtime.session_store.read_usage_accounting
+    # Overview tokens come from the store's per-session totals.
+    original = runtime.session_store.read_session_usage_totals
 
-    async def malformed(query, **kwargs):
-        result = await original(query, **kwargs)
-        object.__setattr__(
-            result.summary.usage, "input_tokens", bad if bad is True else SecretValue()
-        )
+    async def malformed(session_ids, **kwargs):
+        result = await original(session_ids, **kwargs)
+        for summary in result.values():
+            object.__setattr__(summary.usage, "input_tokens", bad if bad is True else SecretValue())
         return result
 
     with TestClient(create_server(runtime, config=ServerConfig.local_development())) as client:
         client.portal.call(_start, runtime, "measured", "writer")
-        monkeypatch.setattr(runtime.session_store, "read_usage_accounting", malformed)
+        monkeypatch.setattr(runtime.session_store, "read_session_usage_totals", malformed)
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
             response = client.get("/api/sessions/overview/counts")

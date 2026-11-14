@@ -28,6 +28,7 @@ from cayu.storage._knowledge_lookup_schema import KNOWLEDGE_LOOKUP_TOTALS_REVISI
 from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
+from cayu.storage._usage_projection_schema import USAGE_PROJECTION_REVISION
 
 # Prefix for every Cayu-owned table, so Cayu state never collides with an app's own
 # tables in a shared database (ADR 0001, Decision 5).
@@ -682,6 +683,12 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(
         revision=EVAL_VIEW_SUMMARIES_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146
     ),
+    # Usage and Tools read stored totals: cayu_session_usage, cayu_usage_hourly
+    # and cayu_tool_usage, kept by triggers on cayu_usage_events in the same
+    # transaction as each event, for every writer. cayu_usage_events also copies
+    # each event's agent and environment names. The migration fills them from
+    # the retained events. Session stores require it.
+    Revision(revision=USAGE_PROJECTION_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
 )
 
 #: The revision an empty database is initialized to.

@@ -220,6 +220,7 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/sessions/{session_id}/topology",
             "/supervision-events/query",
             "/usage/rollup",
+            "/usage/rollup/recompute",
         )
     }
 )

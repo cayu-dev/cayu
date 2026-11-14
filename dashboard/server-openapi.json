@@ -50264,6 +50264,69 @@
         "title": "UsageMetrics",
         "type": "object"
       },
+      "UsageRecomputeDifference": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "Dotted path of the value that differs.",
+            "title": "Path",
+            "type": "string"
+          },
+          "recomputed": {
+            "description": "The value recomputed from events.",
+            "title": "Recomputed"
+          },
+          "stored": {
+            "description": "The value from the stored totals.",
+            "title": "Stored"
+          }
+        },
+        "required": [
+          "path",
+          "stored",
+          "recomputed"
+        ],
+        "title": "UsageRecomputeDifference",
+        "type": "object"
+      },
+      "UsageRecomputeReport": {
+        "additionalProperties": false,
+        "description": "Whether stored usage and tool totals equal a recompute from events.",
+        "properties": {
+          "difference_count": {
+            "title": "Difference Count",
+            "type": "integer"
+          },
+          "differences": {
+            "items": {
+              "$ref": "#/components/schemas/UsageRecomputeDifference"
+            },
+            "title": "Differences",
+            "type": "array"
+          },
+          "matches": {
+            "title": "Matches",
+            "type": "boolean"
+          },
+          "rollup_matches": {
+            "title": "Rollup Matches",
+            "type": "boolean"
+          },
+          "tool_usage_matches": {
+            "title": "Tool Usage Matches",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "matches",
+          "rollup_matches",
+          "tool_usage_matches",
+          "difference_count",
+          "differences"
+        ],
+        "title": "UsageRecomputeReport",
+        "type": "object"
+      },
       "UsageRecordedAssertionSpec": {
         "additionalProperties": false,
         "properties": {
@@ -66345,6 +66408,55 @@
           }
         },
         "summary": "Get Usage Rollup"
+      }
+    },
+    "/api/usage/rollup/recompute": {
+      "post": {
+        "description": "Check stored usage totals: read the rollup the request describes from the stored totals and again from its events, read retained tool totals both ways, and list every difference (leaf values only, redacted like the rollup). The reads are separate snapshots, so events written between them show up as differences.",
+        "operationId": "recompute_usage_rollup_api_usage_rollup_recompute_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsageRollupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageRecomputeReport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The configured store does not implement this aggregate read."
+          }
+        },
+        "summary": "Recompute Usage Rollup"
       }
     },
     "/api/user-input/recover": {

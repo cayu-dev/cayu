@@ -522,3 +522,144 @@ def test_usage_counts_relation_filters_require_capability_and_valid_syntax(monke
                 assert main([*command, *options, "--json"]) == 1
                 assert calls == []
                 assert "error" in json.loads(capsys.readouterr().out)
+
+
+def test_usage_cli_recompute_checks_stored_totals_against_events(monkeypatch, capsys, tmp_path):
+    import asyncio
+    import sqlite3
+
+    from cayu.applications import CayuApp
+    from cayu.events import Event, EventType
+    from cayu.messages import Message
+    from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    path = tmp_path / "recompute.sqlite"
+    store = SQLiteSessionStore(path)
+    app = CayuApp(session_store=store, enable_logging=False)
+    start = datetime(2026, 3, 1, 9, 30, tzinfo=UTC)
+
+    async def populate() -> None:
+        await store.create(
+            RunRequest(session_id="s", agent_name="writer", messages=[Message.text("user", "x")]),
+            identity=SessionIdentity(provider_name="anthropic", model="claude-x"),
+        )
+        for index in range(6):
+            await store.append_event(
+                "s",
+                Event(
+                    id=f"s-{index}",
+                    session_id="s",
+                    type=EventType.MODEL_COMPLETED,
+                    timestamp=start + timedelta(minutes=40 * index),
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "anthropic",
+                            "model": "claude-x",
+                            "input_tokens": 100,
+                            "output_tokens": 10,
+                            "total_tokens": 110,
+                        }
+                    },
+                ),
+            )
+
+    asyncio.run(populate())
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        monkeypatch.setattr(
+            "cayu.cli._cloud_agent_api.CayuApi",
+            lambda url, **kwargs: CayuApi(url, http=client, **kwargs),
+        )
+        arguments = [
+            "usage",
+            "rollup",
+            "--server-url",
+            "http://127.0.0.1",
+            "--since",
+            (start - timedelta(minutes=10)).isoformat(),
+            "--until",
+            (start + timedelta(hours=5)).isoformat(),
+            "--recompute",
+            "--json",
+        ]
+        assert main(arguments) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["matches"] is True and report["differences"] == []
+
+        connection = sqlite3.connect(path)
+        # An unfiltered rollup sums the hourly totals.
+        connection.execute("UPDATE cayu_usage_hourly SET input_tokens = input_tokens + 1")
+        connection.commit()
+        connection.close()
+        assert main(arguments) == 1
+        report = json.loads(capsys.readouterr().out)
+        assert report["matches"] is False and report["rollup_matches"] is False
+        assert report["tool_usage_matches"] is True
+        # Either the sum differs, or the stored rollup fails its own pricing
+        # conservation check against the changed total.
+        assert any(
+            difference["path"] in {"rollup.totals.usage.input_tokens", "rollup.error"}
+            for difference in report["differences"]
+        )
+
+
+def test_recompute_differences_carry_leaf_values_only():
+    from cayu.sessions.usage_recompute import _differences
+
+    found = []
+    count = _differences(
+        {"records": [{"title": "a"}, {"title": "b"}], "group": {"x": 1}},
+        {"records": [{"title": "a"}], "group": "missing"},
+        "rollup",
+        found,
+    )
+    # Elements past the shorter list are covered by the length difference.
+    assert count == 2
+    assert {(item.path, item.stored, item.recomputed) for item in found} == {
+        ("rollup.records.length", 2, 1),
+        ("rollup.group", "<object>", "missing"),
+    }
+
+
+def test_recompute_route_redacts_its_report_and_bounds_its_body(monkeypatch, tmp_path):
+    from cayu.applications import CayuApp
+    from cayu.sessions import usage_recompute
+    from cayu.storage.sqlite import SQLiteSessionStore
+
+    secret = "sk-live-recompute-canary"
+
+    async def leaking(store, query):
+        return usage_recompute.UsageRecomputeReport(
+            matches=False,
+            rollup_matches=False,
+            tool_usage_matches=True,
+            difference_count=1,
+            differences=[
+                usage_recompute.UsageRecomputeDifference(
+                    path="rollup.session_breakdown.groups[0].title",
+                    stored=f"title {secret}",
+                    recomputed=None,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("cayu.server._usage_recompute_routes.recompute_usage", leaking)
+    app = CayuApp(
+        session_store=SQLiteSessionStore(tmp_path / "redacted.sqlite"), enable_logging=False
+    )
+    # The server's redaction, as a configured secret redactor applies it.
+    monkeypatch.setattr(
+        app,
+        "redact_json",
+        lambda value: json.loads(json.dumps(value).replace(secret, "[redacted]")),
+    )
+    body = {"start_at": "2026-03-01T00:00:00Z", "end_at": "2026-03-02T00:00:00Z"}
+    with TestClient(create_server(app, config=ServerConfig.local_development())) as client:
+        response = client.post("/api/usage/rollup/recompute", json=body)
+        assert response.status_code == 200, response.text
+        assert secret not in response.text
+        oversized = client.post(
+            "/api/usage/rollup/recompute", json={**body, "pad": "x" * (8 * 1024 * 1024)}
+        )
+        assert oversized.status_code == 413, oversized.text[:200]

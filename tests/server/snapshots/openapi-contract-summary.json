@@ -34075,6 +34075,69 @@
       "title": "UsageMetrics",
       "type": "object"
     },
+    "UsageRecomputeDifference": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Dotted path of the value that differs.",
+          "title": "Path",
+          "type": "string"
+        },
+        "recomputed": {
+          "description": "The value recomputed from events.",
+          "title": "Recomputed"
+        },
+        "stored": {
+          "description": "The value from the stored totals.",
+          "title": "Stored"
+        }
+      },
+      "required": [
+        "path",
+        "stored",
+        "recomputed"
+      ],
+      "title": "UsageRecomputeDifference",
+      "type": "object"
+    },
+    "UsageRecomputeReport": {
+      "additionalProperties": false,
+      "description": "Whether stored usage and tool totals equal a recompute from events.",
+      "properties": {
+        "difference_count": {
+          "title": "Difference Count",
+          "type": "integer"
+        },
+        "differences": {
+          "items": {
+            "$ref": "#/components/schemas/UsageRecomputeDifference"
+          },
+          "title": "Differences",
+          "type": "array"
+        },
+        "matches": {
+          "title": "Matches",
+          "type": "boolean"
+        },
+        "rollup_matches": {
+          "title": "Rollup Matches",
+          "type": "boolean"
+        },
+        "tool_usage_matches": {
+          "title": "Tool Usage Matches",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "matches",
+        "rollup_matches",
+        "tool_usage_matches",
+        "difference_count",
+        "differences"
+      ],
+      "title": "UsageRecomputeReport",
+      "type": "object"
+    },
     "UsageRollupRequest": {
       "additionalProperties": false,
       "properties": {
@@ -45255,6 +45318,43 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/usage/rollup/recompute": {
+      "post": {
+        "operation_id": "recompute_usage_rollup_api_usage_rollup_recompute_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/UsageRollupRequest"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/UsageRecomputeReport"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
               }
             }
           },

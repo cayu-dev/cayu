@@ -1295,7 +1295,9 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
             claimed = await task_store.claim_task(
                 "worker-a",
                 TaskQuery(type=task_type),
-                lease_seconds=5,
+                # Attached recovery expires the claim only after SIGKILL. Do
+                # not let schema/app setup consume the short expiry interval.
+                lease_seconds=300 if action == "start_attached" else 5,
             )
             if claimed is None or claimed.id != task_id:
                 raise AssertionError("worker-a did not claim the expected task")
@@ -1333,6 +1335,19 @@ async def _run_task_claim(config: dict[str, Any]) -> dict[str, Any]:
                 pass
             raise AssertionError("attached task start unexpectedly returned")
 
+        if action in {"recover_attached", "plan_attached_manual"}:
+            # The first worker has been killed at the durable side-effect
+            # marker. Shorten its remaining lease through the native API now,
+            # so expiry follows that boundary rather than racing initial setup.
+            killed_task = await task_store.load_task(task_id)
+            if killed_task is None or killed_task.lease_expires_at is None:
+                raise AssertionError("killed worker lost its attached task lease")
+            await task_store.heartbeat(
+                task_id,
+                "worker-a",
+                lease_expires_at=killed_task.lease_expires_at,
+                extend_seconds=1,
+            )
         await _wait_for_task_lease_expiry(task_store, task_id)
         reclaimed = await task_store.reclaim_expired(
             query=TaskQuery(type=task_type),

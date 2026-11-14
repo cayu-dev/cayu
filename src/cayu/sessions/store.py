@@ -227,6 +227,7 @@ from cayu.tools.grants import (
 )
 
 if TYPE_CHECKING:
+    from cayu.budgets.usage import SessionUsageSummary
     from cayu.collaboration._contracts import ExactLookup
     from cayu.collaboration.participants import ParticipantRef as _ParticipantRef
     from cayu.knowledge.usage import KnowledgeLookupTotal
@@ -293,7 +294,7 @@ if TYPE_CHECKING:
         ExternalWaitRetirementRequest,
         ExternalWaitScope,
     )
-    from cayu.sessions.tool_usage import ToolUsageTally
+    from cayu.sessions.tool_usage import ToolCallHeads, ToolUsageTally
     from cayu.sessions.trace_events import TraceEvent, TranscriptToolCall
     from cayu.storage.retention import (
         RetentionAuditEntry,
@@ -4912,6 +4913,30 @@ class SessionStore(ABC):
         """
         raise NotImplementedError("This SessionStore does not support bounded usage accounting.")
 
+    async def read_session_usage_totals(
+        self,
+        session_ids: Sequence[str],
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> dict[str, SessionUsageSummary]:
+        """Each session's usage summary over events in [since, until).
+
+        Equals ``read_usage_accounting(by_session=True)`` for the same sessions
+        and window: sessions without usage are absent. This default reads that
+        reducer; native stores sum their stored ``cayu_session_usage`` totals.
+        """
+
+        from cayu.sessions.event_queries import EventQuery
+
+        session_ids = tuple(dict.fromkeys(session_ids))
+        if not session_ids:
+            return {}
+        usage = await self.read_usage_accounting(
+            EventQuery(session_ids=session_ids, since=since, until=until), by_session=True
+        )
+        return {summary.session_id: summary for summary in usage.session_summaries}
+
     async def read_cost_accounting(
         self,
         query: EventQuery,
@@ -4997,17 +5022,40 @@ class SessionStore(ABC):
         """
         raise NotImplementedError("This SessionStore keeps no stored lookup totals.")
 
-    async def tool_usage_totals(self) -> tuple[dict[str, ToolUsageTally], int]:
+    async def tool_usage_totals(
+        self, *, from_events: bool = False
+    ) -> tuple[dict[str, ToolUsageTally], int]:
         """Tally retained tool calls, failures and approval decisions by raw tool name.
 
         Counts what ``cayu.tool_inventory.tool_usage_contribution`` counts, inside
         one stable snapshot, and returns the tallies with the snapshot's newest
         sequence of any type. This default folds every retained tool event through
-        ``fold_event_snapshot``; a native store counts in its own query instead.
+        ``fold_event_snapshot``; a native store reads its stored totals instead.
+        ``from_events`` asks a native store for its event-level count, the
+        reference its stored totals are checked against.
         """
         from cayu.sessions.tool_usage import fold_tool_usage_totals
 
+        del from_events
         return await fold_tool_usage_totals(self)
+
+    async def tool_call_heads(
+        self,
+        raw_names: tuple[str, ...] | None,
+        *,
+        before_sequence: int | None,
+        limit: int,
+    ) -> ToolCallHeads:
+        """The newest terminal tool calls of ``raw_names`` (``None``: any), newest first.
+
+        Reads only event heads, at most ``limit`` per name, older than
+        ``before_sequence``, with the newest event sequence of the same
+        snapshot. ``ToolUsageReader`` then loads the full events it returns.
+        Default raises ``NotImplementedError``; the reader then scans tool
+        events instead.
+        """
+
+        raise NotImplementedError(f"{type(self).__name__} does not read tool call heads.")
 
     async def query_events_bounded(
         self,
@@ -5670,10 +5718,14 @@ class SessionStore(ABC):
             "This SessionStore does not support operational aggregate snapshots."
         )
 
-    async def aggregate_usage(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+    async def aggregate_usage(
+        self, query: UsageRollupQuery, *, from_events: bool = False
+    ) -> UsageRollupStoreResult:
         """Aggregate bounded event-time activity and usage without loading histories.
 
-        Default raises ``NotImplementedError`` so adding this control-plane read
+        Native stores read stored totals; ``from_events`` asks them to add up the
+        events instead, the reference those totals are checked against. A store
+        without stored totals reads events either way. Default raises ``NotImplementedError`` so adding this control-plane read
         model does not make existing out-of-tree stores uninstantiable.
         """
         raise NotImplementedError("This SessionStore does not support usage aggregates.")

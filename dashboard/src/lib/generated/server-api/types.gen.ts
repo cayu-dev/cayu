@@ -25375,6 +25375,58 @@ export type UsageMetrics = {
 };
 
 /**
+ * UsageRecomputeDifference
+ */
+export type UsageRecomputeDifference = {
+    /**
+     * Path
+     *
+     * Dotted path of the value that differs.
+     */
+    path: string;
+    /**
+     * Recomputed
+     *
+     * The value recomputed from events.
+     */
+    recomputed: unknown;
+    /**
+     * Stored
+     *
+     * The value from the stored totals.
+     */
+    stored: unknown;
+};
+
+/**
+ * UsageRecomputeReport
+ *
+ * Whether stored usage and tool totals equal a recompute from events.
+ */
+export type UsageRecomputeReport = {
+    /**
+     * Difference Count
+     */
+    difference_count: number;
+    /**
+     * Differences
+     */
+    differences: Array<UsageRecomputeDifference>;
+    /**
+     * Matches
+     */
+    matches: boolean;
+    /**
+     * Rollup Matches
+     */
+    rollup_matches: boolean;
+    /**
+     * Tool Usage Matches
+     */
+    tool_usage_matches: boolean;
+};
+
+/**
  * UsageRecordedAssertionSpec
  */
 export type UsageRecordedAssertionSpec = {
@@ -34017,6 +34069,35 @@ export type GetUsageRollupApiUsageRollupPostResponses = {
 };
 
 export type GetUsageRollupApiUsageRollupPostResponse = GetUsageRollupApiUsageRollupPostResponses[keyof GetUsageRollupApiUsageRollupPostResponses];
+
+export type RecomputeUsageRollupApiUsageRollupRecomputePostData = {
+    body: UsageRollupRequest;
+    path?: never;
+    query?: never;
+    url: '/api/usage/rollup/recompute';
+};
+
+export type RecomputeUsageRollupApiUsageRollupRecomputePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * The configured store does not implement this aggregate read.
+     */
+    501: ApiErrorResponse;
+};
+
+export type RecomputeUsageRollupApiUsageRollupRecomputePostError = RecomputeUsageRollupApiUsageRollupRecomputePostErrors[keyof RecomputeUsageRollupApiUsageRollupRecomputePostErrors];
+
+export type RecomputeUsageRollupApiUsageRollupRecomputePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: UsageRecomputeReport;
+};
+
+export type RecomputeUsageRollupApiUsageRollupRecomputePostResponse = RecomputeUsageRollupApiUsageRollupRecomputePostResponses[keyof RecomputeUsageRollupApiUsageRollupRecomputePostResponses];
 
 export type RecoverUserInputApiUserInputRecoverPostData = {
     body: UserInputRecoveryBody;

@@ -797,6 +797,8 @@ def test_postgres_native_session_decoder_preserves_metadata():
             ),
             query=query,
             as_of=START,
+            # The fake cursor serves the event-level statements' positional rows.
+            from_events=True,
         )
         result.validate_for_query(query)
         assert result.session_breakdown.groups[0].agent_name == "writer"

@@ -293,8 +293,11 @@ def test_usage_and_tools_pages_read_only_the_narrow_copy_at_review_scale(review_
     assert int(rollup["totals"]["model_steps"]) == MODEL_STEPS
     assert int(rollup["totals"]["tool_calls"]) == TOOL_CALLS
     assert len(rollup["series"]["buckets"]) in (DAYS, DAYS + 1)
+    # Both pages read the stored totals (and the narrow copy for partial hours),
+    # never event payloads.
+    stored = {"cayu_usage_events", "cayu_tool_usage", "cayu_session_usage", "cayu_usage_hourly"}
     for reads in (tools_reads, rollup_reads):
-        assert "cayu_usage_events" in reads.tables(), sorted(reads.columns)
+        assert stored & set(reads.tables()), sorted(reads.columns)
         assert ("cayu_events", "payload_json") not in reads.columns, sorted(reads.columns)
     assert tools_seconds < PAGE_LIMIT_SECONDS
     assert rollup_seconds < PAGE_LIMIT_SECONDS

@@ -101,6 +101,11 @@ def add_usage_parser(subparsers: Any) -> None:
                 default="tokens",
                 help="Rank all bounded candidates by cost, with an explicit token fallback when costs cannot be compared; requires --top-sessions.",
             )
+            command.add_argument(
+                "--recompute",
+                action="store_true",
+                help="Check the server's stored usage and tool totals against a recompute from events for this window; exits 1 on any difference.",
+            )
         else:
             command.add_argument("--include-eval", action="store_true")
             command.add_argument("--include-forks", action="store_true")
@@ -246,6 +251,17 @@ async def _run_usage(args: argparse.Namespace, target: ReadTarget) -> int:
                 from cayu.budgets.pricing import default_price_book
 
                 body["pricing"] = default_price_book().model_dump(mode="json")
+            if args.recompute:
+                if cost_order:
+                    raise ValueError("--recompute does not rank sessions by cost.")
+                report = api.post("/usage/rollup/recompute", body, resource="usage recompute check")
+                if not isinstance(report, dict) or not isinstance(report.get("matches"), bool):
+                    raise ValueError("The server returned an invalid recompute report.")
+                if args.output_format == "json":
+                    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+                else:
+                    _render_recompute(report)
+                return 0 if report["matches"] else 1
             result = api.post("/usage/rollup", body, resource="usage rollup")
         else:
             query: dict[str, str | list[str]] = {
@@ -339,6 +355,25 @@ def _render_table(result: dict[str, Any], *, starts: bool) -> None:
             for b in series["buckets"]
         ]
         _print_values(headers, rows)
+
+
+def _render_recompute(report: dict[str, Any]) -> None:
+    _print_values(
+        ("Check", "Result"),
+        [
+            ["Usage rollup", "matches" if report["rollup_matches"] else "differs"],
+            ["Tool usage", "matches" if report["tool_usage_matches"] else "differs"],
+            ["Differences", report["difference_count"]],
+        ],
+    )
+    if report["differences"]:
+        _print_values(
+            ("Path", "Stored", "Recomputed"),
+            [
+                [row["path"], json.dumps(row["stored"]), json.dumps(row["recomputed"])]
+                for row in report["differences"]
+            ],
+        )
 
 
 def _cost_label(cost: dict[str, Any]) -> str:

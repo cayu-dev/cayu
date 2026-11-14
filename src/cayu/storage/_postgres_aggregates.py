@@ -829,7 +829,164 @@ async def aggregate_session_usage(
     session_plan: SessionQuerySqlPlan,
     query: UsageRollupQuery,
     as_of: datetime,
+    from_events: bool = False,
 ) -> UsageRollupStoreResult:
+    """Roll up usage inside the caller's read snapshot, from the stored totals.
+
+    ``from_events`` reads every event instead: the reference the stored totals
+    are checked against.
+    """
+
+    if not from_events:
+        return await _aggregate_stored_totals(
+            connection, session_plan=session_plan, query=query, as_of=as_of
+        )
+    return await _aggregate_events(connection, session_plan=session_plan, query=query, as_of=as_of)
+
+
+async def _fetch(connection: Any, sql: str, params: tuple[object, ...]) -> list[dict[str, Any]]:
+    async with connection.cursor() as cursor:
+        await cursor.execute(cast("LiteralString", sql), params)
+        rows = await cursor.fetchall()
+        names = [column.name for column in cursor.description]
+    return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+async def _aggregate_stored_totals(
+    connection: Any,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    as_of: datetime,
+) -> UsageRollupStoreResult:
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    sql, params = projection_reads.rollup_statement(
+        "postgres", session_plan=session_plan, query=query
+    )
+    rows = await _fetch(connection, sql, params)
+    session_breakdown = None
+    if query.retained_session_limit is not None:
+        session_sql, session_params = projection_reads.session_breakdown_statement(
+            "postgres", session_plan=session_plan, query=query
+        )
+        session_breakdown = _session_breakdown_from_rows(
+            await _fetch(connection, session_sql, session_params),
+            limit=query.retained_session_limit,
+        )
+    pricing = await _stored_pricing(connection, session_plan=session_plan, query=query)
+    session_pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
+    if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
+        session_pricing = await _stored_pricing(
+            connection,
+            session_plan=session_plan,
+            query=query,
+            session_ids=tuple(group.session_id for group in session_breakdown.groups),
+        )
+    series = None
+    if query.series is not None:
+        series_sql, series_params = projection_reads.series_statement(
+            "postgres", session_plan=session_plan, query=query
+        )
+        series = _series_from_rows(await _fetch(connection, series_sql, series_params), query)
+    result = _result_from_rows(
+        rows,
+        query=query,
+        as_of=as_of,
+        pricing=pricing.result(),
+        session_pricing=session_pricing.result(),
+        session_breakdown=session_breakdown,
+        series=series,
+    )
+    result.reported_costs = await _reported_costs(connection, session_plan, query)
+    return result
+
+
+async def _stored_pricing(
+    connection: Any,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    session_ids: tuple[str, ...] | None = None,
+) -> BoundedUsagePricingInputAccumulator:
+    """Price inputs from the stored whole hours plus the window's partial edges."""
+
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    def accumulator() -> BoundedUsagePricingInputAccumulator:
+        return BoundedUsagePricingInputAccumulator(
+            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+        )
+
+    pricing = accumulator()
+    if not query.include_pricing_inputs:
+        return pricing
+    split = projection_reads.stored_hours(query)
+    try:
+        if split.hours is not None:
+            sql, params = projection_reads.pricing_statement(
+                "postgres", session_plan=session_plan, hours=split.hours, session_ids=session_ids
+            )
+            projection_reads.add_stored_pricing_rows(
+                pricing,
+                await _fetch(connection, sql, params),
+                with_session=session_ids is not None,
+            )
+        for edge in projection_reads.edge_queries(query, split):
+            await _event_pricing(connection, pricing, session_plan, edge, session_ids)
+    except projection_reads.StoredTotalsUnavailable:
+        pricing = accumulator()
+        await _event_pricing(connection, pricing, session_plan, query, session_ids)
+    return pricing
+
+
+async def _event_pricing(
+    connection: Any,
+    pricing: BoundedUsagePricingInputAccumulator,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    session_ids: tuple[str, ...] | None,
+) -> None:
+    if session_ids is None:
+        sql, params = pricing_input_statement(session_plan=session_plan, query=query)
+        add = _add_pricing_input_from_values
+    else:
+        sql, params = session_pricing_input_statement(
+            session_plan=session_plan, query=query, session_ids=session_ids
+        )
+        add = _add_session_pricing_input_from_values
+    async with connection.cursor() as cursor:
+        await cursor.execute(cast("LiteralString", sql), params)
+        for row in await cursor.fetchall():
+            if pricing.truncated:
+                break
+            add(pricing, row)
+
+
+async def _reported_costs(
+    connection: Any, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+):
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            cast(
+                "LiteralString", reported_cost_statement(session_plan.filter_where_sql, "postgres")
+            ),
+            (*session_plan.filter_params, query.start_at, query.end_at),
+        )
+        return reported_cost_page(await cursor.fetchall())
+
+
+async def _aggregate_events(
+    connection: Any,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    as_of: datetime,
+) -> UsageRollupStoreResult:
+    """The event-level reference rollup, inside the caller's read snapshot."""
+
     sql, params = usage_rollup_statement(session_plan=session_plan, query=query)
     async with connection.cursor() as cursor:
         await cursor.execute(cast("LiteralString", sql), params)
@@ -901,14 +1058,7 @@ async def aggregate_session_usage(
         session_breakdown=session_breakdown,
         series=series,
     )
-    async with connection.cursor() as cursor:
-        await cursor.execute(
-            cast(
-                "LiteralString", reported_cost_statement(session_plan.filter_where_sql, "postgres")
-            ),
-            (*session_plan.filter_params, query.start_at, query.end_at),
-        )
-        result.reported_costs = reported_cost_page(await cursor.fetchall())
+    result.reported_costs = await _reported_costs(connection, session_plan, query)
     return result
 
 

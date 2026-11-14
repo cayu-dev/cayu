@@ -773,80 +773,34 @@ def aggregate_session_usage(
     *,
     session_plan: SessionQuerySqlPlan,
     query: UsageRollupQuery,
+    from_events: bool = False,
 ) -> UsageRollupStoreResult:
-    sql, params = usage_rollup_statement(session_plan=session_plan, query=query)
+    """Roll up usage in one read snapshot, from the stored totals.
+
+    ``from_events`` reads every event instead, the reference the stored totals
+    are checked against. A read the stored totals cannot answer exactly (a
+    saturated counter) also falls back to it.
+    """
+    from cayu.storage import _usage_projection_reads as projection_reads
+
     owns_transaction = not connection.in_transaction
     if owns_transaction:
         connection.execute("BEGIN")
     try:
-        rows = connection.execute(sql, params).fetchall()
-        session_breakdown = None
-        if query.retained_session_limit is not None:
-            session_sql, session_params = session_breakdown_statement(
-                session_plan=session_plan,
-                query=query,
-            )
-            session_rows = connection.execute(session_sql, session_params).fetchall()
-            session_breakdown = _session_breakdown_from_rows(
-                session_rows,
-                limit=query.retained_session_limit,
-            )
-        pricing = BoundedUsagePricingInputAccumulator(
-            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
-        )
-        if query.include_pricing_inputs:
-            pricing_sql, pricing_params = pricing_input_statement(
-                session_plan=session_plan,
-                query=query,
-            )
-            cursor = connection.execute(pricing_sql, pricing_params)
-            for row in cursor:
-                _add_pricing_input_from_row(pricing, row)
-                if pricing.truncated:
-                    break
-        session_pricing = BoundedUsagePricingInputAccumulator(
-            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
-        )
-        if (
-            query.include_pricing_inputs
-            and session_breakdown is not None
-            and session_breakdown.groups
-        ):
-            session_pricing_sql, session_pricing_params = session_pricing_input_statement(
-                session_plan=session_plan,
-                query=query,
-                session_ids=tuple(group.session_id for group in session_breakdown.groups),
-            )
-            cursor = connection.execute(session_pricing_sql, session_pricing_params)
-            for row in cursor:
-                _add_pricing_input_from_row(
-                    session_pricing,
-                    row,
-                    session_id=row["session_id"],
+        result = None
+        if not from_events:
+            try:
+                result = _aggregate_stored_totals(
+                    connection, session_plan=session_plan, query=query
                 )
-                if session_pricing.truncated:
-                    break
-        series = None
-        if query.series is not None:
-            series_sql, series_params = usage_series_statement(
-                session_plan=session_plan, query=query
-            )
-            series = _series_from_rows(
-                connection.execute(series_sql, series_params).fetchall(), query
-            )
-        result = _result_from_rows(
-            rows,
-            query=query,
-            pricing=pricing.result(),
-            session_pricing=session_pricing.result(),
-            session_breakdown=session_breakdown,
-            series=series,
-        )
-        cost_rows = connection.execute(
-            reported_cost_statement(session_plan.filter_where_sql, "sqlite"),
-            (*session_plan.filter_params, query.start_at.isoformat(), query.end_at.isoformat()),
-        ).fetchall()
-        result.reported_costs = reported_cost_page([tuple(row) for row in cost_rows])
+            except projection_reads.StoredTotalsUnavailable:
+                result = None
+            except sqlite3.OperationalError as exc:
+                if "integer overflow" not in str(exc):
+                    raise
+                result = None
+        if result is None:
+            result = _aggregate_events(connection, session_plan=session_plan, query=query)
         if owns_transaction:
             connection.commit()
         return result
@@ -854,6 +808,188 @@ def aggregate_session_usage(
         if owns_transaction:
             connection.rollback()
         raise
+
+
+def _aggregate_stored_totals(
+    connection: sqlite3.Connection,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+) -> UsageRollupStoreResult:
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    sql, params = projection_reads.rollup_statement(
+        "sqlite", session_plan=session_plan, query=query
+    )
+    rows = connection.execute(sql, params).fetchall()
+    if projection_reads.row_overflowed(rows):
+        raise projection_reads.StoredTotalsUnavailable("A stored usage counter saturated.")
+    session_breakdown = None
+    if query.retained_session_limit is not None:
+        session_sql, session_params = projection_reads.session_breakdown_statement(
+            "sqlite", session_plan=session_plan, query=query
+        )
+        session_rows = connection.execute(session_sql, session_params).fetchall()
+        if projection_reads.row_overflowed(session_rows):
+            raise projection_reads.StoredTotalsUnavailable("A stored usage counter saturated.")
+        session_breakdown = _session_breakdown_from_rows(
+            session_rows, limit=query.retained_session_limit
+        )
+    pricing = _stored_pricing(connection, session_plan=session_plan, query=query)
+    session_pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
+    if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
+        session_pricing = _stored_pricing(
+            connection,
+            session_plan=session_plan,
+            query=query,
+            session_ids=tuple(group.session_id for group in session_breakdown.groups),
+        )
+    series = None
+    if query.series is not None:
+        series_sql, series_params = projection_reads.series_statement(
+            "sqlite", session_plan=session_plan, query=query
+        )
+        series_rows = connection.execute(series_sql, series_params).fetchall()
+        if projection_reads.row_overflowed(series_rows):
+            raise projection_reads.StoredTotalsUnavailable("A stored usage counter saturated.")
+        series = _series_from_rows(series_rows, query)
+    result = _result_from_rows(
+        rows,
+        query=query,
+        pricing=pricing.result(),
+        session_pricing=session_pricing.result(),
+        session_breakdown=session_breakdown,
+        series=series,
+    )
+    result.reported_costs = _reported_costs(connection, session_plan=session_plan, query=query)
+    return result
+
+
+def _stored_pricing(
+    connection: sqlite3.Connection,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    session_ids: tuple[str, ...] | None = None,
+) -> BoundedUsagePricingInputAccumulator:
+    """Price inputs from the stored whole hours plus the window's partial edges.
+
+    A stored group that spans one of the request's tier boundaries makes the
+    whole window price from events, as the reference does.
+    """
+    from cayu.storage import _usage_projection_reads as projection_reads
+
+    def accumulator() -> BoundedUsagePricingInputAccumulator:
+        return BoundedUsagePricingInputAccumulator(
+            query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+        )
+
+    pricing = accumulator()
+    if not query.include_pricing_inputs:
+        return pricing
+    split = projection_reads.stored_hours(query)
+    try:
+        if split.hours is not None:
+            sql, params = projection_reads.pricing_statement(
+                "sqlite", session_plan=session_plan, hours=split.hours, session_ids=session_ids
+            )
+            projection_reads.add_stored_pricing_rows(
+                pricing,
+                connection.execute(sql, params).fetchall(),
+                with_session=session_ids is not None,
+            )
+        for edge in projection_reads.edge_queries(query, split):
+            _event_pricing(connection, pricing, session_plan, edge, session_ids)
+    except projection_reads.StoredTotalsUnavailable:
+        pricing = accumulator()
+        _event_pricing(connection, pricing, session_plan, query, session_ids)
+    return pricing
+
+
+def _event_pricing(
+    connection: sqlite3.Connection,
+    pricing: BoundedUsagePricingInputAccumulator,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    session_ids: tuple[str, ...] | None,
+) -> None:
+    if session_ids is None:
+        sql, params = pricing_input_statement(session_plan=session_plan, query=query)
+    else:
+        sql, params = session_pricing_input_statement(
+            session_plan=session_plan, query=query, session_ids=session_ids
+        )
+    for row in connection.execute(sql, params):
+        if pricing.truncated:
+            break
+        _add_pricing_input_from_row(
+            pricing, row, session_id=None if session_ids is None else row["session_id"]
+        )
+
+
+def _reported_costs(
+    connection: sqlite3.Connection, *, session_plan: SessionQuerySqlPlan, query: UsageRollupQuery
+):
+    cost_rows = connection.execute(
+        reported_cost_statement(session_plan.filter_where_sql, "sqlite"),
+        (*session_plan.filter_params, query.start_at.isoformat(), query.end_at.isoformat()),
+    ).fetchall()
+    return reported_cost_page([tuple(row) for row in cost_rows])
+
+
+def _aggregate_events(
+    connection: sqlite3.Connection,
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+) -> UsageRollupStoreResult:
+    """The event-level reference rollup, inside the caller's read transaction."""
+
+    sql, params = usage_rollup_statement(session_plan=session_plan, query=query)
+    rows = connection.execute(sql, params).fetchall()
+    session_breakdown = None
+    if query.retained_session_limit is not None:
+        session_sql, session_params = session_breakdown_statement(
+            session_plan=session_plan,
+            query=query,
+        )
+        session_rows = connection.execute(session_sql, session_params).fetchall()
+        session_breakdown = _session_breakdown_from_rows(
+            session_rows,
+            limit=query.retained_session_limit,
+        )
+    pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
+    if query.include_pricing_inputs:
+        _event_pricing(connection, pricing, session_plan, query, None)
+    session_pricing = BoundedUsagePricingInputAccumulator(
+        query.pricing_input_limit, tier_boundaries=query.pricing_tier_boundaries
+    )
+    if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
+        _event_pricing(
+            connection,
+            session_pricing,
+            session_plan,
+            query,
+            tuple(group.session_id for group in session_breakdown.groups),
+        )
+    series = None
+    if query.series is not None:
+        series_sql, series_params = usage_series_statement(session_plan=session_plan, query=query)
+        series = _series_from_rows(connection.execute(series_sql, series_params).fetchall(), query)
+    result = _result_from_rows(
+        rows,
+        query=query,
+        pricing=pricing.result(),
+        session_pricing=session_pricing.result(),
+        session_breakdown=session_breakdown,
+        series=series,
+    )
+    result.reported_costs = _reported_costs(connection, session_plan=session_plan, query=query)
+    return result
 
 
 def usage_rollup_statement(
