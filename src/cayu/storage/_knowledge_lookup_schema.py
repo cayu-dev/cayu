@@ -187,7 +187,9 @@ def _postgres_returned(row: str) -> str:
 
 POSTGRES_KNOWLEDGE_LOOKUP_DDL: tuple[str, ...] = (
     # Writers wait while the retained lookups are copied, so none is counted twice.
-    "LOCK TABLE cayu_events IN SHARE MODE",
+    # Replacing the triggers on cayu_events later takes ACCESS EXCLUSIVE; a weaker
+    # lock here would let a writer that read the table deadlock with that upgrade.
+    "LOCK TABLE cayu_events IN ACCESS EXCLUSIVE MODE",
     """
     CREATE TABLE IF NOT EXISTS cayu_knowledge_lookups (
         sequence BIGINT NOT NULL,

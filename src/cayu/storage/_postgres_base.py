@@ -48,8 +48,10 @@ from cayu.storage._collaboration_wait_schema import validate_postgres_wait_disco
 from cayu.storage._context_selection_schema import validate_postgres_context_selection_schema
 from cayu.storage._diagnostic_inspection import current_diagnostic_store_inspection
 from cayu.storage._participant_bindings_schema import validate_postgres_participant_bindings
+from cayu.storage._postgres_migration_locks import MigrationLockRetry, set_migration_lock_timeout
 from cayu.storage._product_operation_schema import validate_postgres_product_operation_schema
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
+from cayu.storage.targets import configured_database_migration_lock_timeout
 from cayu.tasks.handoff import TaskInterruptedHandoffRequest, prepare_interrupted_task_handoff
 from cayu.tasks.records import Task, TaskStatus
 
@@ -860,13 +862,29 @@ class _PostgresStoreBase:
         bounded_entry_preflight_complete = False
         activation_preflight_complete = False
         empty_recall_reset_complete = False
+        # Each revision is one transaction. Bound its lock waits, and run it again
+        # from the recorded revision when it deadlocks with or times out behind a
+        # live writer; the rolled-back attempt left nothing behind.
+        lock_timeout = configured_database_migration_lock_timeout()
+        lock_retry = MigrationLockRetry()
         while True:
             concurrent_revision: schema.Revision | None = None
             concurrent_indexes: tuple[postgres_schema_history._ConcurrentIndexMigration, ...] = ()
             recorded_indexes: tuple[postgres_schema_history._ConcurrentIndexMigration, ...] = ()
-            async with PostgresTimingScope(self._pool.connection()) as conn:
+            preflight_progress = (
+                relation_preflight_complete,
+                maintenance_preflight_complete,
+                bounded_entry_preflight_complete,
+                activation_preflight_complete,
+                empty_recall_reset_complete,
+            )
+            async with (
+                lock_retry.transaction(),
+                PostgresTimingScope(self._pool.connection()) as conn,
+            ):
                 async with conn.cursor() as cur:
                     await _acquire_schema_transaction_lock(conn, cur)
+                    await set_migration_lock_timeout(cur, lock_timeout)
                     # Resolve the exact input and every clean-break refusal
                     # before even creating migration bookkeeping. Revision
                     # transactions repeat the checks that need a writer fence.
@@ -1182,6 +1200,7 @@ class _PostgresStoreBase:
                         )
                     else:
                         revision = pending[0]
+                        lock_retry.step = f"revision {revision.revision}"
                         if revision.revision == 43:
                             await _reject_revision_43_knowledge_identity_overflow(cur)
                         if revision.revision == 65:
@@ -1213,6 +1232,16 @@ class _PostgresStoreBase:
                             await self._validate_revision_schema_objects(cur, revision)
                             await self._record_revision(cur, revision)
                 await conn.commit()
+            if lock_retry.retrying:
+                # The checks the rolled-back attempt ran must run again.
+                (
+                    relation_preflight_complete,
+                    maintenance_preflight_complete,
+                    bounded_entry_preflight_complete,
+                    activation_preflight_complete,
+                    empty_recall_reset_complete,
+                ) = preflight_progress
+                continue
             if concurrent_revision is None:
                 if not pending:
                     for index in recorded_indexes:

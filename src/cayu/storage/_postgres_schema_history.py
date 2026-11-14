@@ -1026,8 +1026,15 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     148: POSTGRES_EVENT_SEQUENCE_PINNED_SEARCH_PATH_DDL,
     # Usage rollups and tool totals read a narrow trigger-maintained event copy.
     149: POSTGRES_USAGE_EVENTS_DDL,
-    # Knowledge lookup counts and list order read trigger-maintained tables.
-    KNOWLEDGE_LOOKUP_TOTALS_REVISION: POSTGRES_KNOWLEDGE_LOOKUP_DDL + POSTGRES_KNOWLEDGE_ORDER_DDL,
+    # Knowledge lookup counts and list order read trigger-maintained tables. Both
+    # halves replace triggers, which takes ACCESS EXCLUSIVE; lock every table
+    # either half changes in that mode before the first one copies anything.
+    KNOWLEDGE_LOOKUP_TOTALS_REVISION: (
+        "LOCK TABLE cayu_events, cayu_knowledge_entries, cayu_knowledge_revisions "
+        "IN ACCESS EXCLUSIVE MODE",
+        *POSTGRES_KNOWLEDGE_LOOKUP_DDL,
+        *POSTGRES_KNOWLEDGE_ORDER_DDL,
+    ),
     # When each alias key was first used. A table of its own, so binaries from
     # revision 146 on, which check the alias key table's exact shape, still open it.
     150: (

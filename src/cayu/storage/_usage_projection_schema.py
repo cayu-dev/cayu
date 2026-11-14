@@ -1326,8 +1326,11 @@ POSTGRES_USAGE_PROJECTION_REBUILD: tuple[str, ...] = (
 )
 
 POSTGRES_USAGE_PROJECTION_DDL: tuple[str, ...] = (
-    # Event writers wait until the copy and the projections agree.
-    "LOCK TABLE cayu_events, cayu_usage_events IN SHARE ROW EXCLUSIVE MODE",
+    # Event writers wait until the copy and the projections agree. The ALTER and
+    # DROP TRIGGER statements below need ACCESS EXCLUSIVE, so take it before any
+    # of them: a weaker lock first would let a writer that read cayu_events
+    # deadlock with the upgrade.
+    "LOCK TABLE cayu_events, cayu_usage_events IN ACCESS EXCLUSIVE MODE",
     "ALTER TABLE cayu_usage_events ADD COLUMN IF NOT EXISTS agent_name TEXT",
     "ALTER TABLE cayu_usage_events ADD COLUMN IF NOT EXISTS environment_name TEXT",
     "ALTER TABLE cayu_usage_events ADD COLUMN IF NOT EXISTS projection_price_identity_id BIGINT",

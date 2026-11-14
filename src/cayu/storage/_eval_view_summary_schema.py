@@ -187,6 +187,10 @@ def _postgres_checkpoint_select(checkpoint: str) -> str:
 
 
 POSTGRES_EVAL_VIEW_SUMMARIES_DDL: tuple[str, ...] = (
+    # The new tables' foreign keys lock these tables in SHARE ROW EXCLUSIVE mode
+    # and replacing their triggers takes ACCESS EXCLUSIVE. Take the stronger lock
+    # first, so a writer that read either table waits instead of deadlocking.
+    "LOCK TABLE cayu_eval_suites, cayu_eval_run_trial_checkpoints IN ACCESS EXCLUSIVE MODE",
     """
     CREATE TABLE IF NOT EXISTS cayu_eval_suite_catalog (
         corpus_revision TEXT NOT NULL,

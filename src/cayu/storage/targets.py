@@ -11,6 +11,9 @@ two cannot select different stores from the same configuration:
   connection a direct server address when ``CAYU_DATABASE_URL`` points at a
   transaction-pooling proxy such as PgBouncer.
 - ``CAYU_DATABASE_POOL_MAX`` bounds each shared PostgreSQL connection pool.
+- ``CAYU_DATABASE_MIGRATION_LOCK_TIMEOUT`` bounds, in whole seconds, how long a
+  PostgreSQL migration transaction waits for one lock before it rolls back and
+  retries (default 30; 0 waits indefinitely).
 - ``CAYU_REQUIRE_POSTGRES=1`` makes every Cayu SQLite store refuse to open.
 
 This module imports no database driver and no CLI code.
@@ -29,8 +32,10 @@ from urllib.parse import unquote, urlsplit
 DATABASE_URL_ENV = "CAYU_DATABASE_URL"
 DATABASE_DIRECT_URL_ENV = "CAYU_DATABASE_DIRECT_URL"
 DATABASE_POOL_MAX_ENV = "CAYU_DATABASE_POOL_MAX"
+DATABASE_MIGRATION_LOCK_TIMEOUT_ENV = "CAYU_DATABASE_MIGRATION_LOCK_TIMEOUT"
 REQUIRE_POSTGRES_ENV = "CAYU_REQUIRE_POSTGRES"
 DEFAULT_DATABASE_POOL_MAX = 5
+DEFAULT_DATABASE_MIGRATION_LOCK_TIMEOUT_SECONDS = 30
 CANONICAL_SQLITE_PATH = Path("data/cayu.db")
 
 
@@ -90,6 +95,23 @@ def configured_database_pool_max(environ: Mapping[str, str] | None = None) -> in
     text = value.strip()
     if not text.isascii() or not text.isdigit() or int(text) < 1:
         raise SessionStoreTargetError(f"{DATABASE_POOL_MAX_ENV} must be a positive integer.")
+    return int(text)
+
+
+def configured_database_migration_lock_timeout(
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Return the PostgreSQL migration lock timeout in seconds (default 30, 0 for none)."""
+
+    value = (os.environ if environ is None else environ).get(DATABASE_MIGRATION_LOCK_TIMEOUT_ENV)
+    if value is None:
+        return DEFAULT_DATABASE_MIGRATION_LOCK_TIMEOUT_SECONDS
+    text = value.strip()
+    if not text.isascii() or not text.isdigit():
+        raise SessionStoreTargetError(
+            f"{DATABASE_MIGRATION_LOCK_TIMEOUT_ENV} must be a whole number of seconds "
+            "(0 waits indefinitely)."
+        )
     return int(text)
 
 
@@ -263,8 +285,10 @@ def _require_nonblank(value: str, label: str) -> str:
 __all__ = [
     "CANONICAL_SQLITE_PATH",
     "DATABASE_DIRECT_URL_ENV",
+    "DATABASE_MIGRATION_LOCK_TIMEOUT_ENV",
     "DATABASE_POOL_MAX_ENV",
     "DATABASE_URL_ENV",
+    "DEFAULT_DATABASE_MIGRATION_LOCK_TIMEOUT_SECONDS",
     "DEFAULT_DATABASE_POOL_MAX",
     "REQUIRE_POSTGRES_ENV",
     "PostgresRequiredError",
@@ -273,6 +297,7 @@ __all__ = [
     "SessionStoreTargetError",
     "application_store_target",
     "configured_database_direct_url",
+    "configured_database_migration_lock_timeout",
     "configured_database_pool_max",
     "configured_database_url",
     "parse_database_url",

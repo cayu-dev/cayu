@@ -104,8 +104,9 @@ JOIN cayu_knowledge_revisions AS revision
 
 
 POSTGRES_KNOWLEDGE_ORDER_DDL: tuple[str, ...] = (
-    "LOCK TABLE cayu_knowledge_entries IN SHARE MODE",
-    "LOCK TABLE cayu_knowledge_revisions IN SHARE MODE",
+    # Replacing the triggers below takes ACCESS EXCLUSIVE. Take it first, so a
+    # writer that read these tables waits for the revision instead of deadlocking.
+    "LOCK TABLE cayu_knowledge_entries, cayu_knowledge_revisions IN ACCESS EXCLUSIVE MODE",
     """
     CREATE TABLE IF NOT EXISTS cayu_knowledge_entry_order (
         entry_id TEXT PRIMARY KEY,

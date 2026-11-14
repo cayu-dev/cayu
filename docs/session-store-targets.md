@@ -68,6 +68,7 @@ same store for every combination of the variable and that section. Explicit
 | `CAYU_DATABASE_URL` | App factories and the CLI | Postgres URL, or absolute SQLite URL. Unset selects the project's local SQLite file. A set but blank value is an error. |
 | `CAYU_DATABASE_POOL_MAX` | `open_application_stores`, `open_agent_snapshot_store` and the project Evals store | Maximum connections per pool (default 5). The application's PostgreSQL session, task, knowledge, and (with `product_operations=True` or `agent_snapshots=True`) product operation and agent snapshot stores share one pool. `open_agent_snapshot_store` builds a snapshot store with its own pool. |
 | `CAYU_DATABASE_DIRECT_URL` | `open_application_stores` | Optional Postgres URL for the task-admission `LISTEN` connection. `LISTEN` does not survive transaction pooling, so set it to a direct server address when `CAYU_DATABASE_URL` points at PgBouncer or a similar proxy. Pooled store traffic keeps using `CAYU_DATABASE_URL`. |
+| `CAYU_DATABASE_MIGRATION_LOCK_TIMEOUT` | `cayu storage migrate` and Postgres stores opened with `SchemaMode.MIGRATE` | Longest wait, in whole seconds, for one lock in a migration transaction (default 30). A revision that waits longer, or deadlocks, rolls back and runs again, up to 5 attempts. `0` waits indefinitely. |
 | `CAYU_REQUIRE_POSTGRES` | Every Cayu SQLite store | `1` makes SQLite stores raise at construction; `0` or unset changes nothing. Deployments set it so a missing `CAYU_DATABASE_URL` fails at startup. |
 
 The application stores also include a durable budget ledger in the same
@@ -160,6 +161,17 @@ Postgres stores validate their schema at startup and never run DDL
    definitions, process listings, and logs would expose it.
 3. Start the service only after the step exits `0`. A failed migration then
    fails the deployment instead of crash-looping application processes.
+
+Stop the previous release's workers and servers before the step when you can.
+Additive revisions keep the old release compatible with the migrated schema,
+but a revision is not an online change: it can hold a table lock while it
+backfills, and writers that need that table wait until it commits. On Postgres
+each revision runs in one transaction that waits at most
+`CAYU_DATABASE_MIGRATION_LOCK_TIMEOUT` seconds (default 30) for any one lock,
+and rolls back and runs again after a lock timeout or a deadlock, up to 5
+attempts, logging a warning for each retry. If every attempt
+fails, the step exits non-zero with the database at the last revision that
+committed; stop the writers and run it again.
 
 A platform can ask first whether a release needs the step:
 
