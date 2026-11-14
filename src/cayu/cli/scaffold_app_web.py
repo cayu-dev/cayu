@@ -21,9 +21,10 @@ area of the app `cayu serve --dev` serves.
 `templates/app_web_conversations/` goes on top of the operators layer for an Agent people chat
 with (the agent preset): its Conversations area, through Cayu's own API at /api.
 
-`templates/app_web_organizations/` is the organizations layer the b2b preset adds: member
-sign-in for `cayu serve --dev`, the Members area, the organization switcher, conversations
-scoped to an organization, and their calls to b2b's own routes.
+`templates/app_web_organizations/` is the layer of the `organizations` capability (the b2b
+preset), on the generic app alone: member sign-in for `cayu serve --dev`, the Members area,
+the organization switcher, conversations scoped to an organization, and their calls to the
+organizations' own routes.
 
 This module imports nothing from Cayu, so the build script loads it from its file.
 """

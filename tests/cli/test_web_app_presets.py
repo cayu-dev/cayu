@@ -32,8 +32,20 @@ def test_the_service_preset_has_no_web_app_and_says_why() -> None:
     assert "agent, coding or long-running" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("option", ["with_capabilities", "without_capabilities"])
-def test_the_b2b_preset_keeps_its_own_web_app(option: str) -> None:
+def test_the_b2b_preset_is_the_web_app_with_organizations() -> None:
+    plan = normalize_application_plan(name="x", agent_name="x", preset="b2b")
+    assert {"web-app", "organizations", "app-database"} <= set(plan.capabilities)
+    # Asking for what it has already changes nothing.
+    assert (
+        normalize_application_plan(
+            name="x", agent_name="x", preset="b2b", with_capabilities=("web-app",)
+        )
+        == plan
+    )
+
     with pytest.raises(ScaffoldPlanError) as excinfo:
-        normalize_application_plan(name="x", agent_name="x", preset="b2b", **{option: ("web-app",)})
-    assert excinfo.value.code == "capability_required"
+        normalize_application_plan(
+            name="x", agent_name="x", preset="b2b", without_capabilities=("web-app",)
+        )
+    assert excinfo.value.code == "capability_dependency_conflict"
+    assert "members sign in to the web app" in str(excinfo.value)

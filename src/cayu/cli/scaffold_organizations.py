@@ -1,10 +1,18 @@
-"""Files for the ``b2b`` preset of ``cayu new``.
+"""The `organizations` capability of ``cayu new``, which the ``b2b`` preset turns on.
 
-The preset starts from the agent preset's files and the app-database convention, and adds
-what an application serving several businesses needs: organizations, departments and
+It goes on top of the agent preset's files, the app-database convention and the web app, and
+adds what an application serving several businesses needs: organizations, departments and
 memberships in its own tables, and a policy that turns a person's current membership into
 Cayu resource-access grants. The application decides who belongs where; Cayu enforces the
 result on every read, listing and background step.
+
+The web app's people become the organizations' members. `served_app_files`
+(`scaffold_web_app.py`) gives the app with the organizations layer and the generated routes;
+this module gives the Agent's router (`integrations/http/__init__.py`), which signs members in
+through `integrations/sign_in.py` (a demonstration login under `cayu serve --dev`, Cayu
+Cloud's sign-in or an OIDC bearer token otherwise). The Developer dashboard reads every
+conversation, so `[tool.cayu.serve].auth` becomes `OPERATOR_ONLY_AUTH`: the Agent's operators
+keep it, and members reach their data only through `/app`.
 """
 
 from __future__ import annotations
@@ -13,9 +21,10 @@ from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
 )
-from cayu.cli.scaffold_app_routes import app_route_files, cloud_application_slug
-from cayu.cli.scaffold_app_web import ORGANIZATIONS, web_app_files
-from cayu.cli.scaffold_plan import ApplicationPlan
+from cayu.cli.scaffold_app_routes import cloud_application_slug
+from cayu.cli.scaffold_app_web import ORGANIZATIONS as ORGANIZATIONS_LAYER
+from cayu.cli.scaffold_plan import ORGANIZATIONS, ApplicationPlan
+from cayu.cli.scaffold_web_app import served_app_files
 
 _MODELS_APPEND = '''
 
@@ -590,10 +599,11 @@ if __name__ == "__main__":
     main()
 '''
 
-_CONFTEST_PY = '''"""Fixtures shared by the PostgreSQL tests."""
-
-from test_app_database import database  # noqa: F401  (a fresh PostgreSQL database per test)
-'''
+# The fixtures the PostgreSQL tests share, which tests/conftest.py imports.
+_CONFTEST_IMPORTS = (
+    "from test_app_database import database  # noqa: F401  (a fresh PostgreSQL database per test)\n"
+)
+_CONFTEST_PY = '"""Fixtures shared by the PostgreSQL tests."""\n\n' + _CONFTEST_IMPORTS
 
 _TEST_ORGANIZATIONS_PY = '''"""Organizations share one database and agent; each person sees only what membership allows.
 
@@ -2520,54 +2530,89 @@ _B2B_MULTI_USER = (
 
 def _agents_md(agents: str) -> str:
     for row, replacement in _AGENTS_ROWS.items():
-        agents = agents.replace(row, replacement)
-    return agents.replace(_MULTI_USER_ADVICE, _B2B_MULTI_USER)
+        agents = _replace_once(agents, row, replacement, "AGENTS.md")
+    return _replace_once(agents, _MULTI_USER_ADVICE, _B2B_MULTI_USER, "AGENTS.md")
 
 
-def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
-    """The b2b additions on top of the agent preset's and app-database's files."""
+def _tests_conftest(existing: str | None) -> str:
+    """The organizations' `tests/conftest.py`, or the one the project already has with their
+    fixtures imported after its own imports (the agent preset's Docker sandbox keeps its
+    tests hermetic there)."""
 
-    models = files["database/models.py"].replace(
+    if existing is None:
+        return _CONFTEST_PY
+    head, separator, rest = existing.partition("\n\n\n")
+    if not separator:
+        raise RuntimeError("tests/conftest.py isn't the one the agent preset generates.")
+    return f"{head}\n{_CONFTEST_IMPORTS}\n\n{rest}"
+
+
+def _replace_once(text: str, old: str, new: str, path: str) -> str:
+    """``text`` with ``old`` replaced by ``new``, which must be in it exactly once."""
+
+    if text.count(old) != 1:
+        raise RuntimeError(f"{path} isn't the agent preset's, which organizations build on.")
+    return text.replace(old, new)
+
+
+def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
+    """The organizations additions on top of the agent preset's, app-database's and the web
+    app's files, for a plan with `organizations`."""
+
+    if ORGANIZATIONS not in plan.capabilities:
+        return {}
+    models = _replace_once(
+        files["database/models.py"],
         "from sqlalchemy import DateTime, MetaData, String, func\n",
         "from sqlalchemy import (\n    BigInteger,\n    CheckConstraint,\n    DateTime,\n    ForeignKey,\n"
         "    ForeignKeyConstraint,\n    MetaData,\n    String,\n    UniqueConstraint,\n"
         "    func,\n)\n",
+        "database/models.py",
     )
-    app = (
-        files["app.py"]
-        .replace(
-            "from memory.context import build_context_policy\n",
-            "from memory.context import build_context_policy\n"
-            "from policies.access import build_access_policy\n",
-        )
-        .replace(
+    app = files["app.py"]
+    for old, new in (
+        # The last of the project's own imports, which sort before `policies`.
+        (
+            "\n\n\ndef build_app(",
+            "\nfrom policies.access import build_access_policy\n\n\ndef build_app(",
+        ),
+        (
             "from cayu.model_policy import configured_model_policy\n",
             "from cayu.model_policy import configured_model_policy\n"
             "from cayu.resource_access import ResourceAccessPolicy\n",
-        )
-        .replace(
+        ),
+        (
             "    artifact_store: ArtifactStore | None = None,\n) -> CayuApp:",
             "    artifact_store: ArtifactStore | None = None,\n"
             "    access_policy: ResourceAccessPolicy | None = None,\n) -> CayuApp:",
-        )
-        .replace(
+        ),
+        (
             "            enable_logging=runtime.enable_logging,\n",
             "            enable_logging=runtime.enable_logging,\n"
             "            resource_access_policy=(\n"
             "                access_policy if access_policy is not None else build_access_policy()\n"
             "            ),\n",
-        )
-    )
+        ),
+    ):
+        app = _replace_once(app, old, new, "app.py")
     return {
-        # The Developer dashboard login the b2b preset uses (see pyproject.toml below).
+        # `web/` with the organizations layer, the generated routes, and `cayu serve` serving
+        # them. The application's own users sign in through the same proxy as members, so
+        # the Developer dashboard (which reads every conversation) is for operators only.
+        **served_app_files(
+            files=files,
+            title=plan.name,
+            layers=(ORGANIZATIONS_LAYER,),
+            auth=ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
+            # The npm package's name, which no build reads.
+            package_name="b2b-web" if plan.preset == "b2b" else "web",
+        ),
+        # The Developer dashboard login the organizations use (see pyproject.toml above).
         "README.md": files["README.md"].replace(
             ENVIRONMENT_OPERATOR_AUTH_TARGET, ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET
         )
         + _GUIDANCE,
         "AGENTS.md": _agents_md(files["AGENTS.md"]) + _GUIDANCE,
-        # Installed packages and build output of web/ and of a Developer dashboard ejected
-        # with `cayu dashboard eject`, which writes no .gitignore of its own.
-        ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
         "app.py": app,
         "database/models.py": models + _MODELS_APPEND,
         "migrations/versions/0002_organizations.py": _MIGRATION,
@@ -2576,17 +2621,9 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "domain/sharing.py": _SHARING_PY,
         "policies/access.py": _ACCESS_POLICY_PY,
         "operations/demo_seed.py": _DEMO_SEED_PY,
-        "tests/conftest.py": _CONFTEST_PY,
+        "tests/conftest.py": _tests_conftest(files.get("tests/conftest.py")),
         "tests/test_organizations.py": _TEST_ORGANIZATIONS_PY.replace(
             "__AGENT_NAME__", plan.agent_name
-        ),
-        # The application's own users sign in through the same proxy as members, so the
-        # Developer dashboard (which reads every conversation) is for operators only.
-        "pyproject.toml": files["pyproject.toml"].replace(
-            f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"\n',
-            f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET}"\n'
-            'routers = ["integrations.http:build_router"]\n'
-            'ui = "web/static"\n',
         ),
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
         "migrations/versions/0003_membership_roles.py": _ROLES_MIGRATION,
@@ -2594,10 +2631,8 @@ def b2b_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[s
         "integrations/http/__init__.py": _HTTP_PY.replace(
             "__AGENT_NAME__", plan.agent_name
         ).replace("__CLOUD_APPLICATION__", cloud_application_slug(plan.name)),
-        **app_route_files(),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
-        **web_app_files(plan.name, layers=(ORGANIZATIONS,), package_name="b2b-web"),
         "tests/test_http_api.py": _TEST_HTTP_API_PY,
         "tests/test_generated_routes.py": _TEST_GENERATED_ROUTES_PY,
         "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(

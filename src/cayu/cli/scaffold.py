@@ -55,6 +55,7 @@ from cayu.cli.scaffold_plan import (
     ADAPTERS,
     CAPABILITIES,
     CI_CHOICES,
+    ORGANIZATIONS,
     PRESETS,
     WEB_APP,
     ApplicationPlan,
@@ -2760,7 +2761,8 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         help=(
             "Coherent application shape: agent (default), service, coding, "
             "long-running (approval, waits, timers, spend cap and restart tests), or b2b "
-            "(organizations, departments and members sharing one deployment)."
+            "(the web app plus organizations: several businesses' departments and members "
+            "sharing one deployment)."
         ),
     )
     # Deprecated: every project now selects its database at runtime through
@@ -3129,7 +3131,7 @@ def _rendered_preset_files(
                 else "An agent that several businesses share. Organizations, departments and\nmemberships live in the application's own tables (`domain/organizations.py`), and\n`policies/access.py` turns each person's current membership into Cayu resource-access\ngrants, so everyone sees only their own, their department's and their organization's\nconversations. Its registered specialist identity is `__AGENT_NAME__`.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
-                if plan.preset == "b2b"
+                if ORGANIZATIONS in plan.capabilities
                 else "A Cayu application with the standard capability layout. Its registered specialist\nidentity is `__AGENT_NAME__`. The scaffold profile records its selected capabilities.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
@@ -3266,19 +3268,19 @@ def _rendered_preset_files(
         )
         files.update(web_app_project_files(files=files, plan=plan))
         return files
-    if plan.preset == "agent":
+    if plan.preset in ("agent", "b2b"):
+        # The web app's people are the Agent's operators, or with organizations (the b2b
+        # preset), the organizations' members.
+        from cayu.cli.scaffold_organizations import organizations_project_files
+
         files.update(web_app_project_files(files=files, plan=plan))
+        files.update(organizations_project_files(files=files, plan=plan))
         return files
     if plan.preset == "long-running":
         from cayu.cli.scaffold_long_running import long_running_project_files
 
         files.update(long_running_project_files(files=files, render=render, plan=plan))
         files.update(web_app_project_files(files=files, plan=plan))
-        return files
-    if plan.preset == "b2b":
-        from cayu.cli.scaffold_b2b import b2b_project_files
-
-        files.update(b2b_project_files(files=files, plan=plan))
         return files
     files.update(
         {
@@ -3559,6 +3561,8 @@ def _run_new_discovery(args: argparse.Namespace) -> int | None:
             print("Guide: cayu guide applications#explicit-service-extensions")
         if spec.implied:
             print("Implies: " + ", ".join(spec.implied))
+        if spec.conflicts:
+            print("Conflicts with: " + ", ".join(spec.conflicts))
         if spec.files:
             print("Canonical homes: " + ", ".join(spec.files))
         if spec.owned_files:
@@ -3787,9 +3791,9 @@ def _render_new_receipt(
     else:
         print("  Local Developer dashboard: uv run --no-sync cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")
-    if plan.preset == "b2b":
+    if ORGANIZATIONS in plan.capabilities:
         print("  Web interface for the organizations' people: http://127.0.0.1:8000/")
-    if WEB_APP in plan.capabilities:
+    elif WEB_APP in plan.capabilities:
         print("  Web app for the Agent's operators: http://127.0.0.1:8000/")
     if plan.provider == "neutral":
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")

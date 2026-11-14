@@ -6,7 +6,8 @@ Agent supplies what only it knows (who a request's person is, its overview metri
 settings it reads from its environment, how its tasks group into runs) as arguments to
 `build_generated_router`. A preset that has people composes them into its own `/app` router:
 the `web-app` capability does with the Agent's operators (`scaffold_web_app.py`), and
-`cayu new --preset b2b` with its organizations' members (`scaffold_b2b.py`). The read routes the web app follows tag their
+the `organizations` capability (the b2b preset) with the organizations' members
+(`scaffold_organizations.py`). The read routes the web app follows tag their
 answer with Cayu's `cayu.server.etag`, so a read of an unchanged answer costs a 304.
 """
 

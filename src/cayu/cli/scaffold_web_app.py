@@ -12,8 +12,9 @@ It composes parts that are each usable on their own:
 - the Agent's own router (`integrations/http/__init__.py`, `[tool.cayu.serve] routers`),
   where its routes of its own go.
 
-The b2b preset's app is the generic app with the organizations layer instead, and its people
-are the organizations' members (`scaffold_b2b.py`).
+With the `organizations` capability (the b2b preset), the app is the generic app with the
+organizations layer instead, and its people are the organizations' members: that capability
+composes `served_app_files` with its own sign-in and routes (`scaffold_organizations.py`).
 """
 
 from __future__ import annotations
@@ -21,10 +22,12 @@ from __future__ import annotations
 from cayu._operator_credentials import ENVIRONMENT_OPERATOR_AUTH_TARGET
 from cayu.cli.scaffold_app_routes import app_route_files, cloud_application_slug
 from cayu.cli.scaffold_app_web import CONVERSATIONS, OPERATORS, web_app_files
-from cayu.cli.scaffold_plan import WEB_APP, ApplicationPlan
+from cayu.cli.scaffold_plan import ORGANIZATIONS, WEB_APP, ApplicationPlan
 
 # What `cayu serve` reads to serve the Agent's routes and the app.
 SERVE_ROUTERS = 'routers = ["integrations.http:build_router"]\nui = "web/static"\n'
+# The `[tool.cayu.serve]` table every preset with `cayu serve` starts from.
+_SERVE_AUTH = '[tool.cayu.serve]\nauth = "{auth}"\n'
 
 _HTTP_PY = '''"""THE AGENT'S OWN. The Agent's HTTP API, which `cayu serve` serves under /app
 ([tool.cayu.serve] routers in pyproject.toml), next to Cayu's API at /api and its Developer
@@ -414,33 +417,59 @@ _AGENTS_WEB_APP_ROW = (
 )
 
 
-def web_app_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
-    """The web app's files, and its changes to ``files``, for a plan with `web-app`."""
+def served_app_files(
+    *,
+    files: dict[str, str],
+    title: str,
+    layers: tuple[str, ...],
+    auth: str = ENVIRONMENT_OPERATOR_AUTH_TARGET,
+    package_name: str = "web",
+) -> dict[str, str]:
+    """What every web app adds, whoever its people are: `web/` with ``layers`` on the generic
+    app, the generated routes in `integrations/http/generated/`, and `[tool.cayu.serve]`
+    serving the Agent's router at /app and the app at /, behind ``auth``. The Agent's router
+    in `integrations/http/__init__.py`, which says who its people are, is the caller's."""
 
-    if WEB_APP not in plan.capabilities:
+    serve = _SERVE_AUTH.format(auth=ENVIRONMENT_OPERATOR_AUTH_TARGET)
+    if files["pyproject.toml"].count(serve) != 1:
+        raise RuntimeError("pyproject.toml has no [tool.cayu.serve] auth for the web app's routes.")
+    return {
+        "pyproject.toml": files["pyproject.toml"].replace(
+            serve, _SERVE_AUTH.format(auth=auth) + SERVE_ROUTERS
+        ),
+        # Installed packages and build output of web/ and of a Developer dashboard ejected
+        # with `cayu dashboard eject`, which writes no .gitignore of its own.
+        ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
+        **app_route_files(),
+        **web_app_files(title, layers=layers, package_name=package_name),
+    }
+
+
+def web_app_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
+    """The web app's files, and its changes to ``files``, for a plan with `web-app` whose
+    people are the Agent's operators. With `organizations`, they are its members instead
+    (`scaffold_organizations.organizations_project_files`)."""
+
+    if WEB_APP not in plan.capabilities or ORGANIZATIONS in plan.capabilities:
         return {}
     # People chat with the agent preset's agent, so its app has Conversations too.
     chats = plan.preset == "agent"
     guidance = _GUIDANCE.replace(
         "__OWN_AREAS__", "Conversations, Task runs" if chats else "Task runs"
     ).replace("__CONVERSATIONS__", _CONVERSATIONS_GUIDANCE if chats else "")
-    serve = f'[tool.cayu.serve]\nauth = "{ENVIRONMENT_OPERATOR_AUTH_TARGET}"\n'
-    if files["pyproject.toml"].count(serve) != 1:
-        raise RuntimeError("pyproject.toml has no [tool.cayu.serve] auth for the web app's routes.")
     return {
-        "pyproject.toml": files["pyproject.toml"].replace(serve, serve + SERVE_ROUTERS),
+        **served_app_files(
+            files=files,
+            title=plan.name,
+            layers=(OPERATORS, CONVERSATIONS) if chats else (OPERATORS,),
+        ),
         "README.md": files["README.md"] + guidance,
         "AGENTS.md": files["AGENTS.md"].replace(_AGENTS_WEB_ROW, _AGENTS_WEB_APP_ROW) + guidance,
-        # Installed packages and build output of web/ and of a Developer dashboard ejected
-        # with `cayu dashboard eject`, which writes no .gitignore of its own.
-        ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
         "integrations/http/__init__.py": _HTTP_PY.replace(
             "__AGENT_NAME__", plan.agent_name
         ).replace("__CLOUD_APPLICATION__", cloud_application_slug(plan.name)),
-        **app_route_files(),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
-        **web_app_files(plan.name, layers=(OPERATORS, CONVERSATIONS) if chats else (OPERATORS,)),
         "tests/test_web_app.py": _TEST_WEB_APP_PY,
     }

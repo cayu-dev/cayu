@@ -22,6 +22,7 @@ from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
     ApplicationPlan,
     ScaffoldPlanError,
+    declared_capabilities,
     normalize_application_plan,
     normalize_extension_declarations,
     preset_spec,
@@ -518,7 +519,7 @@ def _normalized_declared_plan(contract: Mapping[str, object]) -> ApplicationPlan
 
     preset = cast("str", contract["preset"])
     selected_preset = preset_spec(preset)
-    recorded = cast("list[str]", capabilities)
+    recorded = declared_capabilities(preset, cast("list[str]", capabilities))
     defaults = set(selected_preset.default_capabilities)
     selected = set(recorded)
     plan = normalize_application_plan(

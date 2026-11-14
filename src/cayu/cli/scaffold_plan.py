@@ -8,6 +8,7 @@ describes source generation only; a scaffold plan is never runtime authority.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -32,6 +33,9 @@ CI_CHOICES: tuple[CiName, ...] = ("github", "none")
 CapabilityStatus = Literal["selectable", "extension-only", "preset-owned"]
 # The web app for the Agent's own team (`scaffold_web_app.py`).
 WEB_APP = "web-app"
+# Organizations on top of the web app, whose people become their members
+# (`scaffold_organizations.py`).
+ORGANIZATIONS = "organizations"
 
 
 class ScaffoldPlanError(ValueError):
@@ -186,8 +190,10 @@ PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="b2b",
         summary=(
-            "Agent for several businesses sharing one deployment: organizations, departments "
-            "and members in its own tables, turned into Cayu resource-access grants."
+            "The web app plus organizations, for an Agent several businesses share on one "
+            "deployment: organizations, departments and members in its own tables, turned "
+            "into Cayu resource-access grants. Choose it only when people from separate "
+            "organizations use the same deployment."
         ),
         default_capabilities=(
             "app-database",
@@ -196,8 +202,10 @@ PRESETS: tuple[PresetSpec, ...] = (
             "evals",
             "human-input",
             "observability",
+            ORGANIZATIONS,
             "recovery",
             "tasks",
+            WEB_APP,
         ),
         environment=(OPERATOR_PASSWORD_VARIABLE, OPERATOR_USERNAME_VARIABLE),
     ),
@@ -418,13 +426,15 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     CapabilitySpec(
         name=WEB_APP,
         summary=(
-            "A web app for the Agent's own team, which `cayu serve` serves at / beside the "
-            "Developer dashboard at /cayu/: Overview, Task runs, Settings and Cayu's Inbox. "
-            "Its people are the Agent's operators: Cayu Cloud's, with their Cloud roles, when "
-            "deployed, and you under `cayu serve --dev`. Leave it out with --without web-app."
+            "A web app, which `cayu serve` serves at / beside the Developer dashboard at "
+            "/cayu/: Overview, Settings and the Agent's own areas, such as Task runs, with "
+            "links to Cayu's Inbox. Its people are the Agent's operators: Cayu Cloud's, with "
+            "their Cloud roles, when deployed, and you under `cayu serve --dev`; with "
+            "organizations, the organizations' members instead. Leave it out with --without "
+            "web-app."
         ),
         status="selectable",
-        supported_presets=("agent", "coding", "long-running"),
+        supported_presets=("agent", "coding", "long-running", "b2b"),
         files=(
             "web/",
             "integrations/http/",
@@ -437,6 +447,37 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "npm --prefix web run check:build",
             "npm --prefix web/e2e ci",
             "npm --prefix web/e2e test",
+        ),
+    ),
+    CapabilitySpec(
+        name=ORGANIZATIONS,
+        summary=(
+            "Several businesses on one deployment: organizations, departments and memberships "
+            "in the application's own tables, turned into Cayu resource-access grants, so each "
+            "person sees only their own, their department's and their organization's "
+            "conversations. The web app's people become the organizations' members, with "
+            "Members and an organization switcher; operators keep the Developer dashboard. "
+            "Needs web-app and app-database; can't be combined with knowledge or memory."
+        ),
+        status="selectable",
+        supported_presets=("agent", "b2b"),
+        implied=(WEB_APP, "app-database"),
+        conflicts=("knowledge", "memory"),
+        files=(
+            "domain/organizations.py",
+            "domain/sharing.py",
+            "database/memberships.py",
+            "policies/access.py",
+            "integrations/sign_in.py",
+            "integrations/http/",
+            "operations/demo_seed.py",
+            "migrations/versions/0002_organizations.py",
+            "migrations/versions/0003_membership_roles.py",
+            "web/",
+        ),
+        verification=(
+            "uv run --no-sync pytest -q tests/test_organizations.py tests/test_http_api.py "
+            "tests/test_background_revocation.py",
         ),
     ),
     CapabilitySpec(
@@ -670,12 +711,15 @@ def normalize_application_plan(
             "capabilities cannot be both included and excluded: " + ", ".join(overlap),
         )
 
-    if preset == "b2b" and WEB_APP in (*requested, *excluded):
-        # b2b's app is its own, with the organizations its members sign in to.
+    if preset == "service" and WEB_APP in requested:
+        # A service's operators sign in with a bearer token a browser page can't send, and
+        # `create_agent_service` assembles its server rather than `[tool.cayu.serve]`.
         raise ScaffoldPlanError(
-            "capability_required",
-            "preset 'b2b' always has its own web app, which its organizations' members use; "
-            "--with and --without web-app don't apply to it",
+            "unsupported_capability",
+            "preset 'service' has no web app yet: its operators sign in with a bearer token, "
+            "which a browser page can't send, and its server isn't assembled from "
+            "[tool.cayu.serve]. Choose preset agent, coding or long-running for an Agent with "
+            "a web app for its team",
         )
     if preset == "service" and WEB_APP in requested:
         # A service's operators sign in with a bearer token a browser page can't send, and
@@ -723,11 +767,12 @@ def normalize_application_plan(
         capabilities.discard(name_value)
 
     for name_value in excluded:
-        for selected in capabilities:
+        for selected in sorted(capabilities):
             if name_value in capability_spec(selected).implied:
+                reason = _DEPENDENCY_REASONS.get((selected, name_value), "")
                 raise ScaffoldPlanError(
                     "capability_dependency_conflict",
-                    f"capability {selected!r} requires excluded capability {name_value!r}",
+                    f"capability {selected!r} requires excluded capability {name_value!r}" + reason,
                 )
 
     required = {"tasks"} if preset == "service" else set()
@@ -735,6 +780,9 @@ def normalize_application_plan(
         # The example's approval, reply and timer patterns are built on these.
         required.update(("approvals", "human-input", "tasks"))
     if preset == "b2b":
+        # The preset is the web app with organizations.
+        required.add(ORGANIZATIONS)
+    if ORGANIZATIONS in capabilities:
         # Memberships live in the application's own tables; sharing covers tasks and artifacts.
         required.update(("app-database", "artifacts", "tasks"))
     if preset == "coding" and execution == "docker":
@@ -743,7 +791,14 @@ def normalize_application_plan(
     if missing:
         raise ScaffoldPlanError(
             "capability_required",
-            f"preset {preset!r} with execution {execution!r} requires: " + ", ".join(missing),
+            f"preset {preset!r} with execution {execution!r} requires: "
+            + ", ".join(missing)
+            + (
+                ". It is the web app plus organizations; for an Agent without them, choose "
+                "preset agent"
+                if preset == "b2b" and ORGANIZATIONS in missing
+                else ""
+            ),
         )
 
     for name_value in sorted(capabilities):
@@ -752,7 +807,9 @@ def normalize_application_plan(
         if conflicts:
             raise ScaffoldPlanError(
                 "capability_conflict",
-                f"capability {name_value!r} conflicts with: " + ", ".join(conflicts),
+                f"capability {name_value!r} conflicts with: "
+                + ", ".join(conflicts)
+                + _CONFLICT_REASONS.get(name_value, ""),
             )
 
     return ApplicationPlan(
@@ -766,6 +823,23 @@ def normalize_application_plan(
         coding_command_authority=resolved_coding_command_authority,
         ci=cast("CiName", ci),
     )
+
+
+# Why a capability needs another, added to the refusal of a plan that leaves it out.
+_DEPENDENCY_REASONS = {
+    (ORGANIZATIONS, WEB_APP): (
+        ": the organizations' members sign in to the web app. An Agent without a web app "
+        "has no organizations: choose a preset other than b2b, without organizations"
+    ),
+}
+# Why a capability can't be combined with those it conflicts with.
+_CONFLICT_REASONS = {
+    ORGANIZATIONS: (
+        ". The agent reads one knowledge store in every conversation, so what it learned or "
+        "was told in one organization's conversation would reach another's. Leave them out "
+        "with --without knowledge,memory"
+    ),
+}
 
 
 def _adapter(kind: Literal["provider", "execution"], name: str) -> AdapterSpec:
@@ -891,3 +965,15 @@ def normalize_extension_declarations(
     if extensions != normalized:
         raise ScaffoldPlanError("extensions_not_normalized", "extensions must be sorted and unique")
     return normalized
+
+
+def declared_capabilities(preset: str, recorded: Sequence[str]) -> tuple[str, ...]:
+    """The capabilities a project's `[tool.cayu.scaffold]` records, as this version names them.
+
+    b2b projects generated before `web-app` and `organizations` were capabilities record
+    neither, though they have both: the web app and organizations were the preset's own.
+    """
+
+    if preset == "b2b" and WEB_APP not in recorded and ORGANIZATIONS not in recorded:
+        return tuple(sorted({*recorded, WEB_APP, ORGANIZATIONS}))
+    return tuple(recorded)

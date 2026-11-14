@@ -59,9 +59,10 @@ def test_every_preset_gets_a_pinned_workflow_that_needs_no_secrets(
     for name, value in plan.check_environment():
         assert f"          {name}: '{value}'\n" in workflow
     has_web = "web/package.json" in files
-    assert has_web == (preset == "b2b" or "web-app" in plan.capabilities)
-    # The `web-app` capability's smoke test runs after the check, against `cayu serve --dev`.
-    smoke = "web-app" in plan.capabilities
+    assert has_web == ("web-app" in plan.capabilities)
+    # The operator app's smoke test runs after the check, against `cayu serve --dev`.
+    # Organizations' members sign in to theirs, which has none yet.
+    smoke = "web-app" in plan.capabilities and "organizations" not in plan.capabilities
     assert smoke == ("web/e2e/package.json" in files)
     if smoke:
         assert (

@@ -58,6 +58,7 @@ from cayu.cli.scaffold_plan import (
     PRESETS,
     ApplicationPlan,
     ScaffoldPlanError,
+    declared_capabilities,
     normalize_application_plan,
     preset_spec,
 )
@@ -445,7 +446,8 @@ def _declared_plan(
         raise ScaffoldPlanError("invalid_capabilities", "capabilities must be a list of strings")
     preset = cast("str", contract["preset"])
     defaults = set(preset_spec(preset).default_capabilities)
-    selected = set(cast("list[str]", recorded))
+    recorded = list(declared_capabilities(preset, cast("list[str]", recorded)))
+    selected = set(recorded)
     plan = normalize_application_plan(
         name=name,
         agent_name=agent_name,
