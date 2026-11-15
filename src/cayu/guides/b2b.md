@@ -1,12 +1,14 @@
 # Organizations on one deployment: the b2b preset
 
 `cayu new NAME --preset b2b` generates an agent that people from separate organizations
-share on one deployment, one database and one agent. Each organization (a customer, a client
-firm, a household) has departments and members. People sign in to the application's web
-app, see their own conversations, their department's and their organization's, and nothing
-of another organization. The organization's admins manage its members in the web app.
+share on one deployment, one database and one agent. Each organization (a client firm, an
+agency's client, a household) has departments and several members. People sign in to the
+application's web app, see their own conversations, their department's and their
+organization's, and nothing of another organization. The organization's admins manage its
+members in the web app.
 
-Choose it only for that. Every preset but service already comes with a web app for your own
+Choose it only for that, not for your own customers or users, who are each one person: use
+service or agent. Every preset but service already comes with a web app for your own
 team (`cayu guide app-ui`), so an Agent that only you and your colleagues use doesn't need
 b2b to get one. b2b is that web app plus the `organizations` capability, with the
 application database it needs:

@@ -200,10 +200,12 @@ PRESETS: tuple[PresetSpec, ...] = (
     PresetSpec(
         name="b2b",
         summary=(
-            "The web app plus organizations. Choose it only when people from separate "
-            "organizations (customers, client firms, households) share one deployment and "
-            "each must see only their own organization's data: organizations, departments "
-            "and members in its own tables, turned into Cayu resource-access grants. Every "
+            "The web app plus organizations. Choose it only when separate organizations "
+            "(client firms, an agency's clients, households) share one deployment, each with "
+            "several people who sign in and see only their own organization's data: "
+            "organizations, departments and members in its own tables, turned into Cayu "
+            "resource-access grants. Not for your own customers or users, who are each one "
+            "person: use service or agent. Every "
             "preset but service already has a web app for your own team. The agent preset "
             "takes the same organizations with --with organizations --without "
             "knowledge,memory."

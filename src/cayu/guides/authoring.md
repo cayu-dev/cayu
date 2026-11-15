@@ -72,7 +72,7 @@ only when the requested behavior requires it.
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
 | An HTTP API and the Developer dashboard | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
 | A web app for your team, to see what the agent did and what waits for a person | `web/` from `cayu new` on every preset but service; add an area in `web/src/agent/` | `cayu guide app-ui` |
-| People from separate organizations (customers, client firms, households) sharing one deployment, each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web app plus organizations and member sign-in | `cayu guide b2b` |
+| Separate organizations (client firms, households) sharing one deployment, each with several people who sign in and see only their own organization's data; not your own customers or users, who are each one person | `cayu new NAME --preset b2b`: the web app plus organizations and member sign-in | `cayu guide b2b` |
 | A product whose own frontend or other systems call the agent over an authenticated API for their end users | `cayu new NAME --preset service`, maintained tenant-safe service factory with no web app | `cayu guide references#server` |
 | A maintained repository-coding starter | `cayu new NAME --preset coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
 | A product API around repository coding | application-owned authentication, durable intake, workers and independent acceptance | `cayu guide authoring#coding-product-host` |
@@ -153,10 +153,11 @@ tool policy, approval policy, and runtime gates independently authorize calls.
 
 Choose a preset by the work, not by whether you want a web app: every preset
 but service comes with one for your team (`cayu guide app-ui`), and
-`--without web-app` leaves it out. When people from separate organizations
-(customers, client firms, households) sign in to one deployment and each must see
-only their own organization's data, start with `cayu new NAME --preset b2b`, which
-adds organizations and member sign-in to that web app; see `cayu guide b2b`. For a
+`--without web-app` leaves it out. When separate organizations (client firms, an
+agency's clients, households) share one deployment, each with several people who sign
+in and see only their own organization's data, start with `cayu new NAME --preset b2b`,
+which adds organizations and member sign-in to that web app; see `cayu guide b2b`.
+Your own customers or users are each one person, not an organization. For a
 product whose own frontend or other systems call the agent over an API, start with
 `cayu new NAME --preset service`. That template keeps customer authentication,
 tenant-qualified application storage, public identifiers, allow-listed product

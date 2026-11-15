@@ -453,7 +453,7 @@ leaves it out:
 | `coding` | The agent edits a code repository and runs its tests. | For your team. |
 | `long-running` | Work spans hours or days: approval, a waited-for reply, reminder and deadline timers, a spend cap, restart tests. | For your team. |
 | `service` | Your own product or other systems call the agent over an authenticated API for their end users. | None; API only. |
-| `b2b` | People from separate organizations (customers, client firms, households) share one deployment and each must see only their own organization's data. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |
+| `b2b` | Separate organizations (client firms, an agency's clients, households) share one deployment: each has several people who sign in, and they see only their own organization's data. Not for your own customers or users, who are each one person: use service or agent. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |
 
 `--preset long-running` is
 the agent layout plus a worked example of approval, a waited-for reply,

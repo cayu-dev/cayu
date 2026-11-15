@@ -1068,7 +1068,7 @@ yourself, use the Cayu feature that already does it:
 | Running a fixed command or parsing files in isolation | `cayu new NAME --execution docker` on the agent preset: a hardened per-session sandbox your tools reach with `require_sandbox_runner(ctx)`. Don't switch to the coding preset for this. | `cayu guide references#environments` |
 __CODING_CONVERSION_ROW__| Another agent for a sub-task | Subagent tools | `cayu guide references#subagents` |
 | Spending or usage limits | Budgets and run limits | `cayu guide references#cost-control` |
-| People from separate organizations (customers, client firms) sharing one deployment, each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web app with organizations and member sign-in | `cayu guide b2b` |
+| Separate organizations (client firms, households) sharing one deployment, each with several people who sign in and see only their own organization's data; not your own customers or users, who are each one person | `cayu new NAME --preset b2b`: the web app with organizations and member sign-in | `cayu guide b2b` |
 | A product whose own frontend or other systems call the agent over an authenticated API for their end users | `cayu new NAME --preset service` | `cayu guide references#server` |
 
 Run every `cayu guide` command as `uv run --no-sync cayu guide ...`.
@@ -2768,9 +2768,10 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
             "and restart tests). service: your own product or other systems call it over an "
             "authenticated API; API only. Every preset but service comes with a web app for "
             "your team; --without web-app leaves it out. b2b: the web app plus "
-            "organizations; choose it (or --with organizations on agent) only when people "
-            "from separate organizations share one deployment and each must see only their "
-            "own organization's data. See --list-presets."
+            "organizations; choose it (or --with organizations on agent) only when separate "
+            "organizations (client firms, households) share one deployment, each with several "
+            "people who sign in and see only their own organization's data, not for your own "
+            "customers or users. See --list-presets."
         ),
     )
     # Deprecated: every project now selects its database at runtime through

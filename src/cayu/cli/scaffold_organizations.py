@@ -2553,8 +2553,9 @@ _AGENTS_ROWS = {
         "the operator API, which people signed in as members can't use. | `cayu guide app-ui`, "
         "`cayu guide b2b` |"
     ),
-    "| People from separate organizations (customers, client firms) sharing one deployment, "
-    "each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web "
+    "| Separate organizations (client firms, households) sharing one deployment, each with "
+    "several people who sign in and see only their own organization's data; not your own "
+    "customers or users, who are each one person | `cayu new NAME --preset b2b`: the web "
     "app with organizations and member sign-in | `cayu guide b2b` |\n"
     "| A product whose own frontend or other systems call the agent over an authenticated API "
     "for their end users | `cayu new NAME --preset service` | `cayu guide references#server` |": (

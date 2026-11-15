@@ -118,3 +118,17 @@ def test_a_projects_readme_and_agents_md_point_at_the_app_ui_guide() -> None:
         assert "web/package.json" in files, name
         for document in ("README.md", "AGENTS.md"):
             assert "cayu guide app-ui" in files[document], (name, document)
+
+
+def test_b2b_does_not_offer_your_own_customers_as_organizations(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # "customers" among b2b's example organizations led an author to make each shopper of a
+    # store's support chat "an organization of one".
+    for name, text in _texts(capsys).items():
+        lowered = " ".join(text.split()).casefold()
+        assert "(customers," not in lowered and "(a customer," not in lowered, name
+
+    listing = _output(capsys, "new", "--list-presets").splitlines()
+    (line,) = [line for line in listing if line.split()[:1] == ["b2b"]]
+    assert "Not for your own customers or users" in line
