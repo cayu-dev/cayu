@@ -42,7 +42,9 @@ from cayu.storage._product_operation_schema import SQLITE_PRODUCT_OPERATION_DDL
 from cayu.storage._retention_schema import SQLITE_RETENTION_AUDIT_DDL
 from cayu.storage._session_execution import SQLITE_EXECUTION_DDL
 from cayu.storage._session_list_index_schema import (
+    ENVIRONMENT_ACTIVITY_INDEX_REVISION,
     SESSION_LIST_INDEX_REVISION,
+    SQLITE_ENVIRONMENT_ACTIVITY_INDEX_DDL,
     SQLITE_SESSION_LIST_INDEX_DDL,
 )
 from cayu.storage._session_summary_schema import (
@@ -841,6 +843,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     USAGE_PROJECTION_REVISION: SQLITE_USAGE_PROJECTION_DDL,
     # Session lists sort and page by keyset on these indexes.
     SESSION_LIST_INDEX_REVISION: SQLITE_SESSION_LIST_INDEX_DDL,
+    # Environment counts and latest activity read this covering index.
+    ENVIRONMENT_ACTIVITY_INDEX_REVISION: SQLITE_ENVIRONMENT_ACTIVITY_INDEX_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

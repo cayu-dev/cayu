@@ -51,6 +51,8 @@ from cayu.storage._retention_schema import POSTGRES_RETENTION_AUDIT_DDL
 from cayu.storage._session_closure_sql import POSTGRES_TASK_CLOSURE_GUARD_DDL
 from cayu.storage._session_execution import POSTGRES_EXECUTION_DDL
 from cayu.storage._session_list_index_schema import (
+    ENVIRONMENT_ACTIVITY_INDEX_REVISION,
+    ENVIRONMENT_ACTIVITY_INDEXES,
     SESSION_LIST_INDEX_REVISION,
     SESSION_LIST_INDEXES,
 )
@@ -1061,6 +1063,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     USAGE_PROJECTION_REVISION: POSTGRES_USAGE_PROJECTION_DDL,
     # The session list indexes are built CONCURRENTLY; see _CONCURRENT_INDEX_MIGRATIONS.
     SESSION_LIST_INDEX_REVISION: (),
+    # The environment activity index is built CONCURRENTLY; see _CONCURRENT_INDEX_MIGRATIONS.
+    ENVIRONMENT_ACTIVITY_INDEX_REVISION: (),
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,
@@ -4945,9 +4949,12 @@ class _ConcurrentIndexMigration:
         return "".join(parts)
 
 
-_CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
-    # Session lists sort and page by keyset on these indexes.
-    SESSION_LIST_INDEX_REVISION: tuple(
+def _session_index_migrations(
+    indexes: tuple[tuple[str, str, tuple[str, ...]], ...],
+) -> tuple[_ConcurrentIndexMigration, ...]:
+    """Concurrent builds of plain ``cayu_sessions`` indexes: (name, keys, columns)."""
+
+    return tuple(
         _ConcurrentIndexMigration(
             index_name=name,
             table_name="cayu_sessions",
@@ -4956,8 +4963,15 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             create_statement=f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON cayu_sessions({keys})",
             drop_statement=f"DROP INDEX CONCURRENTLY IF EXISTS {name}",
         )
-        for name, keys, columns in SESSION_LIST_INDEXES
-    ),
+        for name, keys, columns in indexes
+    )
+
+
+_CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
+    # Session lists sort and page by keyset on these indexes.
+    SESSION_LIST_INDEX_REVISION: _session_index_migrations(SESSION_LIST_INDEXES),
+    # Environment counts and latest activity read this covering index.
+    ENVIRONMENT_ACTIVITY_INDEX_REVISION: _session_index_migrations(ENVIRONMENT_ACTIVITY_INDEXES),
     # Recovery lists the sessions whose checkpoint holds an unsettled invocation
     # terminal decision from this index instead of scanning every checkpoint.
     143: (

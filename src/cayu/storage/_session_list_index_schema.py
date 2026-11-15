@@ -39,13 +39,33 @@ SESSION_LIST_INDEXES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
 )
 
-SQLITE_SESSION_LIST_INDEX_DDL = "\n".join(
-    f"CREATE INDEX IF NOT EXISTS {name} ON cayu_sessions({keys});"
-    for name, keys, _ in SESSION_LIST_INDEXES
+#: The Environments page counts each environment's sessions and finds its latest
+#: activity from this covering index, without reading the session rows.
+ENVIRONMENT_ACTIVITY_INDEX_REVISION = 159
+ENVIRONMENT_ACTIVITY_INDEXES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "idx_cayu_sessions_environment_activity",
+        "environment_name, last_activity_at",
+        ("environment_name", "last_activity_at"),
+    ),
 )
 
+
+def _sqlite_index_ddl(indexes: tuple[tuple[str, str, tuple[str, ...]], ...]) -> str:
+    return "\n".join(
+        f"CREATE INDEX IF NOT EXISTS {name} ON cayu_sessions({keys});" for name, keys, _ in indexes
+    )
+
+
+SQLITE_SESSION_LIST_INDEX_DDL = _sqlite_index_ddl(SESSION_LIST_INDEXES)
+
+SQLITE_ENVIRONMENT_ACTIVITY_INDEX_DDL = _sqlite_index_ddl(ENVIRONMENT_ACTIVITY_INDEXES)
+
 __all__ = [
+    "ENVIRONMENT_ACTIVITY_INDEXES",
+    "ENVIRONMENT_ACTIVITY_INDEX_REVISION",
     "SESSION_LIST_INDEXES",
     "SESSION_LIST_INDEX_REVISION",
+    "SQLITE_ENVIRONMENT_ACTIVITY_INDEX_DDL",
     "SQLITE_SESSION_LIST_INDEX_DDL",
 ]

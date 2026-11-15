@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query"
+import { keepPreviousData, useQuery } from "@tanstack/react-query"
 import { useSearch } from "@tanstack/react-router"
 import { Bot, ChevronDown, Play, Search } from "lucide-react"
 import { useState } from "react"
@@ -104,14 +104,18 @@ function SpecialistCard({
   const now = useNow()
   const { prototype, executionEnabled } = useServices()
   const viewer = useViewer()
+  // A collapsed card shows only when the specialist was last active: one row.
+  const recentLimit = open ? 5 : 1
   const recent = useQuery({
-    queryKey: ["specialist-recent", agent.name],
+    queryKey: ["specialist-recent", agent.name, recentLimit],
     enabled: recentEnabled,
+    // Expanding keeps showing the last activity while the five rows load.
+    placeholderData: keepPreviousData,
     queryFn: ({ signal }) =>
       api.sessions(
         {
           agent_name: agent.name,
-          limit: 5,
+          limit: recentLimit,
           order_by: "updated_at_desc",
           include_eval: true,
           include_forks: true,
