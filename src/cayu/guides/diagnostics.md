@@ -169,9 +169,9 @@ so it isn't counted. Options passed from another module, and Cloud secrets such
 as a `CAYU_WORKER_PROCESSES` set with `cayu cloud env set`, aren't seen.
 
 On Cloud, one process per CPU isn't one process for a `cpu_millis` of 1000 or
-less: Cloud can round CPU up for the memory size, and a worker with
-`cpu_millis = 1000` and `memory_mb = 2048` has started two. The check doesn't
-rely on `cpu_millis`.
+less: the worker's size isn't always a CPU limit on its container, so it can
+see more CPUs than its `cpu_millis`, and a worker with `cpu_millis = 1000` and
+`memory_mb = 2048` has started two. The check doesn't rely on `cpu_millis`.
 
 ## worker-command-invalid
 

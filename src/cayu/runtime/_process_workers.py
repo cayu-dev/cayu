@@ -77,8 +77,9 @@ def available_cpu_count() -> int:
 
     The CPUs it may be scheduled on (``os.process_cpu_count()`` where Python
     has it, else the scheduler affinity or ``os.cpu_count()``), lowered to a
-    container's CPU limit (a cgroup CPU quota, rounded down), as on Cayu Cloud
-    where it is the process's ``cpu_millis``.
+    container's CPU limit (a cgroup CPU quota, rounded down) when it has one. On
+    Cayu Cloud a process's ``cpu_millis`` isn't always such a limit, so the count
+    can be higher than its ``cpu_millis`` suggests.
     """
 
     count = _schedulable_cpu_count()

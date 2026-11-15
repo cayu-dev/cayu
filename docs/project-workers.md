@@ -703,9 +703,11 @@ constants.
 
 `cayu worker NAME` starts one worker process per CPU it may use: the CPUs it can
 be scheduled on, lowered to a container's CPU limit (a cgroup CPU quota, rounded
-down to whole CPUs). On Cayu Cloud that limit is the worker's `cpu_millis`, so a
-2-vCPU worker runs two processes and a 500-millicore one runs one. With one CPU it
-runs in its own process, as before. It prints how many it starts:
+down to whole CPUs). On Cayu Cloud, don't count on the worker's `cpu_millis` to
+set it: depending on the install, the size isn't always a CPU limit on the
+worker's container, and a worker with `cpu_millis = 1000` has started two
+processes. Set the count as below when it matters. With one CPU it runs in its
+own process, as before. It prints how many it starts:
 
 ```console
 $ cayu worker dispatch

@@ -2661,11 +2661,39 @@ above the environment's configured ceiling and names valid sizes.
 
 A Python process runs the runtime's own work for all of its sessions on one CPU
 core, however many vCPUs its task has, and past a few concurrent sessions each
-of them slows down. So `cayu worker NAME` starts one process per vCPU of its
-`cpu_millis`, rounded down: two for `cpu_millis = 2000`, one for 1000 or less.
-Set another count with `--processes N` in the `[worker]` command, or with the
-`CAYU_WORKER_PROCESSES` setting (`N` or `auto`); `--processes 1` runs one. The
-processes share the Agent's PostgreSQL database, whose claims keep them from
+of them slows down. So `cayu worker NAME` can start several worker processes.
+Cloud doesn't pick how many; `cayu worker` does, from the first of these that
+is set:
+
+- `--processes N` (or `auto`) in the `[worker]` command;
+- the `CAYU_WORKER_PROCESSES` environment variable (`N` or `auto`), in `[env]`
+  or set on the Agent with `cayu cloud env set`;
+- `NAME = N` (or `"auto"`) under `[tool.cayu.worker_processes]` in
+  `pyproject.toml`;
+- otherwise `auto`: one process per CPU the worker's container can use.
+
+A worker run with `--until-idle` or `--reconcile-abandoned-after-seconds` starts
+one process.
+
+`cpu_millis` doesn't decide the `auto` count. `auto` counts the CPUs the
+container can be scheduled on, lowered to a container CPU limit only when the
+container has one. Depending on how the Cloud install runs the Agent, the
+process size can be a share of a machine with more CPUs rather than a CPU limit
+on the container, so the worker sees more CPUs than its `cpu_millis`: an Agent
+with `cpu_millis = 1000` has started two worker processes. The worker prints the
+count it starts ("Worker 'NAME' is starting 2 processes (one per CPU)") in its
+logs. When the count matters, set it with one of the settings above rather than
+through `cpu_millis`; `--processes 1` runs one.
+
+Some workers need exactly one process: a worker whose entrypoint passes
+`reconcile_abandoned_after_s` to `run_task_worker` exits at startup in more than
+one. `cayu check --deploy` reports a `[worker]` command that wouldn't run such a
+worker in one process as `WORKER_SINGLE_PROCESS_REQUIRED`, and treats `auto` as
+several; see `cayu guide diagnostics#worker-single-process-required`. Pin it with
+`cayu worker NAME --processes 1` in the `[worker]` command or `NAME = 1` under
+`[tool.cayu.worker_processes]`.
+
+The processes share the Agent's PostgreSQL database, whose claims keep them from
 taking the same work. Sessions a web process runs itself are bound
 the same way, so move them to the worker. See [one process is one CPU
 core](project-workers.md#one-process-is-one-cpu-core); a worker logs a warning
