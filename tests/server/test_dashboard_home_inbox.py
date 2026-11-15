@@ -410,7 +410,7 @@ def test_inbox_protected_review_uses_reference_for_member():
             await page.goto(base + "/cayu/inbox?kind=approval", wait_until="networkidle")
             await expect(page.get_by_text("Protected human review", exact=True)).to_be_visible()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
-            await page.get_by_role("button", name="Refresh review").click()
+            await page.get_by_role("button", name="Show review").click()
             await expect(page.get_by_text("Review this exact proposal", exact=True)).to_be_visible()
             await expect(page.get_by_label("Decision reason", exact=True)).to_be_visible()
             await page.get_by_label("Decision reason", exact=True).fill("Checked by reviewer")
@@ -434,15 +434,11 @@ def test_inbox_member_keeps_and_drops_knowledge_with_source_fields():
             await page.goto(base + "/cayu/inbox?kind=knowledge", wait_until="networkidle")
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_have_count(2)
             await expect(page.get_by_label("Knowledge awaiting review")).to_have_text("2")
-            for label in [
-                "Namespace",
-                "Labels",
-                "Aspects",
-                "Impact targets",
-                "Source URI",
-                "Created by",
-            ]:
-                await expect(page.get_by_text(label, exact=True).first).to_be_visible()
+            # The source is one line; the rest of the entry's fields are folded under Details.
+            await expect(page.get_by_text("Proposed by", exact=False).first).to_be_visible()
+            await expect(page.get_by_text("Namespace", exact=True).first).to_be_hidden()
+            await page.get_by_text("Details", exact=True).first.click()
+            await expect(page.get_by_text("Namespace", exact=True).first).to_be_visible()
             await page.get_by_text("Decision options", exact=True).first.click()
             await page.get_by_label("Reason (optional)", exact=True).first.fill("Keep reviewed")
             await page.get_by_role("button", name="Keep", exact=True).first.click()

@@ -442,6 +442,8 @@ def test_member_proposal_preserves_source_identity_only_at_matching_revision():
             await expect(
                 page.get_by_text("Review document knowledge", exact=True).first
             ).to_be_visible()
+            # The source type and ID are folded under the card's Details.
+            await page.get_by_text("Details", exact=True).first.click()
             await expect(page.get_by_text("document", exact=True)).to_be_visible()
             await expect(page.get_by_text("invoice-2026-10", exact=True)).to_be_visible()
             await expect(page.get_by_role("button", name="Keep", exact=True)).to_be_enabled()

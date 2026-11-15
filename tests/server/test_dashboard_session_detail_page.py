@@ -1308,7 +1308,7 @@ def test_detail_member_protected_review_uses_exact_reference_and_reason():
             await expect(page.get_by_role("tab", name="Conversation", exact=True)).to_be_visible()
             await expect(page.get_by_text("Protected human review", exact=True)).to_be_visible()
             await expect(page.get_by_role("button", name="Approve", exact=True)).to_have_count(0)
-            await page.get_by_role("button", name="Refresh review", exact=True).click()
+            await page.get_by_role("button", name="Show review", exact=True).click()
             await expect(page.get_by_text("Review this exact proposal", exact=True)).to_be_visible()
             await page.get_by_label("Decision reason", exact=True).fill("Checked Session proposal")
             await page.get_by_role("button", name="Approve", exact=True).click()

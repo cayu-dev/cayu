@@ -129,7 +129,7 @@ def test_protected_review_clicks(tmp_path, decision, fault):
                         exact=True,
                     )
                     await expect(button).to_have_count(0)
-                    await page.get_by_role("button", name="Refresh review").click()
+                    await page.get_by_role("button", name="Show review").click()
                     await expect(button).to_be_enabled() if decision != "answer" else await expect(
                         page.get_by_label("Answer")
                     ).to_be_enabled()
@@ -238,7 +238,7 @@ def test_withheld_and_missing_review_clicks(status):
                     lambda route: route.fulfill(content_type="text/html", body=html),
                 )
                 await page.goto(f"{root}/review-test")
-                await page.get_by_role("button", name="Refresh review").click()
+                await page.get_by_role("button", name="Show review").click()
                 if status == "denied":
                     await expect(page.get_by_role("alert")).to_contain_text("denied")
                 else:
@@ -321,7 +321,7 @@ def test_long_field_click_reads_the_complete_value_then_approves(tmp_path):
                         ),
                     )
                     await page.goto(f"{root}/review-test")
-                    await page.get_by_role("button", name="Refresh review").click()
+                    await page.get_by_role("button", name="Show review").click()
                     show = page.get_by_role(
                         "button", name=f"Show all {len(BODY):,} characters of value"
                     )

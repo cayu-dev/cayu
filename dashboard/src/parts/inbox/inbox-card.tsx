@@ -16,7 +16,7 @@ import {
 import { cn } from "@kit/lib"
 import { Button } from "@kit/ui"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ReactNode, useState } from "react"
+import { Fragment, type ReactNode, useState } from "react"
 import { relativeTime } from "../format"
 import { type PartChange, useInboxHost } from "../host"
 import { partKeys } from "../keys"
@@ -37,6 +37,10 @@ const KIND: Record<InboxItem["kind"], { icon: KitIcon; label: string }> = {
   recovery: { icon: RotateLeft01Icon, label: "Needs recovery" },
   knowledge: { icon: BulbIcon, label: "Knowledge to review" },
 }
+
+// Shown when an Agent keeps a call's arguments out of the inbox.
+const QUARANTINED_NOTE =
+  "Arguments are not listed in the inbox. The app's review policy decides what protected human review shows."
 
 /** A listed item as the change a recovery reports; it stays pending until the next read. */
 const listedState = (item: InboxItem): InboxItemState => ({
@@ -175,7 +179,6 @@ export function InboxCard({
           {item.agent_name ?? "The specialist"} wants to run{" "}
           <code className="font-mono text-[13px]">{item.tool_name}</code>.
         </p>
-        {item.detail && <p className="text-xs text-muted-foreground">{item.detail}</p>}
       </>
     )
     actions = (
@@ -303,7 +306,7 @@ export function InboxCard({
     body = (
       <>
         <p>{item.agent_name ?? "The specialist"} wants to remember:</p>
-        <blockquote className="rounded-lg bg-muted px-3 py-2">
+        <blockquote className="whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2">
           {item.detail ?? item.title}
         </blockquote>
       </>
@@ -415,6 +418,7 @@ export function InboxCard({
         )}
         {item.kind === "knowledge" && item.knowledge && (
           <KnowledgeSource
+            quoted={item.detail ?? item.title}
             entry={knowledgeSource.data}
             error={knowledgeSource.error}
             revision={item.knowledge.revision}
@@ -422,18 +426,26 @@ export function InboxCard({
             showEvidence={showKnowledgeEvidence}
           />
         )}
-        {item.kind === "approval" && item.arguments_unavailable_reason === "no_review_policy" && (
-          <p className="text-xs text-muted-foreground">
-            This agent shows no arguments for approvals. To show selected ones, the agent can
-            configure a human review policy such as{" "}
-            <code className="font-mono">ToolArgumentReview</code>.
-          </p>
+        {item.kind === "approval" && (item.detail || item.arguments_unavailable_reason) && (
+          // Why the call waits, and why its arguments aren't on the card: the same on every
+          // card of a tool, so it stays folded.
+          <details className="text-xs text-muted-foreground">
+            <summary className="cursor-pointer">Why this needs approval</summary>
+            <div className="mt-2 space-y-1">
+              {item.detail && <p>{item.detail}</p>}
+              {item.arguments_unavailable_reason === "no_review_policy" && (
+                <p>
+                  This agent shows no arguments for approvals. To show selected ones, the agent can
+                  configure a human review policy such as{" "}
+                  <code className="font-mono">ToolArgumentReview</code>.
+                </p>
+              )}
+              {item.arguments_unavailable_reason === "quarantined" && <p>{QUARANTINED_NOTE}</p>}
+            </div>
+          </details>
         )}
-        {item.arguments_unavailable_reason === "quarantined" && (
-          <p className="text-xs text-muted-foreground">
-            Arguments are not listed in the inbox. The app's review policy decides what protected
-            human review shows.
-          </p>
+        {item.kind !== "approval" && item.arguments_unavailable_reason === "quarantined" && (
+          <p className="text-xs text-muted-foreground">{QUARANTINED_NOTE}</p>
         )}
         {!decided && item.kind !== "recovery" && (
           <details className="text-xs" open={override || !!argumentError}>
@@ -618,13 +630,18 @@ function RecoveryForm({
   )
 }
 
+const SESSION_SOURCE = "cayu://sessions/"
+
 function KnowledgeSource({
+  quoted,
   entry,
   error,
   revision,
   shown,
   showEvidence,
 }: {
+  /** The text the card already quotes; not repeated. */
+  quoted: string
   entry: PendingKnowledgeDetailResponse | undefined
   error: unknown
   revision: number
@@ -632,43 +649,64 @@ function KnowledgeSource({
   shown: boolean
   showEvidence: boolean
 }) {
+  const { Link } = useInboxHost()
   if (!shown) return null
   if (error) return <p className="text-xs text-muted-foreground">Source details are unavailable.</p>
   if (!entry) return <p role="status">Loading source details…</p>
   if (entry.revision !== revision)
     return <p role="status">This proposal changed. Refresh the Inbox before deciding.</p>
+  const labels = Object.entries(entry.labels)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(", ")
+  const createdBy = `${entry.created_by_type}${entry.created_by ? `: ${entry.created_by}` : ""}`
+  // A proposal recorded from a session names it in its source URI.
+  const sessionId = entry.source_uri?.startsWith(SESSION_SOURCE)
+    ? entry.source_uri.slice(SESSION_SOURCE.length) || null
+    : null
+  // Only the rows that say something; the rest stay out of the way.
+  const details: [string, string][] = [
+    ["Namespace", entry.namespace],
+    ["Labels", labels],
+    ["Aspects", entry.aspects.join(", ")],
+    ["Impact targets", entry.impact_targets.join(", ")],
+    ["Source type", entry.source_type ?? ""],
+    ["Source ID", entry.source_id ?? ""],
+    ["Source URI", entry.source_uri ?? ""],
+  ].filter((row): row is [string, string] => !!row[1])
   return (
     <>
-      <h3 className="text-xs font-medium">Full proposal</h3>
-      <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">
-        {entry.title ?? "Untitled proposal"}
+      {entry.title && <p className="font-medium [overflow-wrap:anywhere]">{entry.title}</p>}
+      {entry.text.trim() !== quoted.trim() && (
+        <p className="whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2">
+          {entry.text}
+        </p>
+      )}
+      <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+        {sessionId ? (
+          <>
+            From{" "}
+            <Link
+              to={{ session: sessionId }}
+              className="font-mono hover:text-foreground hover:underline"
+            >
+              {sessionId}
+            </Link>{" "}
+            ·{" "}
+          </>
+        ) : null}
+        Proposed by {createdBy}
       </p>
-      <p className="whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2">{entry.text}</p>
-      <dl className="grid gap-1 break-words text-xs text-muted-foreground">
-        <dt>Namespace</dt>
-        <dd>{entry.namespace}</dd>
-        <dt>Labels</dt>
-        <dd>
-          {Object.entries(entry.labels)
-            .map(([key, value]) => `${key}=${value}`)
-            .join(", ") || "None"}
-        </dd>
-        <dt>Aspects</dt>
-        <dd>{entry.aspects.join(", ") || "None"}</dd>
-        <dt>Impact targets</dt>
-        <dd>{entry.impact_targets.join(", ") || "None"}</dd>
-        <dt>Source type</dt>
-        <dd className="[overflow-wrap:anywhere]">{entry.source_type ?? "None"}</dd>
-        <dt>Source ID</dt>
-        <dd className="[overflow-wrap:anywhere]">{entry.source_id ?? "None"}</dd>
-        <dt>Source URI</dt>
-        <dd>{entry.source_uri || "None"}</dd>
-        <dt>Created by</dt>
-        <dd>
-          {entry.created_by_type}
-          {entry.created_by ? `: ${entry.created_by}` : ""}
-        </dd>
-      </dl>
+      <details className="text-xs text-muted-foreground">
+        <summary className="cursor-pointer">Details</summary>
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 break-words">
+          {details.map(([label, value]) => (
+            <Fragment key={label}>
+              <dt>{label}</dt>
+              <dd className="[overflow-wrap:anywhere]">{value}</dd>
+            </Fragment>
+          ))}
+        </dl>
+      </details>
       {showEvidence && (
         <details className="min-w-0 text-xs">
           <summary className="cursor-pointer">Proposal evidence</summary>

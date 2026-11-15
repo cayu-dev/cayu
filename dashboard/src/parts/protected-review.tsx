@@ -191,7 +191,7 @@ export function ProtectedReviewPart({
   const bound = view?.reference && view.interaction_id && view.kind === kind
   const blocked = disabled || busy || !bound
   return (
-    <Card>
+    <Card className="w-full">
       <CardContent className="space-y-4 p-4">
         <p className="font-medium">Protected human review</p>
         {purpose === null ? (
@@ -200,11 +200,21 @@ export function ProtectedReviewPart({
             request it with. Decide it in the Developer dashboard.
           </p>
         ) : (
-          <Button variant="outline" disabled={busy || disabled} onClick={() => void inspect()}>
-            Refresh review
-          </Button>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <Button
+              variant={view ? "outline" : "default"}
+              disabled={busy || disabled}
+              onClick={() => void inspect()}
+            >
+              {view ? "Refresh review" : "Show review"}
+            </Button>
+            {!view && (
+              <p className="text-xs text-muted-foreground">
+                Shows what this call will do; approve or deny from there.
+              </p>
+            )}
+          </div>
         )}
-        {!view && purpose !== null && <p>Inspect the current protected review before deciding.</p>}
         {unavailableReason && <p>{unavailableReason}</p>}
         {view && (
           <>
