@@ -32,8 +32,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cayu.cli import dev_postgres
 from cayu.cli.scaffold_app_database import APP_DATABASE
-from cayu.cli.scaffold_ci import _POSTGRES_IMAGE
 from cayu.cli.scaffold_plan import (
     ORGANIZATIONS,
     PRESETS,
@@ -44,8 +44,6 @@ from cayu.cli.scaffold_plan import (
 )
 
 PROJECT = "acme"
-# The project's tests create their own databases on this server; nothing on it outlives a run.
-_POSTGRES_PASSWORD = "postgres"
 
 
 @dataclass(frozen=True)
@@ -152,34 +150,18 @@ def project_steps(plan: ApplicationPlan, paths: Collection[str], *, database: st
 
 
 @contextmanager
-def _postgres(case: str) -> Iterator[str]:
-    """A throwaway PostgreSQL server in Docker, the image the generated CI uses."""
+def _postgres(project: Path) -> Iterator[str]:
+    """A throwaway PostgreSQL server for the project: `cayu dev postgres up`, then `down`."""
 
     given = os.environ.get("CAYU_TEST_POSTGRES_DSN", "").strip()
     if given:
         yield given
         return
-    name = f"cayu-generated-{case}-{os.getpid()}"
-    run = ["docker", "run", "--detach", "--rm", "--name", name, "--publish", "127.0.0.1::5432"]
-    subprocess.run(
-        [*run, "--env", f"POSTGRES_PASSWORD={_POSTGRES_PASSWORD}", _POSTGRES_IMAGE],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    server, _ = dev_postgres.start(project, timeout=120)
     try:
-        address = subprocess.run(
-            ["docker", "port", name, "5432/tcp"], check=True, capture_output=True, text=True
-        ).stdout.split()[0]
-        # Asked over TCP: while it initializes, the image runs a server on its socket alone.
-        ready = ["docker", "exec", name, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
-        deadline = time.monotonic() + 120
-        while subprocess.run(ready, capture_output=True, check=False).returncode != 0:
-            if time.monotonic() > deadline:
-                raise RuntimeError("PostgreSQL did not become ready in 120 seconds")
-            time.sleep(1)
-        yield f"postgresql://postgres:{_POSTGRES_PASSWORD}@{address}/postgres"
+        yield server.url
     finally:
-        subprocess.run(["docker", "rm", "--force", name], capture_output=True, check=False)
+        dev_postgres.stop(project)
 
 
 def _environment(project: Path) -> dict[str, str]:
@@ -209,7 +191,7 @@ def check(case: Case, parent: Path) -> list[tuple[str, float]]:
         raise RuntimeError(f"the project records {record['capabilities']}, not {plan.capabilities}")
 
     timings: list[tuple[str, float]] = []
-    database = _postgres(case.name) if APP_DATABASE in plan.capabilities else _no_database()
+    database = _postgres(project) if APP_DATABASE in plan.capabilities else _no_database()
     with database as dsn:
         environment = _environment(project)
         for step in project_steps(plan, paths, database=dsn):

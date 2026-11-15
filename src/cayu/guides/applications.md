@@ -548,7 +548,9 @@ or Alembic dependency: the generated project does.
 - `tests/test_app_database.py` runs without a database; with
   `CAYU_TEST_POSTGRES_DSN` naming a server where it may create databases, it also
   migrates a fresh database, runs both migrations in either order, and checks that
-  autogenerate finds nothing to change.
+  autogenerate finds nothing to change. `eval "$(cayu dev postgres up --export)"`
+  starts a throwaway server for the project in Docker, the image the generated CI
+  uses, and sets that variable; `cayu dev postgres down` removes it.
 
 `cayu check` reports `SCAFFOLD_PLAN_DRIFT` with field `storage` when the storage
 module constructs a fixed SQLite or Postgres store, or when

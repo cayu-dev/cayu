@@ -629,8 +629,9 @@ _CONFTEST_HOOKS = """def pytest_terminal_summary(terminalreporter) -> None:
         terminalreporter.write_line(f"  {report.nodeid}")
     terminalreporter.write_line(
         "They include the checks that one organization can't see another's data. "
-        "Set CAYU_TEST_POSTGRES_DSN to a PostgreSQL server where they may create "
-        "databases and run pytest again (README, Organizations and sharing). "
+        'Run `eval "$(uv run --no-sync cayu dev postgres up --export)"` for a throwaway '
+        "PostgreSQL, or set CAYU_TEST_POSTGRES_DSN to a server where they may create "
+        "databases, and run pytest again (README, Organizations and sharing). "
         "CAYU_REQUIRE_POSTGRES_TESTS=1 makes them fail instead of skipping."
     )
 """
@@ -2502,11 +2503,11 @@ who belongs where; Cayu enforces it.
 - The tests that read and write the application's tables, among them the checks that one
   organization can't see another's data, need a PostgreSQL server where they may create
   databases. Without one they are skipped, and pytest ends by naming them. For a local
-  one, `docker run -d --name app-test-postgres -e POSTGRES_PASSWORD=postgres -p
-  127.0.0.1:5432:5432 postgres:17-alpine`, then
-  `CAYU_TEST_POSTGRES_DSN=postgresql://postgres:postgres@127.0.0.1:5432/postgres uv run
-  --no-sync pytest`. With `CAYU_REQUIRE_POSTGRES_TESTS=1` they fail instead of skipping;
-  the CI workflow `cayu new` writes sets it and gives them a server.
+  one, run `eval "$(uv run --no-sync cayu dev postgres up --export)"` before `uv run
+  --no-sync pytest`: it starts a throwaway server for this project, the one the generated
+  CI uses, and sets `CAYU_TEST_POSTGRES_DSN`. `uv run --no-sync cayu dev postgres down`
+  removes it and its data. With `CAYU_REQUIRE_POSTGRES_TESTS=1` they fail instead of
+  skipping; the CI workflow `cayu new` writes sets it and gives them a server.
 
 ## The web app
 

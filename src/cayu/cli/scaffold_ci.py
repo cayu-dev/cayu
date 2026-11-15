@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from cayu.cli.dev_postgres import POSTGRES_IMAGE
 from cayu.cli.scaffold_app_database import APP_DATABASE
 from cayu.cli.scaffold_plan import ORGANIZATIONS, ApplicationPlan, CiName
 
@@ -28,10 +29,6 @@ _CHECKOUT = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1"
 _SETUP_UV = "astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2"
 _SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0"
 _UV_VERSION = "0.9.28"
-# Pinned to a digest, as the actions are to commits.
-_POSTGRES_IMAGE = (
-    "postgres:17-alpine@sha256:d3244e8ce3f165ee3c93d9c4a4b1d0fe48b3a89e2287b717fdcbbde92d405065"
-)
 _POSTGRES_URL = "postgresql://postgres:postgres@localhost:5432/postgres"
 
 _HEADER = """\
@@ -308,7 +305,7 @@ def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     if postgres:
         header = header.replace(
             "    timeout-minutes: 20\n",
-            "    timeout-minutes: 20\n" + _POSTGRES_SERVICE.replace("__IMAGE__", _POSTGRES_IMAGE),
+            "    timeout-minutes: 20\n" + _POSTGRES_SERVICE.replace("__IMAGE__", POSTGRES_IMAGE),
         )
     workflow = header + "".join(steps)
     if _has_web_app(files):

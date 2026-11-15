@@ -94,6 +94,8 @@ _GENERATED_PROJECT_EXACT_PATHS = {
     "scripts/build_app_web.py",
     "scripts/check_generated_project.py",
     "src/cayu/cli/coding_composition.py",
+    # The generated CI's PostgreSQL image, and the server the matrix starts with it.
+    "src/cayu/cli/dev_postgres.py",
     "tests/fixtures/b2b_tree.json",
 }
 _RELEASE_EXACT_PATHS = {

@@ -382,6 +382,11 @@ APP_DATABASE_TABLES = """- Application-owned records, such as orders, cases, mem
   database also needs `uv run cayu storage migrate` first. The application
   connects on first use and never migrates itself. Details:
   `cayu guide applications#application-tables`.
+- The tests that read and write these tables need a PostgreSQL server where they
+  may create databases (`CAYU_TEST_POSTGRES_DSN`), and are skipped without one. Run
+  `eval "$(uv run --no-sync cayu dev postgres up --export)"` before `uv run --no-sync
+  pytest` to start a throwaway one, the one the generated CI uses, and set the variable;
+  `uv run --no-sync cayu dev postgres down` removes it and its data.
 """
 
 
