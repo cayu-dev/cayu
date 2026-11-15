@@ -77,7 +77,7 @@
     },
     "web/biome.json": {
       "reference_sha256": "154dd387935d5cc9575ac3820a7cba92421cbb1f49daf0b358b229ce96661db6",
-      "same": true
+      "deviation": "The schema is the locked Biome 2.6.3's and the linter uses `rules.preset` instead of the deprecated `rules.recommended`, so `npm run lint` prints no notice (#4073)."
     },
     "web/e2e/.gitignore": {
       "reference_sha256": null,
@@ -105,11 +105,11 @@
     },
     "web/package-lock.json": {
       "reference_sha256": "071b7864fe7dea9377fe48f02c9b78497930abb78f49d31651fcf4093990e147",
-      "deviation": "Without lucide-react, which only the imported Inbox part used."
+      "deviation": "Without lucide-react, which only the imported Inbox part used. Requires Biome ^2.6.3, the locked version its biome.json is written for (#4073)."
     },
     "web/package.json": {
       "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Requires Biome ^2.6.3, the locked version its biome.json is written for (#4073)."
     },
     "web/scripts/add-licenses.mjs": {
       "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",

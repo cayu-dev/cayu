@@ -92,6 +92,19 @@ def test_the_generic_app_names_no_organizations_members_or_departments() -> None
     assert not (app / "static").exists()
 
 
+def test_the_biome_config_is_for_the_locked_biome() -> None:
+    # Biome prints a notice on every `npm run lint` when the configuration's schema isn't
+    # the CLI's version, or the configuration uses a field it has deprecated (#4073).
+    app = TEMPLATES / APP
+    config = json.loads((app / "biome.json").read_text(encoding="utf-8"))
+    lock = json.loads((app / "package-lock.json").read_text(encoding="utf-8"))
+    locked = lock["packages"]["node_modules/@biomejs/biome"]["version"]
+
+    assert config["$schema"] == f"https://biomejs.dev/schemas/{locked}/schema.json"
+    assert lock["packages"][""]["devDependencies"]["@biomejs/biome"] == f"^{locked}"
+    assert config["linter"]["rules"] == {"preset": "recommended"}
+
+
 def test_the_operator_app_is_the_generic_app_with_the_operators_layer() -> None:
     app = layer_sources(TEMPLATES)
     composed = layer_sources(TEMPLATES, (OPERATORS,))
