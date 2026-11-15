@@ -46,6 +46,7 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
         "python3 scripts/run_ci.py --lane collection",
         'python3 scripts/run_ci.py --lane general --shard "${{ matrix.shard }}"',
         "python3 scripts/run_ci.py --lane specialist",
+        "python3 scripts/run_ci.py --lane postgres-18",
         "python3 scripts/run_ci.py --lane sqlite-cancellation",
         "python3 scripts/run_ci.py --lane package",
         "python3 scripts/run_ci.py --lane dashboard",
@@ -279,6 +280,23 @@ def test_local_general_shards_use_bounded_parallel_workers(monkeypatch, tmp_path
     assert [item.label for item in runner.evidence] == [f"shard {n}" for n in range(1, 44)]
     with pytest.raises(ValueError, match="between 1 and 43"):
         _run_general_shards(_dry_runner(), jobs=44)
+
+
+def test_postgres_18_lane_runs_the_postgres_store_and_migration_tests() -> None:
+    runner = _dry_runner()
+    _RUNNER["_run_postgres_18"](runner)
+
+    (command,) = [item.command for item in runner.evidence]
+    assert command.startswith(
+        "env CAYU_REQUIRE_POSTGRES_TESTS=1 CAYU_TEST_POSTGRES_VERSION=18 CAYU_TEST_STORES=all "
+    )
+    assert "-m 'postgres and not (stress or qualification or host_journey)'" in command
+    files = command.split(" host_journey)' ", 1)[1].split()
+    assert "tests/core/test_postgres_migrations.py" in files
+    assert "tests/core/test_postgres_schema_owners.py" in files
+    assert "tests/core/test_postgres_knowledge_store.py" in files
+    assert "tests/evals/test_postgres_eval_store.py" in files
+    assert not any(path.startswith("tests/qualification/") for path in files)
 
 
 def test_sqlite_lane_repeats_the_canonical_nodes_three_times() -> None:

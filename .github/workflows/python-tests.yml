@@ -150,3 +150,22 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
           retention-days: 14
+
+  # The other lanes test on PostgreSQL 16. PostgreSQL 18 records NOT NULL constraints
+  # in pg_constraint, so the Postgres store, schema and migration tests run on it too.
+  postgres_18:
+    name: Postgres 18 store and migration tests (Python 3.14)
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    env:
+      # Workers are single-use VMs, so testcontainers' Ryuk reaper has nothing to
+      # clean up, and pulling its image from Docker Hub can fail the job.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Test Postgres stores and migrations on PostgreSQL 18
+        env:
+          # Keep private lock directories separate from other runner users on the host.
+          TMPDIR: ${{ runner.temp }}
+        run: python3 scripts/run_ci.py --lane postgres-18

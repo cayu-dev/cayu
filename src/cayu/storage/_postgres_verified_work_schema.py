@@ -26,7 +26,8 @@ async def _validate_work_attempt_lifecycle_schema(cur: Any) -> None:
         "SELECT c.contype, pg_get_constraintdef(c.oid, TRUE) "
         "FROM pg_constraint AS c JOIN pg_class AS r ON r.oid = c.conrelid "
         "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
-        "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_preparation_holds'"
+        "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_preparation_holds' "
+        "AND c.contype <> 'n'"  # PostgreSQL 18 NOT NULL rows
     )
     hold_constraints = tuple(
         (str(kind), " ".join(str(definition).lower().split()))
@@ -67,7 +68,8 @@ async def _validate_work_attempt_lifecycle_schema(cur: Any) -> None:
         "SELECT c.contype, pg_get_constraintdef(c.oid, TRUE) "
         "FROM pg_constraint AS c JOIN pg_class AS r ON r.oid = c.conrelid "
         "JOIN pg_namespace AS n ON n.oid = r.relnamespace "
-        "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_lifecycle_receipts'"
+        "WHERE n.nspname = current_schema() AND r.relname = 'cayu_work_attempt_lifecycle_receipts' "
+        "AND c.contype <> 'n'"  # PostgreSQL 18 NOT NULL rows
     )
     constraints = tuple(
         (str(kind), " ".join(str(definition).lower().split()))
@@ -190,6 +192,7 @@ async def _validate_work_attempt_admission_schema(cur: Any) -> None:
                   'cayu_work_attempt_admissions',
                   'cayu_work_attempt_execution_claims'
               )
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(await cur.fetchall())
@@ -568,6 +571,7 @@ async def _validate_verified_work_schema(
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = ANY(%s)
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (list(required_constraints),),
     )

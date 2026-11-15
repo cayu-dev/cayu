@@ -72,6 +72,16 @@ _REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES_TESTS"
 _RUNTIME_REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES"
 _REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
+# CAYU_TEST_POSTGRES_VERSION runs the Postgres tests on another supported major
+# version and fails them if the server is a different one. CI's postgres-18 lane
+# sets 18: PostgreSQL 18 records NOT NULL constraints in pg_constraint.
+_POSTGRES_VERSION_ENV_VAR = "CAYU_TEST_POSTGRES_VERSION"
+_POSTGRES_VERSION_IMAGES = {
+    "18": (
+        "pgvector/pgvector:pg18"
+        "@sha256:38681dc6eaf55308e2a4c6de392d131652dcfac70e1263e35cd9b5ea3fe39782"
+    ),
+}
 _IMAGE_PULL_ATTEMPTS = 3
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _MAX_UNKNOWN_DURATION_FRACTION = 0.05
@@ -90,6 +100,7 @@ def pytest_configure(config: pytest.Config) -> None:
         store_mode()
     except ValueError as exc:
         raise pytest.UsageError(str(exc)) from exc
+    _postgres_container_image()
     if os.environ.get("GITHUB_ACTIONS") != "true" or not (
         config.getoption("splits", None) or config.getoption("ci_shard", None)
     ):
@@ -274,6 +285,39 @@ def _pull_image(image: str) -> None:
             time.sleep(5 * attempt)
 
 
+def _postgres_version() -> str | None:
+    return os.environ.get(_POSTGRES_VERSION_ENV_VAR, "").strip() or None
+
+
+def _postgres_container_image() -> str:
+    version = _postgres_version()
+    if version is None:
+        return _POSTGRES_CONTAINER_IMAGE
+    if version not in _POSTGRES_VERSION_IMAGES:
+        raise pytest.UsageError(
+            f"{_POSTGRES_VERSION_ENV_VAR}={version} has no test image; "
+            f"choose one of {', '.join(sorted(_POSTGRES_VERSION_IMAGES))} or unset it."
+        )
+    return _POSTGRES_VERSION_IMAGES[version]
+
+
+def _check_postgres_version(dsn: str) -> None:
+    """Fail when CAYU_TEST_POSTGRES_VERSION names a major version the server isn't."""
+
+    version = _postgres_version()
+    if version is None:
+        return
+    import psycopg
+
+    with psycopg.connect(dsn) as connection:
+        row = connection.execute("SHOW server_version_num").fetchone()
+    major = int(row[0]) // 10000
+    if str(major) != version:
+        pytest.fail(
+            f"{_POSTGRES_VERSION_ENV_VAR}={version}, but the test server runs PostgreSQL {major}."
+        )
+
+
 def _postgres_required() -> bool:
     return os.environ.get(_REQUIRE_POSTGRES_ENV_VAR, "").strip().lower() in _TRUTHY_ENV_VALUES
 
@@ -404,7 +448,8 @@ def _postgres_server_dsn() -> str:
 
     1. ``CAYU_TEST_POSTGRES_DSN`` — point the tests at an already-running Postgres
        (a CI service container, or a local instance). Used as-is.
-    2. A Dockerized pgvector-capable Postgres via testcontainers.
+    2. A Dockerized pgvector-capable Postgres via testcontainers: PostgreSQL 16, or
+       the pinned image for ``CAYU_TEST_POSTGRES_VERSION``.
 
     Skips the whole module when neither is available, unless
     ``CAYU_REQUIRE_POSTGRES_TESTS`` is set. CI sets that flag so a lost Postgres tier
@@ -414,6 +459,7 @@ def _postgres_server_dsn() -> str:
     """
     env_dsn = os.environ.get(_DSN_ENV_VAR)
     if env_dsn and env_dsn.strip():
+        _check_postgres_version(env_dsn.strip())
         yield env_dsn.strip()
         return
 
@@ -425,8 +471,9 @@ def _postgres_server_dsn() -> str:
     except Exception as exc:  # pragma: no cover - dependency guard
         _skip_or_fail_postgres_unavailable(f"testcontainers unavailable: {exc}")
 
-    _pull_image(_POSTGRES_CONTAINER_IMAGE)
-    container = PostgresContainer(_POSTGRES_CONTAINER_IMAGE)
+    image = _postgres_container_image()
+    _pull_image(image)
+    container = PostgresContainer(image)
     container.start()
     try:
         url = container.get_connection_url()
@@ -434,6 +481,7 @@ def _postgres_server_dsn() -> str:
         dsn = url.replace("postgresql+psycopg2://", "postgresql://").replace(
             "postgresql+psycopg://", "postgresql://"
         )
+        _check_postgres_version(dsn)
         yield dsn
     finally:
         container.stop()

@@ -151,6 +151,7 @@ async def _validate_local_execution_attempt_schema(cur: Any) -> None:
               ON namespace.oid = relation.relnamespace
             WHERE namespace.nspname = current_schema()
               AND relation.relname = 'cayu_local_execution_attempts'
+              AND constraint_definition.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(await cur.fetchall())

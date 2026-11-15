@@ -26,6 +26,51 @@ def test_postgres_fixture_uses_pgvector_container_image() -> None:
     assert TEST_CONFTEST._POSTGRES_CONTAINER_IMAGE == "pgvector/pgvector:pg16"
 
 
+def test_postgres_version_selects_a_digest_pinned_pgvector_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CAYU_TEST_POSTGRES_VERSION", raising=False)
+    assert TEST_CONFTEST._postgres_container_image() == "pgvector/pgvector:pg16"
+
+    monkeypatch.setenv("CAYU_TEST_POSTGRES_VERSION", " 18 ")
+    image = TEST_CONFTEST._postgres_container_image()
+    assert image.startswith("pgvector/pgvector:pg18@sha256:")
+    assert len(image.rsplit("@sha256:", 1)[1]) == 64
+
+    monkeypatch.setenv("CAYU_TEST_POSTGRES_VERSION", "15")
+    with pytest.raises(pytest.UsageError, match="CAYU_TEST_POSTGRES_VERSION=15"):
+        TEST_CONFTEST._postgres_container_image()
+
+
+@pytest.mark.parametrize(("server_version_num", "fails"), [("180007", False), ("160010", True)])
+def test_postgres_version_fails_tests_on_another_server(
+    monkeypatch: pytest.MonkeyPatch, server_version_num: str, fails: bool
+) -> None:
+    import psycopg
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def execute(self, query: str) -> Connection:
+            assert query == "SHOW server_version_num"
+            return self
+
+        def fetchone(self) -> tuple[str]:
+            return (server_version_num,)
+
+    monkeypatch.setattr(psycopg, "connect", lambda dsn: Connection())
+    monkeypatch.setenv("CAYU_TEST_POSTGRES_VERSION", "18")
+    if fails:
+        with pytest.raises(pytest.fail.Exception, match="runs PostgreSQL 16"):
+            TEST_CONFTEST._check_postgres_version("postgresql://test")
+    else:
+        TEST_CONFTEST._check_postgres_version("postgresql://test")
+
+
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
 def test_postgres_required_accepts_truthy_env_values(
     monkeypatch: pytest.MonkeyPatch, value: str

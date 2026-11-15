@@ -46,6 +46,13 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 import ci_shard_plan  # noqa: E402
 
 _STORE_MODES = ci_shard_plan.STORE_MODES
+# The other lanes test on PostgreSQL 16. This lane runs the Postgres store, schema and
+# migration tests on 18 as well, which records NOT NULL constraints in pg_constraint.
+_POSTGRES_18_TEST_ENV = {
+    "CAYU_REQUIRE_POSTGRES_TESTS": "1",
+    "CAYU_TEST_POSTGRES_VERSION": "18",
+    ci_shard_plan.STORES_ENV: "all",
+}
 # Pull request CI runs SQLite store variants; nightly and release runs pass all.
 _DEFAULT_STORES = "sqlite"
 _DEFAULT_TEST_WORKERS = ci_shard_plan.DEFAULT_WORKERS
@@ -772,6 +779,39 @@ def _run_specialist_lane(runner: LocalCiRunner, lane: str) -> None:
     )
 
 
+def _postgres_store_test_files(root: Path) -> tuple[str, ...]:
+    tests = root / "tests"
+    return tuple(
+        sorted(
+            path.relative_to(root).as_posix()
+            for path in tests.rglob("test_*postgres*.py")
+            if "qualification" not in path.relative_to(tests).parts
+        )
+    )
+
+
+def _run_postgres_18(runner: LocalCiRunner) -> None:
+    command = (
+        "uv",
+        "run",
+        "--no-sync",
+        "pytest",
+        "-q",
+        "-n",
+        str(runner.test_workers),
+        "--dist",
+        "worksteal",
+        "-m",
+        ci_shard_plan.POSTGRES_MARKER,
+        *_postgres_store_test_files(runner.root),
+    )
+    runner.run(
+        "Python 3.14 Postgres store and migration tests on PostgreSQL 18",
+        command,
+        env=_POSTGRES_18_TEST_ENV,
+    )
+
+
 def _run_general_shards(runner: LocalCiRunner, *, jobs: int) -> None:
     shards = _general_shards(runner.stores)
     if jobs not in range(1, _MAX_GENERAL_SHARDS + 1):
@@ -825,6 +865,7 @@ def _run_python_suite(runner: LocalCiRunner, *, jobs: int) -> None:
     _install_playwright_chromium(runner)
     for lane in _specialist_lanes(runner.stores, (*_CI_SPECIALIST_FAMILIES, "qualification")):
         _run_specialist_lane(runner, lane)
+    _run_postgres_18(runner)
 
 
 def _run_sqlite_cancellation_version(runner: LocalCiRunner, python_version: str) -> None:
@@ -1243,6 +1284,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "plan",
             "general",
             "specialist",
+            "postgres-18",
             "sqlite-cancellation",
             "fault-injection",
             "dashboard",
@@ -1402,6 +1444,10 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             if args.specialist_lane.startswith("qualification-"):
                 _install_playwright_chromium(runner)
             _run_specialist_lane(runner, args.specialist_lane)
+        elif args.lane == "postgres-18":
+            _run_docker_prerequisite(runner)
+            _sync_python_test_environment(runner, browser=False)
+            _run_postgres_18(runner)
         elif args.lane == "sqlite-cancellation":
             if args.python_version is None:
                 raise ValueError("--lane sqlite-cancellation requires --python-version")

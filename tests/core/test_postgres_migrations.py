@@ -1242,6 +1242,37 @@ def test_cli_migrate_rejects_foreign_progress_after_preflight(
     assert "migration_receipt" not in payload
 
 
+def test_cli_migrate_and_status_bring_a_new_database_to_head(
+    _postgres_server_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Every schema check runs on the server under test, so a head schema must pass
+    # them all, including PostgreSQL 18, which lists NOT NULL constraints in
+    # pg_constraint.
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    database = f"cayu_test_{uuid4().hex}"
+    with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    try:
+        dsn = make_conninfo(_postgres_server_dsn, dbname=database)
+        assert main(["storage", "migrate", "--postgres", dsn]) == 0
+        migrated = json.loads(capsys.readouterr().out)
+        assert migrated["up_to_date"] is True
+        assert main(["storage", "status", "--postgres", dsn]) == 0
+        status = json.loads(capsys.readouterr().out)
+    finally:
+        with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
+            )
+    assert status["up_to_date"] is True
+    assert status["database"]["revision"] == status["application"]["latest_revision"]
+    assert status["database"]["revision"] == schema.REVISIONS[-1].revision
+
+
 def test_cli_migrate_records_postgres_operation_identity(
     postgres_dsn: str,
     capsys: pytest.CaptureFixture[str],

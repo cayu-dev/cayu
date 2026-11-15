@@ -564,7 +564,7 @@ deployment:
 | `cayu[server]` | FastAPI server API and the packaged Developer dashboard |
 | `cayu[server-settings]` | Server extra plus typed environment and `.env` loading |
 | `cayu[oidc]` | Server extra plus OIDC/JWT bearer-token verification (`OidcBearerAuth`) |
-| `cayu[postgres]` | PostgreSQL session, task, knowledge, and related stores |
+| `cayu[postgres]` | PostgreSQL session, task, knowledge, and related stores (PostgreSQL 16, 17 or 18) |
 | `cayu[aws]` | Amazon Bedrock and Lambda MicroVM support |
 | `cayu[vertex]` | Anthropic models through Google Cloud Vertex AI |
 | `cayu[e2b]` | E2B runner and workspace |

@@ -225,6 +225,10 @@ ways to run them:
 - Or point `CAYU_TEST_POSTGRES_DSN` at a **disposable** test server using a role with
   database-creation permission.
 
+Cayu supports PostgreSQL 16, 17 and 18. The testcontainers server is PostgreSQL 16; set
+`CAYU_TEST_POSTGRES_VERSION=18` for a digest-pinned PostgreSQL 18 image. With a DSN, the
+same variable fails the tests when the server runs another major version.
+
 Docker runner and egress tests require a running Docker daemon and skip automatically
 when it is unavailable.
 
@@ -391,7 +395,9 @@ The Python test jobs live in `.github/workflows/python-tests.yml`, which `ci.yml
 general shards, six Postgres shards, two host-journey shards and the browser-docker lane.
 Release tags, manual runs and the nightly run every store across 32 general and twelve
 Postgres shards. General and Postgres shards use four pytest workers with work stealing, so
-idle workers take tests from a large file. Ordinary process recovery regressions remain
+idle workers take tests from a large file. The shards test on PostgreSQL 16. One more job,
+outside the shard plan, runs the Postgres tests in `tests/**/test_*postgres*.py` (stores,
+schema checks and migrations) on PostgreSQL 18: `python3 scripts/run_ci.py --lane postgres-18`. Ordinary process recovery regressions remain
 in the PR gate. Tests marked `stress` or `qualification`, including full-scale evidence and
 capacity checks, run separately across twelve single-worker shards in `qualification.yml`,
 daily and on manual dispatch.

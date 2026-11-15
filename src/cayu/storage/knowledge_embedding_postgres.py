@@ -790,6 +790,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_knowledge_embeddings'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
         )
         constraints = [

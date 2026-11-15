@@ -1,9 +1,11 @@
 """Schema owners compose with caller-owned cursors, transactions and imports."""
 
+import ast
 import asyncio
 import importlib
 import inspect
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -61,6 +63,28 @@ def _arguments(validator):
 
         arguments["tokenizer_version"] = TRANSCRIPT_SEARCH_TOKENIZER_VERSION
     return arguments
+
+
+_CONSTRAINT_SELECTION = re.compile(
+    r"contype\s*<>\s*'n'|contype\s*=\s*'[cfpux]'|contype\s+IN\s*\(|conname\s*="
+)
+
+
+def test_constraint_reads_leave_out_postgres_18_not_null_rows():
+    # PostgreSQL 18 also lists NOT NULL constraints in pg_constraint (contype 'n').
+    # Column checks own nullability, so a constraint read names the kinds or the
+    # constraint it compares, or leaves 'n' out.
+    unfiltered = []
+    for path in sorted(Path(cayu.__file__).parent.joinpath("storage").rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "pg_constraint" in node.value
+                and not _CONSTRAINT_SELECTION.search(node.value)
+            ):
+                unfiltered.append(f"{path.name}:{node.lineno}")
+    assert unfiltered == []
 
 
 @pytest.mark.parametrize("owner", _OWNERS)

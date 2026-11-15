@@ -43,6 +43,7 @@ async def _validate_knowledge_activation_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_knowledge_activation_receipts'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(
@@ -123,6 +124,7 @@ async def _validate_knowledge_activation_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_knowledge_activation_retirements'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     retirement_constraints = tuple(
@@ -192,6 +194,7 @@ async def _validate_knowledge_maintenance_governance_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_knowledge_maintenance_governance_routes'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(
@@ -263,6 +266,7 @@ async def _validate_knowledge_semantic_watch_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_knowledge_semantic_watch_receipts'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(
@@ -581,6 +585,7 @@ async def _validate_knowledge_revision_schema(
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = ANY(%s)
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             ORDER BY table_record.relname, constraint_record.contype,
                      constraint_record.conname
             """,
@@ -828,6 +833,7 @@ async def _validate_knowledge_change_schema(
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = ANY(%s)
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (
             [
@@ -1136,6 +1142,7 @@ async def _validate_knowledge_relation_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = ANY(%s)
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (list(expected_columns),),
     )
@@ -1304,6 +1311,7 @@ async def _validate_knowledge_maintenance_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = %s
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (table,),
     )
@@ -1376,6 +1384,7 @@ async def _validate_knowledge_maintenance_proposal_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = %s
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (table,),
     )
@@ -1479,6 +1488,7 @@ async def _validate_knowledge_index_readiness_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = ANY(%s)
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """,
         (list(expected_columns),),
     )

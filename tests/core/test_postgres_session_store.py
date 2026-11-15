@@ -2310,6 +2310,33 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
         )
         assert after_concurrent_resolution.actions == []
 
+        # A real ledger holds many settled tool calls. Without them, PostgreSQL 18
+        # finds the few terminal events through idx_cayu_events_type_timestamp.
+        history = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="settled_history_pg",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            history.id,
+            [
+                Event(
+                    id=f"settled_{index}",
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id=history.id,
+                    tool_name="lookup",
+                    payload={
+                        **_tool_round_identity_payload(),
+                        "tool_call_id": f"settled_call_{index}",
+                    },
+                )
+                for index in range(500)
+            ],
+        )
+
         async with (
             await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
             conn.cursor() as cur,

@@ -57,6 +57,7 @@ async def _validate_child_session_lifecycle_schema(cur: Any) -> None:
               ON namespace.oid = table_record.relnamespace
             WHERE namespace.nspname = current_schema()
               AND table_record.relname = 'cayu_child_session_lifecycle_candidates'
+              AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
             """
     )
     constraints = tuple(
@@ -330,6 +331,7 @@ async def _validate_targeted_tool_grant_schema(cur: Any) -> None:
                   ON namespace.oid = table_record.relnamespace
                 WHERE namespace.nspname = current_schema()
                   AND table_record.relname = %s
+                  AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
                 """,
             (table_name,),
         )

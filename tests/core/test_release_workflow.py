@@ -52,7 +52,7 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     tests = _PYTHON_TESTS_WORKFLOW.read_text()
     test_references = [
         reference
-        for job_name in ("test-collection", "test_shards", "test_specialists")
+        for job_name in ("test-collection", "test_shards", "test_specialists", "postgres_18")
         for reference in _action_references(_job_block(tests, job_name))
         if not reference.startswith("./")
     ]

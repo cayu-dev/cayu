@@ -255,6 +255,7 @@ async def _validate_agent_work_context_schema(cur: Any) -> None:
                   ON namespace.oid = table_record.relnamespace
                 WHERE namespace.nspname = current_schema()
                   AND table_record.relname = %s
+                  AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
                 """,
             (table,),
         )
@@ -509,6 +510,7 @@ async def _validate_agent_recall_delivery_schema(
                   ON namespace.oid = table_record.relnamespace
                 WHERE namespace.nspname = current_schema()
                   AND table_record.relname = %s
+                  AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
                 """,
             (table,),
         )
@@ -913,6 +915,7 @@ async def _validate_agent_recall_subscription_schema(cur: Any) -> None:
                   ON namespace.oid = table_record.relnamespace
                 WHERE namespace.nspname = current_schema()
                   AND table_record.relname = %s
+                  AND constraint_record.contype <> 'n' -- PostgreSQL 18 NOT NULL rows
                 """,
             (table,),
         )
