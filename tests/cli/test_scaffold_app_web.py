@@ -94,7 +94,7 @@ def test_the_generic_app_names_no_organizations_members_or_departments() -> None
 
 def test_the_biome_config_is_for_the_locked_biome() -> None:
     # Biome prints a notice on every `npm run lint` when the configuration's schema isn't
-    # the CLI's version, or the configuration uses a field it has deprecated (#4073).
+    # the CLI's version, or the configuration uses a field it has deprecated.
     app = TEMPLATES / APP
     config = json.loads((app / "biome.json").read_text(encoding="utf-8"))
     lock = json.loads((app / "package-lock.json").read_text(encoding="utf-8"))
