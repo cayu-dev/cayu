@@ -88,6 +88,24 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
     assert "protected_label_keys" in files["policies/access.py"]
 
 
+def test_the_project_has_no_knowledge_or_memory_homes() -> None:
+    # Organizations conflict with knowledge and memory, so the preset never turns them on
+    # and gets what the agent preset's --without knowledge,memory gets.
+    files = project_files("acme-desk", preset="b2b")
+    agent = project_files(
+        "acme-desk",
+        preset="agent",
+        with_capabilities=("organizations",),
+        without_capabilities=("knowledge", "memory"),
+    )
+
+    assert not [path for path in files if path.startswith(("knowledge/", "memory/"))]
+    assert "from knowledge" not in files["app.py"]
+    assert "from memory" not in files["app.py"]
+    assert files["app.py"] == agent["app.py"]
+    assert files["tests/test_architecture.py"] == agent["tests/test_architecture.py"]
+
+
 def test_the_web_interface_is_copied_with_its_source_and_build() -> None:
     files = project_files("acme-desk", preset="b2b")
     # The generic app with the organizations layer on top (tests/cli/test_scaffold_app_web.py).

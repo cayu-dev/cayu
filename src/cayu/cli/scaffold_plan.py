@@ -910,16 +910,22 @@ def _plan_dependencies(plan: ApplicationPlan) -> tuple[str, ...]:
 
 
 def removed_capability_files(plan: ApplicationPlan) -> frozenset[str]:
-    """Return the owned files a plan's `--without` choices leave out.
+    """Return the owned files a plan leaves out.
 
     A file is removed when a capability that owns it is a preset default the
-    plan turned off and no capability that owns it is still selected. Presets
-    keep the homes of capabilities they don't turn on by default, so those can
-    be wired in later.
+    plan turned off, or conflicts with a selected capability, and no capability
+    that owns it is still selected. Presets keep the homes of other capabilities
+    they don't turn on by default, so those can be wired in later; a conflicting
+    one can't be, so the b2b preset, whose organizations conflict with knowledge
+    and memory, gets neither home.
     """
 
     selected = set(plan.capabilities)
-    excluded = set(_PRESET_BY_NAME[plan.preset].default_capabilities) - selected
+    excluded = set(_PRESET_BY_NAME[plan.preset].default_capabilities)
+    excluded.update(
+        conflict for name in selected for conflict in _CAPABILITY_BY_NAME[name].conflicts
+    )
+    excluded -= selected
     removed: set[str] = set()
     for name in excluded:
         for path in _CAPABILITY_BY_NAME[name].owned_files:
