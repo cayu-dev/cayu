@@ -28,7 +28,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Collection, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -184,7 +184,7 @@ def check(case: Case, parent: Path) -> list[tuple[str, float]]:
         raise RuntimeError(f"the project records {record['capabilities']}, not {plan.capabilities}")
 
     timings: list[tuple[str, float]] = []
-    database = _postgres(project) if APP_DATABASE in plan.capabilities else _no_database()
+    database = _postgres(project) if APP_DATABASE in plan.capabilities else nullcontext("")
     with database as dsn:
         environment = _environment(project)
         for step in project_steps(plan, paths, database=dsn):
@@ -204,11 +204,6 @@ def check(case: Case, parent: Path) -> list[tuple[str, float]]:
     return timings
 
 
-@contextmanager
-def _no_database() -> Iterator[str]:
-    yield ""
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -219,15 +214,16 @@ def main(argv: list[str] | None = None) -> int:
         "--dir", type=Path, help="make the projects here (default: a temporary folder)"
     )
     args = parser.parse_args(argv)
+    known = cases()
     if args.list:
-        print("\n".join(cases()))
+        print("\n".join(known))
         return 0
-    unknown = sorted(set(args.cases) - cases().keys())
+    unknown = sorted(set(args.cases) - known.keys())
     if unknown:
         parser.error(f"unknown cases {unknown}; --list lists them")
     failed = []
-    for name in args.cases or cases():
-        case = cases()[name]
+    for name in args.cases or known:
+        case = known[name]
         started = time.monotonic()
         try:
             if args.dir is not None:

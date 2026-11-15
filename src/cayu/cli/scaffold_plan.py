@@ -740,17 +740,7 @@ def normalize_application_plan(
         # `create_agent_service` assembles its server rather than `[tool.cayu.serve]`.
         raise ScaffoldPlanError(
             "unsupported_capability",
-            "preset 'service' has no web app yet: its operators sign in with a bearer token, "
-            "which a browser page can't send, and its server isn't assembled from "
-            "[tool.cayu.serve]. Choose preset agent, coding or long-running for an Agent with "
-            "a web app for its team",
-        )
-    if preset == "service" and WEB_APP in requested:
-        # A service's operators sign in with a bearer token a browser page can't send, and
-        # `create_agent_service` assembles its server rather than `[tool.cayu.serve]`.
-        raise ScaffoldPlanError(
-            "unsupported_capability",
-            "preset 'service' has no web app yet: its operators sign in with a bearer token, "
+            "preset 'service' has no web app: its operators sign in with a bearer token, "
             "which a browser page can't send, and its server isn't assembled from "
             "[tool.cayu.serve]. Choose preset agent, coding or long-running for an Agent with "
             "a web app for its team",
