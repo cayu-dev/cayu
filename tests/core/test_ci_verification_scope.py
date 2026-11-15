@@ -312,6 +312,7 @@ def test_new_concept_helpers_keep_runtime_ci_coverage(package: str, helper: str)
         "src/cayu/cli/scaffold.py",
         "src/cayu/cli/scaffold_ci.py",
         "src/cayu/cli/scaffold_organizations.py",
+        "src/cayu/memberships/postgres.py",
         "src/cayu/cli/_scaffold_test_tools.py",
         "src/cayu/cli/coding_composition.py",
         "src/cayu/cli/templates/app_web/package.json",

@@ -18,27 +18,27 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
-from sqlalchemy.exc import IntegrityError
 
 from cayu import CayuApp
-from cayu.server.resource_access import create_resource_router
-from database.memberships import (
-    MemberRecord,
-    add_member,
-    admins_of,
-    members_of,
-    memberships_of,
-    remove_member,
+from cayu.memberships import (
+    LastAdmin,
+    Member,
+    MemberChange,
+    NotAnAdmin,
+    RemoveMember,
+    SetMember,
+    Sharing,
+    UnknownDepartment,
+    conversation_labels,
 )
-from database.session import session
-from domain.organizations import Membership, app_role
-from domain.sharing import Sharing, conversation_labels
+from cayu.server.resource_access import create_resource_router
+from database.memberships import memberships
+from domain.organizations import app_role
 from integrations.http.fixed_settings import fixed_settings
 from integrations.http.generated import Person, build_generated_router
 from integrations.http.overview_metrics import overview_metrics
@@ -92,7 +92,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
         refuses or allows either way."""
 
         subject = await authenticate(request)
-        role = app_role(record.role for record in await _read(memberships_of, subject))
+        role = app_role(record.role for record in await memberships().of_subject(subject))
         return Person(
             subject=subject,
             role=role,
@@ -113,7 +113,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
 
     @router.get("/me")
     async def me(subject: str = Depends(signed_in)) -> dict:
-        records = await _read(memberships_of, subject)
+        records = await memberships().of_subject(subject)
         return {
             "subject": subject,
             "agent_name": AGENT_NAME,
@@ -125,10 +125,9 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
         record = await _membership(subject, body.organization)
         if record is None:
             raise HTTPException(403, "You aren't a member of that organization.")
-        membership = Membership(record.organization, record.department)
         try:
             return conversation_labels(
-                subject=subject, membership=membership, sharing=body.sharing
+                subject=subject, membership=record.membership, sharing=body.sharing
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
@@ -139,7 +138,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     ) -> list[dict]:
         if await _membership(subject, organization) is None:
             raise HTTPException(404, "Organization unavailable.")
-        return [_member(item) for item in await _read(members_of, organization)]
+        return [_member(item) for item in await memberships().of_organization(organization)]
 
     # A member ID is the identity provider's opaque subject, which may contain '/'.
     @router.put("/organizations/{organization}/members/{member:path}")
@@ -151,19 +150,9 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     ) -> dict:
         await _require_admin(subject, organization)
         _require_subject(member)
-        try:
-            await _change_members(
-                subject,
-                add_member,
-                subject=member,
-                organization=organization,
-                department=body.department,
-                role=body.role,
-            )
-        except IntegrityError:
-            raise HTTPException(
-                422, "The department must be one of this organization's."
-            ) from None
+        await _change_members(
+            subject, organization, SetMember(member, body.department, body.role)
+        )
         return {"subject": member, "organization": organization, **body.model_dump()}
 
     @router.delete(
@@ -174,12 +163,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     ) -> Response:
         await _require_admin(subject, organization)
         _require_subject(member)
-        await _change_members(
-            subject,
-            remove_member,
-            subject=member,
-            organization=organization,
-        )
+        await _change_members(subject, organization, RemoveMember(member))
         return Response(status_code=204)
 
     if isinstance(authenticate, DemoSignIn):
@@ -214,7 +198,7 @@ def cloud_application() -> str:
     return os.environ.get("CAYU_CLOUD_APPLICATION_ID", "").strip() or CLOUD_APPLICATION
 
 
-def _member(record: MemberRecord) -> dict:
+def _member(record: Member) -> dict:
     return {
         "subject": record.subject,
         "organization": record.organization,
@@ -223,8 +207,8 @@ def _member(record: MemberRecord) -> dict:
     }
 
 
-async def _membership(subject: str, organization: str) -> MemberRecord | None:
-    records = await _read(memberships_of, subject)
+async def _membership(subject: str, organization: str) -> Member | None:
+    records = await memberships().of_subject(subject)
     return next((item for item in records if item.organization == organization), None)
 
 
@@ -234,14 +218,6 @@ async def _require_admin(subject: str, organization: str) -> None:
         raise HTTPException(404, "Organization unavailable.")
     if record.role != "admin":
         raise HTTPException(403, "Only the organization's admins manage its members.")
-
-
-async def _read(query, value):
-    def read():
-        with session() as db:
-            return query(db, value)
-
-    return await asyncio.to_thread(read)
 
 
 def _require_subject(member: str) -> None:
@@ -255,22 +231,22 @@ def _require_subject(member: str) -> None:
         raise HTTPException(422, "A member ID has no '.' or '..' path segments.")
 
 
-async def _change_members(caller: str, change, **arguments) -> None:
-    """Change the organization's members while its admins' rows are locked, so the caller
-    is still an admin when it happens and at least one admin remains afterwards."""
+async def _change_members(caller: str, organization: str, change: MemberChange) -> None:
+    """Change the organization's members as `caller`: `cayu.memberships` locks its admins'
+    rows, so the caller is still an admin when it happens and at least one admin remains
+    afterwards."""
 
-    organization = arguments["organization"]
-
-    def write() -> None:
-        with session() as db:
-            if caller not in admins_of(db, organization, lock=True):
-                raise HTTPException(
-                    403, "Only the organization's admins manage its members."
-                )
-            change(db, **arguments)
-            if not admins_of(db, organization):
-                db.rollback()
-                raise HTTPException(409, "An organization keeps at least one admin.")
-            db.commit()
-
-    await asyncio.to_thread(write)
+    try:
+        await memberships().change_as_admin(caller, organization, change)
+    except NotAnAdmin:
+        raise HTTPException(
+            403, "Only the organization's admins manage its members."
+        ) from None
+    except LastAdmin:
+        raise HTTPException(409, "An organization keeps at least one admin.") from None
+    except UnknownDepartment:
+        raise HTTPException(
+            422, "The department must be one of this organization's."
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None

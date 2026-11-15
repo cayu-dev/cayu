@@ -475,7 +475,17 @@ organization. Cayu asks the policy again at every read, listing and background
 step, so a removed member loses access at their next step; changing a membership
 also raises the access revision, so no decision read before it is used again.
 `uv run --no-sync python -m operations.demo_seed` adds two demonstration
-organizations to a development database.
+organizations to a development database. The policy, the membership reads and writes, and
+the sharing labels come from `cayu.memberships`; the project keeps its tables, sign-in,
+roles, routes and pages. `uv run --no-sync cayu memberships list|add|remove` manages members
+from the command line.
+
+### Move to `cayu.memberships`
+
+A project generated before `cayu.memberships` existed carries its own copies of the
+membership code. `uv run --no-sync cayu check` notes each one that is still exactly the copy
+Cayu generated (`MEMBERSHIPS_GENERATED_COPY`), and `cayu guide b2b#move-to-cayumemberships`
+walks through the one-commit move, which needs no database migration.
 
 ## Durable data
 

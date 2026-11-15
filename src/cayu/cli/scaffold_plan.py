@@ -479,7 +479,6 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         conflicts=("knowledge", "memory"),
         files=(
             "domain/organizations.py",
-            "domain/sharing.py",
             "database/memberships.py",
             "policies/access.py",
             "integrations/sign_in.py",

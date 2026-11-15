@@ -16,17 +16,19 @@ from fastapi.testclient import TestClient
 from test_app_database import ALEMBIC, requires_postgres
 
 from cayu import CayuApp
+from cayu.memberships import (
+    InMemoryMembershipDirectory,
+    Membership,
+    MembershipAccessPolicy,
+    conversation_labels,
+)
 from cayu.server import serve_web_app
 from cayu.sessions import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity
 from cayu.sessions.requests import RunRequest
-from database.memberships import DatabaseMembershipDirectory
-from database.session import session
-from domain.organizations import InMemoryMembershipDirectory, Membership
-from domain.sharing import conversation_labels
+from database.memberships import memberships
 from integrations.http import AGENT_NAME, build_router
 from operations.demo_seed import seed
-from policies.access import MembershipAccessPolicy
 
 ALICE = Membership("acme", "acme/finance")
 IDENTITY = SessionIdentity(provider_name="fake", model="fake")
@@ -164,10 +166,8 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
     database,
 ) -> None:
     command.upgrade(ALEMBIC, "head")
-    with session() as db:
-        seed(db)
-        db.commit()
-    app = _app(DatabaseMembershipDirectory())
+    seed()
+    app = _app(memberships())
     with _client(app) as client:
         shared = _start(client, app, "department")
 
@@ -248,10 +248,8 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
 @requires_postgres
 def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> None:
     command.upgrade(ALEMBIC, "head")
-    with session() as db:
-        seed(db)
-        db.commit()
-    app = _app(DatabaseMembershipDirectory())
+    seed()
+    app = _app(memberships())
     with _client(app) as client:
         assert client.get("/app/whoami").status_code == 401
         _start(client, app, "personal")

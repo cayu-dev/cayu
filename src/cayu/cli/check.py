@@ -16,6 +16,7 @@ from cayu.cli._check_keys import (
 from cayu.cli._dashboard_parts import dashboard_parts_findings
 from cayu.cli._dashboard_upgrade import dashboard_source_findings
 from cayu.cli._local_alias_keys import keyring_required_diagnostic
+from cayu.cli._membership_copies import membership_copy_findings
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.project import (
     CayuProject,
@@ -116,6 +117,7 @@ def _run_check(args: argparse.Namespace) -> int:
                     *serve_identity_proxy_findings(project.root),
                     *dashboard_parts_findings(project.root),
                     *dashboard_source_findings(project.root),
+                    *membership_copy_findings(project.root),
                 ),
                 tags=requested_tags,
                 deploy_only=args.deploy,

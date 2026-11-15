@@ -33,8 +33,8 @@ The application decides who belongs where. Cayu enforces what that allows.
 | --- | --- | --- |
 | The application | Organizations, departments, memberships and roles, in its own tables | `database/`, `migrations/` |
 | The application | Who a request is (sign-in) | `integrations/sign_in.py` |
-| The application | Which labels a new conversation gets (personal, department or organization sharing) | `domain/sharing.py` |
-| The application | Turning a person's current memberships into Cayu grants | `policies/access.py` |
+| The application | Which policy turns a person's current memberships into Cayu grants: `cayu.memberships`' `MembershipAccessPolicy`, or its own | `policies/access.py` |
+| Cayu (`cayu.memberships`) | Reading and changing memberships in those tables, the access revision, the sharing labels a new conversation gets (`conversation_labels`) and the grants they allow | `database/memberships.py` wires it to the application's database |
 | Cayu | Checking those grants at every protected step: listing, reading, continuing, background work | `ResourceAccessPolicy`, `app.access(subject)` |
 
 Cayu asks the policy again at every protected step, so removing a member takes effect at
@@ -176,6 +176,43 @@ organization's admins manage its members on the Members page. `cayu memberships 
 --organization ORGANIZATION` lists its members and `cayu memberships remove SUBJECT
 ORGANIZATION` removes one; neither the command nor the Members page removes or demotes an
 organization's last admin.
+
+## Move to `cayu.memberships`
+
+Projects generated before Cayu had `cayu.memberships` carry their own copies of the policy
+(`policies/access.py`), the membership SQL (`database/memberships.py`) and the sharing labels
+(`domain/sharing.py`). Moving them to the library takes one commit:
+
+1. Upgrade the project's Cayu to a release with `cayu.memberships` and run `uv run --no-sync
+   cayu check`. It notes each file that is still exactly the copy Cayu generated
+   (`MEMBERSHIPS_GENERATED_COPY`). A file you edited is yours: compare it with what `cayu new`
+   generates now and carry your change over, or keep it.
+2. Generate a new project with the same capabilities next to it, for example `cayu new
+   acme-desk --preset b2b --dir /tmp/fresh`, and copy these files from it:
+   `policies/access.py`, `database/memberships.py`, `domain/organizations.py` (now only
+   `app_role`), `operations/demo_seed.py`, `integrations/http/__init__.py`,
+   `integrations/http/overview_metrics.py`, `tests/test_organizations.py`,
+   `tests/test_http_api.py`, `tests/test_generated_routes.py` and
+   `tests/test_background_revocation.py`. The "Organizations and sharing" section of
+   `README.md` and `AGENTS.md` changed too.
+3. Delete `domain/sharing.py`. Import `Membership`, `conversation_labels`, `Sharing`,
+   `InMemoryMembershipDirectory` and `MembershipAccessPolicy` from `cayu.memberships`
+   wherever your own code and tests took them from `domain/` or `policies/access.py`.
+   `DatabaseMembershipDirectory()` becomes `memberships()`, `seed(db)` becomes `seed()`,
+   `add_member` and `remove_member` become `memberships().add(...)` and
+   `memberships().remove(...)` (they are async), and the member routes call
+   `memberships().change_as_admin(...)`.
+4. Run the tests with `CAYU_TEST_POSTGRES_DSN` set; `tests/test_organizations.py` checks the
+   tables with `check_membership_tables`.
+
+There is no database migration: the library reads and writes the same `memberships` and
+`access_revision` tables. Queued and running work stays admitted, because the policy keeps
+the authority `b2b-membership-v1` and grants exactly what the generated one did. The one
+difference: it refuses a membership whose department isn't its organization's, which the
+generated tables already prevent. Members can now be managed with `uv run --no-sync cayu
+memberships list|add|remove`.
+
+The library itself is described in Cayu's `docs/memberships.md`.
 
 ## Deploy
 

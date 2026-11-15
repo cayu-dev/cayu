@@ -9,14 +9,11 @@ The generated `GET /app/overview` (integrations/http/generated/overview.py) call
 
 from __future__ import annotations
 
-import asyncio
-
+from cayu.memberships import Membership
 from cayu.sessions import SessionQuery
 from cayu.tasks import TaskQuery
 
-from database.memberships import members_of, memberships_of
-from database.session import session
-from domain.organizations import Membership
+from database.memberships import memberships
 from integrations.http.generated import Metric, OverviewContext
 
 # Tasks counted at most; more shows as this many and a plus.
@@ -25,7 +22,7 @@ TASK_COUNT_LIMIT = 1000
 
 async def overview_metrics(context: OverviewContext) -> list[Metric]:
     subject = context.person.subject
-    organizations, members = await asyncio.to_thread(_people, subject)
+    organizations, members = await _people(subject)
     access = await context.app.access(subject)
     visible = await access.sessions.list_sessions(SessionQuery(limit=1, include_total_count=True))
     own = await access.sessions.list_sessions(
@@ -63,17 +60,16 @@ async def overview_metrics(context: OverviewContext) -> list[Metric]:
     ]
 
 
-def _people(subject: str) -> tuple[list[Membership], int]:
+async def _people(subject: str) -> tuple[list[Membership], int]:
     """The person's memberships, and how many people their organizations have together."""
 
-    with session() as db:
-        records = memberships_of(db, subject)
-        people = {
-            member.subject
-            for record in records
-            for member in members_of(db, record.organization)
-        }
-    return [Membership(record.organization, record.department) for record in records], len(people)
+    records = await memberships().of_subject(subject)
+    people = {
+        member.subject
+        for record in records
+        for member in await memberships().of_organization(record.organization)
+    }
+    return [record.membership for record in records], len(people)
 
 
 def _where(membership: Membership) -> str:

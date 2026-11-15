@@ -21,11 +21,11 @@
   "files": {
     "domain/organizations.py": {
       "reference_sha256": "b3cc3ebea813e21d59d4efca170940f73396939e34dbdf05f1f6ee1705b232e8",
-      "same": true
+      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065); the reference moves under cayu-b2b-reference#3."
     },
     "integrations/http/__init__.py": {
       "reference_sha256": "ae6dd5369a24ee7e1e5c2c6aee0ec098e5005ec761469a683cdfa3b6ed130cae",
-      "deviation": "No inbox_page: without an Inbox page of its own, the Overview links to the Developer dashboard's Inbox. The person docstring says /app/inbox instead of the app's Inbox. No /app/ui router (integrations/web.py). Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). The Settings page's commands name the Cloud application (CAYU_CLOUD_APPLICATION_ID, else the slug `cayu cloud init` makes from the project's name), not the specialist's name (review of #3839)."
+      "deviation": "No inbox_page: without an Inbox page of its own, the Overview links to the Developer dashboard's Inbox. The person docstring says /app/inbox instead of the app's Inbox. No /app/ui router (integrations/web.py). Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). The Settings page's commands name the Cloud application (CAYU_CLOUD_APPLICATION_ID, else the slug `cayu cloud init` makes from the project's name), not the specialist's name (review of #3839). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065); the reference moves under cayu-b2b-reference#3."
     },
     "integrations/http/fixed_settings.py": {
       "reference_sha256": "bf0aa72f9896de69495087332a8d75a21cddef749b7ba003dc3f8715cefb3ec7",
@@ -61,15 +61,15 @@
     },
     "integrations/http/overview_metrics.py": {
       "reference_sha256": "e0e716691bbffb025644fc0f91f61c4003b59d3d604736c066e5bfc9eaf3e3fc",
-      "same": true
+      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065); the reference moves under cayu-b2b-reference#3."
     },
     "tests/test_generated_routes.py": {
       "reference_sha256": "84ee3465b174180c1ccc7645c6b9a78b8b96f4b722a545a691f5ceb6accb7142",
-      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839). A test that settings, the Overview and task runs answer an unchanged read with a 304 and a changed one with a new tag (#4005)."
+      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839). A test that settings, the Overview and task runs answer an unchanged read with a 304 and a changed one with a new tag (#4005). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065); the reference moves under cayu-b2b-reference#3."
     },
     "tests/test_http_api.py": {
       "reference_sha256": "a74e7c077c6ca57065f2c0a0c7bb68df107d23b8fffaa3f3c01b89b2ede6edfc",
-      "deviation": "Serves web/static with serve_web_app as `cayu serve` does, and checks the page at / and at a deep path, its img-src policy, assets, missing assets and unknown /app paths as 404s. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+      "deviation": "Serves web/static with serve_web_app as `cayu serve` does, and checks the page at / and at a deep path, its img-src policy, assets, missing assets and unknown /app paths as 404s. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065); the reference moves under cayu-b2b-reference#3."
     },
     "web/.gitignore": {
       "reference_sha256": "790e3169bc19b046fe55ba1da6d13b976c28363c8c00462a2195fe5faf260910",

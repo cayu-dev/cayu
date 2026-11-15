@@ -28,8 +28,12 @@ from cayu.sessions import InMemorySessionStore
 from cayu.tasks import InMemoryTaskStore
 from cayu.tasks.creation import TaskCreate
 from cayu.tasks.worker import run_task_worker
-from domain.organizations import InMemoryMembershipDirectory, Membership
-from domain.sharing import conversation_labels
+from cayu.memberships import (
+    InMemoryMembershipDirectory,
+    Membership,
+    MembershipAccessPolicy,
+    conversation_labels,
+)
 from integrations.http.generated import (
     FixedSetting,
     Metric,
@@ -38,7 +42,6 @@ from integrations.http.generated import (
     build_generated_router,
 )
 from integrations.http.generated.task_runs import TaskRun, list_task_runs
-from policies.access import MembershipAccessPolicy
 
 ALICE = Membership("acme", "acme/finance")
 PEOPLE = {

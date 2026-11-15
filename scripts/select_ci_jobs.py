@@ -88,6 +88,8 @@ _GENERATED_PROJECT_PREFIXES = (
     "src/cayu/cli/scaffold",
     "src/cayu/cli/_scaffold",
     "src/cayu/cli/templates/",
+    # Generated organizations projects import it instead of carrying copies.
+    "src/cayu/memberships/",
     "tests/fixtures/preset_trees/",
 )
 _GENERATED_PROJECT_EXACT_PATHS = {

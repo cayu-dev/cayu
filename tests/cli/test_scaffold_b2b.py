@@ -44,7 +44,6 @@ B2B_FILES = (
     "tests/test_background_revocation.py",
     "domain/organizations.py",
     "database/memberships.py",
-    "domain/sharing.py",
     "policies/access.py",
     "operations/demo_seed.py",
     "migrations/versions/0002_organizations.py",
@@ -84,8 +83,17 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
     assert serve["routers"] == ["integrations.http:build_router"]
     assert serve["auth"] == "cayu.server.environment_auth:OPERATOR_ONLY_AUTH"
     assert "role: Mapped[str]" in files["database/models.py"]
-    # The sharing labels Cayu enforces can't be changed by the people they protect.
-    assert "protected_label_keys" in files["policies/access.py"]
+    # The policy, sharing labels and membership SQL are Cayu's (`cayu.memberships`), not
+    # copies in the project.
+    assert "MembershipAccessPolicy(memberships())" in files["policies/access.py"]
+    assert "PostgresMemberships(" in files["database/memberships.py"]
+    assert "domain/sharing.py" not in files
+    for path, text in files.items():
+        if path.endswith(".py") and not path.startswith("migrations/"):
+            assert "class MembershipAccessPolicy" not in text, path
+            assert "def conversation_labels" not in text, path
+            assert "AccessRevision.revision + 1" not in text, path
+            assert "with_for_update" not in text, path
 
 
 def test_the_project_has_no_knowledge_or_memory_homes() -> None:

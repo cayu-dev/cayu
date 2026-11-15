@@ -157,6 +157,20 @@ cayu memberships remove carol acme
 It refuses removing or demoting an organization's last admin, and a department of another
 organization. `--schema` names another schema; `--json` prints JSON.
 
+## In generated projects
+
+`cayu new --preset b2b` and `cayu new --with organizations` wire these pieces into the
+project: `database/memberships.py` builds `PostgresMemberships` over the application's own
+connection pool, `policies/access.py` builds `MembershipAccessPolicy` over it, and the member
+routes call `change_as_admin`. The tables, sign-in, roles (`app_role`), routes and pages stay
+the project's.
+
+Projects generated before `cayu.memberships` carry their own copies. `cayu check` notes each
+`policies/access.py` or `database/memberships.py` that is still exactly the copy a release
+generated (`MEMBERSHIPS_GENERATED_COPY`, info) and leaves edited ones alone; `cayu guide
+b2b#move-to-cayumemberships` walks through the move. It needs no database migration, and
+queued work stays admitted because the authority and grant are unchanged.
+
 ## Your own pieces
 
 - Memberships somewhere else (an identity provider's groups, another service): write a
