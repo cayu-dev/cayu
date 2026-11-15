@@ -2512,7 +2512,8 @@ who belongs where; Cayu enforces it.
 
 `web/` is one React app, served at `/` and calling only `/app`. Each file says in its
 first doc comment whether it is `GENERATED.` (the generator owns it and may rewrite it) or
-`THE AGENT'S OWN.` (yours).
+`THE AGENT'S OWN.` (yours). `uv run --no-sync cayu guide app-ui` covers the app's parts and
+how to add an area.
 
 | Path | What it is | Whose |
 | --- | --- | --- |
@@ -2549,7 +2550,8 @@ _AGENTS_ROWS = {
         "| A web UI for the organizations' people | `web/`, served at `/`, calling only "
         "`/app`: add an area in `web/src/agent/` and list it in `web/src/agent/index.tsx`; leave "
         '`GENERATED.` files to the generator (README "The web app"). Not `client.js`: it calls '
-        "the operator API, which people signed in as members can't use. | `cayu guide b2b` |"
+        "the operator API, which people signed in as members can't use. | `cayu guide app-ui`, "
+        "`cayu guide b2b` |"
     ),
     "| People from separate organizations (customers, client firms) sharing one deployment, "
     "each seeing only their own organization's data | `cayu new NAME --preset b2b`: the web "

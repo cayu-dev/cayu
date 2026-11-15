@@ -119,6 +119,7 @@ class VerificationScope:
     release_artifacts: bool
     sqlite_cancellation: bool
     fault_injection: bool
+    generated_projects: bool
 
 
 _PACKAGE_VERIFICATION_GROUPS = (
@@ -401,7 +402,13 @@ def _resolve_scope(root: Path, base_sha: str, head_sha: str) -> VerificationScop
         if not separator or raw_value not in {"true", "false"}:
             raise RuntimeError(f"unexpected CI scope output: {line!r}")
         values[name] = raw_value == "true"
-    expected = {"dashboard", "release_artifacts", "sqlite_cancellation", "fault_injection"}
+    expected = {
+        "dashboard",
+        "release_artifacts",
+        "sqlite_cancellation",
+        "fault_injection",
+        "generated_projects",
+    }
     if values.keys() != expected:
         raise RuntimeError(f"unexpected CI scope keys: {sorted(values)}")
     return VerificationScope(**values)
@@ -961,6 +968,27 @@ fi
     )
 
 
+def _run_generated_projects(runner: LocalCiRunner, case: str | None = None) -> None:
+    """Generate each preset case's project from this checkout and run what its own CI runs.
+
+    Without a case, every case, one after another (scripts/check_generated_project.py).
+    """
+
+    runner.run("Sync generator environment", ("uv", "sync", "--frozen"))
+    _validate_node_environment(runner)
+    runner.run(
+        f"Generated project {case}" if case else "Generated projects",
+        (
+            "uv",
+            "run",
+            "--no-sync",
+            "python",
+            "scripts/check_generated_project.py",
+            *((case,) if case else ()),
+        ),
+    )
+
+
 def _prepare_package_environment(runner: LocalCiRunner) -> None:
     runner.run("Install Python 3.11 for package checks", ("uv", "python", "install", "3.11"))
     runner.run(
@@ -1155,6 +1183,7 @@ def _write_proof(
         f"- `release_artifacts={str(scope.release_artifacts).lower()}`",
         f"- `sqlite_cancellation={str(scope.sqlite_cancellation).lower()}`",
         f"- `fault_injection={str(scope.fault_injection).lower()}`",
+        f"- `generated_projects={str(scope.generated_projects).lower()}`",
         f"- `fault_injection_points={'every' if exhaustive_fault_injection else 'sample'}`",
         f"- `publishing={str(publishing).lower()}`",
         "",
@@ -1217,6 +1246,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "sqlite-cancellation",
             "fault-injection",
             "dashboard",
+            "generated-project",
             "package",
         ),
         help="run one canonical lane (used by GitHub Actions); plan prints the shard plan",
@@ -1230,6 +1260,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--specialist-lane",
         choices=_ALL_SPECIALIST_LANES,
         help="specialist lane identity",
+    )
+    parser.add_argument(
+        "--generated-project",
+        help="generated-project lane: the case (scripts/check_generated_project.py --list)",
     )
     parser.add_argument("--package-group", choices=_PACKAGE_GROUPS)
     parser.add_argument("--package-artifacts", type=Path)
@@ -1376,6 +1410,10 @@ def _run_ci_lane(args: argparse.Namespace) -> int:
             _run_fault_injection(runner, exhaustive=args.exhaustive_fault_injection)
         elif args.lane == "dashboard":
             _run_dashboard(runner)
+        elif args.lane == "generated-project":
+            if args.generated_project is None:
+                raise ValueError("--lane generated-project requires --generated-project")
+            _run_generated_projects(runner, args.generated_project)
         elif args.lane == "package":
             with tempfile.TemporaryDirectory(
                 prefix="cayu-local-package-ci-",
@@ -1436,7 +1474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if initial_execution_untracked:
                 raise RuntimeError("isolated CI worktree unexpectedly contains untracked paths")
             scope = (
-                VerificationScope(True, True, True, True)
+                VerificationScope(True, True, True, True, True)
                 if args.all
                 else _resolve_scope(execution_root, base_sha, head_sha)
             )
@@ -1455,6 +1493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"release_artifacts={scope.release_artifacts} "
                 f"sqlite_cancellation={scope.sqlite_cancellation} "
                 f"fault_injection={scope.fault_injection} "
+                f"generated_projects={scope.generated_projects} "
                 f"fault_injection_points={'every' if exhaustive_fault_injection else 'sample'} "
                 f"publishing={args.publishing} jobs={args.jobs}"
             )
@@ -1488,6 +1527,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _run_fault_injection(runner, exhaustive=exhaustive_fault_injection)
                     if scope.dashboard:
                         _run_dashboard(runner)
+                    if scope.generated_projects:
+                        _run_generated_projects(runner)
                     if scope.release_artifacts:
                         _run_release_artifacts(
                             runner,

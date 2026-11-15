@@ -70,6 +70,7 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
             "package",
             "release-qualification",
             "dashboard",
+            "generated-projects",
             "publish",
             "github-release",
         )
@@ -94,6 +95,7 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
         "package",
         "release-qualification",
         "dashboard",
+        "generated-projects",
         "publish",
         "github-release",
     }
@@ -105,7 +107,13 @@ def test_pull_requests_and_manual_runs_keep_selected_high_value_gates() -> None:
     scope = _job_block(workflow, "verification-scope")
     assert "python3 scripts/select_ci_jobs.py" in scope
     assert 'test "$EVENT_NAME" != "pull_request"' in scope
-    for output in ("dashboard", "release_artifacts", "sqlite_cancellation", "fault_injection"):
+    for output in (
+        "dashboard",
+        "release_artifacts",
+        "sqlite_cancellation",
+        "fault_injection",
+        "generated_projects",
+    ):
         assert f'echo "{output}=true"' in scope
         assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
 
@@ -302,7 +310,7 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
         "needs: [static, python-tests, sqlite-cancellation, fault-injection, package-build, "
-        "package, dashboard, release-qualification]" in publish
+        "package, dashboard, generated-projects, release-qualification]" in publish
     )
     assert (
         "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in github_release
@@ -520,7 +528,7 @@ def test_private_release_prs_force_validation_without_enabling_publication(tmp_p
     scripts.mkdir()
     (scripts / "select_ci_jobs.py").write_text(
         'print("dashboard=false\\nrelease_artifacts=false\\nsqlite_cancellation=false'
-        '\\nfault_injection=false")\n'
+        '\\nfault_injection=false\\ngenerated_projects=false")\n'
     )
     for event, candidate, forced in (
         ("pull_request", "true", True),
@@ -548,6 +556,7 @@ def test_private_release_prs_force_validation_without_enabling_publication(tmp_p
             "release_artifacts": str(forced).lower(),
             "sqlite_cancellation": str(forced).lower(),
             "fault_injection": str(forced).lower(),
+            "generated_projects": str(forced).lower(),
         }
     tests = _job_block(workflow, "python-tests")
     assert "needs: verification-scope" in tests

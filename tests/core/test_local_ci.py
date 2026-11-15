@@ -49,6 +49,7 @@ def test_workflow_routes_canonical_lanes_and_keeps_release_state_tag_only() -> N
         "python3 scripts/run_ci.py --lane sqlite-cancellation",
         "python3 scripts/run_ci.py --lane package",
         "python3 scripts/run_ci.py --lane dashboard",
+        "python3 scripts/run_ci.py --lane generated-project",
     ):
         assert command in workflow
 
@@ -575,7 +576,7 @@ def test_proof_distinguishes_publication_policy_and_skipped_commands(
         head_sha="b" * 40,
         merge_base="a" * 40,
         changed_paths=("src/cayu/tasks/base.py",),
-        scope=VerificationScope(True, True, True, True),
+        scope=VerificationScope(True, True, True, True, True),
         source_untracked=("?? local-proof.md",),
         execution_untracked=("?? generated-output.txt",),
         open_file_limits=(256, 8192),

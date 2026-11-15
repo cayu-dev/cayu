@@ -24,6 +24,7 @@ def test_unrelated_pull_request_keeps_expensive_jobs_skipped() -> None:
         release_artifacts=False,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
 
 
@@ -33,6 +34,7 @@ def test_sqlite_regression_path_selects_only_cross_version_lane() -> None:
         release_artifacts=False,
         sqlite_cancellation=True,
         fault_injection=True,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["tests/examples/test_sqlite_example_paths.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/_task_wait.py"]) == expected
@@ -52,6 +54,7 @@ def test_runtime_change_selects_sqlite_dashboard_and_fault_injection_lanes() -> 
         release_artifacts=False,
         sqlite_cancellation=True,
         fault_injection=True,
+        generated_projects=False,
     )
 
 
@@ -81,6 +84,7 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
 
     dashboard_only = VerificationScope(
@@ -88,6 +92,7 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         release_artifacts=False,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["scripts/generate_dashboard_api_types.py"]) == dashboard_only
     assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == VerificationScope(
@@ -95,12 +100,14 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
     assert select_pull_request_jobs(["tests/browser_client/client.test.mjs"]) == dashboard_only
     assert select_pull_request_jobs(["src/cayu/server/browser_client/client.js"]) == dashboard_only
     # The web app templates, the generic app and its layers, and how they compose, are built
-    # and checked in the dashboard job, which has Node, and ship in the package.
+    # and checked in the dashboard job, which has Node, and ship in the package. Generated
+    # projects build them too.
     for path in (
         "src/cayu/cli/templates/app_web/src/main.tsx",
         "src/cayu/cli/templates/app_web_operators/src/agent/task-runs.tsx",
@@ -109,14 +116,25 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
         "src/cayu/cli/scaffold_app_web.py",
     ):
         assert select_pull_request_jobs([path]) == VerificationScope(
-            dashboard=True, release_artifacts=True, sqlite_cancellation=False, fault_injection=False
+            dashboard=True,
+            release_artifacts=True,
+            sqlite_cancellation=False,
+            fault_injection=False,
+            generated_projects=True,
         )
-    assert select_pull_request_jobs(["scripts/build_app_web.py"]) == dashboard_only
+    assert select_pull_request_jobs(["scripts/build_app_web.py"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=False,
+        sqlite_cancellation=False,
+        fault_injection=False,
+        generated_projects=True,
+    )
     assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
         dashboard=True,
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
 
 
@@ -126,6 +144,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["LICENSE"]) == expected
     assert select_pull_request_jobs(["README.md"]) == expected
@@ -157,6 +176,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         release_artifacts=True,
         sqlite_cancellation=True,
         fault_injection=True,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["tests/cli/test_scaffold_docker_live.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/guides/evals-first.md"]) == expected
@@ -165,6 +185,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(
         ["src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"]
@@ -173,6 +194,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
 
 
@@ -182,6 +204,7 @@ def test_cloud_cli_changes_select_release_artifact_lane() -> None:
         release_artifacts=True,
         sqlite_cancellation=False,
         fault_injection=False,
+        generated_projects=False,
     )
     assert select_pull_request_jobs(["src/cayu/cli/cloud.py"]) == expected
     assert select_pull_request_jobs(["src/cayu/cli/_cloud_project.py"]) == expected
@@ -193,6 +216,7 @@ def test_dependency_or_scope_changes_fail_open() -> None:
         release_artifacts=True,
         sqlite_cancellation=True,
         fault_injection=True,
+        generated_projects=True,
     )
     assert select_pull_request_jobs(["pyproject.toml"]) == all_jobs
     assert select_pull_request_jobs([".github/workflows/ci.yml"]) == all_jobs
@@ -211,8 +235,10 @@ def test_github_outputs_are_stable_lowercase_booleans() -> None:
         release_artifacts=False,
         sqlite_cancellation=True,
         fault_injection=False,
+        generated_projects=False,
     ).render_github_outputs() == (
         "dashboard=true\nrelease_artifacts=false\nsqlite_cancellation=true\nfault_injection=false"
+        "\ngenerated_projects=false"
     )
 
 
@@ -248,6 +274,8 @@ def test_public_export_and_layout_changes_select_all_contract_lanes(path: str) -
         release_artifacts=True,
         sqlite_cancellation=True,
         fault_injection=True,
+        # The layout inventories define CI scope, so they select every job.
+        generated_projects=path.startswith("docs/"),
     )
 
 
@@ -274,4 +302,28 @@ def test_new_concept_helpers_keep_runtime_ci_coverage(package: str, helper: str)
         release_artifacts=False,
         sqlite_cancellation=True,
         fault_injection=True,
+        generated_projects=False,
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/cayu/cli/scaffold.py",
+        "src/cayu/cli/scaffold_ci.py",
+        "src/cayu/cli/scaffold_organizations.py",
+        "src/cayu/cli/_scaffold_test_tools.py",
+        "src/cayu/cli/coding_composition.py",
+        "src/cayu/cli/templates/app_web/package.json",
+        "tests/fixtures/preset_trees/agent.json",
+        "tests/fixtures/b2b_tree.json",
+        "scripts/check_generated_project.py",
+    ],
+)
+def test_scaffold_changes_select_the_generated_projects(path: str) -> None:
+    assert select_pull_request_jobs([path]).generated_projects
+
+
+def test_other_cli_changes_leave_the_generated_projects_to_main() -> None:
+    assert not select_pull_request_jobs(["src/cayu/cli/cloud.py"]).generated_projects
+    assert not select_pull_request_jobs(["src/cayu/server/app.py"]).generated_projects

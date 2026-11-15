@@ -81,6 +81,21 @@ _DASHBOARD_EXACT_PATHS = {
     # How the web app templates compose, which scripts/build_app_web.py builds.
     "src/cayu/cli/scaffold_app_web.py",
 }
+# What `cayu new` writes, and what proves it: the generated projects' matrix
+# (scripts/check_generated_project.py) runs when one changes. A change elsewhere in Cayu that
+# breaks a generated project shows on main, where every gate runs.
+_GENERATED_PROJECT_PREFIXES = (
+    "src/cayu/cli/scaffold",
+    "src/cayu/cli/_scaffold",
+    "src/cayu/cli/templates/",
+    "tests/fixtures/preset_trees/",
+)
+_GENERATED_PROJECT_EXACT_PATHS = {
+    "scripts/build_app_web.py",
+    "scripts/check_generated_project.py",
+    "src/cayu/cli/coding_composition.py",
+    "tests/fixtures/b2b_tree.json",
+}
 _RELEASE_EXACT_PATHS = {
     ".gitattributes",
     "LICENSE",
@@ -126,6 +141,7 @@ class VerificationScope:
     release_artifacts: bool
     sqlite_cancellation: bool
     fault_injection: bool
+    generated_projects: bool
 
     def render_github_outputs(self) -> str:
         return "\n".join(
@@ -134,6 +150,7 @@ class VerificationScope:
                 f"release_artifacts={str(self.release_artifacts).lower()}",
                 f"sqlite_cancellation={str(self.sqlite_cancellation).lower()}",
                 f"fault_injection={str(self.fault_injection).lower()}",
+                f"generated_projects={str(self.generated_projects).lower()}",
             )
         )
 
@@ -154,6 +171,9 @@ def select_pull_request_jobs(changed_paths: Iterable[str]) -> VerificationScope:
         fault_injection=scope_definition_changed
         or dependency_changed
         or any(_affects_fault_injection(path) for path in paths),
+        generated_projects=scope_definition_changed
+        or dependency_changed
+        or any(_affects_generated_projects(path) for path in paths),
     )
 
 
@@ -173,6 +193,10 @@ def _affects_sqlite_cancellation(path: str) -> bool:
 
 def _affects_fault_injection(path: str) -> bool:
     return _affects_sqlite_cancellation(path) or path.startswith(_FAULT_INJECTION_PREFIXES)
+
+
+def _affects_generated_projects(path: str) -> bool:
+    return path in _GENERATED_PROJECT_EXACT_PATHS or path.startswith(_GENERATED_PROJECT_PREFIXES)
 
 
 def _affects_dashboard(path: str) -> bool:

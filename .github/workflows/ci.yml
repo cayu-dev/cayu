@@ -35,6 +35,7 @@ jobs:
       release_artifacts: ${{ steps.scope.outputs.release_artifacts }}
       sqlite_cancellation: ${{ steps.scope.outputs.sqlite_cancellation }}
       fault_injection: ${{ steps.scope.outputs.fault_injection }}
+      generated_projects: ${{ steps.scope.outputs.generated_projects }}
     steps:
       - name: Check out the compared history
         if: github.event_name == 'pull_request'
@@ -59,6 +60,7 @@ jobs:
               echo "release_artifacts=true"
               echo "sqlite_cancellation=true"
               echo "fault_injection=true"
+              echo "generated_projects=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -244,6 +246,61 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: python3 scripts/run_ci.py --lane dashboard
 
+  # A project `cayu new` writes from this checkout for each case passes what its own
+  # generated CI runs: `uv sync`, its tests, `cayu check`, the web app's smoke test in a
+  # browser, and the web app's lint, typecheck and build. Pull requests run it when what
+  # `cayu new` writes changes; main runs it on every push. scripts/check_generated_project.py
+  # owns the cases; tests/cli/test_generated_projects.py keeps this list equal to them.
+  generated-projects:
+    name: Generated project (${{ matrix.case }})
+    needs: verification-scope
+    if: needs.verification-scope.outputs.generated_projects == 'true'
+    # The cases with application tables start a throwaway PostgreSQL server in Docker.
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - agent
+          - agent-without-web-app
+          - service
+          - coding
+          - coding-without-web-app
+          - long-running
+          - long-running-without-web-app
+          - b2b
+          - agent-organizations
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The generated project installs into the same uv cache: UV_CACHE_DIR, which this
+      # sets, overrides the project's own `[tool.uv] cache-dir`.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          cache-suffix: generated-projects
+          prune-cache: false
+      # The generated workflow's Node, and the npm cache of the lockfiles it copies.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            src/cayu/cli/templates/app_web/package-lock.json
+            src/cayu/cli/templates/app_web/e2e/package-lock.json
+      # Playwright's system dependencies read the apt sources this points at the primary
+      # archive.
+      - name: Install system packages
+        timeout-minutes: 5
+        uses: ./.github/actions/install-system-packages
+        with:
+          packages: ripgrep
+          commands: rg
+      - name: Generate the project and run its own checks
+        run: >-
+          python3 scripts/run_ci.py --lane generated-project
+          --generated-project "${{ matrix.case }}"
+
   release-qualification:
     name: Release qualification
     needs: verification-scope
@@ -272,7 +329,7 @@ jobs:
       github.event_name == 'push' &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, python-tests, sqlite-cancellation, fault-injection, package-build, package, dashboard, release-qualification]
+    needs: [static, python-tests, sqlite-cancellation, fault-injection, package-build, package, dashboard, generated-projects, release-qualification]
     runs-on: ${{ fromJSON(vars.CI_RUNNER_GENERAL || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     environment:

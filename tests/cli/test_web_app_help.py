@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from cayu.cli import main
 from cayu.cli.scaffold import project_files
-from cayu.cli.scaffold_plan import PRESETS, WEB_APP
+from cayu.cli.scaffold_plan import PRESETS, WEB_APP, normalize_application_plan
 
 if TYPE_CHECKING:
     import pytest
@@ -96,3 +96,25 @@ def test_the_presets_with_the_web_app_say_so(capsys: pytest.CaptureFixture[str])
     explained = _output(capsys, "new", "--explain", "web-app")
     on_by_default = [spec.name for spec in PRESETS if WEB_APP in spec.default_capabilities]
     assert "On by default in: " + ", ".join(on_by_default) in explained
+
+
+def test_a_projects_readme_and_agents_md_point_at_the_app_ui_guide() -> None:
+    projects = {
+        spec.name: project_files("acme", preset=spec.name)
+        for spec in PRESETS
+        if WEB_APP in spec.default_capabilities
+    }
+    assert {"agent", "coding", "long-running", "b2b"} <= projects.keys()
+    projects["agent with organizations"] = project_files(
+        "acme",
+        application_plan=normalize_application_plan(
+            name="acme",
+            agent_name="acme",
+            with_capabilities=("organizations",),
+            without_capabilities=("knowledge", "memory"),
+        ),
+    )
+    for name, files in projects.items():
+        assert "web/package.json" in files, name
+        for document in ("README.md", "AGENTS.md"):
+            assert "cayu guide app-ui" in files[document], (name, document)

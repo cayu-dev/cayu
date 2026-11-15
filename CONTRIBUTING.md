@@ -454,6 +454,15 @@ freshness and tag/version checks, and may publish the exact artifact validated b
 path. Package verification builds one wheel and source archive, then checks those same archives
 in parallel core, server, campaign, dashboard, authoring, coding, Docker, and service jobs.
 
+When what `cayu new` writes changes (the scaffold modules, the web app templates, the recorded
+preset trees), and on every push to main, one job per case generates a project from the
+checkout and runs what the project's own generated CI runs: `uv sync`, its tests, `cayu check`,
+and for a web app its smoke test, lint, typecheck and build. The cases are every preset, every
+preset that has the web app without it, and the agent preset with organizations
+(`uv run --no-sync python scripts/check_generated_project.py --list`). Run one locally with
+`uv run --no-sync python scripts/check_generated_project.py CASE`; it needs Node, and Docker for
+the cases with application tables.
+
 Run the complete contract, including full-scale qualification, locally from a clean tracked checkout:
 
 ```bash
