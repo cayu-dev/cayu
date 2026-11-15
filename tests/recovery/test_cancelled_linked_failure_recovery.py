@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -30,11 +31,25 @@ from cayu.tasks.records import TaskClaimLost
 
 
 def _crash_failure_with_cancellation(root: Path, cancellation: str) -> None:
+    # The worker isolates handler failures, so an exception raised inside a
+    # patched boundary would otherwise only show up as "the worker returned".
+    # Keep a trail of the boundaries reached and every failure seen on the way,
+    # and report both if the process does not die where it is meant to.
+    trail: list[str] = []
+    failures: list[str] = []
+
+    def reached(boundary: str) -> None:
+        trail.append(boundary)
+
+    def failed(boundary: str) -> None:
+        failures.append(f"{boundary}:\n{traceback.format_exc()}")
+
     async def run():
         with pytest.MonkeyPatch.context() as patch:
             app, _store, provider = _application(root, patch)
 
             async def fail(_request):
+                reached("provider stream")
                 assert (root / "allocated").exists()
                 yield ModelStreamEvent.error("original failure wins the session")
                 yield ModelStreamEvent.completed({"finish_reason": "error"})
@@ -45,18 +60,33 @@ def _crash_failure_with_cancellation(root: Path, cancellation: str) -> None:
             fail_task = app._session_finalization.fail_task
 
             async def cancel_after_election(**kwargs):
-                await elect(**kwargs)
-                task = await app.task_store.load_task("linked")
-                requested = await app.task_store.request_claimed_task_cancellation(
-                    task.id, task.worker_id, claim_generation=task.claim_generation
-                )
-                assert _task_cancellation_requested(requested)
+                try:
+                    await elect(**kwargs)
+                    reached("failure elected")
+                    task = await app.task_store.load_task("linked")
+                    requested = await app.task_store.request_claimed_task_cancellation(
+                        task.id, task.worker_id, claim_generation=task.claim_generation
+                    )
+                    assert _task_cancellation_requested(requested)
+                    reached("cancellation requested")
+                except BaseException:
+                    failed("electing the failure and requesting cancellation")
+                    raise
                 if cancellation == "requested":
                     os._exit(137)
 
             async def die_after_cancelled_task(**kwargs):
-                task = await fail_task(**kwargs)
-                assert task.status is TaskStatus.CANCELLED
+                reached("fail_task entered")
+                try:
+                    task = await fail_task(**kwargs)
+                except BaseException:
+                    failed("fail_task")
+                    raise
+                reached(f"fail_task returned {task.status.value}")
+                if task.status is not TaskStatus.CANCELLED:
+                    message = f"fail_task returned a {task.status.value} task, not a cancelled one"
+                    failures.append(message)
+                    raise AssertionError(message)
                 os._exit(137)
 
             patch.setattr(
@@ -65,28 +95,54 @@ def _crash_failure_with_cancellation(root: Path, cancellation: str) -> None:
             patch.setattr(app._session_finalization, "fail_task", die_after_cancelled_task)
 
             async def handler(application, task, worker_id):
-                async for _ in application.run(
-                    RunRequest(
-                        agent_name="coding",
-                        session_id="cancelled-failure",
-                        task_id=task.id,
-                        task_worker_id=worker_id,
-                        task_lease_expires_at=task.lease_expires_at,
-                        messages=[Message.text("user", "work")],
-                    )
-                ):
-                    pass
+                reached("handler started")
+                try:
+                    async for _ in application.run(
+                        RunRequest(
+                            agent_name="coding",
+                            session_id="cancelled-failure",
+                            task_id=task.id,
+                            task_worker_id=worker_id,
+                            task_lease_expires_at=task.lease_expires_at,
+                            messages=[Message.text("user", "work")],
+                        )
+                    ):
+                        pass
+                except BaseException:
+                    failed("handler run")
+                    raise
+                reached("handler returned")
 
-            await run_task_worker(
-                app,
-                app.task_store,
-                handler,
-                worker_id="original",
-                lease_seconds=1,
-                max_tasks=1,
-                reclaim=False,
+            try:
+                handled = await run_task_worker(
+                    app,
+                    app.task_store,
+                    handler,
+                    worker_id="original",
+                    lease_seconds=1,
+                    max_tasks=1,
+                    reclaim=False,
+                )
+                reached(f"worker returned after {handled} task(s)")
+            except BaseException:
+                failed("run_task_worker")
+            final = await app.task_store.load_task("linked")
+            report = "\n".join(
+                [
+                    "Worker did not reach the elected cancellation/failure boundary.",
+                    f"Boundaries reached: {trail}",
+                    "Final task: "
+                    + (
+                        "missing"
+                        if final is None
+                        else f"status={final.status.value} reason={final.status_reason} "
+                        f"cancellation_requested={_task_cancellation_requested(final)} "
+                        f"error={final.error}"
+                    ),
+                    *failures,
+                ]
             )
-            raise AssertionError("Worker did not reach the elected cancellation/failure boundary")
+            raise AssertionError(report)
 
     asyncio.run(run())
 
@@ -131,7 +187,13 @@ def _crash_process(root: Path, entry: str, cancellation: str) -> None:
         capture_output=True,
         timeout=60,
     )
-    assert child.returncode == 137, (child.stdout, child.stderr)
+    if child.returncode != 137:
+        # pytest shortens long assertion values, which hides the child's report.
+        pytest.fail(
+            f"{entry} exited with {child.returncode}, not 137.\n"
+            f"stdout:\n{child.stdout}\nstderr:\n{child.stderr}",
+            pytrace=False,
+        )
 
 
 @pytest.mark.parametrize("cancellation", ["requested", "cancelled"])

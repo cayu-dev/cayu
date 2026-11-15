@@ -444,7 +444,10 @@ async def _settle_claim_or_requested_cancellation(
     """The terminal task, and whether the owner's cancellation request settled it.
 
     The cancellation is fenced by the failing request: its worker, its handoff,
-    and its claim generation, or without one its lease when it carries one.
+    and its claim generation. A request without one (a runtime failure, which
+    carries at most the lease it was dispatched with) is checked against the
+    loaded row, its lease too when it carries one, and the cancellation is then
+    fenced by that row's claim generation, which lease renewals keep.
     Once settled, a repeat of the same request returns the task that request's
     receipt cancelled. A worker may supply its stable generation for cancellation
     settlement separately, preserving an elected failure request's digest.
@@ -487,10 +490,19 @@ async def _settle_claim_or_requested_cancellation(
             and task.lease_expires_at != request.lease_expires_at
         ):
             raise
+        # The row just loaded is this worker's claim. Fence the cancellation by
+        # that claim's generation, not by the lease expiry read with it: the
+        # claim's own heartbeat keeps renewing the lease, and a renewal landing
+        # before the write below would otherwise lose a settlement that belongs
+        # to this claim. A later claim still advances the generation.
         cancellation = _task_cancellation_terminalization_request(
             task,
             worker_id=request.worker_id,
-            claim_generation=cancellation_claim_generation,
+            claim_generation=(
+                task.claim_generation
+                if cancellation_claim_generation is None
+                else cancellation_claim_generation
+            ),
         )
         if cancellation is None:
             raise

@@ -26,6 +26,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.sessions import InMemorySessionStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore
 from cayu.tasks import InMemoryTaskStore, TaskCreate, TaskStatus
+from cayu.tasks import _terminalization as terminalization_module
 from cayu.tasks import worker as worker_module
 from cayu.tasks._cancellation import _task_cancellation_terminalization_request
 from cayu.tasks._terminalization import (
@@ -356,5 +357,91 @@ def test_a_worker_failure_settles_its_cancellation_after_its_lease_was_renewed()
         )
         assert await _terminalize_claimed_task_or_detect_peer_winner(tasks, failure) is True
         assert (await tasks.load_task(claimed.id)).status is TaskStatus.CANCELLED
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_a_session_failure_settles_its_cancellation_when_a_renewal_lands_before_the_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """The claim's heartbeat may renew between loading the request and settling it.
+
+    A runtime failure carries no claim generation. The cancellation it settles
+    is fenced by the loaded claim's generation rather than its lease expiry, so
+    a renewal by the same claim landing before the write still settles it and
+    the elected failure with it.
+    """
+
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        tasks = (
+            InMemoryTaskStore()
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "tasks.sqlite")
+        )
+        task = await tasks.create_task(TaskCreate(type=TASK_TYPE))
+        app = _app(store, tasks)
+        policy = _FailingStopPolicy()
+
+        async def handler(app: CayuApp, task, worker_id: str) -> None:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=SESSION_ID,
+                    task_id=task.id,
+                    task_worker_id=worker_id,
+                    task_lease_expires_at=task.lease_expires_at,
+                    messages=[Message.text("user", "answer")],
+                    loop_policies=(policy,),
+                )
+            ):
+                pass
+
+        terminalize = terminalization_module._terminalize_claimed_task
+        renewals = []
+
+        async def renew_before_cancellation(task_store, request):
+            if request.kind is TaskTerminalKind.CANCELLED and not renewals:
+                current = await tasks.load_task(request.task_id)
+                renewed = await tasks.heartbeat(
+                    current.id,
+                    WORKER_ID,
+                    claim_generation=current.claim_generation,
+                    extend_seconds=600,
+                )
+                renewals.append((current.lease_expires_at, renewed.lease_expires_at))
+            return await terminalize(task_store, request)
+
+        monkeypatch.setattr(
+            terminalization_module, "_terminalize_claimed_task", renew_before_cancellation
+        )
+        try:
+            worker = asyncio.create_task(
+                run_task_worker(
+                    app,
+                    tasks,
+                    handler,
+                    worker_id=WORKER_ID,
+                    query=TaskQuery(type=TASK_TYPE),
+                    max_tasks=1,
+                    poll_interval_s=0.005,
+                    reclaim=False,
+                    recover_interrupted_handoffs=False,
+                )
+            )
+            await asyncio.wait_for(policy.entered.wait(), timeout=10)
+            claimed = await tasks.load_task(task.id)
+            await tasks.request_claimed_task_cancellation(
+                claimed.id, WORKER_ID, claim_generation=claimed.claim_generation
+            )
+            policy.release.set()
+            assert await asyncio.wait_for(worker, timeout=10) == 1
+            assert len(renewals) == 1 and renewals[0][0] != renewals[0][1]
+            await _assert_failed_session_with_cancelled_task(store, tasks, task.id)
+        finally:
+            await app.aclose()
+            if backend == "sqlite":
+                await tasks.close()
 
     asyncio.run(scenario())
