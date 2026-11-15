@@ -782,7 +782,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 chunks=copied_chunks,
                 evidence=copied_evidence,
                 expected_revision=expected_revision,
-                access_scope=scope,
+                access_scope=self._presented_access_scope(access_scope),
             )
         async with self._lock:
             with sqlite_connection._transaction(self._connection):

@@ -19,11 +19,9 @@ application database it needs:
   `/cayu/`.
 - `--without organizations` and `--without web-app` are refused on b2b. For an Agent
   without organizations, choose another preset.
-- The agent preset takes the same organizations with `cayu new NAME --with organizations
-  --without knowledge,memory`. Organizations can't be combined with knowledge or memory:
-  the agent reads one knowledge store in every conversation, so what it learned in one
-  organization's conversation would reach another's. The coding, long-running and service
-  presets don't take organizations.
+- The agent preset takes the same organizations with `cayu new NAME --with organizations`,
+  and keeps its knowledge and memory, scoped to each organization (see "Knowledge and
+  memory" below). The coding, long-running and service presets don't take organizations.
 
 ## Who decides what
 
@@ -176,6 +174,34 @@ organization's admins manage its members on the Members page. `cayu memberships 
 --organization ORGANIZATION` lists its members and `cayu memberships remove SUBJECT
 ORGANIZATION` removes one; neither the command nor the Members page removes or demotes an
 organization's last admin.
+
+## Knowledge and memory
+
+The b2b preset has no knowledge or memory. `cayu new NAME --with organizations` on the agent
+preset keeps both, and each organization's knowledge is its own. The knowledge store
+enforces it, so no tool has to remember to filter:
+
+- `policies/access.py` builds `MembershipAccessPolicy(memberships(), knowledge=True)`: a
+  member reads, creates and revises knowledge labelled with one of their organizations, and
+  nothing of any other organization's.
+- `knowledge/retrieval.py` sets `session_label_keys=("organization",)` on the knowledge scope:
+  inside a conversation, every knowledge read and write is pinned to that conversation's
+  verified `organization` label. A person in two organizations recalls only the current
+  conversation's organization's knowledge, so it never lands in a conversation the other
+  organization's members read.
+- `remember_knowledge` copies `organization` from the conversation
+  (`RememberKnowledgePolicy(copy_session_labels=("organization",))`), never from the model.
+  The store refuses a note without it, or with another organization's.
+- Recall, `search_knowledge`, `read_knowledge`, `list_knowledge` and the pending notes recall
+  offers all read through the same filter.
+- Curation is per organization: `uv run --no-sync cayu knowledge list --status pending
+  --label organization=acme`, then `cayu knowledge keep` or `drop`. A curator or a
+  maintenance run takes `labels={"organization": ...}` for one organization. Operator and
+  background work outside a member's conversation isn't narrowed, so give operator-written
+  knowledge an `organization` label, or members won't see it.
+
+Work queued before you turn on `knowledge=True` keeps the grant it was admitted with, which
+has no knowledge, so its knowledge reads are refused.
 
 ## Move to `cayu.memberships`
 

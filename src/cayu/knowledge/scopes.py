@@ -46,6 +46,30 @@ class KnowledgeAccessScope(BaseModel):
 
         return validate_constraints(values)
 
+    #: Labels pinned to the session a knowledge operation runs in. Inside a session under a
+    #: resource-access binding, an entry is read or written only when its value for each key
+    #: equals the session's verified label, so a person in several organizations sees only
+    #: the current conversation's organization's knowledge, and a note can't be written into
+    #: another one. A binding whose session lacks one of these labels is refused. Outside a
+    #: binding (operators, curation, maintenance) the keys don't narrow anything.
+    session_label_keys: tuple[str, ...] = Field(default=(), exclude_if=lambda v: not v)
+
+    @field_validator("session_label_keys", mode="before")
+    @classmethod
+    def validate_session_label_keys(cls, value) -> tuple[str, ...]:
+        if isinstance(value, str) or value is None:
+            raise ValueError("`session_label_keys` must be an iterable of label keys.")
+        try:
+            items = list(value)
+        except TypeError as exc:
+            raise ValueError("`session_label_keys` must be an iterable of label keys.") from exc
+        keys: list[str] = []
+        for index, item in enumerate(items):
+            if type(item) is not str:
+                raise ValueError(f"`session_label_keys[{index}]` must be a string.")
+            keys.append(require_clean_nonblank(item, f"session_label_keys[{index}]"))
+        return tuple(sorted(dict.fromkeys(keys)))
+
     allowed_namespaces: list[str] = Field(default_factory=list)
     allow_all_namespaces: bool = False
     required_labels: dict[str, str] = Field(default_factory=dict)
@@ -154,6 +178,7 @@ def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessS
         raise TypeError("KnowledgeAccessScope instances must not be subclasses.")
     return KnowledgeAccessScope(
         resource_constraints=scope.resource_constraints,
+        session_label_keys=scope.session_label_keys,
         allowed_namespaces=list(scope.allowed_namespaces),
         allow_all_namespaces=scope.allow_all_namespaces,
         required_labels=copy_label_map(scope.required_labels, "required_labels"),

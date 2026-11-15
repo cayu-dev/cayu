@@ -249,8 +249,9 @@ your team, and `--without web-app` leaves it out:
 | `service` | Your own product or other systems call the agent over an authenticated API for their end users. | None; API only. |
 | `b2b` | Separate organizations (client firms, an agency's clients, households) share one deployment: each has several people who sign in, and they see only their own organization's data. Not for your own customers or users, who are each one person: use service or agent. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |
 
-Choose b2b only for separate organizations. `--preset agent --with organizations
---without knowledge,memory` adds the same organizations to the agent preset.
+Choose b2b only for separate organizations. `--preset agent --with organizations` adds
+the same organizations to the agent preset, with its knowledge and memory scoped to each
+organization.
 
 The long-running preset is a small working example of
 approval before a side effect, a waited-for reply, reminder and deadline timers,

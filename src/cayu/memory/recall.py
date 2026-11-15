@@ -350,7 +350,14 @@ class RecallSituation(BaseModel):
     ) -> dict[str, Any] | None:
         if value is None:
             return None
+        # Only when set, so a scope without it serializes as it always has.
+        pinned = (
+            {"session_label_keys": list(value.session_label_keys)}
+            if value.session_label_keys
+            else {}
+        )
         return {
+            **pinned,
             "allowed_namespaces": list(value.allowed_namespaces),
             "allow_all_namespaces": value.allow_all_namespaces,
             "required_labels": dict(value.required_labels),

@@ -48,7 +48,7 @@ refuses a membership whose department doesn't (`ValueError`), as it refuses a pe
 than `max_memberships` memberships, which one stored grant can't hold.
 
 `MembershipAccessPolicy(directory, *, authority="b2b-membership-v1",
-decision_lifetime=timedelta(seconds=60), max_memberships=16)`:
+decision_lifetime=timedelta(seconds=60), max_memberships=16, knowledge=False)`:
 
 - `authority` is stored with every piece of work Cayu admits, and Cayu refuses work whose
   authority differs from the policy's. Keep the default unless you mean to strand queued
@@ -58,6 +58,45 @@ decision_lifetime=timedelta(seconds=60), max_memberships=16)`:
   read before a change is refused.
 - `max_memberships` bounds one person's memberships. Sixteen keeps a grant with the longest
   IDs well inside the 64 KiB Cayu stores with each admitted piece of work.
+- `knowledge=True` grants knowledge as well: a member reads, creates and revises knowledge
+  entries labelled with one of their organizations, `organization` can't be changed on an
+  entry, and nobody deletes through the grant. Off, the grant has no knowledge, as before,
+  so a project without knowledge gets exactly the grant it always had.
+
+### Knowledge scoped by organization
+
+Turning on `knowledge=True` is half of it. The other half is the knowledge scope the store is
+built with:
+
+```python
+from cayu.storage import KnowledgeAccessScope, KnowledgeStatus
+from cayu.tools import RememberKnowledgePolicy, RememberKnowledgeTool
+
+scope = KnowledgeAccessScope(
+    allowed_namespaces=["project:acme-desk:agent:assistant"],
+    allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    session_label_keys=("organization",),
+)
+remember = RememberKnowledgeTool(
+    policy=RememberKnowledgePolicy(
+        default_namespace="project:acme-desk:agent:assistant",
+        copy_session_labels=("organization",),
+    )
+)
+```
+
+`session_label_keys` pins every knowledge read and write inside a conversation to that
+conversation's own `organization` label, the one Cayu verified when it admitted the
+conversation. The store applies it with the grant, on every get, list, search and write, so
+recall, the knowledge tools and the pending entries recall offers are all filtered, and a
+tool that forgets to filter still can't reach another organization. A person who belongs to
+two organizations recalls only the current conversation's organization's knowledge.
+`copy_session_labels` labels each note from the conversation; the store refuses a note with
+no `organization`, or another one's, whatever the model asked for. Outside a conversation
+(`app.access(subject).knowledge(...)` in the web app) the grant alone decides, so a member sees
+all their organizations' knowledge. Operator and background work outside any member's
+binding isn't narrowed: curate one organization at a time with `cayu knowledge list --status
+pending --label organization=ID`.
 
 Never take sharing labels from a request: build them with `conversation_labels` from the
 signed-in person and a membership you read yourself. Cayu refuses any the person may not
@@ -163,7 +202,10 @@ organization. `--schema` names another schema; `--json` prints JSON.
 project: `database/memberships.py` builds `PostgresMemberships` over the application's own
 connection pool, `policies/access.py` builds `MembershipAccessPolicy` over it, and the member
 routes call `change_as_admin`. The tables, sign-in, roles (`app_role`), routes and pages stay
-the project's.
+the project's. With knowledge (`cayu new --with organizations` on the agent preset), the
+policy is `MembershipAccessPolicy(memberships(), knowledge=True)`, `knowledge/retrieval.py`
+pins the knowledge scope to the conversation's `organization`, and `remember_knowledge` copies
+it from the conversation, as above.
 
 Projects generated before `cayu.memberships` carry their own copies. `cayu check` notes each
 `policies/access.py` or `database/memberships.py` that is still exactly the copy a release

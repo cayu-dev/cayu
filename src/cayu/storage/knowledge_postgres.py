@@ -1026,7 +1026,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
                 chunks=copied_chunks,
                 evidence=copied_evidence,
                 expected_revision=expected_revision,
-                access_scope=scope,
+                access_scope=self._presented_access_scope(access_scope),
             )
         await self._ensure_ready()
         async with self._connection() as conn:

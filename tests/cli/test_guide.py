@@ -948,7 +948,7 @@ def test_b2b_guide_runs_the_generated_application(capsys) -> None:
         "`APP_SIGN_IN`",
         "`OPERATOR_ONLY_AUTH`",
         "Every preset but service already comes with a web app for your own team",
-        "`cayu new NAME --with organizations --without knowledge,memory`",
+        "`cayu new NAME --with organizations`, and keeps its knowledge and memory",
     ):
         assert statement in content, statement
     # Every person the guide demonstrates is one the seed adds.

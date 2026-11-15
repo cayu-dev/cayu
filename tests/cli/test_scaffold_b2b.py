@@ -97,8 +97,8 @@ def test_the_app_is_built_with_the_membership_policy() -> None:
 
 
 def test_the_project_has_no_knowledge_or_memory_homes() -> None:
-    # Organizations conflict with knowledge and memory, so the preset never turns them on
-    # and gets what the agent preset's --without knowledge,memory gets.
+    # The b2b preset leaves knowledge and memory out, and gets what the agent preset's
+    # organizations with --without knowledge,memory gets.
     files = project_files("acme-desk", preset="b2b")
     agent = project_files(
         "acme-desk",

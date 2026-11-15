@@ -1149,16 +1149,21 @@ class ToolInvocation:
         tool_context = invocation_resources.context
 
         async def observe_knowledge_lookup(namespace: str, entry_ids: tuple[str, ...]) -> None:
-            lookup_event = await self.terminals.emit(
-                Event(
-                    type=EventType.KNOWLEDGE_LOOKUP,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=effective_tool_call.name,
-                    payload={"namespace": namespace, "entry_ids": list(entry_ids)},
+            from cayu.resource_access import _runtime_owned_store_access
+
+            # Counting the lookup is Cayu's bookkeeping, not the tool's: under a resource
+            # binding the tool body only reaches the model-facing store surface.
+            async with _runtime_owned_store_access():
+                lookup_event = await self.terminals.emit(
+                    Event(
+                        type=EventType.KNOWLEDGE_LOOKUP,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=effective_tool_call.name,
+                        payload={"namespace": namespace, "entry_ids": list(entry_ids)},
+                    )
                 )
-            )
             dispatch.events.append(lookup_event)
 
         raw_workspace = invocation_resources.raw_workspace

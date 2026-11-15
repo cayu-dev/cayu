@@ -42,7 +42,27 @@ def intersect_scope(scope):
     combined = tuple(dict.fromkeys((*scope.resource_constraints, *constraints)))
     if len(combined) > 4:
         raise ResourceAccessDenied()
-    return scope.model_copy(update={"resource_constraints": combined})
+    update = {"resource_constraints": combined}
+    if scope.session_label_keys:
+        update["required_labels"] = _session_pinned_labels(scope)
+    return scope.model_copy(update=update)
+
+
+def _session_pinned_labels(scope):
+    """``scope``'s required labels plus the running session's ``session_label_keys``."""
+
+    from cayu.resource_access import current_binding, current_execution_labels
+
+    required = dict(scope.required_labels)
+    if current_binding() is None:
+        # An explicit scoped handle outside any session: the grant alone decides.
+        return required
+    labels = current_execution_labels()
+    for key in scope.session_label_keys:
+        value = labels.get(key)
+        if value is None or required.setdefault(key, value) != value:
+            raise ResourceAccessDenied()
+    return required
 
 
 def matches(scope, labels):

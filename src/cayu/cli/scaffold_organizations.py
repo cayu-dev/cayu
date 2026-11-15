@@ -2036,6 +2036,256 @@ def _replace_once(text: str, old: str, new: str, path: str) -> str:
     return text.replace(old, new)
 
 
+_TEST_ORGANIZATION_KNOWLEDGE_PY = '''"""Each organization's knowledge is its own.
+
+What the agent remembers in one organization's conversation carries that organization, and
+another organization's members never get it back: not from automatic recall, not from the
+knowledge tools, not among the pending notes the tools return. Cayu's knowledge store
+enforces it with `policies/access.py` and `knowledge/retrieval.py`; these check this
+application's wiring.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from cayu import Message
+from cayu.evals import ScriptedModelProvider
+from cayu.events import EventType
+from cayu.memberships import (
+    InMemoryMembershipDirectory,
+    Membership,
+    conversation_labels,
+)
+from cayu.providers import ModelStreamEvent
+from cayu.sessions import InMemorySessionStore
+from cayu.sessions.requests import RunRequest
+from cayu.storage import InMemoryKnowledgeStore, KnowledgeEntry, KnowledgeStatus
+from cayu.tasks import InMemoryTaskStore
+from cayu.tools import RememberKnowledgeTool, ToolContext
+
+import policies.access
+from app import build_app
+from knowledge.retrieval import KNOWLEDGE_NAMESPACE, build_knowledge_scope
+from tools.registration import build_agent_tools
+
+# A note the agent remembered in alice's conversation, still pending review.
+NOTE = "Invoices over ten thousand need a second approver."
+# A note an operator kept for acme.
+KEPT = "Invoices over ten thousand go to the finance lead as the second approver."
+ALICE = Membership("acme", "acme/finance")
+CAROL = Membership("acme")
+DAVE = Membership("globex", "globex/support")
+
+
+async def _remember_in_alices_conversation(store: InMemoryKnowledgeStore) -> str:
+    remember = next(
+        tool for tool in build_agent_tools() if isinstance(tool, RememberKnowledgeTool)
+    )
+    labels = conversation_labels(subject="alice", membership=ALICE, sharing="personal")
+    result = await remember.run(
+        ToolContext(
+            session_id="alice-conversation",
+            session_labels=labels,
+            knowledge_store=store,
+            idempotency_key="alice-note",
+        ),
+        # Whatever organization the model names, the note is the conversation's.
+        {"text": NOTE, "labels": {"organization": "globex"}},
+    )
+    assert not result.is_error, result
+    return result.structured["entry"]["entry_id"]
+
+
+async def _conversation(
+    store: InMemoryKnowledgeStore, monkeypatch, subject: str, membership: Membership, note: str
+) -> list[str]:
+    """What the model was given at each step of `subject`'s conversation, in which it
+    searches knowledge and reads `note` by its ID."""
+
+    directory = InMemoryMembershipDirectory({"alice": [ALICE], "carol": [CAROL], "dave": [DAVE]})
+    monkeypatch.setattr(policies.access, "memberships", lambda: directory)
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="search",
+                    name="search_knowledge",
+                    arguments={"query": "invoices second approver"},
+                ),
+                ModelStreamEvent.tool_call(
+                    id="read", name="read_knowledge", arguments={"entry_id": note}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Done."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    async with build_app(
+        provider=provider,
+        session_store=InMemorySessionStore(),
+        task_store=InMemoryTaskStore(),
+        knowledge_store=store,
+        access_policy=policies.access.build_access_policy(),
+    ) as app:
+        access = await app.access(subject)
+        labels = conversation_labels(subject=subject, membership=membership, sharing="personal")
+        question = Message.text("user", "Do invoices over ten thousand need a second approver?")
+        failed = [
+            event
+            async for event in access.run(
+                RunRequest(agent_name="__AGENT_NAME__", messages=[question], labels=labels)
+            )
+            if event.type in (EventType.TOOL_CALL_FAILED, EventType.SESSION_FAILED)
+        ]
+    assert failed == []
+    # The conversation ran through: the model got its tools' results back.
+    assert len(provider.requests) == 2
+    return [repr(request) for request in provider.requests]
+
+
+def test_one_organizations_knowledge_never_reaches_another_organizations_member(
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(access_scope=build_knowledge_scope())
+        note = await _remember_in_alices_conversation(store)
+        entry = await store.get_entry(note)
+        assert entry is not None and entry.labels["organization"] == "acme"
+        assert entry.status is KnowledgeStatus.PENDING
+        await store.create_entry(
+            KnowledgeEntry(
+                id="acme-invoices",
+                namespace=KNOWLEDGE_NAMESPACE,
+                text=KEPT,
+                status=KnowledgeStatus.ACTIVE,
+                labels={"organization": "acme"},
+            )
+        )
+
+        # A colleague in acme gets the kept note from automatic recall (memory) before the
+        # model's first step, and both notes from the knowledge tools...
+        recalled, answered = await _conversation(store, monkeypatch, "carol", CAROL, note)
+        assert KEPT in recalled
+        assert NOTE in answered and KEPT in answered
+        # ...and a member of globex gets neither, though the model asked for one by its ID.
+        for step in await _conversation(store, monkeypatch, "dave", DAVE, note):
+            assert KEPT not in step and NOTE not in step
+
+    asyncio.run(run())
+'''
+
+
+# The agent preset's knowledge scope and `remember_knowledge` policy, which organizations
+# scope to the conversation's organization. Matched at any indentation: the generator lays
+# them out before it settles its own conditionals.
+_KNOWLEDGE_SCOPE = """\
+return KnowledgeAccessScope(
+    allowed_namespaces=[KNOWLEDGE_NAMESPACE],
+    allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+)
+"""
+_ORGANIZATION_KNOWLEDGE_SCOPE = """\
+return KnowledgeAccessScope(
+    allowed_namespaces=[KNOWLEDGE_NAMESPACE],
+    allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    # Inside a conversation, only that conversation's organization's knowledge: the
+    # store pins every read and write to its verified `organization` label.
+    session_label_keys=("organization",),
+)
+"""
+_REMEMBER_POLICY = """\
+policy=RememberKnowledgePolicy(
+    default_namespace=KNOWLEDGE_NAMESPACE,
+),
+"""
+_ORGANIZATION_REMEMBER_POLICY = """\
+policy=RememberKnowledgePolicy(
+    default_namespace=KNOWLEDGE_NAMESPACE,
+    # Each note carries the conversation's organization, never one the model names.
+    copy_session_labels=("organization",),
+),
+"""
+_RECALL_ASSERTION = "        assert KEPT in recalled\n"
+_NO_RECALL_ASSERTION = "        assert KEPT not in recalled\n"
+_KNOWLEDGE_GUIDANCE = """
+## Knowledge and memory by organization
+
+Each organization's knowledge is its own, and Cayu's knowledge store enforces it, so a tool
+that forgets to filter still can't reach another organization's.
+
+- `policies/access.py` passes `knowledge=True`: a member reads and the agent remembers into
+  their organizations' knowledge, and nothing else.
+- `knowledge/retrieval.py` sets `session_label_keys=("organization",)`: inside a
+  conversation, recall, the knowledge tools and pending notes are that conversation's
+  organization's only.
+- `remember_knowledge` labels each note with the conversation's organization
+  (`copy_session_labels`), never one the model names.
+- Review one organization's pending notes with `uv run --no-sync cayu knowledge list
+  --status pending --label organization=ID`, then `cayu knowledge keep` or `drop`. Knowledge
+  you add yourself needs an `organization` label, or no member sees it.
+- `tests/test_organization_knowledge.py` shows it. `uv run --no-sync cayu guide b2b` has more.
+"""
+_KNOWLEDGE_ACCESS_POLICY = (
+    "    # Each member also reads, and the agent remembers into, their organizations'\n"
+    "    # knowledge, and nothing of any other organization's.\n"
+    "    return MembershipAccessPolicy(memberships(), knowledge=True)\n"
+)
+
+
+def _replace_block_once(text: str, old: str, new: str, path: str) -> str:
+    """``text`` with the block ``old``, at whatever indentation it has there, replaced by
+    ``new`` at the same indentation. ``old`` must be in it exactly once."""
+
+    first = old.splitlines()[0]
+    found = [
+        line[: len(line) - len(first)]
+        for line in text.splitlines()
+        if line.endswith(first) and not line[: len(line) - len(first)].strip()
+    ]
+    if len(found) != 1:
+        raise RuntimeError(f"{path} isn't the agent preset's, which organizations build on.")
+    indent = found[0]
+
+    def indented(block: str) -> str:
+        return "".join(indent + line if line.strip() else line for line in block.splitlines(True))
+
+    return _replace_once(text, indented(old), indented(new), path)
+
+
+def _organization_knowledge_files(
+    *, files: dict[str, str], plan: ApplicationPlan
+) -> dict[str, str]:
+    """Knowledge and memory scoped by organization, when the plan has knowledge."""
+
+    if "knowledge" not in plan.capabilities:
+        return {}
+    return {
+        "knowledge/retrieval.py": _replace_block_once(
+            files["knowledge/retrieval.py"],
+            _KNOWLEDGE_SCOPE,
+            _ORGANIZATION_KNOWLEDGE_SCOPE,
+            "knowledge/retrieval.py",
+        ),
+        "tools/registration.py": _replace_block_once(
+            files["tools/registration.py"],
+            _REMEMBER_POLICY,
+            _ORGANIZATION_REMEMBER_POLICY,
+            "tools/registration.py",
+        ),
+        "tests/test_organization_knowledge.py": _replace_once(
+            _TEST_ORGANIZATION_KNOWLEDGE_PY.replace("__AGENT_NAME__", plan.agent_name),
+            _RECALL_ASSERTION,
+            # Without memory there is no automatic recall; the tools still see the notes.
+            _RECALL_ASSERTION if "memory" in plan.capabilities else _NO_RECALL_ASSERTION,
+            "tests/test_organization_knowledge.py",
+        ),
+    }
+
+
 def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> dict[str, str]:
     """The organizations additions on top of the agent preset's, app-database's and the web
     app's files, for a plan with `organizations`."""
@@ -2076,7 +2326,9 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
         ),
     ):
         app = _replace_once(app, old, new, "app.py")
+    knowledge_guidance = _KNOWLEDGE_GUIDANCE if "knowledge" in plan.capabilities else ""
     return {
+        **_organization_knowledge_files(files=files, plan=plan),
         # `web/` with the organizations layer, the generated routes, and `cayu serve` serving
         # them. The application's own users sign in through the same proxy as members, so
         # the Developer dashboard (which reads every conversation) is for operators only.
@@ -2092,14 +2344,24 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
         "README.md": files["README.md"].replace(
             ENVIRONMENT_OPERATOR_AUTH_TARGET, ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET
         )
-        + _GUIDANCE,
-        "AGENTS.md": _agents_md(files["AGENTS.md"]) + _GUIDANCE,
+        + _GUIDANCE
+        + knowledge_guidance,
+        "AGENTS.md": _agents_md(files["AGENTS.md"]) + _GUIDANCE + knowledge_guidance,
         "app.py": app,
         "database/models.py": models + _MODELS_APPEND,
         "migrations/versions/0002_organizations.py": _MIGRATION,
         "domain/organizations.py": _ORGANIZATIONS_PY,
         "database/memberships.py": _MEMBERSHIPS_PY,
-        "policies/access.py": _ACCESS_POLICY_PY,
+        "policies/access.py": (
+            _replace_once(
+                _ACCESS_POLICY_PY,
+                "    return MembershipAccessPolicy(memberships())\n",
+                _KNOWLEDGE_ACCESS_POLICY,
+                "policies/access.py",
+            )
+            if "knowledge" in plan.capabilities
+            else _ACCESS_POLICY_PY
+        ),
         "operations/demo_seed.py": _DEMO_SEED_PY,
         "tests/conftest.py": _tests_conftest(files.get("tests/conftest.py")),
         "tests/test_organizations.py": _TEST_ORGANIZATIONS_PY,

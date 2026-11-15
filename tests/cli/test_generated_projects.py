@@ -56,7 +56,9 @@ def test_every_preset_is_a_case_with_and_without_its_web_app() -> None:
             expected.add(f"{spec.name}-without-web-app")
     assert set(CASES) == expected | {"agent-organizations"}
     organizations = CASES["agent-organizations"].plan()
-    assert {"organizations", "app-database", WEB_APP} <= set(organizations.capabilities)
+    assert {"organizations", "app-database", WEB_APP, "knowledge", "memory"} <= set(
+        organizations.capabilities
+    )
 
 
 def test_the_ci_job_runs_every_case_on_the_generated_workflows_node() -> None:

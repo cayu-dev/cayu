@@ -84,15 +84,8 @@ def cases() -> dict[str, Case]:
             except ScaffoldPlanError:
                 continue  # b2b: the app is what it is
             found.append(without)
-    # Organizations on the agent preset; they refuse a knowledge store every organization shares.
-    found.append(
-        Case(
-            "agent-organizations",
-            "agent",
-            with_capabilities=(ORGANIZATIONS,),
-            without_capabilities=("knowledge", "memory"),
-        )
-    )
+    # Organizations on the agent preset, with its knowledge and memory scoped to each one.
+    found.append(Case("agent-organizations", "agent", with_capabilities=(ORGANIZATIONS,)))
     return {case.name: case for case in found}
 
 

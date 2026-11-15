@@ -463,9 +463,9 @@ reminder and deadline timers, a spend cap, and restart tests; see
 `--preset b2b` is the web app plus the `organizations` capability, for an
 application people from separate organizations share on one deployment, with one
 database and one agent; choose it only for that. `--preset agent --with
-organizations --without knowledge,memory` adds the same organizations to the agent
-preset (organizations can't be combined with knowledge or memory, and the coding,
-long-running and service presets don't take them). Organizations, departments
+organizations` adds the same organizations to the agent preset, with its knowledge and
+memory scoped to each organization (the coding, long-running and service presets
+don't take organizations). Organizations, departments
 and memberships are application tables (it always includes `app-database`), and
 `policies/access.py` turns each person's current membership into Cayu
 resource-access grants: everyone sees their own conversations, their department's

@@ -132,7 +132,7 @@ def test_retained_checkpoint_cannot_publish_after_its_writer_window_closes(tmp_p
         monkeypatch.setattr(checkpoints, "capture_workspace_checkpoint", block_first_capture)
         apps = []
 
-        async def run_session(session_id, filename):
+        async def run_session(session_id, filename, *, timeout_seconds=120):
             app = CayuApp(session_store=store, enable_logging=False)
             apps.append(app)
             app.register_provider(
@@ -142,7 +142,9 @@ def test_retained_checkpoint_cannot_publish_after_its_writer_window_closes(tmp_p
                 default=True,
             )
             spec = _portable_environment_spec("local")
-            spec.workspace_checkpoint_policy = WorkspaceCheckpointPolicy(timeout_seconds=1)
+            spec.workspace_checkpoint_policy = WorkspaceCheckpointPolicy(
+                timeout_seconds=timeout_seconds
+            )
             app.register_environment(
                 Environment(
                     spec,
@@ -166,12 +168,16 @@ def test_retained_checkpoint_cannot_publish_after_its_writer_window_closes(tmp_p
             )
 
         try:
-            first_events = await asyncio.wait_for(run_session("timed-out", "first.txt"), 10)
+            first_events = await asyncio.wait_for(
+                run_session("timed-out", "first.txt", timeout_seconds=1), 10
+            )
             assert first_events[-1].type is EventType.SESSION_FAILED
             assert blocked.is_set() and not retained[0].done()
             assert windows[0].closed
+            # Only the deliberately blocked capture needs a short deadline. A healthy
+            # writer must not fail because checkpoint I/O takes over one second in CI.
             events = await run_session("next-writer", "second.txt")
-            assert events[-1].type is EventType.SESSION_COMPLETED
+            assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
             release.set()
             (result,) = await asyncio.gather(*retained, return_exceptions=True)
             assert isinstance(result, WorkspaceCheckpointError)

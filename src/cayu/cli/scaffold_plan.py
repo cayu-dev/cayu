@@ -206,8 +206,8 @@ PRESETS: tuple[PresetSpec, ...] = (
             "resource-access grants. Not for your own customers or users, who are each one "
             "person: use service or agent. Every "
             "preset but service already has a web app for your own team. The agent preset "
-            "takes the same organizations with --with organizations --without "
-            "knowledge,memory."
+            "takes the same organizations with --with organizations, keeping its knowledge "
+            "and memory, scoped to each organization."
         ),
         default_capabilities=(
             "app-database",
@@ -471,12 +471,13 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "person sees only their own, their department's and their organization's "
             "conversations. The web app's people become the organizations' members, with "
             "Members and an organization switcher; operators keep the Developer dashboard. "
-            "Needs web-app and app-database; can't be combined with knowledge or memory."
+            "With knowledge and memory (the agent preset), each organization's knowledge is "
+            "its own: notes carry the conversation's organization, and recall and lookup "
+            "return only that organization's entries. Needs web-app and app-database."
         ),
         status="selectable",
         supported_presets=("agent", "b2b"),
         implied=(WEB_APP, "app-database"),
-        conflicts=("knowledge", "memory"),
         files=(
             "domain/organizations.py",
             "database/memberships.py",
@@ -830,9 +831,7 @@ def normalize_application_plan(
         if conflicts:
             raise ScaffoldPlanError(
                 "capability_conflict",
-                f"capability {name_value!r} conflicts with: "
-                + ", ".join(conflicts)
-                + _CONFLICT_REASONS.get(name_value, ""),
+                f"capability {name_value!r} conflicts with: " + ", ".join(conflicts),
             )
 
     return ApplicationPlan(
@@ -853,14 +852,6 @@ _DEPENDENCY_REASONS = {
     (ORGANIZATIONS, WEB_APP): (
         ": the organizations' members sign in to the web app. An Agent without a web app "
         "has no organizations: choose a preset other than b2b, without organizations"
-    ),
-}
-# Why a capability can't be combined with those it conflicts with.
-_CONFLICT_REASONS = {
-    ORGANIZATIONS: (
-        ". The agent reads one knowledge store in every conversation, so what it learned or "
-        "was told in one organization's conversation would reach another's. Leave them out "
-        "with --without knowledge,memory"
     ),
 }
 
@@ -923,9 +914,8 @@ def removed_capability_files(plan: ApplicationPlan) -> frozenset[str]:
     A file is removed when a capability that owns it is a preset default the
     plan turned off, or conflicts with a selected capability, and no capability
     that owns it is still selected. Presets keep the homes of other capabilities
-    they don't turn on by default, so those can be wired in later; a conflicting
-    one can't be, so the b2b preset, whose organizations conflict with knowledge
-    and memory, gets neither home.
+    they don't turn on by default, so those can be wired in later. The b2b preset
+    doesn't support knowledge or memory, so it gets neither home.
     """
 
     selected = set(plan.capabilities)
@@ -933,6 +923,8 @@ def removed_capability_files(plan: ApplicationPlan) -> frozenset[str]:
     excluded.update(
         conflict for name in selected for conflict in _CAPABILITY_BY_NAME[name].conflicts
     )
+    if plan.preset == "b2b":
+        excluded.update(("knowledge", "memory"))
     excluded -= selected
     removed: set[str] = set()
     for name in excluded:

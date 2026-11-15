@@ -50,12 +50,56 @@ def test_organizations_bring_the_web_app_and_the_app_database() -> None:
     )
 
 
-def test_organizations_refuse_a_knowledge_store_every_organization_shares() -> None:
-    with pytest.raises(ScaffoldPlanError) as excinfo:
-        _plan(with_capabilities=("organizations", "app-database"))
-    assert excinfo.value.code == "capability_conflict"
-    assert "knowledge, memory" in str(excinfo.value)
-    assert "--without knowledge,memory" in str(excinfo.value)
+def test_organizations_keep_knowledge_and_memory_scoped_to_each_organization() -> None:
+    """The agent preset's knowledge and memory stay on, each organization's its own."""
+
+    plan = _plan(with_capabilities=("organizations",))
+    assert {"organizations", "knowledge", "memory"} <= set(plan.capabilities)
+    files = project_files("acme-desk", application_plan=plan)
+
+    assert 'session_label_keys=("organization",),' in files["knowledge/retrieval.py"]
+    assert 'copy_session_labels=("organization",),' in files["tools/registration.py"]
+    assert "MembershipAccessPolicy(memberships(), knowledge=True)" in files["policies/access.py"]
+    assert "tests/test_organization_knowledge.py" in files
+    for guidance in ("README.md", "AGENTS.md"):
+        assert "## Knowledge and memory by organization" in files[guidance]
+    for path in (
+        "knowledge/retrieval.py",
+        "tools/registration.py",
+        "policies/access.py",
+        "tests/test_organization_knowledge.py",
+    ):
+        compile(files[path], path, "exec")
+
+
+def test_organizations_with_knowledge_but_no_memory_expect_no_automatic_recall() -> None:
+    plan = _plan(with_capabilities=("organizations",), without_capabilities=("memory",))
+    assert "knowledge" in plan.capabilities and "memory" not in plan.capabilities
+    test = project_files("acme-desk", application_plan=plan)["tests/test_organization_knowledge.py"]
+    assert "assert KEPT not in recalled\n" in test
+    assert "assert KEPT in recalled\n" not in test
+    compile(test, "tests/test_organization_knowledge.py", "exec")
+
+
+def test_without_organizations_knowledge_is_generated_as_before() -> None:
+    """A project without organizations, or organizations without knowledge, is unchanged."""
+
+    plain = project_files("acme-desk", application_plan=_plan())
+    assert "session_label_keys" not in plain["knowledge/retrieval.py"]
+    assert "copy_session_labels" not in plain["tools/registration.py"]
+    without = project_files(
+        "acme-desk",
+        application_plan=_plan(
+            with_capabilities=("organizations",), without_capabilities=("knowledge", "memory")
+        ),
+    )
+    assert (
+        without["policies/access.py"]
+        == project_files("acme-desk", preset="b2b")["policies/access.py"]
+    )
+    assert "knowledge=True" not in without["policies/access.py"]
+    assert "tests/test_organization_knowledge.py" not in without
+    assert "Knowledge and memory by organization" not in without["README.md"]
 
 
 def test_organizations_need_the_web_app() -> None:
@@ -152,7 +196,7 @@ def test_cayu_new_names_the_organizations_people_and_lists_the_capability(
     assert main(["new", "--explain", "organizations"]) == 0
     explained = capsys.readouterr().out
     assert "Implies: web-app, app-database" in explained
-    assert "Conflicts with: knowledge, memory" in explained
+    assert "Conflicts with" not in explained
 
 
 def test_an_older_b2b_projects_record_still_reads_as_b2b() -> None:
@@ -178,7 +222,8 @@ def test_a_generated_project_passes_cayu_check_and_its_tests_on_postgres(
     monkeypatch: pytest.MonkeyPatch,
     _postgres_server_dsn: str,
 ) -> None:
-    assert main(["new", "acme-desk", *ORGANIZATIONS, "--dir", str(tmp_path)]) == 0
+    # With the agent preset's knowledge and memory, scoped to each organization.
+    assert main(["new", "acme-desk", "--with", "organizations", "--dir", str(tmp_path)]) == 0
     capsys.readouterr()
     project = tmp_path / "acme-desk"
     monkeypatch.chdir(project)
@@ -211,6 +256,7 @@ def test_a_generated_project_passes_cayu_check_and_its_tests_on_postgres(
             "tests/test_generated_routes.py",
             "tests/test_background_revocation.py",
             "tests/test_app_database.py",
+            "tests/test_organization_knowledge.py",
         ],
         cwd=project,
         env=environment,

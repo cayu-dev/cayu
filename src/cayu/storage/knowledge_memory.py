@@ -740,7 +740,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 chunks=copied_chunks,
                 evidence=copied_evidence,
                 expected_revision=expected_revision,
-                access_scope=scope,
+                access_scope=self._presented_access_scope(access_scope),
             )
         existing_receipt = self._publication_receipts.get(operation_id)
         if existing_receipt is not None:

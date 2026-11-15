@@ -127,6 +127,22 @@ class KnowledgeStore(ABC):
             raise KnowledgeAccessDenied("access_scope_override")
         return _intersect_resource_knowledge_scope(explicit_scope)
 
+    def _presented_access_scope(
+        self,
+        access_scope: KnowledgeAccessScope | None,
+    ) -> KnowledgeAccessScope:
+        """The scope the caller presented, before resource access narrows it.
+
+        Activation authority binds this scope, the one its caller saw; the narrowed scope from
+        ``_operation_access_scope`` still decides what the operation may touch. Call it only
+        after ``_operation_access_scope`` accepted ``access_scope``.
+        """
+
+        scope = self._default_access_scope if access_scope is None else access_scope
+        if scope is None:
+            raise TypeError("knowledge operation requires `access_scope`.")
+        return copy_knowledge_access_scope(scope)
+
     def _review_read_access_scope(
         self,
         access_scope: KnowledgeAccessScope | None,

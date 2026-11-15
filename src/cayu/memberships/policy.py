@@ -6,6 +6,9 @@ organization. Only the owner continues, changes or deletes a conversation: seein
 one doesn't let anyone else run it. Cayu applies this to sessions, tasks and artifacts on
 every read, listing and background step, asking the policy again each time, so a removed
 member loses access at their next step.
+
+With ``knowledge=True`` each person also reads, and the agent remembers into, the knowledge of
+the organizations they belong to, and nothing of any other organization's.
 """
 
 from __future__ import annotations
@@ -45,6 +48,12 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
     ``authority`` names the policy in every binding Cayu stores; changing it strands work
     admitted under the old name. ``decision_lifetime`` bounds how long Cayu may use one
     decision, and ``max_memberships`` how many memberships one person's grant may carry.
+
+    ``knowledge=True`` grants knowledge too: a member reads, creates and revises entries
+    labelled with one of their organizations (``organization`` can't be changed), and nothing
+    else. Pair it with a knowledge scope whose ``session_label_keys`` names ``organization``,
+    so inside a conversation only that conversation's organization's knowledge is used. Off
+    by default, which denies all knowledge, as before.
     """
 
     def __init__(
@@ -54,6 +63,7 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
         authority: str = DEFAULT_AUTHORITY,
         decision_lifetime: timedelta = DEFAULT_DECISION_LIFETIME,
         max_memberships: int = DEFAULT_MAX_MEMBERSHIPS,
+        knowledge: bool = False,
     ) -> None:
         if not isinstance(authority, str) or not authority.strip():
             raise ValueError("A membership policy's authority is a non-blank string.")
@@ -61,10 +71,13 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
             raise ValueError("decision_lifetime must be a positive timedelta.")
         if type(max_memberships) is not int or max_memberships < 1:
             raise ValueError("max_memberships must be a positive integer.")
+        if type(knowledge) is not bool:
+            raise ValueError("knowledge must be a boolean.")
         self._directory = directory
         self._authority = authority
         self._decision_lifetime = decision_lifetime
         self._max_memberships = max_memberships
+        self._knowledge = knowledge
 
     @property
     def authority(self) -> str:
@@ -125,8 +138,13 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
             update_labels=tuple(own),
             protected_label_keys=SHARING_LABELS,
         )
+        knowledge = None
+        if self._knowledge:
+            # Knowledge is shared by a whole organization, whichever conversation it came from.
+            within = (_rule(organization=organizations),)
+            knowledge = SessionAccessScope(read=within, create=within, modify=within)
         return ResourceAccessDecision(
-            ResourceAccessGrant(sessions=scope, tasks=scope, artifacts=scope),
+            ResourceAccessGrant(sessions=scope, tasks=scope, artifacts=scope, knowledge=knowledge),
             revision=snapshot.revision,
             valid_until=datetime.now(UTC) + self._decision_lifetime,
         )
