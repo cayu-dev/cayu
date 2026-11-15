@@ -197,8 +197,11 @@ enforces it, so no tool has to remember to filter:
 - Curation is per organization: `uv run --no-sync cayu knowledge list --status pending
   --label organization=acme`, then `cayu knowledge keep` or `drop`. A curator or a
   maintenance run takes `labels={"organization": ...}` for one organization. Operator and
-  background work outside a member's conversation isn't narrowed, so give operator-written
-  knowledge an `organization` label, or members won't see it.
+  background work outside a member's conversation isn't narrowed.
+- Knowledge you add yourself (seeding, operator scripts, curation) needs an `organization`
+  label, since no member could read it without one: the store refuses an active or pending
+  entry without it and says what to add. Entries stored before this rule can still be
+  revised to add the label, or archived.
 
 Work queued before you turn on `knowledge=True` keeps the grant it was admitted with, which
 has no knowledge, so its knowledge reads are refused.

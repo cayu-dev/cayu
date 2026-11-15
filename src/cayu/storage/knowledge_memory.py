@@ -38,6 +38,7 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_activation_retirement_access,
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
+    _require_session_label_keys,
 )
 from cayu.knowledge.access import runtime_knowledge_operation
 from cayu.knowledge.activation_contracts import (
@@ -389,6 +390,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=None)
         _require_knowledge_entry_access(scope, entry, operation="create_entry")
+        _require_session_label_keys(scope, entry, operation="create_entry")
         existing = self._current_entry(entry.id)
         if existing is not None:
             _require_knowledge_entry_access(scope, existing, operation="create_entry")
@@ -727,6 +729,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         # retire it without admitting the archived status. A new entry is checked in full
         # once the store shows there is no current revision.
         _require_knowledge_successor_access(scope, copied_entry, operation="publish_entry_revision")
+        _require_session_label_keys(scope, copied_entry, operation="publish_entry_revision")
         copied_authority = (
             None
             if activation_authority is None
@@ -1161,6 +1164,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         inherit_evidence: bool,
     ) -> KnowledgeEntry:
         _validate_revision_append(entry, expected_revision=expected_revision)
+        _require_session_label_keys(access_scope, entry, operation=operation)
         current = self._current_entry(entry.id)
         if current is None:
             raise KnowledgeRevisionConflict(
@@ -1627,6 +1631,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             activated,
             operation="approve_pending_entry",
         )
+        _require_session_label_keys(scope, activated, operation="approve_pending_entry")
         target_chunks = self._revision_chunks(activated, None, previous=current)
         target_evidence = _revision_rules._copy_evidence_for_revision(
             current_evidence,

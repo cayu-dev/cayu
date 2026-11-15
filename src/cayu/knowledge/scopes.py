@@ -21,9 +21,10 @@ from cayu.knowledge.records import (
 class KnowledgeAccessDenied(PermissionError):
     """Raised when a knowledge mutation falls outside its explicit access scope."""
 
-    def __init__(self, operation: str) -> None:
+    def __init__(self, operation: str, *, reason: str | None = None) -> None:
         self.operation = require_clean_nonblank(operation, "operation")
-        super().__init__(f"Knowledge access denied for {self.operation}.")
+        message = f"Knowledge access denied for {self.operation}."
+        super().__init__(message if reason is None else f"{message} {reason}")
 
 
 class KnowledgeAccessScope(BaseModel):
@@ -51,7 +52,9 @@ class KnowledgeAccessScope(BaseModel):
     #: equals the session's verified label, so a person in several organizations sees only
     #: the current conversation's organization's knowledge, and a note can't be written into
     #: another one. A binding whose session lacks one of these labels is refused. Outside a
-    #: binding (operators, curation, maintenance) the keys don't narrow anything.
+    #: binding (operators, curation, maintenance) the keys don't narrow reads, but an active
+    #: or pending entry written there must still carry every key, since no conversation could
+    #: ever read it otherwise.
     session_label_keys: tuple[str, ...] = Field(default=(), exclude_if=lambda v: not v)
 
     @field_validator("session_label_keys", mode="before")

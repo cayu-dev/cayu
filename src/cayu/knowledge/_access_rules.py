@@ -416,6 +416,42 @@ def _require_knowledge_entry_access(
         raise KnowledgeAccessDenied(operation)
 
 
+def _require_session_label_keys(
+    scope: KnowledgeAccessScope,
+    entry: KnowledgeEntry,
+    *,
+    operation: str,
+) -> None:
+    """Refuse an entry no conversation could read: active or pending, and missing one of
+    ``scope``'s ``session_label_keys``.
+
+    Inside a conversation those keys pin every read to the conversation's own labels, so an
+    entry without one would only ever be seen by operators. Under a resource grant the grant
+    and the pinned labels already decide, so this covers the writes nothing else narrows:
+    operator code, seeding, curation and maintenance. Retiring an entry stays possible.
+    """
+
+    if (
+        not scope.session_label_keys
+        or scope.resource_constraints
+        or entry.status in _KNOWLEDGE_RETIREMENT_STATUSES
+    ):
+        return
+    missing = [key for key in scope.session_label_keys if key not in entry.labels]
+    if not missing:
+        return
+    named = ", ".join(repr(key) for key in missing)
+    example = ", ".join(f'"{key}": "<{key} id>"' for key in missing)
+    raise KnowledgeAccessDenied(
+        operation,
+        reason=(
+            f"Entry {entry.id!r} has no {named} label, and this store pins knowledge to each "
+            f"conversation's {named} (session_label_keys), so no conversation could read it. "
+            f"Add labels={{{example}}} for the one it belongs to."
+        ),
+    )
+
+
 def _require_knowledge_successor_access(
     scope: KnowledgeAccessScope,
     entry: KnowledgeEntry,

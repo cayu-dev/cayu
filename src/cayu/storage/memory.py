@@ -68,6 +68,9 @@ from cayu.knowledge._access_rules import (
 from cayu.knowledge._access_rules import (
     _require_knowledge_successor_access as _require_knowledge_successor_access,
 )
+from cayu.knowledge._access_rules import (
+    _require_session_label_keys as _require_session_label_keys,
+)
 from cayu.knowledge.activation_contracts import (
     _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES as _MAX_KNOWLEDGE_ACTIVATION_RETIREMENT_BYTES,
 )

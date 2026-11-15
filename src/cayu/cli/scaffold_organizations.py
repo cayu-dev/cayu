@@ -2209,6 +2209,15 @@ policy=RememberKnowledgePolicy(
     copy_session_labels=("organization",),
 ),
 """
+# The standard tests' remembered note, which needs the organization it belongs to: the store
+# refuses knowledge no organization's members could read.
+_APPROVAL_RUN = """\
+messages=[Message.text("user", "Remember this preference")],
+"""
+_ORGANIZATION_APPROVAL_RUN = """\
+messages=[Message.text("user", "Remember this preference")],
+labels={"organization": "acme"},
+"""
 _RECALL_ASSERTION = "        assert KEPT in recalled\n"
 _NO_RECALL_ASSERTION = "        assert KEPT not in recalled\n"
 _KNOWLEDGE_GUIDANCE = """
@@ -2226,7 +2235,7 @@ that forgets to filter still can't reach another organization's.
   (`copy_session_labels`), never one the model names.
 - Review one organization's pending notes with `uv run --no-sync cayu knowledge list
   --status pending --label organization=ID`, then `cayu knowledge keep` or `drop`. Knowledge
-  you add yourself needs an `organization` label, or no member sees it.
+  you add yourself needs an `organization` label too; the store refuses it without one.
 - `tests/test_organization_knowledge.py` shows it. `uv run --no-sync cayu guide b2b` has more.
 """
 _KNOWLEDGE_ACCESS_POLICY = (
@@ -2263,7 +2272,21 @@ def _organization_knowledge_files(
 
     if "knowledge" not in plan.capabilities:
         return {}
+    standard = files.get("tests/test_standard_capabilities.py")
     return {
+        # Present only when the plan has the standard capabilities tests.
+        **(
+            {}
+            if standard is None
+            else {
+                "tests/test_standard_capabilities.py": _replace_block_once(
+                    standard,
+                    _APPROVAL_RUN,
+                    _ORGANIZATION_APPROVAL_RUN,
+                    "tests/test_standard_capabilities.py",
+                )
+            }
+        ),
         "knowledge/retrieval.py": _replace_block_once(
             files["knowledge/retrieval.py"],
             _KNOWLEDGE_SCOPE,

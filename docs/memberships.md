@@ -96,7 +96,12 @@ no `organization`, or another one's, whatever the model asked for. Outside a con
 (`app.access(subject).knowledge(...)` in the web app) the grant alone decides, so a member sees
 all their organizations' knowledge. Operator and background work outside any member's
 binding isn't narrowed: curate one organization at a time with `cayu knowledge list --status
-pending --label organization=ID`.
+pending --label organization=ID`. What it writes is checked, though: an active or pending
+entry written through a scope with `session_label_keys` must carry each of those labels,
+since no conversation could read it otherwise, so the store refuses one without
+`organization` (`KnowledgeAccessDenied`, naming the label to add). An entry stored without it
+can still be revised to add it, or archived. For knowledge you mean to keep out of every
+conversation, write it through a store or scope without `session_label_keys`.
 
 Never take sharing labels from a request: build them with `conversation_labels` from the
 signed-in person and a membership you read yourself. Cayu refuses any the person may not

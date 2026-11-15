@@ -67,6 +67,7 @@ from cayu.knowledge._access_rules import (
     _require_knowledge_activation_retirement_access,
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
+    _require_session_label_keys,
 )
 from cayu.knowledge._maintenance_rules import (
     _knowledge_maintenance_successors,
@@ -511,6 +512,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         entry = copy_knowledge_entry(entry)
         _validate_revision_append(entry, expected_revision=None)
         _require_knowledge_entry_access(scope, entry, operation="create_entry")
+        _require_session_label_keys(scope, entry, operation="create_entry")
         copied_chunks = (
             [_default_chunk_for_entry(entry)]
             if chunks is None
@@ -1013,6 +1015,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         # retire it without admitting the archived status. A new entry is checked in full
         # once the store shows there is no current revision.
         _require_knowledge_successor_access(scope, copied_entry, operation="publish_entry_revision")
+        _require_session_label_keys(scope, copied_entry, operation="publish_entry_revision")
         copied_authority = (
             None
             if activation_authority is None
@@ -4262,6 +4265,7 @@ class PostgresKnowledgeStore(postgres_base._PostgresStoreBase, KnowledgeStore):
         allow_pending_maintenance_replacement: bool = False,
     ) -> None:
         _validate_revision_append(entry, expected_revision=expected_revision)
+        _require_session_label_keys(access_scope, entry, operation=operation)
         current = await self._load_entry(cur, entry.id)
         if current is None:
             raise KnowledgeRevisionConflict(

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from cayu._resource_access_binding import ResourceExecutionBinding
+from cayu.knowledge._revision_rules import _default_chunk_for_entry
 from cayu.knowledge.access import ScopedKnowledgeAccess
 from cayu.knowledge.scopes import knowledge_access_scope_sha256
 from cayu.memberships import (
@@ -31,10 +32,12 @@ from cayu.resource_access import (
 )
 from cayu.storage import (
     InMemoryKnowledgeStore,
+    KnowledgeAccessDenied,
     KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeQuery,
+    KnowledgeReviewWorkflow,
     KnowledgeStatus,
 )
 from cayu.storage.knowledge_sqlite import SQLiteKnowledgeStore
@@ -271,8 +274,155 @@ def test_without_knowledge_the_policy_grants_what_it_always_did() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_knowledge_written_outside_a_conversation_needs_the_organization(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    """Operator code, seeding and curation run outside any binding. An active or pending
+    entry they write without `organization` would reach no conversation, so it's refused,
+    with what to add; entries already stored without one can still be fixed or retired."""
+
+    async def run() -> None:
+        store = _store(backend, request, _scope())
+        try:
+            with pytest.raises(KnowledgeAccessDenied) as refused:
+                await store.create_entry(
+                    KnowledgeEntry(
+                        id="bare", namespace=NAMESPACE, text=NOTE, status=KnowledgeStatus.ACTIVE
+                    )
+                )
+            assert "'organization'" in str(refused.value)
+            assert 'labels={"organization": "<organization id>"}' in str(refused.value)
+            assert await store.get_entry("bare") is None
+
+            kept = await store.create_entry(
+                KnowledgeEntry(
+                    id="kept",
+                    namespace=NAMESPACE,
+                    text=NOTE,
+                    status=KnowledgeStatus.ACTIVE,
+                    labels={"organization": "acme"},
+                )
+            )
+            # A revision can't drop it either, through either write path.
+            unlabelled = kept.model_copy(update={"revision": 2, "labels": {}})
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.append_entry_revision(unlabelled, expected_revision=1)
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.publish_entry_revision(
+                    unlabelled,
+                    [_default_chunk_for_entry(unlabelled)],
+                    operation_id="drop-label",
+                    expected_revision=1,
+                )
+            current = await store.get_entry("kept")
+            assert current is not None and current.revision == 1
+
+            # remember_knowledge outside a conversation with no organization is refused too.
+            result = await RememberKnowledgeTool(
+                policy=RememberKnowledgePolicy(
+                    default_namespace=NAMESPACE, copy_session_labels=("organization",)
+                )
+            ).run(
+                ToolContext(session_id="operator", knowledge_store=store, idempotency_key="op"),
+                {"text": NOTE},
+            )
+            assert result.is_error, result
+            listed = await store.list_entries(KnowledgeListQuery(limit=100))
+            assert {item.entry.id for item in listed.entries} == {"kept"}
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_an_entry_stored_without_the_organization_can_be_labelled_or_retired(
+    backend: str, tmp_path: Path
+) -> None:
+    """Entries stored before the rule: revising, keeping or activating one without the label
+    is refused, labelling or retiring it isn't."""
+
+    legacy = [
+        KnowledgeEntry(id=entry_id, namespace=NAMESPACE, text=NOTE, status=status)
+        for entry_id, status in (
+            ("legacy", KnowledgeStatus.ACTIVE),
+            ("stale", KnowledgeStatus.ACTIVE),
+            ("proposal", KnowledgeStatus.PENDING),
+            ("dropped", KnowledgeStatus.PENDING),
+        )
+    ]
+
+    async def open_store():
+        if backend == "memory":
+            return InMemoryKnowledgeStore(legacy, access_scope=_scope())
+        path = tmp_path / "knowledge.db"
+        plain = SQLiteKnowledgeStore(path, access_scope=_scope(session_label_keys=()))
+        try:
+            for entry in legacy:
+                await plain.create_entry(entry)
+        finally:
+            await plain.close()
+        return SQLiteKnowledgeStore(path, access_scope=_scope())
+
+    async def run() -> None:
+        store = await open_store()
+        try:
+            current = await store.get_entry("legacy")
+            assert current is not None
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.append_entry_revision(
+                    current.model_copy(update={"revision": 2, "text": "Revised."}),
+                    expected_revision=1,
+                )
+            labelled = await store.append_entry_revision(
+                current.model_copy(update={"revision": 2, "labels": {"organization": "acme"}}),
+                expected_revision=1,
+            )
+            assert labelled.labels == {"organization": "acme"}
+
+            # Keeping an unlabelled proposal would publish it to no one.
+            with pytest.raises(KnowledgeAccessDenied):
+                await KnowledgeReviewWorkflow(store, namespace=NAMESPACE).approve(
+                    "proposal",
+                    operation_id="keep-proposal",
+                    reviewer_identity="operator",
+                    reviewer_version="1",
+                )
+            with pytest.raises(KnowledgeAccessDenied):
+                await store.transition_entry_status(
+                    "proposal",
+                    expected_revision=1,
+                    from_status=KnowledgeStatus.PENDING,
+                    to_status=KnowledgeStatus.ACTIVE,
+                )
+            proposal = await store.get_entry("proposal")
+            assert proposal is not None and proposal.status is KnowledgeStatus.PENDING
+
+            # Dropping or archiving one still works.
+            dropped = await store.transition_entry_status(
+                "dropped",
+                expected_revision=1,
+                from_status=KnowledgeStatus.PENDING,
+                to_status=KnowledgeStatus.ARCHIVED,
+            )
+            assert dropped.status is KnowledgeStatus.ARCHIVED
+            stale = await store.get_entry("stale")
+            assert stale is not None
+            archived = await store.append_entry_revision(
+                stale.model_copy(update={"revision": 2, "status": KnowledgeStatus.ARCHIVED}),
+                expected_revision=1,
+            )
+            assert archived.status is KnowledgeStatus.ARCHIVED
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
 def test_projects_without_organizations_read_and_write_as_before(tmp_path: Path) -> None:
-    """A scope without `session_label_keys`, and any scope outside a binding, is unchanged."""
+    """A scope without `session_label_keys` is unchanged, and outside a binding one with
+    them narrows no reads."""
 
     plain = KnowledgeAccessScope(
         allowed_namespaces=[NAMESPACE],
@@ -315,5 +465,3 @@ def test_projects_without_organizations_read_and_write_as_before(tmp_path: Path)
 
     plain_hits = asyncio.run(run(plain))
     assert len(plain_hits) == 1
-    # With no binding, session_label_keys narrows nothing either.
-    assert asyncio.run(run(_scope())) == plain_hits
