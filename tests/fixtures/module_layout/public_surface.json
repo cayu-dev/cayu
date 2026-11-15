@@ -2658,6 +2658,43 @@
         "SUPPORTED_MCP_PROTOCOL_VERSIONS"
       ]
     },
+    "cayu.memberships": {
+      "defined_in": {
+        "cayu.memberships.changes": [
+          "LastAdmin",
+          "MembershipChangeRefused",
+          "NotAnAdmin",
+          "RemoveMember",
+          "SetMember",
+          "UnknownDepartment"
+        ],
+        "cayu.memberships.directory": [
+          "AccessSnapshot",
+          "InMemoryMembershipDirectory",
+          "Member",
+          "Membership",
+          "MembershipDirectory"
+        ],
+        "cayu.memberships.policy": [
+          "MembershipAccessPolicy"
+        ],
+        "cayu.memberships.postgres": [
+          "MembershipTablesInvalid",
+          "PostgresMemberships",
+          "check_membership_tables"
+        ],
+        "cayu.memberships.sharing": [
+          "conversation_labels"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "MemberChange",
+        "Role",
+        "SHARING_LABELS",
+        "Sharing"
+      ]
+    },
     "cayu.memory": {
       "defined_in": {
         "cayu._validation": [

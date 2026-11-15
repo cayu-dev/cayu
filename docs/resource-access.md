@@ -64,6 +64,10 @@ same registered specialist can serve private users, departments, organization-wi
 resources, or separate organizations by changing classification and policy. No
 membership tables or `tenant_id` columns are added by Runtime.
 
+For organizations, departments and members, `cayu.memberships` has this policy ready:
+`MembershipAccessPolicy` over a directory of the application's own memberships, with a
+PostgreSQL store for its tables ([memberships](memberships.md)).
+
 Each action permits at most 16 alternative rules. Selectors inside a rule are
 ANDed; rules are ORed. Effective authority is **admitted maximum AND current
 authority AND caller filters**. Empty action grants deny. An empty rule is invalid

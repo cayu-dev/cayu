@@ -1,0 +1,147 @@
+"""Memberships in the application's own tables.
+
+Change them through `add_member` and `remove_member`: each raises the access revision, so
+Cayu refuses any decision read before the change.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from database import models
+from database.session import session
+from domain.organizations import AccessSnapshot, Membership
+
+# The single row of `access_revision`.
+_REVISION_ROW = 1
+
+
+class DatabaseMembershipDirectory:
+    """Reads memberships when Cayu asks; it connects on first use, never at startup."""
+
+    async def current(self, subject: str) -> AccessSnapshot:
+        return await asyncio.to_thread(self._current, subject)
+
+    def _current(self, subject: str) -> AccessSnapshot:
+        with session() as db:
+            # One snapshot, so the memberships and their revision agree.
+            db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            rows = db.execute(
+                select(
+                    models.Membership.organization_id, models.Membership.department_id
+                )
+                .where(models.Membership.subject == subject)
+                .order_by(models.Membership.organization_id)
+            ).all()
+            revision = db.scalar(
+                select(models.AccessRevision.revision).where(
+                    models.AccessRevision.id == _REVISION_ROW
+                )
+            )
+        return AccessSnapshot(
+            memberships=tuple(
+                Membership(organization, department)
+                for organization, department in rows
+            ),
+            revision=revision or 0,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MemberRecord:
+    subject: str
+    organization: str
+    department: str | None
+    role: str
+
+
+def add_member(
+    db: Session,
+    *,
+    subject: str,
+    organization: str,
+    department: str | None = None,
+    role: str = "member",
+) -> None:
+    """Add `subject` to `organization`, or move them to `department` and `role` if already
+    a member."""
+
+    db.execute(
+        insert(models.Membership)
+        .values(
+            subject=subject,
+            organization_id=organization,
+            department_id=department,
+            role=role,
+        )
+        .on_conflict_do_update(
+            index_elements=[
+                models.Membership.subject,
+                models.Membership.organization_id,
+            ],
+            set_={"department_id": department, "role": role},
+        )
+    )
+    _raise_revision(db)
+
+
+def admins_of(db: Session, organization: str, *, lock: bool = False) -> set[str]:
+    """The organization's admins; `lock=True` holds their rows until the transaction ends."""
+
+    query = select(models.Membership.subject).where(
+        models.Membership.organization_id == organization,
+        models.Membership.role == "admin",
+    )
+    if lock:
+        query = query.with_for_update()
+    return set(db.scalars(query))
+
+
+def memberships_of(db: Session, subject: str) -> list[MemberRecord]:
+    return _records(db, models.Membership.subject == subject)
+
+
+def members_of(db: Session, organization: str) -> list[MemberRecord]:
+    return _records(db, models.Membership.organization_id == organization)
+
+
+def _records(db: Session, condition) -> list[MemberRecord]:
+    rows = db.execute(
+        select(
+            models.Membership.subject,
+            models.Membership.organization_id,
+            models.Membership.department_id,
+            models.Membership.role,
+        )
+        .where(condition)
+        .order_by(models.Membership.organization_id, models.Membership.subject)
+    ).all()
+    return [MemberRecord(*row) for row in rows]
+
+
+def remove_member(db: Session, *, subject: str, organization: str) -> None:
+    """Remove `subject` from `organization`; their next protected step there is denied."""
+
+    db.execute(
+        delete(models.Membership).where(
+            models.Membership.subject == subject,
+            models.Membership.organization_id == organization,
+        )
+    )
+    _raise_revision(db)
+
+
+def _raise_revision(db: Session) -> None:
+    db.execute(
+        insert(models.AccessRevision)
+        .values(id=_REVISION_ROW, revision=1)
+        .on_conflict_do_update(
+            index_elements=[models.AccessRevision.id],
+            set_={"revision": models.AccessRevision.revision + 1},
+        )
+    )

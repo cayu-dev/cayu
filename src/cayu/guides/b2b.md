@@ -170,9 +170,12 @@ Until one is configured, the application's API answers 503. The web app signs pe
 in with a cookie, so it works with Cayu Cloud's sign-in and the demonstration login; with
 `oidc`, the API is for clients that send their own bearer token.
 
-Add the first admin of each organization with `add_member(...)` in
-`database/memberships.py`, from a one-off operation you write; from then on, the
-organization's admins manage its members on the Members page.
+Add the first admin of each organization with `cayu memberships add SUBJECT ORGANIZATION
+--role admin`, with `CAYU_DATABASE_URL` set to the application's database; from then on, the
+organization's admins manage its members on the Members page. `cayu memberships list
+--organization ORGANIZATION` lists its members and `cayu memberships remove SUBJECT
+ORGANIZATION` removes one; neither the command nor the Members page removes or demotes an
+organization's last admin.
 
 ## Deploy
 

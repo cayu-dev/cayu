@@ -1,0 +1,414 @@
+"""PostgresMemberships over the application's own tables, on the shared PostgreSQL server.
+
+The tables are created here from the documented contract (`cayu.memberships.postgres`), and
+one test checks that contract is exactly what generated migrations 0002 and 0003 create.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import types
+from collections.abc import Iterator
+from functools import partial
+
+import pytest
+
+psycopg = pytest.importorskip("psycopg")
+
+from tests.memberships_support import _create, _execute  # noqa: E402
+
+from cayu import CayuApp  # noqa: E402
+from cayu.memberships import (  # noqa: E402
+    AccessSnapshot,
+    LastAdmin,
+    Member,
+    Membership,
+    MembershipAccessPolicy,
+    MembershipTablesInvalid,
+    NotAnAdmin,
+    PostgresMemberships,
+    RemoveMember,
+    SetMember,
+    UnknownDepartment,
+    check_membership_tables,
+    conversation_labels,
+)
+from cayu.sessions import InMemorySessionStore  # noqa: E402
+from cayu.sessions.access import SessionAccessDenied  # noqa: E402
+from cayu.sessions.records import SessionIdentity  # noqa: E402
+from cayu.sessions.requests import RunRequest  # noqa: E402
+
+pytestmark = pytest.mark.postgres
+
+IDENTITY = SessionIdentity(provider_name="fake", model="fake")
+
+
+@pytest.fixture
+def store(postgres_dsn: str) -> Iterator[PostgresMemberships]:
+    _create(postgres_dsn)
+    yield PostgresMemberships(partial(psycopg.connect, postgres_dsn))
+
+
+def _catalog(dsn: str, schema: str) -> dict[str, object]:
+    with psycopg.connect(dsn) as connection:
+        columns = connection.execute(
+            "SELECT table_name, column_name, data_type, character_maximum_length, "
+            "is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema = %s ORDER BY table_name, column_name",
+            (schema,),
+        ).fetchall()
+        constraints = connection.execute(
+            "SELECT c.relname, con.conname, pg_get_constraintdef(con.oid) "
+            "FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s "
+            "ORDER BY 1, 2",
+            (schema,),
+        ).fetchall()
+        indexes = connection.execute(
+            "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = %s "
+            "ORDER BY 1, 2",
+            (schema,),
+        ).fetchall()
+    return {"columns": columns, "constraints": constraints, "indexes": indexes}
+
+
+def test_the_contract_is_what_the_generated_migrations_create(postgres_dsn: str) -> None:
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    pytest.importorskip("alembic")
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from cayu.cli import scaffold_organizations
+
+    _execute(postgres_dsn, "DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app")
+    url = psycopg.conninfo.conninfo_to_dict(postgres_dsn)
+    engine = sqlalchemy.create_engine(
+        "postgresql+psycopg://",
+        connect_args={key: value for key, value in url.items() if value is not None},
+    )
+    try:
+        with (
+            engine.begin() as connection,
+            Operations.context(MigrationContext.configure(connection)),
+        ):
+            for source in (
+                scaffold_organizations._MIGRATION,
+                scaffold_organizations._ROLES_MIGRATION,
+            ):
+                migration = types.ModuleType("migration")
+                exec(compile(source, "migration.py", "exec"), migration.__dict__)
+                migration.upgrade()
+    finally:
+        engine.dispose()
+    generated = _catalog(postgres_dsn, "app")
+
+    _create(postgres_dsn)
+
+    assert _catalog(postgres_dsn, "app") == generated
+    with psycopg.connect(postgres_dsn) as connection:
+        check_membership_tables(connection)
+
+
+def test_reads_take_memberships_and_revision_from_one_snapshot(store) -> None:
+    async def run() -> None:
+        assert await store.current("alice") == AccessSnapshot((), 0)
+        await store.add("alice", "globex")
+        await store.add("alice", "acme", department="acme/finance", role="admin")
+        assert await store.current("alice") == AccessSnapshot(
+            (Membership("acme", "acme/finance"), Membership("globex")), 2
+        )
+        # Moving a member is the same call, and raises the revision too.
+        await store.add("alice", "globex", department="globex/support")
+        snapshot = await store.current("alice")
+        assert snapshot.memberships[1] == Membership("globex", "globex/support")
+        assert snapshot.revision == 3
+        assert await store.remove("alice", "globex") is True
+        assert await store.remove("alice", "globex") is False
+        assert await store.current("alice") == AccessSnapshot(
+            (Membership("acme", "acme/finance"),), 5
+        )
+
+    asyncio.run(run())
+
+
+def test_the_snapshot_is_repeatable_read_from_its_first_statement() -> None:
+    statements: list[str] = []
+
+    class Cursor:
+        rowcount = 0
+
+        def execute(self, sql: str, parameters=()) -> None:
+            statements.append(sql)
+
+        def fetchall(self) -> list:
+            return []
+
+        def fetchone(self):
+            return (7,)
+
+        def close(self) -> None:
+            pass
+
+    class Connection:
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+        def commit(self) -> None:
+            statements.append("COMMIT")
+
+        def rollback(self) -> None:
+            statements.append("ROLLBACK")
+
+        def close(self) -> None:
+            statements.append("CLOSE")
+
+    snapshot = asyncio.run(PostgresMemberships(Connection).current("alice"))
+    assert snapshot == AccessSnapshot((), 7)
+    assert statements[0] == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+    assert statements[-2:] == ["ROLLBACK", "CLOSE"]
+
+
+def test_an_autocommit_connection_is_refused_before_any_change(postgres_dsn: str) -> None:
+    _create(postgres_dsn)
+    autocommit = PostgresMemberships(partial(psycopg.connect, postgres_dsn, autocommit=True))
+    store = PostgresMemberships(partial(psycopg.connect, postgres_dsn))
+
+    async def run() -> None:
+        await store.add("alice", "acme", role="admin")
+        with pytest.raises(ValueError, match="autocommit"):
+            await autocommit.remove("alice", "acme")
+        with pytest.raises(ValueError, match="autocommit"):
+            await autocommit.current("alice")
+        assert await store.current("alice") == AccessSnapshot((Membership("acme"),), 1)
+
+    asyncio.run(run())
+
+
+def test_members_are_listed_by_organization_and_by_person(store) -> None:
+    async def run() -> None:
+        await store.add("carol", "acme", department="acme/finance")
+        await store.add("alice", "acme", department="acme/finance", role="admin")
+        await store.add("alice", "globex", role="admin")
+        assert await store.of_organization("acme") == (
+            Member("alice", "acme", "acme/finance", "admin"),
+            Member("carol", "acme", "acme/finance", "member"),
+        )
+        alice = await store.of_subject("alice")
+        assert [item.organization for item in alice] == ["acme", "globex"]
+        assert alice[0].membership == Membership("acme", "acme/finance")
+        assert await store.of_organization("initech") == ()
+
+    asyncio.run(run())
+
+
+def test_a_membership_stays_inside_its_organization(store) -> None:
+    async def run() -> None:
+        # Another organization's department, a department that doesn't exist and an
+        # organization that doesn't exist.
+        for organization, department in (
+            ("acme", "globex/support"),
+            ("acme", "acme/missing"),
+            ("initech", None),
+        ):
+            with pytest.raises(UnknownDepartment):
+                await store.add("mallory", organization, department=department)
+        for arguments in (
+            {"role": "owner"},
+            {"department": "acme"},
+        ):
+            with pytest.raises((ValueError, UnknownDepartment)):
+                await store.add("mallory", "acme", **arguments)
+        for subject in ("", " mallory", "x" * 201):
+            with pytest.raises(ValueError):
+                await store.add(subject, "acme")
+        assert await store.current("mallory") == AccessSnapshot((), 0)
+
+    asyncio.run(run())
+
+
+def test_no_change_leaves_an_organization_without_its_last_admin(store) -> None:
+    async def run() -> None:
+        # An organization with no admin yet takes members.
+        await store.add("carol", "acme")
+        await store.add("alice", "acme", role="admin")
+        with pytest.raises(LastAdmin):
+            await store.remove("alice", "acme")
+        with pytest.raises(LastAdmin):
+            await store.add("alice", "acme", role="member")
+        await store.add("carol", "acme", role="admin")
+        assert await store.remove("alice", "acme") is True
+        assert [item.subject for item in await store.of_organization("acme")] == ["carol"]
+
+    asyncio.run(run())
+
+
+def test_only_an_admin_changes_members_and_one_admin_always_remains(store) -> None:
+    async def run() -> None:
+        await store.add("alice", "acme", department="acme/finance", role="admin")
+        await store.add("carol", "acme", department="acme/finance")
+        await store.add("dave", "globex", role="admin")
+        revision = (await store.current("alice")).revision
+
+        for caller in ("carol", "dave", "nobody"):
+            with pytest.raises(NotAnAdmin):
+                await store.change_as_admin(caller, "acme", RemoveMember("alice"))
+        with pytest.raises(LastAdmin):
+            await store.change_as_admin("alice", "acme", RemoveMember("alice"))
+        with pytest.raises(LastAdmin):
+            await store.change_as_admin("alice", "acme", SetMember("alice", "acme/legal"))
+        with pytest.raises(UnknownDepartment):
+            await store.change_as_admin("alice", "acme", SetMember("bob", "globex/support"))
+        # Nothing refused changed anything.
+        assert (await store.current("alice")).revision == revision
+
+        assert await store.change_as_admin("alice", "acme", SetMember("bob", "acme/legal"))
+        assert await store.change_as_admin("alice", "acme", RemoveMember("carol"))
+        assert not await store.change_as_admin("alice", "acme", RemoveMember("carol"))
+        assert (await store.current("alice")).revision == revision + 3
+        assert [item.subject for item in await store.of_organization("acme")] == [
+            "alice",
+            "bob",
+        ]
+
+    asyncio.run(run())
+
+
+def test_two_admins_removing_each_other_at_once_leave_one(store, postgres_dsn: str) -> None:
+    asyncio.run(store.add("alice", "acme", role="admin"))
+    asyncio.run(store.add("bob", "acme", role="admin"))
+    # Each removal holds its connection open after locking until both have started, so
+    # they overlap.
+    started = threading.Barrier(2, timeout=10)
+
+    def connect():
+        connection = psycopg.connect(postgres_dsn)
+        cursor = connection.cursor
+        first = [True]
+
+        def overlapping_cursor(*args, **kwargs):
+            if first[0]:
+                first[0] = False
+                started.wait()
+            return cursor(*args, **kwargs)
+
+        connection.cursor = overlapping_cursor
+        return connection
+
+    racing = PostgresMemberships(connect)
+
+    async def remove(caller: str, member: str) -> str:
+        try:
+            await racing.change_as_admin(caller, "acme", RemoveMember(member))
+        except (NotAnAdmin, LastAdmin) as exc:
+            return type(exc).__name__
+        return "removed"
+
+    async def run() -> list[str]:
+        return await asyncio.gather(remove("alice", "bob"), remove("bob", "alice"))
+
+    results = asyncio.run(run())
+    assert sorted(results) == ["NotAnAdmin", "removed"]
+    assert len(asyncio.run(store.of_organization("acme"))) == 1
+
+
+def test_the_policy_reads_current_memberships_from_the_tables(store) -> None:
+    async def run() -> None:
+        await store.add("alice", "acme", department="acme/finance", role="admin")
+        await store.add("carol", "acme", department="acme/finance")
+        await store.add("bob", "acme", department="acme/legal")
+        app = CayuApp(
+            session_store=InMemorySessionStore(),
+            resource_access_policy=MembershipAccessPolicy(store),
+        )
+        alice = await app.access("alice")
+        labels = conversation_labels(
+            subject="alice", membership=Membership("acme", "acme/finance"), sharing="department"
+        )
+        shared = (
+            await alice.sessions.create(
+                RunRequest(agent_name="assistant", messages=[], labels=labels), identity=IDENTITY
+            )
+        ).id
+        carol = await app.access("carol")
+        assert (await carol.sessions.load(shared)).id == shared
+        bob = await app.access("bob")
+        with pytest.raises(SessionAccessDenied):
+            await bob.sessions.load(shared)
+
+        await store.change_as_admin("alice", "acme", RemoveMember("carol"))
+
+        # The handle she already holds is refused at its next step.
+        with pytest.raises(SessionAccessDenied):
+            await carol.sessions.load(shared)
+
+    asyncio.run(run())
+
+
+def test_it_runs_on_a_sqlalchemy_pool_and_in_another_schema(postgres_dsn: str) -> None:
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    _create(postgres_dsn, "tenancy")
+    url = psycopg.conninfo.conninfo_to_dict(postgres_dsn)
+    engine = sqlalchemy.create_engine(
+        "postgresql+psycopg://",
+        connect_args={key: value for key, value in url.items() if value is not None},
+        pool_size=1,
+        max_overflow=0,
+    )
+    try:
+        memberships = PostgresMemberships(engine.raw_connection, schema="tenancy")
+
+        async def run() -> None:
+            await memberships.add("alice", "acme", role="admin")
+            # The one pooled connection is back in the pool after each call.
+            for _ in range(3):
+                assert (await memberships.current("alice")).memberships == (Membership("acme"),)
+            with pytest.raises(LastAdmin):
+                await memberships.remove("alice", "acme")
+            assert (await memberships.current("alice")).revision == 1
+
+        asyncio.run(run())
+        with engine.connect() as connection:
+            check_membership_tables(connection.connection.driver_connection, schema="tenancy")
+    finally:
+        engine.dispose()
+    with pytest.raises(ValueError, match="schema"):
+        PostgresMemberships(engine.raw_connection, schema="app; DROP TABLE x")
+
+
+def test_the_table_check_names_what_the_store_would_miss(postgres_dsn: str) -> None:
+    _create(postgres_dsn)
+    with psycopg.connect(postgres_dsn) as connection:
+        check_membership_tables(connection)
+    _execute(
+        postgres_dsn,
+        "ALTER TABLE app.memberships DROP CONSTRAINT memberships_role_check;"
+        "ALTER TABLE app.memberships DROP CONSTRAINT memberships_subject_organization_id_key;"
+        "ALTER TABLE app.memberships "
+        "DROP CONSTRAINT memberships_organization_id_department_id_fkey;"
+        "ALTER TABLE app.memberships ALTER COLUMN department_id SET NOT NULL;"
+        "ALTER TABLE app.access_revision ALTER COLUMN revision TYPE integer;",
+    )
+    with (
+        psycopg.connect(postgres_dsn) as connection,
+        pytest.raises(MembershipTablesInvalid) as raised,
+    ):
+        check_membership_tables(connection)
+    assert raised.value.problems == (
+        "app.memberships.department_id must be nullable.",
+        "app.access_revision.revision is int4; it must be one of int8.",
+        "app.memberships has no unique key on (organization_id, subject).",
+        "app.memberships has no foreign key (organization_id, department_id) referencing "
+        "app.departments (organization_id, id).",
+        "app.memberships has no check keeping role to 'member' and 'admin'.",
+    )
+    _execute(postgres_dsn, "DROP SCHEMA app CASCADE; CREATE SCHEMA app")
+    with (
+        psycopg.connect(postgres_dsn) as connection,
+        pytest.raises(MembershipTablesInvalid) as raised,
+    ):
+        check_membership_tables(connection)
+    assert raised.value.problems == (
+        "There is no table app.memberships.",
+        "There is no table app.access_revision.",
+    )

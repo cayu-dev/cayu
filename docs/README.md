@@ -53,6 +53,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Host-owned tool execution](host-owned-tool-execution.md)
 - [Exact immutable input resources](immutable-resources.md)
 - [Application-owned resource access](resource-access.md)
+- [Memberships and the membership access policy](memberships.md)
 - [Memory foundation](memory-foundation.md)
 - [Search when automatic recall is insufficient](knowledge-search-fallback.md)
 - [Opt-in knowledge offers](knowledge-offers.md)

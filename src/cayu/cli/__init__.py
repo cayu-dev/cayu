@@ -46,6 +46,7 @@ def _command_specs() -> tuple[
     from cayu.cli.keys import add_keys_parser, run_keys
     from cayu.cli.knowledge import add_knowledge_parser, run_knowledge
     from cayu.cli.lambda_microvm import add_lambda_microvm_parser, run_lambda_microvm
+    from cayu.cli.memberships import add_memberships_parser, run_memberships
     from cayu.cli.objectives import add_objectives_parser, run_objectives
     from cayu.cli.providers import add_providers_parser, run_providers
     from cayu.cli.recovery import add_recovery_parser, run_recovery
@@ -78,6 +79,7 @@ def _command_specs() -> tuple[
         ("keys", add_keys_parser, run_keys),
         ("knowledge", add_knowledge_parser, run_knowledge),
         ("lambda-microvm", add_lambda_microvm_parser, run_lambda_microvm),
+        ("memberships", add_memberships_parser, run_memberships),
         ("new", add_new_parser, run_new),
         ("objectives", add_objectives_parser, run_objectives),
         ("providers", add_providers_parser, run_providers),

@@ -1,0 +1,114 @@
+"""Who may see and continue which conversations, from current membership.
+
+Each person sees their own personal conversations, those shared with a department they
+belong to, and those shared with an organization they belong to, and nothing of any other
+organization. Only the owner continues, changes or deletes a conversation: seeing a shared
+one doesn't let anyone else run it. Cayu applies this to sessions, tasks and artifacts on
+every read, listing and background step, asking this policy again each time, so a removed
+member loses access at their next step. See `uv run --no-sync cayu guide applications`.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+from cayu.resource_access import (
+    ResourceAccessDecision,
+    ResourceAccessGrant,
+    ResourceAccessPolicy,
+)
+from cayu.sessions import SessionAccessRule, SessionAccessScope, SessionAccessSelector
+
+from database.memberships import DatabaseMembershipDirectory
+from domain.organizations import MembershipDirectory
+
+# The longest Cayu may use one decision. It asks the policy again at every protected step.
+DECISION_LIFETIME = timedelta(seconds=60)
+# Cayu stores each admitted grant with the work it admits, up to 64 KiB. With the longest IDs
+# (64 characters) a person's grant fits up to 20 memberships; this leaves room to spare.
+MAX_MEMBERSHIPS = 16
+# The labels that decide sharing; nobody may change them on an existing conversation.
+SHARING_LABELS = ("organization", "department", "owner", "sharing")
+
+
+def _rule(**labels: list[str]) -> SessionAccessRule:
+    return SessionAccessRule(
+        selectors=tuple(
+            SessionAccessSelector(key=key, values=tuple(values))
+            for key, values in labels.items()
+        )
+    )
+
+
+class MembershipAccessPolicy(ResourceAccessPolicy):
+    authority = "b2b-membership-v1"
+
+    def __init__(self, directory: MembershipDirectory) -> None:
+        self._directory = directory
+
+    async def resolve(self, subject: str) -> ResourceAccessDecision:
+        snapshot = await self._directory.current(subject)
+        organizations = sorted({item.organization for item in snapshot.memberships})
+        if not organizations:
+            return ResourceAccessDecision(
+                ResourceAccessGrant(), revision=snapshot.revision
+            )
+        if len(snapshot.memberships) > MAX_MEMBERSHIPS:
+            raise ValueError(
+                f"{subject!r} has more than {MAX_MEMBERSHIPS} memberships, more than one grant holds."
+            )
+        departments = sorted(
+            {
+                item.department
+                for item in snapshot.memberships
+                if item.department is not None
+            }
+        )
+        owner = [subject]
+        visible = [
+            _rule(organization=organizations, owner=owner, sharing=["personal"]),
+            _rule(organization=organizations, sharing=["organization"]),
+        ]
+        # A new conversation is always the person's own, inside their memberships.
+        creatable = [
+            _rule(
+                organization=organizations,
+                owner=owner,
+                sharing=["personal", "organization"],
+            )
+        ]
+        own = list(creatable)
+        if departments:
+            # A department conversation is decided by its department alone: a department ID
+            # names its organization (`acme/finance`), so whatever organization label it
+            # carries grants nothing.
+            visible.append(_rule(department=departments, sharing=["department"]))
+            creatable.append(
+                _rule(
+                    organization=organizations,
+                    department=departments,
+                    owner=owner,
+                    sharing=["department"],
+                )
+            )
+            own.append(
+                _rule(department=departments, owner=owner, sharing=["department"])
+            )
+        scope = SessionAccessScope(
+            read=tuple(visible),
+            create=tuple(creatable),
+            execute=tuple(own),
+            modify=tuple(own),
+            delete=tuple(own),
+            update_labels=tuple(own),
+            protected_label_keys=SHARING_LABELS,
+        )
+        return ResourceAccessDecision(
+            ResourceAccessGrant(sessions=scope, tasks=scope, artifacts=scope),
+            revision=snapshot.revision,
+            valid_until=datetime.now(UTC) + DECISION_LIFETIME,
+        )
+
+
+def build_access_policy() -> MembershipAccessPolicy:
+    return MembershipAccessPolicy(DatabaseMembershipDirectory())

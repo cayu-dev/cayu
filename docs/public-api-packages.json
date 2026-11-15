@@ -18,6 +18,7 @@
   "cayu.extensions.runners",
   "cayu.external_agents",
   "cayu.mcp",
+  "cayu.memberships",
   "cayu.memory",
   "cayu.observability",
   "cayu.providers",
