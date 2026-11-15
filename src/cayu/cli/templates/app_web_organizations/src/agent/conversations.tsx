@@ -9,7 +9,7 @@ import { queryContentProps, queryTableProps } from "@kit/data";
 import { BubbleChatIcon } from "@kit/icons";
 import type { AppArea } from "../app/area";
 import { useAreaApi } from "../app/services";
-import { b2bApi, type B2bApi, type Conversation, type Membership, messageOf, ReplyFailed, type Sharing, statusOf, stream, textOf, titleOf } from "./api";
+import { b2bApi, type B2bApi, type Conversation, type Membership, messageOf, ReplyFailed, SHARING, type Sharing, statusOf, stream, textOf, titleOf } from "./api";
 import { Markdown } from "./markdown";
 import { MembershipFailed, membershipBlocker, OrganizationSelect, useMembership } from "./organization";
 
@@ -37,13 +37,12 @@ export const conversationsKey = ["b2b", "conversations"] as const;
 
 export const SHARING_LABEL: Record<Sharing, string> = {
   personal: "Only me",
-  department: "My department",
   organization: "My organization",
 };
 
 /** Who can see a conversation, from its sharing labels. */
 export function SharingBadge({ labels }: { labels: Record<string, string> }) {
-  const text = labels.sharing === "department" ? labels.department : labels.sharing === "organization" ? labels.organization : "Only the owner";
+  const text = labels.sharing === "organization" ? labels.organization : "Only the owner";
   return <StatusBadge tone="neutral">{text ?? "Unknown"}</StatusBadge>;
 }
 
@@ -71,7 +70,7 @@ function ConversationsPage() {
   return (
     <div className="flex flex-col gap-page-section" data-origin="own">
       <AppPageHeader
-        description={organization ? `In ${organization}: your own, and those shared with your department or organization.` : null}
+        description={organization ? `In ${organization}: your own, and those shared with your organization.` : null}
         actions={
           <>
             <OrganizationSelect />
@@ -154,7 +153,6 @@ function NewConversationForm({ agent, membership }: { agent: string; membership:
   const [reply, setReply] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const options: Sharing[] = membership.department ? ["personal", "department", "organization"] : ["personal", "organization"];
   // Leaving the page keeps reading the reply, since stopping would stop the agent, but it no
   // longer updates this page or opens the conversation.
   const shown = React.useRef(true);
@@ -207,7 +205,7 @@ function NewConversationForm({ agent, membership }: { agent: string; membership:
             }}
             className="flex-wrap"
           >
-            {options.map((option) => (
+            {SHARING.map((option) => (
               <ToggleGroupItem key={option} value={option}>
                 {SHARING_LABEL[option]}
               </ToggleGroupItem>

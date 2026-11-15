@@ -202,7 +202,7 @@ PRESETS: tuple[PresetSpec, ...] = (
             "The web app plus organizations. Choose it only when separate organizations "
             "(client firms, an agency's clients, households) share one deployment, each with "
             "several people who sign in and see only their own organization's data: "
-            "organizations, departments and members in its own tables, turned into Cayu "
+            "organizations and members in its own tables, turned into Cayu "
             "resource-access grants. Not for your own customers or users, who are each one "
             "person: use service or agent. Every "
             "preset but service already has a web app for your own team. The agent preset "
@@ -466,10 +466,9 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
     CapabilitySpec(
         name=ORGANIZATIONS,
         summary=(
-            "Several businesses on one deployment: organizations, departments and memberships "
-            "in the application's own tables, turned into Cayu resource-access grants, so each "
-            "person sees only their own, their department's and their organization's "
-            "conversations. The web app's people become the organizations' members, with "
+            "Several businesses on one deployment: organizations and memberships in the "
+            "application's own tables, turned into Cayu resource-access grants, so each "
+            "person sees only their own conversations and their organization's. The web app's people become the organizations' members, with "
             "Members and an organization switcher; operators keep the Developer dashboard. "
             "With knowledge and memory (the agent preset), each organization's knowledge is "
             "its own: notes carry the conversation's organization, and recall and lookup "

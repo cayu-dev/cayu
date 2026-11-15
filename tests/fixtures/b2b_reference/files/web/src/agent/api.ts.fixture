@@ -8,7 +8,7 @@ import { session } from "../app/services";
  * it answers.
  */
 
-export const SHARING = ["personal", "department", "organization"] as const;
+export const SHARING = ["personal", "organization"] as const;
 export type Sharing = (typeof SHARING)[number];
 export const ROLES = ["member", "admin"] as const;
 export type Role = (typeof ROLES)[number];
@@ -16,7 +16,6 @@ export type Role = (typeof ROLES)[number];
 export const membership = z.object({
   subject: z.string(),
   organization: z.string(),
-  department: z.string().nullable(),
   role: z.enum(ROLES),
 });
 export type Membership = z.infer<typeof membership>;
@@ -125,8 +124,8 @@ export function b2bApi(request: Requester) {
     },
     members: (organization: string, signal?: AbortSignal) =>
       request(`organizations/${encodeURIComponent(organization)}/members`, { signal, schema: z.array(membership) }),
-    putMember: (organization: string, subject: string, department: string | null, role: Role) =>
-      request(memberPath(organization, subject), { method: "PUT", body: { department, role } }),
+    putMember: (organization: string, subject: string, role: Role) =>
+      request(memberPath(organization, subject), { method: "PUT", body: { role } }),
     removeMember: (organization: string, subject: string) => request(memberPath(organization, subject), { method: "DELETE" }),
   };
 }

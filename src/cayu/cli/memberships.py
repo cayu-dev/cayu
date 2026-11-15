@@ -46,10 +46,10 @@ def add_memberships_parser(subparsers: Any) -> None:
     which.add_argument("--subject", help="The person whose memberships to list.")
     add = commands.add_parser(
         "add",
-        help="Add a person to an organization, or move them to another department or role.",
+        help="Add a person to an organization, or change their role there.",
         description=(
-            "Add SUBJECT to ORGANIZATION, or move them if already a member. Refuses a "
-            "department of another organization, and demoting the organization's last admin."
+            "Add SUBJECT to ORGANIZATION, or change their role if already a member. Refuses "
+            "an organization that doesn't exist, and demoting the organization's last admin."
         ),
     )
     remove = commands.add_parser(
@@ -63,7 +63,6 @@ def add_memberships_parser(subparsers: Any) -> None:
     for command in (add, remove):
         command.add_argument("subject", metavar="SUBJECT", help="The person's sign-in subject.")
         command.add_argument("organization", metavar="ORGANIZATION", help="The organization ID.")
-    add.add_argument("--department", help="A department of ORGANIZATION, such as acme/finance.")
     add.add_argument("--role", choices=("member", "admin"), default="member")
     for command in (listing, add, remove):
         command.add_argument(
@@ -125,19 +124,11 @@ async def _run(args: argparse.Namespace) -> str:
             return "No members.\n"
         return _table(rows)
     if args.memberships_command == "add":
-        await memberships.add(
-            args.subject, args.organization, department=args.department, role=args.role
-        )
-        result = {
-            "subject": args.subject,
-            "organization": args.organization,
-            "department": args.department,
-            "role": args.role,
-        }
+        await memberships.add(args.subject, args.organization, role=args.role)
+        result = {"subject": args.subject, "organization": args.organization, "role": args.role}
         if args.output_format == "json":
             return _json({"added": result})
-        where = args.department or args.organization
-        return f"{terminal_safe(args.subject)} is a{'n' if args.role == 'admin' else ''} {args.role} of {terminal_safe(where)}.\n"
+        return f"{terminal_safe(args.subject)} is a{'n' if args.role == 'admin' else ''} {args.role} of {terminal_safe(args.organization)}.\n"
     removed = await memberships.remove(args.subject, args.organization)
     if args.output_format == "json":
         return _json(
@@ -179,12 +170,11 @@ def _table(rows: list[dict[str, Any]]) -> str:
     text = io.StringIO()
     with contextlib.redirect_stdout(text):
         print_table(
-            ("Subject", "Organization", "Department", "Role"),
+            ("Subject", "Organization", "Role"),
             [
                 {
                     "Subject": row["subject"],
                     "Organization": row["organization"],
-                    "Department": row["department"],
                     "Role": row["role"],
                 }
                 for row in rows

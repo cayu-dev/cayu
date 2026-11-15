@@ -2,10 +2,9 @@
 
 `cayu new NAME --preset b2b` generates an agent that people from separate organizations
 share on one deployment, one database and one agent. Each organization (a client firm, an
-agency's client, a household) has departments and several members. People sign in to the
-application's web app, see their own conversations, their department's and their
-organization's, and nothing of another organization. The organization's admins manage its
-members in the web app.
+agency's client, a household) has several members. People sign in to the application's web
+app, see their own conversations and those shared with their organization, and nothing of
+another organization. The organization's admins manage its members in the web app.
 
 Choose it only for that, not for your own customers or users, who are each one person: use
 service or agent. Every preset but service already comes with a web app for your own
@@ -29,7 +28,7 @@ The application decides who belongs where. Cayu enforces what that allows.
 
 | Owner | What it decides | Where |
 | --- | --- | --- |
-| The application | Organizations, departments, memberships and roles, in its own tables | `database/`, `migrations/` |
+| The application | Organizations, memberships and roles, in its own tables, and any grouping of people inside an organization it wants | `database/`, `migrations/` |
 | The application | Who a request is (sign-in) | `integrations/sign_in.py` |
 | The application | Which policy turns a person's current memberships into Cayu grants: `cayu.memberships`' `MembershipAccessPolicy`, or its own | `policies/access.py` |
 | Cayu (`cayu.memberships`) | Reading and changing memberships in those tables, the access revision, the sharing labels a new conversation gets (`conversation_labels`) and the grants they allow | `database/memberships.py` wires it to the application's database |
@@ -37,6 +36,14 @@ The application decides who belongs where. Cayu enforces what that allows.
 
 Cayu asks the policy again at every protected step, so removing a member takes effect at
 their next step, including a conversation that is running or a task that is queued.
+
+Cayu's part has organizations, members and roles only. Whether people inside an organization
+are grouped at all, and how (teams, projects, client matters), is the application's choice:
+it keeps those groups in its own tables and writes its own `ResourceAccessPolicy` in
+`policies/access.py` over the same `memberships()`, adding to the grant
+`MembershipAccessPolicy` gives a rule for each of the person's groups. Each rule names the
+group's organization, so a group of the same name in another organization never matches.
+Cayu's `docs/memberships.md` ("Groups of your own") has an example.
 
 ## Run it locally
 
@@ -54,17 +61,17 @@ uv run --no-sync cayu serve --dev
 
 Open `http://127.0.0.1:8000/` and choose a demonstration person:
 
-| Person | Organization and department | Role | What they see |
+| Person | Organization | Role | What they see |
 | --- | --- | --- | --- |
-| alice | acme, acme/finance | admin | Her own, and acme/finance's and acme's shared conversations; the Members page |
-| carol | acme, acme/finance | member | Her own, and acme/finance's and acme's shared conversations; continues only her own |
-| bob | acme, acme/legal | member | Nothing alice shared with acme/finance; what she shared with acme |
-| dave | globex, globex/support | admin | Nothing of acme's |
+| alice | acme | admin | Her own, and what acme's members shared with acme; the Members page |
+| carol | acme | member | Her own, and what acme's members shared with acme; continues only her own |
+| dave | globex | admin | Nothing of acme's |
+| bob | globex | member | Nothing of acme's |
 
-As alice, start a conversation shared with "My department", then pick carol under
-"Demonstration person" in the profile menu: she reads it but can't continue it. As bob or dave, it isn't listed and
-its address answers that it doesn't exist. As alice, remove carol on the Members page; her
-next step is refused.
+As alice, start a conversation shared with "My organization", then pick carol under
+"Demonstration person" in the profile menu: she reads it but can't continue it. As dave or
+bob, it isn't listed and its address answers that it doesn't exist. As alice, remove carol on
+the Members page; her next step is refused.
 
 The demonstration login exists only under `cayu serve --dev`, for the people
 `operations/demo_seed.py` adds.
@@ -121,7 +128,7 @@ The app calls only the application's API under `/app`, never Cayu's `/api`:
 | `GET /app/me` | The signed-in person, their memberships and the agent's name |
 | `POST /app/conversation-labels` | The labels for a new conversation, built from the person's membership |
 | `/app/resources/...` | Cayu's scoped routes: list and read conversations, start (`runs`) and continue (`resume`) one with a streamed reply |
-| `/app/organizations/{organization}/members` | Admins list, add, move and remove members |
+| `/app/organizations/{organization}/members` | Admins list, add, change and remove members |
 | `GET /app/whoami` | The signed-in person and their role: `admin` if they administer any of their organizations, else `member` |
 | `GET /app/settings` | The Agent's managed settings, where each value comes from and the `cayu cloud settings` commands that change it, and the settings it reads at start-up |
 | `GET /app/overview` | The Agent's metrics for the person (`integrations/http/overview_metrics.py`) and what waits in Cayu's inbox |
@@ -221,9 +228,10 @@ Projects generated before Cayu had `cayu.memberships` carry their own copies of 
    `policies/access.py`, `database/memberships.py`, `domain/organizations.py` (now only
    `app_role`), `operations/demo_seed.py`, `integrations/http/__init__.py`,
    `integrations/http/overview_metrics.py`, `tests/test_organizations.py`,
-   `tests/test_http_api.py`, `tests/test_generated_routes.py` and
-   `tests/test_background_revocation.py`. The "Organizations and sharing" section of
-   `README.md` and `AGENTS.md` changed too.
+   `tests/test_http_api.py`, `tests/test_generated_routes.py`,
+   `tests/test_background_revocation.py` and the web app's `web/src/agent/`, then rebuild
+   `web/static` (`npm --prefix web ci` and `npm --prefix web run build`). The "Organizations
+   and sharing" section of `README.md` and `AGENTS.md` changed too.
 3. Delete `domain/sharing.py`. Import `Membership`, `conversation_labels`, `Sharing`,
    `InMemoryMembershipDirectory` and `MembershipAccessPolicy` from `cayu.memberships`
    wherever your own code and tests took them from `domain/` or `policies/access.py`.
@@ -235,11 +243,19 @@ Projects generated before Cayu had `cayu.memberships` carry their own copies of 
    tables with `check_membership_tables`.
 
 There is no database migration: the library reads and writes the same `memberships` and
-`access_revision` tables. Queued and running work stays admitted, because the policy keeps
-the authority `b2b-membership-v1` and grants exactly what the generated one did. The one
-difference: it refuses a membership whose department isn't its organization's, which the
-generated tables already prevent. Members can now be managed with `uv run --no-sync cayu
-memberships list|add|remove`.
+`access_revision` tables. Projects generated by Cayu 0.16.1 to 0.20.0 also have a
+`departments` table and a `department_id` column on `memberships`; the library ignores both,
+and they can stay or go in a migration of the project's own. The policy keeps the authority
+`b2b-membership-v1`, so queued and running work stays admitted for the person who started it.
+
+What changes is departments. The library has none, so a conversation those projects shared
+with a department becomes visible only to its owner, who still reads and continues it; the
+other members of the department lose it. Access only narrows: apart from a conversation's
+owner, nobody sees one they couldn't see before, and personal and organization conversations
+are decided as before. To
+keep sharing with departments, keep them as the application's own groups and write the
+policy for them ("Who decides what" above). Members can now be managed with `uv run --no-sync
+cayu memberships list|add|remove`.
 
 The library itself is described in Cayu's `docs/memberships.md`.
 

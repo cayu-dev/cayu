@@ -7,7 +7,7 @@
   new conversation they share takes. The active organization a client shows is only a filter
   and a default: it never grants anything.
 - /app/organizations/{organization}/members: the members, which an organization's admins
-  add, move and remove.
+  add, change and remove.
 - /app/whoami, /app/settings, /app/overview, /app/task-runs and /app/inbox: the routes every
   Agent's web app reads (integrations/http/generated/), given this application's people and
   roles (`person` below), its overview metrics (`overview_metrics.py`) and the settings it
@@ -33,7 +33,7 @@ from cayu.memberships import (
     RemoveMember,
     SetMember,
     Sharing,
-    UnknownDepartment,
+    UnknownOrganization,
     conversation_labels,
 )
 from cayu.server.resource_access import create_resource_router
@@ -69,7 +69,6 @@ class LabelsRequest(BaseModel):
 
 
 class MemberRequest(BaseModel):
-    department: str | None = None
     role: Literal["member", "admin"] = "member"
 
 
@@ -150,9 +149,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     ) -> dict:
         await _require_admin(subject, organization)
         _require_subject(member)
-        await _change_members(
-            subject, organization, SetMember(member, body.department, body.role)
-        )
+        await _change_members(subject, organization, SetMember(member, body.role))
         return {"subject": member, "organization": organization, **body.model_dump()}
 
     @router.delete(
@@ -202,7 +199,6 @@ def _member(record: Member) -> dict:
     return {
         "subject": record.subject,
         "organization": record.organization,
-        "department": record.department,
         "role": record.role,
     }
 
@@ -244,9 +240,7 @@ async def _change_members(caller: str, organization: str, change: MemberChange) 
         ) from None
     except LastAdmin:
         raise HTTPException(409, "An organization keeps at least one admin.") from None
-    except UnknownDepartment:
-        raise HTTPException(
-            422, "The department must be one of this organization's."
-        ) from None
+    except UnknownOrganization:
+        raise HTTPException(404, "Organization unavailable.") from None
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None

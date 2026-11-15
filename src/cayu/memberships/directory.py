@@ -1,7 +1,7 @@
 """Who belongs where: memberships, the snapshot a policy reads, and the directory seam.
 
-The application owns its organizations, departments and memberships. Cayu keeps none of its
-own: a :class:`MembershipDirectory` reports a person's current memberships, and
+The application owns its organizations and memberships. Cayu keeps none of its own: a
+:class:`MembershipDirectory` reports a person's current memberships, and
 :class:`~cayu.memberships.MembershipAccessPolicy` turns them into resource-access grants each
 time Cayu asks. :class:`InMemoryMembershipDirectory` serves tests and trying the policy without
 a database; :class:`~cayu.memberships.PostgresMemberships` reads the application's own tables.
@@ -19,14 +19,9 @@ ROLES: tuple[Role, ...] = ("member", "admin")
 
 @dataclass(frozen=True, slots=True)
 class Membership:
-    """A membership of ``organization``, and of at most one of its departments.
-
-    A department ID starts with its organization's ID and a ``/``, as in ``acme/finance``,
-    so it can never name another organization's department.
-    """
+    """A membership of ``organization``."""
 
     organization: str
-    department: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,12 +41,11 @@ class Member:
 
     subject: str
     organization: str
-    department: str | None
     role: str
 
     @property
     def membership(self) -> Membership:
-        return Membership(self.organization, self.department)
+        return Membership(self.organization)
 
 
 class MembershipDirectory(Protocol):

@@ -3162,7 +3162,7 @@ def _rendered_preset_files(
                     "__AGENT_NAME__", resolved_agent_name
                 )
                 if plan.preset == "long-running"
-                else "An agent that several businesses share. Organizations, departments and\nmemberships live in the application's own tables (`domain/organizations.py`), and\n`policies/access.py` turns each person's current membership into Cayu resource-access\ngrants, so everyone sees only their own, their department's and their organization's\nconversations. Its registered specialist identity is `__AGENT_NAME__`.".replace(
+                else "An agent that several businesses share. Organizations and memberships live in the\napplication's own tables (`domain/organizations.py`), and `policies/access.py` turns\neach person's current membership into Cayu resource-access grants, so everyone sees\nonly their own conversations and their organization's. Its registered specialist\nidentity is `__AGENT_NAME__`.".replace(
                     "__AGENT_NAME__", resolved_agent_name
                 )
                 if ORGANIZATIONS in plan.capabilities

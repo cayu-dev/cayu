@@ -1,10 +1,11 @@
-"""Organizations, departments and memberships: who belongs where, owned by this application.
+"""Organizations and memberships: who belongs where, owned by this application.
 
 The tables are this application's (`database/models.py`, `migrations/`). `cayu.memberships`
 reads and changes its memberships (`database/memberships.py`), turns a person's current
 memberships into Cayu resource-access grants (`policies/access.py`) and gives a new
 conversation its sharing labels (`conversation_labels`). What roles mean here is this
-application's own decision.
+application's own decision, and so is any grouping of people inside an organization (teams,
+projects): add its tables here and its rules in `policies/access.py`.
 """
 
 from __future__ import annotations

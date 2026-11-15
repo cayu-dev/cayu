@@ -1,8 +1,8 @@
 """The `organizations` capability of ``cayu new``, which the ``b2b`` preset turns on.
 
 It goes on top of the agent preset's files, the app-database convention and the web app, and
-adds what an application serving several businesses needs: organizations, departments and
-memberships in its own tables, and a policy that turns a person's current membership into
+adds what an application serving several businesses needs: organizations and memberships
+in its own tables, and a policy that turns a person's current membership into
 Cayu resource-access grants. The application decides who belongs where; Cayu enforces the
 result on every read, listing and background step.
 
@@ -29,8 +29,8 @@ from cayu.cli.scaffold_web_app import served_app_files
 _MODELS_APPEND = '''
 
 class Organization(Base):
-    """A business this application serves. Its ID has no '/', which separates it from a
-    department's own part in a department ID."""
+    """A business this application serves. Its ID has no '/', so it is one segment of the
+    routes' paths, as in `/app/organizations/{organization}/members`."""
 
     __tablename__ = "organizations"
     __table_args__ = (CheckConstraint("strpos(id, '/') = 0"),)
@@ -39,38 +39,12 @@ class Organization(Base):
     name: Mapped[str] = mapped_column(String(200))
 
 
-class Department(Base):
-    """A department of one organization; its ID starts with the organization's, as in
-    `acme/finance`, so it can never name another organization's department."""
-
-    __tablename__ = "departments"
-    __table_args__ = (
-        # The target of a membership's (organization, department) reference.
-        UniqueConstraint("organization_id", "id"),
-        CheckConstraint("starts_with(id, organization_id || '/')"),
-    )
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    organization_id: Mapped[str] = mapped_column(
-        ForeignKey(f"{SCHEMA}.organizations.id", ondelete="CASCADE")
-    )
-    name: Mapped[str] = mapped_column(String(200))
-
-
 class Membership(Base):
-    """One person's membership of an organization, and of at most one of its departments.
-
-    The department must belong to the same organization; remove or move its members before
-    deleting a department.
-    """
+    """One person's membership of an organization."""
 
     __tablename__ = "memberships"
     __table_args__ = (
         UniqueConstraint("subject", "organization_id"),
-        ForeignKeyConstraint(
-            ["organization_id", "department_id"],
-            [f"{SCHEMA}.departments.organization_id", f"{SCHEMA}.departments.id"],
-        ),
         CheckConstraint("role in ('member', 'admin')"),
     )
 
@@ -79,8 +53,7 @@ class Membership(Base):
     organization_id: Mapped[str] = mapped_column(
         ForeignKey(f"{SCHEMA}.organizations.id", ondelete="CASCADE")
     )
-    department_id: Mapped[str | None] = mapped_column(String(64))
-    # `admin` may add, move and remove the organization's members. It is this application's
+    # `admin` may add, change and remove the organization's members. It is this application's
     # decision only: it never widens what Cayu lets anyone see.
     role: Mapped[str] = mapped_column(String(16), server_default="member")
 
@@ -94,7 +67,7 @@ class AccessRevision(Base):
     revision: Mapped[int] = mapped_column(BigInteger)
 '''
 
-_MIGRATION = '''"""Organizations, departments and memberships.
+_MIGRATION = '''"""Organizations and memberships.
 
 Revision ID: 0002
 Revises: 0001
@@ -120,20 +93,6 @@ def upgrade() -> None:
         schema="app",
     )
     op.create_table(
-        "departments",
-        sa.Column("id", sa.String(length=64), primary_key=True),
-        sa.Column(
-            "organization_id",
-            sa.String(length=64),
-            sa.ForeignKey("app.organizations.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("name", sa.String(length=200), nullable=False),
-        sa.UniqueConstraint("organization_id", "id"),
-        sa.CheckConstraint("starts_with(id, organization_id || '/')"),
-        schema="app",
-    )
-    op.create_table(
         "memberships",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("subject", sa.String(length=200), nullable=False),
@@ -143,12 +102,7 @@ def upgrade() -> None:
             sa.ForeignKey("app.organizations.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("department_id", sa.String(length=64), nullable=True),
         sa.UniqueConstraint("subject", "organization_id"),
-        sa.ForeignKeyConstraint(
-            ["organization_id", "department_id"],
-            ["app.departments.organization_id", "app.departments.id"],
-        ),
         schema="app",
     )
     op.create_table(
@@ -160,17 +114,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    for table in ("access_revision", "memberships", "departments", "organizations"):
+    for table in ("access_revision", "memberships", "organizations"):
         op.drop_table(table, schema="app")
 '''
 
-_ORGANIZATIONS_PY = '''"""Organizations, departments and memberships: who belongs where, owned by this application.
+_ORGANIZATIONS_PY = '''"""Organizations and memberships: who belongs where, owned by this application.
 
 The tables are this application's (`database/models.py`, `migrations/`). `cayu.memberships`
 reads and changes its memberships (`database/memberships.py`), turns a person's current
 memberships into Cayu resource-access grants (`policies/access.py`) and gives a new
 conversation its sharing labels (`conversation_labels`). What roles mean here is this
-application's own decision.
+application's own decision, and so is any grouping of people inside an organization (teams,
+projects): add its tables here and its rules in `policies/access.py`.
 """
 
 from __future__ import annotations
@@ -224,11 +179,11 @@ def _connect():
 _ACCESS_POLICY_PY = '''"""Who may see and continue which conversations, from current membership.
 
 `cayu.memberships`' policy over this application's memberships. Each person sees their own
-personal conversations, those shared with a department they belong to, and those shared
-with an organization they belong to, and nothing of any other organization. Only the owner
-continues, changes or deletes a conversation. Cayu applies this to sessions, tasks and
-artifacts on every read, listing and background step, asking the policy again each time, so
-a removed member loses access at their next step. For other rules, write your own
+conversations and those shared with an organization they belong to, and nothing of any
+other organization. Only the owner continues, changes or deletes a conversation. Cayu
+applies this to sessions, tasks and artifacts on every read, listing and background step,
+asking the policy again each time, so a removed member loses access at their next step. For
+other rules, such as sharing with groups of this application's own, write your own
 `ResourceAccessPolicy` here. See `uv run --no-sync cayu guide b2b`.
 """
 
@@ -262,17 +217,12 @@ from database.memberships import memberships
 from database.session import session
 
 DEMO_ORGANIZATIONS = {"acme": "Acme", "globex": "Globex"}
-DEMO_DEPARTMENTS = {
-    "acme/finance": ("acme", "Finance"),
-    "acme/legal": ("acme", "Legal"),
-    "globex/support": ("globex", "Support"),
-}
-# (subject, organization, department, role)
+# (subject, organization, role)
 DEMO_MEMBERS = (
-    ("alice", "acme", "acme/finance", "admin"),
-    ("carol", "acme", "acme/finance", "member"),
-    ("bob", "acme", "acme/legal", "member"),
-    ("dave", "globex", "globex/support", "admin"),
+    ("alice", "acme", "admin"),
+    ("carol", "acme", "member"),
+    ("dave", "globex", "admin"),
+    ("bob", "globex", "member"),
 )
 
 
@@ -293,19 +243,13 @@ def seed() -> None:
                 .values(id=identifier, name=name)
                 .on_conflict_do_nothing()
             )
-        for identifier, (organization, name) in DEMO_DEPARTMENTS.items():
-            db.execute(
-                insert(models.Department)
-                .values(id=identifier, organization_id=organization, name=name)
-                .on_conflict_do_nothing()
-            )
         db.commit()
     asyncio.run(_add_members())
 
 
 async def _add_members() -> None:
-    for subject, organization, department, role in DEMO_MEMBERS:
-        await memberships().add(subject, organization, department=department, role=role)
+    for subject, organization, role in DEMO_MEMBERS:
+        await memberships().add(subject, organization, role=role)
 
 
 def main() -> None:
@@ -375,7 +319,7 @@ from test_app_database import ALEMBIC, requires_postgres
 
 from cayu.memberships import (
     MembershipAccessPolicy,
-    UnknownDepartment,
+    UnknownOrganization,
     check_membership_tables,
 )
 from database import models
@@ -404,24 +348,17 @@ def test_the_tables_are_the_shape_cayu_memberships_needs(database) -> None:
     seed()
     assert [item.subject for item in asyncio.run(memberships().of_organization("acme"))] == [
         "alice",
-        "bob",
         "carol",
     ]
 
 
 @requires_postgres
-def test_a_membership_cant_name_another_organizations_department(database) -> None:
+def test_a_membership_is_of_an_organization_that_exists(database) -> None:
     command.upgrade(ALEMBIC, "head")
     seed()
-    with pytest.raises(UnknownDepartment):
-        asyncio.run(memberships().add("mallory", "globex", department="acme/finance"))
-    # A department ID always starts with its organization's, so none is ever reused across them.
-    with session() as db, pytest.raises(IntegrityError):
-        db.add(
-            models.Department(id="finance", organization_id="globex", name="Finance")
-        )
-        db.commit()
-    # Nor can an organization's ID look like another's department prefix.
+    with pytest.raises(UnknownOrganization):
+        asyncio.run(memberships().add("mallory", "initech"))
+    # An organization's ID is one segment of the routes' paths.
     with session() as db, pytest.raises(IntegrityError):
         db.add(models.Organization(id="acme/eu", name="Acme EU"))
         db.commit()
@@ -590,7 +527,7 @@ _HTTP_PY = '''"""THE AGENT'S OWN. The application's HTTP API, which `cayu serve`
   new conversation they share takes. The active organization a client shows is only a filter
   and a default: it never grants anything.
 - /app/organizations/{organization}/members: the members, which an organization's admins
-  add, move and remove.
+  add, change and remove.
 - /app/whoami, /app/settings, /app/overview, /app/task-runs and /app/inbox: the routes every
   Agent's web app reads (integrations/http/generated/), given this application's people and
   roles (`person` below), its overview metrics (`overview_metrics.py`) and the settings it
@@ -616,7 +553,7 @@ from cayu.memberships import (
     RemoveMember,
     SetMember,
     Sharing,
-    UnknownDepartment,
+    UnknownOrganization,
     conversation_labels,
 )
 from cayu.server.resource_access import create_resource_router
@@ -652,7 +589,6 @@ class LabelsRequest(BaseModel):
 
 
 class MemberRequest(BaseModel):
-    department: str | None = None
     role: Literal["member", "admin"] = "member"
 
 
@@ -733,9 +669,7 @@ def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     ) -> dict:
         await _require_admin(subject, organization)
         _require_subject(member)
-        await _change_members(
-            subject, organization, SetMember(member, body.department, body.role)
-        )
+        await _change_members(subject, organization, SetMember(member, body.role))
         return {"subject": member, "organization": organization, **body.model_dump()}
 
     @router.delete(
@@ -785,7 +719,6 @@ def _member(record: Member) -> dict:
     return {
         "subject": record.subject,
         "organization": record.organization,
-        "department": record.department,
         "role": record.role,
     }
 
@@ -827,10 +760,8 @@ async def _change_members(caller: str, organization: str, change: MemberChange) 
         ) from None
     except LastAdmin:
         raise HTTPException(409, "An organization keeps at least one admin.") from None
-    except UnknownDepartment:
-        raise HTTPException(
-            422, "The department must be one of this organization's."
-        ) from None
+    except UnknownOrganization:
+        raise HTTPException(404, "Organization unavailable.") from None
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
 '''
@@ -922,7 +853,7 @@ async def overview_metrics(context: OverviewContext) -> list[Metric]:
         Metric(
             label="Organizations",
             value=str(len(organizations)),
-            description=", ".join(_where(item) for item in organizations) or "No organization has added you yet.",
+            description=", ".join(item.organization for item in organizations) or "No organization has added you yet.",
         ),
         Metric(
             label="Members",
@@ -933,8 +864,8 @@ async def overview_metrics(context: OverviewContext) -> list[Metric]:
             label="Conversations",
             value=str(visible.total_count or 0),
             description=(
-                f"{own.total_count or 0} started by you, the rest shared with your department "
-                "or organization."
+                f"{own.total_count or 0} started by you, the rest shared with your "
+                "organization."
             ),
         ),
         Metric(
@@ -955,10 +886,6 @@ async def _people(subject: str) -> tuple[list[Membership], int]:
         for member in await memberships().of_organization(record.organization)
     }
     return [record.membership for record in records], len(people)
-
-
-def _where(membership: Membership) -> str:
-    return membership.department or membership.organization
 '''
 
 
@@ -1007,7 +934,7 @@ from integrations.http.generated import (
 )
 from integrations.http.generated.task_runs import TaskRun, list_task_runs
 
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 PEOPLE = {
     "alice": Person(subject="alice", role="admin", may_decide=False, may_change=True),
     "bob": Person(subject="bob", role="member", may_decide=False, may_change=False),
@@ -1471,7 +1398,7 @@ from database.memberships import memberships
 from integrations.http import AGENT_NAME, build_router
 from operations.demo_seed import seed
 
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 IDENTITY = SessionIdentity(provider_name="fake", model="fake")
 # The built web app, `[tool.cayu.serve] ui` in pyproject.toml.
 WEB = Path(__file__).resolve().parents[1] / "web" / "static"
@@ -1583,23 +1510,21 @@ def test_conversations_over_http_show_each_person_only_their_own() -> None:
     directory = InMemoryMembershipDirectory(
         {
             "alice": [ALICE],
-            "carol": [Membership("acme", "acme/finance")],
-            "bob": [Membership("acme", "acme/legal")],
-            "dave": [Membership("globex", "globex/support")],
+            "carol": [Membership("acme")],
+            "dave": [Membership("globex")],
         }
     )
     app = _app(directory)
     with _client(app) as client:
         personal = _start(client, app, "personal")
-        department = _start(client, app, "department")
+        shared = _start(client, app, "organization")
         _sign_in(client, "carol")
-        assert _listed(client) == {department}
-        _sign_in(client, "bob")
-        assert _listed(client) == set()
+        assert _listed(client) == {shared}
         _sign_in(client, "dave")
-        assert client.get(f"/app/resources/sessions/{department}").status_code == 404
+        assert _listed(client) == set()
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 404
         _sign_in(client, "alice")
-        assert _listed(client) == {personal, department}
+        assert _listed(client) == {personal, shared}
 
 
 @requires_postgres
@@ -1610,25 +1535,23 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
     seed()
     app = _app(memberships())
     with _client(app) as client:
-        shared = _start(client, app, "department")
+        shared = _start(client, app, "organization")
 
         _sign_in(client, "carol")
         me = client.get("/app/me").json()
         assert me["agent_name"] == AGENT_NAME
         assert me["memberships"] == [
-            {
-                "subject": "carol",
-                "organization": "acme",
-                "department": "acme/finance",
-                "role": "member",
-            }
+            {"subject": "carol", "organization": "acme", "role": "member"}
         ]
         labels = client.post(
             "/app/conversation-labels",
-            json={"organization": "acme", "sharing": "department"},
+            json={"organization": "acme", "sharing": "organization"},
         ).json()
-        assert labels["department"] == "acme/finance"
-        assert labels["owner"] == "carol"
+        assert labels == {
+            "organization": "acme",
+            "owner": "carol",
+            "sharing": "organization",
+        }
         assert (
             client.post(
                 "/app/conversation-labels",
@@ -1638,19 +1561,20 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
         )
         assert client.get(f"/app/resources/sessions/{shared}").status_code == 200
         # A member reads the member list but doesn't change it.
-        assert len(client.get("/app/organizations/acme/members").json()) == 3
-        assert client.delete("/app/organizations/acme/members/bob").status_code == 403
+        assert len(client.get("/app/organizations/acme/members").json()) == 2
+        assert client.delete("/app/organizations/acme/members/alice").status_code == 403
 
         _sign_in(client, "dave")
         assert client.get("/app/organizations/acme/members").status_code == 404
         assert client.delete("/app/organizations/acme/members/carol").status_code == 404
 
         _sign_in(client, "alice")
-        moved = client.put(
-            "/app/organizations/acme/members/bob",
-            json={"department": "globex/support"},
+        assert (
+            client.put(
+                "/app/organizations/acme/members/bob", json={"role": "owner"}
+            ).status_code
+            == 422
         )
-        assert moved.status_code == 422
         too_long = "x" * 201
         assert (
             client.delete(f"/app/organizations/acme/members/{too_long}").status_code
@@ -1662,18 +1586,14 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
         # Acme's only admin can't leave it without one.
         assert (
             client.put(
-                "/app/organizations/acme/members/alice",
-                json={"department": "acme/finance", "role": "member"},
+                "/app/organizations/acme/members/alice", json={"role": "member"}
             ).status_code
             == 409
         )
         assert client.delete("/app/organizations/acme/members/alice").status_code == 409
         # An identity provider's subject may contain '/'.
         assert (
-            client.put(
-                "/app/organizations/acme/members/staff/erin",
-                json={"department": "acme/legal"},
-            ).status_code
+            client.put("/app/organizations/acme/members/staff/erin", json={}).status_code
             == 200
         )
         assert (
@@ -1694,7 +1614,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
     with _client(app) as client:
         assert client.get("/app/whoami").status_code == 401
         _start(client, app, "personal")
-        _start(client, app, "department")
+        _start(client, app, "organization")
 
         # An admin of any of their organizations is `admin`; others are members. Under
         # `cayu serve --dev`, Cayu's inbox is open, so they may decide in the app's Inbox.
@@ -1707,7 +1627,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
         }
         assert metrics == {
             "Organizations": "1",
-            "Members": "3",
+            "Members": "2",
             "Conversations": "2",
             "Tasks": "0",
         }
@@ -1720,7 +1640,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
             for item in client.get("/app/overview").json()["metrics"]
             if item["label"] == "Conversations"
         )
-        # Carol sees Alice's department conversation, not her personal one.
+        # Carol sees what Alice shared with acme, not Alice's personal one.
         assert conversations["value"] == "1"
         assert conversations["description"].startswith("0 started by you")
 
@@ -1729,7 +1649,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
             item["label"]: item["value"]
             for item in client.get("/app/overview").json()["metrics"]
         }
-        assert (metrics["Members"], metrics["Conversations"]) == ("1", "0")
+        assert (metrics["Members"], metrics["Conversations"]) == ("2", "0")
 '''
 
 _TEST_BACKGROUND_REVOCATION_PY = '''"""Removing a member stops their background work at its next step, also after a restart."""
@@ -1759,13 +1679,13 @@ from cayu.memberships import (
 )
 from app import build_app
 
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 
 
 async def _queue_report(app: CayuApp) -> str:
     access = await app.access("alice")
     labels = conversation_labels(
-        subject="alice", membership=ALICE, sharing="department"
+        subject="alice", membership=ALICE, sharing="organization"
     )
     task = await access.tasks.create(
         TaskCreate(type="report", title="Quarterly report"), labels=labels
@@ -1852,7 +1772,7 @@ def test_a_running_conversation_stops_at_its_next_step() -> None:
         ) as app:
             access = await app.access("alice")
             labels = conversation_labels(
-                subject="alice", membership=ALICE, sharing="department"
+                subject="alice", membership=ALICE, sharing="organization"
             )
             events = access.run(
                 RunRequest(
@@ -1883,7 +1803,7 @@ who belongs where; Cayu enforces it.
 
 | Where | What it owns |
 | --- | --- |
-| `database/models.py`, `migrations/` | Organizations, departments (each in one organization, its ID starting with the organization's, as in `acme/finance`) and memberships, in the `app` schema |
+| `database/models.py`, `migrations/` | Organizations and memberships, in the `app` schema |
 | `database/memberships.py` | `memberships()`: `cayu.memberships`' store over those tables, which Cayu reads memberships from; `add`, `remove` and `change_as_admin` are the only way to change them |
 | `policies/access.py` | `cayu.memberships`' `MembershipAccessPolicy`, which turns a person's current memberships into Cayu resource-access grants |
 | `domain/organizations.py` | `app_role`: what this application's roles mean in the web app |
@@ -1895,14 +1815,17 @@ who belongs where; Cayu enforces it.
 - Start a conversation through `await app.access(subject)` with the labels
   `conversation_labels(...)` (from `cayu.memberships`) returns for the signed-in person. Never take a subject, an
   organization or labels from the request itself.
-- Everyone sees their own conversations, their department's and their organization's, and
+- Everyone sees their own conversations and those shared with their organization, and
   nothing of another organization. Only the owner continues, changes or deletes one.
+- Grouping people inside an organization (teams, projects, client matters) is this
+  application's choice: add its tables, and its rules in `policies/access.py` over the same
+  `memberships()` (`uv run --no-sync cayu guide b2b`).
 - Cayu asks the policy again at every protected step, so removing a member takes effect at
   their next step, in background work too.
 - The Developer dashboard reads every conversation, so it is for operators only:
   `[tool.cayu.serve].auth` is `OPERATOR_ONLY_AUTH`, which refuses the people Cayu Cloud signs
   in as members. They reach their data only through `/app`.
-- Organization admins (`role = "admin"` on a membership) add, move and remove members
+- Organization admins (`role = "admin"` on a membership) add, change and remove members
   through `/app/organizations/{organization}/members`. That role is the application's own
   decision and never widens what Cayu lets anyone see. Operators use `uv run --no-sync
   cayu memberships list|add|remove`, for example to add an organization's first admin.
@@ -1987,7 +1910,7 @@ _AGENTS_ROWS = {
     "app with organizations and member sign-in | `cayu guide b2b` |\n"
     "| A product whose own frontend or other systems call the agent over an authenticated API "
     "for their end users | `cayu new NAME --preset service` | `cayu guide references#server` |": (
-        "| Another organization, department or member | `cayu memberships add`, "
+        "| Another organization or member | `cayu memberships add`, "
         "`memberships().add` in `database/memberships.py`, or an admin on the Members page | "
         "`cayu guide b2b` |"
     ),
@@ -2073,9 +1996,9 @@ from tools.registration import build_agent_tools
 NOTE = "Invoices over ten thousand need a second approver."
 # A note an operator kept for acme.
 KEPT = "Invoices over ten thousand go to the finance lead as the second approver."
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 CAROL = Membership("acme")
-DAVE = Membership("globex", "globex/support")
+DAVE = Membership("globex")
 
 
 async def _remember_in_alices_conversation(store: InMemoryKnowledgeStore) -> str:
@@ -2319,8 +2242,7 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
         files["database/models.py"],
         "from sqlalchemy import DateTime, MetaData, String, func\n",
         "from sqlalchemy import (\n    BigInteger,\n    CheckConstraint,\n    DateTime,\n    ForeignKey,\n"
-        "    ForeignKeyConstraint,\n    MetaData,\n    String,\n    UniqueConstraint,\n"
-        "    func,\n)\n",
+        "    MetaData,\n    String,\n    UniqueConstraint,\n    func,\n)\n",
         "database/models.py",
     )
     app = files["app.py"]

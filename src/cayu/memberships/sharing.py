@@ -7,13 +7,13 @@ the person may not create.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
 from cayu.memberships.directory import Membership
 
-Sharing = Literal["personal", "department", "organization"]
+Sharing = Literal["personal", "organization"]
 # The labels that decide sharing; nobody may change them on an existing conversation.
-SHARING_LABELS = ("organization", "department", "owner", "sharing")
+SHARING_LABELS = ("organization", "owner", "sharing")
 
 
 def conversation_labels(
@@ -21,13 +21,10 @@ def conversation_labels(
 ) -> dict[str, str]:
     """The labels a conversation ``subject`` starts and shares as ``sharing`` takes."""
 
-    labels = {
+    if sharing not in get_args(Sharing):
+        raise ValueError("A conversation is shared as 'personal' or 'organization'.")
+    return {
         "organization": membership.organization,
         "owner": subject,
         "sharing": sharing,
     }
-    if sharing == "department":
-        if membership.department is None:
-            raise ValueError("Only a member of a department can share with it.")
-        labels["department"] = membership.department
-    return labels

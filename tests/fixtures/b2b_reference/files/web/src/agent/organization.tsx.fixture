@@ -64,7 +64,6 @@ export function OrganizationSelect() {
       {memberships.map((item) => (
         <NativeSelectOption key={item.organization} value={item.organization}>
           {item.organization}
-          {item.department ? ` · ${item.department}` : ""}
         </NativeSelectOption>
       ))}
     </NativeSelect>

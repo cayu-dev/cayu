@@ -43,7 +43,7 @@ from integrations.http.generated import (
 )
 from integrations.http.generated.task_runs import TaskRun, list_task_runs
 
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 PEOPLE = {
     "alice": Person(subject="alice", role="admin", may_decide=False, may_change=True),
     "bob": Person(subject="bob", role="member", may_decide=False, may_change=False),

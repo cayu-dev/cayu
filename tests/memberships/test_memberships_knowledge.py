@@ -45,9 +45,9 @@ from cayu.tools import RememberKnowledgePolicy, RememberKnowledgeTool, ToolConte
 
 NAMESPACE = "project:acme-agent:agent:assistant"
 NOTE = "Invoices over ten thousand need a second approver."
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 CAROL = Membership("acme")
-DAVE = Membership("globex", "globex/support")
+DAVE = Membership("globex")
 
 
 def _scope(*, session_label_keys: tuple[str, ...] = ("organization",)) -> KnowledgeAccessScope:

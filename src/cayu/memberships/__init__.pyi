@@ -6,7 +6,7 @@ from cayu.memberships.changes import MembershipChangeRefused as MembershipChange
 from cayu.memberships.changes import NotAnAdmin as NotAnAdmin
 from cayu.memberships.changes import RemoveMember as RemoveMember
 from cayu.memberships.changes import SetMember as SetMember
-from cayu.memberships.changes import UnknownDepartment as UnknownDepartment
+from cayu.memberships.changes import UnknownOrganization as UnknownOrganization
 from cayu.memberships.directory import AccessSnapshot as AccessSnapshot
 from cayu.memberships.directory import InMemoryMembershipDirectory as InMemoryMembershipDirectory
 from cayu.memberships.directory import Member as Member

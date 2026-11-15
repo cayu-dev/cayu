@@ -28,44 +28,28 @@ def _json(capsys, *argv: str) -> tuple[int, dict]:
     return status, json.loads(capsys.readouterr().out)
 
 
-def test_members_are_added_listed_moved_and_removed(database, capsys) -> None:
-    assert (
-        main(
-            [
-                "memberships",
-                "add",
-                "alice",
-                "acme",
-                "--department",
-                "acme/finance",
-                "--role",
-                "admin",
-            ]
-        )
-        == 0
-    )
-    assert capsys.readouterr().out == "alice is an admin of acme/finance.\n"
+def test_members_are_added_listed_changed_and_removed(database, capsys) -> None:
+    assert main(["memberships", "add", "alice", "acme", "--role", "admin"]) == 0
+    assert capsys.readouterr().out == "alice is an admin of acme.\n"
     assert main(["memberships", "add", "carol", "acme"]) == 0
-    capsys.readouterr()
+    assert capsys.readouterr().out == "carol is a member of acme.\n"
 
     status, listed = _json(capsys, "list", "--organization", "acme")
     assert status == 0
     assert listed == {
         "members": [
-            {
-                "subject": "alice",
-                "organization": "acme",
-                "department": "acme/finance",
-                "role": "admin",
-            },
-            {"subject": "carol", "organization": "acme", "department": None, "role": "member"},
+            {"subject": "alice", "organization": "acme", "role": "admin"},
+            {"subject": "carol", "organization": "acme", "role": "member"},
         ]
     }
-    assert main(["memberships", "add", "carol", "acme", "--department", "acme/legal"]) == 0
-    capsys.readouterr()
+    status, added = _json(capsys, "add", "carol", "acme", "--role", "admin")
+    assert (status, added) == (
+        0,
+        {"added": {"subject": "carol", "organization": "acme", "role": "admin"}},
+    )
     assert main(["memberships", "list", "--subject", "carol"]) == 0
     table = capsys.readouterr().out
-    assert "acme/legal" in table and "member" in table
+    assert "acme" in table and "admin" in table
 
     status, removed = _json(capsys, "remove", "carol", "acme")
     assert (status, removed["removed"]) == (0, True)
@@ -78,7 +62,7 @@ def test_members_are_added_listed_moved_and_removed(database, capsys) -> None:
     assert revision == (5,)
 
 
-def test_the_last_admin_and_a_foreign_department_are_refused(database, capsys) -> None:
+def test_the_last_admin_and_an_unknown_organization_are_refused(database, capsys) -> None:
     assert main(["memberships", "add", "alice", "acme", "--role", "admin"]) == 0
     capsys.readouterr()
 
@@ -88,10 +72,21 @@ def test_the_last_admin_and_a_foreign_department_are_refused(database, capsys) -
     assert status == 1
     assert refused["error"]["code"] == "MEMBERSHIPS_COMMAND_FAILED"
     assert "at least one admin" in refused["error"]["message"]
-    assert main(["memberships", "add", "bob", "acme", "--department", "globex/support"]) == 1
-    assert "isn't a department of 'acme'" in capsys.readouterr().err
+    assert main(["memberships", "add", "bob", "initech"]) == 1
+    assert "'initech' doesn't exist" in capsys.readouterr().err
     status, listed = _json(capsys, "list", "--organization", "acme")
     assert [item["subject"] for item in listed["members"]] == ["alice"]
+
+
+def test_it_works_on_the_older_tables_with_departments(database, capsys) -> None:
+    _create(database, older=True)
+    assert main(["memberships", "add", "alice", "acme", "--role", "admin"]) == 0
+    capsys.readouterr()
+    status, listed = _json(capsys, "list", "--subject", "alice")
+    assert (status, listed["members"]) == (
+        0,
+        [{"subject": "alice", "organization": "acme", "role": "admin"}],
+    )
 
 
 def test_it_says_when_the_tables_or_the_database_are_missing(database, capsys, monkeypatch) -> None:

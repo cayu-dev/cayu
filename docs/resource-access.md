@@ -2,7 +2,7 @@
 
 A shared Cayu application can enforce application-defined access to independently
 classified resources. The application authenticates users and evaluates membership,
-roles, departments, organizations, and sharing. Runtime enforces opaque subject
+roles, teams, organizations, and sharing. Runtime enforces opaque subject
 references and bounded label predicates. `AuthContext.tenant` remains provenance.
 
 Use `await app.access(verified_subject)` in trusted host code. Never construct a
@@ -35,15 +35,15 @@ class ProductPolicy(ResourceAccessPolicy):
         if member is None:
             return ResourceAccessDecision(ResourceAccessGrant(), revision=0)
         private = rule(organization=member.organization, owner=subject)
-        department = rule(organization=member.organization,
-                          department=member.department, sharing="department")
+        team = rule(organization=member.organization,
+                    team=member.team, sharing="team")
         organization = rule(organization=member.organization, sharing="organization")
         scope = SessionAccessScope(
-            read=(private, department, organization),
+            read=(private, team, organization),
             create=(private,), modify=(private,), delete=(private,),
-            execute=(private, department, organization),
+            execute=(private, team, organization),
             update_labels=(private,),
-            protected_label_keys=("organization", "owner", "department", "sharing"),
+            protected_label_keys=("organization", "owner", "team", "sharing"),
         )
         # Each family is independent. Omitted families deny access.
         return ResourceAccessDecision(
@@ -60,13 +60,15 @@ page = await access.sessions.list_sessions()
 ```
 
 `product_memberships` and `verified_subject` are application-owned symbols. The
-same registered specialist can serve private users, departments, organization-wide
+same registered specialist can serve private users, teams, organization-wide
 resources, or separate organizations by changing classification and policy. No
 membership tables or `tenant_id` columns are added by Runtime.
 
-For organizations, departments and members, `cayu.memberships` has this policy ready:
+For organizations and their members, `cayu.memberships` has a policy ready:
 `MembershipAccessPolicy` over a directory of the application's own memberships, with a
-PostgreSQL store for its tables ([memberships](memberships.md)).
+PostgreSQL store for its tables ([memberships](memberships.md)). Groups inside an
+organization, such as the teams above, stay the application's: its own policy can add them
+to that one's grant ([groups of your own](memberships.md#groups-of-your-own)).
 
 Each action permits at most 16 alternative rules. Selectors inside a rule are
 ANDed; rules are ORed. Effective authority is **admitted maximum AND current

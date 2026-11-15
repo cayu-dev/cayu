@@ -18,7 +18,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SHARING_LABELS": ("cayu.memberships.sharing", "SHARING_LABELS"),
     "SetMember": ("cayu.memberships.changes", "SetMember"),
     "Sharing": ("cayu.memberships.sharing", "Sharing"),
-    "UnknownDepartment": ("cayu.memberships.changes", "UnknownDepartment"),
+    "UnknownOrganization": ("cayu.memberships.changes", "UnknownOrganization"),
     "check_membership_tables": ("cayu.memberships.postgres", "check_membership_tables"),
     "conversation_labels": ("cayu.memberships.sharing", "conversation_labels"),
 }
@@ -41,7 +41,7 @@ PUBLIC_NAMES = [
     "SHARING_LABELS",
     "SetMember",
     "Sharing",
-    "UnknownDepartment",
+    "UnknownOrganization",
     "check_membership_tables",
     "conversation_labels",
 ]

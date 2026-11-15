@@ -76,7 +76,7 @@ export function YourOrganizations() {
   return (
     <AppPageSection
       title="Your organizations"
-      description="Where you belong decides what you see: your own conversations, your department's and your organization's."
+      description="Where you belong decides what you see: your own conversations and your organization's."
       actions={
         <Button variant="outline" size="sm" render={<Link to="/members" />}>
           Members
@@ -95,7 +95,6 @@ export function YourOrganizations() {
         emptyDescription="No organization has added you. Ask one of its admins."
         columns={[
           { key: "organization", label: "Organization", cell: (row) => <span className="font-medium">{row.organization}</span> },
-          { key: "department", label: "Department", cell: (row) => row.department ?? "—" },
           { key: "role", label: "Your role", cell: (row) => <StatusBadge tone={row.role === "admin" ? "success" : "neutral"}>{row.role}</StatusBadge> },
         ]}
       />

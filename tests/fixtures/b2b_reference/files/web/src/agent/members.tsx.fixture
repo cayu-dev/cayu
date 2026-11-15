@@ -84,13 +84,12 @@ function MemberList({ organization, admin }: { organization: string; admin: bool
         showHeading={false}
         rows={members.data ?? []}
         rowId={(row) => row.subject}
-        searchText={(row) => `${row.subject} ${row.department ?? ""}`}
+        searchText={(row) => row.subject}
         itemLabel={{ singular: "member", plural: "members" }}
         emptyTitle="No members"
         emptyDescription="Nobody is in this organization."
         columns={[
           { key: "subject", label: "Person", sortValue: (row) => row.subject, cell: (row) => <span className="font-medium">{row.subject}</span> },
-          { key: "department", label: "Department", sortValue: (row) => row.department ?? "", cell: (row) => row.department ?? "—" },
           {
             key: "role",
             label: "Role",
@@ -138,26 +137,20 @@ function MemberList({ organization, admin }: { organization: string; admin: bool
 function AddMember({ organization, onChange }: { organization: string; onChange: (action: () => Promise<unknown>, done: string) => Promise<boolean> }) {
   const api = useAreaApi(b2bApi);
   const [subject, setSubject] = React.useState("");
-  const [department, setDepartment] = React.useState("");
   const [role, setRole] = React.useState<Role>("member");
   const submit = async () => {
     const person = subject.trim();
-    if (!(await onChange(() => api.putMember(organization, person, department.trim() || null, role), `Saved ${person}`))) return;
+    if (!(await onChange(() => api.putMember(organization, person, role), `Saved ${person}`))) return;
     setSubject("");
-    setDepartment("");
     setRole("member");
   };
   return (
-    <AppPageSection title="Add or change a member" description="Adding someone already in the organization moves them to this department and role.">
+    <AppPageSection title="Add or change a member" description="Adding someone already in the organization gives them this role.">
       <Card>
         <CardContent className="flex flex-wrap items-end gap-3">
           <Field className="w-56">
             <FieldLabel>Person's ID</FieldLabel>
             <Input value={subject} placeholder="Their sign-in ID" onChange={(event) => setSubject(event.target.value)} />
-          </Field>
-          <Field className="w-64">
-            <FieldLabel>Department (optional)</FieldLabel>
-            <Input value={department} placeholder={`e.g. ${organization}/finance`} onChange={(event) => setDepartment(event.target.value)} />
           </Field>
           <Field className="w-36">
             <FieldLabel>Role</FieldLabel>

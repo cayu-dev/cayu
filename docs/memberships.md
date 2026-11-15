@@ -6,13 +6,18 @@ Cayu enforces what that allows, at every read, listing and background step. `cay
 --preset b2b` and `cayu new --with organizations` assemble it into a project, and every
 piece also works on its own.
 
+It has organizations, members and roles only. Whether an application groups people inside
+an organization at all, and how (teams, projects, client matters), is the application's
+choice: [Groups of your own](#groups-of-your-own) shows how to add a grouping with a policy of
+its own over the same directory.
+
 | Piece | What it does |
 | --- | --- |
-| `Membership`, `AccessSnapshot`, `MembershipDirectory` | A membership of an organization and at most one of its departments; a person's memberships with the revision they were read at; the seam a policy reads them through (`current(subject)`) |
+| `Membership`, `AccessSnapshot`, `MembershipDirectory` | A membership of an organization; a person's memberships with the revision they were read at; the seam a policy reads them through (`current(subject)`) |
 | `InMemoryMembershipDirectory` | Memberships in memory, for tests and trying the policy without a database |
 | `PostgresMemberships` | The directory over the application's own PostgreSQL tables, and the only writes they need: `add`, `remove`, `change_as_admin` |
 | `MembershipAccessPolicy` | A `ResourceAccessPolicy` that turns current memberships into Cayu grants |
-| `conversation_labels`, `Sharing`, `SHARING_LABELS` | The labels a new conversation takes: personal, department or organization sharing |
+| `conversation_labels`, `Sharing`, `SHARING_LABELS` | The labels a new conversation takes: personal or organization sharing |
 | `check_membership_tables` | Checks the tables are the shape `PostgresMemberships` relies on |
 | `cayu memberships list\|add\|remove` | The same store from the command line |
 
@@ -27,25 +32,26 @@ from cayu.memberships import (
     conversation_labels,
 )
 
-directory = InMemoryMembershipDirectory({"alice": [Membership("acme", "acme/finance")]})
+directory = InMemoryMembershipDirectory({"alice": [Membership("acme")]})
 app = CayuApp(resource_access_policy=MembershipAccessPolicy(directory))
 
 access = await app.access("alice")
-labels = conversation_labels(
-    subject="alice", membership=Membership("acme", "acme/finance"), sharing="department"
-)
+labels = conversation_labels(subject="alice", membership=Membership("acme"), sharing="organization")
 ```
 
-Each person sees their own personal conversations, those shared with a department they
-belong to and those shared with an organization they belong to, and nothing of another
-organization. Only the owner continues, changes or deletes a conversation. A department
-conversation is decided by its department alone. The sharing labels (`organization`,
-`department`, `owner`, `sharing`) can't be changed on an existing conversation. The same
-grant covers sessions, tasks and artifacts.
+Each person sees their own conversations and those shared with an organization they belong
+to, and nothing of another organization. A person creates only their own conversations,
+shared as `personal` or `organization`, inside their organizations. Only the owner continues,
+changes or deletes a conversation. A conversation of theirs with another `sharing` (one a
+policy of the application's own allowed, or an older project shared with a department) stays
+visible to its owner alone. The sharing labels (`organization`, `owner`, `sharing`) can't be
+changed on an existing conversation. Tasks and artifacts follow the same rules, except that
+the owner creates them in any conversation of their own, whatever its sharing: work inside
+the conversation takes its labels, and nobody else sees it unless it is shared with their
+organization.
 
-A department ID starts with its organization's ID and `/`, as in `acme/finance`. The policy
-refuses a membership whose department doesn't (`ValueError`), as it refuses a person with more
-than `max_memberships` memberships, which one stored grant can't hold.
+The policy refuses a person with more than `max_memberships` memberships (`ValueError`),
+which one stored grant can't hold.
 
 `MembershipAccessPolicy(directory, *, authority="b2b-membership-v1",
 decision_lifetime=timedelta(seconds=60), max_memberships=16, knowledge=False)`:
@@ -125,26 +131,24 @@ from cayu.memberships import MembershipAccessPolicy, PostgresMemberships, Remove
 memberships = PostgresMemberships(partial(psycopg.connect, database_url))
 policy = MembershipAccessPolicy(memberships)
 
-await memberships.add("alice", "acme", department="acme/finance", role="admin")
+await memberships.add("alice", "acme", role="admin")
 await memberships.change_as_admin("alice", "acme", RemoveMember("carol"))
 ```
 
 - `current(subject)` reads the person's memberships and the access revision in one
   REPEATABLE READ snapshot, so they always agree. It makes the store a `MembershipDirectory`.
 - `of_subject(subject)` and `of_organization(organization)` list `Member` rows (subject,
-  organization, department, role).
-- `add(subject, organization, *, department=None, role="member")` adds a member, or moves
-  one to another department or role. `remove(subject, organization)` removes one and says
-  whether they were a member.
+  organization, role).
+- `add(subject, organization, *, role="member")` adds a member, or gives one another role.
+  `remove(subject, organization)` removes one and says whether they were a member.
 - `change_as_admin(caller, organization, change)` makes a `SetMember` or `RemoveMember`
   change for a signed-in person. In one transaction it locks the organization's admins'
   rows, checks the caller is one of them (`NotAnAdmin`), makes the change, keeps at least
   one admin (`LastAdmin`) and raises the revision.
 - Every change raises the access revision in the same transaction. No change leaves an
   organization that has an admin without one (`LastAdmin`); an organization with no admin
-  yet still takes members. A department of another organization, or a department or
-  organization that doesn't exist, is `UnknownDepartment`. All three are
-  `MembershipChangeRefused`, and nothing was changed.
+  yet still takes members. An organization that doesn't exist is `UnknownOrganization`. All
+  three are `MembershipChangeRefused`, and nothing was changed.
 
 ### The tables
 
@@ -158,21 +162,12 @@ CREATE TABLE app.organizations (
     name varchar(200) NOT NULL,
     CHECK (strpos(id, '/') = 0)
 );
-CREATE TABLE app.departments (
-    id varchar(64) PRIMARY KEY,
-    organization_id varchar(64) NOT NULL REFERENCES app.organizations (id) ON DELETE CASCADE,
-    name varchar(200) NOT NULL,
-    UNIQUE (organization_id, id),
-    CHECK (starts_with(id, organization_id || '/'))
-);
 CREATE TABLE app.memberships (
     id serial PRIMARY KEY,
     subject varchar(200) NOT NULL,
     organization_id varchar(64) NOT NULL REFERENCES app.organizations (id) ON DELETE CASCADE,
-    department_id varchar(64),
     role varchar(16) NOT NULL DEFAULT 'member',
     UNIQUE (subject, organization_id),
-    FOREIGN KEY (organization_id, department_id) REFERENCES app.departments (organization_id, id),
     CONSTRAINT memberships_role_check CHECK (role in ('member', 'admin'))
 );
 CREATE TABLE app.access_revision (
@@ -181,9 +176,16 @@ CREATE TABLE app.access_revision (
 );
 ```
 
+The organizations table is the application's own beyond its `id`: the store only relies on
+the foreign key from `memberships`. Generated projects keep organization IDs free of `/` so
+each is one segment of their routes' paths. Other columns and tables, such as a grouping of
+the application's own, are left alone, and projects generated by Cayu 0.16.1 to 0.20.0 keep
+their `departments` table and `department_id` column, which the store neither reads nor
+writes.
+
 `check_membership_tables(connection, *, schema="app")` checks what the store relies on: the
 columns it reads and writes, the unique (subject, organization) and revision keys, the
-department foreign key and the role check. It raises `MembershipTablesInvalid`, whose
+foreign key to the organizations and the role check. It raises `MembershipTablesInvalid`, whose
 `problems` name each difference. Run it in a test against your migrated database.
 
 ## From the command line
@@ -192,14 +194,14 @@ department foreign key and the role check. It raises `MembershipTablesInvalid`, 
 else `CAYU_DATABASE_URL`, else `[tool.cayu.session_store]`. It checks the tables first.
 
 ```console
-cayu memberships add alice acme --department acme/finance --role admin
+cayu memberships add alice acme --role admin
 cayu memberships list --organization acme
 cayu memberships list --subject alice --json
 cayu memberships remove carol acme
 ```
 
-It refuses removing or demoting an organization's last admin, and a department of another
-organization. `--schema` names another schema; `--json` prints JSON.
+It refuses removing or demoting an organization's last admin, and an organization that
+doesn't exist. `--schema` names another schema; `--json` prints JSON.
 
 ## In generated projects
 
@@ -216,7 +218,10 @@ Projects generated before `cayu.memberships` carry their own copies. `cayu check
 `policies/access.py` or `database/memberships.py` that is still exactly the copy a release
 generated (`MEMBERSHIPS_GENERATED_COPY`, info) and leaves edited ones alone; `cayu guide
 b2b#move-to-cayumemberships` walks through the move. It needs no database migration, and
-queued work stays admitted because the authority and grant are unchanged.
+queued work stays admitted for the person who started it because the authority is
+unchanged. Those projects shared conversations with departments too, which this library
+doesn't: such a conversation becomes visible only to its owner, so access narrows and never
+widens.
 
 ## Your own pieces
 
@@ -225,3 +230,89 @@ queued work stays admitted because the authority and grant are unchanged.
   the revision whenever memberships change.
 - Different sharing rules: write your own `ResourceAccessPolicy`
   ([resource access](resource-access.md)) and keep the directory and the store.
+
+### Groups of your own
+
+Teams, projects or client matters inside an organization are the application's: it keeps
+them in its own tables and adds them to the grant with a policy of its own, over the same
+directory. This one starts from `MembershipAccessPolicy`'s decision and adds conversations
+shared with a team the person is in:
+
+```python
+from dataclasses import replace
+
+from cayu.memberships import MembershipAccessPolicy
+from cayu.resource_access import ResourceAccessDecision, ResourceAccessPolicy
+from cayu.sessions import SessionAccessRule, SessionAccessSelector
+
+
+def rule(**labels: list[str]) -> SessionAccessRule:
+    return SessionAccessRule(
+        selectors=tuple(
+            SessionAccessSelector(key=key, values=tuple(values)) for key, values in labels.items()
+        )
+    )
+
+
+class Read:
+    """A directory that answers with one snapshot already read."""
+
+    def __init__(self, snapshot):
+        self._snapshot = snapshot
+
+    async def current(self, subject):
+        return self._snapshot
+
+
+class TeamAccessPolicy(ResourceAccessPolicy):
+    def __init__(self, directory, teams) -> None:
+        self._directory = directory
+        # The application's own: async teams(subject) -> [(organization, team), ...]
+        self._teams = teams
+
+    @property
+    def authority(self) -> str:
+        return "acme-teams-v1"
+
+    async def resolve(self, subject: str) -> ResourceAccessDecision:
+        # One read of the memberships, for the library's grant and the teams alike.
+        snapshot = await self._directory.current(subject)
+        decision = await MembershipAccessPolicy(Read(snapshot), authority=self.authority).resolve(
+            subject
+        )
+        organizations = {item.organization for item in snapshot.memberships}
+        # Only teams of organizations the person still belongs to, each rule naming its
+        # organization, so a team of the same name elsewhere never matches.
+        teams = [(org, team) for org, team in await self._teams(subject) if org in organizations]
+        if not teams:
+            return decision
+        read = tuple(rule(organization=[o], team=[t], sharing=["team"]) for o, t in teams)
+        create = tuple(
+            rule(organization=[o], owner=[subject], team=[t], sharing=["team"]) for o, t in teams
+        )
+        grant = decision.grant
+        added = {
+            family: replace(scope, read=(*scope.read, *read), create=(*scope.create, *create))
+            for family, scope in (
+                ("sessions", grant.sessions),
+                ("tasks", grant.tasks),
+                ("artifacts", grant.artifacts),
+            )
+            if scope is not None
+        }
+        return replace(decision, grant=replace(grant, **added))
+```
+
+A conversation labelled `organization=acme`, `sharing=team` and `team=finance` is then read by
+the members of acme's finance team, and still continued only by its owner. Each rule names its
+organization: a team ID is the application's and may repeat across organizations, so a rule on
+the team alone would let globex's finance team read acme's. Teams of an organization the person
+no longer belongs to grant nothing, and Cayu protects the `team` label like the others, since a
+rule names it. Each team is one more rule, so keep a person's teams bounded, as
+`max_memberships` bounds their organizations.
+
+Raise the access revision (the `access_revision` row) in the same transaction as any change to
+a team, as a membership change does, so Cayu refuses a decision read before it. The example
+names an `authority` of its own; an application that already runs `MembershipAccessPolicy` with
+queued work keeps `b2b-membership-v1`, since Cayu refuses work admitted under another
+authority. `tests/memberships/test_memberships_policy.py` runs this example.

@@ -50,8 +50,9 @@ def membership_copy_findings(root: Path) -> tuple[ProjectDiagnostic, ...]:
                 path=path,
                 message=(
                     f"{path} is the copy Cayu {releases} generated, unedited. "
-                    "`cayu.memberships` now provides it, with the same authority and grant, "
-                    "so queued work stays admitted when the project moves to it."
+                    "`cayu.memberships` now provides it, with the same authority, so queued "
+                    "work stays admitted for the person who started it when the project moves "
+                    "to it."
                 ),
                 hint=(
                     "Replace it with the imports `cayu new` generates now, as `cayu guide "

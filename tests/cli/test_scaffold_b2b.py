@@ -1,4 +1,4 @@
-"""`cayu new --preset b2b`: organizations, departments and members in the app's own tables,
+"""`cayu new --preset b2b`: organizations and members in the app's own tables,
 turned into Cayu resource-access grants."""
 
 from __future__ import annotations

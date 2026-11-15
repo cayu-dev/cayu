@@ -1,11 +1,13 @@
 """Who may see and continue which conversations, from current membership.
 
-Each person sees their own personal conversations, those shared with a department they
-belong to, and those shared with an organization they belong to, and nothing of any other
-organization. Only the owner continues, changes or deletes a conversation: seeing a shared
-one doesn't let anyone else run it. Cayu applies this to sessions, tasks and artifacts on
-every read, listing and background step, asking the policy again each time, so a removed
-member loses access at their next step.
+Each person sees their own conversations and those shared with an organization they belong
+to, and nothing of any other organization. Only the owner continues, changes or deletes a
+conversation: seeing a shared one doesn't let anyone else run it. Cayu applies this to
+sessions, tasks and artifacts on every read, listing and background step, asking the policy
+again each time, so a removed member loses access at their next step.
+
+Grouping people inside an organization is the application's: a policy of its own can add
+rules for its groups to this one's grant.
 
 With ``knowledge=True`` each person also reads, and the agent remembers into, the knowledge of
 the organizations they belong to, and nothing of any other organization's.
@@ -13,6 +15,7 @@ the organizations they belong to, and nothing of any other organization's.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from cayu.memberships.directory import MembershipDirectory
@@ -30,7 +33,7 @@ DEFAULT_AUTHORITY = "b2b-membership-v1"
 # The longest Cayu may use one decision. It asks the policy again at every protected step.
 DEFAULT_DECISION_LIFETIME = timedelta(seconds=60)
 # Cayu stores each admitted grant with the work it admits, up to 64 KiB. With the longest IDs
-# (64 characters) a person's grant fits up to 20 memberships; this leaves room to spare.
+# (64 characters) a person's grant fits many more memberships; this leaves room to spare.
 DEFAULT_MAX_MEMBERSHIPS = 16
 
 
@@ -93,58 +96,40 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
                 f"{subject!r} has more than {self._max_memberships} memberships, "
                 "more than one grant holds."
             )
-        for item in snapshot.memberships:
-            if item.department is not None and not item.department.startswith(
-                f"{item.organization}/"
-            ):
-                raise ValueError(
-                    f"{subject!r} has a membership of department {item.department!r}, "
-                    f"which isn't one of {item.organization!r}'s: a department ID starts "
-                    "with its organization's ID and '/'."
-                )
-        departments = sorted(
-            {item.department for item in snapshot.memberships if item.department is not None}
-        )
         owner = [subject]
-        visible = [
-            _rule(organization=organizations, owner=owner, sharing=["personal"]),
-            _rule(organization=organizations, sharing=["organization"]),
-        ]
-        # A new conversation is always the person's own, inside their memberships.
-        creatable = [
-            _rule(organization=organizations, owner=owner, sharing=["personal", "organization"])
-        ]
-        own = list(creatable)
-        if departments:
-            # A department conversation is decided by its department alone: a department ID
-            # names its organization (`acme/finance`), so whatever organization label it
-            # carries grants nothing.
-            visible.append(_rule(department=departments, sharing=["department"]))
-            creatable.append(
+        # A person's own conversations in their organizations, however they are shared:
+        # one labelled with a sharing this policy doesn't grant on, such as a grouping the
+        # application used to have, stays its owner's alone.
+        own = (_rule(organization=organizations, owner=owner),)
+        visible = (*own, _rule(organization=organizations, sharing=["organization"]))
+        # A conversation a person starts is theirs, inside their memberships, and shared only
+        # in a way this policy knows.
+        conversations = SessionAccessScope(
+            read=visible,
+            create=(
                 _rule(
-                    organization=organizations,
-                    department=departments,
-                    owner=owner,
-                    sharing=["department"],
-                )
-            )
-            own.append(_rule(department=departments, owner=owner, sharing=["department"]))
-        scope = SessionAccessScope(
-            read=tuple(visible),
-            create=tuple(creatable),
-            execute=tuple(own),
-            modify=tuple(own),
-            delete=tuple(own),
-            update_labels=tuple(own),
+                    organization=organizations, owner=owner, sharing=["personal", "organization"]
+                ),
+            ),
+            execute=own,
+            modify=own,
+            delete=own,
+            update_labels=own,
             protected_label_keys=SHARING_LABELS,
         )
+        # Tasks and artifacts take the labels of the conversation that makes them, so the
+        # owner creates them in any conversation of their own. Whatever their sharing, nobody
+        # else sees one unless it is shared with an organization they belong to.
+        outputs = replace(conversations, create=own)
         knowledge = None
         if self._knowledge:
             # Knowledge is shared by a whole organization, whichever conversation it came from.
             within = (_rule(organization=organizations),)
             knowledge = SessionAccessScope(read=within, create=within, modify=within)
         return ResourceAccessDecision(
-            ResourceAccessGrant(sessions=scope, tasks=scope, artifacts=scope, knowledge=knowledge),
+            ResourceAccessGrant(
+                sessions=conversations, tasks=outputs, artifacts=outputs, knowledge=knowledge
+            ),
             revision=snapshot.revision,
             valid_until=datetime.now(UTC) + self._decision_lifetime,
         )

@@ -9,11 +9,8 @@ exactly what ``cayu new --with organizations`` (and the b2b preset) generates in
         id serial PRIMARY KEY,
         subject varchar(200) NOT NULL,
         organization_id varchar(64) NOT NULL REFERENCES app.organizations (id) ON DELETE CASCADE,
-        department_id varchar(64),
         role varchar(16) NOT NULL DEFAULT 'member',
         UNIQUE (subject, organization_id),
-        FOREIGN KEY (organization_id, department_id)
-            REFERENCES app.departments (organization_id, id),
         CONSTRAINT memberships_role_check CHECK (role in ('member', 'admin'))
     );
     CREATE TABLE app.access_revision (
@@ -21,8 +18,9 @@ exactly what ``cayu new --with organizations`` (and the b2b preset) generates in
         revision bigint NOT NULL
     );
 
-The organizations and departments tables, and any columns the application adds to them, stay
-the application's own. :func:`check_membership_tables` checks what the store relies on.
+The organizations table, and any columns or tables the application adds, stay the
+application's own: the store reads and writes only the columns above and leaves any others
+as they are. :func:`check_membership_tables` checks what the store relies on.
 
 Every change raises the access revision in the same transaction, and :meth:`current` reads a
 person's memberships and the revision in one REPEATABLE READ snapshot, so Cayu refuses any
@@ -50,7 +48,7 @@ from cayu.memberships.changes import (
     NotAnAdmin,
     RemoveMember,
     SetMember,
-    UnknownDepartment,
+    UnknownOrganization,
 )
 from cayu.memberships.directory import ROLES, AccessSnapshot, Member, Membership, Role
 
@@ -60,7 +58,6 @@ _SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
 # The lengths of the contract's columns.
 SUBJECT_LENGTH = 200
 ORGANIZATION_LENGTH = 64
-DEPARTMENT_LENGTH = 64
 _FOREIGN_KEY_VIOLATION = "23503"
 
 
@@ -87,18 +84,9 @@ def _identifier(name: str, *, field: str, limit: int) -> str:
     return name
 
 
-def _checked(subject: str, organization: str, department: str | None, role: str) -> None:
+def _checked(subject: str, organization: str, role: str) -> None:
     _identifier(subject, field="A member's subject", limit=SUBJECT_LENGTH)
     _identifier(organization, field="An organization", limit=ORGANIZATION_LENGTH)
-    if "/" in organization:
-        raise ValueError("An organization ID has no '/'.")
-    if department is not None:
-        _identifier(department, field="A department", limit=DEPARTMENT_LENGTH)
-        if not department.startswith(f"{organization}/"):
-            raise UnknownDepartment(
-                f"{department!r} isn't a department of {organization!r}: a department ID "
-                "starts with its organization's ID and '/'."
-            )
     if role not in ROLES:
         raise ValueError(f"A role is one of {', '.join(ROLES)}.")
 
@@ -142,18 +130,15 @@ class PostgresMemberships:
         subject: str,
         organization: str,
         *,
-        department: str | None = None,
         role: Role = "member",
     ) -> None:
-        """Add ``subject`` to ``organization``, or move them to ``department`` and ``role``
-        if already a member.
+        """Add ``subject`` to ``organization``, or give them ``role`` if already a member.
 
-        Raises :class:`UnknownDepartment` for an organization that doesn't exist or a
-        department that isn't its own, and :class:`LastAdmin` when it would demote the
-        organization's last admin.
+        Raises :class:`UnknownOrganization` for an organization that doesn't exist, and
+        :class:`LastAdmin` when it would demote the organization's last admin.
         """
 
-        change = SetMember(subject, department, role)
+        change = SetMember(subject, role)
         await asyncio.to_thread(self._change, organization, change, None)
 
     async def remove(self, subject: str, organization: str) -> bool:
@@ -171,7 +156,7 @@ class PostgresMemberships:
         In one transaction it locks the organization's admins' rows, checks ``caller`` is
         one of them (:class:`NotAnAdmin` otherwise), makes the change, keeps at least one
         admin (:class:`LastAdmin`) and raises the access revision. Returns whether a member
-        was added, moved or removed.
+        was added, changed or removed.
         """
 
         _identifier(caller, field="The caller's subject", limit=SUBJECT_LENGTH)
@@ -182,7 +167,7 @@ class PostgresMemberships:
             # One snapshot, so the memberships and their revision agree.
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             cursor.execute(
-                f"SELECT organization_id, department_id FROM {self._memberships} "
+                f"SELECT organization_id FROM {self._memberships} "
                 "WHERE subject = %s ORDER BY organization_id",
                 (subject,),
             )
@@ -190,9 +175,7 @@ class PostgresMemberships:
             cursor.execute(f"SELECT revision FROM {self._revision} WHERE id = %s", (_REVISION_ROW,))
             revision = cursor.fetchone()
             return AccessSnapshot(
-                memberships=tuple(
-                    Membership(organization, department) for organization, department in rows
-                ),
+                memberships=tuple(Membership(organization) for (organization,) in rows),
                 revision=0 if revision is None or revision[0] is None else int(revision[0]),
             )
 
@@ -201,7 +184,7 @@ class PostgresMemberships:
     def _members(self, column: str, value: str) -> tuple[Member, ...]:
         def read(cursor: Any) -> tuple[Member, ...]:
             cursor.execute(
-                f"SELECT subject, organization_id, department_id, role FROM {self._memberships} "
+                f"SELECT subject, organization_id, role FROM {self._memberships} "
                 f"WHERE {column} = %s ORDER BY organization_id, subject",
                 (value,),
             )
@@ -211,7 +194,7 @@ class PostgresMemberships:
 
     def _change(self, organization: str, change: MemberChange, caller: str | None) -> bool:
         if isinstance(change, SetMember):
-            _checked(change.subject, organization, change.department, change.role)
+            _checked(change.subject, organization, change.role)
         elif isinstance(change, RemoveMember):
             _identifier(change.subject, field="A member's subject", limit=SUBJECT_LENGTH)
             _identifier(organization, field="An organization", limit=ORGANIZATION_LENGTH)
@@ -227,10 +210,9 @@ class PostgresMemberships:
             if isinstance(change, SetMember):
                 cursor.execute(
                     f"INSERT INTO {self._memberships} "
-                    "(subject, organization_id, department_id, role) VALUES (%s, %s, %s, %s) "
-                    "ON CONFLICT (subject, organization_id) "
-                    "DO UPDATE SET department_id = EXCLUDED.department_id, role = EXCLUDED.role",
-                    (change.subject, organization, change.department, change.role),
+                    "(subject, organization_id, role) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (subject, organization_id) DO UPDATE SET role = EXCLUDED.role",
+                    (change.subject, organization, change.role),
                 )
                 changed = True
             else:
@@ -254,9 +236,7 @@ class PostgresMemberships:
             # psycopg 3 names the SQLSTATE `sqlstate`, psycopg2 `pgcode`.
             code = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
             if code == _FOREIGN_KEY_VIOLATION:
-                raise UnknownDepartment(
-                    f"{organization!r} doesn't exist, or the department isn't one of its own."
-                ) from None
+                raise UnknownOrganization(f"{organization!r} doesn't exist.") from None
             raise
 
     def _admins(self, cursor: Any, organization: str, *, lock: bool) -> set[str]:
@@ -299,7 +279,6 @@ _INTEGER_TYPES = frozenset({"int2", "int4", "int8"})
 _COLUMNS: dict[tuple[str, str], tuple[frozenset[str], bool]] = {
     ("memberships", "subject"): (_TEXT_TYPES, True),
     ("memberships", "organization_id"): (_TEXT_TYPES, True),
-    ("memberships", "department_id"): (_TEXT_TYPES, False),
     ("memberships", "role"): (_TEXT_TYPES, True),
     ("access_revision", "id"): (_INTEGER_TYPES, True),
     ("access_revision", "revision"): (frozenset({"int8"}), True),
@@ -352,10 +331,11 @@ def check_membership_tables(connection: Any, *, schema: str = "app") -> None:
     relies on, and raise :class:`MembershipTablesInvalid` naming each difference.
 
     It checks the columns the store reads and writes, the unique (subject, organization)
-    and access-revision keys its upserts need, the foreign key that keeps a membership's
-    department inside its organization, and the check that keeps roles to ``member`` and
-    ``admin``. ``connection`` is a DB-API connection to the application's database; the
-    check only reads the catalog and leaves its transaction to the caller.
+    and access-revision keys its upserts need, the foreign key that keeps a membership to an
+    organization that exists, and the check that keeps roles to ``member`` and ``admin``;
+    other columns are the application's own. ``connection`` is a DB-API connection to the
+    application's database; the check only reads the catalog and leaves its transaction to
+    the caller.
     """
 
     schema = _schema(schema)
@@ -405,20 +385,20 @@ def _table_problems(cursor: Any, schema: str) -> list[str]:
     if "memberships" not in tables:
         return problems
     cursor.execute(_CONSTRAINTS_SQL, (schema,))
-    department_key = role_check = False
+    organization_key = role_check = False
     for kind, own, target_schema, target, referenced, definition in cursor.fetchall():
         if kind == "f":
-            department_key = department_key or (
-                (target_schema, target) == (schema, "departments")
-                and set(zip(own, referenced, strict=False))
-                == {("organization_id", "organization_id"), ("department_id", "id")}
+            organization_key = organization_key or (
+                (target_schema, target) == (schema, "organizations")
+                and list(own) == ["organization_id"]
+                and list(referenced) == ["id"]
             )
         elif list(own) == ["role"]:
             role_check = role_check or ("'member'" in definition and "'admin'" in definition)
-    if not department_key:
+    if not organization_key:
         problems.append(
-            f"{schema}.memberships has no foreign key (organization_id, department_id) "
-            f"referencing {schema}.departments (organization_id, id)."
+            f"{schema}.memberships has no foreign key (organization_id) referencing "
+            f"{schema}.organizations (id)."
         )
     if not role_check:
         problems.append(f"{schema}.memberships has no check keeping role to 'member' and 'admin'.")

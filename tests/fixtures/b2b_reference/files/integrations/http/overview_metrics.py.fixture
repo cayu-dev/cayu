@@ -37,7 +37,7 @@ async def overview_metrics(context: OverviewContext) -> list[Metric]:
         Metric(
             label="Organizations",
             value=str(len(organizations)),
-            description=", ".join(_where(item) for item in organizations) or "No organization has added you yet.",
+            description=", ".join(item.organization for item in organizations) or "No organization has added you yet.",
         ),
         Metric(
             label="Members",
@@ -48,8 +48,8 @@ async def overview_metrics(context: OverviewContext) -> list[Metric]:
             label="Conversations",
             value=str(visible.total_count or 0),
             description=(
-                f"{own.total_count or 0} started by you, the rest shared with your department "
-                "or organization."
+                f"{own.total_count or 0} started by you, the rest shared with your "
+                "organization."
             ),
         ),
         Metric(
@@ -70,7 +70,3 @@ async def _people(subject: str) -> tuple[list[Membership], int]:
         for member in await memberships().of_organization(record.organization)
     }
     return [record.membership for record in records], len(people)
-
-
-def _where(membership: Membership) -> str:
-    return membership.department or membership.organization

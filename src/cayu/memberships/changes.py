@@ -9,10 +9,9 @@ from cayu.memberships.directory import Role
 
 @dataclass(frozen=True, slots=True)
 class SetMember:
-    """Add ``subject`` to the organization, or move them to ``department`` and ``role``."""
+    """Add ``subject`` to the organization, or give them ``role`` if already a member."""
 
     subject: str
-    department: str | None = None
     role: Role = "member"
 
 
@@ -38,5 +37,5 @@ class LastAdmin(MembershipChangeRefused):
     """The change would leave an organization that has an admin without one."""
 
 
-class UnknownDepartment(MembershipChangeRefused):
-    """The organization doesn't exist, or the department isn't one of its own."""
+class UnknownOrganization(MembershipChangeRefused):
+    """The organization doesn't exist."""

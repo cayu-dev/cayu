@@ -465,13 +465,14 @@ application people from separate organizations share on one deployment, with one
 database and one agent; choose it only for that. `--preset agent --with
 organizations` adds the same organizations to the agent preset, with its knowledge and
 memory scoped to each organization (the coding, long-running and service presets
-don't take organizations). Organizations, departments
-and memberships are application tables (it always includes `app-database`), and
+don't take organizations). Organizations and memberships
+are application tables (it always includes `app-database`), and
 `policies/access.py` turns each person's current membership into Cayu
-resource-access grants: everyone sees their own conversations, their department's
-and their organization's, and nothing of another organization. Only the owner
-continues or changes a conversation. A department is always matched with its own
-organization. Cayu asks the policy again at every read, listing and background
+resource-access grants: everyone sees their own conversations and those shared with
+their organization, and nothing of another organization. Only the owner
+continues or changes a conversation. Grouping people inside an organization (teams,
+projects) is the application's own choice, with its own tables and its own policy over
+the same memberships. Cayu asks the policy again at every read, listing and background
 step, so a removed member loses access at their next step; changing a membership
 also raises the access revision, so no decision read before it is used again.
 `uv run --no-sync python -m operations.demo_seed` adds two demonstration
@@ -485,7 +486,10 @@ from the command line.
 A project generated before `cayu.memberships` existed carries its own copies of the
 membership code. `uv run --no-sync cayu check` notes each one that is still exactly the copy
 Cayu generated (`MEMBERSHIPS_GENERATED_COPY`), and `cayu guide b2b#move-to-cayumemberships`
-walks through the one-commit move, which needs no database migration.
+walks through the one-commit move, which needs no database migration. The library has no
+departments: it ignores those projects' `departments` table and `department_id` column, and
+a conversation they shared with a department becomes visible only to its owner, so access
+only narrows.
 
 ## Durable data
 

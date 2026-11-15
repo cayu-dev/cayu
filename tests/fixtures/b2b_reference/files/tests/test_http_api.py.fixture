@@ -30,7 +30,7 @@ from database.memberships import memberships
 from integrations.http import AGENT_NAME, build_router
 from operations.demo_seed import seed
 
-ALICE = Membership("acme", "acme/finance")
+ALICE = Membership("acme")
 IDENTITY = SessionIdentity(provider_name="fake", model="fake")
 # The built web app, `[tool.cayu.serve] ui` in pyproject.toml.
 WEB = Path(__file__).resolve().parents[1] / "web" / "static"
@@ -142,23 +142,21 @@ def test_conversations_over_http_show_each_person_only_their_own() -> None:
     directory = InMemoryMembershipDirectory(
         {
             "alice": [ALICE],
-            "carol": [Membership("acme", "acme/finance")],
-            "bob": [Membership("acme", "acme/legal")],
-            "dave": [Membership("globex", "globex/support")],
+            "carol": [Membership("acme")],
+            "dave": [Membership("globex")],
         }
     )
     app = _app(directory)
     with _client(app) as client:
         personal = _start(client, app, "personal")
-        department = _start(client, app, "department")
+        shared = _start(client, app, "organization")
         _sign_in(client, "carol")
-        assert _listed(client) == {department}
-        _sign_in(client, "bob")
-        assert _listed(client) == set()
+        assert _listed(client) == {shared}
         _sign_in(client, "dave")
-        assert client.get(f"/app/resources/sessions/{department}").status_code == 404
+        assert _listed(client) == set()
+        assert client.get(f"/app/resources/sessions/{shared}").status_code == 404
         _sign_in(client, "alice")
-        assert _listed(client) == {personal, department}
+        assert _listed(client) == {personal, shared}
 
 
 @requires_postgres
@@ -169,25 +167,23 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
     seed()
     app = _app(memberships())
     with _client(app) as client:
-        shared = _start(client, app, "department")
+        shared = _start(client, app, "organization")
 
         _sign_in(client, "carol")
         me = client.get("/app/me").json()
         assert me["agent_name"] == AGENT_NAME
         assert me["memberships"] == [
-            {
-                "subject": "carol",
-                "organization": "acme",
-                "department": "acme/finance",
-                "role": "member",
-            }
+            {"subject": "carol", "organization": "acme", "role": "member"}
         ]
         labels = client.post(
             "/app/conversation-labels",
-            json={"organization": "acme", "sharing": "department"},
+            json={"organization": "acme", "sharing": "organization"},
         ).json()
-        assert labels["department"] == "acme/finance"
-        assert labels["owner"] == "carol"
+        assert labels == {
+            "organization": "acme",
+            "owner": "carol",
+            "sharing": "organization",
+        }
         assert (
             client.post(
                 "/app/conversation-labels",
@@ -197,19 +193,20 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
         )
         assert client.get(f"/app/resources/sessions/{shared}").status_code == 200
         # A member reads the member list but doesn't change it.
-        assert len(client.get("/app/organizations/acme/members").json()) == 3
-        assert client.delete("/app/organizations/acme/members/bob").status_code == 403
+        assert len(client.get("/app/organizations/acme/members").json()) == 2
+        assert client.delete("/app/organizations/acme/members/alice").status_code == 403
 
         _sign_in(client, "dave")
         assert client.get("/app/organizations/acme/members").status_code == 404
         assert client.delete("/app/organizations/acme/members/carol").status_code == 404
 
         _sign_in(client, "alice")
-        moved = client.put(
-            "/app/organizations/acme/members/bob",
-            json={"department": "globex/support"},
+        assert (
+            client.put(
+                "/app/organizations/acme/members/bob", json={"role": "owner"}
+            ).status_code
+            == 422
         )
-        assert moved.status_code == 422
         too_long = "x" * 201
         assert (
             client.delete(f"/app/organizations/acme/members/{too_long}").status_code
@@ -221,18 +218,14 @@ def test_admins_manage_members_and_a_removed_member_loses_access_at_once(
         # Acme's only admin can't leave it without one.
         assert (
             client.put(
-                "/app/organizations/acme/members/alice",
-                json={"department": "acme/finance", "role": "member"},
+                "/app/organizations/acme/members/alice", json={"role": "member"}
             ).status_code
             == 409
         )
         assert client.delete("/app/organizations/acme/members/alice").status_code == 409
         # An identity provider's subject may contain '/'.
         assert (
-            client.put(
-                "/app/organizations/acme/members/staff/erin",
-                json={"department": "acme/legal"},
-            ).status_code
+            client.put("/app/organizations/acme/members/staff/erin", json={}).status_code
             == 200
         )
         assert (
@@ -253,7 +246,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
     with _client(app) as client:
         assert client.get("/app/whoami").status_code == 401
         _start(client, app, "personal")
-        _start(client, app, "department")
+        _start(client, app, "organization")
 
         # An admin of any of their organizations is `admin`; others are members. Under
         # `cayu serve --dev`, Cayu's inbox is open, so they may decide in the app's Inbox.
@@ -266,7 +259,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
         }
         assert metrics == {
             "Organizations": "1",
-            "Members": "3",
+            "Members": "2",
             "Conversations": "2",
             "Tasks": "0",
         }
@@ -279,7 +272,7 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
             for item in client.get("/app/overview").json()["metrics"]
             if item["label"] == "Conversations"
         )
-        # Carol sees Alice's department conversation, not her personal one.
+        # Carol sees what Alice shared with acme, not Alice's personal one.
         assert conversations["value"] == "1"
         assert conversations["description"].startswith("0 started by you")
 
@@ -288,4 +281,4 @@ def test_whoami_and_the_overview_answer_for_the_signed_in_person(database) -> No
             item["label"]: item["value"]
             for item in client.get("/app/overview").json()["metrics"]
         }
-        assert (metrics["Members"], metrics["Conversations"]) == ("1", "0")
+        assert (metrics["Members"], metrics["Conversations"]) == ("2", "0")

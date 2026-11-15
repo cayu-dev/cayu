@@ -267,3 +267,24 @@ def test_a_generated_project_passes_cayu_check_and_its_tests_on_postgres(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SKIPPED" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "choices",
+    [
+        {"preset": "b2b"},
+        {"preset": "agent", "with_capabilities": ("organizations",)},
+    ],
+    ids=["b2b", "agent-with-organizations"],
+)
+def test_organizations_are_members_and_roles_with_no_grouping_inside(choices) -> None:
+    """Grouping people inside an organization is the application's choice, so the generated
+    project builds none in: no table, column, sharing or page for one."""
+
+    files = project_files("acme-desk", application_plan=_plan(**choices))
+
+    named = sorted(path for path, text in files.items() if "department" in text.lower())
+    assert named == []
+    models = files["database/models.py"]
+    assert "class Organization(Base)" in models and "class Membership(Base)" in models
+    assert 'SHARING = ["personal", "organization"]' in files["web/src/agent/api.ts"]

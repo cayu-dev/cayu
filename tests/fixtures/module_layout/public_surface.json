@@ -2666,7 +2666,7 @@
           "NotAnAdmin",
           "RemoveMember",
           "SetMember",
-          "UnknownDepartment"
+          "UnknownOrganization"
         ],
         "cayu.memberships.directory": [
           "AccessSnapshot",
