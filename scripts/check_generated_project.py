@@ -119,7 +119,7 @@ def project_steps(plan: ApplicationPlan, paths: Collection[str], *, database: st
             if postgres
             else {},
         ),
-        Step("cayu check", plan.check_command(), env=dict(plan.check_environment())),
+        Step("cayu check", plan.ci_check_command(), env=dict(plan.ci_check_environment())),
     ]
     if "web/e2e/package.json" in paths:
         smoke_env = {}

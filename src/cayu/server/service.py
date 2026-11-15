@@ -57,6 +57,7 @@ from cayu.project_control_plane import ProjectControlPlaneContext
 from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.service_manifest import (
+    AccessSettingNames,
     PublicServiceManifest,
     RuntimeStoreDurability,
     ServiceIdentityStoreKind,
@@ -444,11 +445,16 @@ class DevelopmentProductAccess(_ProductAccess):
 
 
 class PlaceholderProductAccess(BaseModel):
-    """Fail-closed missing product authentication surfaced by deployment checks."""
+    """Fail-closed missing product authentication surfaced by deployment checks.
+
+    *settings* names what a deployment provides to replace it, such as
+    ``("PRODUCT_AUTH_TOKENS_JSON",)``, so the deploy check can say so.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["placeholder"] = "placeholder"
+    settings: AccessSettingNames = ()
 
     @model_validator(mode="wrap")
     @classmethod
@@ -465,11 +471,16 @@ ProductAccess = AuthenticatedProductAccess | DevelopmentProductAccess | Placehol
 
 
 class PlaceholderOperatorAccess(BaseModel):
-    """Fail-closed missing operator authentication surfaced by deployment checks."""
+    """Fail-closed missing operator authentication surfaced by deployment checks.
+
+    *settings* names what a deployment provides to replace it, such as
+    ``("CAYU_OPERATOR_BEARER_TOKEN",)``, so the deploy check can say so.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["placeholder"] = "placeholder"
+    settings: AccessSettingNames = ()
 
     @model_validator(mode="wrap")
     @classmethod
@@ -2738,6 +2749,14 @@ def create_agent_service(
         mode=mode,
         product_access=product_access.kind,
         operator_access=operator_access.kind,
+        product_access_settings=(
+            product_access.settings if isinstance(product_access, PlaceholderProductAccess) else ()
+        ),
+        operator_access_settings=(
+            operator_access.settings
+            if isinstance(operator_access, PlaceholderOperatorAccess)
+            else ()
+        ),
         identity_store=store_category,
         runtime_session_store=runtime_session_store,
         runtime_task_store=runtime_task_store,

@@ -56,13 +56,16 @@ def test_every_preset_gets_a_pinned_workflow_that_needs_no_secrets(
     # A Docker coding app needs its image before `cayu check` can build the app.
     docker_coding = (preset, execution) == ("coding", "docker")
     image = ["uv run --no-sync python build_coding_image.py"] if docker_coding else []
-    checks = [install, "uv run --no-sync pytest -q", *image, plan.check_command()]
+    checks = [install, "uv run --no-sync pytest -q", *image, plan.ci_check_command()]
     assert commands[: len(checks)] == checks
     assert not any("cayu eval run" in command for command in commands)
     if "evals" in plan.capabilities:
         assert "      #   run: uv run --no-sync cayu eval run\n" in workflow
-    # The service's check verifies authentication with throwaway local values.
-    for name, value in plan.check_environment():
+    # The service's CI runs the deploy check, which verifies authentication with
+    # throwaway local values; every other preset runs the documented check.
+    assert ("--deploy" in plan.ci_check_command()) == (preset == "service")
+    assert bool(plan.ci_check_environment()) == (preset == "service")
+    for name, value in plan.ci_check_environment():
         assert f"          {name}: '{value}'\n" in workflow
     has_web = "web/package.json" in files
     assert has_web == ("web-app" in plan.capabilities)

@@ -224,6 +224,14 @@ def ci_guidance(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
         if _builds_coding_image(files)
         else ""
     )
+    deploy = (
+        " The deploy check runs with throwaway "
+        + " and ".join(f"`{name}`" for name, _value in plan.ci_check_environment())
+        + " values, so it proves the service's authentication is wired; a deployment sets "
+        "its own."
+        if plan.ci_check_environment()
+        else ""
+    )
     evals = (
         " `cayu eval run` is a commented step: it needs a stable memory evidence key, "
         "which a fresh checkout doesn't have."
@@ -234,8 +242,8 @@ def ci_guidance(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     )
     return (
         _GUIDANCE_MARKER + f"`{CI_WORKFLOW_PATH}` runs `uv sync`, `uv run --no-sync pytest -q` and "
-        f"`{plan.check_command()}` on GitHub Actions for every pull request and every "
-        f"push to `main`. It needs no secrets.{image}{web}{evals} Keep it passing, and add a "
+        f"`{plan.ci_check_command()}` on GitHub Actions for every pull request and every "
+        f"push to `main`. It needs no secrets.{deploy}{image}{web}{evals} Keep it passing, and add a "
         "command there when the project gains another check.\n"
     )
 
@@ -273,8 +281,8 @@ def _github_workflow(plan: ApplicationPlan, files: Mapping[str, str]) -> str:
     )
     if _builds_coding_image(files):
         steps.append(_CODING_IMAGE_STEP)
-    check = f"      - name: cayu check\n        run: {plan.check_command()}\n"
-    environment = plan.check_environment()
+    check = f"      - name: cayu check\n        run: {plan.ci_check_command()}\n"
+    environment = plan.ci_check_environment()
     if environment:
         check = (
             "      # Throwaway local credentials that let the check verify the service's\n"

@@ -2148,7 +2148,10 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "private, no-store" in readme
 
     output = capsys.readouterr().out
-    assert "cayu check --deploy --fail-on warning --json" in output
+    # The closing output gives the check a fresh checkout passes without settings.
+    assert "  uv run --no-sync cayu check --fail-on warning --json\n" in output
+    assert "--deploy" not in output
+    assert "PRODUCT_AUTH_TOKENS_JSON" not in output
     assert "pytest -q tests/test_public_service_security.py" in output
     assert "Product API: http://127.0.0.1:8000/api/operations" in output
     assert "Developer dashboard: http://127.0.0.1:8000/cayu/" in output
@@ -2185,6 +2188,50 @@ def test_scaffolded_service_replacement_recovery_uses_profiled_admission(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH")
+@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="needs a virtual environment")
+def test_fresh_service_project_passes_its_documented_check_as_written(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The check README, AGENTS.md and `cayu new` give passes with no settings."""
+
+    from cayu.cli.scaffold_plan import normalize_application_plan
+
+    assert main(["new", "fresh", "--preset", "service", "--dir", str(tmp_path)]) == 0
+    receipt = capsys.readouterr().out
+    project = tmp_path / "fresh"
+    plan = normalize_application_plan(name="fresh", agent_name="fresh", preset="service")
+    documented = plan.check_command() + " --json"
+    assert f"  {documented}\n" in receipt
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+    assert f"\n{documented}\n" in readme.split("## Setup and prove the project", 1)[1]
+    assert f"`{documented}`" in agents
+
+    # `uv run --no-sync` uses the project's .venv; this one is the test's own
+    # environment, which has this Cayu installed.
+    (project / ".venv").symlink_to(sys.prefix, target_is_directory=True)
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"PRODUCT_AUTH_TOKENS_JSON", "CAYU_OPERATOR_BEARER_TOKEN"}
+        and not name.startswith(("CAYU_", "UV_", "VIRTUAL_ENV"))
+    }
+    result = subprocess.run(
+        shlex.split(documented),
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert {item["severity"] for item in report["diagnostics"]} <= {"info"}
+
+
 def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_auth(
     tmp_path: Path,
     monkeypatch,
@@ -2203,6 +2250,26 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
         "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
         "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
     ]
+    # The deploy finding names exactly the settings to provide.
+    named = {
+        item["code"]: (item["severity"], item["parameters"]["settings"], item["hint"])
+        for item in unsafe["diagnostics"]
+    }
+    for code, setting in (
+        ("PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "CAYU_OPERATOR_BEARER_TOKEN"),
+        ("PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE", "PRODUCT_AUTH_TOKENS_JSON"),
+    ):
+        severity, settings, hint = named[code]
+        assert (severity, settings) == ("error", [setting])
+        assert hint.startswith(f"Set {setting} ")
+
+    # Outside --deploy the same missing settings are information, not a failure.
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    local = json.loads(capsys.readouterr().out)
+    assert {(item["code"], item["severity"]) for item in local["diagnostics"]} == {
+        ("PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "info"),
+        ("PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE", "info"),
+    }
 
     monkeypatch.setenv("PRODUCT_AUTH_TOKENS_JSON", '{"customer-token":null}')
     monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "operator-token")

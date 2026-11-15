@@ -1253,7 +1253,7 @@ def _configured_product_principals() -> dict[str, ProductPrincipal] | None:
 def _production_product_access():
     configured = _configured_product_principals()
     if configured is None:
-        return PlaceholderProductAccess()
+        return PlaceholderProductAccess(settings=("PRODUCT_AUTH_TOKENS_JSON",))
 
     async def authenticate(request: Request) -> ProductPrincipal:
         token = _bearer_token(request)
@@ -1275,11 +1275,11 @@ def _production_product_access():
 def _production_operator_access() -> ServerAccessConfig | PlaceholderOperatorAccess:
     configured_token = _validated_bearer_token(configured_operator_bearer_token())
     if configured_token is None:
-        return PlaceholderOperatorAccess()
+        return PlaceholderOperatorAccess(settings=("CAYU_OPERATOR_BEARER_TOKEN",))
     product_principals = _configured_product_principals()
     if product_principals is not None and configured_token in product_principals:
         # Customer credentials must never grant operator-plane access.
-        return PlaceholderOperatorAccess()
+        return PlaceholderOperatorAccess(settings=("CAYU_OPERATOR_BEARER_TOKEN",))
 
     async def authenticate(request: Request):
         token = _bearer_token(request)
@@ -2636,10 +2636,16 @@ tenant-qualified lookup in the application-owned product store. Keep the
 Developer dashboard policy separate and never expose `/cayu/` or raw Cayu evidence to
 customers. An arbitrary ASGI route is outside Cayu's verification boundary.
 
-Before declaring production work complete, run:
+Before declaring production work complete, run these with
+`PRODUCT_AUTH_TOKENS_JSON` and `CAYU_OPERATOR_BEARER_TOKEN` set (throwaway
+values are fine locally, as in the CI workflow):
 
 - `uv run --no-sync cayu check --deploy --fail-on warning --json`
 - `uv run --no-sync pytest -q tests/test_public_service_security.py`
+
+Without them, the deploy check reports the product API and the Developer
+dashboard as unauthenticated and names the settings to provide. The everyday
+`uv run --no-sync cayu check --fail-on warning --json` needs neither.
 """
 
 _GITIGNORE = (

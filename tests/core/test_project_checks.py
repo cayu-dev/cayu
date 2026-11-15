@@ -19,7 +19,11 @@ from cayu.evals import ScriptedModelProvider
 from cayu.managed_settings import ManagedSetting, ManagedSettingChoice, model_setting
 from cayu.runners import LocalRunner
 from cayu.runtime import ProjectDiagnostic, check_manifest
-from cayu.runtime.checks import BUILTIN_DIAGNOSTIC_CODES, ProjectControlPlaneCheckEvidence
+from cayu.runtime.checks import (
+    BUILTIN_DIAGNOSTIC_CODES,
+    ProjectControlPlaneCheckEvidence,
+    check_public_service_deployment,
+)
 from cayu.runtime.service_manifest import PublicServiceManifest
 from cayu.storage import InMemoryKnowledgeStore, KnowledgeAccessScope
 from cayu.tools import (
@@ -207,6 +211,91 @@ def test_public_service_deployment_rejects_in_memory_runtime_stores() -> None:
         "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
     ]
     assert report.service_evidence.configuration == "unsupported"
+
+
+def _placeholder_service(**overrides: object) -> PublicServiceManifest:
+    fields: dict[str, object] = {
+        "mode": "production",
+        "product_access": "placeholder",
+        "operator_access": "placeholder",
+        "product_access_settings": ("PRODUCT_AUTH_TOKENS_JSON",),
+        "operator_access_settings": ("CAYU_OPERATOR_BEARER_TOKEN",),
+        "identity_store": "durable",
+        "runtime_session_store": "durable",
+        "runtime_task_store": "durable",
+        "product_api_path": "/api",
+        "control_plane_path": "/cayu",
+    }
+    fields.update(overrides)
+    return PublicServiceManifest.model_validate(fields)
+
+
+def test_placeholder_access_is_a_deploy_error_and_local_information() -> None:
+    manifest = CayuApp(enable_logging=False).describe()
+    service = _placeholder_service()
+    codes = ["PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"]
+
+    deploy = check_manifest(manifest, service_manifest=service, deploy_only=True)
+    assert [item.code for item in deploy.diagnostics] == codes
+    assert {item.severity for item in deploy.diagnostics} == {"error"}
+    by_code = {item.code: item for item in deploy.diagnostics}
+    product = by_code["PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"]
+    assert product.parameters["settings"] == ("PRODUCT_AUTH_TOKENS_JSON",)
+    assert "PRODUCT_AUTH_TOKENS_JSON" in product.message
+    assert product.hint is not None and product.hint.startswith("Set PRODUCT_AUTH_TOKENS_JSON ")
+    operator = by_code["PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE"]
+    assert operator.parameters["settings"] == ("CAYU_OPERATOR_BEARER_TOKEN",)
+    assert deploy.service_evidence.configuration == "unsupported"
+
+    # What `cayu serve` refuses on is unchanged.
+    assert sorted(item.code for item in check_public_service_deployment(service)) == codes
+    assert {item.severity for item in check_public_service_deployment(service)} == {"error"}
+
+    local = check_manifest(manifest, service_manifest=service)
+    assert [item.code for item in local.diagnostics if item.subject == "public_service"] == codes
+    assert {item.severity for item in local.diagnostics if item.subject == "public_service"} == {
+        "info"
+    }
+    assert all("deploy" not in item.tags for item in local.diagnostics)
+    assert local.service_evidence.configuration == "unsupported"
+
+
+def test_local_check_still_fails_open_or_development_access() -> None:
+    manifest = CayuApp(enable_logging=False).describe()
+    service = _placeholder_service(
+        product_access="development",
+        operator_access="open",
+        product_access_settings=(),
+        operator_access_settings=(),
+    )
+
+    for deploy_only in (False, True):
+        report = check_manifest(manifest, service_manifest=service, deploy_only=deploy_only)
+        assert {
+            (item.code, item.severity)
+            for item in report.diagnostics
+            if item.subject == "public_service"
+        } == {
+            ("PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "error"),
+            ("PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE", "error"),
+        }
+
+
+def test_placeholder_without_named_settings_keeps_the_generic_hint() -> None:
+    report = check_manifest(
+        CayuApp(enable_logging=False).describe(),
+        service_manifest=_placeholder_service(
+            product_access_settings=(), operator_access_settings=()
+        ),
+        deploy_only=True,
+    )
+
+    hints = {item.code: item.hint for item in report.diagnostics}
+    assert hints["PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"] == (
+        "Configure AuthenticatedProductAccess with trusted tenant resolution."
+    )
+    with pytest.raises(ValidationError):
+        _placeholder_service(product_access_settings=("not a name",))
 
 
 def test_workflow_tool_references_must_match_that_agents_registered_tools() -> None:

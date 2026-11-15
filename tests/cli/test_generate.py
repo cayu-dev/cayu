@@ -127,7 +127,9 @@ def test_generate_service_context_migrates_the_previous_generated_factory(
     service_path.write_text(previous, encoding="utf-8")
     monkeypatch.chdir(project)
 
-    assert main(["check", "--json"]) == 1
+    # The migration finding is a warning; the missing service credentials are only
+    # information outside --deploy.
+    assert main(["check", "--fail-on", "warning", "--json"]) == 1
     before_migration = json.loads(capsys.readouterr().out)
     assert "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED" in {
         item["code"] for item in before_migration["diagnostics"]
@@ -148,7 +150,7 @@ def test_generate_service_context_migrates_the_previous_generated_factory(
     assert "    project_context: ProjectControlPlaneContext | None = None,\n" in migrated
     assert "        project_context=project_context,\n" in migrated
 
-    assert main(["check", "--json"]) == 1
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
     after_migration = json.loads(capsys.readouterr().out)
     assert "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED" not in {
         item["code"] for item in after_migration["diagnostics"]

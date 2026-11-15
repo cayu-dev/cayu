@@ -7,7 +7,6 @@ describes source generation only; a scaffold plan is never runtime authority.
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -543,13 +542,28 @@ class ApplicationPlan:
         return None if self.provider == "neutral" else self.provider
 
     def check_command(self) -> str:
-        """The `cayu check` that proves a fresh checkout of this plan, without `--json`."""
+        """The `cayu check` a fresh checkout of this plan passes as it is, without `--json`.
 
-        deploy = " --deploy" if self.preset == "service" else ""
-        return f"uv run --no-sync cayu check{deploy} --fail-on warning"
+        Every preset documents the same command, and it needs no environment: a
+        service's missing authentication settings are information here, not a
+        deploy error. `ci_check_command` is the stricter one CI runs.
+        """
 
-    def check_environment(self) -> tuple[tuple[str, str], ...]:
-        """Throwaway local values `check_command` needs; a deployment sets its own."""
+        return "uv run --no-sync cayu check --fail-on warning"
+
+    def ci_check_command(self) -> str:
+        """The `cayu check` the generated CI runs, with `ci_check_environment` set.
+
+        A service's CI runs the deploy check with throwaway settings, so it proves the
+        service's authentication is wired; the other presets run `check_command`.
+        """
+
+        if self.preset != "service":
+            return self.check_command()
+        return "uv run --no-sync cayu check --deploy --fail-on warning"
+
+    def ci_check_environment(self) -> tuple[tuple[str, str], ...]:
+        """Throwaway values `ci_check_command` needs; a deployment sets its own."""
 
         if self.preset != "service":
             return ()
@@ -562,12 +576,7 @@ class ApplicationPlan:
         )
 
     def verification_commands(self) -> tuple[str, ...]:
-        check = " ".join(
-            (
-                *(f"{name}={shlex.quote(value)}" for name, value in self.check_environment()),
-                self.check_command() + " --json",
-            )
-        )
+        check = self.check_command() + " --json"
         focused_test = {
             "agent": "uv run --no-sync pytest",
             "service": "uv run --no-sync pytest -q tests/test_public_service_security.py",

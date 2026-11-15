@@ -177,7 +177,7 @@ def check_manifest(
         for component in manifest._undeclared_execution_identities
     ]
     if service_manifest is not None:
-        diagnostics.extend(_check_public_service(service_manifest))
+        diagnostics.extend(_check_public_service(service_manifest, deploy=deploy_only))
     if not manifest.agents:
         diagnostics.append(
             ProjectDiagnostic(
@@ -826,7 +826,78 @@ def _check_project_control_plane(
     return diagnostics
 
 
-def _check_public_service(manifest: PublicServiceManifest) -> list[ProjectDiagnostic]:
+def _settings_sentence(settings: tuple[str, ...]) -> str:
+    names = " and ".join(settings)
+    verb = "is" if len(settings) == 1 else "are"
+    return f"Its authentication is configured by {names}, which {verb} not usable here."
+
+
+def _placeholder_access_diagnostic(
+    *,
+    code: str,
+    path: str,
+    surface: str,
+    unsafe_message: str,
+    settings: tuple[str, ...],
+    hint: str,
+    deploy: bool,
+    verification: str,
+) -> ProjectDiagnostic:
+    """A fail-closed placeholder: a deploy error, or local information outside `--deploy`.
+
+    A placeholder is what a maintained factory builds when the settings that
+    configure production authentication are not set, as on a fresh local checkout.
+    `cayu serve` and `cayu check --deploy` still refuse it.
+    """
+
+    anchor = code.lower().replace("_", "-")
+    named = f" {_settings_sentence(settings)}" if settings else ""
+    if deploy:
+        message = f"{unsafe_message}{named}"
+        severity = DiagnosticSeverity.ERROR
+        tags: tuple[str, ...] = ("deploy", "security")
+        full_hint = (
+            f"Set {' and '.join(settings)} to a valid value in the deployment's environment, "
+            f"usually as a secret. To authenticate another way: {hint}"
+            if settings
+            else hint
+        )
+    else:
+        message = (
+            f"{surface} has no production authentication yet, so it stays closed. That is "
+            f"expected locally; `cayu check --deploy` and `cayu serve` refuse it.{named}"
+        )
+        severity = DiagnosticSeverity.INFO
+        tags = ("configuration", "security")
+        full_hint = (
+            f"Nothing to do for local development. Before deploying, set {' and '.join(settings)}."
+            if settings
+            else f"Nothing to do for local development. Before deploying: {hint}"
+        )
+    return ProjectDiagnostic(
+        code=code,
+        severity=severity,
+        subject="public_service",
+        path=path,
+        message=message,
+        hint=full_hint,
+        tags=tags,
+        parameters={"configured": "placeholder", "settings": list(settings), "deploy": deploy},
+        documentation_anchor=f"cayu guide diagnostics#{anchor}",
+        verification_command=verification,
+    )
+
+
+def _check_public_service(
+    manifest: PublicServiceManifest, *, deploy: bool = True
+) -> list[ProjectDiagnostic]:
+    """Findings for a maintained service; *deploy* False lets local placeholders through.
+
+    A fail-closed placeholder access policy is what a fresh checkout without its
+    authentication settings builds. Outside `cayu check --deploy` it is reported as
+    information; every other finding, and every finding with *deploy*, is unchanged.
+    """
+
     if not isinstance(manifest, PublicServiceManifest):
         raise TypeError("service_manifest must be a PublicServiceManifest.")
     diagnostics: list[ProjectDiagnostic] = []
@@ -845,7 +916,22 @@ def _check_public_service(manifest: PublicServiceManifest) -> list[ProjectDiagno
                 verification_command=verification,
             )
         )
-    if manifest.product_access != "authenticated":
+    if manifest.product_access == "placeholder":
+        diagnostics.append(
+            _placeholder_access_diagnostic(
+                code="PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+                path="service.product_access",
+                surface="The product API",
+                unsafe_message=(
+                    "The product API does not use configured production authentication."
+                ),
+                settings=manifest.product_access_settings,
+                hint="Configure AuthenticatedProductAccess with trusted tenant resolution.",
+                deploy=deploy,
+                verification=verification,
+            )
+        )
+    elif manifest.product_access != "authenticated":
         diagnostics.append(
             ProjectDiagnostic(
                 code="PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
@@ -860,7 +946,20 @@ def _check_public_service(manifest: PublicServiceManifest) -> list[ProjectDiagno
                 verification_command=verification,
             )
         )
-    if manifest.operator_access != "authenticated":
+    if manifest.operator_access == "placeholder":
+        diagnostics.append(
+            _placeholder_access_diagnostic(
+                code="PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+                path="service.operator_access",
+                surface="The Cayu Developer dashboard",
+                unsafe_message="The Cayu Developer dashboard is not authenticated.",
+                settings=manifest.operator_access_settings,
+                hint="Configure AuthenticatedAccess as the separate operator_access policy.",
+                deploy=deploy,
+                verification=verification,
+            )
+        )
+    elif manifest.operator_access != "authenticated":
         diagnostics.append(
             ProjectDiagnostic(
                 code="PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",

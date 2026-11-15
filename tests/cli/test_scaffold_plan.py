@@ -17,7 +17,7 @@ from cayu.cli import main
 from cayu.cli._constant_branches import has_constant_branches
 from cayu.cli.project import project_context
 from cayu.cli.scaffold import project_files
-from cayu.cli.scaffold_plan import normalize_application_plan
+from cayu.cli.scaffold_plan import PRESETS, normalize_application_plan
 
 
 def _json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
@@ -491,11 +491,31 @@ def test_service_plan_declares_and_supplies_non_secret_auth_proof_environment() 
         "CAYU_OPERATOR_BEARER_TOKEN",
         "PRODUCT_AUTH_TOKENS_JSON",
     ]
-    check = next(
-        command for command in plan.verification_commands() if "cayu check --deploy" in command
+    # The documented check needs no environment; CI runs the deploy check
+    # with throwaway values.
+    assert "uv run --no-sync cayu check --fail-on warning --json" in plan.verification_commands()
+    assert not any("--deploy" in command for command in plan.verification_commands())
+    assert not any(
+        "PRODUCT_AUTH_TOKENS_JSON" in command for command in plan.verification_commands()
     )
-    assert check.startswith("PRODUCT_AUTH_TOKENS_JSON=")
-    assert "CAYU_OPERATOR_BEARER_TOKEN=local-operator-token" in check
+    assert plan.ci_check_command() == "uv run --no-sync cayu check --deploy --fail-on warning"
+    assert dict(plan.ci_check_environment())["CAYU_OPERATOR_BEARER_TOKEN"] == (
+        "local-operator-token"
+    )
+    assert "PRODUCT_AUTH_TOKENS_JSON" in dict(plan.ci_check_environment())
+
+
+@pytest.mark.parametrize("preset", [spec.name for spec in PRESETS])
+def test_every_preset_documents_the_same_check_without_environment(preset: str) -> None:
+    plan = normalize_application_plan(name="app", agent_name="app", preset=preset)
+
+    assert plan.check_command() == "uv run --no-sync cayu check --fail-on warning"
+    assert plan.check_command() + " --json" in plan.verification_commands()
+    if preset == "service":
+        assert plan.ci_check_command() == "uv run --no-sync cayu check --deploy --fail-on warning"
+    else:
+        assert plan.ci_check_command() == plan.check_command()
+        assert plan.ci_check_environment() == ()
 
 
 @pytest.mark.parametrize("preset", ("agent", "coding"))

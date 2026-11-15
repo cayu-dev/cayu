@@ -460,6 +460,14 @@ model output, or tool input. For OIDC/JWT bearer tokens,
 `OidcBearerAuth(...).product_dependency(tenant_claim=...)` takes both from the
 verified token and rejects a token without the tenant claim.
 
+A fail-closed placeholder is what a maintained factory builds when the settings
+that configure its authentication are missing or invalid, as on a fresh local
+checkout. `PlaceholderProductAccess(settings=(...))` names those settings, and
+the finding lists them. `cayu check --deploy` and `cayu serve` report a
+placeholder as an error. A plain `cayu check` reports it as information, so a
+fresh checkout passes `cayu check --fail-on warning` before any credential exists.
+Development access and every other unsafe configuration stay errors there too.
+
 ## public-service-operator-access-unsafe
 
 `PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE` means the separately mounted `/cayu/`
@@ -467,6 +475,9 @@ Developer dashboard uses `OpenAccess` or a fail-closed placeholder because
 production authentication is missing or invalid. Configure
 `AuthenticatedAccess` for production. Dashboard authentication protects the raw
 Developer dashboard; it does not make that surface customer-facing or tenant-scoped.
+`PlaceholderOperatorAccess(settings=(...))` names the settings a deployment provides,
+and a placeholder is information outside `--deploy`, as for the product API above.
+`OpenAccess` stays an error in every check.
 
 ## public-service-identity-store-not-durable
 

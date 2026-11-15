@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 PUBLIC_SERVICE_MANIFEST_SCHEMA_VERSION = "2"
+
+# Names of the settings (environment variables, for example) a deployment provides so
+# a fail-closed placeholder access policy becomes configured authentication. Names
+# only: never their values.
+AccessSettingNames = Annotated[
+    tuple[
+        Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$", max_length=128)],
+        ...,
+    ],
+    Field(max_length=16),
+]
 
 
 class ServiceMode(StrEnum):
@@ -46,6 +57,9 @@ class PublicServiceManifest(BaseModel):
     mode: ServiceMode
     product_access: Literal["authenticated", "development", "placeholder"]
     operator_access: Literal["authenticated", "open", "placeholder"]
+    # The settings a placeholder product or operator access policy names as missing.
+    product_access_settings: AccessSettingNames = ()
+    operator_access_settings: AccessSettingNames = ()
     identity_store: ServiceIdentityStoreKind
     runtime_session_store: RuntimeStoreDurability
     runtime_task_store: RuntimeStoreDurability | Literal["missing"]
