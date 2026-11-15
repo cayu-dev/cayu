@@ -2506,6 +2506,26 @@ def test_placeholder_product_access_always_uses_runtime_owned_denial() -> None:
         PlaceholderProductAccess(dependency=lambda _request: None)
 
 
+def test_service_manifest_carries_why_each_placeholder_was_chosen() -> None:
+    service, _store, _provider = _build_service(
+        product_access=PlaceholderProductAccess(
+            settings=("PRODUCT_AUTH_TOKENS_JSON",), reason="malformed"
+        ),
+        operator_access=PlaceholderOperatorAccess(
+            settings=("CAYU_OPERATOR_BEARER_TOKEN",), reason="reused"
+        ),
+    )
+    assert service.manifest.product_access_reason == "malformed"
+    assert service.manifest.operator_access_reason == "reused"
+
+    unset, _store, _provider = _build_service(product_access=PlaceholderProductAccess())
+    assert unset.manifest.product_access_reason == "unset"
+    assert unset.manifest.operator_access_reason is None
+
+    with pytest.raises(ValidationError, match="Invalid placeholder product-access"):
+        PlaceholderProductAccess(reason="mistyped")
+
+
 def test_request_fingerprint_is_stable_and_does_not_expose_request_text() -> None:
     service, store, _provider = _build_service()
     request_text = "private customer prompt"

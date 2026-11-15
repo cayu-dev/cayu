@@ -1167,6 +1167,7 @@ from __future__ import annotations
 import hmac
 import json
 import re
+from typing import Literal
 
 from fastapi import HTTPException, Request
 
@@ -1230,30 +1231,38 @@ async def _development_product_auth(request: Request) -> ProductPrincipal:
     return ProductPrincipal(tenant_id=tenant, subject_id=subject)
 
 
-def _configured_product_principals() -> dict[str, ProductPrincipal] | None:
+def _configured_product_principals() -> (
+    dict[str, ProductPrincipal] | Literal["unset", "malformed"]
+):
+    """The configured product tokens, or why there are none (never their values)."""
+
     raw = configured_product_auth_tokens_json()
+    if not raw:
+        return "unset"
     try:
-        configured = json.loads(raw) if raw else None
+        configured = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        return "malformed"
     if type(configured) is not dict or not configured:
-        return None
+        return "malformed"
     principals: dict[str, ProductPrincipal] = {}
     try:
         for raw_token, raw_principal in configured.items():
             token = _validated_bearer_token(raw_token)
             if token is None or type(raw_principal) is not dict:
-                return None
+                return "malformed"
             principals[token] = ProductPrincipal.model_validate(raw_principal)
     except (TypeError, ValueError):
-        return None
+        return "malformed"
     return principals
 
 
 def _production_product_access():
     configured = _configured_product_principals()
-    if configured is None:
-        return PlaceholderProductAccess(settings=("PRODUCT_AUTH_TOKENS_JSON",))
+    if isinstance(configured, str):
+        return PlaceholderProductAccess(
+            settings=("PRODUCT_AUTH_TOKENS_JSON",), reason=configured
+        )
 
     async def authenticate(request: Request) -> ProductPrincipal:
         token = _bearer_token(request)
@@ -1273,13 +1282,23 @@ def _production_product_access():
 
 
 def _production_operator_access() -> ServerAccessConfig | PlaceholderOperatorAccess:
-    configured_token = _validated_bearer_token(configured_operator_bearer_token())
+    raw_token = configured_operator_bearer_token()
+    if not raw_token:
+        return PlaceholderOperatorAccess(settings=("CAYU_OPERATOR_BEARER_TOKEN",))
+    configured_token = _validated_bearer_token(raw_token)
     if configured_token is None:
-        return PlaceholderOperatorAccess(settings=("CAYU_OPERATOR_BEARER_TOKEN",))
+        return PlaceholderOperatorAccess(
+            settings=("CAYU_OPERATOR_BEARER_TOKEN",), reason="malformed"
+        )
     product_principals = _configured_product_principals()
-    if product_principals is not None and configured_token in product_principals:
+    if (
+        not isinstance(product_principals, str)
+        and configured_token in product_principals
+    ):
         # Customer credentials must never grant operator-plane access.
-        return PlaceholderOperatorAccess(settings=("CAYU_OPERATOR_BEARER_TOKEN",))
+        return PlaceholderOperatorAccess(
+            settings=("CAYU_OPERATOR_BEARER_TOKEN",), reason="reused"
+        )
 
     async def authenticate(request: Request):
         token = _bearer_token(request)

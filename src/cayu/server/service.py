@@ -58,6 +58,7 @@ from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.service_manifest import (
     AccessSettingNames,
+    PlaceholderReason,
     PublicServiceManifest,
     RuntimeStoreDurability,
     ServiceIdentityStoreKind,
@@ -449,12 +450,17 @@ class PlaceholderProductAccess(BaseModel):
 
     *settings* names what a deployment provides to replace it, such as
     ``("PRODUCT_AUTH_TOKENS_JSON",)``, so the deploy check can say so.
+    *reason* says why: ``"unset"`` (the default, as on a fresh checkout),
+    ``"malformed"`` when a setting is present but invalid, or ``"reused"`` when it
+    repeats a credential another access policy accepts. A plain ``cayu check``
+    reports only an unset placeholder as information.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["placeholder"] = "placeholder"
     settings: AccessSettingNames = ()
+    reason: PlaceholderReason = "unset"
 
     @model_validator(mode="wrap")
     @classmethod
@@ -475,12 +481,16 @@ class PlaceholderOperatorAccess(BaseModel):
 
     *settings* names what a deployment provides to replace it, such as
     ``("CAYU_OPERATOR_BEARER_TOKEN",)``, so the deploy check can say so.
+    *reason* says why: ``"unset"`` (the default), ``"malformed"``, or ``"reused"``
+    when the operator token is also a product token. A plain ``cayu check``
+    reports only an unset placeholder as information.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     kind: Literal["placeholder"] = "placeholder"
     settings: AccessSettingNames = ()
+    reason: PlaceholderReason = "unset"
 
     @model_validator(mode="wrap")
     @classmethod
@@ -2756,6 +2766,14 @@ def create_agent_service(
             operator_access.settings
             if isinstance(operator_access, PlaceholderOperatorAccess)
             else ()
+        ),
+        product_access_reason=(
+            product_access.reason if isinstance(product_access, PlaceholderProductAccess) else None
+        ),
+        operator_access_reason=(
+            operator_access.reason
+            if isinstance(operator_access, PlaceholderOperatorAccess)
+            else None
         ),
         identity_store=store_category,
         runtime_session_store=runtime_session_store,

@@ -468,6 +468,15 @@ placeholder as an error. A plain `cayu check` reports it as information, so a
 fresh checkout passes `cayu check --fail-on warning` before any credential exists.
 Development access and every other unsafe configuration stay errors there too.
 
+The placeholder also records why it was chosen, as `reason`: `"unset"` (the
+default), `"malformed"` when a setting is present but invalid, such as
+`PRODUCT_AUTH_TOKENS_JSON` that isn't a JSON object of valid tokens and
+principals, or `"reused"` when the operator token is also a product token. The
+finding carries it in `parameters.reason`. Only an unset placeholder is
+information in a plain `cayu check`; a malformed or reused setting is an error in
+every check, so a typo shows up before deploy. The finding names the setting and
+what is wrong with it, never its value.
+
 ## public-service-operator-access-unsafe
 
 `PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE` means the separately mounted `/cayu/`
@@ -476,7 +485,8 @@ production authentication is missing or invalid. Configure
 `AuthenticatedAccess` for production. Dashboard authentication protects the raw
 Developer dashboard; it does not make that surface customer-facing or tenant-scoped.
 `PlaceholderOperatorAccess(settings=(...))` names the settings a deployment provides,
-and a placeholder is information outside `--deploy`, as for the product API above.
+and an unset placeholder is information outside `--deploy`, as for the product API
+above. A malformed or reused operator token stays an error.
 `OpenAccess` stays an error in every check.
 
 ## public-service-identity-store-not-durable

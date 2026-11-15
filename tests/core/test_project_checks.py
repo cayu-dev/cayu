@@ -260,6 +260,73 @@ def test_placeholder_access_is_a_deploy_error_and_local_information() -> None:
     assert local.service_evidence.configuration == "unsupported"
 
 
+@pytest.mark.parametrize(
+    ("overrides", "code", "setting", "reason", "problem"),
+    [
+        (
+            {"product_access_reason": "malformed"},
+            "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+            "PRODUCT_AUTH_TOKENS_JSON",
+            "malformed",
+            "PRODUCT_AUTH_TOKENS_JSON is set but malformed.",
+        ),
+        (
+            {"operator_access_reason": "malformed"},
+            "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+            "CAYU_OPERATOR_BEARER_TOKEN",
+            "malformed",
+            "CAYU_OPERATOR_BEARER_TOKEN is set but malformed.",
+        ),
+        (
+            {"operator_access_reason": "reused"},
+            "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+            "CAYU_OPERATOR_BEARER_TOKEN",
+            "reused",
+            "CAYU_OPERATOR_BEARER_TOKEN reuses a credential another access policy",
+        ),
+    ],
+)
+def test_malformed_or_reused_placeholder_settings_fail_every_check(
+    overrides: dict[str, object], code: str, setting: str, reason: str, problem: str
+) -> None:
+    manifest = CayuApp(enable_logging=False).describe()
+    service = _placeholder_service(**overrides)
+
+    for deploy_only in (False, True):
+        report = check_manifest(manifest, service_manifest=service, deploy_only=deploy_only)
+        by_code = {item.code: item for item in report.diagnostics}
+        finding = by_code[code]
+        assert finding.severity == "error"
+        assert finding.parameters["reason"] == reason
+        assert finding.parameters["settings"] == (setting,)
+        assert problem in finding.message
+        assert "deploy" in finding.tags
+        # The other access policy is still an unset placeholder.
+        other = next(
+            item
+            for item in report.diagnostics
+            if item.subject == "public_service" and item.code != code
+        )
+        assert other.parameters["reason"] == "unset"
+        assert other.severity == ("error" if deploy_only else "info")
+
+    assert code in {item.code for item in check_public_service_deployment(service)}
+
+
+def test_placeholder_reason_needs_a_placeholder() -> None:
+    assert _placeholder_service().product_access_reason is None
+    with pytest.raises(ValidationError):
+        _placeholder_service(
+            product_access="development",
+            product_access_settings=(),
+            product_access_reason="malformed",
+        )
+    with pytest.raises(ValidationError):
+        _placeholder_service(operator_access="authenticated", operator_access_reason="reused")
+    with pytest.raises(ValidationError):
+        _placeholder_service(product_access_reason="mistyped")
+
+
 def test_local_check_still_fails_open_or_development_access() -> None:
     manifest = CayuApp(enable_logging=False).describe()
     service = _placeholder_service(

@@ -2188,13 +2188,12 @@ def test_scaffolded_service_replacement_recovery_uses_profiled_admission(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH")
-@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="needs a virtual environment")
-def test_fresh_service_project_passes_its_documented_check_as_written(
+def _run_documented_service_check(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The check README, AGENTS.md and `cayu new` give passes with no settings."""
+    settings: dict[str, str],
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    """Run a fresh service project's documented check as written, with *settings*."""
 
     from cayu.cli.scaffold_plan import normalize_application_plan
 
@@ -2218,6 +2217,7 @@ def test_fresh_service_project_passes_its_documented_check_as_written(
         if name not in {"PRODUCT_AUTH_TOKENS_JSON", "CAYU_OPERATOR_BEARER_TOKEN"}
         and not name.startswith(("CAYU_", "UV_", "VIRTUAL_ENV"))
     }
+    environment.update(settings)
     result = subprocess.run(
         shlex.split(documented),
         cwd=project,
@@ -2227,9 +2227,78 @@ def test_fresh_service_project_passes_its_documented_check_as_written(
         text=True,
         timeout=600,
     )
+    return result, json.loads(result.stdout)
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH")
+@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="needs a virtual environment")
+def test_fresh_service_project_passes_its_documented_check_as_written(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The check README, AGENTS.md and `cayu new` give passes with no settings."""
+
+    result, report = _run_documented_service_check(tmp_path, capsys, {})
     assert result.returncode == 0, result.stdout + result.stderr
-    report = json.loads(result.stdout)
     assert {item["severity"] for item in report["diagnostics"]} <= {"info"}
+    assert {item["parameters"]["reason"] for item in report["diagnostics"]} == {"unset"}
+
+
+_VALID_PRODUCT_TOKENS = '{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}'
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH")
+@pytest.mark.skipif(sys.prefix == sys.base_prefix, reason="needs a virtual environment")
+@pytest.mark.parametrize(
+    ("settings", "code", "setting", "reason"),
+    [
+        (
+            {"PRODUCT_AUTH_TOKENS_JSON": "{not-json-secret"},
+            "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+            "PRODUCT_AUTH_TOKENS_JSON",
+            "malformed",
+        ),
+        (
+            {
+                "PRODUCT_AUTH_TOKENS_JSON": _VALID_PRODUCT_TOKENS,
+                "CAYU_OPERATOR_BEARER_TOKEN": "øperator-secret",
+            },
+            "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+            "CAYU_OPERATOR_BEARER_TOKEN",
+            "malformed",
+        ),
+        (
+            {
+                "PRODUCT_AUTH_TOKENS_JSON": _VALID_PRODUCT_TOKENS,
+                "CAYU_OPERATOR_BEARER_TOKEN": "customer-token",
+            },
+            "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+            "CAYU_OPERATOR_BEARER_TOKEN",
+            "reused",
+        ),
+    ],
+    ids=["malformed-product-tokens", "malformed-operator-token", "reused-operator-token"],
+)
+def test_fresh_service_documented_check_fails_on_a_malformed_or_reused_setting(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    settings: dict[str, str],
+    code: str,
+    setting: str,
+    reason: str,
+) -> None:
+    """A setting that is present but wrong fails the documented check, not just deploy."""
+
+    result, report = _run_documented_service_check(tmp_path, capsys, settings)
+    assert result.returncode == 1, result.stdout + result.stderr
+    findings = {item["code"]: item for item in report["diagnostics"]}
+    finding = findings[code]
+    assert finding["severity"] == "error"
+    assert finding["parameters"]["reason"] == reason
+    assert finding["parameters"]["settings"] == [setting]
+    assert setting in finding["message"]
+    for value in settings.values():
+        assert value not in result.stdout + result.stderr
 
 
 def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_auth(
@@ -2237,6 +2306,18 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     monkeypatch,
     capsys,
 ) -> None:
+    def assert_local_check_names(code: str, setting: str, reason: str) -> None:
+        # A present but wrong setting fails the plain check too, naming the setting
+        # and the reason but never the value.
+        assert main(["check", "--fail-on", "warning", "--json"]) == 1
+        output = capsys.readouterr().out
+        local = json.loads(output)
+        finding = next(item for item in local["diagnostics"] if item["code"] == code)
+        assert finding["severity"] == "error"
+        assert finding["parameters"]["reason"] == reason
+        assert setting in finding["message"]
+        assert os.environ[setting] not in output
+
     assert main(["new", "service", "--preset", "service", "--dir", str(tmp_path)]) == 0
     project = tmp_path / "service"
     capsys.readouterr()
@@ -2278,6 +2359,9 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     assert [item["code"] for item in invalid_principal["diagnostics"]] == [
         "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"
     ]
+    assert_local_check_names(
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE", "PRODUCT_AUTH_TOKENS_JSON", "malformed"
+    )
 
     monkeypatch.setenv(
         "PRODUCT_AUTH_TOKENS_JSON",
@@ -2288,6 +2372,9 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     assert [item["code"] for item in invalid_product_token["diagnostics"]] == [
         "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"
     ]
+    assert_local_check_names(
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE", "PRODUCT_AUTH_TOKENS_JSON", "malformed"
+    )
 
     monkeypatch.setenv(
         "PRODUCT_AUTH_TOKENS_JSON",
@@ -2299,6 +2386,9 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     assert [item["code"] for item in invalid_operator_token["diagnostics"]] == [
         "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE"
     ]
+    assert_local_check_names(
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "CAYU_OPERATOR_BEARER_TOKEN", "malformed"
+    )
 
     monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "customer-token")
     assert main(["check", "--deploy", "--json"]) == 1
@@ -2306,6 +2396,10 @@ def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_au
     assert [item["code"] for item in overlapping["diagnostics"]] == [
         "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE"
     ]
+    assert overlapping["diagnostics"][0]["parameters"]["reason"] == "reused"
+    assert_local_check_names(
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE", "CAYU_OPERATOR_BEARER_TOKEN", "reused"
+    )
 
     monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "operator-token")
     assert main(["check", "--deploy", "--fail-on", "warning", "--json"]) == 0

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from cayu.agents import AgentAuthoringState
 from cayu.runtime.manifest import AppManifest, FrozenJsonObject, ToolManifest
 from cayu.runtime.service_manifest import (
+    PlaceholderReason,
     PublicServiceManifest,
     RuntimeStoreDurability,
     ServiceMode,
@@ -832,6 +833,32 @@ def _settings_sentence(settings: tuple[str, ...]) -> str:
     return f"Its authentication is configured by {names}, which {verb} not usable here."
 
 
+def _invalid_setting_sentence(
+    settings: tuple[str, ...], reason: PlaceholderReason
+) -> tuple[str, str]:
+    """What is wrong with a present setting, and how to fix it, without its value."""
+
+    names = " and ".join(settings)
+    verb = "is" if len(settings) == 1 else "are"
+    if reason == "reused":
+        subject = names or "Its authentication setting"
+        return (
+            f"{subject} reuses a credential another access policy already accepts, "
+            "and one credential must not open both.",
+            f"Give {names or 'that setting'} a value of its own that no other access "
+            "policy accepts.",
+        )
+    if settings:
+        return (
+            f"{names} {verb} set but malformed.",
+            f"Correct {names} where it is set; the finding does not show its value.",
+        )
+    return (
+        "A setting that configures its authentication is set but malformed.",
+        "Correct the setting that configures this access policy.",
+    )
+
+
 def _placeholder_access_diagnostic(
     *,
     code: str,
@@ -839,23 +866,33 @@ def _placeholder_access_diagnostic(
     surface: str,
     unsafe_message: str,
     settings: tuple[str, ...],
+    reason: PlaceholderReason | None,
     hint: str,
     deploy: bool,
     verification: str,
 ) -> ProjectDiagnostic:
-    """A fail-closed placeholder: a deploy error, or local information outside `--deploy`.
+    """A fail-closed placeholder, reported by why the factory chose it.
 
-    A placeholder is what a maintained factory builds when the settings that
-    configure production authentication are not set, as on a fresh local checkout.
-    `cayu serve` and `cayu check --deploy` still refuse it.
+    A placeholder whose settings are unset is what a fresh local checkout builds:
+    a deploy error, or information outside `--deploy`. `cayu serve` and
+    `cayu check --deploy` still refuse it. A placeholder chosen because a setting
+    is present but malformed, or reuses another policy's credential, is an error in
+    every check, so a typo is caught before deploy.
     """
 
     anchor = code.lower().replace("_", "-")
+    reason = reason or "unset"
     named = f" {_settings_sentence(settings)}" if settings else ""
-    if deploy:
+    if reason != "unset":
+        problem, fix = _invalid_setting_sentence(settings, reason)
+        message = f"{surface} stays closed because its authentication setting is invalid. {problem}"
+        severity = DiagnosticSeverity.ERROR
+        tags: tuple[str, ...] = ("deploy", "configuration", "security")
+        full_hint = f"{fix} To authenticate another way: {hint}"
+    elif deploy:
         message = f"{unsafe_message}{named}"
         severity = DiagnosticSeverity.ERROR
-        tags: tuple[str, ...] = ("deploy", "security")
+        tags = ("deploy", "security")
         full_hint = (
             f"Set {' and '.join(settings)} to a valid value in the deployment's environment, "
             f"usually as a secret. To authenticate another way: {hint}"
@@ -882,7 +919,12 @@ def _placeholder_access_diagnostic(
         message=message,
         hint=full_hint,
         tags=tags,
-        parameters={"configured": "placeholder", "settings": list(settings), "deploy": deploy},
+        parameters={
+            "configured": "placeholder",
+            "settings": list(settings),
+            "reason": reason,
+            "deploy": deploy,
+        },
         documentation_anchor=f"cayu guide diagnostics#{anchor}",
         verification_command=verification,
     )
@@ -891,11 +933,12 @@ def _placeholder_access_diagnostic(
 def _check_public_service(
     manifest: PublicServiceManifest, *, deploy: bool = True
 ) -> list[ProjectDiagnostic]:
-    """Findings for a maintained service; *deploy* False lets local placeholders through.
+    """Findings for a maintained service; *deploy* False lets unset placeholders through.
 
-    A fail-closed placeholder access policy is what a fresh checkout without its
-    authentication settings builds. Outside `cayu check --deploy` it is reported as
-    information; every other finding, and every finding with *deploy*, is unchanged.
+    A fail-closed placeholder access policy whose settings are unset is what a fresh
+    checkout builds. Outside `cayu check --deploy` it is reported as information. A
+    placeholder chosen because a setting is malformed or reused, every other finding,
+    and every finding with *deploy*, stays an error.
     """
 
     if not isinstance(manifest, PublicServiceManifest):
@@ -926,6 +969,7 @@ def _check_public_service(
                     "The product API does not use configured production authentication."
                 ),
                 settings=manifest.product_access_settings,
+                reason=manifest.product_access_reason,
                 hint="Configure AuthenticatedProductAccess with trusted tenant resolution.",
                 deploy=deploy,
                 verification=verification,
@@ -954,6 +998,7 @@ def _check_public_service(
                 surface="The Cayu Developer dashboard",
                 unsafe_message="The Cayu Developer dashboard is not authenticated.",
                 settings=manifest.operator_access_settings,
+                reason=manifest.operator_access_reason,
                 hint="Configure AuthenticatedAccess as the separate operator_access policy.",
                 deploy=deploy,
                 verification=verification,

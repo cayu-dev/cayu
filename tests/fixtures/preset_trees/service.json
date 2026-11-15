@@ -70,7 +70,7 @@
     "operations/RECOVERY.md": "e696ba2d948898e7ca562cbff236d8d72380f2b666e99e6b299908b8ab613262",
     "evals/CAPABILITY.md": "6c6fb9a6b68576372eae80f18a57519c7cf3da57db3f4f668d639f20204e15d4",
     "observability/CAPABILITY.md": "19cfb82dd66198521a28242b3946386d8af2d08438a05a549b6e53b9400b91d7",
-    "service.py": "e14b579905d09922926cad1008f24a5559327fad747bb2cc5759b9926ed41421",
+    "service.py": "c6014a2d773fe480559a48e479fbf5728ddda0ee2750b3242cdda6373612fe2d",
     "tests/test_public_service_security.py": "754e4bd5015e2aaae8ccddcf084b37e58a40f8ed9b234f50937ac1cb0d0f9a68",
     "cayu-objectives.toml": "21d1ff3185bebdcb45c4a0986d136357f50147891684b0ccbd7e28a8a59420ca",
     ".github/workflows/ci.yml": "304e1c0d171a4e2ecb70c27432af7de8450c2f86c516975b673cf0ccf753c08c"
