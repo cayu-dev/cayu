@@ -3,7 +3,9 @@
 Cayu Cloud starts a public service's web process with `cayu serve`, which refuses to
 start a production service while `check_public_service_deployment` reports anything.
 This runs the same `cayu check --deploy` report locally, through the check library, so
-that refusal shows up before the upload instead of as a web process that exits 1.
+that refusal shows up before the upload instead of as a web process that exits 1. It
+also runs `cayu check --deploy`'s `[worker]` check, so a `cayu worker` command that
+would refuse to start is caught here too.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from cayu.cli._serve_readiness import (
     server_extra_state,
 )
 from cayu.cli._targets import TargetResolutionError, load_target
+from cayu.cli._worker_process_check import is_cayu_worker_command, worker_command_findings
 from cayu.cli.check import check_project, serve_identity_proxy_findings
 from cayu.cli.project import (
     ProjectError,
@@ -59,6 +62,13 @@ DEPLOY_CHECK_ENVIRONMENT_HINT = (
     "The check uses this shell's environment. If access or storage is configured through "
     "Cayu Cloud environment variables or secrets, set the same variables here for the "
     f"check, or pass {SKIP_DEPLOY_CHECK_FLAG}."
+)
+
+DEPLOY_CHECK_WORKER_ENVIRONMENT_HINT = (
+    "The worker check reads only the [env] table of cayu-cloud.toml, not this shell or Cayu "
+    "Cloud environment variables and secrets. If the worker's process count is set on Cloud "
+    "(for example CAYU_WORKER_PROCESSES with `cayu cloud env set`), set it in [env] or in "
+    f"the [worker] command instead, or pass {SKIP_DEPLOY_CHECK_FLAG}."
 )
 
 _AUTH_PATH = "pyproject.toml:[tool.cayu.serve].auth"
@@ -107,8 +117,10 @@ def run_cloud_deploy_check(
     serves_web: bool,
     web_command: str | None = None,
     boot_service: bool = True,
+    worker_command: str | None = None,
+    worker_environment: Mapping[str, str] | None = None,
 ) -> CloudDeployCheck:
-    """Check locally that the web process Cayu Cloud starts can start.
+    """Check locally that the web and worker processes Cayu Cloud starts can start.
 
     When the web command is `cayu serve`, the project must declare `cayu[server]`
     or an extra that includes it (in `pyproject.toml` and, when present, `uv.lock`).
@@ -128,9 +140,44 @@ def run_cloud_deploy_check(
     ``boot_service=False`` leaves that boot out, for a check that must write nothing: booting
     opens the project's stores, which can create them. A public service is then `skipped`
     once the file checks pass, with the command that runs the rest.
+
+    When ``worker_command`` is a `cayu worker` command, it gets `cayu check --deploy`'s
+    worker check (`WORKER_SINGLE_PROCESS_REQUIRED`, `WORKER_COMMAND_INVALID`) with
+    ``worker_environment``, the manifest's `[env]`. That check reads files only, so it
+    runs whatever ``boot_service`` says, and its findings are blocking.
     """
 
     root = root.resolve()
+    web = _web_check(
+        root, serves_web=serves_web, web_command=web_command, boot_service=boot_service
+    )
+    if not is_cayu_worker_command(worker_command) or not _is_own_project(root):
+        return web
+    assert worker_command is not None
+    worker = worker_command_findings(root, worker_command, worker_environment or {})
+    if worker:
+        return CloudDeployCheck(status="failed", blocking=web.blocking + worker)
+    if web.status == "not_applicable":
+        return CloudDeployCheck(status="passed")
+    return web
+
+
+def _is_own_project(root: Path) -> bool:
+    """Whether ``root`` holds a Cayu project of its own, or one that can't be read, which
+    `cayu worker` would refuse. A parent directory's project isn't uploaded with it."""
+
+    try:
+        configuration = discover_cayu_project_configuration(
+            discovery_keys=("workers", "factory"), start=root
+        )
+    except ProjectError:
+        return True
+    return configuration is not None and configuration.root == root
+
+
+def _web_check(
+    root: Path, *, serves_web: bool, web_command: str | None, boot_service: bool
+) -> CloudDeployCheck:
     if not serves_web:
         return CloudDeployCheck(status="not_applicable")
     try:
@@ -502,13 +549,17 @@ def _serve_diagnostic(code: str, *, path: str, message: str, hint: str) -> Proje
 def deploy_check_refusal(check: CloudDeployCheck) -> str:
     """The refusal `cayu cloud deploy` reports for a failed check."""
 
-    serve = [item for item in check.blocking if item.code.startswith("SERVE_")]
-    service = [item for item in check.blocking if not item.code.startswith("SERVE_")]
+    serve, worker, service = _split_blocking(check)
     reasons: list[str] = []
     if serve:
         reasons.append(
             "its `cayu serve` web process could not start: "
             + " ".join(f"{item.message} {item.hint}" for item in serve)
+        )
+    if worker:
+        reasons.append(
+            "its `cayu worker` process could not start: "
+            + " ".join(f"{item.message} {item.hint}" for item in worker)
         )
     if service:
         reasons.append(
@@ -523,12 +574,42 @@ def deploy_check_refusal(check: CloudDeployCheck) -> str:
     )
 
 
+def _split_blocking(
+    check: CloudDeployCheck,
+) -> tuple[list[ProjectDiagnostic], list[ProjectDiagnostic], list[ProjectDiagnostic]]:
+    """The blocking findings for the web command, the worker command and the service."""
+
+    serve: list[ProjectDiagnostic] = []
+    worker: list[ProjectDiagnostic] = []
+    service: list[ProjectDiagnostic] = []
+    for item in check.blocking:
+        if item.code.startswith("SERVE_"):
+            serve.append(item)
+        elif item.code.startswith("WORKER_"):
+            worker.append(item)
+        else:
+            service.append(item)
+    return serve, worker, service
+
+
+def deploy_check_hint(check: CloudDeployCheck) -> str:
+    """Where the failed check's findings looked for the environment, and how to change it."""
+
+    serve, worker, service = _split_blocking(check)
+    hints = []
+    if serve or service or not worker:
+        hints.append(DEPLOY_CHECK_ENVIRONMENT_HINT)
+    if worker:
+        hints.append(DEPLOY_CHECK_WORKER_ENVIRONMENT_HINT)
+    return " ".join(hints)
+
+
 def init_deploy_check_notice(check: CloudDeployCheck) -> str | None:
     """What `cayu cloud init` tells the author about the deploy check, if anything."""
 
     if check.status == "failed":
-        serve = [item for item in check.blocking if item.code.startswith("SERVE_")]
-        service = [item for item in check.blocking if not item.code.startswith("SERVE_")]
+        # Plain `cayu cloud init` doesn't run the worker check, so there are no worker findings.
+        serve, _, service = _split_blocking(check)
         parts: list[str] = []
         if serve:
             parts.append(

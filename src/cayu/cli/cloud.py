@@ -1959,6 +1959,8 @@ def _check_manifest(arguments: argparse.Namespace) -> dict[str, Any]:
         serves_web=manifest.web is not None,
         web_command=None if manifest.web is None else manifest.web.command,
         boot_service=False,
+        worker_command=None if manifest.worker is None else manifest.worker.command,
+        worker_environment=manifest.runtime_environment,
     )
     if check.status != "not_applicable":
         result["deploy_check"] = check.public_dict()
@@ -3123,18 +3125,24 @@ def _deploy_check(project: ResolvedCloudProject, *, skip: bool) -> dict[str, Any
         # A repository source is built from its remote revision, not this checkout.
         return None
     from cayu.cli._cloud_deploy_check import (
-        DEPLOY_CHECK_ENVIRONMENT_HINT,
+        deploy_check_hint,
         deploy_check_refusal,
         run_cloud_deploy_check,
     )
+    from cayu.cli._worker_process_check import is_cayu_worker_command
 
-    serves_web = project.manifest.web is not None
+    manifest = project.manifest
+    serves_web = manifest.web is not None
+    worker_command = None if manifest.worker is None else manifest.worker.command
     if skip:
-        return {"status": "skipped"} if serves_web else None
+        checks_worker = is_cayu_worker_command(worker_command)
+        return {"status": "skipped"} if serves_web or checks_worker else None
     check = run_cloud_deploy_check(
         project.root,
         serves_web=serves_web,
-        web_command=project.manifest.web.command if project.manifest.web is not None else None,
+        web_command=manifest.web.command if manifest.web is not None else None,
+        worker_command=worker_command,
+        worker_environment=manifest.runtime_environment,
     )
     if check.status == "not_applicable":
         return None
@@ -3143,7 +3151,7 @@ def _deploy_check(project: ResolvedCloudProject, *, skip: bool) -> dict[str, Any
             deploy_check_refusal(check),
             details={
                 "deploy_check": check.public_dict(),
-                "hint": DEPLOY_CHECK_ENVIRONMENT_HINT,
+                "hint": deploy_check_hint(check),
             },
         )
     return check.public_dict()

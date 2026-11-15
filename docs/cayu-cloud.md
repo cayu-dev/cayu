@@ -2089,8 +2089,9 @@ booted there, for example because its dependencies aren't installed, the deploy 
 with `result.deploy_check.status` `unavailable` and the reason, since Cloud builds the
 release in its own environment. Source diagnostics that prevent safely importing the
 service also report `unavailable`, never `passed`. Other source findings, such as a
-missing README, do not suppress the service safety checks. Repository sources and projects
-without a public service or a `[web]` process are not checked.
+missing README, do not suppress the service safety checks. Repository sources are not
+checked, and neither are projects without a public service, a `[web]` process or a
+`cayu worker` `[worker]` command.
 
 When the manifest's web command is `cayu serve`, the deploy also checks that
 `cayu serve` can start outside `--dev`, for any project, not only a public service.
@@ -2147,7 +2148,15 @@ exit at startup and keep restarting. Add `--processes 1` to the command or set
 for a command `cayu worker` would refuse, such as an undeclared worker name. The check
 reads the entrypoint's source without importing it; see
 `cayu guide diagnostics#worker-single-process-required` for what it sees.
-`cayu cloud deploy`'s own check doesn't run these yet.
+
+`cayu cloud deploy` and `cayu cloud init --check` run the same worker check before
+uploading anything, with the same codes and hints, for worker-only Agents too. Either
+error refuses the deploy with `deploy_check_failed`, the findings under
+`deploy_check.blocking`, and "Nothing was uploaded"; `--skip-deploy-check` uploads
+anyway. Like `cayu check --deploy`, it reads only `[env]` from the manifest, not this
+shell or Cloud environment variables and secrets, and the refusal's `hint` says so: a
+count set with `cayu cloud env set CAYU_WORKER_PROCESSES=1` isn't seen, so set it in
+`[env]` or the `[worker]` command instead.
 
 ## Agent environment variables
 
