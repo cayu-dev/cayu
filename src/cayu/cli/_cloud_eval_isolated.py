@@ -82,6 +82,8 @@ def run_isolated(
         "idempotency_key": operation_id,
         "max_concurrency": arguments.max_concurrency,
     }
+    if arguments.max_parallel_trials is not None:
+        body["max_parallel_trials"] = arguments.max_parallel_trials
     environment = {
         name: value
         for name, value in (("database", arguments.database), ("isolation", arguments.isolation))
@@ -95,6 +97,10 @@ def run_isolated(
         "cases": suite.case_count,
         "trials_per_case": suite.trials,
         "allocations": arguments.trials,
+        # A run sharing one database runs its allocations one at a time, whatever it asks.
+        "parallel_allocations": 1
+        if arguments.isolation == "run"
+        else min(arguments.max_parallel_trials or 1, arguments.trials),
         "total_trials": suite.case_count * suite.trials * arguments.trials,
         "max_concurrency": arguments.max_concurrency,
         "timeout_seconds_per_trial": suite.timeout_seconds,
@@ -395,6 +401,7 @@ def _continuation(
         *("--trials", str(arguments.trials), "--max-concurrency", str(arguments.max_concurrency)),
     ]
     for option, value in (
+        ("--max-parallel-trials", arguments.max_parallel_trials),
         ("--target", arguments.target),
         ("--database", arguments.database),
         ("--isolation", arguments.isolation),
@@ -421,6 +428,12 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
         else "an eval database where the install gives one"
     )
     isolation = environment.get("isolation") or "trial"
+    parallel = bound.get("parallel_allocations") or 1
+    at_once = (
+        ""
+        if parallel == 1
+        else f" Up to {parallel} allocations run at once, as far as the install allows."
+    )
     return "\n".join(
         [
             f"Isolated evaluation of Release {bound['release_id']}, suite {bound['suite_id']}: "
@@ -429,9 +442,93 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
             f"{count(bound['total_trials'], 'trial')}, at most {bound['max_concurrency']} "
             "running at a time in each allocation.",
             f"Each trial: {bound['timeout_seconds_per_trial']}s. Each allocation gets {where} "
-            f"(isolation {isolation}); nothing reaches the live Agent's stores.",
+            f"(isolation {isolation}); nothing reaches the live Agent's stores.{at_once}",
         ]
     )
+
+
+def environment_show(
+    client: CloudApiClient, application_id: str, *, release_id: str | None
+) -> dict[str, Any]:
+    """What an isolated evaluation of the Release (default: the Agent's selected one) would
+    get, from Cloud's evaluation catalog: names and limits, never a value."""
+
+    query = {} if release_id is None else {"release_id": release_id}
+    catalog = client.request(
+        "GET",
+        f"/v1/applications/{quote(application_id, safe='')}/evaluation-catalog",
+        query=query,
+    )
+    execution = catalog.get("execution")
+    return {
+        "release_id": catalog.get("release_id"),
+        "version": catalog.get("version"),
+        "selected": catalog.get("selected"),
+        "eval_targets": list(catalog.get("eval_targets") or []),
+        # None from a Cloud that doesn't report it yet.
+        "environment": catalog.get("environment"),
+        "execution": execution if isinstance(execution, dict) else None,
+        "model_access_problem": catalog.get("model_access_problem"),
+    }
+
+
+def _names(items: Sequence[object]) -> str:
+    return ", ".join(_text(item) for item in items) or "none"
+
+
+def render_environment(result: Mapping[str, Any]) -> str:
+    lines = [
+        f"Release {_text(result['release_id'])} (version {_text(result['version'])}"
+        + (", selected)" if result.get("selected") else ")")
+    ]
+    execution = result.get("execution") or {}
+    if execution.get("available") is False:
+        lines.append(f"Isolated runs unavailable: {_text(execution.get('reason'))}")
+    targets = _names(result["eval_targets"])
+    environment = result.get("environment")
+    if not isinstance(environment, dict):
+        lines.append(
+            f"This Cayu Cloud doesn't describe its eval environments yet. Eval targets: {targets}."
+        )
+        return "\n".join(lines)
+    seed = environment.get("seed")
+    variables = [
+        str(item.get("name")) + (" (secret)" if item.get("secret") else "")
+        for item in environment.get("eval_only_variables") or []
+        if isinstance(item, dict)
+    ]
+    limits = environment.get("limits") or {}
+    lines += [
+        f"Eval targets: {targets}"
+        + (
+            f" (default {_text(environment['default_eval_target'])})"
+            if environment.get("default_eval_target")
+            else ""
+        ),
+        "Database: "
+        + (
+            "its own PostgreSQL database for each allocation by default"
+            if environment.get("database") == "postgres"
+            else "none (this install gives no eval databases)"
+            if not environment.get("databases_available")
+            else "none by default"
+        ),
+        "Seed: "
+        + (
+            f"{_text(seed.get('target'))}, up to {_text(seed.get('timeout_seconds'))}s"
+            if isinstance(seed, dict)
+            else _text(environment.get("seed_problem") or "none declared")
+        ),
+        "Fixtures: " + _names(environment.get("fixtures") or []),
+        "Eval-only variables: " + _names(variables),
+        "Model keys brokered to trials: " + _names(environment.get("brokered_credentials") or []),
+        f"Limits: {_text(limits.get('max_trials'))} trials, "
+        f"{_text(limits.get('max_parallel_trials'))} at once, "
+        f"concurrency {_text(limits.get('max_concurrency'))} in each.",
+    ]
+    if result.get("model_access_problem"):
+        lines.append(_text(result["model_access_problem"]))
+    return "\n".join(lines)
 
 
 def count(number: object, noun: str) -> str:

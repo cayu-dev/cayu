@@ -1805,6 +1805,7 @@ cayu cloud eval run --application my-agent --corpus evals.json --suite refund-re
 cayu cloud eval runs list --application my-agent
 cayu cloud eval runs show --application my-agent evl_...
 cayu cloud eval runs cancel --application my-agent evl_...
+cayu cloud eval environment show --application my-agent
 ```
 
 ### Isolated eval runs
@@ -1836,13 +1837,24 @@ fixtures = ["demo-data/"]            # files only evaluations get, never the dep
 
 A seed that fails fails the evaluation as `seed_failed` before any case runs.
 
+`--max-parallel-trials N` lets up to N of the `--trials` allocations run at once (default 1),
+as far as the installation allows; the next ones start when those end, and a failed one ends
+the run once the others running beside it have. A run that shares one database
+(`--isolation run`) still runs its allocations one at a time.
+
+`eval environment show` says what an isolated run of the selected Release, or
+`--release RELEASE`, would get: its eval targets and the default one, the database each
+allocation gets, the declared seed and fixtures, the Agent's eval-only variables (names and
+whether secret, never a value), the model keys brokered to its trials, and the installation's
+limits. A Cayu Cloud that doesn't describe it yet answers with the eval targets alone.
+
 The command waits for the evaluation, prints its cases' outcomes, and with `--output FILE`
 writes its receipt: case ids, outcomes and counts, never outputs or reference answers. An
 evaluation that fails or is cancelled exits `2` with `eval_run_failed` (and its failure code
 and message) or `eval_run_cancelled`; one still running at `--wait-seconds` exits `2` with
 `eval_run_still_running` and its `runs show` and `runs cancel` commands. `--no-wait` returns
 once it is started. `--max-cost`, `--currency` and `--execution-profile-revision` are live
-only.
+only; `--max-parallel-trials` is isolated only.
 
 `runs list` lists the Agent's isolated evaluations, newest first; `runs show` and `runs cancel`
 take an isolated run's id (`evl_...`), and any other id as the live Agent's own run.

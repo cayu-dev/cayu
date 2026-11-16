@@ -42,6 +42,15 @@ class _EvaluationsCloud:
         self.polls = polls
         self.evaluations: dict[str, dict[str, Any]] = {}
         self.keys: dict[str, str] = {}
+        self.catalog_queries: list[dict[str, str]] = []
+        self.catalog: dict[str, Any] = {
+            "release_id": _RELEASE,
+            "version": "2.1",
+            "selected": True,
+            "eval_targets": ["evals.agent:build_eval"],
+            "model_access_problem": None,
+            "execution": {"available": True, "reason": None},
+        }
 
     def request(
         self,
@@ -76,6 +85,9 @@ class _EvaluationsCloud:
                     "_polls": 0,
                 }
             return self._public(self.keys[key])
+        if path == f"{base}/evaluation-catalog" and method == "GET":
+            self.catalog_queries.append(dict(query or {}))
+            return self.catalog
         if path == f"{base}/evaluations" and method == "GET":
             return {
                 "items": [self._public(item) for item in reversed(self.evaluations)],
@@ -179,22 +191,27 @@ def test_a_runs_options_reach_its_request_and_its_continuation_repeats_it(
     options = (
         *("--release", "dep_candidate", "--target", "evals.agent:build_eval"),
         *("--trials", "3", "--max-concurrency", "4", "--isolation", "run"),
-        *("--database", "postgres", "--no-wait"),
+        *("--database", "postgres", "--max-parallel-trials", "2", "--no-wait"),
     )
-    code, answer, _ = _eval(capsys, *_run(tmp_path, *options))
+    code, answer, progress = _eval(capsys, *_run(tmp_path, *options))
 
     assert code == 0, answer
     result = answer["result"]
     assert result["run"]["status"] == "queued" and result["summary"] is None
+    # A run sharing one database runs its allocations one at a time, whatever it asks.
+    assert "run at once" not in progress
     (body,) = cloud.submitted
     assert body["release_id"] == "dep_candidate"
     assert body["suite"]["eval_target"] == "evals.agent:build_eval"
-    assert (body["trials"], body["max_concurrency"]) == (3, 4)
+    assert (body["trials"], body["max_concurrency"], body["max_parallel_trials"]) == (3, 4, 2)
     assert body["environment"] == {"database": "postgres", "isolation": "run"}
     # The continuation repeats the same request under the same key: nothing new starts.
     again = shlex.split(result["commands"]["continue"])
     assert again[:3] == ["cayu", "cloud", "eval"]
-    for option in ("--release", "--target", "--trials", "--isolation", "--database"):
+    for option in (
+        *("--release", "--target", "--trials", "--isolation", "--database"),
+        "--max-parallel-trials",
+    ):
         assert option in again
     code, repeated, _ = _eval(capsys, *again[3:], *_FAST)
     assert code == 0, repeated
@@ -212,6 +229,8 @@ def test_each_place_refuses_the_options_only_the_other_takes(
         (("--on", "live", "--release", "dep_x"), "--release"),
         (("--on", "live", "--trials", "2"), "--trials"),
         (("--on", "live", "--isolation", "run"), "--isolation"),
+        (("--on", "live", "--max-parallel-trials", "2"), "--max-parallel-trials"),
+        (("--max-parallel-trials", "11"), "--max-parallel-trials"),
     ):
         code, answer, _ = _eval(capsys, *_run(tmp_path, *extra))
         assert code == 2, answer
@@ -377,3 +396,63 @@ def test_a_status_filter_reads_further_pages_until_it_has_enough(
     assert [item["id"] for item in listed["result"]["items"]] == ["evl_1"]
     assert listed["result"]["has_more"] is False
     assert [query.get("cursor") for query in queries] == [None, "c1", "c2"]
+
+
+def test_a_run_without_parallel_trials_sends_none_and_says_so_when_asked(
+    tmp_path: Path, cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _eval(capsys, *_run(tmp_path, "--no-wait"))[0] == 0
+    assert "max_parallel_trials" not in cloud.submitted[-1]
+    code, _, progress = _eval(
+        capsys, *_run(tmp_path, "--trials", "4", "--max-parallel-trials", "3", "--no-wait")
+    )
+    assert code == 0
+    assert "Up to 3 allocations run at once" in progress
+
+
+_ENVIRONMENT = {
+    "default_eval_target": "evals.agent:build_eval",
+    "seed": {"target": "evals.seed:load_demo_book", "timeout_seconds": 120},
+    "seed_problem": None,
+    "fixtures": ["demo-data/"],
+    "database": "postgres",
+    "databases_available": True,
+    "eval_only_variables": [
+        {"name": "BROKER_KEY", "secret": True},
+        {"name": "STUB_URL", "secret": False},
+    ],
+    "brokered_credentials": ["OPENAI_API_KEY"],
+    "limits": {"max_trials": 10, "max_parallel_trials": 4, "max_concurrency": 64},
+}
+
+
+def test_environment_show_says_what_an_isolated_run_would_get(
+    cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud.catalog["environment"] = _ENVIRONMENT
+    code, answer, _ = _eval(
+        capsys, "environment", "show", "--application", _AGENT, "--release", "dep_candidate"
+    )
+
+    assert code == 0, answer
+    assert answer["operation"] == "eval.environment.show"
+    assert answer["result"]["environment"] == _ENVIRONMENT
+    assert cloud.catalog_queries == [{"release_id": "dep_candidate"}]
+    # Text names the variables, never a value, and says what each trial gets.
+    assert main(["cloud", "eval", "environment", "show", "--application", _AGENT]) == 0
+    text = capsys.readouterr().out
+    assert cloud.catalog_queries[-1] == {}
+    assert "Seed: evals.seed:load_demo_book, up to 120s" in text
+    assert "Eval-only variables: BROKER_KEY (secret), STUB_URL" in text
+    assert "Model keys brokered to trials: OPENAI_API_KEY" in text
+    assert "its own PostgreSQL database for each allocation" in text
+    assert not [item for item in cloud.requests if "/service" in item]
+
+
+def test_environment_show_on_a_cloud_that_doesnt_describe_it_yet(
+    cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["cloud", "eval", "environment", "show", "--application", _AGENT]) == 0
+    text = capsys.readouterr().out
+    assert "doesn't describe its eval environments yet" in text
+    assert "evals.agent:build_eval" in text

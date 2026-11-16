@@ -69,7 +69,7 @@ _LIVE_WARNING = (
 )
 # Options only one place takes.
 _LIVE_ONLY = ("max_cost", "currency", "execution_profile_revision")
-_ISOLATED_ONLY = ("release", "target", "database", "isolation")
+_ISOLATED_ONLY = ("release", "target", "database", "isolation", "max_parallel_trials")
 TERMINAL_RUN_STATUSES = frozenset(RUN_STATUSES[3:])
 # The Agent accepts up to 512 characters; the CLI's other operation IDs stop at 256.
 _OPERATION_ID_MAX_CHARS = 256
@@ -181,6 +181,16 @@ def add_eval_parser(
         ),
     )
     run.add_argument(
+        "--max-parallel-trials",
+        type=_positive_count,
+        metavar="N",
+        help=(
+            "Isolated only: how many of the --trials allocations run at once (default 1), at "
+            "most what the install allows. A run sharing one database (--isolation run) runs "
+            "them one at a time."
+        ),
+    )
+    run.add_argument(
         "--isolation",
         choices=("trial", "run"),
         help=(
@@ -265,6 +275,26 @@ def add_eval_parser(
     add_output_argument(run, render_run, failure=render_failure)
     # Before Cloud is asked anything: an option the run's place doesn't take is refused.
     run.set_defaults(_cloud_preflight=require_place_options)
+
+    environment = actions.add_parser(
+        "environment", description="Read what an Agent's isolated eval runs get."
+    )
+    environment_actions = environment.add_subparsers(dest="eval_environment_command", required=True)
+    environment_show = environment_actions.add_parser(
+        "show",
+        description=(
+            "Show what an isolated eval run of one of the Agent's Releases would get: its eval "
+            "targets, database, seed step, fixtures, eval-only variables (names only), the "
+            "model keys brokered to its trials, and the install's limits."
+        ),
+    )
+    _add_application_argument(environment_show)
+    environment_show.add_argument(
+        "--release",
+        metavar="RELEASE",
+        help="The Release to describe (default: the Agent's selected Release).",
+    )
+    add_output_argument(environment_show, render_environment, failure=render_failure)
 
     runs = actions.add_parser("runs", description="List, show or cancel an Agent's eval runs.")
     run_actions = runs.add_subparsers(dest="eval_runs_command", required=True)
@@ -380,6 +410,15 @@ def eval_command(
             monotonic=monotonic,
         )
     application_id = _application_id(client, arguments.application)
+    if action == "environment":
+        return {
+            "operation": "eval.environment.show",
+            "result": {
+                "schema_version": SCHEMA_VERSION,
+                "application_id": application_id,
+                **isolated.environment_show(client, application_id, release_id=arguments.release),
+            },
+        }
     if action == "runs":
         answer = _isolated_runs(client, application_id, arguments)
         if answer is not None:
@@ -605,6 +644,10 @@ def require_place_options(arguments: argparse.Namespace) -> None:
             )
         if arguments.trials > isolated.MAX_TRIALS:
             raise CloudEvalError("invalid_input", f"--trials is at most {isolated.MAX_TRIALS}.")
+        if (arguments.max_parallel_trials or 1) > isolated.MAX_TRIALS:
+            raise CloudEvalError(
+                "invalid_input", f"--max-parallel-trials is at most {isolated.MAX_TRIALS}."
+            )
         return
     given = [name for name in _ISOLATED_ONLY if getattr(arguments, name) is not None]
     if arguments.trials != 1:
@@ -1766,6 +1809,10 @@ def render_run_detail(answer: Mapping[str, Any]) -> str:
             )
         lines.append(line)
     return "\n".join(lines)
+
+
+def render_environment(answer: Mapping[str, Any]) -> str:
+    return isolated.render_environment(answer["result"])
 
 
 def render_cancel(answer: Mapping[str, Any]) -> str:
