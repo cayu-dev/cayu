@@ -2287,6 +2287,28 @@ If submission loses its response, the CLI reports `deployment_id` and
 --idempotency-key KEY`. Agent process health failures, on either smoke provider, and
 other nonretryable failures require repairing the source.
 
+
+### Eval-only values
+
+`--scope eval` keeps values only the Agent's [isolated eval runs](#isolated-eval-runs) get:
+a sandbox key for a service the suite calls, a test data token, a stub service's URL. Cayu
+Cloud keeps them apart from the Agent's own variables; its service never reads them, so a
+change restarts nothing.
+
+```console
+cayu cloud env set STUB_URL=https://stub.example.test --scope eval --application my-agent
+cayu cloud env set SANDBOX_KEY --secret --value-file key.txt --scope eval --application my-agent
+cayu cloud env list --scope eval --application my-agent
+cayu cloud env unset SANDBOX_KEY --scope eval --application my-agent
+```
+
+Each isolated run's allocations get them over the Agent's plain values, secrets included, as
+ordinary variables; a value named like one of the Agent's own secrets replaces it there, and
+the Agent's own secret never reaches the run. Model keys aren't eval-only values: the run's
+model calls use the Agent's own keys through Cloud's brokering. Several assignments are set one
+after another, not as one change. A Cayu Cloud installation may keep only plain eval-only values;
+it refuses a `--secret` with `evaluation_secrets_unsupported`.
+
 ## Organization API keys
 
 CI, Compass and other automated callers reach Cayu Cloud with an Organization API key instead

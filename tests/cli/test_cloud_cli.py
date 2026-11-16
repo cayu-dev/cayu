@@ -5082,3 +5082,110 @@ def test_an_older_cloud_says_it_doesnt_report_rollouts(
     # Doctor still answers, without the platform.
     assert main(["cloud", "doctor"]) == 0
     assert json.loads(capsys.readouterr().out)["result"]["platform"] is None
+
+
+def test_cloud_env_eval_scope_uses_the_eval_only_routes_and_keeps_secrets_out_of_argv(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, str, dict[str, object]]] = []
+
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            self.requests.append((method, path, kwargs))
+            if path == "/v1/applications":
+                return {"items": [{"id": "app_voice", "name": "Voice Agent"}]}
+            if method == "GET":
+                return {"items": [], "secrets_available": True}
+            if method == "DELETE":
+                return {"configuration": None, "removed": True}
+            name = path.rsplit("/", 1)[1]
+            payload = kwargs["payload"]
+            assert isinstance(payload, dict)
+            return {
+                "configuration": {
+                    "name": name,
+                    "scope": "eval",
+                    "secret": payload["secret"],
+                    "value": None if payload["secret"] else payload["value"],
+                }
+            }
+
+    value_file = tmp_path / "sandbox-key.txt"
+    value_file.write_text("sandbox-secret-value\n", encoding="utf-8")
+    client = Client()
+    set_result = cloud_cli._environment(
+        SimpleNamespace(
+            application="app_voice",
+            assignments=["BROKER_KEY"],
+            environment_command="set",
+            secret=True,
+            value_file=[value_file],
+            scope="eval",
+        ),
+        client=client,
+    )
+    listed = cloud_cli._environment(
+        SimpleNamespace(application="app_voice", environment_command="list", scope="eval"),
+        client=client,
+    )
+    unset = cloud_cli._environment(
+        SimpleNamespace(
+            application="app_voice", environment_command="unset", names=["BROKER_KEY"], scope="eval"
+        ),
+        client=client,
+    )
+
+    calls = [(method, path) for method, path, _ in client.requests if path != "/v1/applications"]
+    assert calls == [
+        ("PUT", "/v1/applications/app_voice/evaluation-environment/BROKER_KEY"),
+        ("GET", "/v1/applications/app_voice/evaluation-environment"),
+        ("DELETE", "/v1/applications/app_voice/evaluation-environment/BROKER_KEY"),
+    ]
+    assert set_result["result"] == {
+        "scope": "eval",
+        "configuration": [{"name": "BROKER_KEY", "scope": "eval", "secret": True, "value": None}],
+    }
+    assert listed["result"]["secrets_available"] is True
+    assert unset["result"] == {"scope": "eval", "unset": ["BROKER_KEY"], "removed": [True]}
+    assert "sandbox-secret-value" not in json.dumps([set_result, listed, unset])
+
+
+def test_cloud_env_eval_scope_names_what_was_stored_before_a_refusal(tmp_path: Path) -> None:
+    from cayu.cli._cloud_api import CloudApiError
+
+    class Client:
+        def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+            if path == "/v1/applications":
+                return {"items": [{"id": "app_voice", "name": "Voice Agent"}]}
+            name = path.rsplit("/", 1)[1]
+            if name == "A_KEY":
+                raise CloudApiError(
+                    "conflict",
+                    "This installation keeps no eval secrets.",
+                    code="evaluation_secrets_unsupported",
+                )
+            return {"configuration": {"name": name, "scope": "eval", "secret": False}}
+
+    value_file = tmp_path / "k.txt"
+    value_file.write_text("k\n", encoding="utf-8")
+    with pytest.raises(cloud_cli.CloudCommandError) as raised:
+        cloud_cli._environment(
+            SimpleNamespace(
+                application="app_voice",
+                assignments=["STUB_URL=https://stub.example", "A_KEY"],
+                environment_command="set",
+                secret=True,
+                value_file=[value_file],
+                scope="eval",
+            ),
+            client=Client(),
+        )
+    assert raised.value.category == "conflict"
+    message = str(raised.value)
+    assert "keeps no eval secrets" in message
+    assert "A_KEY and the variables after it were not set; STUB_URL already were" in message
+
+
+def test_cloud_env_scope_is_agent_unless_eval_is_asked() -> None:
+    assert main(["cloud", "env", "list", "--application", "a", "--scope", "live"]) == 2

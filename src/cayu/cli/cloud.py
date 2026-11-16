@@ -1455,6 +1455,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description="List environment variables without revealing secret values.",
     )
     environment_list.add_argument("--application", required=True, help=APPLICATION_HELP)
+    _add_environment_scope(environment_list)
     environment_set = environment_commands.add_parser(
         "set",
         description=(
@@ -1467,6 +1468,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     environment_set.add_argument("assignments", nargs="+", metavar="assignment")
     environment_set.add_argument("--application", required=True, help=APPLICATION_HELP)
+    _add_environment_scope(environment_set)
     environment_set.add_argument("--secret", action="store_true")
     environment_set.add_argument(
         "--value-file",
@@ -1486,6 +1488,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     environment_unset.add_argument("names", nargs="+", metavar="name")
     environment_unset.add_argument("--application", required=True, help=APPLICATION_HELP)
+    _add_environment_scope(environment_unset)
 
     schedule = commands.add_parser(
         "schedule",
@@ -4235,11 +4238,26 @@ def _resolve_application(
     )
 
 
+def _add_environment_scope(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--scope",
+        choices=("agent", "eval"),
+        default="agent",
+        help=(
+            "agent (default): the variables the Agent's service runs with; a change restarts "
+            "it. eval: values only the Agent's isolated eval runs get, never its service; a "
+            "change restarts nothing."
+        ),
+    )
+
+
 def _environment(
     arguments: argparse.Namespace,
     *,
     client: CloudApiClient,
 ) -> dict[str, Any]:
+    if getattr(arguments, "scope", "agent") == "eval":
+        return _evaluation_environment(arguments, client=client)
     if arguments.environment_command == "list":
         application_id = _application_id(client, arguments.application)
         return {
@@ -4269,6 +4287,61 @@ def _environment(
     else:
         result = _change_environment(client, base, {"set": variables})
     return {"operation": "env.set", "result": result}
+
+
+def _evaluation_environment(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+) -> dict[str, Any]:
+    """`env ... --scope eval`: the Agent's eval-only variables, which Cloud keeps apart from its
+    own. Each is set or unset on its own, in the order given, and no service restarts."""
+
+    command = arguments.environment_command
+    if command == "list":
+        application_id = _application_id(client, arguments.application)
+        return {
+            "operation": "env.list",
+            "result": client.request(
+                "GET", f"/v1/applications/{application_id}/evaluation-environment"
+            ),
+        }
+    if command == "unset":
+        names = _distinct_environment_names([_environment_name(name) for name in arguments.names])
+        application_id = _application_id(client, arguments.application)
+        base = f"/v1/applications/{application_id}/evaluation-environment"
+        removed = [client.request("DELETE", f"{base}/{name}") for name in names]
+        return {
+            "operation": "env.unset",
+            "result": {
+                "scope": "eval",
+                "unset": names,
+                "removed": [r.get("removed") for r in removed],
+            },
+        }
+    variables = _environment_assignments(
+        [str(assignment) for assignment in arguments.assignments],
+        secret=bool(arguments.secret),
+        value_files=list(arguments.value_file or ()),
+    )
+    application_id = _application_id(client, arguments.application)
+    base = f"/v1/applications/{application_id}/evaluation-environment"
+    configuration: list[Any] = []
+    for name, payload in variables.items():
+        try:
+            answer = client.request("PUT", f"{base}/{name}", payload=payload)
+        except CloudApiError as exc:
+            if not configuration:
+                raise
+            # Each variable is its own request: say which ones before it were stored.
+            stored = ", ".join(str(item.get("name")) for item in configuration if item)
+            raise CloudCommandError(
+                exc.category,
+                f"{exc} {name} and the variables after it were not set; {stored} "
+                "already were (`env unset --scope eval NAME` removes one).",
+            ) from exc
+        configuration.append(answer.get("configuration"))
+    return {"operation": "env.set", "result": {"scope": "eval", "configuration": configuration}}
 
 
 def _environment_assignments(
