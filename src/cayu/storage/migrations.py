@@ -19,7 +19,11 @@ Compatibility model (ADR 0001, Decision 7):
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 from cayu.storage._artifact_index_schema import ARTIFACT_INDEX_REVISION
@@ -818,6 +822,65 @@ def validate(
         )
 
 
+@dataclass(frozen=True)
+class RevisionCommitted:
+    """One schema revision whose migration transaction has committed."""
+
+    revision: int
+    kind: RevisionKind
+    #: When the backend reported the commit, in UTC.
+    committed_at: datetime
+    #: Revisions still pending after this one, up to :data:`LATEST_REVISION`.
+    remaining: int
+
+
+#: Called once per committed revision, in commit order, on the migrating thread.
+MigrationProgressCallback = Callable[[RevisionCommitted], None]
+
+_progress_callback: contextvars.ContextVar[MigrationProgressCallback | None] = (
+    contextvars.ContextVar("cayu_migration_progress", default=None)
+)
+
+
+@contextlib.contextmanager
+def observe_migration_progress(callback: MigrationProgressCallback) -> Iterator[None]:
+    """Call ``callback`` for each revision a migration commits inside this block.
+
+    Both backends report every revision right after its transaction commits,
+    including the baseline of an empty database. The scope is a context
+    variable, so it follows ``asyncio.run`` and ``asyncio.to_thread`` and
+    nests: the innermost observer wins. An exception raised by ``callback``
+    propagates and stops the migration after the revision it reported; that
+    revision stays committed and a rerun resumes from it.
+    """
+
+    token = _progress_callback.set(callback)
+    try:
+        yield
+    finally:
+        _progress_callback.reset(token)
+
+
+def report_revision_committed(rev: Revision) -> None:
+    """Tell the active progress observer, if any, that ``rev`` has committed.
+
+    Backend adapters call this after the commit that records ``rev``; it is a
+    no-op when no :func:`observe_migration_progress` block is active.
+    """
+
+    callback = _progress_callback.get()
+    if callback is None:
+        return
+    callback(
+        RevisionCommitted(
+            revision=rev.revision,
+            kind=rev.kind,
+            committed_at=datetime.now(UTC),
+            remaining=len(pending(rev.revision)),
+        )
+    )
+
+
 __all__ = [
     "BASELINE_REVISION",
     "LATEST_REVISION",
@@ -826,7 +889,9 @@ __all__ = [
     "REVISIONS",
     "TABLE_PREFIX",
     "UNINITIALIZED",
+    "MigrationProgressCallback",
     "Revision",
+    "RevisionCommitted",
     "RevisionKind",
     "SchemaError",
     "SchemaMode",
@@ -834,7 +899,9 @@ __all__ = [
     "SchemaTooNew",
     "SchemaTooOld",
     "SchemaUninitialized",
+    "observe_migration_progress",
     "pending",
+    "report_revision_committed",
     "revision",
     "validate",
     "validate_migration_input",

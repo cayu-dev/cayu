@@ -869,6 +869,8 @@ class _PostgresStoreBase:
         lock_retry = MigrationLockRetry()
         while True:
             concurrent_revision: schema.Revision | None = None
+            # Revisions this attempt's transaction records; reported once it commits.
+            committed: list[schema.Revision] = []
             concurrent_indexes: tuple[postgres_schema_history._ConcurrentIndexMigration, ...] = ()
             recorded_indexes: tuple[postgres_schema_history._ConcurrentIndexMigration, ...] = ()
             preflight_progress = (
@@ -1000,6 +1002,7 @@ class _PostgresStoreBase:
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
+                        committed.append(schema.revision(current))
                     pending = schema.pending(current)
                     if not pending:
                         current_state = await self._read_schema_state(cur)
@@ -1231,6 +1234,7 @@ class _PostgresStoreBase:
                                 await cur.execute(cast("LiteralString", statement))
                             await self._validate_revision_schema_objects(cur, revision)
                             await self._record_revision(cur, revision)
+                            committed.append(revision)
                 await conn.commit()
             if lock_retry.retrying:
                 # The checks the rolled-back attempt ran must run again.
@@ -1242,6 +1246,8 @@ class _PostgresStoreBase:
                     empty_recall_reset_complete,
                 ) = preflight_progress
                 continue
+            for committed_revision in committed:
+                schema.report_revision_committed(committed_revision)
             if concurrent_revision is None:
                 if not pending:
                     for index in recorded_indexes:
@@ -1279,6 +1285,9 @@ class _PostgresStoreBase:
                         )
                     await self._record_revision(cur, concurrent_revision)
                 await conn.commit()
+            # Report it even when a competing migrator recorded it first: the
+            # database has reached this revision either way.
+            schema.report_revision_committed(concurrent_revision)
 
     async def _preflight_migration_authority(self, cur: Any) -> None:
         """Validate backend-specific migration authority under the schema fence."""

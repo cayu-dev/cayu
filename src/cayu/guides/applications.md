@@ -517,7 +517,9 @@ authorization, claims, and settlement) in the same database with
   `cayu-cloud.toml`.
 - Deployments set `CAYU_DATABASE_URL` to a migrated PostgreSQL database, run
   `cayu storage migrate` as a deploy step, and set `CAYU_REQUIRE_POSTGRES=1` so
-  every Cayu SQLite store refuses to open.
+  every Cayu SQLite store refuses to open. `cayu storage migrate --progress` also
+  prints a JSON line as each revision commits, for a deploy step that reports
+  progress while a long migration runs.
 - `CAYU_DATABASE_POOL_MAX` (default 5) bounds the shared connection pool. Behind a
   transaction-pooling proxy such as PgBouncer, `CAYU_DATABASE_DIRECT_URL` gives the
   task-admission `LISTEN` connection a direct server address.

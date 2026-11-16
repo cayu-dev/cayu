@@ -228,6 +228,15 @@ def add_storage_parser(subparsers: Any) -> None:
                         "tables when crossing revision 73."
                     ),
                 )
+            if name == "migrate":
+                sub.add_argument(
+                    "--progress",
+                    action="store_true",
+                    help=(
+                        "Write one line to stdout as each revision commits, before the final "
+                        "result. With JSON output each line is a revision_committed JSON object."
+                    ),
+                )
             add_output_options(sub)
     _add_reset_aliases_parser(inner)
     add_check_trace_parser(inner)
@@ -1178,11 +1187,12 @@ def _migrate_sqlite_locked(
 
             # The complete schema path and alias-key reconciliation run against
             # the snapshot. The live database path is still untouched.
-            store = SQLiteSessionStore(
-                staging_path,
-                schema_mode=schema.SchemaMode.MIGRATE,
-                public_authority_alias_codec=codec,
-            )
+            with _migration_progress(args, "sqlite"):
+                store = SQLiteSessionStore(
+                    staging_path,
+                    schema_mode=schema.SchemaMode.MIGRATE,
+                    public_authority_alias_codec=codec,
+                )
 
             async def close_sqlite() -> None:
                 await store.close()
@@ -1409,7 +1419,8 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
         ):
             return await postgres_base.read_schema_state(cur)
 
-    state = _run_postgres(run, args)
+    with _migration_progress(args, "postgres"):
+        state = _run_postgres(run, args)
     if state is None:
         return 1
     expected_output = schema.SchemaState(
@@ -1447,6 +1458,49 @@ def _migrate_postgres(args: argparse.Namespace) -> int:
     with contextlib.suppress(Exception):
         asyncio.run(discard_receipt())
     return 0
+
+
+def _migration_progress(
+    args: argparse.Namespace, backend: str
+) -> contextlib.AbstractContextManager[None]:
+    """Print one flushed stdout line per committed revision when ``--progress`` is set.
+
+    SQLite migrates a staging copy that replaces the database only after every
+    revision passes, so its lines say ``staged``; a Postgres line means the
+    database itself has reached that revision.
+    """
+
+    if not getattr(args, "progress", False):
+        return contextlib.nullcontext()
+    staged = backend == "sqlite"
+
+    def report(event: schema.RevisionCommitted) -> None:
+        if args.output_format == "json":
+            line = json.dumps(
+                _revision_committed_payload(event, backend=backend, staged=staged),
+                sort_keys=True,
+            )
+        else:
+            verb = "staged" if staged else "committed"
+            line = f"{verb} revision {event.revision} ({event.kind}), {event.remaining} remaining"
+        print(line, file=sys.stdout, flush=True)
+
+    return schema.observe_migration_progress(report)
+
+
+def _revision_committed_payload(
+    event: schema.RevisionCommitted, *, backend: str, staged: bool
+) -> dict[str, object]:
+    return {
+        "schema_version": "1",
+        "event": "revision_committed",
+        "backend": backend,
+        "revision": event.revision,
+        "kind": str(event.kind),
+        "committed_at": event.committed_at.isoformat().replace("+00:00", "Z"),
+        "remaining": event.remaining,
+        "staged": staged,
+    }
 
 
 def _preflight_sqlite_migration(

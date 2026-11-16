@@ -173,6 +173,54 @@ attempts, logging a warning for each retry. If every attempt
 fails, the step exits non-zero with the database at the last revision that
 committed; stop the writers and run it again.
 
+### Migration progress
+
+By default `migrate` writes one result when it finishes, so a platform running
+it as a task cannot tell which revision a long migration has reached. Pass
+`--progress` to also write one line to stdout as each revision commits,
+flushed before the next revision starts:
+
+```console
+cayu storage migrate --json --progress
+```
+
+With JSON output (the default) each line is a JSON object, and the usual
+result follows as the last line, unchanged:
+
+```json
+{"backend": "postgres", "committed_at": "2026-11-15T18:04:33.315545Z", "event": "revision_committed", "kind": "additive", "remaining": 2, "revision": 157, "schema_version": "1", "staged": false}
+```
+
+- `revision` and `kind` name the revision that committed, and `remaining`
+  counts the revisions still to apply after it; `0` means the schema is at
+  this build's latest revision, though the command still validates, delivers
+  its receipt, and writes the result after that.
+- `committed_at` is the UTC time the backend reported the commit.
+- `staged` is `false` on PostgreSQL: the database itself has reached the
+  revision, and a failure later leaves it there. SQLite migrates a staging
+  copy and replaces the database only after every revision passes, so its
+  lines say `staged: true`; if the migration then fails, the database keeps
+  its original revision.
+- A database with no Cayu schema reports the baseline (revision 1) first.
+- Lines with an `event` field are progress; the line without one is the
+  result or, on failure, the `error` object. A consumer that reads only the
+  last line keeps working with or without `--progress`. Without `--progress`
+  the output is exactly one JSON document, as before.
+
+With `--table`, each revision prints a short line such as
+`committed revision 157 (additive), 2 remaining` (`staged revision ...` on
+SQLite) before the usual summary. Progress always goes to stdout, so with
+`--output FILE` the file holds only the result. A resumed migration reports
+only the revisions it commits itself, and a SQLite run that only recovers
+an earlier receipt reports none.
+
+Code that migrates through a store with `SchemaMode.MIGRATE` can observe the
+same events: wrap it in `cayu.storage.migrations.observe_migration_progress(callback)`,
+which calls `callback` with a `RevisionCommitted` (`revision`, `kind`,
+`committed_at`, `remaining`) after each commit. The scope is a context
+variable, so it follows `asyncio.run` and `asyncio.to_thread`. An exception
+from the callback stops the migration after the revision it reported.
+
 A platform can ask first whether a release needs the step:
 
 ```console

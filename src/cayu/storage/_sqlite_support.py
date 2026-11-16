@@ -1543,8 +1543,11 @@ def _apply_pending_after_preflight(
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
+        schema.report_revision_committed(schema.revision(current))
     for rev in schema.pending(current):
+        # Each revision commits its own transaction before the next one starts.
         _apply_revision(connection, rev)
+        schema.report_revision_committed(rev)
 
 
 def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> None:
