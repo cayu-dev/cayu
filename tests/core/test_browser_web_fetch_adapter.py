@@ -2172,7 +2172,7 @@ def test_guest_blocking_profile_cleanup_returns_bounded_failure(tmp_path: Path) 
                 "pathlib.Path(sys.argv[1]).write_text('ready');"
                 "sys.stdout.buffer.write(b'1');sys.stdout.buffer.flush();"
                 "sys.stdin.buffer.read(1);"
-                "time.sleep(1)"
+                "time.sleep(30)"
             ),
             str(owner_ready),
         )
@@ -2218,7 +2218,9 @@ def test_guest_blocking_profile_cleanup_returns_bounded_failure(tmp_path: Path) 
 
     assert captured.value.code == "cleanup_failed"
     assert owner_ready.read_text(encoding="utf-8") == "ready"
-    assert elapsed < 0.5
+    # The owner would block for 30 s; returning well before that shows the
+    # bounded cleanup gave up on it, whatever the runner's process start-up costs.
+    assert elapsed < 10
     assert profile_home.exists() is True
 
 

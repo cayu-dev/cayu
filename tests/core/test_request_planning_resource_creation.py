@@ -152,6 +152,50 @@ async def test_exact_resource_preparation_creates_one_inert_child(
     )
 
 
+@pytest.mark.parametrize("native_stores", ["memory"], indirect=True)
+async def test_cancel_settlement_outliving_its_observation_still_converges(
+    tmp_path, artifact_store, monkeypatch, native_stores
+):
+    """A cancel whose settlement outlasts its observer settles after an exact retry."""
+    await resource_creation_journey(
+        tmp_path, artifact_store, monkeypatch, native_stores, "planner_cancel_lapse"
+    )
+
+
+def hold_resource_settlement_past_observation(monkeypatch, lapsed):
+    """Make the next resource settlement outlive its owner's foreground observer.
+
+    A slow machine does this whenever settlement takes longer than
+    RESOURCE_FOREGROUND_TIMEOUT_S. Holding the settlement until its observer
+    has given up makes the same state deterministic instead of timing-based.
+    """
+    import cayu.artifacts._resource_preparation_cleanup as cleanup
+    import cayu.artifacts.resources as resource_contract
+
+    settle = cleanup.settle_preparation
+    observe = LocalArtifactResourceOwner._observe
+    foreground = resource_contract.RESOURCE_FOREGROUND_TIMEOUT_S
+
+    async def held_settlement(*args, **kwargs):
+        monkeypatch.setattr(cleanup, "settle_preparation", settle)
+        await lapsed.wait()
+        return await settle(*args, **kwargs)
+
+    async def observed(owner, task, work=None):
+        try:
+            return await observe(owner, task, work)
+        except ResourceOwnerUnavailable as error:
+            if "settlement remains owned" in str(error):
+                monkeypatch.setattr(resource_contract, "RESOURCE_FOREGROUND_TIMEOUT_S", foreground)
+                monkeypatch.setattr(LocalArtifactResourceOwner, "_observe", observe)
+                lapsed.set()
+            raise
+
+    monkeypatch.setattr(cleanup, "settle_preparation", held_settlement)
+    monkeypatch.setattr(LocalArtifactResourceOwner, "_observe", observed)
+    monkeypatch.setattr(resource_contract, "RESOURCE_FOREGROUND_TIMEOUT_S", 0.05)
+
+
 @pytest.mark.parametrize("native_stores", ["sqlite", "postgres"], indirect=True)
 async def test_resource_transfer_process_loss_recovers_through_public_planning(
     tmp_path, artifact_store, monkeypatch, native_stores
@@ -665,6 +709,10 @@ async def resource_creation_journey(
                 return
             if interruption.startswith("planner_cancel_"):
                 boundary = interruption.removeprefix("planner_cancel_")
+                # The lapse case cancels at the transfer boundary, then keeps the
+                # cancel's own settlement running past its foreground observer.
+                lapse = boundary == "lapse"
+                boundary = "transfer" if lapse else boundary
                 method_name = "acquire" if boundary == "second" else boundary
                 method = getattr(NativePlanningResourceOwner, method_name)
                 reached, release = asyncio.Event(), asyncio.Event()
@@ -736,9 +784,13 @@ async def resource_creation_journey(
                         kind="cancelled",
                         initiator=_initiator(request_resolver.recipient.context),
                     )
+                    lapsed = asyncio.Event()
+                    if lapse:
+                        hold_resource_settlement_past_observation(monkeypatch, lapsed)
                     terminal = await complete_plan(
                         application, control, request_resolver.recipient.context, control=True
                     )
+                    assert lapsed.is_set() == lapse
                     assert terminal.state == "cancelled" and terminal.pending_stages == 0
                     assert terminal.reserved_bytes == terminal.reserved_events == 0
                     successor = successor.model_copy(

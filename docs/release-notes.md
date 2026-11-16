@@ -1,37 +1,195 @@
 # Release notes
 
-## Unreleased
+## v0.21.0
 
-Upgrade: Storage revision 158 is additive; run `cayu storage migrate` before
-restarting. It adds sort indexes on `cayu_sessions`; PostgreSQL builds them
-concurrently.
+Upgrade: Stop workers and servers that open the database, take a restorable
+backup, and run `cayu storage migrate` before restarting. Storage revision
+advances from 157 to 159 with two additive index revisions, which PostgreSQL
+builds concurrently. The compatibility floor stays 146, server contract stays
+91 and app manifest schema stays 18, so no breaking-revision acknowledgement is
+needed from v0.20.0. Clients that read `total_count` from `GET /api/sessions`
+must now ask for it with `include=total`. Scripts that run
+`cayu cloud eval run` or `cayu cloud eval runs list` against the live Agent
+need `--on live`. Ejected dashboards upgraded to this release build with Vite+
+and need Node.js 22.18+, 24.11+ or 26+.
 
 ### Breaking changes
 
-- `GET /api/sessions` returns `total_count` only for `include=total`. It was
-  returned for every unfiltered list and cost a full count on each request.
+- `GET /api/sessions` returns `total_count` only when the request includes
+  `include=total`. It used to be returned for every unfiltered list and cost a
+  full count on each request. `cayu session list` asks for it.
+- `RunRequest` and `ForkSessionRequest` refuse the metadata keys
+  `cayu:tool_policy_reauthorization` and `cayu:approved_arguments_reauthorization`,
+  and tool policies no longer see them when a caller sets them anywhere else.
+  Only the runtime sets them now. This is a security fix: a caller could make a
+  fresh tool call look like one a policy or a person had already approved.
+- The bundled and editable dashboard and the web app `cayu new` writes build,
+  lint, format and test with Vite+ (`vite-plus` 1.0.0-rc.1, a release candidate
+  pinned exactly) instead of Biome and plain Vite. `biome.json` is gone, lint
+  and format settings live in `vite.config.ts`, and Node.js 22.18+, 24.11+ or
+  26+ is required. An existing generated web app can keep Biome. To switch,
+  copy `web/package.json`, `web/package-lock.json`, `web/vite.config.ts`,
+  `web/tsconfig.base.json` and `web/scripts/check-build.mjs` from a freshly
+  generated project, delete `web/biome.json`, and rebuild `web/static`.
+- `cayu cloud eval run` runs the suite in an isolated environment by default
+  (`--on isolated`), against the Agent's selected Release, instead of on the
+  live Agent and its stores. `cayu cloud eval runs list` lists isolated runs by
+  default. Add `--on live` to keep the old behavior; it now warns that the run
+  writes into the live Agent's stores. The isolated default needs a Cayu Cloud
+  whose evaluation service runs corpus suites; an older one refuses with
+  `isolated_runs_unavailable` and names `--on live`.
+
+### Deprecations
+
+- `ModelPolicyController`, `CayuApp(model_policy=...)` and
+  `CAYU_MODEL_POLICY_CONFIG` are still deprecated and may be removed in the next
+  minor release. Bind model slots in Cayu Cloud instead.
 
 ### Changes
 
-- Session lists filtered by overview state and eval or fork lineage filter in SQL
-  on the summary rows and return full pages until the list ends. Text search is
-  matched on the public projection of each candidate, up to 10,000 per request.
-  The dashboard no longer follows up to 25 empty pages.
-- `GET /api/sessions/overview/counts` groups summary rows by state.
-- `sessions?ids=` resolves public aliases and loads sessions in one read each.
-- The web app `cayu new` writes into `web/`, and the bundled and editable
-  dashboard, build, lint, format and test with Vite+ (`vite-plus` 1.0.0-rc.1)
-  instead of Biome and plain Vite. Vite+ 1.0.0-rc.1 is a release
-  candidate, pinned exactly; `vite` resolves to its core
-  (`@voidzero-dev/vite-plus-core`) at the same version. `npm run lint` runs
-  `vp lint --deny-warnings`, and the new `npm run format` and
-  `npm run format:check` run `vp fmt`; lint and format settings live in
-  `vite.config.ts`, and `biome.json` is gone. The dashboard's unit tests run
-  with `vp test run`. Node.js 22.18+, 24.11+ or 26+ is required. An existing
-  project can keep Biome; to switch, take `web/package.json`,
-  `web/package-lock.json`, `web/vite.config.ts`, `web/tsconfig.base.json` and
-  `web/scripts/check-build.mjs` from a freshly generated project, delete
-  `web/biome.json`, and rebuild `web/static`.
+- `cayu new` gives the agent, coding and long-running presets a web app for the
+  Agent's team, served at `/` with the Developer dashboard at `/cayu/`. The
+  agent preset's app has a Conversations area. Leave it out with
+  `--without web-app`. The service preset has no web app.
+- Add the `organizations` capability: people from separate organizations share
+  one deployment and see only their organization's data. The b2b preset is the
+  web app plus organizations, and the agent preset accepts
+  `--with organizations`. b2b projects no longer get knowledge or memory stubs.
+- Add `cayu.memberships`, the membership store and access policy that
+  organizations projects used to carry as copies, and `cayu memberships list`,
+  `add` and `remove`. New organizations projects import it. `cayu check` notes
+  an unedited copy in an older project (`MEMBERSHIPS_GENERATED_COPY`); the b2b
+  guide says how to move. No database migration is needed. Memberships have
+  organizations, members and roles; departments are left to the application.
+- Scope knowledge and memory by organization with
+  `KnowledgeAccessScope(session_label_keys=("organization",))` and
+  `MembershipAccessPolicy(..., knowledge=True)`. Work in a session labelled with
+  an organization reads and writes only that organization's knowledge, with or
+  without a member binding. Under such a scope, active or pending entries
+  written without the label are refused with a message that names it.
+- Add `cayu.server.operator_sign_in`, which gives an Agent's own routes the
+  signed-in operator and applies Cayu Cloud's roles, and `cayu.server.etag` for
+  ETag answers. Generated `/app` reads answer unchanged requests with 304.
+- `cayu new` writes `.github/workflows/ci.yml`. Projects with application
+  tables get a PostgreSQL service in it, and their organization isolation tests
+  fail instead of skipping when PostgreSQL is required
+  (`CAYU_REQUIRE_POSTGRES_TESTS=1`).
+- Add `cayu dev postgres up`, `url` and `down` to run a throwaway PostgreSQL in
+  Docker for a project's tests.
+- `cayu inspect` and `cayu eval run` lend a throwaway memory evidence key in a
+  fresh checkout, as `cayu check` does. `cayu eval run` lends one only to a new
+  local store and otherwise refuses with `MEMORY_EVIDENCE_KEY_REQUIRED`.
+- `cayu cloud deploy` runs the worker process checks of `cayu check --deploy`
+  before uploading, and refuses a worker command `cayu worker` would refuse or
+  one that would start several processes when one is required.
+- A plain `cayu check` reports a service's unset access settings as
+  information, so a fresh service project passes its documented check.
+  `--deploy` and `cayu serve` still treat them as errors. A malformed
+  `PRODUCT_AUTH_TOKENS_JSON` or `CAYU_OPERATOR_BEARER_TOKEN`, or an operator
+  token that reuses a product token, is an error in every check.
+- `cayu storage migrate --progress` prints one line per committed revision.
+  Code that migrates a store can use `observe_migration_progress`.
+- Every `cayu` command says on stderr, at most once a day, when a newer release
+  is on PyPI. It stays quiet in CI, when stderr is not a terminal, for JSON
+  output, and with `CAYU_NO_VERSION_CHECK=1`.
+- Session lists filtered by overview state, eval trials, forks or text filter
+  in SQL on the summary rows and return full pages. Revision 158 adds the sort
+  indexes. `GET /api/sessions/overview/counts` groups summary rows by state,
+  and `sessions?ids=` resolves public aliases.
+- Revision 159 adds a covering index for environment activity, and collapsed
+  specialist cards read one session instead of five.
+- The Sessions page and Home hide tool-proposal sessions by default, with a
+  toggle to show them. `GET /api/sessions` and the overview counts leave them
+  out with `include_tool_proposals=false`. A proposal session is titled after
+  its tool and the call's title.
+- Isolated `cayu cloud eval run` takes `--release`, `--target`, `--trials`,
+  `--isolation trial|run` and `--database postgres|none`, and gives each
+  allocation its own database where Cayu Cloud offers one.
+- `cayu cloud env list`, `set` and `unset` take `--scope eval` for values only
+  isolated eval runs get, such as a sandbox key or a test data feed. The
+  Agent's service never reads them. `--scope agent` stays the default. It needs
+  a Cayu Cloud that serves eval-only values; an older one answers 404 or 503.
+- `cayu cloud eval environment show [--release RELEASE]` says what an isolated
+  eval run of a Release would get: its eval targets, the database each
+  allocation gets, the seed step and fixtures, the Agent's eval-only variable
+  names, the model keys brokered to its trials and the installation's limits. It
+  only reads. `cayu cloud eval run --max-parallel-trials N` (at most 10) lets up
+  to N of a run's `--trials` allocations run at once; `--on live` refuses it.
+- The command sidecar example (`examples/aws/lambda_microvm_sidecar`) gains a
+  Kubernetes mode, `CAYU_SIDECAR_MODE=kubernetes`, for sandbox pods that require
+  non-root containers and refuse added capabilities. The same image runs as two
+  non-root containers: a supervisor that holds the token, TLS and command
+  records, and an agent-side executor that runs the commands. `lambda` stays the
+  default, and any other value stops the sidecar at startup.
+- Add `cayu.runners.KubernetesSandboxRunner`, which drives that sidecar in a
+  sandbox pod your control plane manages. It speaks the same command protocol as
+  `LambdaMicroVMRunner` (owner claims, carried and detached commands, resume,
+  cleanup, port forwards and limits), connects over HTTPS only with a bearer
+  token that may rotate, and refuses a sidecar that isn't in Kubernetes mode.
+- In Kubernetes mode, the command sidecar relays sandbox egress from the pod's
+  loopback. Commands that name an egress proxy get proxy settings pointing at
+  `127.0.0.1:18080`, and the supervisor adds the proxy's transport token there,
+  so the token never reaches the agent container. The relay holds port 18080
+  from startup and follows a new owner to its proxy on handover, so carried
+  commands keep working. The proxy may be at any non-public address, which
+  covers pod networks such as `100.64.0.0/10`. Ports 8080 and 18080 are reserved
+  in Kubernetes-mode pods.
+- Virtual egress brokers API keys sent in their own header. The credential kinds
+  `opaque_x_api_key` (`x-api-key`, as Anthropic's API takes it) and
+  `opaque_x_goog_api_key` (`x-goog-api-key`, as Google's Gemini API takes it)
+  take a virtual value in that header and forward the real key in the same
+  header, so a sandboxed agent calling these APIs no longer needs the real key.
+  Such a header counts as a presented credential only when it holds a Cayu
+  virtual value; any other value there is left alone, as before.
+- An Agent with knowledge gets a Knowledge area in its web app: what the Agent
+  knows, what is waiting to be remembered, and Correct and Forget for the
+  people allowed to change it. With organizations, members see only their
+  organizations' knowledge. The agent and coding presets and the agent preset
+  with organizations get it.
+- Dashboard tables use the full window width. Sessions keep state and last
+  update in view, and Tools shows session titles. Inbox approval and knowledge
+  cards fold repeated policy text and details.
+
+### Fixes
+
+- Upgrading PostgreSQL through revisions 152 and 157 no longer deadlocks with
+  running event writers. Those revisions lock their tables first, so readers
+  also wait during the backfill, and revisions that hit a lock wait are retried.
+- `cayu storage migrate` and PostgreSQL stores work on PostgreSQL 18, whose NOT
+  NULL constraints were read as schema conflicts. PostgreSQL 16, 17 and 18 are
+  supported.
+- Under `cayu serve`, Cloud members reach project routes that apply their own
+  role rule instead of getting 403.
+- Order artifact lists by the filename a reader is shown, so a redacted name
+  doesn't reveal its hidden text through its place in the list.
+- Keep runner completion events from showing command arguments while sibling
+  calls in the same round may still resolve secrets.
+- Count a stopped approval or question round as a recovery item in Inbox
+  counts, matching the list.
+- `cayu dashboard upgrade` keeps a file whose name changes only in case on
+  case-insensitive filesystems.
+- Fix task and recovery cases that could leave work stuck: a cancelled
+  operation child now settles its dispatch claim; reclaiming continues until
+  every expired claim is handled; group cancellation of a retry member no
+  longer makes claiming fail repeatedly; and a runtime failure's cancellation
+  is fenced by its claim generation, not a lease time a heartbeat can renew.
+- Fix interruption and recovery cases: an operator interruption during
+  completion copy-back settles; closing a whole-turn wait stream no longer
+  releases the writer early; live interruption keeps a provider-owned
+  interaction recoverable; a released predecessor binding no longer blocks
+  recovery; and an unclaimed egress adoption handoff is parked again when
+  resume exits early.
+- Keep target grant lifecycle events in audit after authority adoption.
+- Close browser recording store connections after each transaction.
+- A run paused for user input no longer fails when the same round has an
+  authorized tool-search call.
+- Cancelling a caller after a binding's finalization succeeded no longer
+  replays finalization against the disposed binding.
+- `cayu cloud sandboxes` messages say what an older Cayu Cloud lacks in plain
+  words.
+- A verified task worker that loses its lease while it recovers an attempt
+  reports the lost claim as an `ExceptionGroup`, instead of a
+  `BaseExceptionGroup` that `except Exception` doesn't catch.
 
 ## v0.20.0
 

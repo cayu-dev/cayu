@@ -55,8 +55,39 @@ async def lookup_plan(application, expected, context):
         return next(iter(done)).result()
 
 
+RESOURCE_OBSERVATION_LAPSED = "Resource settlement remains owned; drain or retry."
+
+
 async def complete_plan(application, command, context, *, control=False, reconcile=False):
-    """Observe existing ownership, then use authenticated exact public readback."""
+    """Observe existing ownership, then use authenticated exact public readback.
+
+    A resource owner bounds how long a planning mutation observes its settlement,
+    and a slow machine can exceed that bound while the settlement keeps running.
+    That failure is not evidence about the plan. Wait for the retained work, then
+    submit the same exact command again; it reads back what the work settled.
+    """
+    for _ in range(8):
+        try:
+            return await _complete_plan_once(
+                application, command, context, control=control, reconcile=reconcile
+            )
+        except CollaborationUnavailable as error:
+            if str(error.__cause__) != RESOURCE_OBSERVATION_LAPSED:
+                raise
+            await _settle_resource_workers(application)
+    raise AssertionError("Planning resource settlement kept lapsing its observation bound.")
+
+
+async def _settle_resource_workers(application):
+    """Wait for evidence: retained resource work finishes before the exact retry."""
+    owners = application._request_coordinator._resource_owners.values()
+    workers = {task for owner in owners for task in owner._workers if not task.done()}
+    if workers:
+        _, remaining = await asyncio.wait(workers, timeout=180)
+        assert not remaining, "Resource settlement remains owned after bounded observation."
+
+
+async def _complete_plan_once(application, command, context, *, control, reconcile):
     try:
         if control:
             return await application.control_collaboration_plan(command, context=context)

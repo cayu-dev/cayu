@@ -329,7 +329,7 @@ def _skip_or_fail_postgres_unavailable(reason: str) -> None:
 
 
 def _requests_postgres(item: pytest.Item) -> bool:
-    if "postgres_dsn" in item.fixturenames:
+    if {"postgres_dsn", "postgres_test_dsn"} & set(item.fixturenames):
         return True
     callspec = getattr(item, "callspec", None)
     if callspec is None:
@@ -487,6 +487,26 @@ def _postgres_server_dsn() -> str:
         container.stop()
 
 
+def _disposable_postgres_database(server_dsn: str):
+    """A database of its own on the shared disposable server, dropped afterwards."""
+    from uuid import uuid4
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    database = f"cayu_test_{uuid4().hex}"
+    with psycopg.connect(server_dsn, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    try:
+        yield make_conninfo(server_dsn, dbname=database)
+    finally:
+        with psycopg.connect(server_dsn, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
+            )
+
+
 @pytest.fixture(scope="module")
 def postgres_dsn(_postgres_server_dsn: str) -> str:
     """Give each test module its own database on the shared disposable server.
@@ -495,22 +515,13 @@ def postgres_dsn(_postgres_server_dsn: str) -> str:
     deployment configuration observed by another module. An externally supplied
     test DSN therefore needs permission to create disposable databases.
     """
-    from uuid import uuid4
+    yield from _disposable_postgres_database(_postgres_server_dsn)
 
-    import psycopg
-    from psycopg import sql
-    from psycopg.conninfo import make_conninfo
 
-    database = f"cayu_test_{uuid4().hex}"
-    with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
-    try:
-        yield make_conninfo(_postgres_server_dsn, dbname=database)
-    finally:
-        with psycopg.connect(_postgres_server_dsn, autocommit=True) as connection:
-            connection.execute(
-                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database))
-            )
+@pytest.fixture
+def postgres_test_dsn(_postgres_server_dsn: str) -> str:
+    """A database for this test alone, for tests that leave theirs at an old schema revision."""
+    yield from _disposable_postgres_database(_postgres_server_dsn)
 
 
 @pytest.fixture(scope="module")

@@ -45,7 +45,8 @@ def test_revision_115_upgrades_indexes_without_changing_receipt_commitments(
         database = (
             tmp_path / "upgrade.sqlite"
             if backend == "sqlite"
-            else request.getfixturevalue("postgres_dsn")
+            # A corrupt case leaves its database at revision 114, so each case gets its own.
+            else request.getfixturevalue("postgres_test_dsn")
         )
 
         def open_store(mode):
