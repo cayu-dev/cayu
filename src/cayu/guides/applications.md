@@ -460,8 +460,8 @@ leaves it out:
 
 | Preset | Choose when | Web app |
 | --- | --- | --- |
-| `agent` (default) | One person or one team runs the agent. | For your team, with Conversations and Task runs. |
-| `coding` | The agent edits a code repository and runs its tests. | For your team. |
+| `agent` (default) | One person or one team runs the agent. | For your team, with Conversations, Task runs and Knowledge. |
+| `coding` | The agent edits a code repository and runs its tests. | For your team, with Task runs and Knowledge. |
 | `long-running` | Work spans hours or days: approval, a waited-for reply, reminder and deadline timers, a spend cap, restart tests. | For your team. |
 | `service` | Your own product or other systems call the agent over an authenticated API for their end users. | None; API only. |
 | `b2b` | Separate organizations (client firms, an agency's clients, households) share one deployment: each has several people who sign in, and they see only their own organization's data. Not for your own customers or users, who are each one person: use service or agent. | The same web app, for the organizations' members, with Conversations, Members and an organization switcher. |

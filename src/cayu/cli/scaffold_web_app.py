@@ -10,7 +10,9 @@ It composes parts that are each usable on their own:
   `PersonDependency`, so the app's people are the Agent's operators: Cayu Cloud's, with their
   Cloud roles, when deployed, and the person running `cayu serve --dev` locally;
 - the Agent's own router (`integrations/http/__init__.py`, `[tool.cayu.serve] routers`),
-  where its routes of its own go.
+  where its routes of its own go;
+- with the `knowledge` capability, the Knowledge area (`scaffold_app_knowledge.py`), where its
+  operators see what the Agent knows, and `admin` and `developer` correct and forget it.
 
 With the `organizations` capability (the b2b preset), the app is the generic app with the
 organizations layer instead, and its people are the organizations' members: that capability
@@ -20,8 +22,9 @@ composes `served_app_files` with its own sign-in and routes (`scaffold_organizat
 from __future__ import annotations
 
 from cayu._operator_credentials import ENVIRONMENT_OPERATOR_AUTH_TARGET
+from cayu.cli import scaffold_app_knowledge
 from cayu.cli.scaffold_app_routes import app_route_files, cloud_application_slug
-from cayu.cli.scaffold_app_web import CONVERSATIONS, OPERATORS, web_app_files
+from cayu.cli.scaffold_app_web import CONVERSATIONS, KNOWLEDGE, OPERATORS, web_app_files
 from cayu.cli.scaffold_plan import ORGANIZATIONS, WEB_APP, ApplicationPlan
 
 # What `cayu serve` reads to serve the Agent's routes and the app.
@@ -424,11 +427,13 @@ def served_app_files(
     layers: tuple[str, ...],
     auth: str = ENVIRONMENT_OPERATOR_AUTH_TARGET,
     package_name: str = "web",
+    knowledge: bool = False,
 ) -> dict[str, str]:
     """What every web app adds, whoever its people are: `web/` with ``layers`` on the generic
     app, the generated routes in `integrations/http/generated/`, and `[tool.cayu.serve]`
-    serving the Agent's router at /app and the app at /, behind ``auth``. The Agent's router
-    in `integrations/http/__init__.py`, which says who its people are, is the caller's."""
+    serving the Agent's router at /app and the app at /, behind ``auth``. With ``knowledge``,
+    the app has the Knowledge area and its generated routes too. The Agent's router in
+    `integrations/http/__init__.py`, which says who its people are, is the caller's."""
 
     serve = _SERVE_AUTH.format(auth=ENVIRONMENT_OPERATOR_AUTH_TARGET)
     if files["pyproject.toml"].count(serve) != 1:
@@ -441,7 +446,12 @@ def served_app_files(
         # with `cayu dashboard eject`, which writes no .gitignore of its own.
         ".gitignore": files[".gitignore"] + "node_modules/\ndist/\n",
         **app_route_files(),
-        **web_app_files(title, layers=layers, package_name=package_name),
+        **(scaffold_app_knowledge.knowledge_route_files() if knowledge else {}),
+        **web_app_files(
+            title,
+            layers=(*layers, KNOWLEDGE) if knowledge else layers,
+            package_name=package_name,
+        ),
     }
 
 
@@ -454,22 +464,36 @@ def web_app_project_files(*, files: dict[str, str], plan: ApplicationPlan) -> di
         return {}
     # People chat with the agent preset's agent, so its app has Conversations too.
     chats = plan.preset == "agent"
+    knowledge = "knowledge" in plan.capabilities
     guidance = _GUIDANCE.replace(
         "__OWN_AREAS__", "Conversations, Task runs" if chats else "Task runs"
     ).replace("__CONVERSATIONS__", _CONVERSATIONS_GUIDANCE if chats else "")
+    if knowledge:
+        guidance += scaffold_app_knowledge.guidance(members=False)
+    router = _HTTP_PY.replace("__AGENT_NAME__", plan.agent_name).replace(
+        "__CLOUD_APPLICATION__", cloud_application_slug(plan.name)
+    )
     return {
         **served_app_files(
             files=files,
             title=plan.name,
             layers=(OPERATORS, CONVERSATIONS) if chats else (OPERATORS,),
+            knowledge=knowledge,
         ),
         "README.md": files["README.md"] + guidance,
         "AGENTS.md": files["AGENTS.md"].replace(_AGENTS_WEB_ROW, _AGENTS_WEB_APP_ROW) + guidance,
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
-        "integrations/http/__init__.py": _HTTP_PY.replace(
-            "__AGENT_NAME__", plan.agent_name
-        ).replace("__CLOUD_APPLICATION__", cloud_application_slug(plan.name)),
+        "integrations/http/__init__.py": (
+            scaffold_app_knowledge.with_operator_knowledge(router) if knowledge else router
+        ),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
         "tests/test_web_app.py": _TEST_WEB_APP_PY,
+        **(
+            {
+                scaffold_app_knowledge.KNOWLEDGE_TEST: scaffold_app_knowledge.operator_knowledge_test()
+            }
+            if knowledge
+            else {}
+        ),
     }

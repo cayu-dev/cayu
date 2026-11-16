@@ -15,7 +15,7 @@ import pytest
 
 from cayu.cli import main
 from cayu.cli.scaffold import project_files
-from cayu.cli.scaffold_app_web import ORGANIZATIONS, layer_sources, templates
+from cayu.cli.scaffold_app_web import ORGANIZATIONS, app_build, app_sources, templates
 
 B2B_FILES = (
     "integrations/sign_in.py",
@@ -116,11 +116,12 @@ def test_the_project_has_no_knowledge_or_memory_homes() -> None:
 
 def test_the_web_interface_is_copied_with_its_source_and_build() -> None:
     files = project_files("acme-desk", preset="b2b")
-    # The generic app with the organizations layer on top (tests/cli/test_scaffold_app_web.py).
-    sources = layer_sources(templates(), (ORGANIZATIONS,))
+    # The generic app with the organizations layer on top (tests/cli/test_scaffold_app_web.py),
+    # and that composition's committed build.
+    build = app_build(templates(), (ORGANIZATIONS,))
     packaged = {
-        f"web/{path}": source.read_text(encoding="utf-8") for path, source in sources.items()
-    }
+        f"web/{path}": text for path, text in app_sources(templates(), (ORGANIZATIONS,)).items()
+    } | {f"web/{path}": source.read_text(encoding="utf-8") for path, source in build.items()}
 
     # Copied as they are, but for the pages' title, the project's name, which the app shows,
     # and the npm package's name.

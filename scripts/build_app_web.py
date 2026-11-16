@@ -6,12 +6,13 @@ Their source lives in the package so `cayu new` can copy it: the generic app in
 is composed and built in a temporary folder:
 
 - the generic app on its own, which ships no build;
-- the generic app with the operators layer, the `web-app` capability's, whose committed build
-  is the layer's `static/`;
-- that app with the conversations layer, the agent preset's, whose committed build is the
-  conversations layer's `static/`;
-- the generic app with the organizations layer, the b2b preset's, whose committed build is
-  the layer's `static/`.
+- the generic app with the operators layer, the `web-app` capability's;
+- that app with the conversations layer, the agent preset's;
+- the generic app with the organizations layer, the b2b preset's;
+- each of those three with the knowledge layer on top, for an Agent with knowledge.
+
+Each composition but the generic app has a committed build in
+`src/cayu/cli/templates/app_web_builds/<name>/`, which `cayu new` copies to `web/static`.
 
 Without `--check` each app is built, and a committed build is replaced with the fresh one.
 With `--check` each is linted, format-checked and typechecked; one with a committed build then runs its own
@@ -51,6 +52,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="lint, check formatting, typecheck and fail on a stale build",
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="NAME",
+        help="only this composition, by its build's name (operators+knowledge); repeatable",
+    )
     args = parser.parse_args(argv)
     web = _composition()
     apps = (
@@ -58,8 +65,16 @@ def main(argv: list[str] | None = None) -> int:
         ("operator app", (web.OPERATORS,)),
         ("operator app with conversations", (web.OPERATORS, web.CONVERSATIONS)),
         ("b2b app", (web.ORGANIZATIONS,)),
+        ("operator app with knowledge", (web.OPERATORS, web.KNOWLEDGE)),
+        (
+            "operator app with conversations and knowledge",
+            (web.OPERATORS, web.CONVERSATIONS, web.KNOWLEDGE),
+        ),
+        ("organizations app with knowledge", (web.ORGANIZATIONS, web.KNOWLEDGE)),
     )
     for label, layers in apps:
+        if args.only and web.build_name(layers) not in args.only:
+            continue
         print(f"== The {label} ({' + '.join((web.APP, *layers))})", flush=True)
         if not _build(web, layers, check=args.check):
             return 1
@@ -67,19 +82,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _build(web, layers: tuple[str, ...], *, check: bool) -> bool:
-    sources = web.layer_sources(TEMPLATES, layers)
-    built = f"{web.BUILT}/"
-    # The folder whose static/ is this app's committed build: its last layer's. The generic
-    # app on its own has none.
-    owner = TEMPLATES / layers[-1] if layers else None
+    sources = web.app_sources(TEMPLATES, layers)
+    # The folder that holds this app's committed build. The generic app on its own has none.
+    owner = TEMPLATES / web.BUILDS / web.build_name(layers) if layers else None
     with tempfile.TemporaryDirectory(prefix="cayu-app-web-") as directory:
         work = Path(directory) / "web"
-        for path, source in sources.items():
-            # The previous build only for `check:build` to compare.
-            if path.startswith(built) and not check:
-                continue
+        for path, text in sources.items():
             (work / path).parent.mkdir(parents=True, exist_ok=True)
-            (work / path).write_bytes(source.read_bytes())
+            (work / path).write_bytes(text.encode("utf-8"))
+        if check and owner is not None:
+            # The committed build, for `check:build` to compare.
+            for path, source in web.app_build(TEMPLATES, layers).items():
+                (work / path).parent.mkdir(parents=True, exist_ok=True)
+                (work / path).write_bytes(source.read_bytes())
         steps: list[list[str]] = [["ci", "--no-audit", "--no-fund"]]
         if check:
             steps += [["run", "lint"], ["run", "format:check"], ["run", "typecheck"]]
@@ -98,8 +113,8 @@ def _build(web, layers: tuple[str, ...], *, check: bool) -> bool:
                     )
                 return False
         if not check and owner is not None:
-            shutil.rmtree(owner / web.BUILT, ignore_errors=True)
-            shutil.copytree(work / web.BUILT, owner / web.BUILT)
+            shutil.rmtree(owner, ignore_errors=True)
+            shutil.copytree(work / web.BUILT, owner)
     return True
 
 

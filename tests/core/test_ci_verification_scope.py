@@ -105,14 +105,16 @@ def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes(
     assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
     assert select_pull_request_jobs(["tests/browser_client/client.test.mjs"]) == dashboard_only
     assert select_pull_request_jobs(["src/cayu/server/browser_client/client.js"]) == dashboard_only
-    # The web app templates, the generic app and its layers, and how they compose, are built
-    # and checked in the dashboard job, which has Node, and ship in the package. Generated
-    # projects build them too.
+    # The web app templates, the generic app, its layers and their builds, and how they
+    # compose, are built and checked in the dashboard job, which has Node, and ship in the
+    # package. Generated projects build them too.
     for path in (
         "src/cayu/cli/templates/app_web/src/main.tsx",
         "src/cayu/cli/templates/app_web_operators/src/agent/task-runs.tsx",
         "src/cayu/cli/templates/app_web_conversations/src/agent/cayu.ts",
         "src/cayu/cli/templates/app_web_organizations/src/agent/members.tsx",
+        "src/cayu/cli/templates/app_web_knowledge/src/generated/knowledge/index.tsx",
+        "src/cayu/cli/templates/app_web_builds/operators+knowledge/index.html",
         "src/cayu/cli/scaffold_app_web.py",
     ):
         assert select_pull_request_jobs([path]) == VerificationScope(

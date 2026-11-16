@@ -21,6 +21,7 @@ from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
     ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
 )
+from cayu.cli import scaffold_app_knowledge
 from cayu.cli.scaffold_app_routes import cloud_application_slug
 from cayu.cli.scaffold_app_web import ORGANIZATIONS as ORGANIZATIONS_LAYER
 from cayu.cli.scaffold_plan import ORGANIZATIONS, ApplicationPlan
@@ -2286,7 +2287,13 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
         ),
     ):
         app = _replace_once(app, old, new, "app.py")
-    knowledge_guidance = _KNOWLEDGE_GUIDANCE if "knowledge" in plan.capabilities else ""
+    knowledge = "knowledge" in plan.capabilities
+    knowledge_guidance = (
+        _KNOWLEDGE_GUIDANCE + scaffold_app_knowledge.guidance(members=True) if knowledge else ""
+    )
+    router = _HTTP_PY.replace("__AGENT_NAME__", plan.agent_name).replace(
+        "__CLOUD_APPLICATION__", cloud_application_slug(plan.name)
+    )
     return {
         **_organization_knowledge_files(files=files, plan=plan),
         # `web/` with the organizations layer, the generated routes, and `cayu serve` serving
@@ -2299,6 +2306,7 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
             auth=ENVIRONMENT_OPERATOR_ONLY_AUTH_TARGET,
             # The npm package's name, which no build reads.
             package_name="b2b-web" if plan.preset == "b2b" else "web",
+            knowledge=knowledge,
         ),
         # The Developer dashboard login the organizations use (see pyproject.toml above).
         "README.md": files["README.md"].replace(
@@ -2319,7 +2327,7 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
                 _KNOWLEDGE_ACCESS_POLICY,
                 "policies/access.py",
             )
-            if "knowledge" in plan.capabilities
+            if knowledge
             else _ACCESS_POLICY_PY
         ),
         "operations/demo_seed.py": _DEMO_SEED_PY,
@@ -2328,14 +2336,19 @@ def organizations_project_files(*, files: dict[str, str], plan: ApplicationPlan)
         "configuration/settings.py": files["configuration/settings.py"] + _SETTINGS_APPEND,
         "migrations/versions/0003_membership_roles.py": _ROLES_MIGRATION,
         "integrations/sign_in.py": _SIGN_IN_PY,
-        "integrations/http/__init__.py": _HTTP_PY.replace(
-            "__AGENT_NAME__", plan.agent_name
-        ).replace("__CLOUD_APPLICATION__", cloud_application_slug(plan.name)),
+        "integrations/http/__init__.py": (
+            scaffold_app_knowledge.with_member_knowledge(router) if knowledge else router
+        ),
         "integrations/http/fixed_settings.py": _FIXED_SETTINGS_PY,
         "integrations/http/overview_metrics.py": _OVERVIEW_METRICS_PY,
         "tests/test_http_api.py": _TEST_HTTP_API_PY,
         "tests/test_generated_routes.py": _TEST_GENERATED_ROUTES_PY,
         "tests/test_background_revocation.py": _TEST_BACKGROUND_REVOCATION_PY.replace(
             "__AGENT_NAME__", plan.agent_name
+        ),
+        **(
+            {scaffold_app_knowledge.KNOWLEDGE_TEST: scaffold_app_knowledge.member_knowledge_test()}
+            if knowledge
+            else {}
         ),
     }

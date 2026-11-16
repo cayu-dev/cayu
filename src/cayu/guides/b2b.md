@@ -207,6 +207,11 @@ enforces it, so no tool has to remember to filter:
   without a member (`app.run`, schedules, operator tasks) is pinned by its own
   `organization` label the same way; operator and background work with no `organization`
   label isn't narrowed.
+- The web app's Knowledge area (`/app/knowledge`, `cayu guide app-ui`) shows each member what
+  the Agent knows in their organizations, read through the same policy, and the suggestions
+  waiting there. An organization's admins correct its statements or have them forgotten; the
+  Agent's operators keep or drop the suggestions. `tests/test_knowledge_area.py` checks that
+  nobody sees, corrects or forgets another organization's.
 - Knowledge you add yourself (seeding, operator scripts, curation) needs an `organization`
   label, since no member could read it without one: the store refuses an active or pending
   entry without it and says what to add. Entries stored before this rule can still be

@@ -257,6 +257,7 @@ def test_a_generated_project_passes_cayu_check_and_its_tests_on_postgres(
             "tests/test_background_revocation.py",
             "tests/test_app_database.py",
             "tests/test_organization_knowledge.py",
+            "tests/test_knowledge_area.py",
         ],
         cwd=project,
         env=environment,

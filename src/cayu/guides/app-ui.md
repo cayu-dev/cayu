@@ -28,13 +28,13 @@ owns it and may rewrite it) or `THE AGENT'S OWN.` (yours).
 | Path | What it is |
 | --- | --- |
 | `web/src/main.tsx`, `web/src/app/` | The shell: browser routes, the area type, the layout with its navigation and profile menu, the status pages, and the requester for `/app`. Generated. |
-| `web/src/generated/`, `web/src/api/` | The Overview and Settings areas, and typed clients for the generated routes. Generated. |
+| `web/src/generated/`, `web/src/api/` | The Overview and Settings areas, the Knowledge area when the Agent has knowledge, and typed clients for the generated routes. Generated. |
 | `web/src/blocks/task-runs.tsx` | TaskRuns, a building block: the Agent's Cayu tasks, one row per run (`GET /app/task-runs`). |
 | `web/src/agent/` | The Agent's own areas, and `index.tsx`, which lists them. Yours. |
 | `web/src/kit/shadcn/` | The component kit every page imports through `@kit`. Generated. |
 | `web/e2e/` | The smoke test: `cayu serve --dev` serves the app, and every area opens in a browser. Yours. |
 | `integrations/http/__init__.py` | The routes under `/app`. The Agent's own go on its `router`, behind the same sign-in. Yours. |
-| `integrations/http/generated/` | The routes the generated pages read: `/app/whoami`, `/app/settings`, `/app/overview`, `/app/task-runs` and `/app/inbox`. Generated. |
+| `integrations/http/generated/` | The routes the generated pages read: `/app/whoami`, `/app/settings`, `/app/overview`, `/app/task-runs` and `/app/inbox`, and `/app/knowledge` when the Agent has knowledge. Generated. |
 
 Every app has the generated Overview and Settings, and its navigation links to
 Cayu's Inbox (`/cayu/inbox`), where approvals and questions are decided, and to the
@@ -42,7 +42,9 @@ Developer dashboard. What `web/src/agent/` adds depends on the preset: the agent
 preset has Conversations, which start and continue the agent's sessions through
 Cayu's API at `/api`, and Task runs; coding and long-running have Task runs; with
 organizations it has Conversations and Members, scoped to the person's
-organizations (`cayu guide b2b`).
+organizations (`cayu guide b2b`). An Agent with the `knowledge` capability (the agent and
+coding presets, and the agent preset with organizations) also has the generated Knowledge
+area ([The Knowledge area](#the-knowledge-area)).
 
 After changing `web/src`, run `npm --prefix web ci` and `npm --prefix web run build`,
 and commit `web/static`, so running and deploying need no Node.
@@ -172,6 +174,40 @@ accepts an OIDC bearer token from API clients that send their own; the web app h
 OIDC sign-in in the browser. `[tool.cayu.serve].auth` is `OPERATOR_ONLY_AUTH`, which keeps
 the Developer dashboard and Cayu's `/api` for operators, so members reach their data
 only through `/app` (`cayu guide b2b`).
+
+### The Knowledge area
+
+The Knowledge area shows the app's people what the Agent knows, written for them rather
+than for its builders. `cayu new` adds it when the project has the `knowledge` capability:
+the page in `web/src/generated/knowledge/`, listed just before Settings, and its routes in
+`integrations/http/generated/knowledge.py`, which the Agent's router includes.
+
+- **What the Agent knows.** Its kept knowledge as plain statements, latest first, with a
+  search (`GET /app/knowledge?q=`, Cayu's keyword search, which matches whole words and
+  their other forms). Each says where it came from (a conversation, linked when the app has
+  Conversations; a document; a person) and when it was learned, and who corrected it.
+- **Waiting to be remembered.** What the Agent asked to remember that nobody has kept or
+  dropped yet (`GET /app/knowledge/suggestions`). These are the knowledge proposals in Cayu's
+  Inbox; each links to its record there, where it is kept or dropped.
+- **Correct and forget.** `POST /app/knowledge/correct` replaces a statement's text, which
+  stays kept and records who corrected it; where it was learned stays as it was.
+  `POST /app/knowledge/forget` archives it with who forgot it and why, as the Developer
+  dashboard's archive does, and the Agent stops finding and recalling it. Both name the
+  statement's `version`, so a statement that changed since the person read it answers 409.
+
+Who reads and changes what follows the app's people. In an operator app every operator
+reads, and Cayu Cloud's `admin` and `developer` (you, under `cayu serve --dev`) correct and
+forget (`operator_knowledge`). With organizations each member reads only their
+organizations' knowledge, through the same resource-access policy recall uses
+(`MembershipAccessPolicy(..., knowledge=True)`); an organization's admins correct and forget
+its statements, and nobody sees, corrects or forgets another organization's
+(`member_knowledge`). Members can't open Cayu's Inbox, so their suggestions don't link
+there: the Agent's operators keep or drop them. `tests/test_knowledge_area.py` checks each
+of these.
+
+The page shows no revisions, chunks, scores or recall evidence. The Developer dashboard
+(`/cayu/`) stays the full view of knowledge, for builders and operators. Both reads answer
+with `tagged_json` and the page follows them with `watchInterval`.
 
 ## Follow live sessions with client.js
 

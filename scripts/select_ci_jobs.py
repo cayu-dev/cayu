@@ -215,9 +215,12 @@ def _affects_dashboard(path: str) -> bool:
         + (
             "dashboard/",
             "src/cayu/artifacts/",
-            # The web app templates: the generic app and the layers on top of it.
+            # The web app templates: the generic app, the layers on top of it, and the
+            # committed build of each composition.
             "src/cayu/cli/templates/app_web/",
+            "src/cayu/cli/templates/app_web_builds/",
             "src/cayu/cli/templates/app_web_conversations/",
+            "src/cayu/cli/templates/app_web_knowledge/",
             "src/cayu/cli/templates/app_web_operators/",
             "src/cayu/cli/templates/app_web_organizations/",
             "src/cayu/core/",
