@@ -1129,6 +1129,10 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             and item.event.payload.get("release_action") == "discard"
             for item in releases
         )
+        if released:
+            # The saved record can outlive its allocation until a successor binds.
+            # Its exact discard release settles it regardless of the live allocation.
+            return None
         checkpoint = await self._session_store.load_checkpoint(session.id)
         # Teardown after a failed or interrupted run finalizes the binding and
         # disposes of its container before the session can be settled, for
@@ -1138,9 +1142,13 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         disposed = self._retired_disposal_matches(
             checkpoint, environment_name=name, allocation=record.get("allocation")
         )
-        if (released or disposed) and self._allocation_coordinator.receipt_from_checkpoint(
-            checkpoint, environment_name=name
-        ) is None:
+        if (
+            disposed
+            and self._allocation_coordinator.receipt_from_checkpoint(
+                checkpoint, environment_name=name
+            )
+            is None
+        ):
             reconnect, owner = _factory_reconnect_state_from_checkpoint(
                 checkpoint, environment_name=name
             )
@@ -1151,8 +1159,6 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         )
         if allocation is None or record.get("allocation") != allocation:
             raise RuntimeError("Terminal binding recovery conflicts with its live allocation.")
-        if released:
-            return None
         if record["execution_profile"] != execution_profile.fingerprint:
             raise RuntimeError("Terminal binding recovery conflicts with its invocation profile.")
         marker = {
