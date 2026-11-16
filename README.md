@@ -169,9 +169,20 @@ When PyPI has a newer Cayu release than the one installed, `cayu new` prints bot
 versions and the command that scaffolds with the latest release
 (`uvx --from 'cayu==X.Y.Z' cayu new ...` with your arguments). In a terminal it
 asks before continuing; otherwise it warns on stderr and continues, and `--json`
-adds a `newer_release` field. The check waits at most about two seconds, runs at
-most once a day, and stays silent when PyPI is unreachable. Set
-`CAYU_NO_VERSION_CHECK=1` to turn it off.
+adds a `newer_release` field.
+
+Every other `cayu` command, `cayu cloud` included, prints one line on stderr after
+its output when a newer release exists, at most once a day, for example
+`cayu 0.20.0 is available; you're running 0.16.1.`, followed by how to update for
+the way Cayu is installed: in a project that depends on Cayu, allow the release in
+`pyproject.toml` if its requirement excludes it (the pin stays yours to move), then
+`uv lock --upgrade-package cayu` and `uv sync`; `uv tool upgrade cayu`
+for a `uv tool` install, or `uvx cayu@latest` under `uvx`. It stays quiet when
+stderr is not a terminal, when `CI` is set, and when the command asks for JSON
+(`--json`, `--jsonl` or `--format json`), and never writes to stdout.
+
+The check waits at most about two seconds, asks PyPI at most once a day, and stays
+silent when PyPI is unreachable. Set `CAYU_NO_VERSION_CHECK=1` to turn it off.
 
 For a portable operator snapshot that performs no agent, tool, recovery, repair,
 or live-provider work, run `cayu doctor --bundle cayu-support.zip`. The

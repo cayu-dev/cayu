@@ -186,7 +186,7 @@ def test_cayu_new_behind_pypi_warns_and_continues_without_a_terminal(
     assert main(["new", "proj", "--dir", str(tmp_path), "--preset", "agent"]) == 0
 
     captured = capsys.readouterr()
-    assert "Cayu 0.14.0 is available; this is Cayu 0.8.1." in captured.err
+    assert "cayu 0.14.0 is available; you're running 0.8.1." in captured.err
     command = f"uvx --from 'cayu==0.14.0' cayu new proj --dir {tmp_path} --preset agent"
     assert f"  {command}\n" in captured.err
     assert "[y/N]" not in captured.err
@@ -210,7 +210,7 @@ def test_cayu_new_json_reports_the_newer_release(
             "--with knowledge --dry-run --json"
         ),
     }
-    assert "Cayu 0.14.0 is available" in captured.err
+    assert "cayu 0.14.0 is available" in captured.err
 
 
 @pytest.mark.parametrize("latest", ["0.8.1", "0.8.0", "0.15.0rc1", None])
@@ -302,7 +302,7 @@ def test_terminal_json_and_dry_run_never_prompt(
     assert main(["new", "other", "--dir", str(tmp_path), "--dry-run"]) == 0
 
     assert "[y/N]" not in stderr.getvalue()
-    assert stderr.getvalue().count("Cayu 0.14.0 is available") == 2
+    assert stderr.getvalue().count("cayu 0.14.0 is available") == 2
 
 
 @pytest.mark.parametrize("stream_name", ["stdin", "stderr"])

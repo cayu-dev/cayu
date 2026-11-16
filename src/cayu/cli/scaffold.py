@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast
+from typing import cast
 
 from cayu._operator_credentials import (
     ENVIRONMENT_OPERATOR_AUTH_TARGET,
@@ -41,7 +41,7 @@ from cayu.cli._guarded_tree_publication import (
     publish_guarded_tree,
 )
 from cayu.cli._identity import identity_markdown
-from cayu.cli._release_check import newer_release
+from cayu.cli._release_check import _is_terminal, describe_newer_release, newer_release
 from cayu.cli.scaffold_app_database import APP_DATABASE, app_database_files
 from cayu.cli.scaffold_ci import CI_WORKFLOW_PATH, ci_files, ci_guidance
 from cayu.cli.scaffold_convention import (
@@ -3872,13 +3872,6 @@ def _new_command_arguments(args: argparse.Namespace, *, name: str) -> list[str]:
     return arguments
 
 
-def _is_terminal(stream: TextIO | None) -> bool:
-    try:
-        return stream is not None and stream.isatty()
-    except (OSError, ValueError):
-        return False
-
-
 def _newer_release_notice(args: argparse.Namespace, *, name: str) -> dict[str, str] | None:
     """Warn on stderr when PyPI has a newer Cayu than the one scaffolding."""
 
@@ -3894,7 +3887,7 @@ def _newer_release_notice(args: argparse.Namespace, *, name: str) -> dict[str, s
     if sys.stderr is not None:
         with suppress(OSError, ValueError):
             print(
-                f"cayu new: Cayu {newer.latest} is available; this is Cayu {newer.installed}.\n"
+                f"cayu new: {describe_newer_release(newer)}\n"
                 f"To scaffold with the latest release, run in a POSIX shell:\n  {command}",
                 file=sys.stderr,
             )

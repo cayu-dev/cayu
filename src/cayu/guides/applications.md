@@ -21,6 +21,17 @@ output then includes `newer_release` with `installed`, `latest` and `command`.
 The check runs at most once a day, gives up after about two seconds, and is
 silent when PyPI is unreachable. `CAYU_NO_VERSION_CHECK=1` turns it off.
 
+Other `cayu` commands print `cayu X.Y.Z is available; you're running A.B.C.` on
+stderr after their output, at most once a day, with the update command for the
+install: in a uv project that depends on Cayu, allow the release in
+`pyproject.toml` if its requirement excludes it (a scaffolded project pins an
+exact version), then `uv lock --upgrade-package cayu` and `uv sync`;
+`uv tool upgrade cayu` for a `uv tool` install; `uvx cayu@latest`
+under `uvx`; otherwise a generic line. A project's pin is left as a choice to
+make, not an error. The notice is skipped when stderr is not a terminal, when `CI`
+is set, for JSON output (`--json`, `--jsonl`, `--format json`), and with
+`CAYU_NO_VERSION_CHECK=1`.
+
 ## Convention
 
 Normal agent, service, coding, and long-running presets share these ownership boundaries:

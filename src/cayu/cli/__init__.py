@@ -118,8 +118,30 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _newer_release_notice(arguments: list[str]) -> None:
+    # `cayu new` prints its own notice, with the command that scaffolds with the
+    # newer release, before it creates anything.
+    if arguments and arguments[0] == "new":
+        return
+    from cayu.cli._release_check import print_newer_release_notice
+
+    print_newer_release_notice(arguments)
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run one `cayu` command, then mention a newer release on stderr at most once a day."""
+
     arguments = sys.argv[1:] if argv is None else argv
+    try:
+        code = _run_command(arguments)
+    except SystemExit:
+        _newer_release_notice(arguments)
+        raise
+    _newer_release_notice(arguments)
+    return code
+
+
+def _run_command(arguments: list[str]) -> int:
     if arguments and arguments[0] == "cloud":
         from cayu.cli.cloud import run_cloud_cli
 
