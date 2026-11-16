@@ -197,7 +197,7 @@ from cayu.tasks.retry import (
     _task_retry_runtime_terminal_request,
 )
 from cayu.tasks.retry_budgets import enforce_task_event_deadline, reconcile_task_event_deadlines
-from cayu.tasks.store import TaskStore
+from cayu.tasks.store import TaskReclaimResult, TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationRequest,
@@ -925,11 +925,13 @@ async def run_task_worker(
                     raise_task_store_operation_failure(failure)
                 reclaimed = reclaim_outcome.result
                 del reclaim_outcome
-                reclaimed_count = 0 if reclaimed is None else len(reclaimed)
             else:
-                reclaimed_count = len(
-                    await task_store.reclaim_expired(query=query, **reclaim_bound)
-                )
+                reclaimed = await task_store.reclaim_expired(query=query, **reclaim_bound)
+            if isinstance(reclaimed, TaskReclaimResult):
+                # Count fences too: only released tasks appear in the result list.
+                reclaimed_count = reclaimed.processed_count
+            else:
+                reclaimed_count = 0 if reclaimed is None else len(reclaimed)
             # Reclamation has just recorded the fences of lost wake attempts.
             await _settle_wake_attempts_of_ended_tasks(app, task_store, worker_id)
             return reclaimed_count
@@ -953,8 +955,13 @@ async def run_task_worker(
                     poller.metrics.maintenance(reclaim=True)
                     # A full batch may leave more; an until-idle run reclaims them first.
                     reclaim_backlog = bool(reclaimed) and reclaimed >= _RECLAIM_BATCH_SIZE
-                    if until_idle is not None and reclaim_backlog:
-                        reclaim_cadence.expedite()
+                    if until_idle is not None:
+                        if reclaim_backlog:
+                            until_idle.maintenance_settled = False
+                            reclaim_cadence.expedite()
+                        if reclaimed:
+                            # Later batches can record fences after the startup scan.
+                            fenced_cadence.expedite()
                 changed = bool(reclaimed)
             if fenced_monitor is not None:
                 _, settled_fenced = await fenced_cadence.run_if_due(

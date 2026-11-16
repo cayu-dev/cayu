@@ -382,7 +382,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleWakeup,
     task_schedule_eligibility,
 )
-from cayu.tasks.store import TaskStore
+from cayu.tasks.store import TaskReclaimResult, TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
@@ -7539,7 +7539,10 @@ class SQLiteTaskStore(TaskStore):
                     self._record_task_transition_unlocked(task, updated)
                     reclaimed.append(updated)
                 self._connection.commit()
-                return [task.model_copy(deep=True) for task in reclaimed]
+                return TaskReclaimResult(
+                    (task.model_copy(deep=True) for task in reclaimed),
+                    processed_count=len(task_ids),
+                )
             except Exception:
                 self._connection.rollback()
                 raise

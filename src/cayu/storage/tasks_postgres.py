@@ -266,7 +266,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleWakeup,
     task_schedule_eligibility,
 )
-from cayu.tasks.store import TaskStore
+from cayu.tasks.store import TaskReclaimResult, TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
@@ -5735,7 +5735,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 await conn.rollback()
                 return []
             await conn.commit()
-        return [task.model_copy(deep=True) for task in reclaimed]
+        return TaskReclaimResult(
+            (task.model_copy(deep=True) for task in reclaimed),
+            processed_count=len(expired),
+        )
 
     # -- internal helpers -------------------------------------------------
 

@@ -583,3 +583,59 @@ def test_until_idle_keeps_reclaiming_when_reclaimed_tasks_cannot_run_yet(monkeyp
         assert result.handled == 3 and result.idle
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("reconcile", [False, True])
+def test_until_idle_finishes_later_reclaim_batches_and_scans_their_fences(
+    tmp_path, monkeypatch, backend, reconcile
+):
+    async def run():
+        monkeypatch.setattr(task_worker, "_RECLAIM_BATCH_SIZE", 2)
+        now = [datetime.now(UTC)]
+        store = (
+            InMemoryTaskStore(ownership_clock=lambda: now[0])
+            if backend == "memory"
+            else SQLiteTaskStore(tmp_path / "tasks.sqlite", ownership_clock=lambda: now[0])
+        )
+        app = CayuApp(task_store=store, enable_logging=False)
+        try:
+            for index in range(4):
+                await store.create_task(TaskCreate(task_id=f"lost-{index}", type="lost"))
+                claimed = await store.claim_task("dead-worker", lease_seconds=30)
+                assert claimed is not None and claimed.id == f"lost-{index}"
+                if index < 3:
+                    await store.mark_claimed_task_execution_started(
+                        claimed.id, "dead-worker", claim_generation=claimed.claim_generation
+                    )
+                now[0] += timedelta(milliseconds=1)
+            now[0] += timedelta(seconds=31)
+
+            async def handler(_app, task, worker_id):
+                assert task.id == "lost-3"
+                await complete_managed_task(store, task, worker_id, {})
+
+            result = await _until_idle(
+                app,
+                store,
+                handler,
+                "lost",
+                reconcile_abandoned_after_s=0 if reconcile else None,
+                recover_interrupted_handoffs=False,
+            )
+
+            assert result.handled == 1 and result.idle
+            assert not result.maintenance_required
+            assert result.attention_required is not reconcile
+            for index in range(3):
+                task = await store.load_task(f"lost-{index}")
+                assert task is not None
+                assert task.status is (TaskStatus.CANCELLED if reconcile else TaskStatus.CLAIMED)
+                if not reconcile:
+                    assert task.status_reason == "cancellation_requested"
+        finally:
+            await app.aclose()
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(run())

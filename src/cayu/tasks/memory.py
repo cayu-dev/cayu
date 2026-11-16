@@ -360,7 +360,7 @@ from cayu.tasks.scheduling import (
     TaskScheduleWakeup,
     task_schedule_eligibility,
 )
-from cayu.tasks.store import TaskStore
+from cayu.tasks.store import TaskReclaimResult, TaskStore
 from cayu.tasks.terminalization import (
     TaskTerminalizationConflict,
     TaskTerminalizationReceipt,
@@ -4774,7 +4774,7 @@ class InMemoryTaskStore(TaskStore):
                 )
                 self._store_task(updated)
                 reclaimed.append(updated.model_copy(deep=True))
-            return reclaimed
+            return TaskReclaimResult(reclaimed, processed_count=min(len(expired), max_reclaims))
 
     def _task_has_unsettled_local_execution_attempt(self, task_id: str) -> bool:
         task = self._tasks.get(task_id)

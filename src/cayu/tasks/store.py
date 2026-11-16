@@ -147,6 +147,19 @@ from cayu.tasks.work_receipts import (
 _DURABLE_WORKER_POLLER_REGISTRY_LOCK = Lock()
 
 
+class TaskReclaimResult(list[Task]):
+    """Released tasks, with the bounded pass's total progress including new fences.
+
+    List contents retain ``reclaim_expired``'s pending-only behavior. The
+    ``processed_count`` also counts started claims fenced instead of released,
+    so a short list does not incorrectly imply an exhausted maintenance pass.
+    """
+
+    def __init__(self, tasks: Iterable[Task], *, processed_count: int) -> None:
+        super().__init__(tasks)
+        self.processed_count = processed_count
+
+
 class TaskStore(ABC):
     """Persistent store for durable work items.
 
@@ -1677,4 +1690,9 @@ class TaskStore(ABC):
         query: TaskQuery | None = None,
         max_reclaims: int = 100,
     ) -> list[Task]:
-        """Return expired claimed task leases to pending."""
+        """Release unstarted expired claims and fence started claims.
+
+        ``max_reclaims`` bounds both kinds of transition. Return only tasks
+        released to pending, using ``TaskReclaimResult`` to report the total
+        processed count when started claims can consume slots in the batch.
+        """
