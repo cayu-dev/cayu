@@ -1,4 +1,4 @@
-"""Focused issue #529 tool durability boundary tests."""
+"""Focused tool durability boundary tests."""
 
 from __future__ import annotations
 

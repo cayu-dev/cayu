@@ -1151,7 +1151,7 @@ const NO_SNAPSHOTS: EnvironmentSummary["execution_snapshot_capability"] = {
 /** What differs from the default local environment, by environment name. */
 const ENVIRONMENT_PROFILES: Record<string, Partial<EnvironmentSummary>> = {
   checkout: {
-    metadata: { profile: "pr-checkout-v2", repository: "cayu-tech/cayu" },
+    metadata: { profile: "pr-checkout-v2", repository: "example/app" },
     workspace_id: "checkout-repo",
     runner_type: "DockerRunner",
     binding_type: "GitRepositoryBinding",

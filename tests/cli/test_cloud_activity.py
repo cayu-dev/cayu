@@ -16,10 +16,10 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_activity import _ago, read_activity_reader_status
 from cayu.cli._cloud_api import CloudApiClient
 
-_AGENT = "/v1/applications/cayu-scout"
+_AGENT = "/v1/applications/acme-scout"
 _STATUS = f"{_AGENT}/activity/reader"
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
+_AGENTS = httpx.Response(200, json={"items": [{"id": "acme-scout", "name": "Acme Scout"}]})
 
 
 def _reader(**changes: Any) -> dict[str, Any]:
@@ -95,7 +95,7 @@ def cloud(
 
 
 def _run(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
-    code = main(["cloud", "activity", "status", "--application", "Cayu Scout", *arguments])
+    code = main(["cloud", "activity", "status", "--application", "Acme Scout", *arguments])
     captured = capsys.readouterr()
     return code, captured.out, captured.err
 
@@ -110,7 +110,7 @@ def test_status_reads_the_reader_by_the_agents_name(cloud, capsys) -> None:
     assert answer["ok"] is True and answer["operation"] == "activity.status"
     result = answer["result"]
     assert result["schema_version"] == 1
-    assert result["application_id"] == "cayu-scout"
+    assert result["application_id"] == "acme-scout"
     assert result["reader"] == _reader()
     assert [request.url.raw_path.decode() for request in fake.requests][-1] == _STATUS
 
@@ -121,7 +121,7 @@ def test_status_table_says_where_the_reader_stands(cloud, capsys) -> None:
     code, out, _ = _run([], capsys)
 
     assert code == 0
-    assert out.startswith("Activity reader for cayu-scout\n")
+    assert out.startswith("Activity reader for acme-scout\n")
     lines = {line.split("  ", 2)[1].strip(): line for line in out.splitlines()[1:]}
     assert "after event 1234" in lines["cursor position"]
     assert "2026-11-06 10:00:00Z" in lines["cursor advanced"]
@@ -171,7 +171,7 @@ def test_an_agent_without_a_reader_says_so(cloud, capsys) -> None:
     code, out, _ = _run([], capsys)
 
     assert code == 0
-    assert out.strip() == "Cayu Cloud has no activity reader for cayu-scout yet."
+    assert out.strip() == "Cayu Cloud has no activity reader for acme-scout yet."
 
 
 def test_values_of_another_shape_never_reach_the_output(cloud, capsys) -> None:

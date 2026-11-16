@@ -14,9 +14,9 @@ from cayu.cli import _cloud_api, main
 from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient
 
-_SETTINGS = "/v1/applications/cayu-scout/settings"
+_SETTINGS = "/v1/applications/acme-scout/settings"
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
+_AGENTS = httpx.Response(200, json={"items": [{"id": "acme-scout", "name": "Acme Scout"}]})
 
 
 def _setting(
@@ -38,7 +38,7 @@ def _setting(
 
 def _document(revision: int = 17, **changes: object) -> dict[str, Any]:
     return {
-        "application_id": "cayu-scout",
+        "application_id": "acme-scout",
         "release_id": "rel_one",
         "revision": revision,
         "agent_settings": "published",
@@ -106,12 +106,12 @@ def cloud(
 
 
 def _json(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
-    code = main(["cloud", "settings", *arguments, "--application", "Cayu Scout", "--json"])
+    code = main(["cloud", "settings", *arguments, "--application", "Acme Scout", "--json"])
     return code, json.loads(capsys.readouterr().out)
 
 
 def _text(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
-    code = main(["cloud", "settings", *arguments, "--application", "cayu-scout"])
+    code = main(["cloud", "settings", *arguments, "--application", "acme-scout"])
     streams = capsys.readouterr()
     return code, streams.out, streams.err
 
@@ -135,7 +135,7 @@ def test_list_prints_each_settings_value_source_and_status(
 
     assert (code, err) == (0, "")
     lines = out.splitlines()
-    assert lines[0] == "Agent cayu-scout, Release rel_one, revision 17"
+    assert lines[0] == "Agent acme-scout, Release rel_one, revision 17"
     header = next(line for line in lines if line.startswith("SETTING"))
     assert header.split() == ["SETTING", "NAMESPACE", "VALUE", "SOURCE", "STATUS"]
     rows = {line.split()[0] + "/" + line.split()[1]: line.split() for line in lines[3:8]}
@@ -241,7 +241,7 @@ def test_set_repeats_a_given_operation_id_and_prints_a_summary(
     assert code == 0
     assert fake.sent("PUT")[0]["operation_id"] == "op_again"  # type: ignore[index]
     assert out.splitlines()[:2] == ["Set platform:web.sleep.", "Operation op_again."]
-    assert "Agent cayu-scout, Release rel_one, revision 18" in out
+    assert "Agent acme-scout, Release rel_one, revision 18" in out
 
 
 @pytest.mark.parametrize(
@@ -537,14 +537,14 @@ def test_set_names_an_item_that_does_not_fit_and_changes_nothing(
 def test_list_shortens_a_long_value_between_items_and_prints_it_whole_below(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    repositories = ",".join(f"cayu-tech/repository-{index}" for index in range(39))
+    repositories = ",".join(f"acme-corp/repository-{index}" for index in range(39))
     cloud({("GET", _SETTINGS): httpx.Response(200, json=_list_document(repositories))})
 
     code, out, _ = _text(["list"], capsys)
 
     assert code == 0
     row = next(line for line in out.splitlines() if line.startswith("app.repositories"))
-    assert "cayu-tech/repository-0, ... (+38 more)" in row
+    assert "acme-corp/repository-0, ... (+38 more)" in row
     below = out.split("agent:app.repositories:\n", 1)[1].split("\n\n", 1)[0]
     lines = below.splitlines()
     assert all(line.startswith("  ") and len(line) <= 100 for line in lines)

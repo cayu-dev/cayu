@@ -1,4 +1,4 @@
-"""Failed run outcomes keep exception-group leaves and cause chains (#2330)."""
+"""Failed run outcomes keep exception-group leaves and cause chains."""
 
 from __future__ import annotations
 

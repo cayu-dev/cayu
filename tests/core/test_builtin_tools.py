@@ -6552,7 +6552,7 @@ def test_command_policy_denial_resolves_once_inside_mixed_tool_round():
 
 
 def test_command_approval_member_is_distinct_from_tool_policy():
-    # #125 footgun 2: the command-policy approval member must NOT share a name OR a bare string with
+    # Footgun 2: the command-policy approval member must NOT share a name OR a bare string with
     # the tool-policy one. The tool-policy member creates a durable pause/resume checkpoint; the
     # command-policy one only refuses the command inline (no session pause).
     from cayu.tools.policy import ToolPolicyDecision

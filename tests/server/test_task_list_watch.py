@@ -22,7 +22,7 @@ def _passes():
             task_id="pass-cayu",
             type="shepherd_pass",
             input={
-                "repository": "cayu-tech/cayu",
+                "repository": "example/app",
                 "number": 217,
                 "dry_run": False,
                 "threshold": 0.00001,
@@ -33,7 +33,7 @@ def _passes():
         TaskCreate(
             task_id="pass-design",
             type="shepherd_pass",
-            input={"repository": "cayu-tech/cayu-design"},
+            input={"repository": "example/app-design"},
             metadata={"run": "round-1"},
         ),
         TaskCreate(
@@ -42,7 +42,7 @@ def _passes():
             input={"repository": "private-repository-canary"},
             metadata={"run": "round-2"},
         ),
-        TaskCreate(task_id="digest", type="digest", input={"repository": "cayu-tech/cayu"}),
+        TaskCreate(task_id="digest", type="digest", input={"repository": "example/app"}),
     ]
 
 
@@ -81,12 +81,12 @@ def _ids(response) -> set[str]:
 
 def test_input_and_metadata_filters_match_top_level_values(client):
     get = client.get
-    assert _ids(get("/api/tasks", params={"input": "repository=cayu-tech/cayu"})) == {
+    assert _ids(get("/api/tasks", params={"input": "repository=example/app"})) == {
         "pass-cayu",
         "digest",
     }
     assert _ids(
-        get("/api/tasks", params={"type": "shepherd_pass", "input": "repository=cayu-tech/cayu"})
+        get("/api/tasks", params={"type": "shepherd_pass", "input": "repository=example/app"})
     ) == {"pass-cayu"}
     # Numbers and booleans match their JSON text; several filters must all match.
     assert _ids(

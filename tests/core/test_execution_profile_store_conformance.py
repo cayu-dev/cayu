@@ -633,7 +633,7 @@ async def _close_store(store: SessionStore) -> None:
 
 
 class _LegacyExecutionProfileStore(InMemorySessionStore):
-    """Representative #903 custom store with the pre-#904 rejection signature."""
+    """Representative custom store with the older rejection signature."""
 
     invocation_lifecycle_command_version = 1
 

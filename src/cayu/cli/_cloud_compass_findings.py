@@ -151,8 +151,8 @@ def list_matching(
     the Agent's listing (``list_findings``).
 
     Both rank the findings the same way, so ``limit`` keeps the strongest either way. The
-    paged one also answers ``next_cursor``, but filters only by status and kind; and on a
-    Cloud from before cayu-cloud#969 its findings carry no ``score``, so with neither
+    paged one also answers ``next_cursor``, but filters only by status and kind; and on an
+    older Cloud its findings carry no ``score``, so with neither
     ``limit`` nor anything only it reads, the Agent's listing answers, with their scores, as
     before.
     """

@@ -1,6 +1,6 @@
-"""cayu-shepherd's `integrations/http/auth.py`, the rule `cayu.server.operator_sign_in` replaces.
+"""A real Agent's `integrations/http/auth.py`, the rule `cayu.server.operator_sign_in` replaces.
 
-cayu-shepherd copied it from cayu-scout and cut it down; cayu-herald carries the same rule.
+That Agent copied it from another Agent and cut it down; a third carries the same rule.
 It is kept here unchanged but for the generated `Person`, defined below instead of imported,
 so `test_operator_sign_in_shepherd.py` can show the part gives the same people the same access.
 """

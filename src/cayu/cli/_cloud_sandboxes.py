@@ -14,15 +14,15 @@ that still holds a place but was created for a Release the Agent no longer selec
 since that is what a redeploy leaves behind. `show` adds the sandbox's audit events.
 
 `list --session/--task/--label/--since` lists only the sandboxes created for that session or
-task, with those labels, or since then; Cloud filters and pages them (a Cloud before
-cayu-tech/cayu-cloud#766 would ignore the filters, so the command refuses to list
+task, with those labels, or since then; Cloud filters and pages them (an older Cloud that
+doesn't support sandbox filters would ignore them, so the command refuses to list
 there). Both commands also show what each sandbox did (`activity`: its commands, failed ones
 and their run time, and its file transfers in and out), and `list` the same summed over every
 sandbox that matches, which Cloud adds up; an older Cloud reports none.
 
 `archives` lists the copy-in archives Cloud keeps for the Agent so its next staged copy in of
-the same tree starts without an upload (`GET .../sandboxes/copy-archives`, from
-cayu-tech/cayu-cloud#970): each one's digest, size, status, last use and when it lapses. It
+the same tree starts without an upload (`GET .../sandboxes/copy-archives`, which an older
+Cloud doesn't have): each one's digest, size, status, last use and when it lapses. It
 pages with `--limit` and `--cursor`, and never shows where an archive is stored.
 
 These commands print a table by default; `--json` prints the JSON envelope the other `cayu
@@ -54,16 +54,14 @@ STATUSES = ("provisioning", "ready", "destroying", "destroyed", "failed")
 # once it is out of the queue.
 _HOLDING = frozenset({"provisioning", "ready", "destroying"})
 _SANDBOX_ID_LIMIT = 128
-# The Cloud change that filters the list and sums the activity.
-_FILTERS_CLOUD = "cayu-tech/cayu-cloud#766"
+# Shown in place of the activity when the Cloud is too old to filter and sum it.
+_ACTIVITY_UNREPORTED = "Activity: not reported; that needs a newer Cayu Cloud."
 # Cloud's bounds on a filter (`SandboxFilter`): a provenance id, and a label as a create sets it.
 _ID_LIMIT = 256
 _LABEL_KEY = re.compile(r"[a-z0-9_.-]{1,63}")
 _LABEL_VALUE_LIMIT = 200
 _LABEL_FILTER_LIMIT = 10
 _PROVENANCE = ("release_id", "session_id", "task_id")
-# The Cloud change that lists the copy-in archives an Agent keeps.
-_ARCHIVES_CLOUD = "cayu-tech/cayu-cloud#970"
 _CURSOR_LIMIT = 1024
 _ARCHIVE_FIELDS = (
     "id",
@@ -257,7 +255,7 @@ def sandboxes_command(
             raise CloudApiError(
                 "sandbox_filters_unsupported",
                 "This Cayu Cloud doesn't filter sandboxes by session, task, label or time; "
-                f"it needs {_FILTERS_CLOUD}. Update the install, or list without "
+                "that needs a newer Cayu Cloud. Update the install, or list without "
                 "--session, --task, --label and --since.",
             )
         found = page.get("items")
@@ -309,8 +307,8 @@ def _archives(
             if exc.status_code == 404:
                 raise CloudApiError(
                     "sandbox_archives_unsupported",
-                    "This Cayu Cloud doesn't list the copy-in archives it keeps; it needs "
-                    f"{_ARCHIVES_CLOUD}.",
+                    "This Cayu Cloud doesn't list the copy-in archives it keeps; that needs "
+                    "a newer Cayu Cloud.",
                     status_code=404,
                     code=exc.code,
                     request=exc.request,
@@ -474,8 +472,8 @@ def _sandbox_error(error: CloudApiError) -> CloudApiError:
 
     messages = {
         401: (
-            "Cayu Cloud didn't accept this login on the sandbox routes. A Cloud before "
-            "cayu-tech/cayu-cloud#679 lets only the Agent itself read them."
+            "Cayu Cloud didn't accept this login on the sandbox routes. An older Cayu Cloud "
+            "lets only the Agent itself read them."
         ),
         403: (
             "This login can't read the Agent's sandboxes: it needs to be one of the Agent's "
@@ -692,7 +690,7 @@ def _capacity_line(capacity: Mapping[str, Any] | None) -> str:
 
 def _activity_lines(activity: Mapping[str, Any] | None) -> list[str]:
     if activity is None:
-        return [f"  Activity: not reported; this Cayu Cloud needs {_FILTERS_CLOUD}."]
+        return [f"  {_ACTIVITY_UNREPORTED}"]
     commands = activity["commands"]
     inward = activity["transfers"]["in"]
     outward = activity["transfers"]["out"]
@@ -705,7 +703,7 @@ def _activity_lines(activity: Mapping[str, Any] | None) -> list[str]:
 
 def _totals_line(totals: Mapping[str, Any] | None) -> str:
     if totals is None:
-        return f"Activity: not reported; this Cayu Cloud needs {_FILTERS_CLOUD}."
+        return _ACTIVITY_UNREPORTED
     activity = totals["activity"]
     count = totals["sandboxes"]
     return (

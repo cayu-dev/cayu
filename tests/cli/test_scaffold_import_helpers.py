@@ -10,7 +10,7 @@ from cayu.cli import main
 from cayu.cli._import_helper_calls import MAX_HELPER_DEPTH
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 
-# cayu-scout's configuration/settings.py and agents/scout.py.
+# A real Agent's configuration/settings.py and agents/scout.py.
 _SCOUT_SETTINGS = '''"""Settings."""
 
 import os
@@ -19,9 +19,9 @@ import os
 def configured_reasoning_summaries() -> bool:
     """Whether OpenAI sessions ask for reasoning summaries."""
 
-    selected = os.environ.get("CAYU_SCOUT_REASONING_SUMMARIES", "off").strip().lower()
+    selected = os.environ.get("SCOUT_REASONING_SUMMARIES", "off").strip().lower()
     if selected not in ("on", "off"):
-        raise ValueError(f"CAYU_SCOUT_REASONING_SUMMARIES must be on or off, got {selected!r}")
+        raise ValueError(f"SCOUT_REASONING_SUMMARIES must be on or off, got {selected!r}")
     return selected == "on"
 
 
@@ -50,7 +50,7 @@ HUNTER = AgentSpec(
     system_prompt="Hunt.",
 )
 """
-# cayu-scout's operations/coding.py.
+# The same Agent's operations/coding.py.
 _SCOUT_EXCLUSIONS = """_FILE_PATTERNS = (".env", "*.pem", "credentials")
 _PATH_PATTERNS = (
     "data",

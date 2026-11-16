@@ -1161,7 +1161,7 @@ async def test_runtime_recovers_from_compressed_vertex_413_without_reading_body(
     ("error_type", "expected_public_type", "expected_retryable"),
     [
         pytest.param("UNAUTHENTICATED", "UNAUTHENTICATED", False, id="authentication"),
-        # Plain identifier-shaped types pass through (#1974).
+        # Plain identifier-shaped types pass through.
         pytest.param("FUTURE_STATUS", "FUTURE_STATUS", None, id="unknown"),
         pytest.param(True, None, None, id="boolean"),
         pytest.param("", None, None, id="blank"),

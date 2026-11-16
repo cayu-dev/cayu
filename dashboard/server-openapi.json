@@ -33149,7 +33149,7 @@
       },
       "MemoryVariantCostQualityReport": {
         "additionalProperties": false,
-        "description": "Canonical #300 evidence scoped to one candidate versus the baseline.",
+        "description": "Canonical cost-quality evidence scoped to one candidate versus the baseline.",
         "properties": {
           "candidate_variant_id": {
             "maxLength": 128,

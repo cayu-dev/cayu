@@ -1,4 +1,4 @@
-"""Credential-free allocation lifetime qualification for issue #1412."""
+"""Credential-free allocation lifetime qualification."""
 
 from __future__ import annotations
 

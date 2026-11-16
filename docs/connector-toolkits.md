@@ -331,7 +331,7 @@ false when `max_pages` (10) stopped it.
 - **Checks.** `PullChecks.ci` holds the head's check runs and commit statuses, each a
   `PullCheck` with its `conclusion` and `workflow_run` (a `CheckWorkflowRun`: its id and, from
   `read_pull`, the `attempt` the check ran in; None for a job a rerun of the failed jobs kept
-  from an earlier attempt). `reviewer_app="cayu-reviewer"` puts the check runs that App made in
+  from an earlier attempt). `reviewer_app="acme-reviewer"` puts the check runs that App made in
   `PullChecks.reviewer`, whatever they are named: a workflow job with the same name stays CI.
   `PullChecks.state`, over CI only, is `failed` when a finished check concluded other than
   `success`, `neutral` or `skipped`, even if some weren't read; else `unknown` when some weren't
@@ -498,7 +498,7 @@ from cayu.connectors import github
 app.register_agent(
     spec,
     tools=github.tools(
-        include_writes=True, repositories=["acme/widgets"], reviewer_app="cayu-reviewer"
+        include_writes=True, repositories=["acme/widgets"], reviewer_app="acme-reviewer"
     ),
     tool_policy=github.approval_policy(),
 )

@@ -1331,7 +1331,7 @@ def test_parallel_tool_policy_denials_emit_one_canonical_block_per_call():
 
 
 def test_parallel_tool_round_composes_with_tool_call_limit_and_usage_counting():
-    # Composition pin for issue #101's real-world trigger: a genuinely
+    # Composition pin for a real-world trigger: a genuinely
     # concurrent tool round under RunLimits. The whole round is gated against
     # limits BEFORE execution (mid-round re-evaluation is skipped), and the
     # usage summary must count every tool.call.started the parallel round

@@ -20,7 +20,7 @@ from cayu.connectors.github import pulls as github_pulls
 from cayu.connectors.github.testing import Call, FakeGitHub, reply
 
 REPO = "acme/widgets"
-BOT = "cayu-shepherd[bot]"
+BOT = "acme-shepherd[bot]"
 run = asyncio.run
 
 
@@ -643,19 +643,19 @@ def test_a_check_run_listing_reads_a_pulls_head_by_branch_and_reviews_by_author(
     fake = _fake()
     pull = fake.add_pull(REPO, 7, head_ref="scout/fix-7")
     fake.add_check_run(
-        REPO, pull.head_sha, "cayu-reviewer", app_slug="cayu-reviewer", output_title="5/5"
+        REPO, pull.head_sha, "acme-reviewer", app_slug="acme-reviewer", output_title="5/5"
     )
-    fake.add_review(REPO, 7, "cayu-reviewer[bot]", state="APPROVED", body="5/5")
+    fake.add_review(REPO, 7, "acme-reviewer[bot]", state="APPROVED", body="5/5")
     gh = fake.client()
 
     checks = run(gh.get(f"/repos/{REPO}/commits/scout/fix-7/check-runs"))
     reviews = run(gh.get(f"/repos/{REPO}/pulls/7/reviews"))
 
     assert [(c["app"]["slug"], c["output"]["title"]) for c in checks["check_runs"]] == [
-        ("cayu-reviewer", "5/5")
+        ("acme-reviewer", "5/5")
     ]
     assert [(r["user"]["login"], r["commit_id"]) for r in reviews] == [
-        ("cayu-reviewer[bot]", pull.head_sha)
+        ("acme-reviewer[bot]", pull.head_sha)
     ]
 
 
@@ -756,20 +756,20 @@ def test_a_commits_combined_status_takes_each_contexts_latest() -> None:
 
 def test_the_pull_request_read_model_reads_a_pull_from_the_fake() -> None:
     fake = _fake()
-    pull = fake.add_pull(REPO, 7, behind_by=2, labels=["ready"], author="cayu-scout[bot]")
+    pull = fake.add_pull(REPO, 7, behind_by=2, labels=["ready"], author="acme-scout[bot]")
     ci = fake.add_workflow_run(REPO, pull.head_sha, conclusion="failure")
     fake.add_check_run(REPO, pull.head_sha, "tests", run=ci, conclusion="failure")
     fake.add_status(REPO, pull.head_sha, "deploy", state="success")
-    fake.add_review(REPO, 7, "cayu-reviewer[bot]", state="APPROVED")
+    fake.add_review(REPO, 7, "acme-reviewer[bot]", state="APPROVED")
     fake.add_comment(REPO, 7, "Looks risky.", author="alice")
 
     facts = run(github_pulls.read_pull(fake.client(read_only=True), REPO, 7))
 
-    assert (facts.state, facts.labels, facts.author) == ("open", ("ready",), "cayu-scout[bot]")
+    assert (facts.state, facts.labels, facts.author) == ("open", ("ready",), "acme-scout[bot]")
     assert (facts.behind_by, facts.ahead_by, facts.gaps) == (2, 1, ())
     assert facts.checks.state == "failed"
     assert facts.checks.failed_names == ("tests",)
-    assert [review.author for review in facts.reviews] == ["cayu-reviewer[bot]"]
+    assert [review.author for review in facts.reviews] == ["acme-reviewer[bot]"]
     assert [comment.author for comment in facts.comments or ()] == ["alice"]
     assert not fake.unanswered
 
@@ -829,7 +829,7 @@ def test_the_pull_request_listing_reads_its_answer_from_on_graphql() -> None:
         "baseRefName": "main",
         "headRefName": "fix",
         "headRefOid": "a" * 40,
-        "author": {"__typename": "Bot", "login": "cayu-scout"},
+        "author": {"__typename": "Bot", "login": "acme-scout"},
         "mergedBy": None,
         "labels": {"nodes": [{"name": "ready"}]},
         "assignees": {"nodes": []},
@@ -847,6 +847,6 @@ def test_the_pull_request_listing_reads_its_answer_from_on_graphql() -> None:
 
     assert listed.complete
     assert [(p.number, p.author, p.labels) for p in listed.pulls] == [
-        (7, "cayu-scout[bot]", ("ready",))
+        (7, "acme-scout[bot]", ("ready",))
     ]
     assert not fake.unanswered

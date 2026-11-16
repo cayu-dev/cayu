@@ -9,7 +9,7 @@ for either, so one command serves both without routes or a client of its own:
 from cayu.storage import TaskListRequest, open_cloud_agent_readers
 from cayu.tasks.records import TaskStatus
 
-async with open_cloud_agent_readers("cayu-herald") as agent:
+async with open_cloud_agent_readers("acme-herald") as agent:
     rows = await agent.tasks.list_tasks(
         TaskListRequest(type="digest", status=TaskStatus.COMPLETED, limit=1)
     )

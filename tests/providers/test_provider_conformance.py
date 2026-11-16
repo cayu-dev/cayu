@@ -1431,7 +1431,7 @@ async def test_cache_conformance_allows_scheduling_delay(registration, monkeypat
 
 # Providers send only the leading system run in their system/instructions
 # field. A later system message stays in place, so a request whose trailing
-# system message changes on every turn keeps an append-only prefix (#2289).
+# system message changes on every turn keeps an append-only prefix.
 _BLOCK_TURN_REGISTRATIONS = {
     registrations_module.ANTHROPIC,
     registrations_module.VERTEX,

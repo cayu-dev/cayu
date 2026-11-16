@@ -76,7 +76,7 @@ class PeerContentUnavailable(PermissionError):
 
 @runtime_checkable
 class PeerContentExposureReceiver(Protocol):
-    """Registered #1763 owner for current, revocable provider disclosure."""
+    """Registered owner for current, revocable provider disclosure."""
 
     def acquire_peer_exposures(
         self,
@@ -114,7 +114,7 @@ class PeerContentExposureReceiver(Protocol):
 
 
 class PeerContentAppendAuthorization(ContractValue):
-    """Typed evidence returned by the registered #1763 export owner."""
+    """Typed evidence returned by the registered export owner."""
 
     source_export_receipt_id: Identifier
     producer_receipt_id: Identifier
@@ -125,7 +125,7 @@ class PeerContentAppendAuthorization(ContractValue):
 
 
 class RegisteredPeerContentExposureReceiver:
-    """Adapter from the registered #1763 policy to peer exposure.
+    """Adapter from the registered disclosure policy to peer exposure.
 
     This adapter has no authorization of its own. It delegates to the
     registered policy hook, whose default implementation denies the operation.

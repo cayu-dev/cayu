@@ -1,4 +1,4 @@
-"""Per-provider placement of non-leading system messages (#2289).
+"""Per-provider placement of non-leading system messages.
 
 The shared conformance suite proves append-only prefixes for every built-in
 provider. These tests pin each provider's exact wire mapping, the

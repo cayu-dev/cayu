@@ -722,7 +722,7 @@ def _deterministic_workspace_manifest_bytes(
 
 
 def _deterministic_workspace_manifest_revision(encoded: bytes) -> str:
-    """Return the #909 revision identity for canonical manifest bytes."""
+    """Return the deterministic revision identity for canonical manifest bytes."""
 
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 

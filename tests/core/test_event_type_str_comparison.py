@@ -1,4 +1,4 @@
-"""Regression guard for #125 footgun 1: EventType is a StrEnum — compare with ==, never is.
+"""Regression guard for footgun 1: EventType is a StrEnum — compare with ==, never is.
 
 A known event type validates back to the enum member through the ``Event`` model (so cayu's own
 store-sourced comparisons work), but an event deserialized from JSON elsewhere (webhook / SSE /
@@ -33,7 +33,7 @@ def test_event_type_known_string_coerces_to_enum_through_the_model() -> None:
 
 
 def test_store_round_tripped_failure_event_is_detected(tmp_path: Path) -> None:
-    # #125 footgun-1 acceptance: persist a session.failed event, reload it from the SQLite store,
+    # Footgun-1 acceptance: persist a session.failed event, reload it from the SQLite store,
     # and assert detection succeeds. `_event_from_row` rebuilds via the Event model, so its
     # validator coerces `.type` back to the enum member — the round-trip itself is safe (both `==`
     # and `is` match). This pins that the store path is NOT where the footgun bites.

@@ -49,7 +49,7 @@ def volume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def cloud(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str, Any]]:
-    """A fake Cayu Cloud whose Agent `cayu-scout` serves Cayu at `/cayu/`.
+    """A fake Cayu Cloud whose Agent `acme-scout` serves Cayu at `/cayu/`.
 
     ``state["agent"]`` answers the Agent's requests and ``state["agent_requests"]`` records
     them, with their query strings.
@@ -62,12 +62,12 @@ def cloud(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[dict[str,
             target = urlsplit(self.path)
             origin = f"http://{self.headers['Host']}"
             cloud_answers = {
-                "/v1/applications": {"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]},
-                "/v1/applications/cayu-scout/service": {
+                "/v1/applications": {"items": [{"id": "acme-scout", "name": "Acme Scout"}]},
+                "/v1/applications/acme-scout/service": {
                     "status": "running",
                     "cayu_url": f"{origin}/cayu/",
                 },
-                "/v1/applications/cayu-scout/operator-credentials": {
+                "/v1/applications/acme-scout/operator-credentials": {
                     "username": "operator",
                     "password": _OPERATOR_PASSWORD,
                     "env": {"username": "U", "password": "P"},
@@ -140,7 +140,7 @@ def _assert_private_text_absent(*texts: str) -> None:
 
 
 def test_cat_prints_a_runs_file(served: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
-    code, out, err = _data(capsys, "cat", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, err = _data(capsys, "cat", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 0, err
     assert out.encode() == _RUN
@@ -161,11 +161,11 @@ def test_cat_prints_a_runs_file(served: dict[str, Any], capsys: pytest.CaptureFi
 def test_paths_out_of_the_volume_are_refused(
     served: dict[str, Any], capsys: pytest.CaptureFixture[str], path: str, reason: str
 ) -> None:
-    code, out, err = _data(capsys, "cat", "--application", "cayu-scout", path)
+    code, out, err = _data(capsys, "cat", "--application", "acme-scout", path)
 
     assert code == 2
     assert out == ""
-    assert err.startswith("Error: The Agent cayu-scout rejected the data volume file request: ")
+    assert err.startswith("Error: The Agent acme-scout rejected the data volume file request: ")
     assert reason in err
     _assert_private_text_absent(out, err)
 
@@ -173,7 +173,7 @@ def test_paths_out_of_the_volume_are_refused(
 def test_ls_lists_a_directory_and_pages_on(
     served: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, out, _ = _data(capsys, "ls", "--application", "cayu-scout", "scout/runs/RUN")
+    code, out, _ = _data(capsys, "ls", "--application", "acme-scout", "scout/runs/RUN")
 
     assert code == 0
     lines = out.splitlines()
@@ -183,7 +183,7 @@ def test_ls_lists_a_directory_and_pages_on(
         ["file", "run.json"],
     ]
 
-    code, out, _ = _data(capsys, "ls", "--application", "cayu-scout", "--limit", "1", "--json")
+    code, out, _ = _data(capsys, "ls", "--application", "acme-scout", "--limit", "1", "--json")
     envelope = json.loads(out)
     assert code == 0
     assert envelope["ok"] is True
@@ -191,14 +191,14 @@ def test_ls_lists_a_directory_and_pages_on(
     assert [entry["name"] for entry in envelope["result"]["entries"]] == ["scout"]
     assert envelope["result"]["next_after"] is None
 
-    code, out, _ = _data(capsys, "ls", "--application", "cayu-scout", "scout", "--limit", "1")
+    code, out, _ = _data(capsys, "ls", "--application", "acme-scout", "scout", "--limit", "1")
     assert out.splitlines()[-1] == "More entries follow; go on with --after escape."
 
 
 def test_stat_describes_an_entry(
     served: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, out, _ = _data(capsys, "stat", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, _ = _data(capsys, "stat", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 0
     assert out.startswith(f"scout/runs/RUN/run.json: file, {len(_RUN)} bytes, modified ")
@@ -207,14 +207,14 @@ def test_stat_describes_an_entry(
 def test_get_downloads_a_file_and_never_replaces_one_silently(
     served: dict[str, Any], capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    code, out, _ = _data(capsys, "get", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, _ = _data(capsys, "get", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 0
     assert out.strip() == f"Wrote run.json ({len(_RUN)} bytes)."
     assert (tmp_path / "run.json").read_bytes() == _RUN
 
     (tmp_path / "run.json").write_text("kept")
-    code, _, err = _data(capsys, "get", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, _, err = _data(capsys, "get", "--application", "acme-scout", "scout/runs/RUN/run.json")
     assert code == 2
     assert "run.json exists; pass --force" in err
     assert (tmp_path / "run.json").read_text() == "kept"
@@ -223,7 +223,7 @@ def test_get_downloads_a_file_and_never_replaces_one_silently(
         capsys,
         "get",
         "--application",
-        "cayu-scout",
+        "acme-scout",
         "scout/runs/RUN/run.json",
         "--force",
         "--json",
@@ -250,7 +250,7 @@ def test_get_never_replaces_a_file_that_appears_during_the_download(
         return forward(authorization, target)
 
     served["agent"] = meanwhile
-    code, _, err = _data(capsys, "get", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, _, err = _data(capsys, "get", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 2
     assert "run.json exists; pass --force" in err
@@ -275,7 +275,7 @@ def test_get_works_where_the_file_system_has_no_hard_links(
 ) -> None:
     _without_hard_links(monkeypatch)
 
-    code, out, err = _data(capsys, "get", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, err = _data(capsys, "get", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 0, err
     assert out.strip() == f"Wrote run.json ({len(_RUN)} bytes)."
@@ -298,7 +298,7 @@ def test_without_hard_links_get_still_never_replaces_a_file_that_appears(
         return forward(authorization, target)
 
     served["agent"] = meanwhile
-    code, _, err = _data(capsys, "get", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, _, err = _data(capsys, "get", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 2
     assert "run.json exists; pass --force" in err
@@ -308,7 +308,7 @@ def test_without_hard_links_get_still_never_replaces_a_file_that_appears(
 def test_get_downloads_a_directory_as_an_archive(
     served: dict[str, Any], capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    code, out, _ = _data(capsys, "get", "--application", "cayu-scout", "scout/")
+    code, out, _ = _data(capsys, "get", "--application", "acme-scout", "scout/")
 
     assert code == 0
     assert out.splitlines() == [
@@ -333,7 +333,7 @@ def test_cat_refuses_a_file_past_its_bound(
 ) -> None:
     monkeypatch.setattr(_cloud_data, "MAX_CAT_BYTES", 8)
 
-    code, out, err = _data(capsys, "cat", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, err = _data(capsys, "cat", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 2
     assert out == ""
@@ -357,7 +357,7 @@ def test_a_file_that_changes_between_parts_is_refused(
         return answer
 
     served["agent"] = growing
-    code, out, err = _data(capsys, "cat", "--application", "cayu-scout", "scout/runs/RUN/run.json")
+    code, out, err = _data(capsys, "cat", "--application", "acme-scout", "scout/runs/RUN/run.json")
 
     assert code == 2
     assert out == ""
@@ -374,11 +374,11 @@ def test_a_terminal_gets_text_only_with_controls_escaped(
     (volume / "scout" / "image.bin").write_bytes(b"\x89PNG\xff\xfe")
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
-    code, out, _ = _data(capsys, "cat", "--application", "cayu-scout", "scout/colored.txt")
+    code, out, _ = _data(capsys, "cat", "--application", "acme-scout", "scout/colored.txt")
     assert code == 0
     assert out == "red \\x1b[31mtext\\x1b[0m\n"
 
-    code, out, err = _data(capsys, "cat", "--application", "cayu-scout", "scout/image.bin")
+    code, out, err = _data(capsys, "cat", "--application", "acme-scout", "scout/image.bin")
     assert code == 2
     assert out == ""
     assert "isn't UTF-8 text, so it isn't printed to a terminal" in err
@@ -393,13 +393,13 @@ def test_an_agent_on_an_older_cayu_is_unsupported(
         return 404, {"detail": "Not Found"}
 
     cloud["agent"] = older
-    code, out, _ = _data(capsys, "ls", "--application", "cayu-scout", "--json")
+    code, out, _ = _data(capsys, "ls", "--application", "acme-scout", "--json")
 
     error = json.loads(out)["error"]
     assert code == 2
     assert error["category"] == "unsupported"
     assert error["message"] == (
-        "The Agent cayu-scout runs a Cayu that can't read its data volume. Deploy a release "
+        "The Agent acme-scout runs a Cayu that can't read its data volume. Deploy a release "
         "built with this CLI's Cayu version or newer, then try again."
     )
 
@@ -419,7 +419,7 @@ def test_an_agent_without_a_data_volume_says_how_to_get_one(
             return response.status_code, response.json()
 
         cloud["agent"] = forward
-        code, out, _ = _data(capsys, "stat", "--application", "cayu-scout", "scout", "--json")
+        code, out, _ = _data(capsys, "stat", "--application", "acme-scout", "scout", "--json")
 
     error = json.loads(out)["error"]
     assert code == 2
@@ -445,7 +445,7 @@ def test_the_local_name_comes_from_the_requested_path(
 ) -> None:
     _tamper_archive(served, name="../../escaped.tar.gz")
 
-    code, _, err = _data(capsys, "get", "--application", "cayu-scout", "scout")
+    code, _, err = _data(capsys, "get", "--application", "acme-scout", "scout")
 
     assert code == 0, err
     assert (tmp_path / "scout.tar.gz").is_file()
@@ -457,7 +457,7 @@ def test_an_unreadable_archive_writes_nothing(
 ) -> None:
     _tamper_archive(served, content_base64="%%%")
 
-    code, _, err = _data(capsys, "get", "--application", "cayu-scout", "scout")
+    code, _, err = _data(capsys, "get", "--application", "acme-scout", "scout")
 
     assert code == 2
     assert "content that isn't base64" in err

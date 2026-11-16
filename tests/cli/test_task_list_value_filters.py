@@ -22,19 +22,19 @@ def _tasks() -> list[TaskCreate]:
         TaskCreate(
             task_id="pass-cayu",
             type="shepherd_pass",
-            input={"repository": "cayu-tech/cayu", "number": 217, "dry_run": False},
+            input={"repository": "example/app", "number": 217, "dry_run": False},
             metadata={"run": "round-1"},
         ),
         TaskCreate(
             task_id="pass-design",
             type="shepherd_pass",
-            input={"repository": "cayu-tech/cayu-design", "number": 3},
+            input={"repository": "example/app-design", "number": 3},
             metadata={"run": "round-1"},
         ),
         TaskCreate(
             task_id="pass-later",
             type="shepherd_pass",
-            input={"repository": "cayu-tech/cayu", "number": 218},
+            input={"repository": "example/app", "number": 218},
             metadata={"run": "round-2"},
         ),
         # A value under a sensitive key is hidden in the detail, so it selects nothing.
@@ -68,7 +68,7 @@ def _list(capsys: pytest.CaptureFixture[str], database: Path, *arguments: str) -
 def test_input_metadata_and_run_select_tasks_by_value(
     database: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _list(capsys, database, "--input", "repository=cayu-tech/cayu") == [
+    assert _list(capsys, database, "--input", "repository=example/app") == [
         "pass-cayu",
         "pass-later",
     ]
@@ -76,7 +76,7 @@ def test_input_metadata_and_run_select_tasks_by_value(
     assert _list(capsys, database, "--metadata", "run=round-2") == ["pass-later"]
     # Every filter must match; numbers match by value and booleans as true or false.
     assert _list(
-        capsys, database, "--input", "repository=cayu-tech/cayu", "--input", "number=217.0"
+        capsys, database, "--input", "repository=example/app", "--input", "number=217.0"
     ) == ["pass-cayu"]
     assert _list(capsys, database, "--input", "dry_run=false") == ["pass-cayu"]
     assert _list(capsys, database, "--input", "api_token=token-canary") == []
@@ -85,11 +85,11 @@ def test_input_metadata_and_run_select_tasks_by_value(
 def test_value_filters_page_through_the_matching_tasks(
     database: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    first = _list(capsys, database, "--input", "repository=cayu-tech/cayu", "--limit", "1")
+    first = _list(capsys, database, "--input", "repository=example/app", "--limit", "1")
     second = _list(
         capsys,
         database,
-        *("--input", "repository=cayu-tech/cayu", "--limit", "1", "--offset", "1"),
+        *("--input", "repository=example/app", "--limit", "1", "--offset", "1"),
     )
 
     assert sorted(first + second) == ["pass-cayu", "pass-later"]
@@ -133,10 +133,10 @@ def test_store_and_server_readers_select_the_same_tasks(database: Path) -> None:
     from cayu.server import create_server
 
     requests = [
-        TaskListRequest(input={"repository": "cayu-tech/cayu"}),
+        TaskListRequest(input={"repository": "example/app"}),
         TaskListRequest(metadata={"run": "round-1"}, types=("shepherd_pass",)),
         TaskListRequest(input={"number": "3"}, metadata={"run": "round-1"}),
-        TaskListRequest(input={"repository": "cayu-tech/cayu"}, limit=1, offset=1),
+        TaskListRequest(input={"repository": "example/app"}, limit=1, offset=1),
     ]
 
     async def read() -> list[tuple[list[str], list[str]]]:

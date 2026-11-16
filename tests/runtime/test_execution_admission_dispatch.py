@@ -492,8 +492,8 @@ async def _run(app: CayuApp, session_id: str) -> list[Event]:
 def test_tool_alternatives_use_common_public_run_admission(
     monkeypatch: pytest.MonkeyPatch, proof: str, admitted: bool
 ) -> None:
-    # #860 owns admission of the real public declaration. Native dispatch and
-    # conformance belong to #555; this bounded evidence fixture does not claim
+    # Admission of the real public declaration, native dispatch and conformance
+    # are covered elsewhere; this bounded evidence fixture does not claim
     # to execute a production native backend.
     executable = ToolExecutableRequirement(executable="rg")
 

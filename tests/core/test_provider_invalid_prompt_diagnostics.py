@@ -50,7 +50,7 @@ def test_invalid_prompt_survives_provider_projection(subscription, event_type):
     assert failure["provider_error_code"] == "invalid_prompt"
     assert failure["provider_error_type"] == "invalid_request_error"
     assert failure["retryable"] is False
-    # The provider's message is public (#1974); a request ID that is not a plain
+    # The provider's message is public; a request ID that is not a plain
     # identifier and the request parameter are not.
     assert failure["error"].endswith("private prompt text")
     assert "request_id" not in failure

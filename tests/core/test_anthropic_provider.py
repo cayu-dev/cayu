@@ -1296,7 +1296,7 @@ async def test_runtime_recovers_from_anthropic_413_without_requiring_body_identi
             False,
             id="authentication",
         ),
-        # Plain identifier-shaped types pass through (#1974).
+        # Plain identifier-shaped types pass through.
         pytest.param("future_error", "future_error", None, id="unknown"),
         pytest.param(True, None, None, id="boolean"),
         pytest.param("", None, None, id="blank"),

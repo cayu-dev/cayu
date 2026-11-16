@@ -23,7 +23,7 @@ _RUNTIME = {
     "version": "0.16.1",
     "read_from": "uv.lock",
     "lock_digest": "sha256:" + "a" * 64,
-    "source": {"kind": "git", "url": "https://github.com/cayu-tech/cayu", "commit": "3f2a" * 10},
+    "source": {"kind": "git", "url": "https://github.com/example/app", "commit": "3f2a" * 10},
 }
 
 
@@ -118,7 +118,7 @@ def test_show_prints_the_selected_release_and_what_is_pending(
     assert "Selected at: 2026-10-28 21:03Z" in out
     assert f"Source: https://github.com/acme/my-agent @ {'b' * 40}" in out
     assert "Cayu runtime: cayu 0.16.1" in out
-    assert "Cayu installed from: git https://github.com/cayu-tech/cayu @ 3f2a3f2a3f2a" in out
+    assert "Cayu installed from: git https://github.com/example/app @ 3f2a3f2a3f2a" in out
     pending = out.split("Candidate or in-flight releases:")[1]
     assert "dep_next" in pending and "in-flight" in pending
     assert "dep_staged" in pending and "candidate" in pending

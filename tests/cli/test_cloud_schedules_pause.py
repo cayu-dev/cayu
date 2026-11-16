@@ -15,11 +15,11 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_project import CloudProjectManifest
 
-_APP = "/v1/applications/cayu-scout"
+_APP = "/v1/applications/acme-scout"
 # The Organization `tests/cli/conftest.py` says a change acts in.
 _ORGANIZATION = {"api_url": "https://cloud.example", "id": "org_test", "name": "Test Organization"}
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
+_AGENTS = httpx.Response(200, json={"items": [{"id": "acme-scout", "name": "Acme Scout"}]})
 
 
 class _Cloud:
@@ -76,7 +76,7 @@ def test_service_pause_and_resume_answer_the_service(
     }
     fake = cloud({("POST", f"{_APP}/service/{action}"): httpx.Response(200, json=service)})
 
-    code, output = _run(["service", action, "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", action, "--application", "acme-scout"], capsys)
 
     assert code == 0
     assert output["operation"] == f"service.{action}"
@@ -88,7 +88,7 @@ def test_service_status_shows_paused(cloud, capsys: pytest.CaptureFixture[str]) 
     service = {"status": "running", "paused": True, "paused_at": "2026-10-26T18:00:00Z"}
     cloud({("GET", f"{_APP}/service"): httpx.Response(200, json=service)})
 
-    code, output = _run(["service", "status", "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", "status", "--application", "acme-scout"], capsys)
 
     assert code == 0
     assert output["result"]["paused"] is True
@@ -99,7 +99,7 @@ def test_service_pause_on_a_cloud_without_it_says_so(
 ) -> None:
     cloud({("POST", f"{_APP}/service/pause"): httpx.Response(404, json={"detail": "Not Found"})})
 
-    code, output = _run(["service", "pause", "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", "pause", "--application", "acme-scout"], capsys)
 
     assert code == 2
     assert output["error"] == {
@@ -114,7 +114,7 @@ def test_service_pause_conflict_carries_clouds_reason(
     reason = "Agent service is being deleted."
     cloud({("POST", f"{_APP}/service/pause"): httpx.Response(409, json={"detail": reason})})
 
-    code, output = _run(["service", "pause", "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", "pause", "--application", "acme-scout"], capsys)
 
     assert code == 2
     assert output["error"]["message"] == f"Cayu Cloud API returned HTTP 409: {reason}"
@@ -124,7 +124,7 @@ def test_schedule_run_sends_the_input_and_answers_the_run(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
     run = {
-        "application_id": "cayu-scout",
+        "application_id": "acme-scout",
         "deployment_id": "dep_one",
         "input_overridden": True,
         "run": "task-1",
@@ -139,7 +139,7 @@ def test_schedule_run_sends_the_input_and_answers_the_run(
             "run",
             "scout",
             "--application",
-            "cayu-scout",
+            "acme-scout",
             "--input",
             '{"prompt": "Look again", "limit": 3}',
         ],
@@ -163,7 +163,7 @@ def test_schedule_run_without_input_sends_no_body(
         {("POST", f"{_APP}/schedules/scout/run"): httpx.Response(202, json={"run": "task-2"})}
     )
 
-    code, _ = _run(["schedule", "run", "scout", "--application", "cayu-scout"], capsys)
+    code, _ = _run(["schedule", "run", "scout", "--application", "acme-scout"], capsys)
 
     assert code == 0
     assert fake.requests[-1].content == b""
@@ -178,7 +178,7 @@ def test_schedule_run_reports_an_unknown_schedule(
     }
     cloud({("POST", f"{_APP}/schedules/nightly/run"): httpx.Response(404, json={"detail": detail})})
 
-    code, output = _run(["schedule", "run", "nightly", "--application", "cayu-scout"], capsys)
+    code, output = _run(["schedule", "run", "nightly", "--application", "acme-scout"], capsys)
 
     assert code == 2
     assert output["error"]["code"] == "schedule_not_found"
@@ -193,7 +193,7 @@ def test_schedule_run_refuses_bad_input_before_calling_cloud(
     capsys: pytest.CaptureFixture[str], value: str, reason: str
 ) -> None:
     code, output = _run(
-        ["schedule", "run", "scout", "--application", "cayu-scout", "--input", value], capsys
+        ["schedule", "run", "scout", "--application", "acme-scout", "--input", value], capsys
     )
 
     assert code == 2
@@ -203,8 +203,8 @@ def test_schedule_run_refuses_bad_input_before_calling_cloud(
 
 _MANIFEST = """
 schema_version = 2
-application = "cayu-scout"
-name = "Cayu Scout"
+application = "acme-scout"
+name = "Acme Scout"
 version = "0.1.0"
 entrypoint = "python -m scout"
 capabilities = ["model.generate"]
@@ -273,7 +273,7 @@ def test_service_status_warns_about_tasks_held_by_a_stopped_worker(
     service = {"status": "running", "task_health": task_health}
     cloud({("GET", f"{_APP}/service"): httpx.Response(200, json=service)})
 
-    code, output = _run(["service", "status", "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", "status", "--application", "acme-scout"], capsys)
 
     assert code == 0
     assert output["result"]["task_health"] == task_health
@@ -303,7 +303,7 @@ def test_service_status_says_nothing_without_fenced_tasks(
         }
     )
 
-    code, output = _run(["service", "status", "--application", "cayu-scout"], capsys)
+    code, output = _run(["service", "status", "--application", "acme-scout"], capsys)
 
     assert code == 0
     assert "warnings" not in output

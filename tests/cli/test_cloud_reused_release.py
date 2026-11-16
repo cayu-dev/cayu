@@ -3,7 +3,7 @@
 Cloud answers an unchanged-source deploy with the Release it already built. When that
 Release was promoted long ago, no promotion finalizer is going to publish it again, so
 the deploy must either start the Agent service itself or say why it can't, instead of
-polling a missing service until the wait expires (cayu#2256).
+polling a missing service until the wait expires.
 """
 
 from __future__ import annotations
@@ -371,8 +371,8 @@ def test_promoted_retry_found_from_a_failed_original_is_treated_as_reused(
 def test_unchanged_source_says_which_release_already_has_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # cayu#3120: the Agent's selected Release already has this source and its web process
-    # sleeps, as on staging on 27 Oct. The deploy says so and returns without waiting.
+    # The Agent's selected Release already has this source and its web process sleeps.
+    # The deploy says so and returns without waiting.
     client = ReusingCloud(
         service={"deployment_id": "dep_existing", "issues": [], "status": "sleeping"}
     )

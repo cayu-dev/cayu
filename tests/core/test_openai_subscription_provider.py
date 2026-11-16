@@ -803,7 +803,7 @@ async def test_subscription_runtime_keeps_known_permanent_sse_errors_terminal(
     assert model_error.payload["status_code"] == status_code
     assert model_error.payload["retryable"] is False
     assert model_error.payload["provider_error_type"] == error_type
-    # The backend's own message is shown once credentials are redacted (#1974).
+    # The backend's own message is shown once credentials are redacted.
     assert model_error.payload["error"] == "OpenAI streaming error: raw permanent provider detail"
     assert events[-1].type == EventType.SESSION_FAILED
 

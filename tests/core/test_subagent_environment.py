@@ -1,4 +1,4 @@
-"""SubagentSpec.environment_name places a child in its own environment (#2288)."""
+"""SubagentSpec.environment_name places a child in its own environment."""
 
 from __future__ import annotations
 

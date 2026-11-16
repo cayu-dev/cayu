@@ -1,8 +1,8 @@
 """Time the Developer dashboard's task reads on a production-sized task store.
 
 Run with ``uv run python scripts/benchmark_task_index_reads.py``. It builds a SQLite
-task store of ``--tasks`` tasks (150,000 by default) shaped like review.cayu.ai's:
-most tasks finished, a third of them Cayu's own, a handful of types and agents,
+task store of ``--tasks`` tasks (150,000 by default) shaped like a production code-review
+Agent's: most tasks finished, a third of them Cayu's own, a handful of types and agents,
 graph prerequisites on some, spread over 60 days. ``--postgres DSN`` builds it in
 an empty PostgreSQL database instead, and ``--store PATH`` reads an existing SQLite
 task store (migrated in place, so pass a copy).
@@ -107,7 +107,7 @@ async def _templates(store) -> list[Task]:
                     type=task_type,
                     title=f"Template {task_type}",
                     description="Review a pull request and report what needs fixing.",
-                    input={"repository": "cayu-tech/example", "pull_request": index},
+                    input={"repository": "example/app", "pull_request": index},
                     metadata={"source": "benchmark"},
                 )
             )

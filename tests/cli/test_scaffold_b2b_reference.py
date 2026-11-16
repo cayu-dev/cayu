@@ -86,5 +86,5 @@ def test_reference_files_the_generator_leaves_out_say_why(generated: dict[str, s
 
 def test_no_fixture_names_a_private_package() -> None:
     text = "\n".join(data.decode("utf-8") for data in _fixtures().values())
-    for private in ("@cayu-tech", "cayu-design", "@cayu/design", "npm.pkg.github.com"):
+    for private in ("cayu-tech", "@cayu/design", "npm.pkg.github.com"):
         assert private not in text

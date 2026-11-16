@@ -25,8 +25,8 @@ from typing import Any
 from cayu.events import copy_event
 from cayu.storage import _sqlite_records as sqlite_records
 
-#: (event type, share of all events, average payload JSON bytes), from the
-#: review.cayu.ai store's 997,415 events.
+#: (event type, share of all events, average payload JSON bytes), from a
+#: production code-review Agent's store of 997,415 events.
 TYPE_MIX: tuple[tuple[str, int, int], ...] = (
     ("tool.call.completed", 123_408, 14_226),
     ("tool.call.started", 118_410, 578),

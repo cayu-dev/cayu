@@ -185,7 +185,7 @@ def test_the_web_app_is_the_generated_shell_with_b2bs_pages_as_areas() -> None:
     )
     # Only the stock shadcn kit ships; nothing names a private package or registry.
     everything = "\n".join(text for name, text in files.items() if name.startswith("web/"))
-    for private in ("@cayu-tech", "cayu-design", "@cayu/design", "npm.pkg.github.com"):
+    for private in ("cayu-tech", "@cayu/design", "npm.pkg.github.com"):
         assert private not in everything
     assert "web/.npmrc" not in files
 
@@ -292,7 +292,7 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
         )
 
     # Without a database the policy's own tests pass and the PostgreSQL ones skip, and the
-    # run ends by saying so and how to run them (#3830).
+    # run ends by saying so and how to run them.
     offline = generated_suite({})
     assert offline.returncode == 0, offline.stdout + offline.stderr
     assert "SKIPPED" in offline.stdout

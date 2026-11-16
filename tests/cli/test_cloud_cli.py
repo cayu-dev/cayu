@@ -747,7 +747,7 @@ def test_cloud_init_generates_a_worker_next_to_web_for_a_declared_worker(
     (tmp_path / "pyproject.toml").write_text(
         """
 [project]
-name = "cayu-scout"
+name = "acme-scout"
 version = "0.1.0"
 dependencies = ["cayu[server]>=0.14"]
 
@@ -787,7 +787,7 @@ def test_cloud_init_generates_the_first_of_several_workers_and_names_the_rest(
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\n"
-        'name = "cayu-scout"\n'
+        'name = "acme-scout"\n'
         'version = "0.1.0"\n'
         'dependencies = ["cayu[server]>=0.14"]\n\n'
         "[tool.cayu]\n"
@@ -4581,10 +4581,10 @@ def test_the_id_an_agent_reads_from_its_environment_names_it_in_application() ->
     # however its display name was written.
     class Client:
         def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
-            return {"items": [{"id": "cayu-b2b-reference", "name": "Acme Reference Desk"}]}
+            return {"items": [{"id": "acme-reference-desk", "name": "Acme Reference Desk"}]}
 
-    assert cloud_cli._application_id(Client(), "cayu-b2b-reference") == "cayu-b2b-reference"
-    assert cloud_cli._application_id(Client(), "Acme Reference Desk") == "cayu-b2b-reference"
+    assert cloud_cli._application_id(Client(), "acme-reference-desk") == "acme-reference-desk"
+    assert cloud_cli._application_id(Client(), "Acme Reference Desk") == "acme-reference-desk"
 
 
 def test_deploy_to_an_archived_slug_reports_the_archived_code() -> None:
@@ -5040,7 +5040,7 @@ class _PlatformClient:
 def test_cloud_platform_shows_when_cloud_rolled_out(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`cayu cloud platform` answers "did Cloud change under me?" (cayu-cloud#715)."""
+    """`cayu cloud platform` answers "did Cloud change under me?"."""
 
     broker = {
         "name": "sandbox-broker",

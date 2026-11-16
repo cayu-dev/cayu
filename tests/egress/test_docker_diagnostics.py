@@ -58,7 +58,7 @@ def test_credentials_in_stderr_and_argv_never_escape():
     assert "permission denied" in message
     assert "[REDACTED]" in message
     # Registered secrets and credential-shaped values are removed; plain text
-    # such as names and paths is shown (#1974).
+    # such as names and paths is shown.
     for value in ("password-canary", "token-canary", "mount-canary", "opaque-canary"):
         assert value not in message
     assert "username-canary" not in message

@@ -715,7 +715,7 @@ def test_no_thinking_config_leaves_options_unchanged() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Transcript query: exclude thinking parts (issue #57 AC#9)
+# Transcript query: exclude thinking parts
 # --------------------------------------------------------------------------- #
 def test_filter_transcript_records_excludes_thinking() -> None:
     records = [

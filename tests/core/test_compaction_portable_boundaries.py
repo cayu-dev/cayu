@@ -1,4 +1,4 @@
-"""Focused issue #529 compaction durability boundary tests."""
+"""Focused compaction durability boundary tests."""
 
 from __future__ import annotations
 

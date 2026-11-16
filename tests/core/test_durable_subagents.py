@@ -2046,7 +2046,7 @@ def test_prepared_subagent_task_is_not_claimable_by_pre_feature_worker() -> None
         assert len(queued) == 1
         assert queued[0].type == dispatcher.prepared_subagent_task_type
 
-        # A pre-#213 worker queries only the configured revision-40 resume
+        # An older worker queries only the configured revision-40 resume
         # namespace. It must not be able to claim and reject the expanded
         # prepared-subagent envelope during a rolling deployment.
         legacy_claim = await tasks.claim_task(

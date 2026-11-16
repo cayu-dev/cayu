@@ -21,12 +21,12 @@ from cayu.connectors.github import markers as markers_module
 from cayu.connectors.github.testing import Call, FakeGitHub, reply
 
 REPO = "acme/widgets"
-HERALD = "cayu-herald[bot]"
-SCOUT = "cayu-scout[bot]"
+HERALD = "acme-herald[bot]"
+SCOUT = "acme-scout[bot]"
 SOMEONE = "mallory"
 COMMENTS = f"/repos/{REPO}/issues/7/comments"
 ISSUES = f"/repos/{REPO}/issues"
-LABEL = "cayu-scout"
+LABEL = "acme-scout"
 run = asyncio.run
 
 Fakes = Callable[..., FakeGitHub]
@@ -158,7 +158,7 @@ def test_a_long_body_is_cut_in_utf8_bytes_and_still_ends_with_its_marker() -> No
 
 def test_model_text_mentions_no_one_and_hides_nothing_in_comments() -> None:
     zws = "​"
-    assert github.plain_text(" @cayu-reviewer full ") == f"@{zws}cayu-reviewer full"
+    assert github.plain_text(" @acme-reviewer full ") == f"@{zws}acme-reviewer full"
     assert github.plain_text("ops@example.com and @dataclass") == (
         f"ops@{zws}example.com and @{zws}dataclass"
     )
@@ -180,10 +180,10 @@ def test_only_the_trusted_logins_markers_are_read() -> None:
     marker = github.Marker("shepherd/rerun/abc", {"runs": [1]})
     comments = [
         _pull_comment(SOMEONE, github.with_marker("Me too", marker), 1),
-        _pull_comment("Cayu-Herald[bot]", github.with_marker("Mine", marker), 2),
+        _pull_comment("Acme-Herald[bot]", github.with_marker("Mine", marker), 2),
         _pull_comment(HERALD, "No marker", 3),
         # A user may be named after an App's slug: only the [bot] login is the App.
-        _pull_comment("cayu-herald", github.with_marker("Not the App", marker), 4),
+        _pull_comment("acme-herald", github.with_marker("Not the App", marker), 4),
     ]
     found = github.trusted_markers(comments, login=HERALD)
     assert [(item.marker, item.comment.id) for item in found] == [(marker, 2)]
@@ -193,9 +193,9 @@ def test_only_the_trusted_logins_markers_are_read() -> None:
 
 def test_a_legacy_format_is_read_from_the_trusted_login_only() -> None:
     def legacy(body: str) -> github.Marker | None:
-        return github.Marker("shepherd/introduce") if "<!-- cayu-shepherd" in body else None
+        return github.Marker("shepherd/introduce") if "<!-- acme-shepherd" in body else None
 
-    old = '<!-- cayu-shepherd {"action": "introduce"} -->'
+    old = '<!-- acme-shepherd {"action": "introduce"} -->'
     comments = [_pull_comment(SOMEONE, old, 1), _pull_comment(HERALD, old, 2)]
     found = github.trusted_markers(comments, login=HERALD, legacy=legacy)
     assert [item.comment.id for item in found] == [2]
@@ -211,7 +211,7 @@ def test_an_app_connection_trusts_only_its_bot_login() -> None:
     app = github.app_connections("1234", pem, permissions={"issues": "write"})
     gh = github.GitHubClient(app)
     with pytest.raises(ValueError, match=r"await gh\.login\(\)"):
-        run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login="cayu-herald"))
+        run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login="acme-herald"))
 
 
 def _cloud_slot(connector: str) -> FakeBroker:
@@ -227,7 +227,7 @@ def _cloud_slot(connector: str) -> FakeBroker:
 def test_a_cloud_github_app_slot_trusts_only_its_own_bot_login() -> None:
     broker = _cloud_slot("github-app")
     gh = github.GitHubClient(broker.client)
-    for login in ("cayu-herald", SCOUT):
+    for login in ("acme-herald", SCOUT):
         with pytest.raises(ValueError, match=r"await gh\.login\(\)"):
             run(github.file_issue_once(gh, REPO, "t", "b", github.Marker("k"), login=login))
     assert broker.sent == []
@@ -255,7 +255,7 @@ def test_a_local_app_connection_trusts_only_its_own_bot_login(
 
     monkeypatch.setattr(app, "login", own_login)
     gh = github.GitHubClient(app)
-    with pytest.raises(ValueError, match=r"not 'cayu-scout\[bot\]'"):
+    with pytest.raises(ValueError, match=r"not 'acme-scout\[bot\]'"):
         run(github.comment_once(gh, REPO, 7, "x", github.Marker("k"), login=SCOUT))
 
 

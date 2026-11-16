@@ -1,4 +1,4 @@
-"""Replaying a recorded reconciliation observation rechecks current review permission (#3206)."""
+"""Replaying a recorded reconciliation observation rechecks current review permission."""
 
 import asyncio
 

@@ -4409,7 +4409,7 @@ not hostile-repository isolation. Runtime networking is disabled, the root
 filesystem is read-only, the guest is non-root, all capabilities are dropped,
 resources and writable tmpfs mounts are bounded, no host paths are mounted, and
 no raw workload credentials or ambient host environment enter the guest.
-Untrusted-code execution belongs on Lambda MicroVM and is tracked in #1878.
+Untrusted-code execution belongs on Lambda MicroVM, which is separate work.
 
 Image build authority and runtime execution authority are separate. First run
 `uv lock` and review `uv.lock`. Then pin the image inputs in
@@ -4595,7 +4595,7 @@ verification, non-root/read-only/capability/resource controls, protected source
 paths, ephemeral guest Git, revision-checked bounded copy-back, and tool-free
 reviewer. Never add shell, arbitrary executable authority, runtime installation, publication,
 or network tools to the primary agent. Do not describe this Docker profile as
-untrusted isolation; that work belongs to #1878.
+untrusted isolation; that work belongs to Lambda MicroVM.
 
 Advance the check, command-policy, environment, binding, and primary-agent
 identities with their documented behavior, rebuild the pinned image, and run

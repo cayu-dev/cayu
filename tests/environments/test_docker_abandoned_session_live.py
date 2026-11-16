@@ -1,4 +1,4 @@
-"""Abandoning a session that died mid tool call removes its Docker container (#2548)."""
+"""Abandoning a session that died mid tool call removes its Docker container."""
 
 from __future__ import annotations
 

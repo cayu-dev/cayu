@@ -341,7 +341,7 @@ class SessionExportCoordinator:
         model_attempt_id: str,
         capability_version: int,
     ):
-        """Return the registered #1763 disclosure guard for one peer attempt.
+        """Return the registered disclosure guard for one peer attempt.
 
         The receiver owns current source/export/audience authorization and
         revocation. This coordinator never treats an append receipt as a

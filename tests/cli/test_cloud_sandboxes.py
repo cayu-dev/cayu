@@ -14,11 +14,11 @@ from cayu.cli import _cloud_api, main
 from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient
 
-_AGENT = "/v1/applications/cayu-scout"
+_AGENT = "/v1/applications/acme-scout"
 _SANDBOXES = f"{_AGENT}/sandboxes"
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
-_SELECTED = httpx.Response(200, json={"id": "cayu-scout", "current_deployment_id": "dep_new"})
+_AGENTS = httpx.Response(200, json={"items": [{"id": "acme-scout", "name": "Acme Scout"}]})
+_SELECTED = httpx.Response(200, json={"id": "acme-scout", "current_deployment_id": "dep_new"})
 _CAPACITY = httpx.Response(
     200,
     json={
@@ -32,7 +32,7 @@ _CAPACITY = httpx.Response(
 def _sandbox(sandbox_id: str, **changes: object) -> dict[str, Any]:
     return {
         "id": sandbox_id,
-        "application_id": "cayu-scout",
+        "application_id": "acme-scout",
         "image": "coding-python",
         "egress": {"mode": "none"},
         "status": "ready",
@@ -114,7 +114,7 @@ def cloud(
 
 
 def _run(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
-    code = main(["cloud", "sandboxes", *arguments, "--application", "Cayu Scout"])
+    code = main(["cloud", "sandboxes", *arguments, "--application", "Acme Scout"])
     return code, capsys.readouterr().out
 
 
@@ -326,7 +326,7 @@ def test_a_refused_read_says_what_it_means(
         }
     )
 
-    code = main(["cloud", "sandboxes", "show", "sbx_x", "--application", "cayu-scout", "--json"])
+    code = main(["cloud", "sandboxes", "show", "sbx_x", "--application", "acme-scout", "--json"])
 
     assert code != 0
     assert message in capsys.readouterr().out
@@ -408,7 +408,7 @@ def test_list_refuses_filters_a_cloud_would_ignore(
     assert code != 0
     error = json.loads(out)["error"]
     assert error["category"] == "sandbox_filters_unsupported"
-    assert "needs cayu-tech/cayu-cloud#" in error["message"]
+    assert "that needs a newer Cayu Cloud" in error["message"]
 
 
 def test_list_without_filters_still_works_on_an_older_cloud(
@@ -426,7 +426,7 @@ def test_list_without_filters_still_works_on_an_older_cloud(
     assert code == 0
     (row,) = [line for line in out.splitlines() if line.startswith("sbx_new")]
     assert row.split()[-2:] == ["-", "-"]
-    assert out.splitlines()[-1].startswith("Activity: not reported; this Cayu Cloud needs ")
+    assert out.splitlines()[-1] == "Activity: not reported; that needs a newer Cayu Cloud."
     # It never asks the older Cloud for totals.
     assert not [request for request in fake.requests if "/activity" in str(request.url)]
 
@@ -466,7 +466,7 @@ def test_list_reports_no_totals_from_a_cloud_without_them(
 def test_list_checks_its_filters(
     capsys: pytest.CaptureFixture[str], arguments: list[str], message: str
 ) -> None:
-    code = main(["cloud", "sandboxes", "list", *arguments, "--application", "cayu-scout"])
+    code = main(["cloud", "sandboxes", "list", *arguments, "--application", "acme-scout"])
 
     assert code != 0
     assert message in capsys.readouterr().out
@@ -528,7 +528,7 @@ def test_show_says_an_older_cloud_reports_no_activity(
     code, out = _run(["show", "sbx_old"], capsys)
 
     assert code == 0
-    assert "  Activity: not reported; this Cayu Cloud needs cayu-tech/cayu-cloud#" in out
+    assert "  Activity: not reported; that needs a newer Cayu Cloud.\n" in out
 
 
 _ARCHIVES = f"{_SANDBOXES}/copy-archives"
@@ -651,14 +651,14 @@ def test_archives_says_when_none_are_kept(cloud, capsys: pytest.CaptureFixture[s
     assert code == 0
     assert out.splitlines() == [
         "Reuse: this Cayu Cloud keeps no copy-in archives.",
-        "No copy-in archives kept for cayu-scout.",
+        "No copy-in archives kept for acme-scout.",
     ]
 
 
 @pytest.mark.parametrize(
     ("status", "message"),
     [
-        (404, "cayu-tech/cayu-cloud#970"),
+        (404, "copy-in archives it keeps; that needs a newer Cayu Cloud"),
         (403, "an API key with the read scope"),
         (503, "runs no sandbox broker"),
     ],

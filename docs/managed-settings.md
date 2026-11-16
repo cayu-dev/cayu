@@ -72,20 +72,20 @@ app.declare_settings(
             label="Merge modes",
             item_pattern=REPOSITORY,
             value_choices=("report", "approve", "auto"),
-            default={"cayu-tech/cayu": "report"},
+            default={"example/app": "report"},
             applies="live",
         ),
     ]
 )
 
-app.managed_setting_value("app.repositories")  # ("cayu-tech/cayu", "cayu-tech/cayu-cloud")
-app.managed_setting_value("app.merge_modes")  # {"cayu-tech/cayu": "approve"}
+app.managed_setting_value("app.repositories")  # ("example/app", "example/web")
+app.managed_setting_value("app.merge_modes")  # {"example/app": "approve"}
 ```
 
 Both are `string` settings with a `format` (`list` or `map`), so a Cloud that
 doesn't know `format` still takes them. The value is written and stored as text, items separated by commas or line breaks
-and a map's entries as `KEY=VALUE`: `cayu-tech/cayu,cayu-tech/cayu-cloud` and
-`cayu-tech/cayu=approve,cayu-tech/cayu-cloud=auto`. Spaces around items are
+and a map's entries as `KEY=VALUE`: `example/app,example/web` and
+`example/app=approve,example/web=auto`. Spaces around items are
 dropped, a repeated list item counts once, and a repeated map key is refused, so
 items can't contain a comma or a line break and a map's keys can't contain `=`.
 The application reads a tuple for a list and a dict for a map, empty when there is
@@ -106,9 +106,9 @@ is ignored with a warning, and the default applies.
 
 ```python
 list_setting("repositories", label="Repositories", item_pattern=REPOSITORY,
-             env="SHEPHERD_REPOSITORIES")
+             env="APP_REPOSITORIES")
 ManagedSetting(key="introduce", type="bool", label="Introduce first",
-               default=True, env="SHEPHERD_INTRODUCE")
+               default=True, env="APP_INTRODUCE")
 ```
 
 The order is Cloud's value, then the environment's, then the code's default. The

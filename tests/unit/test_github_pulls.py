@@ -18,7 +18,7 @@ from cayu.connectors.github.pulls import CheckState, PullCheck, PullChecks
 REPO = "acme/widgets"
 SHA = "a" * 40
 ROOT = f"/repos/{REPO}"
-REVIEWER = "cayu-reviewer"
+REVIEWER = "acme-reviewer"
 FORBIDDEN_CHECK = "Resource not accessible by integration"
 GRAPHQL = "/graphql"
 TOO_LARGE = Refusal(502, "upstream_response_too_large", "The answer is over 5 MiB.")
@@ -62,7 +62,7 @@ def _pull(**overrides: Any) -> dict[str, Any]:
         "html_url": f"https://github.com/{REPO}/pull/7",
         "state": "open",
         "draft": False,
-        "user": {"login": "cayu-scout[bot]", "type": "Bot"},
+        "user": {"login": "acme-scout[bot]", "type": "Bot"},
         "labels": [{"name": "P0"}, {"name": "review: 4/5"}],
         "base": {"ref": "release/1.x"},
         "head": {"ref": "scout/widgets", "sha": SHA},
@@ -141,9 +141,9 @@ def _routes(**changes: Answer | Refusal | Callable[[Sent], Answer]) -> dict[str,
         ),
         f"{ROOT}/pulls/7/reviews": Answer(
             body=[
-                _review(1, "cayu-reviewer[bot]", "COMMENTED", _at(11, 10), body="3/5"),
+                _review(1, "acme-reviewer[bot]", "COMMENTED", _at(11, 10), body="3/5"),
                 _review(2, "ana", "APPROVED", _at(11, 11)),
-                _review(3, "cayu-reviewer[bot]", "COMMENTED", _at(11, 12), body="4/5"),
+                _review(3, "acme-reviewer[bot]", "COMMENTED", _at(11, 12), body="4/5"),
                 _review(4, "me", "PENDING", None),
             ]
         ),
@@ -152,7 +152,7 @@ def _routes(**changes: Answer | Refusal | Callable[[Sent], Answer]) -> dict[str,
                 {
                     "id": 50,
                     "user": None,
-                    "body": "@cayu-reviewer review",
+                    "body": "@acme-reviewer review",
                     "created_at": _at(11, 13),
                     "updated_at": _at(11, 13),
                     "html_url": "https://github.com/c/50",
@@ -197,7 +197,7 @@ def test_read_pull_answers_every_fact_through_rest() -> None:
     broker = _rest(_routes())
     facts = _read(broker, reviewer_app=REVIEWER)
 
-    assert (facts.number, facts.title, facts.author) == (7, "Add widgets", "cayu-scout[bot]")
+    assert (facts.number, facts.title, facts.author) == (7, "Add widgets", "acme-scout[bot]")
     assert facts.state is github.PullState.OPEN and not facts.draft
     assert facts.labels == ("P0", "review: 4/5")
     assert (facts.base, facts.head_ref, facts.head_sha) == ("release/1.x", "scout/widgets", SHA)
@@ -229,15 +229,15 @@ def test_read_pull_answers_every_fact_through_rest() -> None:
     assert checks.complete and checks.state is CheckState.FAILED
 
     assert [(review.id, review.author) for review in facts.reviews] == [
-        (1, "cayu-reviewer[bot]"),
+        (1, "acme-reviewer[bot]"),
         (2, "ana"),
-        (3, "cayu-reviewer[bot]"),
+        (3, "acme-reviewer[bot]"),
     ]
     # The reviewer's comment-only reviews stand for nothing; ana's approval stands.
     assert [review.id for review in facts.latest_reviews] == [2]
     assert facts.comments is not None
     assert [(comment.author, comment.body) for comment in facts.comments] == [
-        ("ghost", "@cayu-reviewer review")
+        ("ghost", "@acme-reviewer review")
     ]
 
     assert {sent.method for sent in broker.sent if sent.path != GRAPHQL} == {"GET"}
@@ -539,13 +539,13 @@ def _node(number: int, updated: str = _at(11), **overrides: Any) -> dict[str, An
         "baseRefName": "main",
         "headRefName": f"feature/{number}",
         "headRefOid": SHA,
-        "author": _actor("cayu-scout", "Bot"),
+        "author": _actor("acme-scout", "Bot"),
         "mergedBy": None,
         "labels": {"nodes": [{"name": "P0"}]},
         "assignees": {"nodes": [_actor("ana")]},
         "reviewRequests": {
             "nodes": [
-                {"requestedReviewer": _actor("cayu-reviewer", "Bot")},
+                {"requestedReviewer": _actor("acme-reviewer", "Bot")},
                 {"requestedReviewer": {"__typename": "Team", "slug": "core"}},
             ]
         },
@@ -557,7 +557,7 @@ def _node(number: int, updated: str = _at(11), **overrides: Any) -> dict[str, An
                     "state": "COMMENTED",
                     "submittedAt": _at(11, 10),
                     "url": "https://github.com/r/70",
-                    "author": _actor("cayu-reviewer", "Bot"),
+                    "author": _actor("acme-reviewer", "Bot"),
                     "commit": {"oid": SHA},
                 }
             ],
@@ -623,12 +623,12 @@ def test_list_pulls_reads_open_pulls_with_bot_logins_as_rest_writes_them() -> No
 
     assert listing.complete
     (pull,) = listing.pulls
-    assert pull.author == "cayu-scout[bot]"
+    assert pull.author == "acme-scout[bot]"
     assert pull.state is github.PullState.OPEN
-    assert pull.requested_reviewers == ("cayu-reviewer[bot]",)
+    assert pull.requested_reviewers == ("acme-reviewer[bot]",)
     assert pull.requested_teams == ("core",) and pull.assignees == ("ana",)
     assert [(review.author, review.body) for review in pull.reviews] == [
-        ("cayu-reviewer[bot]", None)
+        ("acme-reviewer[bot]", None)
     ]
     assert (pull.mergeable, pull.mergeable_state) == (True, "clean")
     assert pull.head_committed_at == _when(11, 8)

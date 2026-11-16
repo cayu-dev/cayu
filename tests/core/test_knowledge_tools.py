@@ -699,7 +699,7 @@ def test_remember_knowledge_policy_owns_namespace_and_labels() -> None:
 
 
 def test_remember_knowledge_copies_chosen_labels_from_the_calling_session() -> None:
-    """A note carries the session's module and repository labels (#3195)."""
+    """A note carries the session's module and repository labels."""
 
     policy = RememberKnowledgePolicy(
         require_labels={"kind": "module-note"}, copy_session_labels=("module", "repository")
@@ -4492,7 +4492,7 @@ def test_remember_knowledge_distinct_kinds_are_not_deduped() -> None:
 
 
 def test_the_runtime_gives_a_tool_its_sessions_labels() -> None:
-    """``ToolContext.session_labels`` are the calling session's own (#3195)."""
+    """``ToolContext.session_labels`` are the calling session's own."""
 
     from cayu import AgentSpec, CayuApp, Message
     from cayu.evals import ScriptedModelProvider

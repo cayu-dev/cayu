@@ -1,4 +1,4 @@
-"""Hermetic regressions for optional Responses hosted-search evidence (#1393)."""
+"""Hermetic regressions for optional Responses hosted-search evidence."""
 
 from copy import deepcopy
 

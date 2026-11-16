@@ -101,7 +101,7 @@ def test_real_transport_captures_details_without_changing_public_failures(subscr
     ):
         assert secret not in serialized
     # Public failures show the provider's message with the request credential
-    # removed (#1974); capture neither adds nor removes anything from them.
+    # removed; capture neither adds nor removes anything from them.
     public = json.dumps(after)
     assert "subscription-access" not in public
     assert ("Unsupported input item" in public) is (kind != "transport")
@@ -139,7 +139,7 @@ def test_fastapi_detail_body_is_captured_as_the_message():
     public = asyncio.run(run())
     assert records[0]["error"]["message"] == detail
     assert records[0]["http_status_code"] == 400
-    # The backend's refusal reason is public now (#1974).
+    # The backend's refusal reason is public now.
     assert detail in json.dumps(public)
 
 
@@ -322,7 +322,7 @@ def test_compactor_failure_is_durable_and_credentials_stay_out_of_events(tmp_pat
     assert completions[0].payload["compaction_outcome"] == "provider_error"
     assert any(e.type == EventType.CONTEXT_COMPACTION_FAILED for e in events)
     serialized = json.dumps([e.payload for e in events])
-    # The provider's message is shown (#1974); the subscription token is not.
+    # The provider's message is shown; the subscription token is not.
     assert "Unsupported input item" in serialized
     assert "subscription-access" not in serialized
     assert records[0]["error"]["request_id"] == "req_compaction"

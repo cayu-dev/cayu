@@ -1,4 +1,4 @@
-"""Credential-free SSE controls for #1495; these do not reproduce incident wire data."""
+"""Credential-free SSE search-ordering controls; these do not reproduce incident wire data."""
 
 import json
 from copy import deepcopy

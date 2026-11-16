@@ -962,7 +962,7 @@ def validate_git_repositories(repositories: Sequence[str]) -> tuple[str, ...]:
     and return their canonical form.
 
     1 to ``MAX_GIT_REPOSITORIES`` entries, each ``host/path`` without a scheme
-    (``github.com/cayu-tech/cayu.git``): one public DNS host, no wildcard, and 2 to 10
+    (``github.com/example/app.git``): one public DNS host, no wildcard, and 2 to 10
     path segments of letters, digits, ``.``, ``_`` and ``-``. The host is lowercased; the
     path is kept exactly, case and a trailing ``.git`` included, apart from leading and
     trailing slashes, because only the git host knows which spellings name the same
@@ -991,7 +991,7 @@ def validate_git_repositories(repositories: Sequence[str]) -> tuple[str, ...]:
         ):
             raise ValueError(
                 f"{item!r} isn't a sandbox git repository: name it as host/owner/name, such as "
-                "github.com/cayu-tech/cayu.git, without a scheme."
+                "github.com/example/app.git, without a scheme."
             )
         canonical.add(f"{_egress_host(host)}/{'/'.join(segments)}")
     return tuple(sorted(canonical))

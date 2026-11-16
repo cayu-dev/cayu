@@ -27,7 +27,7 @@ function enabled() {
   return { configured: true, read: { enabled: true, unavailable_reason: null } }
 }
 
-// Mirrors the session follow contract advertised by the server (#1926).
+// Mirrors the session follow contract advertised by the server.
 function sessionFollowContract(pathTemplate = "/cayu/api/sessions/{session_id}/events/stream") {
   return {
     method: "GET",
@@ -1290,10 +1290,10 @@ function task(id, status, { type = "shepherd_pass", updatedAt = "2026-09-01T00:0
 test("watchTasks filters by type, status, input and run, and revalidates with the ETag", async () => {
   const server = new FakeServer()
   server.tasks = [
-    task("cayu", "running", { input: { repository: "cayu-tech/cayu" }, metadata: { run: "r1" } }),
-    task("design", "running", { input: { repository: "cayu-tech/cayu-design" }, metadata: { run: "r1" } }),
-    task("digest", "running", { type: "digest", input: { repository: "cayu-tech/cayu" } }),
-    task("recheck", "completed", { type: "recheck", input: { repository: "cayu-tech/cayu" }, metadata: { run: "r1" } }),
+    task("cayu", "running", { input: { repository: "example/app" }, metadata: { run: "r1" } }),
+    task("design", "running", { input: { repository: "example/app-design" }, metadata: { run: "r1" } }),
+    task("digest", "running", { type: "digest", input: { repository: "example/app" } }),
+    task("recheck", "completed", { type: "recheck", input: { repository: "example/app" }, metadata: { run: "r1" } }),
   ]
   const client = await connect({ apiBaseUrl: API, fetch: server.fetch })
   assert.equal(client.tasksAvailable, true)
@@ -1303,7 +1303,7 @@ test("watchTasks filters by type, status, input and run, and revalidates with th
     {
       type: ["shepherd_pass", "recheck"],
       status: ["running", "completed"],
-      input: { repository: "cayu-tech/cayu" },
+      input: { repository: "example/app" },
       run: "r1",
     },
     (tasks) => changes.push(tasks.map((item) => item.id)),
@@ -1317,7 +1317,7 @@ test("watchTasks filters by type, status, input and run, and revalidates with th
     ["shepherd_pass", "recheck"],
   )
   assert.deepEqual(first.query.getAll("statuses"), ["running", "completed"])
-  assert.deepEqual(first.query.getAll("input"), ["repository=cayu-tech/cayu"])
+  assert.deepEqual(first.query.getAll("input"), ["repository=example/app"])
   assert.deepEqual(first.query.getAll("metadata"), ["run=r1"])
   assert.equal(first.headers.get("If-None-Match"), null)
 
@@ -1332,7 +1332,7 @@ test("watchTasks filters by type, status, input and run, and revalidates with th
   // The pass finishes: the next refresh sees it and the interval resets to 15 s.
   server.tasks[0] = task("cayu", "completed", {
     updatedAt: "2026-09-01T00:10:00+00:00",
-    input: { repository: "cayu-tech/cayu" },
+    input: { repository: "example/app" },
     metadata: { run: "r1" },
   })
   await advance(105_000, 1_000)

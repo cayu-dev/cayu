@@ -33,8 +33,8 @@ from cayu.tools import (
 from cayu.tools.gateway import tool_argument_validation_error
 
 REPO = "acme/widgets"
-BOT = "cayu-shepherd[bot]"
-REVIEWER = "cayu-reviewer"
+BOT = "acme-shepherd[bot]"
+REVIEWER = "acme-reviewer"
 WRITES = (
     "github_comment",
     "github_rerun_failed_jobs",
@@ -101,7 +101,7 @@ def test_the_toolkit_has_read_tools_and_write_tools_only_when_asked() -> None:
 
 def test_read_pull_answers_the_facts_a_model_acts_on() -> None:
     fake = _fake()
-    pull = fake.add_pull(REPO, 7, behind_by=2, labels=["ready"], author="cayu-scout[bot]")
+    pull = fake.add_pull(REPO, 7, behind_by=2, labels=["ready"], author="acme-scout[bot]")
     ci = fake.add_workflow_run(REPO, pull.head_sha, conclusion="failure")
     tests = fake.add_check_run(REPO, pull.head_sha, "tests", run=ci, conclusion="failure")
     fake.add_check_run(REPO, pull.head_sha, "lint", run=ci, conclusion="success")
@@ -220,7 +220,7 @@ def test_list_pulls_answers_each_pull_in_brief() -> None:
         "baseRefName": "main",
         "headRefName": "fix",
         "headRefOid": "a" * 40,
-        "author": {"__typename": "Bot", "login": "cayu-scout"},
+        "author": {"__typename": "Bot", "login": "acme-scout"},
         "mergedBy": None,
         "labels": {"nodes": [{"name": "ready"}]},
         "assignees": {"nodes": []},
@@ -250,7 +250,7 @@ def test_list_pulls_answers_each_pull_in_brief() -> None:
     assert answer["pulls"][0] == {
         "number": 7,
         "title": "Fix the cache",
-        "author": "cayu-scout[bot]",
+        "author": "acme-scout[bot]",
         "state": "open",
         "draft": False,
         "labels": ["ready"],
@@ -362,7 +362,7 @@ def test_comment_posts_the_body_and_answers_the_new_comment() -> None:
 def test_a_comment_mentions_no_one_and_hides_nothing_unless_the_application_allows() -> None:
     fake = _fake()
     fake.add_pull(REPO, 7)
-    text = "@dependabot merge <!-- @cayu-reviewer review -->"
+    text = "@dependabot merge <!-- @acme-reviewer review -->"
 
     _answer(_run(_tools(fake)["github_comment"], repository=REPO, number=7, body=text))
     raw = _tools(fake, plain_comments=False)["github_comment"]

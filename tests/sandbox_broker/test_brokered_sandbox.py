@@ -523,11 +523,11 @@ def test_a_factory_allocates_its_allowlist_and_fingerprints_its_hosts(tmp_path: 
 
 def test_git_repositories_keep_their_exact_path() -> None:
     assert validate_git_repositories(
-        ["GitHub.com/Cayu-Tech/cayu.git", "github.com/cayu-tech/cayu", "github.com/cayu-tech/cayu/"]
-    ) == ("github.com/Cayu-Tech/cayu.git", "github.com/cayu-tech/cayu")
+        ["GitHub.com/Example/app.git", "github.com/example/app", "github.com/example/app/"]
+    ) == ("github.com/Example/app.git", "github.com/example/app")
     for value in (
-        "https://github.com/cayu-tech/cayu",
-        "github.com/cayu-tech",
+        "https://github.com/example/app",
+        "github.com/example",
         "github.com/a/../b",
         "*.github.com/a/b",
         "10.0.0.1/a/b",
@@ -546,7 +546,7 @@ def test_git_repositories_keep_their_exact_path() -> None:
 
 def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
-    broker.git_bindings = {"github.com/cayu-tech/cayu.git"}
+    broker.git_bindings = {"github.com/example/app.git"}
 
     async def scenario():
         client = broker.client()
@@ -555,11 +555,11 @@ def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: P
             image="coding-python",
             egress_mode="allowlist",
             egress_hosts=["github.com"],
-            git_repositories=["GitHub.com/cayu-tech/cayu.git"],
+            git_repositories=["GitHub.com/example/app.git"],
             lease_seconds=60,
         )
         assert record.git is not None
-        assert record.git.repositories == ("github.com/cayu-tech/cayu.git",)
+        assert record.git.repositories == ("github.com/example/app.git",)
         plain = await client.create(
             idempotency_key="plain", image="coding-python", egress_mode="none", lease_seconds=60
         )
@@ -572,7 +572,7 @@ def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: P
                     image="coding-python",
                     egress_mode=egress_mode,
                     egress_hosts=hosts,
-                    git_repositories=["github.com/cayu-tech/cayu.git"],
+                    git_repositories=["github.com/example/app.git"],
                     lease_seconds=60,
                 )
         # Another spelling is another repository, which no binding covers.
@@ -581,7 +581,7 @@ def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: P
                 idempotency_key="unbound",
                 image="coding-python",
                 egress_mode="public_web",
-                git_repositories=["github.com/cayu-tech/cayu"],
+                git_repositories=["github.com/example/app"],
                 lease_seconds=60,
             )
         broker.git_credentials = False
@@ -590,7 +590,7 @@ def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: P
                 idempotency_key="off",
                 image="coding-python",
                 egress_mode="public_web",
-                git_repositories=["github.com/cayu-tech/cayu.git"],
+                git_repositories=["github.com/example/app.git"],
                 lease_seconds=60,
             )
         await client.aclose()
@@ -601,22 +601,22 @@ def test_the_client_asks_for_git_repositories_in_the_contracts_shape(tmp_path: P
         for request in broker.requests
         if request.method == "POST" and request.url.path.endswith("/sandboxes")
     ]
-    assert posted[:2] == [{"repositories": ["github.com/cayu-tech/cayu.git"]}, None]
+    assert posted[:2] == [{"repositories": ["github.com/example/app.git"]}, None]
 
 
 def test_a_factory_allocates_its_git_repositories_and_fingerprints_them(tmp_path: Path) -> None:
     source = _project(tmp_path)
     broker = FakeBroker(tmp_path / "cloud")
-    broker.git_bindings = {"github.com/cayu-tech/cayu.git"}
+    broker.git_bindings = {"github.com/example/app.git"}
     factory = _factory(
         broker,
         source,
         egress="allowlist",
         egress_hosts=["github.com"],
-        git_repositories=["github.com/cayu-tech/cayu.git"],
+        git_repositories=["github.com/example/app.git"],
     )
     plain = _factory(broker, source, egress="allowlist", egress_hosts=["github.com"])
-    assert factory.git_repositories == ("github.com/cayu-tech/cayu.git",)
+    assert factory.git_repositories == ("github.com/example/app.git",)
     assert factory.execution_profile_identity != plain.execution_profile_identity
     with pytest.raises(ValueError, match="egress"):
         _factory(broker, source, egress="none", git_repositories=["github.com/a/b"])
@@ -627,7 +627,7 @@ def test_a_factory_allocates_its_git_repositories_and_fingerprints_them(tmp_path
 
     asyncio.run(scenario())
     (sandbox,) = broker.sandboxes.values()
-    assert sandbox.body["git"] == {"repositories": ["github.com/cayu-tech/cayu.git"]}
+    assert sandbox.body["git"] == {"repositories": ["github.com/example/app.git"]}
 
 
 def test_factory_from_env_reads_git_repositories(tmp_path: Path) -> None:

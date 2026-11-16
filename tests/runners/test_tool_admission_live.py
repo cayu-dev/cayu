@@ -1,4 +1,4 @@
-"""Opt-in #860 qualification; never build images, pull, or install packages."""
+"""Opt-in tool admission qualification; never build images, pull, or install packages."""
 
 from __future__ import annotations
 

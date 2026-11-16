@@ -542,7 +542,7 @@ def test_real_docker_reallocate_after_confirmed_disposal(
     new_session: bool,
     record_property,
 ) -> None:
-    """Issue #1412: a new incarnation must not reuse a released attachment."""
+    """A new incarnation must not reuse a released attachment."""
     docker_path, image, image_id = _configuration_or_skip()
     source = tmp_path / "input"
     source.mkdir()

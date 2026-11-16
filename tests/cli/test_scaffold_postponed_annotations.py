@@ -12,7 +12,7 @@ from cayu.cli.scaffold_check import _check_import_inertness, _without_postponed_
 
 _POSTPONED = "from __future__ import annotations\n"
 
-# The module from issue #3952. Lines 6 and 10 were refused under the future import.
+# The module from a bug report. Lines 6 and 10 were refused under the future import.
 _ISSUE_MODULE = """from __future__ import annotations
 
 import threading

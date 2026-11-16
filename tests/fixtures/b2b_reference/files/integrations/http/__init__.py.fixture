@@ -53,10 +53,10 @@ from integrations.sign_in import (
 # The length of `memberships.subject`.
 MEMBER_SUBJECT_LENGTH = 200
 # The agent the web interface starts conversations with.
-AGENT_NAME = "cayu-b2b-reference"
+AGENT_NAME = "b2b-reference"
 # The Agent's application in Cayu Cloud when Cloud doesn't say (CAYU_CLOUD_APPLICATION_ID):
 # the slug `cayu cloud init` makes from the project's name.
-CLOUD_APPLICATION = "cayu-b2b-reference"
+CLOUD_APPLICATION = "b2b-reference"
 
 
 class DemoSignInRequest(BaseModel):

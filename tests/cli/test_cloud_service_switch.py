@@ -20,16 +20,16 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 
-_APP = "/v1/applications/cayu-scout"
+_APP = "/v1/applications/acme-scout"
 _RUN = f"{_APP}/schedules/scout/run"
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = {"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]}
+_AGENTS = {"items": [{"id": "acme-scout", "name": "Acme Scout"}]}
 _SWITCHING = (
     "The Agent's service is being deployed or changed right now; nothing changed. Try again "
     "once that finishes."
 )
 _STARTED = {
-    "application_id": "cayu-scout",
+    "application_id": "acme-scout",
     "deployment_id": "dep_new",
     "input_overridden": True,
     "run": "task-1",
@@ -96,7 +96,7 @@ def _clock() -> Callable[[], float]:
 def _run_schedule(*, wait: bool, sleeps: list[float] | None = None) -> dict[str, Any]:
     return cloud_cli._schedule(
         SimpleNamespace(
-            application="cayu-scout",
+            application="acme-scout",
             input={"prompt": "Look again"},
             name="scout",
             poll_seconds=5.0,
@@ -150,9 +150,9 @@ def test_schedule_run_with_wait_gives_up_when_the_switch_outlasts_the_wait(
     assert cloud_cli._cloud_failure(raised.value) == 2
     error = json.loads(capsys.readouterr().out)["error"]
     assert error == {
-        "application": "cayu-scout",
+        "application": "acme-scout",
         "category": "service_busy",
-        "commands": {"status": "cayu cloud service status --application cayu-scout"},
+        "commands": {"status": "cayu cloud service status --application acme-scout"},
         "message": (
             "The Agent's service was still being deployed or changed after 30s, so Cayu Cloud "
             "kept refusing the request; nothing changed. Run the command again once that "
@@ -183,7 +183,7 @@ def test_the_request_is_never_sent_again_once_the_wait_is_over() -> None:
         send_when_not_switching(
             refused,
             wait=True,
-            application_id="cayu-scout",
+            application_id="acme-scout",
             poll_seconds=40.0,
             wait_seconds=60.0,
             sleep=sleep,
@@ -236,7 +236,7 @@ def test_schedule_run_wait_from_the_command_line(
             "run",
             "scout",
             "--application",
-            "cayu-scout",
+            "acme-scout",
             "--wait",
             "--poll-seconds",
             "0.001",
@@ -275,7 +275,7 @@ def test_service_changes_with_wait_send_the_request_again_once_the_switch_finish
     method: str,
     path: str,
 ) -> None:
-    service = {"application_id": "cayu-scout", "status": "running"}
+    service = {"application_id": "acme-scout", "status": "running"}
     fake = cloud({(method, path): [_switching(), httpx.Response(200, json=service)]})
 
     code = main(
@@ -284,7 +284,7 @@ def test_service_changes_with_wait_send_the_request_again_once_the_switch_finish
             "service",
             action,
             "--application",
-            "cayu-scout",
+            "acme-scout",
             "--wait",
             "--poll-seconds",
             "0.001",
@@ -298,7 +298,7 @@ def test_service_changes_with_wait_send_the_request_again_once_the_switch_finish
 
 @pytest.mark.parametrize("action", ["status", "logs", "credentials"])
 def test_service_reads_take_no_wait(action: str, capsys: pytest.CaptureFixture[str]) -> None:
-    code = main(["cloud", "service", action, "--application", "cayu-scout", "--wait"])
+    code = main(["cloud", "service", action, "--application", "acme-scout", "--wait"])
 
     assert code == 2
     assert "--wait" in json.loads(capsys.readouterr().out)["error"]["message"]
@@ -319,7 +319,7 @@ def test_wait_options_are_checked_before_anything_is_sent(
             "run",
             "scout",
             "--application",
-            "cayu-scout",
+            "acme-scout",
             "--wait",
             "--poll-seconds",
             "10",

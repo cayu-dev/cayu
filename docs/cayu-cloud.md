@@ -1572,7 +1572,7 @@ The value is printed as JSON; add `--raw` to print a text value as plain text, s
 Markdown brief a task returned:
 
 ```console
-cayu task show TASK_ID --application cayu-herald --field result.markdown --raw
+cayu task show TASK_ID --application acme-herald --field result.markdown --raw
 ```
 
 A path the task doesn't have fails and names the first part that is missing.
@@ -1589,7 +1589,7 @@ command reads either:
 from cayu.storage import TaskListRequest, open_cloud_agent_readers
 from cayu.tasks.records import TaskStatus
 
-async with open_cloud_agent_readers("cayu-herald") as agent:
+async with open_cloud_agent_readers("acme-herald") as agent:
     rows = await agent.tasks.list_tasks(
         TaskListRequest(type="digest", status=TaskStatus.COMPLETED, limit=1)
     )
@@ -1748,10 +1748,10 @@ the fields above, each checked (numbers stay numbers), so it never carries a hos
 its [`/data`](#files-under-data), such as a run's record after the run failed:
 
 ```console
-$ cayu cloud data ls --application cayu-scout scout/runs
-$ cayu cloud data cat --application cayu-scout scout/runs/RUN/run.json
-$ cayu cloud data stat --application cayu-scout scout/runs/RUN/run.json
-$ cayu cloud data get --application cayu-scout scout/runs/RUN
+$ cayu cloud data ls --application acme-scout scout/runs
+$ cayu cloud data cat --application acme-scout scout/runs/RUN/run.json
+$ cayu cloud data stat --application acme-scout scout/runs/RUN/run.json
+$ cayu cloud data get --application acme-scout scout/runs/RUN
 Wrote RUN.tar.gz (48211 bytes).
 ```
 
@@ -2027,8 +2027,8 @@ curl -H "Authorization: Bearer $token" http://127.0.0.1:8000/api/cloud/v1/activi
 stands, for anyone who may see the Agent:
 
 ```bash
-cayu cloud activity status --application cayu-scout
-cayu cloud activity status --application cayu-scout --json
+cayu cloud activity status --application acme-scout
+cayu cloud activity status --application acme-scout --json
 ```
 
 It prints:
@@ -2621,11 +2621,12 @@ their bytes and files) and out (archive downloads and staged copies out).
 `list` ends with the same summed over every sandbox that matches, not only
 the ones it shows. In `--json` that's each sandbox's `activity`, `totals`
 (`{"sandboxes", "activity"}`) and the `filters` asked for. The filters and
-the activity need a Cayu Cloud with cayu-tech/cayu-cloud#766. An older Cloud
+the activity need a Cayu Cloud that supports sandbox filters. An older Cloud
 would ignore the filters, so `list` refuses them there
 (`sandbox_filters_unsupported`) instead of listing every sandbox; without
-filters it lists as before and reports no activity. The commands need a Cayu Cloud with cayu-tech/cayu-cloud#679; an older
-one refuses the login on these routes.
+filters it lists as before and reports no activity. The commands need a Cayu
+Cloud that lets the Agent's people read its sandboxes; an older one refuses
+the login on these routes.
 
 `archives` lists the copy-in archives Cloud keeps for the Agent. Once a staged
 copy in is extracted, Cloud keeps its archive for a while, and the Agent's next
@@ -2637,7 +2638,7 @@ install's setting (how long after the last use, how many per Agent, how big).
 It never shows where an archive is stored, and it changes nothing: Cloud lets
 archives lapse on its own, and nothing gives one up on request. It reads up to
 `--limit` (default 50), newest first; `--cursor` starts from an earlier list's
-`next_cursor`. It needs a Cayu Cloud with cayu-tech/cayu-cloud#970; an older
+`next_cursor`. It needs a Cayu Cloud that keeps copy-in archives; an older
 one answers `sandbox_archives_unsupported`.
 
 Cloud also logs every create it refuses for a full limit, with the limit, how

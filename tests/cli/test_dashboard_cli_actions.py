@@ -778,8 +778,8 @@ def test_archive_reaches_a_cloud_agent_through_its_api(monkeypatch, capsys):
         raising=False,
     )
     command = ["knowledge", "archive", "one", "--reason", "Stale", "--operation-id", "a"]
-    assert main([*command, "--application", "cayu-scout", "--json"]) == 0
-    assert opened == ["cayu-scout"]
+    assert main([*command, "--application", "acme-scout", "--json"]) == 0
+    assert opened == ["acme-scout"]
     assert calls == [
         (
             "/knowledge/one/retire",

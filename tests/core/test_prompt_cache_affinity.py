@@ -1,4 +1,4 @@
-"""Runtime prompt-cache affinity keys follow the fork lineage (#2289)."""
+"""Runtime prompt-cache affinity keys follow the fork lineage."""
 
 from __future__ import annotations
 

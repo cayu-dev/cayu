@@ -38,7 +38,7 @@ class _AuditCsv(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
-        # The mistake from #1972: findings only in structured, a bare summary in content.
+        # Deliberately wrong: findings only in structured, a bare summary in content.
         return ToolResult(content="CSV audit complete", structured={"blank_rows": 3})
 
 

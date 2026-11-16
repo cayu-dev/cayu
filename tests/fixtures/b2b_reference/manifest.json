@@ -1,10 +1,10 @@
 {
   "reference": {
-    "repository": "cayu-tech/cayu-b2b-reference",
+    "repository": "b2b-reference (private)",
     "commit": "2a39006",
     "about": "A `cayu new --preset b2b` project changed by hand until it is what the generator should write; each commit after the first is a change the generator should make."
   },
-  "project": "cayu-b2b-reference",
+  "project": "b2b-reference",
   "prefixes": [
     "web/",
     "integrations/http/"
@@ -21,11 +21,11 @@
   "files": {
     "domain/organizations.py": {
       "reference_sha256": "b3cc3ebea813e21d59d4efca170940f73396939e34dbdf05f1f6ee1705b232e8",
-      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122). The reference moves under cayu-b2b-reference#3."
+      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice. The reference is to make the same change."
     },
     "integrations/http/__init__.py": {
       "reference_sha256": "ae6dd5369a24ee7e1e5c2c6aee0ec098e5005ec761469a683cdfa3b6ed130cae",
-      "deviation": "No inbox_page: without an Inbox page of its own, the Overview links to the Developer dashboard's Inbox. The person docstring says /app/inbox instead of the app's Inbox. No /app/ui router (integrations/web.py). Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). The Settings page's commands name the Cloud application (CAYU_CLOUD_APPLICATION_ID, else the slug `cayu cloud init` makes from the project's name), not the specialist's name (review of #3839). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122). The reference moves under cayu-b2b-reference#3."
+      "deviation": "No inbox_page: without an Inbox page of its own, the Overview links to the Developer dashboard's Inbox. The person docstring says /app/inbox instead of the app's Inbox. No /app/ui router (integrations/web.py). Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. The Settings page's commands name the Cloud application (CAYU_CLOUD_APPLICATION_ID, else the slug `cayu cloud init` makes from the project's name), not the specialist's name. Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice. The reference is to make the same change. The project is named b2b-reference here, not after the reference's repository."
     },
     "integrations/http/fixed_settings.py": {
       "reference_sha256": "bf0aa72f9896de69495087332a8d75a21cddef749b7ba003dc3f8715cefb3ec7",
@@ -33,27 +33,27 @@
     },
     "integrations/http/generated/__init__.py": {
       "reference_sha256": "a9ce5bfa133fa1adb44d33fa8aad22bd3a19cab7fc9afae3eac898a21e9a4f44",
-      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's (review of #3840). Its docstring says settings, overview and task-runs answer with an ETag (#4005). Takes `read_tasks` for /app/task-runs, as the task-runs module does (#4022). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "The /app/inbox line no longer says an Inbox imported from the Developer dashboard reads it. Passes agent_name to the Overview too, so its counts are this Agent's. Its docstring says settings, overview and task-runs answer with an ETag. Takes `read_tasks` for /app/task-runs, as the task-runs module does. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/cayu_api.py": {
       "reference_sha256": "12a1f7a97847913719a6bc68e61fa8ce44ffc59b65413c97f536120581d25ec3",
-      "deviation": "Holds the closed-inbox and no-answer sentences the Overview and /app/inbox share (review of #3840). Its in-process client returns Cayu's 500 as a response instead of raising the app's exception, so the Overview's fallback runs (review of #3839). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "Holds the closed-inbox and no-answer sentences the Overview and /app/inbox share. Its in-process client returns Cayu's 500 as a response instead of raising the app's exception, so the Overview's fallback runs. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/inbox.py": {
       "reference_sha256": "61da01208e2d026b32b02734de27f5888abaa606091700911e1d9bac0caec479",
-      "deviation": "The docstring no longer says the route is for an Inbox imported from the Developer dashboard. Only a 401 or Cayu's role_forbidden becomes the closed-inbox 403; another 403 keeps Cayu's reason. The person dependency is declared once on the router (review of #3840). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "The docstring no longer says the route is for an Inbox imported from the Developer dashboard. Only a 401 or Cayu's role_forbidden becomes the closed-inbox 403; another 403 keeps Cayu's reason. The person dependency is declared once on the router. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/overview.py": {
       "reference_sha256": "05ea3c3217d4d135d3b723059b4341a8a296e9bb18bc2ad06786e72209f909b7",
-      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py (review of #3840). Answers through cayu.server.etag's tagged_json with a tag of everything but as_of, so an unchanged overview costs a 304 (#4005). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "With agent_name, counts only this Agent's inbox items, as /app/inbox lists them; uses the shared sentences from cayu_api.py. Answers through cayu.server.etag's tagged_json with a tag of everything but as_of, so an unchanged overview costs a 304. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/settings.py": {
       "reference_sha256": "82e9b0796e48772fdf774ddff908670b4ed11735e1fb750c9f0a392eda3b8228",
-      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default (review of #3840). A value Cloud refused is reported even when Cloud leaves it out of the values it applies (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304 (#4005). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default. A value Cloud refused is reported even when Cloud leaves it out of the values it applies. Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/task_runs.py": {
       "reference_sha256": "819e7d268a76ace4bf8792d4c9000c71d8e984fa73499ec6f6370d3eb4c4a127",
-      "deviation": "A run ends with its last task's completion, not its last-created task's (review of #3840). When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial` (review of #3839). Answers through cayu.server.etag's tagged_json, so unchanged runs cost a 304 (#4005). Reads tasks with `read_tasks`: by default `scoped_tasks`, the person's through Cayu's resource-access policy, or `operator_tasks`, every task, for an Agent whose people are its operators (#4022). Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings (#4022)."
+      "deviation": "A run ends with its last task's completion, not its last-created task's. When the window of newest tasks is full it also reads each status's open tasks once (the task store has no cursor for more, and offsets skip tasks that change status), and then reports no run as ended: a run whose tasks read have all ended says `partial`. Answers through cayu.server.etag's tagged_json, so unchanged runs cost a 304. Reads tasks with `read_tasks`: by default `scoped_tasks`, the person's through Cayu's resource-access policy, or `operator_tasks`, every task, for an Agent whose people are its operators. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/whoami.py": {
       "reference_sha256": "7083e16e60669c0f8ca957f9ac31f7de0059d6e3fb853f14cd955adbfda8b357",
@@ -61,15 +61,15 @@
     },
     "integrations/http/overview_metrics.py": {
       "reference_sha256": "e0e716691bbffb025644fc0f91f61c4003b59d3d604736c066e5bfc9eaf3e3fc",
-      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122). The reference moves under cayu-b2b-reference#3."
+      "deviation": "Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice. The reference is to make the same change."
     },
     "tests/test_generated_routes.py": {
       "reference_sha256": "84ee3465b174180c1ccc7645c6b9a78b8b96f4b722a545a691f5ceb6accb7142",
-      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window (review of #3839). A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended (review of #3839). A test that settings, the Overview and task runs answer an unchanged read with a 304 and a changed one with a new tag (#4005). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122). The reference moves under cayu-b2b-reference#3."
+      "deviation": "Two settings asserts that joined `is False`/`is True` with `and` are split: Cayu's check for literal capability branches in generated projects refuses `False and` and `True and`. Two tests added: the Overview counts only this Agent's inbox, and /app/inbox keeps Cayu's own 403 reason unless Cayu refuses the person outright. Tests for those three: the Overview keeps its metrics when Cayu's inbox fails, a refused value missing from Cloud's values, and a run with open work beyond the window. A store whose status reads miss open tasks, as when they change status between reads, checks that a run with a missed open task isn't reported ended. A test that settings, the Overview and task runs answer an unchanged read with a 304 and a changed one with a new tag. Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice. The reference is to make the same change."
     },
     "tests/test_http_api.py": {
       "reference_sha256": "a74e7c077c6ca57065f2c0a0c7bb68df107d23b8fffaa3f3c01b89b2ede6edfc",
-      "deviation": "Serves web/static with serve_web_app as `cayu serve` does, and checks the page at / and at a deep path, its img-src policy, assets, missing assets and unknown /app paths as 404s. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL (#4065). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122). The reference moves under cayu-b2b-reference#3."
+      "deviation": "Serves web/static with serve_web_app as `cayu serve` does, and checks the page at / and at a deep path, its img-src policy, assets, missing assets and unknown /app paths as 404s. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Imports cayu.memberships instead of carrying copies of the membership policy, sharing labels and membership SQL. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice. The reference is to make the same change."
     },
     "web/.gitignore": {
       "reference_sha256": "790e3169bc19b046fe55ba1da6d13b976c28363c8c00462a2195fe5faf260910",
@@ -77,71 +77,71 @@
     },
     "web/e2e/.gitignore": {
       "reference_sha256": null,
-      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app and now part of the generic app; the reference has no smoke test."
     },
     "web/e2e/package-lock.json": {
       "reference_sha256": null,
-      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app and now part of the generic app; the reference has no smoke test."
     },
     "web/e2e/package.json": {
       "reference_sha256": null,
-      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app and now part of the generic app; the reference has no smoke test."
     },
     "web/e2e/playwright.config.ts": {
       "reference_sha256": null,
-      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
+      "deviation": "The smoke test's package and Playwright configuration, shared with the operator app and now part of the generic app; the reference has no smoke test."
     },
     "web/e2e/smoke.spec.ts": {
       "reference_sha256": null,
-      "deviation": "The reference has no smoke test. The organizations' app gets one like the operator app's (#4023): `cayu serve --dev` serves it, a demonstration person signs in, and every area in the navigation opens in a browser."
+      "deviation": "The reference has no smoke test. The organizations' app gets one like the operator app's: `cayu serve --dev` serves it, a demonstration person signs in, and every area in the navigation opens in a browser."
     },
     "web/index.html": {
       "reference_sha256": "203705cd7ab3b497c8d64d5f79f9dc919ebc973a405ea7d8f2849c1860d4be33",
-      "deviation": "Carries the page's img-src policy in a <meta> tag, since `cayu serve` sends only frame-ancestors. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+      "deviation": "Carries the page's img-src policy in a <meta> tag, since `cayu serve` sends only frame-ancestors. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. The project is named b2b-reference here, not after the reference's repository."
     },
     "web/package-lock.json": {
       "reference_sha256": "071b7864fe7dea9377fe48f02c9b78497930abb78f49d31651fcf4093990e147",
-      "deviation": "Without lucide-react, which only the imported Inbox part used. Locks Vite+ instead of Biome and Vite (#4134)."
+      "deviation": "Without lucide-react, which only the imported Inbox part used. Locks Vite+ instead of Biome and Vite."
     },
     "web/package.json": {
       "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports (#4134)."
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports."
     },
     "web/scripts/add-licenses.mjs": {
       "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",
-      "deviation": "Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "Formatted with Vite+ (`vp fmt`)."
     },
     "web/scripts/check-build.mjs": {
       "reference_sha256": "5ed85208594e8af82542fc6edb16969d089d638944f9acfef26ea9fe1f40287d",
-      "deviation": "Runs Vite+ (`vp build`, #4134) and add-licenses.mjs with the running Node instead of through npx, which spawnSync can't start on Windows, and removes its temporary folder when a step fails or the build is stale (the reference exits inside the try block)."
+      "deviation": "Runs Vite+ (`vp build`) and add-licenses.mjs with the running Node instead of through npx, which spawnSync can't start on Windows, and removes its temporary folder when a step fails or the build is stale (the reference exits inside the try block)."
     },
     "web/src/agent/api.ts": {
       "reference_sha256": "ed1aaa1fe4390cd7a543da1b07a9ff7a9fc08aec2fe09f4c03fb1872d904292d",
-      "deviation": "The conversation list query is marked read: true; unused demoSignOut removed; statusOf has one branch (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "The conversation list query is marked read: true; unused demoSignOut removed; statusOf has one branch. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice; the reference is to make the same change. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/agent/conversations.tsx": {
       "reference_sha256": "fa380b682c42072b9b220b0d2b6790a02a49ced2c745f814dfa382abf97ba165",
-      "deviation": "Creating a conversation and replying invalidate the conversation lists; a failed /app/me shows an error with a retry instead of loading forever; NoOrganization moved to organization.tsx; conversationPath exported (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`); navigation promises are voided and lint suppressions are Oxlint's (#4134)."
+      "deviation": "Creating a conversation and replying invalidate the conversation lists; a failed /app/me shows an error with a retry instead of loading forever; NoOrganization moved to organization.tsx; conversationPath exported. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice; the reference is to make the same change. Formatted with Vite+ (`vp fmt`); navigation promises are voided and lint suppressions are Oxlint's."
     },
     "web/src/agent/index.tsx": {
       "reference_sha256": "4b92b6bad8409859dc707a116eaae51b7c6d71dedbdb36bf99b93a64326068fc",
-      "deviation": "No Inbox area (The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.) The Agent's name is the page title, which `cayu new` writes into both index.html files, so the committed build is the same for every project."
+      "deviation": "No Inbox area (The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead.) The Agent's name is the page title, which `cayu new` writes into both index.html files, so the committed build is the same for every project."
     },
     "web/src/agent/markdown.tsx": {
       "reference_sha256": "8346a8d7e9866f44e8577e2d75a5ef144dfcf03ccbd713e5b1200b08e7d1a6b2",
-      "deviation": "Formatted with Vite+ (`vp fmt`), and says why its headings have content, which Oxlint's heading-has-content can't see (#4134)."
+      "deviation": "Formatted with Vite+ (`vp fmt`), and says why its headings have content, which Oxlint's heading-has-content can't see."
     },
     "web/src/agent/members.tsx": {
       "reference_sha256": "ff8708373304fe532298f154836b9e2daf4ead57946131ecb4b22d11c8b9744a",
-      "deviation": "A failed /app/me shows an error with a retry; invalidations use membersQuery's key and whoamiKey (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "A failed /app/me shows an error with a retry; invalidations use membersQuery's key and whoamiKey. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice; the reference is to make the same change. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/agent/organization.tsx": {
       "reference_sha256": "9c84cb94f93f00b3094ff5bf9c1a34b33cbd76cd736e8ba137250478521af25f",
-      "deviation": "Holds membershipBlocker, MembershipFailed and NoOrganization, the gate the pages use when /app/me fails or finds no organization; unused placeOf removed (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3."
+      "deviation": "Holds membershipBlocker, MembershipFailed and NoOrganization, the gate the pages use when /app/me fails or finds no organization; unused placeOf removed. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice; the reference is to make the same change."
     },
     "web/src/agent/overview.tsx": {
       "reference_sha256": "b10f203db6f6074cbd4d4b81efe46c9bfcddf18e99a9a6908fe2c00e1c4c780c",
-      "deviation": "Its doc comment carries the `THE AGENT'S OWN.` marker the reference left out. Links through conversationPath (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3."
+      "deviation": "Its doc comment carries the `THE AGENT'S OWN.` marker the reference left out. Links through conversationPath. No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice; the reference is to make the same change."
     },
     "web/src/agent/sign-in.tsx": {
       "reference_sha256": "fb816b0c2cc32eb634ae1b960909889ef50d71086edd9faea7da12202b2c1c92",
@@ -165,11 +165,11 @@
     },
     "web/src/app/layout.tsx": {
       "reference_sha256": "a8e7cf152a89ce1c57b064b9e073d820ca2e109ff3a63c0e981017094241c8e7",
-      "deviation": "The Runtime group links to Cayu's Inbox at /cayu/inbox next to the Developer dashboard. The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead."
+      "deviation": "The Runtime group links to Cayu's Inbox at /cayu/inbox next to the Developer dashboard. The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead."
     },
     "web/src/app/routes.tsx": {
       "reference_sha256": "bec83f26f132fb94775608490c2803622e21fd055ec1307d86964d488b8878d0",
-      "deviation": "Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/app/services.tsx": {
       "reference_sha256": "f5a6419e455a1088ab6835c510b766f1c3a23d0d0862dcd58453d704e85b385a",
@@ -181,11 +181,11 @@
     },
     "web/src/blocks/task-runs.tsx": {
       "reference_sha256": "0c5d2e7283eb0a0a2bdb3b4d8ea3db1502a397ca64dc987604a2320d0633f56c",
-      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839). Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval (#3860). Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "The comment no longer names a private issue. Labels the `partial` run status. Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/generated/overview/index.tsx": {
       "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
-      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860). Says when it last read the overview (dataUpdatedAt), since a 304 keeps the earlier answer's as_of (#4005). Formatted with Vite+ (`vp fmt`), and its lint suppression is Oxlint's (#4134)."
+      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer. Says when it last read the overview (dataUpdatedAt), since a 304 keeps the earlier answer's as_of. Formatted with Vite+ (`vp fmt`), and its lint suppression is Oxlint's."
     },
     "web/src/generated/settings/index.tsx": {
       "reference_sha256": "27ec9dc65bf76e3c8a538b051286a71da4abcb0fec9c5369aa18689ae999922c",
@@ -193,7 +193,7 @@
     },
     "web/src/generated/settings/page.tsx": {
       "reference_sha256": "63ce0183f60e8391f0269fcca2b9e8881a6fb6749ffb94b6a6f9e2c8eb6ed96f",
-      "deviation": "A comment says the kit's settings rows instead of naming the private kit. Formatted with Vite+ (`vp fmt`) (#4134)."
+      "deviation": "A comment says the kit's settings rows instead of naming the private kit. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/kit/shadcn/components/alert.tsx": {
       "reference_sha256": "d5f89fec55b16abccbde138f856a3e45b2b656e0c58ef62b2f5833c87cc2720c",
@@ -325,7 +325,7 @@
     },
     "web/src/kit/shadcn/data.ts": {
       "reference_sha256": "83a7ec973d43d6030564f213c33150d4d93099ad24c4cf58ffc4a3c7cf6e5052",
-      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads (review of #3841). Adds watchInterval, a refetchInterval with Cayu's watch cadence for reads of /app (#3860). The fetch wrapper's comment says reads revalidate through the browser's HTTP cache, which turns a 304 into the kept answer (#4005)."
+      "deviation": "RequestOptions takes read: true for a read sent with another method (a query POST), so its failures are read failures, retried as reads. Adds watchInterval, a refetchInterval with Cayu's watch cadence for reads of /app. The fetch wrapper's comment says reads revalidate through the browser's HTTP cache, which turns a 304 into the kept answer."
     },
     "web/src/kit/shadcn/hooks/index.tsx": {
       "reference_sha256": "1641ceaa3daeed1ab5929b0d179d7e37c25a3a297e1e99ae2f47fc9b9e5a10c4",
@@ -421,7 +421,7 @@
     },
     "web/src/main.tsx": {
       "reference_sha256": "1ccd124f71fded2eea9a24bb0402273194216c63c3f333d99c9f497b4206273f",
-      "deviation": "The browser router has no /app/ui basename. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Calls `session.expire()` from an arrow function, as Oxlint's unbound-method rule asks (#4134)."
+      "deviation": "The browser router has no /app/ui basename. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Calls `session.expire()` from an arrow function, as Oxlint's unbound-method rule asks."
     },
     "web/third_party/shadcn-ui.LICENSE": {
       "reference_sha256": "1564074e13439397221ffd522e2e504d56561994a23d371aa5e3ad43e4f5423f",
@@ -429,7 +429,7 @@
     },
     "web/tsconfig.base.json": {
       "reference_sha256": "77d412588912fafd07329be35644386e62c2078c3907bd4e5124036cbc7f9b06",
-      "deviation": "Uses Vite+'s client types (`vite-plus/client`) instead of Vite's (#4134)."
+      "deviation": "Uses Vite+'s client types (`vite-plus/client`) instead of Vite's."
     },
     "web/tsconfig.json": {
       "reference_sha256": "505560fc20927ebead0630a69eaa83b57c426fc16b78f26c5dc6de6fb5aa37d2",
@@ -437,15 +437,14 @@
     },
     "web/vite.config.ts": {
       "reference_sha256": "a9d0a487695315f8e32a880eeafebf299719fe67daeec58dae9759a760787075",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Imports defineConfig from vite-plus and holds the lint and format settings (#4134)."
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Imports defineConfig from vite-plus and holds the lint and format settings."
     }
   },
   "not_generated": {
-    "integrations/web.py": "The project no longer serves its pages; `cayu serve` serves web/static at / ([tool.cayu.serve] ui) (#3846).",
+    "integrations/web.py": "The project no longer serves its pages; `cayu serve` serves web/static at / ([tool.cayu.serve] ui).",
     "web/.npmrc": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/biome.json": "Vite+ lints and formats the app instead of Biome; its settings are in vite.config.ts (#4134).",
-    "web/src/api/inbox.ts": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
-    "web/src/generated/inbox/index.tsx": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
+    "web/src/api/inbox.ts": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead.",
+    "web/src/generated/inbox/index.tsx": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead.",
     "web/src/kit/design/data.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/src/kit/design/hooks.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/src/kit/design/icons.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
@@ -456,6 +455,7 @@
     "web/src/kit/design/styles.css": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/src/kit/design/ui.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/src/vite-env.d.ts": "Declares only the kit switch, which the generator doesn't write. The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/tsconfig.design.json": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone."
+    "web/tsconfig.design.json": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/biome.json": "Vite+ lints and formats the app instead of Biome; its settings are in vite.config.ts."
   }
 }

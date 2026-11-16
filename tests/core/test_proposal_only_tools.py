@@ -115,7 +115,7 @@ class EverythingItIsGiven(ToolExposurePolicy):
         )
 
 
-ARGS = {"repository": "cayu-tech/cayu", "number": 12}
+ARGS = {"repository": "example/app", "number": 12}
 
 
 def _build(

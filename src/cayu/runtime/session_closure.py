@@ -528,7 +528,7 @@ class KnowledgeSessionClosureStore:
 
 
 class SessionEvidenceClosureStore:
-    """Inventory #946 receipt/exposure references owned by SessionStore."""
+    """Inventory receipt/exposure references owned by SessionStore."""
 
     store_id = "session-store-evidence"
 

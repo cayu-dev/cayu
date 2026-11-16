@@ -16,7 +16,7 @@ from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, Kn
         "Weather tomorrow?",
         "New topic: taxes",
         "Atlas",
-        "#1417",
+        "#42",
         "src/cayu/memory/recall.py",
         "How should we configure deployment rollback safeguards?",
         "Météo demain ?",

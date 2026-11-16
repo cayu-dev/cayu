@@ -211,7 +211,7 @@ def test_tier_gate_allows_at_or_above_and_rejects_below() -> None:
 
 
 def test_tier_gate_reads_persisted_routing_not_a_caller_claim() -> None:
-    # Regression (reviewer talgat0528): the gate must read the routing persisted
+    # Regression: the gate must read the routing persisted
     # on the checkpoint, so a sub-tier approver cannot resolve a corporate-routed
     # approval. Resolution accepts no caller-supplied pending/routing.
     app, _store, tool, approval_event = _paused_app(

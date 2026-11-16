@@ -1060,7 +1060,7 @@ as one waiting on a question or an approval it can no longer resume from:
 
 ```console
 cayu session close SESSION_ID --reason "Stranded by the 27 Oct release."
-cayu session close SESSION_ID --application aifinance --reason "Stranded by the 27 Oct release."
+cayu session close SESSION_ID --application my-agent --reason "Stranded by the 27 Oct release."
 ```
 
 It calls `CayuApp.close_session` (`POST /api/sessions/{id}/close`). The session fails

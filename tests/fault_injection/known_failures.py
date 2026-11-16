@@ -1,4 +1,4 @@
-"""Faults the Runtime does not survive yet, each mapped to the issue it reproduces.
+"""Faults the Runtime does not survive yet, each mapped to the defect it reproduces.
 
 The exhaustive tests accept exactly these violations and nothing else. Every entry
 also has a strict ``xfail`` test that injects at its first point only, so it
@@ -23,36 +23,26 @@ if TYPE_CHECKING:
     from tests.fault_injection.explore import Violation
 
 
-@dataclass(frozen=True)
-class Finding:
-    issue: str
-    summary: str
-
-
-# Issues are cayu-tech/cayu. Findings with no issue of their own are tracked in #3390.
-FINDINGS: dict[str, Finding] = {
-    "group-crash-conflict": Finding(
-        "#3390 (related #3245)",
+# Each finding's summary of the defect it reproduces.
+FINDINGS: dict[str, str] = {
+    "group-crash-conflict": (
         "After a worker dies mid-run its unsettled group execution makes the "
-        "continuation fail with TaskGroupConflict, so the task stays RUNNING",
+        "continuation fail with TaskGroupConflict, so the task stays RUNNING"
     ),
-    "group-crash-after-complete": Finding(
-        "#3390",
+    "group-crash-after-complete": (
         "A crash after the member's live terminalization, before its worker acknowledges "
         "the execution, leaves the group obligation unsettled: nothing durable proves the "
-        "callback returned",
+        "callback returned"
     ),
     # Found by test_continuation_failure_crash.py, whose scenario fails the
     # approval close on purpose, so it has no point list of its own here.
-    "continuation-pause-interaction-open": Finding(
-        "#3345",
+    "continuation-pause-interaction-open": (
         "An approval continuation that fails before its close restores the pause with a "
-        "raw status write, so the resumed interaction is never settled",
+        "raw status write, so the resumed interaction is never settled"
     ),
-    "continuation-pause-event-lost": Finding(
-        "#3345",
+    "continuation-pause-event-lost": (
         "A crash between that raw status write and SESSION_INTERRUPTED loses the event: "
-        "its ID is random and nothing owes it",
+        "its ID is random and nothing owes it"
     ),
 }
 
@@ -72,8 +62,7 @@ class KnownFailure:
 
     @property
     def reason(self) -> str:
-        finding = FINDINGS[self.finding]
-        return f"{finding.issue}: {finding.summary}"
+        return FINDINGS[self.finding]
 
     def matches(self, violation: Violation) -> bool:
         return (

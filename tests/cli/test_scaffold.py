@@ -650,7 +650,7 @@ def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contra
     assert "cayu_wheel_sha256" in builder
     assert '"--build-context"' in builder
     assert "Docker is the P1 bounded path" in readme
-    assert "#1878" in readme
+    assert "Untrusted-code execution belongs on Lambda MicroVM" in readme
     assert "does not claim exact" in readme
     assert "patch_ready_for_delivery" in readme
     assert "class CodingProductTask" in domain_source

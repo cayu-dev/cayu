@@ -1,6 +1,6 @@
-"""The dashboard's Usage and Tools reads at review.cayu.ai's scale.
+"""The dashboard's Usage and Tools reads at a production code-review Agent's scale.
 
-review.cayu.ai keeps about 8,000 sessions with about 110,000 tool calls and
+That Agent keeps about 8,000 sessions with about 110,000 tool calls and
 80,000 model steps over 30 days. Its Usage page (a 30-day rollup with a daily
 series) and Tools page (retained per-tool totals) read the narrow
 ``cayu_usage_events`` copy rather than whole event rows.

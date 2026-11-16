@@ -1,4 +1,4 @@
-"""Qualified local immutable-resource owner for issue #1800.
+"""Qualified local immutable-resource owner.
 
 The owner is deliberately separate from generic artifact writes and from
 Docker input projection. It records the complete operation and responsibility

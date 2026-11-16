@@ -86,7 +86,7 @@ def test_the_crash_point_follows_the_raw_status_write() -> None:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason=FINDINGS["continuation-pause-interaction-open"].summary,
+    reason=FINDINGS["continuation-pause-interaction-open"],
 )
 def test_a_failed_continuation_settles_its_resumed_interaction() -> None:
     result = explore._run_isolated(_SCENARIO, None, None)
@@ -97,7 +97,7 @@ def test_a_failed_continuation_settles_its_resumed_interaction() -> None:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason=FINDINGS["continuation-pause-event-lost"].summary,
+    reason=FINDINGS["continuation-pause-event-lost"],
 )
 def test_a_crash_after_the_restored_pause_keeps_its_session_event() -> None:
     result = explore.run_point(_SCENARIO, FaultKind.CRASH, _SESSION_EVENT_WRITE)

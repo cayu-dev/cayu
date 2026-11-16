@@ -1372,7 +1372,7 @@ class MemoryVariantDisposition(_ReportModel):
 
 
 class MemoryVariantCostQualityReport(_ReportModel):
-    """Canonical #300 evidence scoped to one candidate versus the baseline."""
+    """Canonical cost-quality evidence scoped to one candidate versus the baseline."""
 
     candidate_variant_id: StrictStr = Field(max_length=128)
     report: PairedCostQualityComparisonReport | None = None
@@ -1796,7 +1796,7 @@ def _row_id(case_id: str, repetition: int, variant_id: str) -> str:
 
 
 def memory_experiment_accounting_task_id(experiment_id: str) -> str:
-    """Return the shared #300 task identity for one experiment cohort."""
+    """Return the shared accounting task identity for one experiment cohort."""
 
     normalized_experiment_id = _clean(experiment_id, "experiment_id", maximum=128)
     return _content_revision(
@@ -1806,7 +1806,7 @@ def memory_experiment_accounting_task_id(experiment_id: str) -> str:
 
 
 def memory_experiment_accounting_source_id(case_revision: str, repetition: int) -> str:
-    """Return the exact #300 source identity for one repeated case row."""
+    """Return the exact accounting source identity for one repeated case row."""
 
     case_revision = _revision(case_revision, "case_revision")
     if (

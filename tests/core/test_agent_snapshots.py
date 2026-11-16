@@ -1215,7 +1215,7 @@ async def test_materializations_recorded_before_authority_binding_still_begin_tr
             trial_id="trial-1",
             state_mode=state_mode,
         )
-        # Records written before #2556 derived their scope without the authority
+        # Older records derived their scope without the authority
         # scope and do not record one.
         legacy_request = SimpleNamespace(
             snapshot_fingerprint=request.snapshot_fingerprint,

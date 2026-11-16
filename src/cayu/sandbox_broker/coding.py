@@ -148,7 +148,7 @@ BROKERED_SANDBOX_EGRESS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS"
 #: commas or whitespace (``pypi.org,files.pythonhosted.org,*.githubusercontent.com``).
 BROKERED_SANDBOX_EGRESS_HOSTS_ENV = "CAYU_CLOUD_SANDBOX_EGRESS_HOSTS"
 #: Optional: repositories the sandbox's git fetches with the Agent's brokered git credentials,
-#: ``host/path`` separated by commas or whitespace (``github.com/cayu-tech/cayu.git``).
+#: ``host/path`` separated by commas or whitespace (``github.com/example/app.git``).
 BROKERED_SANDBOX_GIT_REPOSITORIES_ENV = "CAYU_CLOUD_SANDBOX_GIT_REPOSITORIES"
 #: Lease length in seconds, 60 to 3600 (default 900).
 BROKERED_SANDBOX_LEASE_ENV = "CAYU_CLOUD_SANDBOX_LEASE_SECONDS"
@@ -594,7 +594,7 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
     explicit; there is no default.
 
     ``git_repositories`` (``host/path``, such as
-    ``github.com/cayu-tech/cayu.git``) asks Cayu Cloud to authenticate the
+    ``github.com/example/app.git``) asks Cayu Cloud to authenticate the
     sandbox's git fetches of those repositories with the Agent's git credential
     bound to them in Cloud; the token stays in Cloud's broker, and only fetches
     of exactly those repositories are let through on their hosts. It needs

@@ -580,7 +580,7 @@ def pending_approval_expired(approval: PendingToolApproval, now: datetime) -> bo
     """Whether a pending approval's window has closed at ``now``.
 
     Pure access-time check (no daemon); the resolution winner evaluates it
-    after the atomic status claim. A future lifecycle sweep (issue #104) can
+    after the atomic status claim. A future lifecycle sweep can
     call this on interrupted sessions to proactively deny expired approvals.
     """
     return approval.expires_at is not None and now >= approval.expires_at

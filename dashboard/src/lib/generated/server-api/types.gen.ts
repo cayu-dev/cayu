@@ -16260,7 +16260,7 @@ export type MemoryTrialReportRow = {
 /**
  * MemoryVariantCostQualityReport
  *
- * Canonical #300 evidence scoped to one candidate versus the baseline.
+ * Canonical cost-quality evidence scoped to one candidate versus the baseline.
  */
 export type MemoryVariantCostQualityReport = {
     /**

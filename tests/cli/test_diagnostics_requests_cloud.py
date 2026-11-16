@@ -61,13 +61,13 @@ def cloud_agent(monkeypatch):
     monkeypatch.setattr("cayu.cli.cloud.cloud_client", lambda **_kwargs: state["cloud"])
     monkeypatch.setattr(
         "cayu.cli.cloud.resolve_application_id",
-        lambda _client, reference: "app_scout" if reference == "cayu-scout" else "missing",
+        lambda _client, reference: "app_scout" if reference == "acme-scout" else "missing",
     )
     return state
 
 
 def test_application_reads_the_agent_with_its_dashboard_login(cloud_agent, capsys) -> None:
-    command = ["diagnostics", "requests", "--application", "cayu-scout", "--since", "5m"]
+    command = ["diagnostics", "requests", "--application", "acme-scout", "--since", "5m"]
     assert main([*command, "--vcpu", "0.5"]) == 0
 
     captured = capsys.readouterr()
@@ -93,13 +93,13 @@ def test_application_reports_a_refused_login_and_a_missing_route(cloud_agent, ca
             "forbidden", "Only the Agent's developers and admins can do this.", status_code=403
         )
     )
-    assert main(["diagnostics", "requests", "--application", "cayu-scout"]) == 2
+    assert main(["diagnostics", "requests", "--application", "acme-scout"]) == 2
     assert "developers and admins" in capsys.readouterr().err
     assert cloud_agent["agent_requests"] == []
 
     cloud_agent["cloud"] = _FakeCloud()
     cloud_agent["status"] = 404
-    assert main(["diagnostics", "requests", "--application", "cayu-scout"]) == 2
+    assert main(["diagnostics", "requests", "--application", "acme-scout"]) == 2
     error = capsys.readouterr().err
     assert "The Agent app_scout does not serve Cayu's API" in error
     assert _PASSWORD not in error
@@ -112,7 +112,7 @@ def test_application_options_are_checked(cloud_agent, capsys, tmp_path) -> None:
                 "diagnostics",
                 "requests",
                 "--application",
-                "cayu-scout",
+                "acme-scout",
                 "--server-url",
                 "http://127.0.0.1:8000",
             ]
@@ -131,7 +131,7 @@ def test_application_options_are_checked(cloud_agent, capsys, tmp_path) -> None:
     # The output never overwrites the Cloud login it reads.
     output = tmp_path / "summary.json"
     output.symlink_to(context)
-    command = ["diagnostics", "requests", "--application", "cayu-scout"]
+    command = ["diagnostics", "requests", "--application", "acme-scout"]
     assert main([*command, "--context", str(context), "--output", str(output)]) == 2
     assert context.read_text() == '{"preserved": true}'
     assert cloud_agent["agent_requests"] == []

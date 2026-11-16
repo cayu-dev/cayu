@@ -153,8 +153,8 @@ between a half and two thirds of a session scenario's run.
 
 `known_failures.py` records every violation found, by finding, scenario, fault
 and point, with the invariants each point breaks and the stage each is found at
-(in the live process, after shutdown, after recovery), and maps each finding to
-the issue it reproduces or to its bug class. A known defect in the live process
+(in the live process, after shutdown, after recovery), and describes the defect
+each finding reproduces. A known defect in the live process
 therefore doesn't excuse a new one after recovery. The exhaustive tests accept exactly those and fail on anything new.
 Each entry also has a strict `xfail` test that injects at its first point, so it
 reports XPASS when a fix lands; then delete the entry. Points are cancellation
@@ -166,9 +166,6 @@ points unless the fault says otherwise.
 | `group-crash-after-complete` | crash: task-group | 11 | group execution obligation never settled; recovery completes the member but nothing proves its callback returned | a crash after the member's live terminalization, before `_settle_task_group_execution` |
 | `continuation-pause-interaction-open` | none: approval continuation whose close fails (`test_continuation_failure_crash.py`) | - | interaction started never settled | the continuation restores the pause with `update_status` and no interaction transition |
 | `continuation-pause-event-lost` | crash: the same continuation | 1 | no SESSION_INTERRUPTED after the resume, after recovery | a crash between that `update_status` and the SESSION_INTERRUPTED write |
-
-Each finding names its tracking issue in `known_failures.py`; findings with no
-issue of their own share one tracking issue there.
 
 ## What the scenarios do not reach
 
@@ -185,4 +182,4 @@ issue of their own share one tracking issue there.
 Add a `Scenario` to `SCENARIOS` in `explore.py`: an unarmed `setup` and a
 `phase` that hands every Runtime event stream it opens to `consume`. Run the
 new scenario's tests; record what fails on `main` in `known_failures.py` with
-the issue it reproduces, or file one.
+the defect it reproduces, and file an issue for it.

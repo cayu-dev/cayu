@@ -16,14 +16,14 @@ from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient
 from cayu.cli._cloud_database_health import window_minutes
 
-_AGENT = "/v1/applications/cayu-scout"
+_AGENT = "/v1/applications/acme-scout"
 _HEALTH = f"{_AGENT}/service/database"
 _LIST = ("GET", "/v1/applications?lifecycle=all")
-_AGENTS = httpx.Response(200, json={"items": [{"id": "cayu-scout", "name": "Cayu Scout"}]})
+_AGENTS = httpx.Response(200, json={"items": [{"id": "acme-scout", "name": "Acme Scout"}]})
 
 _ANSWER: dict[str, Any] = {
     "schema_version": 1,
-    "application_id": "cayu-scout",
+    "application_id": "acme-scout",
     "observed_at": "2026-11-06T18:30:00+00:00",
     "window": {"start": "2026-11-06T17:30:00+00:00", "end": "2026-11-06T18:30:00+00:00"},
     "round_trips": {
@@ -103,7 +103,7 @@ def cloud(
 
 
 def _run(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
-    code = main(["cloud", "service", "database", "--application", "Cayu Scout", *arguments])
+    code = main(["cloud", "service", "database", "--application", "Acme Scout", *arguments])
     return code, capsys.readouterr().out
 
 

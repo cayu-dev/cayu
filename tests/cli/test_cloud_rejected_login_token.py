@@ -3,7 +3,7 @@
 The CLI refreshes the login before each request when the token's own expiry is near,
 but that check uses the local clock. When the clock runs behind Cayu Cloud's, or the
 token is rejected early, Cloud answers 401 mid-command, for example during a long
-`deploy --wait` (cayu#2256).
+`deploy --wait`.
 """
 
 from __future__ import annotations

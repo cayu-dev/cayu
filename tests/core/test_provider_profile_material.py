@@ -43,9 +43,9 @@ def cases():
 # semantic cleanup policy v1, and HTTP cleanup observation policy v1.
 # Captured against current main before checking the concept migration.
 # The Anthropic entries changed deliberately when prompt caching became the
-# default (AnthropicProvider().cache_policy is now CachePolicy(), #2289).
+# default (AnthropicProvider().cache_policy is now CachePolicy()).
 # Every streaming provider changed deliberately when the absolute stream deadline
-# began counting from the last output (absolute output-idle policy v1, #2800).
+# began counting from the last output (absolute output-idle policy v1).
 _BASE_MATERIAL_SHA256 = {
     "anthropic": "5752745f4e9163a4c25e92d1a6807617e11d175535d5ba4e202ebbf28cee8359",
     "anthropic-tokens": "f0ab2706bce94d182651a849de81c9dd8628bb4df87281a7e2ace761a81d1d68",

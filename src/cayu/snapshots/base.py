@@ -2187,7 +2187,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
         exclude_if=lambda value: value is None,
     )
     # None only on records written before materialization scopes were bound to
-    # the requesting authority scope (#2556).
+    # the requesting authority scope.
     authority_scope_fingerprint: StrictStr | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -2307,7 +2307,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
         exclude_if=lambda value: value is None,
     )
     # None only on records written before materialization scopes were bound to
-    # the requesting authority scope (#2556).
+    # the requesting authority scope.
     authority_scope_fingerprint: StrictStr | None = Field(
         default=None,
         exclude_if=lambda value: value is None,

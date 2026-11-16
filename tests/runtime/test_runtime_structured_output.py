@@ -1092,7 +1092,7 @@ def test_cayu_app_rejects_invalid_native_structured_output_schema_before_run():
 
 
 def test_cayu_app_rejects_openai_native_schema_before_first_model_call():
-    # The issue-#151 acceptance path end-to-end: a schema OpenAI strict mode
+    # The acceptance path end-to-end: a schema OpenAI strict mode
     # always refuses (no `additionalProperties: false`) fails before any
     # session is created and before the transport is touched.
     class UnreachableTransport:

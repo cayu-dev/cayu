@@ -1,4 +1,4 @@
-"""Readiness gate for extracting E2B into an optional package (#1879).
+"""Readiness gate for extracting E2B into an optional package.
 
 An independently installed adapter package cannot import private Cayu modules
 or names. This test parses the in-tree E2B implementation and fails if it

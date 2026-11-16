@@ -276,7 +276,7 @@ def test_run_to_completion_returns_the_interaction_for_final_text() -> None:
 
 
 def test_run_to_completion_detects_failure_when_event_type_is_plain_str() -> None:
-    # #125 footgun 1: `is` would silently miss a plain-str `.type` and leave the run stuck at the
+    # Footgun 1: `is` would silently miss a plain-str `.type` and leave the run stuck at the
     # default INTERRUPTED (the "document hung in processing forever" symptom); `==` detects FAILED.
     outcome = asyncio.run(run_to_completion(_PlainStrFailureApp(), _request()))  # type: ignore[arg-type]
 

@@ -1,4 +1,4 @@
-"""Prompt caching is on by default for Anthropic-shaped providers (#2289)."""
+"""Prompt caching is on by default for Anthropic-shaped providers."""
 
 from __future__ import annotations
 

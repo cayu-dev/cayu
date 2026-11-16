@@ -511,7 +511,7 @@ class _CloudDeploymentStillRunningError(CloudApiError):
         self.waited_seconds = waited_seconds
         message = "Cayu Cloud is still processing this deployment."
         if waited_seconds is not None:
-            # Name what the wait was for, so a wait that ends is never a mystery (cayu#3120).
+            # Name what the wait was for, so a wait that ends is never a mystery.
             named = "the Release" if self.deployment_id is None else f"Release {self.deployment_id}"
             message = (
                 f"Cayu Cloud is still processing {named} (`{self.status}`); the CLI stopped "
@@ -762,7 +762,7 @@ class _CloudServiceStillRunningError(CloudApiError):
         if waited_seconds is not None:
             message = f"{message[:-1]} after {waited_seconds:.0f}s."
         if waiting_for is not None:
-            # Name what the wait was for, so a wait that ends is never a mystery (cayu#3120).
+            # Name what the wait was for, so a wait that ends is never a mystery.
             message = f"{message} The CLI was waiting for {waiting_for}."
         if last_issue is not None:
             message = f"{message} Last report: {last_issue}"
@@ -3265,7 +3265,7 @@ def _deploy(
     )
     original = deployment
     # Cloud answers a new submission with a Release it has only just accepted, so a Release
-    # past that is one it built from this source before (cayu#3120).
+    # past that is one it built from this source before.
     found_existing = acknowledge_existing or _deployment_status(original) != "accepted"
     if _deployment_status(deployment) in _DEPLOYMENT_FAILURES:
         deployment = _latest_source_retry(client, str(application["id"]), original)

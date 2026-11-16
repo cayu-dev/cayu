@@ -1,4 +1,4 @@
-"""Synthetic function-call controls for #1498, never incident wire data."""
+"""Synthetic function-call ordering controls, never incident wire data."""
 
 from copy import deepcopy
 

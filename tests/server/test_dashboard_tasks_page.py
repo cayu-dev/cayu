@@ -737,7 +737,7 @@ def test_failed_tasks_say_why_on_home_tasks_and_the_task_page():
     async def scenario():
         store = InMemoryTaskStore()
         await store.create_task(
-            TaskCreate(task_id="review-217", type="review", title="Review scout#217")
+            TaskCreate(task_id="review-217", type="review", title="Review app#217")
         )
         await store.fail_task(
             "review-217",

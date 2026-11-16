@@ -235,7 +235,7 @@ export interface WatchTasksFilter {
   status?: TaskStatus | readonly TaskStatus[]
   /**
    * Top-level input values every listed task has, as its detail shows them, for
-   * example `{ repository: "cayu-tech/cayu" }`. Numbers match by value.
+   * example `{ repository: "example/app" }`. Numbers match by value.
    */
   input?: Readonly<Record<string, TaskValue>>
   /** The run a task belongs to: its `metadata.run`. */
