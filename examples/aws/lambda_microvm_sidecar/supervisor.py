@@ -75,6 +75,11 @@ LIFECYCLE_ACTIONS = frozenset({"suspend", "terminate"})
 TRANSPORT_TOKEN_ENV = "CAYU_EGRESS_PROXY_TRANSPORT_TOKEN"
 _TRANSPORT_TUNNEL_TARGET = "cayu-transport.invalid:443"
 _MAX_TRANSPORT_RESPONSE_BYTES = 4096
+# In Kubernetes mode commands share the pod's network, so the relay listens on
+# the pod's loopback. It admits as many connections as the Cayu proxy admits
+# tunnels for one sandbox; further ones are closed at once.
+LOOPBACK_RELAY_HOST = "127.0.0.1"
+MAX_LOOPBACK_RELAY_CONNECTIONS = 64
 # The only route from the agent namespace to the Cayu control server. The
 # trusted host configures one private target; the agent namespace resolves
 # AGENT_CONTROL_HOSTNAME to the gateway, and TLS stays end to end.
@@ -377,16 +382,10 @@ class _TcpRelay:
         listen_port: int | None = None,
     ) -> None:
         self.target = (host, port)
-        self._transport_request = (
-            None
-            if transport_token is None
-            else (
-                f"CONNECT {_TRANSPORT_TUNNEL_TARGET} HTTP/1.1\r\n"
-                f"Host: {_TRANSPORT_TUNNEL_TARGET}\r\n"
-                "Proxy-Authorization: Basic "
-                f"{base64.b64encode(b'cayu:' + transport_token).decode('ascii')}\r\n\r\n"
-            ).encode("ascii")
-        )
+        self._transport_request = _transport_request(transport_token)
+        self._listen(listen_host, listen_port)
+
+    def _listen(self, listen_host: str, listen_port: int | None) -> None:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(
@@ -416,6 +415,13 @@ class _TcpRelay:
                 connection.close()
         self._thread.join(timeout=1)
 
+    def _admit(self) -> tuple[tuple[str, int], bytes | None] | None:
+        """The target and transport request for one accepted connection, or None to close it."""
+        return self.target, self._transport_request
+
+    def _release(self) -> None:
+        """Called when an admitted connection ends."""
+
     def _accept(self) -> None:
         while not self._stop.is_set():
             try:
@@ -424,14 +430,21 @@ class _TcpRelay:
                 continue
             except OSError:
                 return
-            threading.Thread(target=self._bridge, args=(client,), daemon=True).start()
+            route = self._admit()
+            if route is None:
+                with contextlib.suppress(OSError):
+                    client.close()
+                continue
+            threading.Thread(target=self._bridge, args=(client, *route), daemon=True).start()
 
-    def _bridge(self, client: socket.socket) -> None:
+    def _bridge(
+        self, client: socket.socket, target: tuple[str, int], transport_request: bytes | None
+    ) -> None:
         upstream: socket.socket | None = None
         try:
-            upstream = socket.create_connection(self.target, timeout=5)
-            if self._transport_request is not None and not _open_transport_tunnel(
-                upstream, self._transport_request
+            upstream = socket.create_connection(target, timeout=5)
+            if transport_request is not None and not _open_transport_tunnel(
+                upstream, transport_request
             ):
                 return
             upstream.settimeout(None)
@@ -451,11 +464,61 @@ class _TcpRelay:
                 self._connections.discard(client)
                 if upstream is not None:
                     self._connections.discard(upstream)
+            self._release()
             with contextlib.suppress(OSError):
                 client.close()
             if upstream is not None:
                 with contextlib.suppress(OSError):
                     upstream.close()
+
+
+class _LoopbackRelay(_TcpRelay):
+    """Kubernetes mode's agent proxy relay on the pod's loopback, held for the sidecar's life.
+
+    Agent commands share the pod's loopback, so the supervisor binds the port
+    when it starts, before any command runs, and keeps it: an agent process
+    cannot take it over. Until the first ``retarget`` the relay closes every
+    connection as soon as it accepts it; afterwards it relays new connections
+    to the current target, presenting its transport token. Retargeting leaves
+    open tunnels alone. At most ``MAX_LOOPBACK_RELAY_CONNECTIONS`` are open at
+    once; a further connection is closed as soon as it is accepted.
+    """
+
+    def __init__(self) -> None:
+        self._route: tuple[tuple[str, int], bytes | None] | None = None
+        self._open = 0
+        self._listen(LOOPBACK_RELAY_HOST, None)
+
+    @property
+    def routed(self) -> bool:
+        return self._route is not None
+
+    def retarget(self, host: str, port: int, *, transport_token: bytes) -> None:
+        route = ((host, port), _transport_request(transport_token))
+        with self._lock:
+            self._route = route
+
+    def _admit(self) -> tuple[tuple[str, int], bytes | None] | None:
+        with self._lock:
+            if self._route is None or self._open >= MAX_LOOPBACK_RELAY_CONNECTIONS:
+                return None
+            self._open += 1
+            return self._route
+
+    def _release(self) -> None:
+        with self._lock:
+            self._open -= 1
+
+
+def _transport_request(transport_token: bytes | None) -> bytes | None:
+    if transport_token is None:
+        return None
+    return (
+        f"CONNECT {_TRANSPORT_TUNNEL_TARGET} HTTP/1.1\r\n"
+        f"Host: {_TRANSPORT_TUNNEL_TARGET}\r\n"
+        "Proxy-Authorization: Basic "
+        f"{base64.b64encode(b'cayu:' + transport_token).decode('ascii')}\r\n\r\n"
+    ).encode("ascii")
 
 
 def _open_transport_tunnel(upstream: socket.socket, request: bytes) -> bool:
@@ -478,7 +541,14 @@ def _open_transport_tunnel(upstream: socket.socket, request: bytes) -> bool:
 
 
 class CommandExecutionBoundary:
-    """Separate ordinary agent processes from authenticated system commands."""
+    """Separate ordinary agent processes from authenticated system commands.
+
+    With ``loopback_relay`` (Kubernetes mode) commands of both profiles run as
+    the agent and share this container's network: the transport token is
+    removed from every command, and a command's proxy settings are relayed
+    through ``LOOPBACK_RELAY_HOST`` only together with a token. The boundary
+    binds that relay's port when it is created, before any command runs.
+    """
 
     def __init__(
         self,
@@ -486,6 +556,7 @@ class CommandExecutionBoundary:
         agent_uid: int | None = None,
         agent_gid: int | None = None,
         agent_netns: str | None = None,
+        loopback_relay: bool = False,
         relay_factory: Any | None = None,
         control_relay_factory: Any | None = None,
         init_interpreter: str = sys.executable,
@@ -502,6 +573,9 @@ class CommandExecutionBoundary:
         ):
             raise ValueError("agent_netns must contain only letters, digits, and hyphens")
         self.agent_netns = agent_netns
+        if loopback_relay and agent_netns is not None:
+            raise ValueError("loopback_relay applies only without an agent network namespace")
+        self.loopback_relay = loopback_relay
         self._relay_factory = relay_factory or _TcpRelay
         self._relay: Any | None = None
         self._relay_target: tuple[tuple[str, int], bytes | None] | None = None
@@ -512,6 +586,8 @@ class CommandExecutionBoundary:
         if not init_interpreter or not os.path.isabs(init_interpreter):
             raise ValueError("init_interpreter must be an absolute path")
         self.init_interpreter = init_interpreter
+        if loopback_relay:
+            self._relay = _hold_loopback_relay()
 
     def isolates_process_tree(self, *, execution_profile: ExecutionProfile) -> bool:
         """Whether an interactive command of this profile runs in its own PID namespace."""
@@ -604,22 +680,38 @@ class CommandExecutionBoundary:
         execution_profile: ExecutionProfile,
     ) -> dict[str, str]:
         copied = dict(environment)
+        if self.loopback_relay:
+            # Even a trusted command runs as the agent here, so neither profile
+            # gets the token, and both reach the proxy through the relay.
+            raw_token = copied.pop(TRANSPORT_TOKEN_ENV, None)
+            target = _configured_proxy(copied, non_public=True)
+            if target is None:
+                return copied
+            if raw_token is None:
+                raise CommandRequestError(
+                    "agent proxy requires a transport token in Kubernetes mode"
+                )
+            return self._relayed(copied, target, _transport_token(raw_token))
         if execution_profile == "trusted":
             return copied
         raw_token = copied.pop(TRANSPORT_TOKEN_ENV, None)
         if self.agent_netns is None:
             return copied
-        configured = [copied[key] for key in _PROXY_ENV_KEYS if key in copied]
-        if not configured:
+        target = _configured_proxy(copied)
+        if target is None:
             return copied
-        targets = {_private_http_proxy(value) for value in configured}
-        if len(targets) != 1:
-            raise CommandRequestError("agent proxy environment must name one private endpoint")
-        target = next(iter(targets))
         token = None if raw_token is None else _transport_token(raw_token)
+        return self._relayed(copied, target, token)
+
+    def _relayed(
+        self, copied: dict[str, str], target: tuple[str, int], token: bytes | None
+    ) -> dict[str, str]:
         relay_key = (target, token)
         with self._relay_lock:
-            if self._relay is None:
+            if isinstance(self._relay, _LoopbackRelay) and self._relay_target is None:
+                self._relay.retarget(*target, transport_token=token)
+                self._relay_target = relay_key
+            elif self._relay is None:
                 self._relay = (
                     self._relay_factory(*target)
                     if token is None
@@ -627,7 +719,10 @@ class CommandExecutionBoundary:
                 )
                 self._relay_target = relay_key
             elif self._relay_target != relay_key:
-                raise CommandRequestError("agent proxy endpoint changed within one MicroVM")
+                raise CommandRequestError(
+                    "agent proxy endpoint changed within one "
+                    + ("sandbox pod" if self.loopback_relay else "MicroVM")
+                )
             proxy_url = self._relay.proxy_url
         for key in _PROXY_ENV_KEYS:
             if key in copied:
@@ -635,9 +730,16 @@ class CommandExecutionBoundary:
         return copied
 
     def close(self) -> None:
+        """Forget the owner's proxy and close the relays a superseding owner must not inherit.
+
+        The Kubernetes loopback relay keeps its port and its current target:
+        carried commands keep reaching the proxy, and the next owner's first
+        proxied command retargets it to that owner's proxy and token.
+        """
         with self._relay_lock:
-            relays = (self._relay, self._control_relay)
-            self._relay = None
+            relays = (None if self.loopback_relay else self._relay, self._control_relay)
+            if not self.loopback_relay:
+                self._relay = None
             self._relay_target = None
             self._control_relay = None
             self._control_target = None
@@ -648,6 +750,28 @@ class CommandExecutionBoundary:
 
 def _control_relay(host: str, port: int) -> _TcpRelay:
     return _TcpRelay(host, port, listen_port=AGENT_CONTROL_RELAY_PORT)
+
+
+def _hold_loopback_relay() -> _LoopbackRelay:
+    try:
+        return _LoopbackRelay()
+    except OSError as exc:
+        raise RuntimeError(
+            f"agent proxy relay cannot listen on {LOOPBACK_RELAY_HOST}:"
+            f"{_AGENT_PROXY_RELAY_PORT}: {exc.strerror or exc}"
+        ) from exc
+
+
+def _configured_proxy(
+    environment: dict[str, str], *, non_public: bool = False
+) -> tuple[str, int] | None:
+    configured = [environment[key] for key in _PROXY_ENV_KEYS if key in environment]
+    if not configured:
+        return None
+    targets = {_private_http_proxy(value, non_public=non_public) for value in configured}
+    if len(targets) != 1:
+        raise CommandRequestError("agent proxy environment must name one private endpoint")
+    return next(iter(targets))
 
 
 class ProcessHandle(Protocol):
@@ -1550,7 +1674,7 @@ def _validated_payload(
     }
 
 
-def _private_http_proxy(value: str) -> tuple[str, int]:
+def _private_http_proxy(value: str, *, non_public: bool = False) -> tuple[str, int]:
     try:
         parsed = urllib.parse.urlsplit(value)
         port = parsed.port
@@ -1567,6 +1691,8 @@ def _private_http_proxy(value: str) -> tuple[str, int]:
         or parsed.fragment
     ):
         raise CommandRequestError("agent proxy must be an unauthenticated HTTP origin")
+    if non_public:
+        return _non_public_ipv4(parsed.hostname, what="agent proxy host"), port
     return _private_ipv4(parsed.hostname, what="agent proxy host"), port
 
 
@@ -1584,6 +1710,36 @@ def _private_ipv4(value: object, *, what: str) -> str:
         raise CommandRequestError(f"{what} must be a private IPv4 literal") from exc
     if not any(address in network for network in _PRIVATE_IPV4_NETWORKS):
         raise CommandRequestError(f"{what} must be a private IPv4 literal")
+    return str(address)
+
+
+# Kubernetes pod networks are not always RFC 1918: GKE, for one, can assign pods
+# the shared address space (100.64.0.0/10), Class E (240.0.0.0/4) and other
+# ranges that are not globally routable. So the loopback relay accepts any IPv4
+# address that ``ipaddress`` does not call global, except the ones that never
+# name another pod: this host's own addresses (the supervisor and the relay
+# itself), link-local ones (instance metadata servers), multicast and broadcast.
+_NON_POD_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network)
+    for network in (
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+    )
+)
+
+
+def _non_public_ipv4(value: object, *, what: str) -> str:
+    if type(value) is not str:
+        raise CommandRequestError(f"{what} must be a non-public IPv4 literal")
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as exc:
+        raise CommandRequestError(f"{what} must be a non-public IPv4 literal") from exc
+    if address.is_global or any(address in network for network in _NON_POD_IPV4_NETWORKS):
+        raise CommandRequestError(f"{what} must be a non-public IPv4 literal")
     return str(address)
 
 

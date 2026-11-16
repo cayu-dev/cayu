@@ -425,7 +425,7 @@ running that it cannot reach; requests wait until the new namespace is in place.
 ### Boot ID and health
 
 `GET /health` returns
-`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch","carry_commands","bearer_auth","boot_id"],"boot_id":"<uuid>"}`.
+`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch","carry_commands","bearer_auth","boot_id","egress_relay"],"boot_id":"<uuid>"}`.
 The `boot_id` is one UUID derived from the supervisor's boot ID, drawn when it starts, and the
 executor's, drawn when it starts and again whenever it replaces the agent namespace, so it changes when
 either container restarts or the agent's processes are lost. When the supervisor sees the
@@ -477,9 +477,57 @@ Kubernetes mode does not serve the Lambda MicroVM hooks under
 The entrypoint creates no agent network namespace, veth pair or firewall rules, and starts no
 EFS mount watchdog; `CAYU_MICROVM_AGENT_NETNS`, which the image sets, is ignored. Agent commands
 share the pod's network, so the pod's NetworkPolicy is the network boundary: admit only the host
-to port 8080 and restrict egress to what the workload needs. Port forwards listen on the pod's
-loopback, `127.0.0.1`, at ports 18500 to 18563, which agent commands reach from their container.
-`POST /v1/control-relay` is refused, and proxy settings in a command's environment reach the agent
-unchanged (its transport token is still removed), because there is no namespace to relay from.
-The image creates `/workspace` owned by the agent UID and GID at build time; a volume mounted
-there must be owned the same way.
+to port 8080 and restrict egress to what the workload needs. Two ports are reserved in the pod,
+because agent commands share its network: 8080, which the sidecar serves, and `127.0.0.1:18080`,
+which it holds for the egress relay from the moment it starts (see below). A workload must not
+listen on either. Port forwards listen on the pod's loopback, `127.0.0.1`, at ports 18500 to
+18563, which agent commands reach from their container.
+`POST /v1/control-relay` is refused, because there is no namespace to relay from. The image creates
+`/workspace` owned by the agent UID and GID at build time; a volume mounted there must be owned the
+same way.
+
+### Egress relay
+
+A sandbox reaches the network through the Cayu egress proxy as in Lambda mode. The host names the
+proxy in a command's `HTTPS_PROXY` or `HTTP_PROXY` (either spelling), as an unauthenticated
+`http://` origin at a non-public IPv4 address (see below), and passes the sandbox's transport
+token in `CAYU_EGRESS_PROXY_TRANSPORT_TOKEN` (64 lowercase hex characters). The supervisor removes
+the token from every command, in both execution profiles, before the command reaches the executor,
+so the agent container never receives it. It rewrites the command's proxy variables to the relay,
+`http://127.0.0.1:18080`; `NO_PROXY` and every other variable reach the command unchanged. For
+each connection the relay connects to the proxy, sends `CONNECT cayu-transport.invalid:443` with
+the token as `Proxy-Authorization: Basic` credentials for user `cayu`, and relays the command's
+bytes only once the proxy answers 200, so the command's own CONNECT reaches the proxy only over
+an authenticated connection. A connection the proxy does not admit is closed.
+
+- The supervisor binds `127.0.0.1:18080` when it starts, before any agent command can run, and
+  holds it until it exits, so no agent process can take the port over. If something already
+  listens there, the sidecar refuses to start and names the port.
+- Until a command brings proxy settings, the relay has no target and closes every connection as
+  soon as it accepts it. Without proxy settings commands get no proxy variables (a token alone is
+  still removed), as for a sandbox without egress.
+- The first proxied command of an owner points the relay at that command's proxy and token. Until
+  a superseding owner claim, a command naming another proxy or token is refused with HTTP 400.
+  After such a claim, or an executor restart, the relay keeps its port and its previous target,
+  and the new owner's first proxied command retargets it to that owner's proxy and token in one
+  step. Tunnels already open are left alone, and carried commands keep the same proxy variables,
+  so they keep working across the handover.
+- A command that names a proxy without a token, with a malformed token, at a public or otherwise
+  refused address, with any scheme but `http`, or at two different proxies is refused with HTTP
+  400, and the relay's target is left as it was.
+- The relay holds at most 64 connections, as many tunnels as the proxy allows one sandbox, and
+  closes any further connection as soon as it accepts it. Connecting to the proxy and the proxy's
+  answer to the token are each bounded by 5 seconds; an open tunnel has no idle limit.
+
+The proxy's address must not be globally routable, because Kubernetes pod networks are not always
+RFC 1918: GKE, for example, can assign pods the shared address space `100.64.0.0/10` or the
+reserved `240.0.0.0/4`. The relay accepts any IPv4 address that Python's `ipaddress` does not
+consider global (`is_global` is false), except addresses that never name another pod: `0.0.0.0/8`,
+loopback `127.0.0.0/8` (the pod itself), link-local `169.254.0.0/16` (instance metadata servers),
+multicast `224.0.0.0/4` and `255.255.255.255`. Public addresses, including public ranges a cluster
+uses privately, are refused. Lambda mode keeps its RFC 1918 rule.
+
+`GET /health` advertises `egress_relay` in Kubernetes mode, so a host can check for the relay
+before it gives a sandbox egress. Agent commands can also reach the proxy's address directly, so
+the pod's NetworkPolicy should allow egress only to that address and port; the proxy closes a
+connection that does not present the token without answering it.

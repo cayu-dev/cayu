@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 from examples.aws.lambda_microvm_sidecar import executor as executor_module
 from examples.aws.lambda_microvm_sidecar import executor_protocol
-from examples.aws.lambda_microvm_sidecar.executor import AgentNamespace, Executor, ExecutorServer
+from examples.aws.lambda_microvm_sidecar.executor import Executor, ExecutorServer
 from examples.aws.lambda_microvm_sidecar.executor_protocol import (
     MAX_FRAME_BYTES,
     ExecutorClient,
@@ -44,7 +44,11 @@ from examples.aws.lambda_microvm_sidecar.supervisor import (
     CommandSupervisor,
     OwnerFence,
 )
-from tests.runners.sidecar_executor_harness import EXECUTOR_PEER_CREDENTIALS, InProcessExecutor
+from tests.runners.sidecar_executor_harness import (
+    EXECUTOR_PEER_CREDENTIALS,
+    InProcessExecutor,
+    agent_namespace_unavailable,
+)
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX executor")
 
@@ -54,21 +58,7 @@ _linux_only = pytest.mark.skipif(
 )
 
 
-def _agent_namespace_unavailable() -> str | None:
-    if sys.platform != "linux":
-        return "the agent namespace needs Linux"
-    if not Path(executor_module.NSENTER).exists():
-        return f"the agent namespace needs {executor_module.NSENTER}"
-    try:
-        namespace = AgentNamespace(sys.executable)
-    except (OSError, RuntimeError) as exc:
-        return f"this host does not allow unprivileged user namespaces: {exc}"
-    namespace.process.kill()
-    namespace.process.wait()
-    return None
-
-
-_NAMESPACE_UNAVAILABLE = _agent_namespace_unavailable()
+_NAMESPACE_UNAVAILABLE = agent_namespace_unavailable()
 _needs_agent_namespace = pytest.mark.skipif(
     _NAMESPACE_UNAVAILABLE is not None, reason=str(_NAMESPACE_UNAVAILABLE)
 )

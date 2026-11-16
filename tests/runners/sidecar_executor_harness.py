@@ -11,11 +11,27 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from examples.aws.lambda_microvm_sidecar.executor import Executor, ExecutorServer
+from examples.aws.lambda_microvm_sidecar import executor as executor_module
+from examples.aws.lambda_microvm_sidecar.executor import AgentNamespace, Executor, ExecutorServer
 from examples.aws.lambda_microvm_sidecar.executor_protocol import ExecutorClient, listen, peer_uid
 
 # Abstract sockets and SO_PEERCRED are Linux-only.
 EXECUTOR_PEER_CREDENTIALS = sys.platform == "linux"
+
+
+def agent_namespace_unavailable() -> str | None:
+    """Why this host cannot create the executor's agent namespace, or None when it can."""
+    if sys.platform != "linux":
+        return "the agent namespace needs Linux"
+    if not Path(executor_module.NSENTER).exists():
+        return f"the agent namespace needs {executor_module.NSENTER}"
+    try:
+        namespace = AgentNamespace(sys.executable)
+    except (OSError, RuntimeError) as exc:
+        return f"this host does not allow unprivileged user namespaces: {exc}"
+    namespace.process.kill()
+    namespace.process.wait()
+    return None
 
 
 class InProcessExecutor:

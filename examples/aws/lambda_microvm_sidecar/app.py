@@ -80,7 +80,9 @@ PROTOCOL_VERSION = "8"
 # Optional protocol 8 features a host checks for before using them.
 CAPABILITIES = ["owner_epoch", "carry_commands"]
 if KUBERNETES:
-    CAPABILITIES.extend(["bearer_auth", "boot_id"])
+    # egress_relay: a command's proxy settings and transport token are relayed
+    # from the pod's loopback, so the token stays in this container.
+    CAPABILITIES.extend(["bearer_auth", "boot_id", "egress_relay"])
 # Changes whenever the sidecar process starts. Health combines it with the
 # executor's, so a host sees either container restart, which loses every command.
 BOOT_ID = str(uuid.uuid4()) if KUBERNETES else None
@@ -104,6 +106,7 @@ EXECUTION_BOUNDARY = CommandExecutionBoundary(
     agent_uid=None if KUBERNETES else AGENT_UID,
     agent_gid=None if KUBERNETES else AGENT_GID,
     agent_netns=AGENT_NETNS,
+    loopback_relay=KUBERNETES,
 )
 SUPERVISOR = CommandSupervisor(
     root=ROOT, execution_boundary=EXECUTION_BOUNDARY, processes=PROCESSES
@@ -220,8 +223,10 @@ async def ready_hook() -> dict[str, str]:
 async def claim_owner(payload: dict[str, Any]) -> dict[str, Any]:
     """Make the caller the only host allowed to start commands.
 
-    A claim that supersedes another resets the agent proxy relay and closes
-    every port forward before the new owner can start anything, then cancels
+    A claim that supersedes another resets the agent proxy relay (in Kubernetes
+    mode the relay keeps its port and target until the new owner's first proxied
+    command retargets it) and closes every port forward before the new owner can
+    start anything, then cancels
     every command of earlier owners. The
     response is sent only after that cancellation, so a completed takeover
     leaves no earlier owner's command able to run. That holds for a retried

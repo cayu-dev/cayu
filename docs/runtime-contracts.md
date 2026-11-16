@@ -16042,7 +16042,21 @@ executor's boot IDs, so it changes when either container restarts or the agent's
 lost; a new value means every command, forward and owner claim is gone (on an executor restart
 the supervisor drops them itself), so the next fenced call raises `SidecarOwnershipSuperseded` and
 the host attaches a new runner. While the executor is unreachable, health and command starts
-answer HTTP 503. The runner's errors are the neutral sidecar classes that the
+answer HTTP 503. Egress works as in a Lambda MicroVM: a command whose environment names a
+non-public `http://` proxy in `HTTPS_PROXY` or `HTTP_PROXY` must also carry
+`CAYU_EGRESS_PROXY_TRANSPORT_TOKEN`, which the supervisor removes from every command, in both
+execution profiles, before the executor sees it. The supervisor relays the command's proxy
+connections from the pod's loopback, `127.0.0.1:18080`, to that one proxy, presenting the token
+on each, and the command's proxy variables name the relay. Like 8080, port 18080 is reserved in
+the pod: the supervisor binds it when it starts, before any command runs, and holds it, so an
+agent process cannot take it, and the sidecar refuses to start if the port is taken. Without
+proxy settings the relay closes every connection it accepts. A command that names a proxy without
+a valid token, or another proxy than the current owner's, is refused with HTTP 400. A superseding
+claim or an executor restart keeps the relay and its previous target; the new owner's first
+proxied command retargets it, so carried commands keep reaching the proxy. The proxy's address
+may be any IPv4 address Python's `ipaddress` does not consider global, such as RFC 1918 or
+`100.64.0.0/10`, except `0.0.0.0/8`, loopback, link-local, multicast and broadcast; public
+addresses and non-`http` proxies are refused. Health advertises `egress_relay` in Kubernetes mode. The runner's errors are the neutral sidecar classes that the
 Lambda MicroVM errors also derive from (`SidecarRunnerError`, `SidecarProtocolError`,
 `SidecarEndpointUnauthorized`, `SidecarEndpointTransientError`, `SidecarOwnershipSuperseded`,
 `SidecarStaleOwnerEpoch`). `system_execution_mode` is `"shared"`: the pod has no separate trusted

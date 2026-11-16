@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 import uvicorn
+from examples.aws.lambda_microvm_sidecar import supervisor as supervisor_module
 from tests.runners.lambda_microvm_harness import (
     DEFAULT_SIDECAR_BOOT_ID,
     KUBERNETES_SANDBOX_TOKEN,
@@ -81,6 +82,8 @@ def sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator:
     executor = InProcessExecutor(workspace)
     monkeypatch.setenv("CAYU_EXECUTOR_SOCKET", executor.address)
     loaded: list[ModuleType] = []
+    # A Kubernetes-mode sidecar holds its egress relay port from the start; tests take a free one.
+    monkeypatch.setattr(supervisor_module, "_AGENT_PROXY_RELAY_PORT", 0)
 
     def load(mode: str = "kubernetes") -> ModuleType:
         monkeypatch.setenv("CAYU_SIDECAR_MODE", mode)
@@ -99,6 +102,8 @@ def sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator:
     finally:
         for module in loaded:
             module.SUPERVISOR.cancel_all()
+            if module.EXECUTION_BOUNDARY.loopback_relay:
+                module.EXECUTION_BOUNDARY._relay.close()
         executor.close()
         sys.modules.pop(_APP, None)
 
