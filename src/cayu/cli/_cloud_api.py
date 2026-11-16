@@ -125,6 +125,11 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "no_selected_release"),
         (409, "release_source_unreadable"),
         (409, "service_busy"),
+        # `cayu cloud eval run`: an evaluation service without isolated corpus runs, or an eval
+        # database, on this installation.
+        (409, "database_unsupported"),
+        (422, "suite_kind_unsupported"),
+        (503, "evaluations_unavailable"),
         # `cayu cloud service check`: why Cloud couldn't run the Agent's operator check.
         (409, "agent_not_active"),
         (409, "no_web_service"),

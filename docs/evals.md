@@ -429,10 +429,11 @@ compared with each other through the same compatibility projection and stable
 exit contract. These commands operate only on the supplied paths and do not
 perform project discovery.
 
-To run a corpus suite on a deployed Agent instead, on its own worker and in its current
-release, use `cayu cloud eval run --application NAME --corpus FILE --suite ID --output
-run.json`; see [Running an Agent's evals](cayu-cloud.md#running-an-agents-evals). Its
-`--output` report is a file `eval report` and `eval compare` read.
+To run a corpus suite against a deployed Agent instead, use `cayu cloud eval run
+--application NAME --corpus FILE --suite ID`: by default it runs isolated, against one of the
+Agent's Releases in allocations of their own, and returns a receipt; with `--on live` it runs on
+the Agent's own worker in its current release, and its `--output` report is a file `eval report`
+and `eval compare` read. See [Running an Agent's evals](cayu-cloud.md#running-an-agents-evals).
 
 The Developer dashboard's suite and run pages, **Add to evals** and **Approve as baseline**
 have CLI forms that call the same server API, on the project's running server or a Cloud

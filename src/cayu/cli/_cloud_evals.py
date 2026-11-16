@@ -1,10 +1,16 @@
 """`cayu cloud eval`: run and read a deployed Agent's evals from the terminal.
 
-The commands call the eval API the Agent's own Cayu serves (`/api/evals/...`), the way `cayu
-task list --application` reads its tasks: Cayu Cloud names the Agent's Cayu address and its
-Developer dashboard login, and the CLI sends that login to the Agent (`_cloud_agent_api`). A
-run executes on the Agent's eval worker, in its current release, with its secrets, sandboxes
-and stores; the CLI imports the corpus, admits the run and reads it.
+By default `eval run` runs isolated (`_cloud_eval_isolated`): Cayu Cloud's evaluation service
+runs the corpus suite against one of the Agent's Releases in allocations of its own, with no
+live secret and, where the install gives one, its own database, so nothing lands in the live
+Agent's stores. `--on live` runs it on the live Agent instead, as described below, and says so
+on standard error.
+
+The live commands call the eval API the Agent's own Cayu serves (`/api/evals/...`), the way
+`cayu task list --application` reads its tasks: Cayu Cloud names the Agent's Cayu address and
+its Developer dashboard login, and the CLI sends that login to the Agent (`_cloud_agent_api`). A
+live run executes on the Agent's eval worker, in its current release, with its secrets,
+sandboxes and stores; the CLI imports the corpus, admits the run and reads it.
 
 `eval run` loads a local corpus, checks the suite against the eval target the Agent publishes
 (`GET /evals/targets`), states the run's bound, imports the corpus and admits one run under an
@@ -33,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
+from cayu.cli import _cloud_eval_isolated as isolated
 from cayu.cli._cloud_agent_api import CayuApi, CayuApiError, CayuApiNotFound, cloud_agent_api
 from cayu.cli._cloud_api import CloudApiError
 from cayu.cli._cloud_reference import APPLICATION_HELP
@@ -52,6 +59,17 @@ DEFAULT_LIST_LIMIT = 20
 MAX_LIST_LIMIT = 200
 # `EvalRunStatus`, in lifecycle order; the first three are still running.
 RUN_STATUSES = ("queued", "running", "cancelling", "completed", "failed", "cancelled")
+# Where a run executes: Cloud's evaluation service, or the live Agent's own eval worker.
+RUN_PLACES = ("isolated", "live")
+_LIVE_WARNING = (
+    "This run executes on the live Agent, in its current release, with its secrets, sandboxes "
+    "and stores: what its suite writes lands in the Agent's sessions, tasks, inbox, knowledge "
+    "and usage, and nothing removes it afterwards. Run it without --on live to evaluate in an "
+    "isolated environment instead."
+)
+# Options only one place takes.
+_LIVE_ONLY = ("max_cost", "currency", "execution_profile_revision")
+_ISOLATED_ONLY = ("release", "target", "database", "isolation")
 TERMINAL_RUN_STATUSES = frozenset(RUN_STATUSES[3:])
 # The Agent accepts up to 512 characters; the CLI's other operation IDs stop at 256.
 _OPERATION_ID_MAX_CHARS = 256
@@ -110,8 +128,9 @@ def add_eval_parser(
         "eval",
         help="Run and read a deployed Agent's evals.",
         description=(
-            "Run a corpus suite on a deployed Agent's eval target, on its own worker and in "
-            "its current release, and read, cancel, compare and approve its runs."
+            "Run a corpus suite against a deployed Agent: isolated in Cayu Cloud's evaluation "
+            "service by default, or on the live Agent's own eval worker with --on live; and "
+            "read, cancel, compare and approve its runs."
         ),
     )
     actions = evals.add_subparsers(dest="eval_command", required=True)
@@ -119,13 +138,64 @@ def add_eval_parser(
     run = actions.add_parser(
         "run",
         description=(
-            "Import a corpus into the Agent, admit one run of one of its suites on the eval "
-            "target the corpus names, and wait for the result. The command states the run's "
-            "bound before admitting it. The trial count is part of the corpus suite: to run a "
-            "different count, add a second suite with that count to the corpus."
+            "Run one suite of a corpus and wait for the result, stating the run's bound before "
+            "it starts. By default it runs isolated: Cayu Cloud runs it against one of the "
+            "Agent's Releases in allocations of their own, with no live secret and, where the "
+            "install gives one, a database of their own, and returns a receipt. With --on live "
+            "it imports the corpus into the live Agent and admits the run on the eval target "
+            "the corpus names, which writes into the Agent's stores. The trial count per case "
+            "is part of the corpus suite."
         ),
     )
     _add_application_argument(run)
+    run.add_argument(
+        "--on",
+        choices=RUN_PLACES,
+        default="isolated",
+        help=(
+            "isolated (default): Cayu Cloud's evaluation service, never the live Agent's "
+            "stores. live: the live Agent's own eval worker and stores."
+        ),
+    )
+    run.add_argument(
+        "--release",
+        metavar="RELEASE",
+        help="Isolated only: the Release to evaluate (default: the Agent's selected Release).",
+    )
+    run.add_argument(
+        "--target",
+        metavar="MODULE:ATTRIBUTE",
+        help=(
+            "Isolated only: the eval target to run the corpus through, one the Release declares "
+            "(default: its [tool.cayu].eval_target)."
+        ),
+    )
+    run.add_argument(
+        "--trials",
+        type=_positive_count,
+        default=1,
+        metavar="N",
+        help=(
+            f"Isolated only: how many times to run the whole suite, each in its own allocation "
+            f"(1 to {isolated.MAX_TRIALS}, default 1)."
+        ),
+    )
+    run.add_argument(
+        "--isolation",
+        choices=("trial", "run"),
+        help=(
+            "Isolated only: a fresh eval database for each allocation (trial, the default) or "
+            "one the whole run shares (run)."
+        ),
+    )
+    run.add_argument(
+        "--database",
+        choices=("postgres", "none"),
+        help=(
+            "Isolated only: give the run its own PostgreSQL database (where the install offers "
+            "one, the default) or none."
+        ),
+    )
     run.add_argument("--corpus", type=Path, required=True, metavar="FILE", help="Corpus JSON.")
     run.add_argument("--suite", required=True, metavar="ID", help="The corpus suite to run.")
     run.add_argument(
@@ -193,17 +263,26 @@ def add_eval_parser(
         help=f"How often to read its progress (default {DEFAULT_POLL_SECONDS:.0f}).",
     )
     add_output_argument(run, render_run, failure=render_failure)
+    # Before Cloud is asked anything: an option the run's place doesn't take is refused.
+    run.set_defaults(_cloud_preflight=require_place_options)
 
     runs = actions.add_parser("runs", description="List, show or cancel an Agent's eval runs.")
     run_actions = runs.add_subparsers(dest="eval_runs_command", required=True)
     listing = run_actions.add_parser(
         "list",
         description=(
-            "List an eval target's runs, newest first; the Agent's default target unless "
-            "--target-key names another."
+            "List the Agent's isolated eval runs (Cayu Cloud's evaluations), newest first; or "
+            "with --on live, the live Agent's own runs of an eval target, its default target "
+            "unless --target-key names another."
         ),
     )
     _add_application_argument(listing)
+    listing.add_argument(
+        "--on",
+        choices=RUN_PLACES,
+        default="isolated",
+        help="isolated (default): Cayu Cloud's evaluations. live: the live Agent's own runs.",
+    )
     listing.add_argument(
         "--target-key", metavar="KEY", help="The eval target (`GET /evals/targets`)."
     )
@@ -217,7 +296,11 @@ def add_eval_parser(
     )
     add_output_argument(listing, render_runs, failure=render_failure)
     show = run_actions.add_parser(
-        "show", description="Show one eval run: its status, progress and result."
+        "show",
+        description=(
+            "Show one eval run: its status, progress and result. An isolated run's id starts "
+            "with evl_; any other is the live Agent's own."
+        ),
     )
     _add_application_argument(show)
     show.add_argument("run_id", metavar="RUN_ID")
@@ -297,6 +380,17 @@ def eval_command(
             monotonic=monotonic,
         )
     application_id = _application_id(client, arguments.application)
+    if action == "runs":
+        answer = _isolated_runs(client, application_id, arguments)
+        if answer is not None:
+            return {
+                "operation": f"eval.runs.{arguments.eval_runs_command}",
+                "result": {
+                    "schema_version": SCHEMA_VERSION,
+                    "application_id": application_id,
+                    **answer,
+                },
+            }
     with _agent_api(client, application_id, arguments.timeout_seconds) as api:
         if action == "runs":
             if arguments.eval_runs_command == "list":
@@ -325,6 +419,29 @@ def eval_command(
     }
 
 
+def _isolated_runs(
+    client: CloudApiClient, application_id: str, arguments: argparse.Namespace
+) -> dict[str, Any] | None:
+    """`runs list|show|cancel` of isolated runs, or None for the live Agent's own."""
+
+    command = arguments.eval_runs_command
+    if command == "list":
+        if arguments.on != "isolated":
+            return None
+        if arguments.target_key is not None:
+            raise CloudEvalError(
+                "invalid_input", "--target-key lists the live Agent's runs: pass --on live."
+            )
+        return isolated.list_isolated(
+            client, application_id, limit=arguments.limit, status=arguments.status
+        )
+    if not isolated.is_isolated_run(arguments.run_id):
+        return None
+    if command == "show":
+        return isolated.show_isolated(client, application_id, arguments.run_id)
+    return isolated.cancel_isolated(client, application_id, arguments.run_id)
+
+
 def _run(
     arguments: argparse.Namespace,
     *,
@@ -336,6 +453,15 @@ def _run(
 ) -> dict[str, Any]:
     if not arguments.no_wait:
         validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+    if arguments.on == "isolated":
+        return _run_isolated(
+            arguments,
+            client=client,
+            recovery_arguments=recovery_arguments,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+    note(_LIVE_WARNING)
     if arguments.currency is not None and arguments.max_cost is None:
         raise CloudEvalError("invalid_input", "--currency applies only with --max-cost.")
     continuing = arguments.execution_profile_revision is not None
@@ -424,7 +550,7 @@ def _run(
             import_corpus=import_corpus if continuing else None,
         )
         run_id = run["id"]
-        commands = {**commands, **_run_id_commands(application_id, run_id, recovery_arguments)}
+        commands = {**commands, **isolated.run_commands(application_id, run_id, recovery_arguments)}
         result: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "application_id": application_id,
@@ -459,6 +585,71 @@ def _run(
         _write_report(arguments.output, report, run_id=run_id, commands=commands)
         result["output"] = str(arguments.output)
     return {"operation": "eval.run", "result": result}
+
+
+def require_place_options(arguments: argparse.Namespace) -> None:
+    """Refuse an option the run's place doesn't take, rather than ignore it."""
+
+    if arguments.on == "isolated":
+        given = [name for name in _LIVE_ONLY if getattr(arguments, name) is not None]
+        if given:
+            raise CloudEvalError(
+                "invalid_input",
+                f"{_options(given)} only with --on live: an isolated run's trial limits are "
+                "its corpus suite's own.",
+            )
+        if arguments.max_concurrency > isolated.MAX_CONCURRENCY:
+            raise CloudEvalError(
+                "invalid_input",
+                f"--max-concurrency is at most {isolated.MAX_CONCURRENCY} for an isolated run.",
+            )
+        if arguments.trials > isolated.MAX_TRIALS:
+            raise CloudEvalError("invalid_input", f"--trials is at most {isolated.MAX_TRIALS}.")
+        return
+    given = [name for name in _ISOLATED_ONLY if getattr(arguments, name) is not None]
+    if arguments.trials != 1:
+        given.append("trials")
+    if given:
+        raise CloudEvalError(
+            "invalid_input",
+            f"{_options(given)} only for an isolated run: a live run uses the Agent's current "
+            "release, its eval target and its own stores.",
+        )
+
+
+def _options(names: Sequence[str]) -> str:
+    return ", ".join("--" + name.replace("_", "-") for name in names)
+
+
+def _run_isolated(
+    arguments: argparse.Namespace,
+    *,
+    client: CloudApiClient,
+    recovery_arguments: Sequence[str],
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> dict[str, Any]:
+    if arguments.output is not None:
+        from cayu.cli.evals import _reject_output_path_aliases
+
+        _reject_output_path_aliases(
+            outputs=(("--output", str(arguments.output)),),
+            protected=(("the eval corpus", str(arguments.corpus)),),
+        )
+    corpus = _load_corpus(arguments.corpus)
+    suite = _corpus_suite(corpus, arguments.suite)
+    application_id = _application_id(client, arguments.application)
+    return isolated.run_isolated(
+        arguments,
+        client=client,
+        application_id=application_id,
+        corpus=corpus,
+        suite=suite,
+        recovery_arguments=recovery_arguments,
+        sleep=sleep,
+        monotonic=monotonic,
+        error=CloudEvalError,
+    )
 
 
 def _load_corpus(path: Path) -> EvalCorpusDocument:
@@ -671,11 +862,15 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
     steps = bound["max_steps_per_trial"]
     lines = [
         f"Suite {bound['suite_id']} on eval target {bound['target_key']}: "
-        f"{_count(bound['cases'], 'case')} x "
-        f"{_count(bound['trials_per_case'], 'trial')} = {_count(bound['total_trials'], 'trial')}, "
+        f"{isolated.count(bound['cases'], 'case')} x "
+        f"{isolated.count(bound['trials_per_case'], 'trial')} = {isolated.count(bound['total_trials'], 'trial')}, "
         f"at most {bound['max_concurrency']} running at a time.",
         "Each trial: "
-        + ("no published step limit" if steps is None else f"up to {_count(steps, 'model step')}")
+        + (
+            "no published step limit"
+            if steps is None
+            else f"up to {isolated.count(steps, 'model step')}"
+        )
         + f" and {bound['timeout_seconds_per_trial']}s.",
     ]
     threshold = bound["candidate_cost_threshold"]
@@ -700,7 +895,7 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
 
 
 def _judge_text(judge: Mapping[str, Any]) -> str:
-    text = f"{judge['key']} ({_count(judge['evaluations'], 'evaluation')})"
+    text = f"{judge['key']} ({isolated.count(judge['evaluations'], 'evaluation')})"
     limits = judge["limits"]
     if limits is None:
         return text + " with no published limits"
@@ -712,7 +907,7 @@ def _judge_text(judge: Mapping[str, Any]) -> str:
         "(one model call can exceed it before its cost is known)"
     )
     return (
-        f"{text}, each with {threshold}, {_count(limits['max_total_tokens'], 'token')} and "
+        f"{text}, each with {threshold}, {isolated.count(limits['max_total_tokens'], 'token')} and "
         f"{limits['timeout_seconds']}s"
     )
 
@@ -1300,7 +1495,7 @@ def _run_commands(
 
     listing = [
         *("cayu", "cloud", *recovery_arguments, "eval", "runs", "list"),
-        *("--application", application_id, "--target-key", target_key),
+        *("--application", application_id, "--on", "live", "--target-key", target_key),
     ]
     command = [
         "cayu",
@@ -1310,6 +1505,8 @@ def _run_commands(
         "run",
         "--application",
         application_id,
+        "--on",
+        "live",
         "--corpus",
         str(arguments.corpus),
         "--suite",
@@ -1325,14 +1522,6 @@ def _run_commands(
     if arguments.output is not None:
         command += ["--output", str(arguments.output)]
     return {"continue": shlex.join(command), "list": shlex.join(listing)}
-
-
-def _run_id_commands(
-    application_id: str, run_id: str, recovery_arguments: Sequence[str]
-) -> dict[str, str]:
-    prefix = ["cayu", "cloud", *recovery_arguments, "eval", "runs"]
-    suffix = ["--application", application_id, run_id]
-    return {action: shlex.join([*prefix, action, *suffix]) for action in ("show", "cancel")}
 
 
 @contextmanager
@@ -1399,10 +1588,6 @@ def _application_id(client: CloudApiClient, reference: str) -> str:
 
 def _run_path(run_id: str) -> str:
     return f"/evals/runs/{quote(run_id, safe='')}"
-
-
-def _count(number: object, noun: str) -> str:
-    return f"{number} {noun}" + ("" if number == 1 else "s")
 
 
 def _add_application_argument(parser: argparse.ArgumentParser) -> None:
@@ -1474,6 +1659,8 @@ def _operation_id(value: str) -> str:
 
 def render_run(answer: Mapping[str, Any]) -> str:
     result = answer["result"]
+    if result.get("on") == "isolated":
+        return isolated.render_isolated_run(result)
     run = result["run"]
     lines = [f"Run {_text(run['id'])}: {_text(run['status'])}"]
     summary = result["summary"]
@@ -1497,6 +1684,26 @@ def render_run(answer: Mapping[str, Any]) -> str:
 def render_runs(answer: Mapping[str, Any]) -> str:
     listed = answer["result"]
     items = listed["items"]
+    if listed.get("on") == "isolated":
+        if not items:
+            return f"No isolated eval runs for {_cell(listed['application_id'])}."
+        lines = _table(
+            ("RUN", "STATUS", "SUITE", "RELEASE", "CREATED"),
+            [
+                (
+                    _cell(item["id"]),
+                    _cell(item["status"])
+                    + (f" ({_cell(item['failure'].get('code'))})" if item.get("failure") else ""),
+                    _cell(item["suite_id"]),
+                    _cell(item["release_id"]),
+                    _cell(item["created_at"]),
+                )
+                for item in items
+            ],
+        )
+        if listed["has_more"]:
+            lines.append(f"Showing the newest {len(items)}; pass a larger --limit for more.")
+        return "\n".join(lines)
     if not items:
         # `cayu eval runs list` names a running server instead of an Agent.
         return f"No eval runs for {_cell(listed.get('application_id') or listed['server_url'])}."
@@ -1520,6 +1727,8 @@ def render_run_detail(answer: Mapping[str, Any]) -> str:
     from cayu.evals.models import candidate_run_failure_text
 
     result = answer["result"]
+    if result.get("on") == "isolated":
+        return isolated.render_isolated_run({**result, "output": None, "commands": {"show": "-"}})
     run, progress = result["run"], result["progress"]
     lines = [
         _text(_progress_line(run, progress)),
@@ -1561,6 +1770,8 @@ def render_run_detail(answer: Mapping[str, Any]) -> str:
 
 def render_cancel(answer: Mapping[str, Any]) -> str:
     run = answer["result"]["run"]
+    if answer["result"].get("on") == "isolated" and run.get("status") == "cancelling":
+        return f"Cancelling evaluation {_text(run['id'])}: its running trial stops."
     run_id, status = _text(run["id"]), run["status"]
     if status == "cancelling":
         return f"Cancelling run {run_id}: its running trials stop and it ends cancelled."
@@ -1582,7 +1793,7 @@ def render_comparison(answer: Mapping[str, Any]) -> str:
         lines.append(f"Not comparable: {_text(reasons or 'unknown reason')}.")
         return "\n".join(lines)
     regressions = comparison.get("regressions") or []
-    lines.append(f"Comparable; {_count(len(regressions), 'regression')}.")
+    lines.append(f"Comparable; {isolated.count(len(regressions), 'regression')}.")
     for regression in regressions:
         scope = regression.get("case_id") or regression.get("scope")
         lines.append(f"  {_text(scope)}: {_text(regression.get('kind'))}")

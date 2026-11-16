@@ -328,14 +328,16 @@ def test_runs_and_baselines_answer_as_cayu_cloud_eval_does(
         first = cloud(*run, *_FAST)["result"]["run"]["id"]
         second = cloud(*run, *_FAST)["result"]["run"]["id"]
 
-        # With --application, `cayu eval runs` is `cayu cloud eval runs`.
-        for argv in (("runs", "list"), ("runs", "show", first)):
+        # With --application, `cayu eval runs` is `cayu cloud eval runs` on the live Agent.
+        for argv, place in ((("runs", "list"), ("--on", "live")), (("runs", "show", first), ())):
             assert main(["eval", *argv, *on_cloud]) == 0
-            assert json.loads(capsys.readouterr().out) == cloud(*argv, *on_cloud)
+            assert json.loads(capsys.readouterr().out) == cloud(*argv, *on_cloud, *place)
         # A running server answers the same, named by its address.
         listed = _ok(capsys, "runs", "list", "--status", "completed", *_LOCAL)
         assert listed.pop("server_url") == _URL
-        on_agent = cloud("runs", "list", "--status", "completed", *on_cloud)["result"]
+        on_agent = cloud("runs", "list", "--status", "completed", *on_cloud, "--on", "live")[
+            "result"
+        ]
         assert on_agent.pop("application_id") == _AGENT
         assert listed == on_agent
         assert [item["id"] for item in listed["items"]] == [second, first]

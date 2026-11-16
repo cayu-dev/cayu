@@ -129,7 +129,10 @@ def _corpus_file(tmp_path: Path, corpus: EvalCorpusDocument) -> Path:
 
 
 def _run_arguments(path: Path, corpus: EvalCorpusDocument) -> tuple[str, ...]:
-    return ("run", "--application", _AGENT, "--corpus", str(path), "--suite", corpus.suites[0].id)
+    return (
+        *("run", "--application", _AGENT, "--on", "live"),
+        *("--corpus", str(path), "--suite", corpus.suites[0].id),
+    )
 
 
 def _cloud(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, dict, str]:
@@ -171,6 +174,8 @@ def test_run_waits_for_the_result_and_writes_the_report_eval_compare_reads(
             capsys, *run, *_FAST, "--operation-id", "release-check", "--output", str(first_report)
         )
         assert code == 0, answer
+        # A live run says on standard error that it writes into the live Agent's stores.
+        assert "This run executes on the live Agent" in progress
         first = answer["result"]
         run_id = first["run"]["id"]
         assert answer["operation"] == "eval.run"
@@ -248,10 +253,14 @@ def test_runs_are_listed_shown_cancelled_and_approved_as_the_baseline(
         first = _ok(capsys, *run, *_FAST)["run"]["id"]
         second = _ok(capsys, *run, *_FAST)["run"]["id"]
 
-        listed = _ok(capsys, "runs", "list", "--application", _AGENT, "--limit", "1")
+        listed = _ok(
+            capsys, "runs", "list", "--application", _AGENT, "--on", "live", "--limit", "1"
+        )
         assert [item["id"] for item in listed["items"]] == [second]
         assert listed["has_more"] is True
-        listed = _ok(capsys, "runs", "list", "--application", _AGENT, "--status", "completed")
+        listed = _ok(
+            capsys, "runs", "list", "--application", _AGENT, "--on", "live", "--status", "completed"
+        )
         assert [item["id"] for item in listed["items"]] == [second, first]
         assert listed["items"][0]["suite_id"] == corpus.suites[0].id
         assert (
@@ -261,6 +270,8 @@ def test_runs_are_listed_shown_cancelled_and_approved_as_the_baseline(
                 "list",
                 "--application",
                 _AGENT,
+                "--on",
+                "live",
                 "--target-key",
                 "refund-agent",
                 "--status",
@@ -328,7 +339,7 @@ def test_run_prints_a_summary_and_sends_the_candidate_cost_threshold(
         shown = _ok(capsys, "runs", "show", "--application", _AGENT, run_id)
         assert shown["run"]["cost_budget"] == {"max_estimated_cost": "0.25", "currency": "USD"}
 
-        assert main(["cloud", "eval", "runs", "list", "--application", _AGENT]) == 0
+        assert main(["cloud", "eval", "runs", "list", "--application", _AGENT, "--on", "live"]) == 0
         table = capsys.readouterr().out.splitlines()
         assert table[0].split() == ["RUN", "STATUS", "SUITE", "CREATED", "RESULT"]
         assert table[1].split()[:3] == [run_id, "completed", corpus.suites[0].id]
@@ -470,14 +481,15 @@ def test_an_agent_without_eval_routes_is_named(
 
         for argv in (
             _run_arguments(_corpus_file(tmp_path, corpus), corpus),
-            ("runs", "list", "--application", _AGENT),
+            ("runs", "list", "--application", _AGENT, "--on", "live"),
         ):
             error = _refused(capsys, *argv)
             assert error["category"] == "evals_unavailable"
             assert error["message"].startswith(f"The Agent {_AGENT} serves no evals")
 
 
-def test_trial_count_is_not_a_run_option(capsys: pytest.CaptureFixture[str]) -> None:
+def test_trial_count_is_not_a_live_run_option(capsys: pytest.CaptureFixture[str]) -> None:
+    # A live run's trial count is its corpus suite's; an isolated run's --trials repeats it.
     code = main(
         [
             "cloud",
@@ -485,12 +497,15 @@ def test_trial_count_is_not_a_run_option(capsys: pytest.CaptureFixture[str]) -> 
             "run",
             "--application",
             _AGENT,
+            "--on",
+            "live",
             "--corpus",
             "e.json",
             "--suite",
             "s",
             "--trials",
             "3",
+            "--json",
         ]
     )
 
@@ -579,7 +594,7 @@ def test_a_lost_admission_answer_is_continued_with_the_printed_operation_id(
         assert continuation[-4:-2] == ("--operation-id", error["operation_id"])
 
         continued = _ok(capsys, *continuation, *_FAST)
-        listed = _ok(capsys, "runs", "list", "--application", _AGENT)
+        listed = _ok(capsys, "runs", "list", "--application", _AGENT, "--on", "live")
         assert [item["id"] for item in listed["items"]] == [continued["run"]["id"]]
         assert continued["summary"]["status"] == "passed"
 
@@ -648,7 +663,7 @@ def test_the_printed_continuation_replays_an_admission_after_a_deploy(
         assert error["message"].endswith(
             "Start a new run without --operation-id and --execution-profile-revision."
         )
-        listed = _ok(capsys, "runs", "list", "--application", _AGENT)
+        listed = _ok(capsys, "runs", "list", "--application", _AGENT, "--on", "live")
         assert [item["id"] for item in listed["items"]] == [first["run"]["id"]]
 
         error = _refused(capsys, *run, "--execution-profile-revision", reviewed)

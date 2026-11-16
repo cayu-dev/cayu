@@ -1788,31 +1788,88 @@ saying to deploy the Agent again.
 ## Running an Agent's evals
 
 `cayu cloud eval` runs a suite of a portable [eval corpus](evals.md#portable-corpus-documents)
-on a deployed Agent and reads its eval runs. The run executes on the Agent's own eval worker,
-in the release it runs now, with its secrets, sandboxes and stores, and lands in the Agent's
-eval history beside the runs its Developer dashboard starts. The commands reach the Agent as
-[reading an Agent's state](#reading-an-agents-state-from-the-cli) does, with its Developer
-dashboard login, and fail with `evals_unavailable` when the Agent's Cayu serves no eval API
-(it predates it, or runs without a durable store).
+against a deployed Agent and reads its eval runs. It runs in one of two places:
+
+- **Isolated** (the default): Cayu Cloud's evaluation service runs the suite against one of the
+  Agent's Releases, in allocations of their own, so nothing it does reaches the live Agent's
+  sessions, tasks, inbox, knowledge or usage. See [Isolated eval runs](#isolated-eval-runs).
+- **Live** (`--on live`): the run executes on the Agent's own eval worker, in the release it runs
+  now, with its secrets, sandboxes and stores, and lands in the Agent's eval history beside the
+  runs its Developer dashboard starts. Use it for suites that only drive ordinary sessions and
+  write nothing that matters; the command says on standard error that the run writes into the
+  live Agent's stores. See [Live eval runs](#live-eval-runs).
 
 ```console
 cayu cloud eval run --application my-agent --corpus evals.json --suite refund-regressions \
-  --output run.json
+  --output receipt.json
 cayu cloud eval runs list --application my-agent
-cayu cloud eval runs show --application my-agent RUN_ID
-cayu cloud eval runs cancel --application my-agent RUN_ID
+cayu cloud eval runs show --application my-agent evl_...
+cayu cloud eval runs cancel --application my-agent evl_...
+```
+
+### Isolated eval runs
+
+`eval run` reads the corpus file (at most 8 MiB), checks that it has the suite, and states the
+run's bound on standard error and as `bound`: cases × trials per case × `--trials` (each a run
+of the whole suite in its own allocation, 1 to 10, default 1) = total trials,
+`--max-concurrency` (cases at once in each allocation, at most 32), each trial's timeout, and
+the eval environment it asks for. It then submits the corpus and one evaluation of the Agent's
+selected Release, or `--release RELEASE`, under an idempotency key: `--operation-id ID`, or a
+fresh one it prints in a continuation command that repeats the same request with the same
+Release, so it starts nothing new and continues with the same evaluation.
+
+Cloud runs the suite through an eval target the Release declares: `--target MODULE:ATTRIBUTE`
+when it names one of its improvement eval targets or its `[tool.cayu].eval_target`, and that
+configured target otherwise. Each allocation runs the Release's own image with none of the
+Agent's secrets (model keys reach it only through virtual credentials Cloud brokers). Where the
+Cayu Cloud installation offers it, each allocation also gets a PostgreSQL database of its own,
+migrated by the Release's own `cayu storage migrate` and dropped when the allocation ends:
+`--database postgres|none` chooses, and `--isolation run` shares one database across the run's
+allocations instead (`trial`, a fresh one each, is the default). A Release can declare a seed
+that sets the database up before the suite runs:
+
+```toml
+[tool.cayu.eval_environment]
+seed = "evals.seed:load_demo_book"   # no arguments, sync or async
+fixtures = ["demo-data/"]            # files only evaluations get, never the deployed Agent
+```
+
+A seed that fails fails the evaluation as `seed_failed` before any case runs.
+
+The command waits for the evaluation, prints its cases' outcomes, and with `--output FILE`
+writes its receipt: case ids, outcomes and counts, never outputs or reference answers. An
+evaluation that fails or is cancelled exits `2` with `eval_run_failed` (and its failure code
+and message) or `eval_run_cancelled`; one still running at `--wait-seconds` exits `2` with
+`eval_run_still_running` and its `runs show` and `runs cancel` commands. `--no-wait` returns
+once it is started. `--max-cost`, `--currency` and `--execution-profile-revision` are live
+only.
+
+`runs list` lists the Agent's isolated evaluations, newest first; `runs show` and `runs cancel`
+take an isolated run's id (`evl_...`), and any other id as the live Agent's own run.
+
+### Live eval runs
+
+With `--on live` the commands reach the Agent as
+[reading an Agent's state](#reading-an-agents-state-from-the-cli) does, with its Developer
+dashboard login, and fail with `evals_unavailable` when the Agent's Cayu serves no eval API
+(it predates it, or runs without a durable store). `runs list --on live` lists its runs.
+
+```console
+cayu cloud eval run --application my-agent --on live --corpus evals.json \
+  --suite refund-regressions --output run.json
+cayu cloud eval runs list --application my-agent --on live
 cayu cloud eval compare --application my-agent BASELINE_RUN_ID CURRENT_RUN_ID
 cayu cloud eval baseline --application my-agent RUN_ID
 ```
 
-`eval run` reads the corpus file (at most 8 MiB) and checks the suite against the eval target
+A live `eval run` reads the corpus file (at most 8 MiB) and checks the suite against the eval target
 the corpus names, as the Agent's current release publishes it (`GET /api/evals/targets`).
 Before importing anything it refuses a target the release doesn't have, naming the ones it
 has; a target whose execution profile isn't ready; and a suite the target can't run: more
 trials per case, cases or seconds per trial than the target allows, or a `--max-concurrency`
-(default 1) above the target's limit or the suite's trial policy. There is no `--trials`: the
-trial count is part of the suite's content, so a different count is a second suite in the
-corpus.
+(default 1) above the target's limit or the suite's trial policy. A live run takes no
+`--trials`: the trial count is part of the suite's content, so a different count is a second
+suite in the corpus.
 
 It then states the run's bound on standard error, and in the JSON result as `bound`: cases ×
 trials per case = total trials, how many run at once, and each trial's model-step limit and
