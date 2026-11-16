@@ -1135,6 +1135,7 @@ class ToolInvocation:
             session_store=self._session_store,
             event_writer=self._event_writer,
             resolved_redactor_observer=resolved_redactor_observer,
+            publish_arguments_as_unavailable=publish_arguments_as_unavailable,
         )
         runner_events = evidence.runner_events
         invocation_resources = self.resources.bind(

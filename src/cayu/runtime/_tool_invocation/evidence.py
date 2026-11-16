@@ -83,6 +83,7 @@ class InvocationEvidence:
         event_writer: RuntimeEventWriter,
         resolved_redactor_observer: Callable[[str, InvocationRedactorSnapshot], Awaitable[None]]
         | None,
+        publish_arguments_as_unavailable: bool,
     ) -> None:
         self._call = call
         self._secret_scope = secret_scope
@@ -90,6 +91,7 @@ class InvocationEvidence:
         self._session_store = session_store
         self._event_writer = event_writer
         self._resolved_redactor_observer = resolved_redactor_observer
+        self._publish_arguments_as_unavailable = publish_arguments_as_unavailable
         self._staged_runner_completion_events: list[tuple[Event, int]] = []
         self.runner_events: list[Event] = []
         registered_environment = call.registered_environment
@@ -189,7 +191,13 @@ class InvocationEvidence:
         self._staged_runner_completion_events = []
         prepared_events: list[Event] = []
         for event, command_evidence_revision in captured_events:
-            if snapshot.secret_scope_incomplete or command_evidence_revision != final_revision:
+            # Sealing this invocation does not close a dynamic round's scope:
+            # a later sibling can still resolve a secret in this command.
+            if (
+                self._publish_arguments_as_unavailable
+                or snapshot.secret_scope_incomplete
+                or command_evidence_revision != final_revision
+            ):
                 command = event.payload.get("command")
                 if not isinstance(command, dict) or command.get("kind") not in {
                     "process",
