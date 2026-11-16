@@ -7818,3 +7818,120 @@ def test_postgres_restart_preserves_queued_profile_and_executes_once(
     assert status is DispatchStatus.COMPLETED
     assert provider_calls == 1
     assert task_status is TaskStatus.COMPLETED
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("worker_mode", ["direct", "loop"])
+@pytest.mark.parametrize("cancel_dependency", [False, True])
+def test_tool_dependency_cancellation_keeps_dispatch_settleable(
+    backend,
+    worker_mode,
+    cancel_dependency,
+    tmp_path,
+):
+    """Child-only operation cancellation must not abandon a started claim."""
+
+    async def scenario():
+        now = datetime.now(UTC)
+        stop = asyncio.Event()
+
+        class DependencyTool(ProfileTool):
+            async def run(self, ctx, args):
+                self.calls += 1
+                # The worker can exit after this turn; setting stop does not
+                # cancel its task or any in-flight operation.
+                stop.set()
+                dependency = asyncio.get_running_loop().create_future()
+                if cancel_dependency:
+                    dependency.cancel("tool service dependency cancelled")
+                else:
+                    dependency.set_result("done")
+                await dependency
+                return ToolResult(content="done")
+
+        tasks = (
+            InMemoryTaskStore(ownership_clock=lambda: now)
+            if backend == "memory"
+            else SQLiteTaskStore(
+                tmp_path / "tool-dependency.sqlite",
+                ownership_clock=lambda: now,
+            )
+        )
+        sessions = InMemorySessionStore()
+        tool = DependencyTool("dependency")
+        provider = FakeProvider(
+            [
+                _batch("initial"),
+                [
+                    ModelStreamEvent.tool_call(id="call-1", name="dependency", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                _batch("after tool"),
+            ]
+        )
+        dispatcher = TaskStoreDispatcher(tasks)
+        app = _configured_app(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            provider=provider,
+            tools=[tool],
+        )
+        try:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="tool-dependency-session",
+                    messages=[Message.text("user", "initial")],
+                )
+            ):
+                pass
+            submitted = await app.dispatch(
+                _dispatch_request("tool-dependency-session", "tool-dependency")
+            )
+            owner = asyncio.create_task(
+                dispatcher.process_next(app, worker_id="tool-owner")
+                if worker_mode == "direct"
+                else dispatcher.run_worker(
+                    app,
+                    worker_id="tool-owner",
+                    stop=stop,
+                    poll_interval_s=0.01,
+                )
+            )
+            outcome = (await asyncio.gather(owner, return_exceptions=True))[0]
+            assert owner.cancelling() == 0  # no worker/caller cancellation
+            assert tool.calls == 1
+            session = await sessions.load("tool-dependency-session")
+            assert session is not None
+            assert session.status is (
+                SessionStatus.INTERRUPTED if cancel_dependency else SessionStatus.COMPLETED
+            )
+            # All runtime work has ended and storage is healthy. Neither lease
+            # expiry nor a replacement dispatcher should leave this row fenced.
+            task_id = submitted.metadata["queue_task_id"]
+            current = await tasks.load_task(task_id)
+            assert current is not None
+            now = (current.lease_expires_at or now) + timedelta(seconds=1)
+            await tasks.reclaim_expired(query=TaskQuery(type=dispatcher.task_type))
+            calls_before_replacement = len(provider.requests)
+            assert (
+                await TaskStoreDispatcher(tasks).process_next(
+                    app,
+                    worker_id="replacement",
+                )
+                is None
+            )
+            assert len(provider.requests) == calls_before_replacement
+            current = await tasks.load_task(task_id)
+            assert current is not None
+            assert current.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }, (current.status, current.status_reason, repr(outcome))
+        finally:
+            if isinstance(tasks, SQLiteTaskStore):
+                await tasks.close()
+
+    asyncio.run(scenario())

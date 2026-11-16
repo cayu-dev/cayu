@@ -26,6 +26,7 @@ from cayu._exception_groups import set_exception_cause as _set_exception_cause
 from cayu._task_wait import (
     await_shielded_task_outcome,
     cancel_and_join,
+    capture_awaitable_outcome,
     restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
@@ -2522,7 +2523,24 @@ class TaskStoreDispatcher(Dispatcher):
         """Supervise one dispatch operation through task-authority settlement."""
 
         async def run_operation() -> Any:
-            return await operation
+            outcome = await capture_awaitable_outcome(lambda: operation)
+            if outcome.error is None:
+                return outcome.result
+            current = asyncio.current_task()
+            if (
+                isinstance(outcome.error, asyncio.CancelledError)
+                and current is not None
+                and current.cancelling() == 0
+            ):
+                # Nothing cancelled this child, so the operation itself was
+                # cancelled (for example by a cancelled dependency). Report it
+                # as a failure so dispatch disposition settles the claim;
+                # supervisor cancellation of the child stays a cancellation.
+                raise unexpected_child_cancellation_error(
+                    outcome.error,
+                    operation="Queued dispatch operation",
+                )
+            raise outcome.error
 
         operation_task = asyncio.create_task(run_operation())
         owner_cancellation: asyncio.CancelledError | None = None
