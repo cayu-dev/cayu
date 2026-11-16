@@ -207,7 +207,9 @@ from cayu.deadlines import (
 from cayu.egress.authority import EgressAuthorityChangeKind, EgressAuthorityTransitionState
 from cayu.egress.runtime import (
     reactivate_parked_egress_environment,
+    repark_unclaimed_egress_environment_handoff,
     require_active_egress_transition_environment,
+    unclaimed_egress_handoff_retired,
 )
 from cayu.egress.transitions import (
     EgressAuthorityAdoptionHandler,
@@ -5211,6 +5213,34 @@ class SessionEngine(BeforeStopPolicies):
 
         if continuing_recovery_boundary:
             ledger.before_abandonment = publish_recovery_input
+        if egress_environment_handoff is not None:
+            # Cutover already reopened the parked runner, but this invocation
+            # claims it only during environment setup. Until then, any exit
+            # (including closing the stream at the admission events below)
+            # must park it again before the run fence is released.
+            activated_handoff = egress_environment_handoff
+            handoff_owner = self._egress_authority_adoption_handler
+            if handoff_owner is None:
+                raise EgressAuthorityTransitionConflict(
+                    "Egress environment handoff lost its adoption handler."
+                )
+            handoff_session_id = session.id
+            handoff_run_epoch = ledger.run_epoch
+            self._environment_lifecycle.retain_unclaimed_environment_handoff(
+                session_id=handoff_session_id,
+                run_epoch=handoff_run_epoch,
+                restore=lambda: repark_unclaimed_egress_environment_handoff(activated_handoff),
+                retired=lambda: unclaimed_egress_handoff_retired(
+                    handoff_owner,
+                    activated_handoff,
+                ),
+            )
+            ledger.local_release.append(
+                lambda: self._environment_lifecycle.forget_unclaimed_environment_handoff(
+                    session_id=handoff_session_id,
+                    run_epoch=handoff_run_epoch,
+                )
+            )
         # Every exit after admission, at any await or yield, ends in one
         # settlement of this invocation.
         async with self._run_settlement.settling(ledger):

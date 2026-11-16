@@ -13,7 +13,7 @@ import inspect
 import json
 import logging
 import weakref
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -874,6 +874,16 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         # setup is adopted or finalized. The run fence permits one owner per
         # session.
         self._active_environment_setups: dict[str, _ActiveEnvironmentSetup] = {}
+        self._unclaimed_environment_handoffs: dict[
+            _RunFenceReleaseKey,
+            tuple[Callable[[], Coroutine[Any, Any, None]], Callable[[], bool]],
+        ] = {}
+        # A started handoff restore is retained environment cleanup: the run
+        # fence stays held until it completes. A failed restore stays retained
+        # until its pre-invocation owner no longer holds the handoff.
+        self._environment_handoff_restores: dict[
+            str, tuple[asyncio.Task[None], Callable[[], bool]]
+        ] = {}
         self._pending_environment_owner_admissions: set[str] = set()
         self._deferred_factory_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._leftover_teardown = KeptTeardowns()
@@ -2282,6 +2292,7 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         return (
             session_id in self._active_environment_setups
             or session_id in self._deferred_factory_cleanup_tasks
+            or session_id in self._environment_handoff_restores
         )
 
     def _signal_environment_cleanup_state_changed(self, session_id: str) -> None:
@@ -2414,6 +2425,36 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             return False
         return True
 
+    def retain_unclaimed_environment_handoff(
+        self,
+        *,
+        session_id: str,
+        run_epoch: int,
+        restore: Callable[[], Coroutine[Any, Any, None]],
+        retired: Callable[[], bool],
+    ) -> None:
+        """Own an admitted invocation's environment handoff until it is claimed.
+
+        ``restore`` returns the handoff to its pre-invocation owner and does
+        nothing once the invocation claimed it. It runs before the invocation's
+        run fence is released, whichever exit releases it, so a successor
+        invocation never observes a handoff that this one left half-taken.
+        ``retired`` reports whether that owner has since let the handoff go
+        (for example by discarding it), which settles a failed restore.
+        """
+
+        if not callable(restore) or not callable(retired):
+            raise TypeError("restore and retired must be callable.")
+        key = (session_id, run_epoch)
+        if key in self._unclaimed_environment_handoffs:
+            raise RuntimeError("The invocation already owns an environment handoff.")
+        self._unclaimed_environment_handoffs[key] = (restore, retired)
+
+    def forget_unclaimed_environment_handoff(self, *, session_id: str, run_epoch: int) -> None:
+        """Drop a handoff owner whose invocation exited without a fence release."""
+
+        self._unclaimed_environment_handoffs.pop((session_id, run_epoch), None)
+
     async def release_run_fence_after_environment_cleanup(
         self,
         *,
@@ -2423,6 +2464,75 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
     ) -> None:
         """Release one invocation epoch only after retained cleanup is quiescent."""
 
+        run_epoch = (
+            _current_session_run_epoch(session_id)
+            if invocation_context is None
+            else invocation_context.binding.run_epoch
+        )
+        handoff = (
+            None
+            if run_epoch is None
+            else self._unclaimed_environment_handoffs.pop((session_id, run_epoch), None)
+        )
+        restore_error: BaseException | None = None
+        if handoff is not None:
+            restore, retired = handoff
+            task = asyncio.create_task(
+                restore(),
+                name=f"cayu-environment-handoff-restore-{session_id}",
+            )
+            self._environment_handoff_restores[session_id] = (task, retired)
+            task.add_done_callback(
+                lambda completed, owned_session_id=session_id: (
+                    self._environment_handoff_restore_completed(owned_session_id, completed)
+                )
+            )
+            try:
+                await asyncio.shield(task)
+            except BaseException as exc:
+                restore_error = exc
+        # A restore still in flight, or one that failed, is retained cleanup,
+        # so this release defers the fence instead of handing a half-restored
+        # handoff to the next invocation.
+        await self._release_run_fence_after_environment_cleanup(
+            session_id=session_id,
+            execution_profile=execution_profile,
+            invocation_context=invocation_context,
+        )
+        if restore_error is not None:
+            raise restore_error
+
+    def _environment_handoff_restore_completed(
+        self,
+        session_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        retained = self._environment_handoff_restores.get(session_id)
+        if retained is None or retained[0] is not task:
+            return
+        if task.cancelled() or task.exception() is not None:
+            # The handoff was not positively restored. Keep it as retained
+            # cleanup so the run fence is never released over it, until its
+            # owner lets it go (see retire_settled_environment_handoff_restores).
+            return
+        del self._environment_handoff_restores[session_id]
+        self._signal_environment_cleanup_state_changed(session_id)
+
+    def retire_settled_environment_handoff_restores(self) -> None:
+        """Retire failed handoff restores whose handoff its owner has let go."""
+
+        for session_id, (task, retired) in tuple(self._environment_handoff_restores.items()):
+            if task.done() and retired():
+                del self._environment_handoff_restores[session_id]
+                self._signal_environment_cleanup_state_changed(session_id)
+
+    async def _release_run_fence_after_environment_cleanup(
+        self,
+        *,
+        session_id: str,
+        execution_profile: ExecutionProfileIdentity | None,
+        invocation_context: InvocationContext | None,
+    ) -> None:
         if invocation_context is not None:
             if type(invocation_context) is not InvocationContext:
                 raise TypeError("invocation_context must be an InvocationContext.")
@@ -6561,6 +6671,11 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         return (
             *self._retained_environment_ends.settling(),
             *self._leftover_teardown.settling(),
+            *(
+                task
+                for task, _retired in self._environment_handoff_restores.values()
+                if not task.done()
+            ),
         )
 
     async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
@@ -6585,6 +6700,7 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             self._retry_failed_deferred_factory_cleanups(
                 attempted_sessions=attempted_factory_recoveries,
             )
+            self.retire_settled_environment_handoff_restores()
             retained = tuple(
                 owner
                 for owner in self._active_environment_setups.values()
@@ -6604,6 +6720,15 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             if not retained and settling:
                 await asyncio.wait(settling, timeout=remaining)
                 continue
+            if (
+                not retained
+                and not self._deferred_factory_cleanup_tasks
+                and self._environment_handoff_restores
+            ):
+                # Only failed handoff restores remain. They settle once their
+                # owner lets the handoff go (a parked-allocation discard), not
+                # by waiting here, so report the cleanup as still retained.
+                return False
             # A retained mutation fence is part of the cleanup owner's
             # authority. Explicit operator drain is therefore also a valid
             # positive-settlement entrance; polling guarded finalization alone

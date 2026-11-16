@@ -149,6 +149,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.sessions._execution_profile_rules import execution_profile_adoption_request_fingerprint
 from cayu.sessions._model_failover import ModelTarget
+from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.forks import ForkExecutionProfileSelection
 from cayu.sessions.memory import InMemorySessionStore
 from cayu.sessions.records import SessionIdentity, SessionStatus
@@ -6845,6 +6846,237 @@ def test_parking_transfers_exact_allocation_before_redelivering_cancellation() -
         assert adapter.cutover_calls == 1
         assert len(candidate_provider.requests) == 1
         assert EventType.SESSION_COMPLETED in {event.type for event in events}
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("close_at_decision", [True, False], ids=["close", "consume"])
+def test_resume_after_closing_egress_adoption_decision_reuses_handoff(
+    tmp_path: Path,
+    backend: str,
+    close_at_decision: bool,
+) -> None:
+    """Closing the stream at the adoption decision must leave a usable handoff."""
+
+    async def exercise() -> None:
+        store = (
+            InMemorySessionStore()
+            if backend == "memory"
+            else SQLiteSessionStore(tmp_path / "adoption-close.sqlite")
+        )
+        adapter = _AdoptionHandoffAdapter()
+        current_factory = _adoption_handoff_factory(adapter=adapter, generation=1, allow_post=False)
+        target_factory = _adoption_handoff_factory(adapter=adapter, generation=2, allow_post=True)
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+        source = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        source.register_provider(_completed_provider(), default=True)
+        source.register_environment_factory(
+            EnvironmentSpec(name="egress"), current_factory, default=True
+        )
+        source.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "egress-adoption-observer-close"
+        provider = _completed_provider(batches=2)
+        app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize generation two on the retained allocation.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"), target_factory, default=True
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        try:
+            await _collect(
+                source.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            )
+            stream = app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "use generation two")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="adoption-observer-close",
+                        reason="Adopt the exact retained allocation.",
+                        requested_by=ResolutionActor(
+                            subject="deployment-controller",
+                            source=ResolutionActorSource.SYSTEM,
+                        ),
+                    ),
+                )
+            )
+            try:
+                if close_at_decision:
+                    event = await anext(stream)
+                    assert event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+                    assert handler.calls == 1
+                    assert adapter.cutover_calls == 1
+                    assert provider.requests == []
+                else:
+                    assert EventType.SESSION_COMPLETED in {
+                        event.type for event in await _collect(stream)
+                    }
+            finally:
+                await stream.aclose()
+            if close_at_decision:
+                session = await store.load(session_id)
+                assert session is not None and session.status is SessionStatus.INTERRUPTED
+            # A new ordinary turn under the already-admitted target profile,
+            # not a replay of the closed observer or of the adoption intent.
+            events = await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            )
+            errors = [
+                event.payload.get("error")
+                for event in events
+                if event.type is EventType.SESSION_FAILED
+            ]
+            assert not errors, errors
+            assert EventType.SESSION_COMPLETED in {event.type for event in events}
+            assert adapter.create_calls == 1
+            assert adapter.renewal_calls == 1
+        finally:
+            await app.discard_parked_egress_allocations(session_id)
+            if backend == "sqlite":
+                await store.close()
+
+    asyncio.run(exercise())
+
+
+class _FailingReparkAdoptionHandoffAdapter(_AdoptionHandoffAdapter):
+    """Parks the source allocation, then fails to park it again after cutover."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.park_calls = 0
+
+    async def park_runner_for_authority_adoption(
+        self,
+        runner: Runner,
+    ) -> RunnerFinalizationResult:
+        self.park_calls += 1
+        if self.park_calls > 1:
+            raise RuntimeError("simulated re-park failure")
+        return await super().park_runner_for_authority_adoption(runner)
+
+
+def test_failed_repark_after_closing_egress_adoption_decision_keeps_run_fence() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        adapter = _FailingReparkAdoptionHandoffAdapter()
+        current_factory = _adoption_handoff_factory(adapter=adapter, generation=1, allow_post=False)
+        target_factory = _adoption_handoff_factory(adapter=adapter, generation=2, allow_post=True)
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+        source = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        source.register_provider(_completed_provider(), default=True)
+        source.register_environment_factory(
+            EnvironmentSpec(name="egress"), current_factory, default=True
+        )
+        source.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "egress-adoption-failed-repark"
+        provider = _completed_provider()
+        app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize generation two on the retained allocation.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"), target_factory, default=True
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            source.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+        stream = app.resume(
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", "use generation two")],
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key="adoption-failed-repark",
+                    reason="Adopt the exact retained allocation.",
+                    requested_by=ResolutionActor(
+                        subject="deployment-controller",
+                        source=ResolutionActorSource.SYSTEM,
+                    ),
+                ),
+            )
+        )
+        event = await anext(stream)
+        assert event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+        with pytest.raises(RuntimeError, match="simulated re-park failure"):
+            await stream.aclose()
+        assert adapter.park_calls == 2
+        # The runner was not parked again, so the stale registry entry must not
+        # be handed to the next invocation: the run fence stays held instead.
+        with pytest.raises(SessionRunFenced):
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            )
+        # The operator drain discards the unparked allocation, which settles
+        # the failed restore and releases the fence it held.
+        assert await app.drain_environment_cleanups(timeout_s=5.0)
+        events = await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue after discard")],
+                )
+            )
+        )
+        errors = [
+            event.payload.get("error") for event in events if event.type is EventType.SESSION_FAILED
+        ]
+        # The discarded allocation is gone, so the resume takes the ordinary
+        # reconnect path, which this test adapter does not support.
+        assert len(errors) == 1
+        assert "does not support virtual-egress reconnect" in errors[0]
+        assert provider.requests == []
+        assert provider.requests == []
 
     asyncio.run(exercise())
 

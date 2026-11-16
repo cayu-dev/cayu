@@ -99,12 +99,14 @@ from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.egress.transitions import (
     _EGRESS_AUTHORITY_PARKED_OUTCOME,
+    EgressAuthorityAdoptionHandler,
     EgressAuthorityAdoptionResult,
     EgressAuthorityTransitionConflict,
     EgressAuthorityTransitionCoordinator,
     EgressAuthorityTransitionRecord,
     _cutover_cancellation_requests,
     _egress_transition_fatal_signal,
+    _parked_egress_authority_allocation_held,
     _runtime_egress_authority_adoption_result,
     egress_authority_owner_fingerprint,
 )
@@ -4856,6 +4858,59 @@ async def reactivate_parked_egress_environment(
         environment_name=environment_name,
         agent_name=agent_name,
         execution_profile_fingerprint=execution_profile_fingerprint,
+    )
+
+
+async def repark_unclaimed_egress_environment_handoff(
+    handoff: EgressAuthorityAdoptionResult,
+) -> None:
+    """Fence an activated allocation again when its invocation never claimed it.
+
+    Cutover reopens the exact runner while the parked registry still owns its
+    factory result. An invocation that ends before claiming the handoff must
+    park the runner again, so the registry entry stays a usable parked
+    allocation that a later resume can renew and reopen.
+    """
+
+    if type(handoff) is not EgressAuthorityAdoptionResult:
+        raise TypeError("handoff must be EgressAuthorityAdoptionResult.")
+    if handoff._claimed:
+        return
+    managed = handoff.environment.runner
+    if not isinstance(managed, _EgressManagedRunner):
+        raise EgressAuthorityTransitionConflict(
+            "The activated invocation environment is not a Cayu-managed runner."
+        )
+    if managed.is_parked_for_authority_adoption:
+        return
+    # Match binding finalization: guest authority is revoked before parking,
+    # and a later resume renews it while reopening the allocation.
+    revoke_cancelled = await managed.revoke_authority()
+    await managed._park_for_authority_adoption()
+    cancellation, cancellation_requests = managed._take_authority_parking_cancellation()
+    if cancellation is not None:
+        restore_task_cancellation_requests(
+            cancellation_requests,
+            cancellation=cancellation,
+        )
+        raise cancellation
+    if revoke_cancelled:
+        raise asyncio.CancelledError()
+
+
+def unclaimed_egress_handoff_retired(
+    handler: EgressAuthorityAdoptionHandler,
+    handoff: EgressAuthorityAdoptionResult,
+) -> bool:
+    """Whether the parked registry no longer holds an unclaimed handoff's allocation."""
+
+    if type(handoff) is not EgressAuthorityAdoptionResult:
+        raise TypeError("handoff must be EgressAuthorityAdoptionResult.")
+    return not _parked_egress_authority_allocation_held(
+        handler,
+        session_id=handoff.transition.session_id,
+        environment_name=handoff.transition.environment_name,
+        factory_result=handoff._factory_result,
     )
 
 

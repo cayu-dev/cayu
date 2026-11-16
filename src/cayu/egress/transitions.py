@@ -301,6 +301,20 @@ def _require_parked_egress_authority_allocation(
     return parked.factory_result
 
 
+def _parked_egress_authority_allocation_held(
+    handler: EgressAuthorityAdoptionHandler,
+    *,
+    session_id: str,
+    environment_name: str,
+    factory_result: EnvironmentFactoryResult,
+) -> bool:
+    """Whether the registry still owns this exact allocation, draining or not."""
+
+    allocations = _parked_egress_allocations_for_handler(handler, create=False)
+    parked = None if allocations is None else allocations.get((session_id, environment_name))
+    return parked is not None and parked.factory_result is factory_result
+
+
 def _find_parked_egress_authority_allocation(
     handler: EgressAuthorityAdoptionHandler,
     *,

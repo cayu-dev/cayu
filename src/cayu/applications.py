@@ -5798,11 +5798,15 @@ class CayuApp(
         handler = self._egress_authority_adoption_handler
         if handler is None:
             return True
-        return await _drain_parked_egress_authority_allocations(
+        drained = await _drain_parked_egress_authority_allocations(
             handler,
             timeout_s=timeout_s,
             session_id=require_durable_clean_nonblank(session_id, "session_id"),
         )
+        # A failed handoff restore holding this session's run fence settles
+        # once its allocation is no longer parked.
+        self._environment_lifecycle.retire_settled_environment_handoff_restores()
+        return drained
 
     @_admitted_entrance
     async def resume_pending_interruption_cascades(
