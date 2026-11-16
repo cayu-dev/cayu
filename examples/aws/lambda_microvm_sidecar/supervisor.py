@@ -19,7 +19,7 @@ import urllib.parse
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import IO, Any, Literal, Protocol, cast
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 1024 * 1024
 # Sized for the built-in browser worker: a default session response envelope
@@ -638,6 +638,115 @@ def _control_relay(host: str, port: int) -> _TcpRelay:
     return _TcpRelay(host, port, listen_port=AGENT_CONTROL_RELAY_PORT)
 
 
+class ProcessHandle(Protocol):
+    """The part of ``subprocess.Popen`` the supervisor drives a command through."""
+
+    stdin: IO[bytes] | None
+    stdout: IO[bytes] | None
+    stderr: IO[bytes] | None
+    returncode: int | None
+
+    def poll(self) -> int | None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
+class CommandProcesses(Protocol):
+    """Where a supervisor's commands run: spawn, signal, and confirm their process trees."""
+
+    def workspace_root(self, root: str | Path) -> Path: ...
+
+    def resolve_cwd(self, cwd: str, root: Path) -> str: ...
+
+    def process_tree(
+        self,
+        execution_boundary: CommandExecutionBoundary,
+        *,
+        execution_profile: ExecutionProfile,
+        interactive: bool,
+    ) -> str: ...
+
+    def spawn(
+        self, record: _CommandRecord, argv: list[str], *, cwd: str, env: dict[str, str]
+    ) -> ProcessHandle: ...
+
+    def await_tree_init(self, record: _CommandRecord, process: ProcessHandle) -> None: ...
+
+    def stop_group(self, record: _CommandRecord, process: ProcessHandle) -> None: ...
+
+    def stop_tree(self, record: _CommandRecord, process: ProcessHandle) -> None: ...
+
+    def tree_stopped(self, record: _CommandRecord, *, timeout_s: float) -> bool: ...
+
+    def release(self, record: _CommandRecord) -> None: ...
+
+
+class LocalProcesses:
+    """Start and stop command processes in this container, through its own ``/proc``.
+
+    The seam between the supervisor's command records and the processes they
+    run. A supervisor whose commands run in another container replaces it with
+    one that asks that container's executor to do each step.
+    """
+
+    def workspace_root(self, root: str | Path) -> Path:
+        resolved = Path(root).resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    def resolve_cwd(self, cwd: str, root: Path) -> str:
+        resolved = Path(cwd).resolve()
+        if not resolved.is_relative_to(root):
+            raise CommandRequestError("cwd escapes the workspace root")
+        if not resolved.is_dir():
+            raise CommandRequestError("cwd does not exist or is not a directory")
+        return str(resolved)
+
+    def process_tree(
+        self,
+        execution_boundary: CommandExecutionBoundary,
+        *,
+        execution_profile: ExecutionProfile,
+        interactive: bool,
+    ) -> str:
+        return (
+            "pid_namespace"
+            if interactive
+            and execution_boundary.isolates_process_tree(execution_profile=execution_profile)
+            else "process_group"
+        )
+
+    def spawn(
+        self, record: _CommandRecord, argv: list[str], *, cwd: str, env: dict[str, str]
+    ) -> ProcessHandle:
+        del record
+        return subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    def await_tree_init(self, record: _CommandRecord, process: ProcessHandle) -> None:
+        record.namespace_init = _await_namespace_init(cast("subprocess.Popen[bytes]", process))
+
+    def stop_group(self, record: _CommandRecord, process: ProcessHandle) -> None:
+        del record
+        _stop_process_group(cast("subprocess.Popen[bytes]", process))
+
+    def stop_tree(self, record: _CommandRecord, process: ProcessHandle) -> None:
+        _stop_interactive(record, cast("subprocess.Popen[bytes]", process))
+
+    def tree_stopped(self, record: _CommandRecord, *, timeout_s: float) -> bool:
+        return _process_tree_stopped(record, timeout_s=timeout_s)
+
+    def release(self, record: _CommandRecord) -> None:
+        """Forget a pruned command; local processes hold nothing beyond the record."""
+
+
 @dataclass
 class _CommandRecord:
     command_id: str
@@ -646,7 +755,7 @@ class _CommandRecord:
     # Taken over from an earlier owner: only its current owner may cancel or release it.
     carried: bool = False
     state: str = "accepted"
-    process: subprocess.Popen[bytes] | None = None
+    process: ProcessHandle | None = None
     cancel_requested: bool = False
     cancel_reason: str | None = None
     result: dict[str, Any] | None = None
@@ -789,9 +898,10 @@ class CommandSupervisor:
         cancel_timeout_s: float = DEFAULT_CANCEL_TIMEOUT_SECONDS,
         result_ttl_s: float = 300.0,
         execution_boundary: CommandExecutionBoundary | None = None,
+        processes: CommandProcesses | None = None,
     ) -> None:
-        self.root = Path(root).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.processes: CommandProcesses = processes or LocalProcesses()
+        self.root = self.processes.workspace_root(root)
         if type(cancel_timeout_s) not in {int, float} or cancel_timeout_s <= 0:
             raise ValueError("cancel_timeout_s must be greater than zero")
         self.cancel_timeout_s = float(cancel_timeout_s)
@@ -821,6 +931,7 @@ class CommandSupervisor:
             payload,
             root=self.root,
             execution_boundary=self.execution_boundary,
+            processes=self.processes,
         )
         # Only a digest is retained for idempotent replays: the payload can carry
         # stdin and environment values that must not outlive the command.
@@ -1052,12 +1163,12 @@ class CommandSupervisor:
         if record.interactive is not None:
             record.interactive.abandon()
             if process is not None:
-                _stop_interactive(record, process)
+                self.processes.stop_tree(record, process)
         elif process is not None:
-            _stop_process_group(process)
+            self.processes.stop_group(record, process)
         record.finished.wait(timeout=self.cancel_timeout_s)
         if terminal and process is not None and process.poll() is not None:
-            stopped = _process_tree_stopped(record, timeout_s=self.cancel_timeout_s)
+            stopped = self.processes.tree_stopped(record, timeout_s=self.cancel_timeout_s)
             if stopped:
                 with record.lock:
                     assert record.result is not None
@@ -1102,7 +1213,7 @@ class CommandSupervisor:
     def _run(self, record: _CommandRecord, payload: dict[str, Any]) -> None:
         stdout = _LimitedBuffer(payload["output_limit_bytes"])
         stderr = _LimitedBuffer(payload["output_limit_bytes"])
-        process: subprocess.Popen[bytes] | None = None
+        process: ProcessHandle | None = None
         readers: list[tuple[threading.Thread, _LimitedBuffer]] = []
         # Each of the process's pipes with the thread that reads or writes it.
         pipes: list[tuple[Any, threading.Thread]] = []
@@ -1124,15 +1235,7 @@ class CommandSupervisor:
                         ),
                     }
                     return
-                process = subprocess.Popen(
-                    argv,
-                    cwd=payload["cwd"],
-                    env=payload["env"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
+                process = self.processes.spawn(record, argv, cwd=payload["cwd"], env=payload["env"])
                 record.process = process
                 record.state = "running"
 
@@ -1166,7 +1269,7 @@ class CommandSupervisor:
                 process.wait(timeout=payload["timeout_s"])
             except subprocess.TimeoutExpired:
                 timed_out = True
-                _stop_process_group(process)
+                self.processes.stop_group(record, process)
                 process.wait(timeout=self.cancel_timeout_s)
             _join_output_readers(readers, timeout_s=self.cancel_timeout_s)
             writer.join(timeout=self.cancel_timeout_s)
@@ -1187,7 +1290,7 @@ class CommandSupervisor:
                 )
         except BaseException as exc:
             if process is not None and process.poll() is None:
-                _stop_process_group(process)
+                self.processes.stop_group(record, process)
             _join_output_readers(readers, timeout_s=self.cancel_timeout_s)
             if not payload["omit_truncated_output"]:
                 stderr.add(f"{type(exc).__name__}: {exc}\n".encode("utf-8", errors="replace"))
@@ -1228,7 +1331,7 @@ class CommandSupervisor:
         """
         streams = cast("_InteractiveStreams", record.interactive)
         stderr = _LimitedBuffer(0)
-        process: subprocess.Popen[bytes] | None = None
+        process: ProcessHandle | None = None
         readers: list[threading.Thread] = []
         timed_out = False
         error: BaseException | None = None
@@ -1241,19 +1344,13 @@ class CommandSupervisor:
                         record, state="cancelled", exit_code=-1, timed_out=False, stopped=True
                     )
                     return
-                process = subprocess.Popen(
-                    payload["argv"],
-                    cwd=payload["cwd"],
-                    env=payload["env"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
+                process = self.processes.spawn(
+                    record, payload["argv"], cwd=payload["cwd"], env=payload["env"]
                 )
                 record.process = process
                 record.state = "running"
             if record.process_tree == "pid_namespace":
-                record.namespace_init = _await_namespace_init(process)
+                self.processes.await_tree_init(record, process)
             streams.attach(process.stdin)
             for target, args in (
                 (_drain_interactive, (process.stdout, streams)),
@@ -1267,7 +1364,7 @@ class CommandSupervisor:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 streams.abandon()
-                _stop_interactive(record, process)
+                self.processes.stop_tree(record, process)
                 process.wait(timeout=self.cancel_timeout_s)
             # Remaining stdout belongs to the host until it reads EOF; a cancel
             # abandons it. A process tree in its own namespace has fully exited
@@ -1285,7 +1382,7 @@ class CommandSupervisor:
             error = exc
             streams.abandon()
             if process is not None and process.poll() is None:
-                _stop_interactive(record, process)
+                self.processes.stop_tree(record, process)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=self.cancel_timeout_s)
         finally:
@@ -1294,7 +1391,7 @@ class CommandSupervisor:
                 streams.abandon()
             stopped = process is None or (
                 process.poll() is not None
-                and _process_tree_stopped(record, timeout_s=self.cancel_timeout_s)
+                and self.processes.tree_stopped(record, timeout_s=self.cancel_timeout_s)
             )
             with record.lock:
                 cancelled = record.cancel_requested and not timed_out
@@ -1336,8 +1433,9 @@ class CommandSupervisor:
                         and not unconfirmed
                     ):
                         expired.append(command_id)
-            for command_id in expired:
-                self._records.pop(command_id, None)
+            pruned = [self._records.pop(command_id) for command_id in expired]
+        for record in pruned:
+            self.processes.release(record)
 
     def _snapshot(self, record: _CommandRecord) -> dict[str, Any]:
         with record.lock:
@@ -1355,7 +1453,9 @@ def _validated_payload(
     *,
     root: Path,
     execution_boundary: CommandExecutionBoundary,
+    processes: CommandProcesses | None = None,
 ) -> dict[str, Any]:
+    processes = processes or LocalProcesses()
     if type(payload) is not dict:
         raise CommandRequestError("command payload must be an object")
     request = cast("dict[str, Any]", payload)
@@ -1372,11 +1472,7 @@ def _validated_payload(
         shell = _nonblank_string(request.get("shell"), "shell")
         argv = ["/bin/bash", "-c", shell]
 
-    cwd = Path(_nonblank_string(request.get("cwd"), "cwd")).resolve()
-    if not cwd.is_relative_to(root):
-        raise CommandRequestError("cwd escapes the workspace root")
-    if not cwd.is_dir():
-        raise CommandRequestError("cwd does not exist or is not a directory")
+    cwd = processes.resolve_cwd(_nonblank_string(request.get("cwd"), "cwd"), root)
 
     raw_env = request.get("env", {})
     if type(raw_env) is not dict:
@@ -1426,7 +1522,7 @@ def _validated_payload(
     return {
         "kind": kind,
         "argv": argv,
-        "cwd": str(cwd),
+        "cwd": cwd,
         "env": env,
         "stdin": stdin,
         "timeout_s": timeout_s,
@@ -1436,11 +1532,8 @@ def _validated_payload(
             "omit_truncated_output",
         ),
         "interactive": interactive,
-        "process_tree": (
-            "pid_namespace"
-            if interactive
-            and execution_boundary.isolates_process_tree(execution_profile=execution_profile)
-            else "process_group"
+        "process_tree": processes.process_tree(
+            execution_boundary, execution_profile=execution_profile, interactive=interactive
         ),
     }
 

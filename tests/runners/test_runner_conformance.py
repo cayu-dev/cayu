@@ -1607,7 +1607,12 @@ async def test_remote_runner_conformance_second_cancel_retains_cleanup_owner(
 ) -> None:
     assert registration.cleanup_factory is not None
     harness = await registration.cleanup_factory(tmp_path, monkeypatch, "command")
-    adapter_module = sys.modules[registration.runner_type.__module__]
+    # The module whose code runs the runner's command cleanup, which may be a base class's.
+    adapter_module = next(
+        module
+        for cls in registration.runner_type.__mro__
+        if hasattr(module := sys.modules[cls.__module__], "cleanup_runner_command_with_diagnostic")
+    )
     original_cleanup = adapter_module.cleanup_runner_command_with_diagnostic
     cleaning = asyncio.Event()
     release = asyncio.Event()

@@ -2084,21 +2084,19 @@
     "_kill_process"
   ],
   "cayu.runners.aws_lambda_microvm:DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS": [
-    "LambdaMicroVMRunner._await_command"
+    "LambdaMicroVMRunner._sidecar_limits"
   ],
   "cayu.runners.aws_lambda_microvm:HttpxLambdaMicroVMEndpointTransport": [
     "LambdaMicroVMRunner.__init__"
   ],
   "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_ENCODED_OUTPUT_BYTES": [
-    "_decode_output"
+    "LambdaMicroVMRunner._sidecar_limits"
   ],
   "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_OUTPUT_BYTES": [
-    "LambdaMicroVMRunner._prepare_exec_request",
-    "LambdaMicroVMRunner.resume_exec",
-    "_decode_output"
+    "LambdaMicroVMRunner._sidecar_limits"
   ],
   "cayu.runners.aws_lambda_microvm:LAMBDA_MICROVM_MAX_RESPONSE_BYTES": [
-    "HttpxLambdaMicroVMEndpointTransport._request"
+    "HttpxLambdaMicroVMEndpointTransport._max_response_bytes"
   ],
   "cayu.runners.aws_lambda_microvm:_LAMBDA_CLIENT_TOKEN_RETRY_DELAYS_SECONDS": [
     "run_microvm_with_client_token"
@@ -2114,7 +2112,7 @@
     "_submit_run_microvm"
   ],
   "cayu.runners.aws_lambda_microvm:datetime": [
-    "_LambdaAdmissionObserver.collect"
+    "_LambdaAdmissionObserver._now"
   ],
   "cayu.runners.docker:DOCKER_COMMAND_STATE_DIR": [
     "DockerRunner._exec",

@@ -1,7 +1,7 @@
 {
   "artifact_version": 1,
   "cayu_version": "0.20.0",
-  "content_digest": "sha256:df2dd26c6f91c260747b89b545d79e45e0f02cc2268691fa265e757c97525cf4",
+  "content_digest": "sha256:e57a1260c79a47287261cc0805622f74d913188eb74a9078633d2962bc8fc394",
   "files": [
     {
       "path": "Dockerfile",
@@ -50,8 +50,8 @@
     },
     {
       "path": "supervisor.py",
-      "sha256": "sha256:fb747859f002a4a4aa842d17ebfd1a64436429bb9c9d480c28516351d998bff7",
-      "size": 75638
+      "sha256": "sha256:fbe60206b25cbe858fb1a0e2a4fd892f41977b4f94ec5d69c7ac14a7f52704cc",
+      "size": 79036
     }
   ],
   "protocol_version": "8",

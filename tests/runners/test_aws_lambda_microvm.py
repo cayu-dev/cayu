@@ -23,6 +23,8 @@ from cayu.runners import (
     LambdaMicroVMProtocolError,
     LambdaMicroVMRunner,
 )
+from cayu.runners._sidecar_runner import _THROTTLE_ATTEMPTS
+from cayu.runners._sidecar_transport import _retry_after_seconds
 from cayu.runners.aws_lambda_microvm import LambdaMicroVMEndpointThrottled
 from cayu.testing.base import verify_provider_credential_isolation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -2154,7 +2156,7 @@ async def test_outer_transient_retries_do_not_repeat_the_throttle_retry(
         else:
             deadline = asyncio.get_running_loop().time() + 600
             await runner._poll_command_until_deadline("c", deadline)
-    assert len(transport.call_tokens) == lambda_microvm_module._LAMBDA_THROTTLE_ATTEMPTS
+    assert len(transport.call_tokens) == _THROTTLE_ATTEMPTS
 
 
 @pytest.mark.anyio
@@ -2175,9 +2177,9 @@ async def test_an_owner_call_still_retries_a_transient_failure_that_is_not_a_thr
 
 
 def test_retry_after_is_read_as_whole_seconds_only() -> None:
-    assert lambda_microvm_module._retry_after_seconds("3") == 3.0
+    assert _retry_after_seconds("3") == 3.0
     for value in (None, "", "soon", "1.5", "Wed, 21 Oct 2026 07:28:00 GMT"):
-        assert lambda_microvm_module._retry_after_seconds(value) is None
+        assert _retry_after_seconds(value) is None
 
 
 @pytest.mark.anyio
