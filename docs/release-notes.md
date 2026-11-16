@@ -1,5 +1,22 @@
 # Release notes
 
+## v0.21.1
+
+Upgrade: v0.21.0 was tagged but never published to PyPI, so upgrade from
+v0.20.0 straight to v0.21.1 and follow the v0.21.0 instructions below. The
+package is the same as v0.21.0 apart from its version; no additional storage or
+manifest migration is required.
+
+### Breaking changes
+
+None.
+
+### Fixes
+
+- Install ripgrep in the PostgreSQL 18 test job, which generates a coding
+  project whose preflight needs `rg`. On stock runners the job failed, which
+  held back the v0.21.0 publication.
+
 ## v0.21.0
 
 Upgrade: Stop workers and servers that open the database, take a restorable
