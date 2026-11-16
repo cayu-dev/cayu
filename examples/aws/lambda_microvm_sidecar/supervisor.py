@@ -234,6 +234,18 @@ class OwnerFence:
                 self._pending_supersede = None
             return self._generation, superseded
 
+    def reset(self) -> None:
+        """Forget the current owner, as a sidecar restart would: every host must claim again.
+
+        The next claim does not supersede anyone, but as any claim after the
+        first it still cancels every earlier owner's commands.
+        """
+
+        with self._lock:
+            self._digest = None
+            self._carry_generation = None
+            self._owner_numbered = False
+
     def is_current(self, claim_id: object) -> bool:
         try:
             digest = _claim_digest(claim_id)

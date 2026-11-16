@@ -1,7 +1,7 @@
 {
   "artifact_version": 1,
   "cayu_version": "0.20.0",
-  "content_digest": "sha256:e57a1260c79a47287261cc0805622f74d913188eb74a9078633d2962bc8fc394",
+  "content_digest": "sha256:a7db4226cef75d8e56ece3b010204ae230c7134eba805e76eeabcbb3160d574e",
   "files": [
     {
       "path": "Dockerfile",
@@ -10,8 +10,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "sha256:e96cfad3d4d71bd728855a7460672057c1ab57cbf51ffd0fc63f4f50d1d1cf88",
-      "size": 21674
+      "sha256": "sha256:eb9834f0d8f4116f57b4f6ce759afdbde4149d8b6dd79d587e80cbed49e21ee1",
+      "size": 32558
     },
     {
       "path": "__init__.py",
@@ -20,8 +20,8 @@
     },
     {
       "path": "app.py",
-      "sha256": "sha256:be2926561fc9dca458b1b9e49333034a0145b9c9ba513237bb9ba1dc46e9f858",
-      "size": 21898
+      "sha256": "sha256:a897d55b87744f60d50334be9f2548428918adec10e6963667cb279927861b67",
+      "size": 27122
     },
     {
       "path": "browser/Dockerfile",
@@ -35,13 +35,28 @@
     },
     {
       "path": "entrypoint.sh",
-      "sha256": "sha256:525209efbf6d085eb5c466433260dc41e749c9258b849408ad50ca0a431d96d8",
-      "size": 2201
+      "sha256": "sha256:41e0731dac49afdeeeebb39cb096b4d0f09508d95264621f0ff74e54f8f24a89",
+      "size": 3300
+    },
+    {
+      "path": "executor.py",
+      "sha256": "sha256:458e7ccf48936629bafa78954a37722994c62173b8be0422cc943f43130f1f65",
+      "size": 31116
+    },
+    {
+      "path": "executor_protocol.py",
+      "sha256": "sha256:d02dbe27392d2be0b51dbc1cb3147f1558ed19acfe9792e9ab256d522e040734",
+      "size": 8312
     },
     {
       "path": "forwards.py",
       "sha256": "sha256:4ef599acdff272994101eaeb408a76329e0df7a75b008465a4c2f75486b34d23",
       "size": 23863
+    },
+    {
+      "path": "remote_processes.py",
+      "sha256": "sha256:5e8c3076b9ab13626aabb1cbe47977792dc6af782ec62ebc8fba4a6f114cb524",
+      "size": 9162
     },
     {
       "path": "requirements.txt",
@@ -50,8 +65,13 @@
     },
     {
       "path": "supervisor.py",
-      "sha256": "sha256:fbe60206b25cbe858fb1a0e2a4fd892f41977b4f94ec5d69c7ac14a7f52704cc",
-      "size": 79036
+      "sha256": "sha256:fee2a9d14b38a26e6d32a7498dc13485ee388f0765edf322d236f0a2dc0c018d",
+      "size": 79454
+    },
+    {
+      "path": "token_auth.py",
+      "sha256": "sha256:4bf2cb81b97de0293a52342f2e0cbb67e7dcabe3d791c7644542a3d2e9f72d8a",
+      "size": 3599
     }
   ],
   "protocol_version": "8",

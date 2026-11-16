@@ -25,7 +25,24 @@ configure_agent_network_boundary() {
     chmod 0644 "/etc/netns/$CAYU_MICROVM_AGENT_NETNS/hosts"
 }
 
-configure_agent_network_boundary
+# In Kubernetes mode the pod's network policy isolates the agent and no EFS
+# mount needs a watchdog, so only the sidecar and the reap loop run. Agent
+# commands run in the pod's agent container, started with
+# `python3.11 -m lambda_microvm_sidecar.executor` (see README.md).
+lambda_mode=false
+if [[ "${CAYU_SIDECAR_MODE:-lambda}" == lambda ]]; then lambda_mode=true; fi
+
+# The host reaches a Kubernetes-mode sidecar over the pod network, so it serves only HTTPS.
+if [[ "$lambda_mode" == false ]]; then
+    if [[ "$(id -u)" == 0 ]]; then
+        echo "Kubernetes mode runs the sidecar as a non-root user" >&2
+        exit 1
+    fi
+    : "${CAYU_SIDECAR_TLS_CERT_FILE:?Kubernetes mode requires CAYU_SIDECAR_TLS_CERT_FILE}"
+    : "${CAYU_SIDECAR_TLS_KEY_FILE:?Kubernetes mode requires CAYU_SIDECAR_TLS_KEY_FILE}"
+fi
+
+if [[ "$lambda_mode" == true ]]; then configure_agent_network_boundary; fi
 
 sidecar_pid=0
 watchdog_pid=0
@@ -40,9 +57,14 @@ trap 'forward_signal INT' INT
 trap 'forward_signal HUP' HUP
 trap 'forward_signal QUIT' QUIT
 
-/usr/bin/amazon-efs-mount-watchdog &
-watchdog_pid=$!
-python3.11 -m uvicorn lambda_microvm_sidecar.app:app --host 0.0.0.0 --port 8080 &
+if [[ "$lambda_mode" == true ]]; then
+    /usr/bin/amazon-efs-mount-watchdog &
+    watchdog_pid=$!
+    python3.11 -m uvicorn lambda_microvm_sidecar.app:app --host 0.0.0.0 --port 8080 &
+else
+    python3.11 -m uvicorn lambda_microvm_sidecar.app:app --host 0.0.0.0 --port 8080 \
+        --ssl-certfile "$CAYU_SIDECAR_TLS_CERT_FILE" --ssl-keyfile "$CAYU_SIDECAR_TLS_KEY_FILE" &
+fi
 sidecar_pid=$!
 
 # As PID 1, Bash adopts command descendants whose direct parent exits. Wait for

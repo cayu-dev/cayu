@@ -5,12 +5,22 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import ssl
+import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 
+from .executor_protocol import (
+    DEFAULT_EXECUTOR_SOCKET,
+    EXECUTOR_SOCKET_ENV,
+    ExecutorClient,
+    ExecutorError,
+)
 from .forwards import FORWARD_PORTS, MAX_FORWARD_CONNECTIONS, PortForwardRegistry
+from .remote_processes import RemoteProcesses
 from .supervisor import (
     MAX_CARRIED_COMMANDS,
     CommandConflictError,
@@ -23,22 +33,84 @@ from .supervisor import (
     OwnerSupersededError,
     StaleOwnerEpochError,
 )
+from .token_auth import BearerToken, TokenFileError, check_private_key_file
 
+LAMBDA_MODE = "lambda"
+# Supervises a workspace in a Kubernetes sandbox pod, whose network policy
+# isolates the agent instead of a network namespace.
+KUBERNETES_MODE = "kubernetes"
+SIDECAR_MODE = os.environ.get("CAYU_SIDECAR_MODE", LAMBDA_MODE)
+if SIDECAR_MODE not in (LAMBDA_MODE, KUBERNETES_MODE):
+    raise RuntimeError(f"CAYU_SIDECAR_MODE must be {LAMBDA_MODE!r} or {KUBERNETES_MODE!r}")
+KUBERNETES = SIDECAR_MODE == KUBERNETES_MODE
+
+
+def _host_token() -> BearerToken:
+    # Never from the environment, which other processes in the pod may read.
+    path = os.environ.get("CAYU_SIDECAR_TOKEN_FILE")
+    if not path:
+        raise RuntimeError("Kubernetes mode requires CAYU_SIDECAR_TOKEN_FILE")
+    return BearerToken(path)
+
+
+def _host_tls() -> tuple[str, str]:
+    """The certificate and key the sidecar serves HTTPS with (entrypoint.sh hands them to
+    Uvicorn), so the host's token never crosses the pod network in clear."""
+    certificate = os.environ.get("CAYU_SIDECAR_TLS_CERT_FILE")
+    key = os.environ.get("CAYU_SIDECAR_TLS_KEY_FILE")
+    if not certificate or not key:
+        raise RuntimeError(
+            "Kubernetes mode requires CAYU_SIDECAR_TLS_CERT_FILE and CAYU_SIDECAR_TLS_KEY_FILE"
+        )
+    check_private_key_file(key)
+    try:
+        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(certificate, key)
+    except (OSError, ssl.SSLError) as exc:
+        raise TokenFileError(
+            f"sidecar TLS certificate {certificate} and key {key} do not load as a pair: {exc}"
+        ) from exc
+    return certificate, key
+
+
+# Read before anything starts, so a bad token or TLS file stops the sidecar.
+HOST_TOKEN = _host_token() if KUBERNETES else None
+HOST_TLS = _host_tls() if KUBERNETES else None
 ROOT = os.environ.get("CAYU_MICROVM_WORKSPACE_ROOT", "/workspace")
 PROTOCOL_VERSION = "8"
 # Optional protocol 8 features a host checks for before using them.
 CAPABILITIES = ["owner_epoch", "carry_commands"]
+if KUBERNETES:
+    CAPABILITIES.extend(["bearer_auth", "boot_id"])
+# Changes whenever the sidecar process starts. Health combines it with the
+# executor's, so a host sees either container restart, which loses every command.
+BOOT_ID = str(uuid.uuid4()) if KUBERNETES else None
 AGENT_UID = int(os.environ.get("CAYU_MICROVM_AGENT_UID", "1000"))
 AGENT_GID = int(os.environ.get("CAYU_MICROVM_AGENT_GID", "1000"))
-AGENT_NETNS = os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
+AGENT_NETNS = None if KUBERNETES else os.environ.get("CAYU_MICROVM_AGENT_NETNS", "cayu-agent")
+# In Kubernetes mode commands run in the agent container, as its own user,
+# through its executor; this container has no workspace and no agent UID to drop to.
+PROCESSES = (
+    RemoteProcesses(
+        ExecutorClient(
+            os.environ.get(EXECUTOR_SOCKET_ENV, DEFAULT_EXECUTOR_SOCKET),
+            session=cast("str", BOOT_ID),
+            on_restart=lambda: _executor_restarted(),
+        )
+    )
+    if KUBERNETES
+    else None
+)
 EXECUTION_BOUNDARY = CommandExecutionBoundary(
-    agent_uid=AGENT_UID,
-    agent_gid=AGENT_GID,
+    agent_uid=None if KUBERNETES else AGENT_UID,
+    agent_gid=None if KUBERNETES else AGENT_GID,
     agent_netns=AGENT_NETNS,
 )
-SUPERVISOR = CommandSupervisor(root=ROOT, execution_boundary=EXECUTION_BOUNDARY)
+SUPERVISOR = CommandSupervisor(
+    root=ROOT, execution_boundary=EXECUTION_BOUNDARY, processes=PROCESSES
+)
 OWNER = OwnerFence()
-FORWARDS = PortForwardRegistry()
+# Without an agent veth gateway, forwards listen on the pod's loopback.
+FORWARDS = PortForwardRegistry(listen_host="127.0.0.1") if KUBERNETES else PortForwardRegistry()
 # 409 on claims rejects stale epochs, 412 rejects superseded owners, and 423
 # reports a lifecycle lease held by the current owner; hosts need not parse bodies.
 OWNER_SUPERSEDED_STATUS = 412
@@ -61,7 +133,60 @@ FORWARD_IO = ThreadPoolExecutor(
     max_workers=len(FORWARD_PORTS) * MAX_FORWARD_CONNECTIONS,
     thread_name_prefix="cayu-forward",
 )
-app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
+
+
+async def _require_host_token(request: Request) -> None:
+    scheme, _, credentials = request.headers.get("authorization", "").partition(" ")
+    if (
+        HOST_TOKEN is None
+        # Only over the TLS entrypoint.sh serves; a sidecar started without it serves nothing.
+        or request.url.scheme != "https"
+        or scheme.lower() != "bearer"
+        or not credentials
+        or not HOST_TOKEN.accepts(credentials.encode())
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="a valid sidecar bearer token is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+if KUBERNETES:
+    # Every route, /health included, needs the host's token; the schema is not served.
+    app = FastAPI(
+        title="Cayu Lambda MicroVM sidecar",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        dependencies=[Depends(_require_host_token)],
+    )
+else:
+    app = FastAPI(title="Cayu Lambda MicroVM sidecar", docs_url=None, redoc_url=None)
+
+_Endpoint = TypeVar("_Endpoint", bound=Callable[..., Any])
+
+
+def _lambda_route(path: str) -> Callable[[_Endpoint], _Endpoint]:
+    """Register a POST route only in Lambda mode; the endpoint stays importable."""
+
+    def register(endpoint: _Endpoint) -> _Endpoint:
+        if KUBERNETES:
+            return endpoint
+        return app.post(path)(endpoint)
+
+    return register
+
+
+def _executor_restarted() -> None:
+    """The agent container's processes are gone: lose the owner and guest work as a restart would.
+
+    The changed boot ID in health tells the host; a stale owner's next fenced
+    call is refused, and a new claim cancels whatever records remain.
+    """
+    OWNER.reset()
+    SUPERVISOR.cancel_all()
+    FORWARDS.close_all()
 
 
 def _close_guest_relays() -> None:
@@ -71,14 +196,21 @@ def _close_guest_relays() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    return {
+    response: dict[str, Any] = {
         "status": "ok",
         "protocol_version": PROTOCOL_VERSION,
         "capabilities": list(CAPABILITIES),
     }
+    if PROCESSES is not None:
+        # An unreachable executor fails health, so the pod stops being ready.
+        try:
+            response["boot_id"] = await asyncio.to_thread(PROCESSES.boot_id, cast("str", BOOT_ID))
+        except ExecutorError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return response
 
 
-@app.post("/aws/lambda-microvms/runtime/v1/ready")
+@_lambda_route("/aws/lambda-microvms/runtime/v1/ready")
 async def ready_hook() -> dict[str, str]:
     """Tell the image builder the command sidecar is ready to snapshot."""
     return {"status": "ok"}
@@ -171,7 +303,7 @@ async def check_owner(payload: dict[str, Any]) -> dict[str, bool]:
     return {"current": OWNER.is_current(payload.get("claim_id"))}
 
 
-@app.post("/v1/owner/lifecycle")
+@_lambda_route("/v1/owner/lifecycle")
 async def acquire_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
     """Confirm the caller still owns the MicroVM and block takeover until it acts.
 
@@ -190,7 +322,7 @@ async def acquire_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=OWNER_SUPERSEDED_STATUS, detail=str(exc)) from exc
 
 
-@app.post("/v1/owner/lifecycle/release")
+@_lambda_route("/v1/owner/lifecycle/release")
 async def release_lifecycle(payload: dict[str, Any]) -> dict[str, str]:
     try:
         await asyncio.to_thread(OWNER.release_lifecycle, payload.get("claim_id"))
@@ -229,6 +361,8 @@ async def start_command(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except CommandRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ExecutorError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 def _configure_control_relay_admitted(
@@ -485,13 +619,13 @@ def _caller_generation(payload: dict[str, Any] | None) -> int | None:
     return None if claim is None else OWNER.current_generation(claim)
 
 
-@app.post("/aws/lambda-microvms/runtime/v1/run")
+@_lambda_route("/aws/lambda-microvms/runtime/v1/run")
 async def run_hook(payload: Any = None) -> dict[str, str]:
     del payload
     return {"status": "ok"}
 
 
-@app.post("/aws/lambda-microvms/runtime/v1/resume")
+@_lambda_route("/aws/lambda-microvms/runtime/v1/resume")
 async def resume_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     OWNER.settle_lifecycle("resume")
@@ -517,7 +651,7 @@ async def _stop_guest_work() -> None:
         raise failure
 
 
-@app.post("/aws/lambda-microvms/runtime/v1/suspend")
+@_lambda_route("/aws/lambda-microvms/runtime/v1/suspend")
 async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     try:
@@ -529,7 +663,7 @@ async def suspend_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/aws/lambda-microvms/runtime/v1/terminate")
+@_lambda_route("/aws/lambda-microvms/runtime/v1/terminate")
 async def terminate_hook(payload: dict[str, Any] | None = None) -> dict[str, str]:
     del payload
     try:

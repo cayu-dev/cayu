@@ -321,3 +321,159 @@ creating an orphan process.
 
 All externally routed requests are protected by Lambda MicroVM's required JWE endpoint token.
 The token is generated and refreshed by the host-side runner and is never stored in the image.
+
+## Kubernetes mode
+
+The same image can supervise a workspace inside a Kubernetes sandbox pod, such as a gVisor
+Agent Sandbox. Set `CAYU_SIDECAR_MODE=kubernetes` on the supervisor container. The default is
+`lambda`; any other value stops the sidecar at startup. The protocol version stays `8`, and Lambda
+mode is unchanged.
+
+### Two containers
+
+A sandbox policy that refuses root containers and added capabilities rules out the Lambda shape,
+where a root sidecar drops each command to the agent UID. The pod instead runs this image twice,
+as two non-root containers that share no volume:
+
+- The **supervisor container** runs `entrypoint.sh` as its own UID (for example 10001), which
+  starts only Uvicorn and refuses to start as root. It holds everything the host talks to and
+  every secret: TLS, the bearer token, the owner fence, command records, output limits and
+  buffering, and port forwards.
+- The **agent container** runs the command executor as PID 1, as the agent's UID (for example
+  1000, `cayu-agent`), and mounts the workspace at `/workspace`:
+  `command: ["python3.11", "-m", "lambda_microvm_sidecar.executor"]` with the image's working
+  directory, `/opt/cayu`. The executor spawns, feeds, drains, signals and confirms commands on
+  the supervisor's behalf and holds nothing else.
+
+Set `runAsNonRoot: true`, `allowPrivilegeEscalation: false` and `capabilities: {drop: ["ALL"]}` on
+both containers, and request at least 1 GiB of memory per requested vCPU, which GKE's sandbox
+policy requires. Both containers need `CAYU_MICROVM_WORKSPACE_ROOT` when the workspace is not at
+`/workspace`; the agent container needs `CAYU_EXECUTOR_SUPERVISOR_UID`, the supervisor
+container's UID. Agent commands run as the agent container's own user: the supervisor uses no
+`setpriv` and has no agent UID to drop to, so `CAYU_MICROVM_AGENT_UID` and `CAYU_MICROVM_AGENT_GID`
+are ignored.
+
+The executor listens on an abstract Unix socket, `@cayu-sidecar-executor` unless
+`CAYU_EXECUTOR_SOCKET` names another (on both containers); a value without `@` is a filesystem
+path, which would need a shared volume. Containers in a pod share its network namespace, which
+scopes abstract socket names, so the two containers meet without a volume. The executor binds the
+name before anything else and serves only callers whose peer credentials (`SO_PEERCRED`) carry
+`CAYU_EXECUTOR_SUPERVISOR_UID`; agent commands share the network namespace but never that UID,
+and their connections are refused before any request is read. The peer PID is not used: across
+containers under gVisor it reads 0. The executor refuses to start as root or when the supervisor
+UID is its own, and marks itself not dumpable, so agent commands, which run as its UID, cannot
+read its memory or environment.
+
+The executor runs every agent command in an agent namespace: user, mount and PID namespaces it
+creates at start, whose user namespace maps only its own UID and GID and whose init mounts a
+`/proc` of its own and reaps orphans. Commands enter it through `nsenter`, which runs with only
+the default `PATH`; the command's environment is applied by `env -i` inside, so values such as
+`LD_PRELOAD` never run where they could reach the executor, and an agent command's program and
+environment names must not contain `=`. The executor stays outside, so no agent command can
+signal it or see it in `/proc` (a sandbox's PID 1 is not protected from `kill -9` by its own
+processes under gVisor). If an agent kills the namespace's init, every agent process dies with
+it; the executor creates a new agent namespace and draws a new boot ID. Files are untouched. A
+background server a command starts with `setsid` outlives that command, inside the namespace,
+until the namespace is replaced.
+Mounting that `/proc` needs a runtime that does not mask `/proc` paths; gVisor does not, and a
+runtime that does stops the executor at startup with an error.
+
+Interactive commands get a PID namespace of their own inside the agent namespace when the
+sandbox allows nested namespaces, which the executor probes at start: they report
+`"process_tree": "pid_namespace"`, and closing one confirms every descendant exited, as in Lambda
+mode. Otherwise they report `"process_group"`: cancellation signals the process group, and a
+descendant that left it keeps running until the agent namespace ends.
+
+### Executor protocol
+
+Each request is one connection: the supervisor connects, sends one frame and reads one frame
+back. A frame is a 4-byte big-endian length followed by at most 2 MiB of UTF-8 JSON, and bytes
+travel base64-encoded. Every request names an `op` and the supervisor's `session` (its boot ID);
+every answer carries the executor's `boot_id`, and a refusal carries `error` with a `kind`
+(`invalid_request`, `conflict`, `unknown_command`, or `os_error` with the spawn's `errno`).
+
+| `op` | Fields | Answer |
+| --- | --- | --- |
+| `hello` | | `pid_namespace`, `protocol_version` (`1`) |
+| `resolve_cwd` | `cwd` | `cwd`, resolved inside the workspace |
+| `spawn` | `command_id`, `argv`, `env`, `cwd`, `process_tree` | `pid`, `process_tree` |
+| `read` | `command_id`, `stream` (`stdout` or `stderr`), `offset`, `max_bytes` (at most 1 MiB), `wait_s` | `data_base64`, `eof` |
+| `write` | `command_id`, `offset`, `data_base64` (at most 1 MiB), `eof` | `offset`, `closed` |
+| `wait` | `command_id`, `wait_s` | `returncode`, null while it runs |
+| `stop_group`, `stop_tree` | `command_id` | |
+| `tree_stopped` | `command_id`, `timeout_s` | `stopped` |
+| `release` | `command_id` | |
+
+Waits are at most 20 seconds. Every request is idempotent, so a connection reset, for example by
+a snapshot and restore, only causes a retry; the supervisor retries for up to 30 seconds. A
+repeated `spawn` returns the process the first one started, and a different command under the
+same ID is a conflict. Reading at an offset acknowledges every earlier byte and a lost answer is
+recovered by reading the same offset again; writing names the offset it starts at, so a replayed
+chunk is skipped. The executor holds up to 4 MiB of unacknowledged output per stream and then
+stops draining the pipe, so the supervisor's output limits and interactive backpressure still
+reach the command. A `write` returns once the command has taken the chunk, however long that
+takes, so a slow reader holds the writer back as a local pipe does instead of failing it. A
+request in a new `session` first stops every command of the earlier one and replaces the agent
+namespace, which ends any background process they left, so a restarted supervisor leaves nothing
+running that it cannot reach; requests wait until the new namespace is in place.
+
+### Boot ID and health
+
+`GET /health` returns
+`{"status":"ok","protocol_version":"8","capabilities":["owner_epoch","carry_commands","bearer_auth","boot_id"],"boot_id":"<uuid>"}`.
+The `boot_id` is one UUID derived from the supervisor's boot ID, drawn when it starts, and the
+executor's, drawn when it starts and again whenever it replaces the agent namespace, so it changes when
+either container restarts or the agent's processes are lost. When the supervisor sees the
+executor's boot ID change, it drops the current owner and cancels every command and closes every
+forward, as its own restart would: the host's next fenced call is refused and a new claim starts
+afresh. While the executor is unreachable, `GET /health` answers HTTP 503, so the supervisor
+container's readiness probe fails, and a command start answers HTTP 503 too.
+
+### Host authentication and TLS
+
+Without Lambda MicroVM's endpoint token in front of it, the sidecar authenticates its host
+itself. Every route, `GET /health` included, requires `Authorization: Bearer <token>` and
+answers HTTP 401 otherwise; the sidecar compares SHA-256 digests in constant time. The token is
+read at startup from the file named by `CAYU_SIDECAR_TOKEN_FILE`, never from the environment,
+and the sidecar refuses to start when that file:
+
+- is missing or not a regular file;
+- holds fewer than 32 bytes (surrounding whitespace is ignored);
+- is owned by neither UID 0 nor the sidecar's own UID;
+- is writable by its group (`0o020`) or accessible to others (any bit of `0o007`).
+
+Its group may read it, so mount it from a Secret volume in the supervisor container only, with
+`defaultMode: 0440` and a pod `fsGroup`. Kubernetes makes Secret files owned by root, so
+`defaultMode: 0400` without an `fsGroup` leaves them unreadable to the non-root sidecar, which then
+does not start. The agent container mounts neither the token nor the key. Before every check the
+sidecar looks at the file's modification time and reads the file again when it has changed, so a
+token rotated on disk replaces the earlier one on the next request; an unsafe replacement is
+ignored and the earlier token stays.
+
+The host reaches the sidecar over the pod network, so in Kubernetes mode it serves only HTTPS and
+the token never crosses that network in clear. Set `CAYU_SIDECAR_TLS_CERT_FILE` to its PEM
+certificate and `CAYU_SIDECAR_TLS_KEY_FILE` to the PEM private key; the entrypoint hands both to
+Uvicorn. The sidecar refuses to start when either is unset, when the certificate and key don't
+load as a pair, or when the key file fails the token file's checks above, and it answers HTTP 401
+to any request that did not arrive over TLS. Mount the key from the same kind of Secret volume as
+the token. A self-signed certificate issued per sandbox for the host name the host connects to
+(for example its Service's `<name>.<namespace>.svc.cluster.local`) lets the host pin exactly that
+certificate, for example with `ssl.create_default_context(cadata=...)`. Uvicorn loads the
+certificate once at startup, so a pod restored from a snapshot keeps serving the one it started
+with; replace the sandbox, rather than its Secret, to change it.
+
+### Routes and network
+
+Kubernetes mode does not serve the Lambda MicroVM hooks under
+`/aws/lambda-microvms/runtime/v1/`, the lifecycle lease routes `POST /v1/owner/lifecycle` and
+`POST /v1/owner/lifecycle/release`, or the API schema. Every other route behaves as in Lambda mode.
+
+The entrypoint creates no agent network namespace, veth pair or firewall rules, and starts no
+EFS mount watchdog; `CAYU_MICROVM_AGENT_NETNS`, which the image sets, is ignored. Agent commands
+share the pod's network, so the pod's NetworkPolicy is the network boundary: admit only the host
+to port 8080 and restrict egress to what the workload needs. Port forwards listen on the pod's
+loopback, `127.0.0.1`, at ports 18500 to 18563, which agent commands reach from their container.
+`POST /v1/control-relay` is refused, and proxy settings in a command's environment reach the agent
+unchanged (its transport token is still removed), because there is no namespace to relay from.
+The image creates `/workspace` owned by the agent UID and GID at build time; a volume mounted
+there must be owned the same way.

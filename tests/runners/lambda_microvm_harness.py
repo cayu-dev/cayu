@@ -6,9 +6,14 @@ import copy
 import email.utils
 import weakref
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from examples.aws.lambda_microvm_sidecar.supervisor import (
     CommandSupervisor,
     OwnerFence,
@@ -236,6 +241,45 @@ class SupervisorTransport(OwnerFencedTransport):
 
     def on_owner_superseded(self, generation: int) -> None:
         self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)
+
+
+def write_sidecar_tls(directory: Path, host: str = "localhost") -> tuple[Path, Path]:
+    """Write a self-signed certificate for ``host`` and its key, as a sandbox's own, and return
+    their paths; the key is readable by its owner alone, as the sidecar requires."""
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
+    now = datetime.now(UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    certificate_path = directory / "tls.crt"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path = directory / "tls.key"
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o600)
+    return certificate_path, key_path
 
 
 def _terminal_result(command_id: str, *, exit_code: int, stdout: str = "") -> dict[str, Any]:
