@@ -7166,6 +7166,7 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         final_revision: WorkspaceRevisionObservation | None = None
         finalization_delta: dict[str, Any] | None = None
         terminal_marker: dict[str, Any] | None = None
+        finalization_succeeded = False
         try:
             if (
                 terminal_outcome in ("failed", "interrupted")
@@ -7240,6 +7241,7 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
                 asyncio.CancelledError | None,
                 int,
             ]:
+                nonlocal finalization_succeeded
                 final_snapshot_value = await self._finalize_binding_with_disposal_checkpoint(
                     registered_environment,
                     binding,
@@ -7247,6 +7249,15 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
                     outcome=outcome,
                     metadata=finalize_metadata,
                 )
+                # Retain settlement before the operation boundary can restore
+                # caller cancellation and discard the successful return value.
+                finalization_succeeded = True
+                if setup_owner is not None:
+                    setup_owner.cleanup_release_safe = True
+                    setup_owner.cleanup_requires_finalize_retry = False
+                    # A lost clear acknowledgement must retry the clear, not finalize
+                    # an already disposed binding a second time.
+                    setup_owner.pending_completion_marker_clear = terminal_marker
                 final_snapshot = copy_workspace_snapshot(final_snapshot_value)
                 if parking_reservation is None:
                     return final_snapshot, None, 0
@@ -7277,11 +7288,6 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
                 ),
                 phase_timer=phase_timer,
             )
-            if setup_owner is not None:
-                # The binding reached its own terminal boundary. Any retained
-                # exact-owner retry state is now safe to discard even if
-                # validating or publishing the resulting snapshot later fails.
-                setup_owner.cleanup_release_safe = True
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
             progress_failure: BaseException | None = None
             try:
@@ -7408,7 +7414,10 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
                 if setup_owner is not None:
                     setup_owner.cleanup_release_safe = True
                     setup_owner.pending_finalize_failure_event = None
-                    if binding._completion_requires_successful_finalization(bound_workspace):
+                    if (
+                        not finalization_succeeded
+                        and binding._completion_requires_successful_finalization(bound_workspace)
+                    ):
                         # The target may hold the only copy of successful tool
                         # mutations. Keep its exact owner for a later bounded retry
                         # after the failure evidence is durable.
@@ -7666,10 +7675,6 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
             event = _copy_event_with_payload(event, terminal_payload)
         # Diagnostic publication cannot retain replay authority for settled effects.
         if terminal_marker is not None:
-            if setup_owner is not None:
-                # A lost clear acknowledgement must retry the clear, not finalize
-                # an already disposed binding a second time.
-                setup_owner.pending_completion_marker_clear = terminal_marker
             await self.clear_completion_finalization(
                 session_id=session.id, expected_marker=terminal_marker
             )
