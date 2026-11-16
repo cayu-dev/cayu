@@ -295,7 +295,10 @@ from cayu.sessions._model_completion_publication import (
     ModelCompletionStageDisposition,
     ModelCompletionStageSettlementRequest,
 )
-from cayu.sessions._model_stage import SessionModelCompletionStageConflict
+from cayu.sessions._model_stage import (
+    ActiveModelCompletionStage,
+    SessionModelCompletionStageConflict,
+)
 from cayu.sessions._model_stage_rules import model_completion_stage_settlement_request
 from cayu.sessions._paired_writes import OUTCOME_SESSION_STATUS
 from cayu.sessions._terminal_evidence import (
@@ -1259,6 +1262,22 @@ def _pending_interaction_action_kind(
     return None
 
 
+async def _provider_operation_owns_model_completion(
+    store: SessionStore, active_model_completion: ActiveModelCompletionStage | None
+) -> bool:
+    if active_model_completion is None:
+        return False
+    if type(active_model_completion.stage.intent.get("provider_operation_start")) is dict:
+        return True
+    try:
+        return (
+            await load_recoverable_provider_operation(store, active_model_completion.stage)
+            is not None
+        )
+    except ProviderOperationEvidenceError:
+        return True
+
+
 _ABANDONED_RUN_REASON = "event_stream_closed"
 
 
@@ -1872,6 +1891,15 @@ class SessionFinalization:
             raise SessionRunFenced(
                 "Interrupted invocation lost its exact session/profile authority."
             )
+        active_model_completion = await self.session_store.load_active_model_completion_stage(
+            session.id
+        )
+        if await _provider_operation_owns_model_completion(
+            self.session_store, active_model_completion
+        ):
+            # Local interruption does not settle remote work. Leave the interaction
+            # open so transition publication can pause it for exact result recovery.
+            return None
         latest_records = await self.session_store.query_events(
             EventQuery(
                 session_id=session.id,
@@ -2188,24 +2216,10 @@ class SessionFinalization:
             session.id
         )
         model_completion_settlement: ModelCompletionStageSettlementRequest | None = None
-        active_provider_operation = (
-            None
-            if active_model_completion is None
-            else active_model_completion.stage.intent.get("provider_operation_start")
+        provider_operation_owned = await _provider_operation_owns_model_completion(
+            self.session_store, active_model_completion
         )
-        provider_operation_owned = type(active_provider_operation) is dict
         model_completion_dispatched = False
-        if active_model_completion is not None and not provider_operation_owned:
-            try:
-                provider_operation_owned = (
-                    await load_recoverable_provider_operation(
-                        self.session_store,
-                        active_model_completion.stage,
-                    )
-                    is not None
-                )
-            except ProviderOperationEvidenceError:
-                provider_operation_owned = True
         if (
             provider_operation_owned
             and active_model_completion is not None
