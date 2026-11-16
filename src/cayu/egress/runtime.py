@@ -926,6 +926,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             # The sealed handoff proves the exact active target before the
             # retained runner acquires this factory's admission authority.
             self._bind_adopted_authority(factory_result, managed_runner)
+            await self._emit_adopted_grant_events(
+                factory_result=factory_result,
+                grants=managed_runner._egress_grants,
+                agent_name=agent_name,
+                execution_profile_fingerprint=execution_profile_fingerprint,
+            )
             return result
         registry = VirtualCredentialRegistry()
         grants = tuple(
@@ -943,8 +949,14 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         audit = _EgressAuditBridge(
             loop=asyncio.get_running_loop(),
             emitter=self._emitter,
-            session_id=authorized.session_id,
-            interaction_id=_current_session_interaction_id(authorized.session_id),
+            session_id=managed_runner._audit._session_id
+            if managed_runner._audit
+            else authorized.session_id,
+            interaction_id=_current_session_interaction_id(
+                managed_runner._audit._session_id
+                if managed_runner._audit
+                else authorized.session_id
+            ),
             agent_name=require_clean_nonblank(agent_name, "agent_name"),
             environment_name=authorized.environment_name,
             execution_profile_fingerprint=execution_profile_fingerprint,
@@ -997,7 +1009,34 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         )
         # Preserve the allocation while rebinding its verified target owner.
         self._bind_adopted_authority(factory_result, managed_runner)
+        await self._emit_adopted_grant_events(
+            factory_result=factory_result,
+            grants=grants,
+            agent_name=agent_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+        )
         return result
+
+    async def _emit_adopted_grant_events(
+        self,
+        *,
+        factory_result: EnvironmentFactoryResult,
+        grants: Sequence[VirtualCredentialGrant],
+        agent_name: str,
+        execution_profile_fingerprint: str | None,
+    ) -> None:
+        binding = factory_result.environment.binding
+        if not isinstance(binding, _EgressTeardownBinding):
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority adoption requires its managed teardown binding."
+            )
+        await binding.emit_adopted_grant_events(
+            grants=grants,
+            runner_kind=self._runner_kind,
+            agent_name=agent_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            approved_destination_count=len(self._approved_destinations),
+        )
 
     def _bind_adopted_authority(
         self,
@@ -1012,6 +1051,19 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
         else:
             factory_result.reconnect_metadata.pop("public_web_authority_fingerprint", None)
+        binding = factory_result.environment.binding
+        if not isinstance(binding, _EgressTeardownBinding):
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority adoption requires its managed teardown binding."
+            )
+        binding.replace_authority_resources(
+            grants=managed_runner._egress_grants,
+            redactor=managed_runner._output_redactor,
+            audit=managed_runner._audit,
+            emitter=self._emitter,
+            agent_name=binding._agent_name,
+            execution_profile_fingerprint=binding._execution_profile_fingerprint,
+        )
         managed_runner._execution_environment_authority = self._execution_environment_authority
 
     async def renew_parked_authority(
@@ -1058,15 +1110,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             )
             for spec in self._credentials
         )
-        audit = _EgressAuditBridge(
-            loop=asyncio.get_running_loop(),
-            emitter=self._emitter,
-            session_id=session_id,
-            interaction_id=_current_session_interaction_id(session_id),
-            agent_name=require_clean_nonblank(agent_name, "agent_name"),
-            environment_name=environment_name,
-            execution_profile_fingerprint=execution_profile_fingerprint,
-        )
+        audit = managed_runner._audit
+        if audit is None:
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority renewal requires its live audit bridge."
+            )
+        agent_name = require_clean_nonblank(agent_name, "agent_name")
         broker = managed_runner._authority_revoker._broker
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
         destinations = _ordered_destinations(
@@ -1081,13 +1130,16 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             target_redactor=SecretRedactor(tuple(grant.presented_value for grant in grants)),
             target_audit=audit,
         )
-        await self._emit_grant_events_for_identity(
-            session_id=session_id,
-            agent_name=agent_name,
-            environment_name=environment_name,
-            execution_profile_fingerprint=execution_profile_fingerprint,
+        audit._emitter = self._emitter
+        audit._interaction_id = _current_session_interaction_id(audit._session_id)
+        audit._agent_name = agent_name
+        audit._execution_profile_fingerprint = execution_profile_fingerprint
+        self._bind_adopted_authority(factory_result, managed_runner)
+        await self._emit_adopted_grant_events(
+            factory_result=factory_result,
             grants=grants,
-            runner_kind=self._runner_kind,
+            agent_name=agent_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
         )
 
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
@@ -1586,6 +1638,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 environment_name=request.environment_name,
                 execution_profile_fingerprint=request.execution_profile_fingerprint,
             )
+            managed_runner._teardown_binding = teardown_binding
 
             await self._emit_grant_events(request, grants, runner_kind=runner_kind)
             final_admission_candidate = managed_runner.execution_admission_candidate()
@@ -2337,6 +2390,7 @@ class _EgressManagedRunner(Runner):
             raise ValueError("Managed egress runner requires at least one destination.")
         self._output_redactor = output_redactor
         self._audit = audit
+        self._teardown_binding: _EgressTeardownBinding | None = None
         self._session_id = require_clean_nonblank(session_id, "session_id")
         self._environment_name = require_clean_nonblank(
             environment_name,
@@ -3665,6 +3719,17 @@ class _EgressManagedRunner(Runner):
         self._egress_destinations = destinations
         self._output_redactor = self._output_redactor.merged_with(redactor)
         self._audit = audit
+        if self._teardown_binding is not None:
+            self._teardown_binding.replace_authority_resources(
+                grants=grants,
+                redactor=redactor,
+                audit=audit,
+                emitter=self._teardown_binding._emitter,
+                agent_name=self._teardown_binding._agent_name,
+                execution_profile_fingerprint=(
+                    self._teardown_binding._execution_profile_fingerprint
+                ),
+            )
         self._teardown_timeout_s = binding.teardown_timeout_s
 
     async def _settle_retained_egress_cutover_for_finalization(
@@ -4913,15 +4978,129 @@ class _EgressTeardownBinding(WorkspaceBinding):
         self._environment_name = environment_name
         self._execution_profile_fingerprint = execution_profile_fingerprint
         self._revocation_emit_lock = asyncio.Lock()
-        self._revocation_emission_attempted_grant_ids: set[str] = set()
         self._unbound_release_settlement_task: asyncio.Task[None] | None = None
         self._unbound_release_managed_settlement_task: asyncio.Task[None] | None = None
         self._finalize_lock = asyncio.Lock()
         self._bound_finalization_states: dict[str, _EgressBoundFinalizationState] = {}
+        self._pending_lifecycle_events: list[tuple[tuple[str, str], Event]] = []
+        self._delivered_lifecycle_event_keys: set[tuple[str, str]] = set()
         # A composite owner may need this wrapper's inner binding to remain
         # reserved after our runner becomes quiescent. The parent later retires
         # that exact owner through ``abandon`` once its own runner is closed.
         self._defer_inner_release = False
+
+    def replace_authority_resources(
+        self,
+        *,
+        grants: Sequence[VirtualCredentialGrant],
+        redactor: SecretRedactor,
+        audit: _EgressAuditBridge | None,
+        emitter: EventEmitter | None,
+        agent_name: str,
+        execution_profile_fingerprint: str | None,
+    ) -> None:
+        """Transfer teardown ownership to a replacement authority."""
+
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("redactor must be a SecretRedactor.")
+        replacement_grants = tuple(grants)
+        replacement_ids = {grant.grant_id for grant in replacement_grants}
+        for grant in self._grants:
+            if grant.grant_id not in replacement_ids:
+                self._queue_lifecycle_event(
+                    (str(EventType.EGRESS_GRANT_REVOKED), grant.grant_id),
+                    Event(
+                        type=EventType.EGRESS_GRANT_REVOKED,
+                        session_id=self._session_id,
+                        agent_name=agent_name,
+                        environment_name=self._environment_name,
+                        payload=_grant_payload(grant),
+                    ),
+                    execution_profile_fingerprint,
+                )
+        self._grants = replacement_grants
+        self._finalize_redactor = self._finalize_redactor.merged_with(redactor)
+        self._emitter = emitter
+        self._audit = audit
+        self._agent_name = agent_name
+        self._execution_profile_fingerprint = execution_profile_fingerprint
+
+    async def emit_adopted_grant_events(
+        self,
+        *,
+        grants: Sequence[VirtualCredentialGrant],
+        runner_kind: str,
+        agent_name: str,
+        execution_profile_fingerprint: str | None,
+        approved_destination_count: int,
+    ) -> None:
+        """Publish target grant lifecycle events at most once on a best-effort basis."""
+
+        grant_ids = tuple(grant.grant_id for grant in grants)
+        self._queue_lifecycle_event(
+            (str(EventType.CREDENTIAL_MODE_SELECTED), ",".join(grant_ids)),
+            Event(
+                type=EventType.CREDENTIAL_MODE_SELECTED,
+                session_id=self._session_id,
+                agent_name=agent_name,
+                environment_name=self._environment_name,
+                payload={
+                    "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
+                    "runner_kind": runner_kind,
+                    "grant_count": len(grants),
+                    "approved_destination_count": approved_destination_count,
+                },
+            ),
+            execution_profile_fingerprint,
+        )
+        for grant in grants:
+            self._queue_lifecycle_event(
+                (str(EventType.EGRESS_GRANT_MINTED), grant.grant_id),
+                Event(
+                    type=EventType.EGRESS_GRANT_MINTED,
+                    session_id=self._session_id,
+                    agent_name=agent_name,
+                    environment_name=self._environment_name,
+                    payload=_grant_payload(grant),
+                ),
+                execution_profile_fingerprint,
+            )
+        self._agent_name = agent_name
+        self._execution_profile_fingerprint = execution_profile_fingerprint
+        if self._emitter is None:
+            return
+        await self._drain_lifecycle_events()
+
+    def _queue_lifecycle_event(
+        self,
+        key: tuple[str, str],
+        event: Event,
+        execution_profile_fingerprint: str | None,
+    ) -> None:
+        if key in self._delivered_lifecycle_event_keys or any(
+            pending_key == key for pending_key, _ in self._pending_lifecycle_events
+        ):
+            return
+        self._pending_lifecycle_events.append(
+            (
+                key,
+                event_with_execution_profile_fingerprint_authority(
+                    event,
+                    execution_profile_fingerprint,
+                ),
+            )
+        )
+
+    async def _drain_lifecycle_events(self) -> None:
+        while self._pending_lifecycle_events:
+            key, event = self._pending_lifecycle_events.pop(0)
+            # An emitter can persist an event and then raise, including during
+            # cancellation. Record the attempt before awaiting so retries never
+            # replay a possibly committed append or block subsequent diagnostics.
+            self._delivered_lifecycle_event_keys.add(key)
+            if self._emitter is not None:
+                with contextlib.suppress(Exception):
+                    await self._emitter(event)
 
     async def bind(
         self,
@@ -5397,13 +5576,13 @@ class _EgressTeardownBinding(WorkspaceBinding):
                     diagnostic_cancellation = asyncio.CancelledError()
             except asyncio.CancelledError as cancellation:
                 diagnostic_cancellation = cancellation
-            except BaseExceptionGroup as diagnostic_error:
-                fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
+            except BaseExceptionGroup as diagnostic_group:
+                fatal_signal = binding_finalize_fatal_signal(diagnostic_group)
                 if fatal_signal is not None:
                     diagnostic_fatal = fatal_signal
                 else:
                     diagnostic_cancellation = binding_finalize_explicit_cancellation(
-                        diagnostic_error
+                        diagnostic_group
                     )
             except (KeyboardInterrupt, SystemExit, GeneratorExit) as fatal_signal:
                 diagnostic_fatal = fatal_signal
@@ -5419,18 +5598,18 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 except asyncio.CancelledError as cancellation:
                     if diagnostic_cancellation is None:
                         diagnostic_cancellation = cancellation
-                except BaseExceptionGroup as diagnostic_error:
-                    fatal_signal = binding_finalize_fatal_signal(diagnostic_error)
+                except BaseExceptionGroup as diagnostic_group:
+                    fatal_signal = binding_finalize_fatal_signal(diagnostic_group)
                     if fatal_signal is not None:
                         diagnostic_fatal = fatal_signal
                     elif diagnostic_cancellation is None:
                         diagnostic_cancellation = binding_finalize_explicit_cancellation(
-                            diagnostic_error
+                            diagnostic_group
                         )
                 except (KeyboardInterrupt, SystemExit, GeneratorExit) as fatal_signal:
                     diagnostic_fatal = fatal_signal
             if diagnostic_cancellation is None and diagnostic_fatal is None:
-                finalization_state.diagnostics_completed = True
+                finalization_state.diagnostics_completed = not self._pending_lifecycle_events
         if (
             inner_error is None
             and cleanup_error is None
@@ -5665,36 +5844,19 @@ class _EgressTeardownBinding(WorkspaceBinding):
 
     async def _emit_revoked(self) -> None:
         async with self._revocation_emit_lock:
-            if all(
-                grant.grant_id in self._revocation_emission_attempted_grant_ids
-                for grant in self._grants
-            ):
-                return
-            if self._emitter is None:
-                self._revocation_emission_attempted_grant_ids.update(
-                    grant.grant_id for grant in self._grants
-                )
-                return
             for grant in self._grants:
-                if grant.grant_id in self._revocation_emission_attempted_grant_ids:
-                    continue
-                # Revocation events are best-effort and at-most-once. Mark the
-                # attempt before awaiting the emitter so a committed delivery
-                # with a lost acknowledgement is not duplicated by a retry.
-                self._revocation_emission_attempted_grant_ids.add(grant.grant_id)
-                with contextlib.suppress(Exception):
-                    await self._emitter(
-                        event_with_execution_profile_fingerprint_authority(
-                            Event(
-                                type=EventType.EGRESS_GRANT_REVOKED,
-                                session_id=self._session_id,
-                                agent_name=self._agent_name,
-                                environment_name=self._environment_name,
-                                payload=_grant_payload(grant),
-                            ),
-                            self._execution_profile_fingerprint,
-                        )
-                    )
+                self._queue_lifecycle_event(
+                    (str(EventType.EGRESS_GRANT_REVOKED), grant.grant_id),
+                    Event(
+                        type=EventType.EGRESS_GRANT_REVOKED,
+                        session_id=self._session_id,
+                        agent_name=self._agent_name,
+                        environment_name=self._environment_name,
+                        payload=_grant_payload(grant),
+                    ),
+                    self._execution_profile_fingerprint,
+                )
+            await self._drain_lifecycle_events()
 
 
 def _grant_payload(grant: VirtualCredentialGrant) -> dict[str, Any]:
