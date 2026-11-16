@@ -1,9 +1,10 @@
 """`cayu new --preset b2b` writes what the b2b reference project says it should.
 
 The reference project (`manifest.json`'s `reference`) is a b2b project changed by hand until
-it is what the generator should write. CI can't read it, so `tests/fixtures/b2b_reference/`
-keeps the generated files that work covers, and the manifest says for each whether it is the
-reference's file byte for byte (with the reference file's SHA-256) or why it differs.
+it is what the generator should write. It lives outside this repository, so
+`tests/fixtures/b2b_reference/` keeps the generated files that work covers, and the manifest
+says for each whether it is the reference's file byte for byte (with the reference file's
+SHA-256) or why it differs.
 `scripts/b2b_reference_fixtures.py --reference PATH` checks those claims against a checkout
 of the reference and records new ones.
 

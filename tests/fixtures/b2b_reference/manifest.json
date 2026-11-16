@@ -1,6 +1,6 @@
 {
   "reference": {
-    "repository": "b2b-reference (private)",
+    "repository": "b2b-reference",
     "commit": "2a39006",
     "about": "A `cayu new --preset b2b` project changed by hand until it is what the generator should write; each commit after the first is a change the generator should make."
   },
@@ -49,7 +49,7 @@
     },
     "integrations/http/generated/settings.py": {
       "reference_sha256": "82e9b0796e48772fdf774ddff908670b4ed11735e1fb750c9f0a392eda3b8228",
-      "deviation": "The docstring no longer links a private issue. The group lookup uses next()'s default. A value Cloud refused is reported even when Cloud leaves it out of the values it applies. Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
+      "deviation": "The docstring no longer links an issue. The group lookup uses next()'s default. A value Cloud refused is reported even when Cloud leaves it out of the values it applies. Answers through cayu.server.etag's tagged_json, so unchanged settings cost a 304. Formatted at ruff's default line length, so `ruff format --check` passes in a project without ruff settings."
     },
     "integrations/http/generated/task_runs.py": {
       "reference_sha256": "819e7d268a76ace4bf8792d4c9000c71d8e984fa73499ec6f6370d3eb4c4a127",
@@ -105,7 +105,7 @@
     },
     "web/package.json": {
       "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports."
     },
     "web/scripts/add-licenses.mjs": {
       "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",
@@ -161,7 +161,7 @@
     },
     "web/src/app/area.ts": {
       "reference_sha256": "82d57b46ae281d4f881fb4468f5c21fed1796a1159ee62faf6bd8adeb675012a",
-      "deviation": "The comment names src/agent/index.tsx (the reference said areas.ts) and no longer names a private project."
+      "deviation": "The comment names src/agent/index.tsx (the reference said areas.ts) and no longer names another project."
     },
     "web/src/app/layout.tsx": {
       "reference_sha256": "a8e7cf152a89ce1c57b064b9e073d820ca2e109ff3a63c0e981017094241c8e7",
@@ -181,7 +181,7 @@
     },
     "web/src/blocks/task-runs.tsx": {
       "reference_sha256": "0c5d2e7283eb0a0a2bdb3b4d8ea3db1502a397ca64dc987604a2320d0633f56c",
-      "deviation": "The comment no longer names a private issue. Labels the `partial` run status. Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval. Formatted with Vite+ (`vp fmt`)."
+      "deviation": "The comment no longer names an issue. Labels the `partial` run status. Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/generated/overview/index.tsx": {
       "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
@@ -193,7 +193,7 @@
     },
     "web/src/generated/settings/page.tsx": {
       "reference_sha256": "63ce0183f60e8391f0269fcca2b9e8881a6fb6749ffb94b6a6f9e2c8eb6ed96f",
-      "deviation": "A comment says the kit's settings rows instead of naming the private kit. Formatted with Vite+ (`vp fmt`)."
+      "deviation": "A comment says the kit's settings rows instead of naming the other kit. Formatted with Vite+ (`vp fmt`)."
     },
     "web/src/kit/shadcn/components/alert.tsx": {
       "reference_sha256": "d5f89fec55b16abccbde138f856a3e45b2b656e0c58ef62b2f5833c87cc2720c",
@@ -337,7 +337,7 @@
     },
     "web/src/kit/shadcn/icons.ts": {
       "reference_sha256": "d8651a84439b23fc1e8629d311e4d2dcd79281d23e10342c40b52e30fc5748a6",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone."
     },
     "web/src/kit/shadcn/layouts/app/index.ts": {
       "reference_sha256": "3a5a27b8aece3f4e0738340be006debb1a04df721255360e3e5944e7778f314d",
@@ -413,7 +413,7 @@
     },
     "web/src/kit/shadcn/styles.css": {
       "reference_sha256": "d13e0007d2f3a9fa447a59956f69e5f7e9e9c8351d762aea0ddd2756041c6241",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No @source for the ejected dashboard's parts."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No @source for the ejected dashboard's parts."
     },
     "web/src/kit/shadcn/ui.ts": {
       "reference_sha256": "3b51ff4fbfafd859455dd5f38ab64359add14460b8e664c2f0a790d17d8eb321",
@@ -433,29 +433,29 @@
     },
     "web/tsconfig.json": {
       "reference_sha256": "505560fc20927ebead0630a69eaa83b57c426fc16b78f26c5dc6de6fb5aa37d2",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No path maps for the ejected dashboard's parts."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No path maps for the ejected dashboard's parts."
     },
     "web/vite.config.ts": {
       "reference_sha256": "a9d0a487695315f8e32a880eeafebf299719fe67daeec58dae9759a760787075",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Imports defineConfig from vite-plus and holds the lint and format settings."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Imports defineConfig from vite-plus and holds the lint and format settings."
     }
   },
   "not_generated": {
     "integrations/web.py": "The project no longer serves its pages; `cayu serve` serves web/static at / ([tool.cayu.serve] ui).",
-    "web/.npmrc": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/.npmrc": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/src/api/inbox.ts": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead.",
     "web/src/generated/inbox/index.tsx": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until Cayu ships it as a part). The shell links to /cayu/inbox instead.",
-    "web/src/kit/design/data.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/hooks.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/icons.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/layouts/app/index.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/layouts/app/router.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/lib.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/patterns.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/styles.css": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/kit/design/ui.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/src/vite-env.d.ts": "Declares only the kit switch, which the generator doesn't write. The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
-    "web/tsconfig.design.json": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/data.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/hooks.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/icons.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/layouts/app/index.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/layouts/app/router.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/lib.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/patterns.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/styles.css": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/kit/design/ui.ts": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/src/vite-env.d.ts": "Declares only the kit switch, which the generator doesn't write. The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/tsconfig.design.json": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
     "web/biome.json": "Vite+ lints and formats the app instead of Biome; its settings are in vite.config.ts."
   }
 }

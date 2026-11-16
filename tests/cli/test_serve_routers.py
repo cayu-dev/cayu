@@ -610,7 +610,7 @@ def test_cayu_check_checks_the_web_app(
     assert ui_codes == (set() if code is None else {code})
 
 
-# The pattern real Agents use for their own routes: ask the auth only who is calling
+# A common pattern for an Agent's own routes: ask the auth only who is calling
 # (`authenticate`), then apply the Agent's own role rule.
 _OWN_ROLE_RULE_ROUTES = """import inspect
 

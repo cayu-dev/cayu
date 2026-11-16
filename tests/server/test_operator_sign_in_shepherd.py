@@ -1,10 +1,9 @@
-"""A real Agent's route rules, run against `cayu.server.operator_sign_in`: same people, same access.
+"""An Agent's own route rules, run against `cayu.server.operator_sign_in`: same people, same access.
 
-The shepherd (and another Agent, with the same rule) signs its `/app` routes in with its own copy
-of a third Agent's `integrations/http/auth.py`, kept in `_shepherd_operator_rules.py`. Each route
-below is served twice, once on the shepherd's dependencies and once on the part's, and every
-request must get the same status and, when admitted, the same person. Only the wording of a
-refusal may differ.
+The Agent (the shepherd here) signs its `/app` routes in with its own `integrations/http/auth.py`,
+kept in `_shepherd_operator_rules.py`. Each route below is served twice, once on the shepherd's
+dependencies and once on the part's, and every request must get the same status and, when
+admitted, the same person. Only the wording of a refusal may differ.
 """
 
 from __future__ import annotations

@@ -16,7 +16,7 @@ from cayu.runtime._process_workers import single_process_worker_requirement
 
 _MODULE = "worker_process_check_app"
 
-# As a real Agent's worker passed it: through an options dictionary.
+# As an Agent's worker may pass it: through an options dictionary.
 _RECONCILING_WORKER = """\
 from cayu import AgentSpec, CayuApp
 from cayu.evals import ScriptedModelProvider

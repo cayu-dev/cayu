@@ -1,4 +1,4 @@
-"""Time decoding stored events, trusted and validating, on a production type mix.
+"""Time decoding stored events, trusted and validating, on a realistic type mix.
 
 Run with ``uv run python scripts/benchmark_event_decode.py``. It builds 10,000
 SQLite ``cayu_events`` rows in memory, with event types in the proportions and
@@ -25,24 +25,24 @@ from typing import Any
 from cayu.events import copy_event
 from cayu.storage import _sqlite_records as sqlite_records
 
-#: (event type, share of all events, average payload JSON bytes), from a
-#: production code-review Agent's store of 997,415 events.
+#: (event type, share per 10,000 events, average payload JSON bytes) for a large
+#: code-review store of about a million events.
 TYPE_MIX: tuple[tuple[str, int, int], ...] = (
-    ("tool.call.completed", 123_408, 14_226),
-    ("tool.call.started", 118_410, 578),
-    ("model.thinking.delta", 97_924, 299),
-    ("runner.exec.completed", 94_923, 1_832),
-    ("runner.exec.started", 94_923, 559),
-    ("request.footprint.recorded", 84_331, 3_778),
-    ("model.started", 84_330, 339),
-    ("tool.exposure.recorded", 82_967, 544),
-    ("model.completed", 82_875, 7_694),
-    ("environment.lifecycle.transition", 55_129, 498),
-    ("interaction.started", 7_882, 713),
-    ("session.started", 7_873, 828),
-    ("turn.completed", 7_860, 479),
-    ("interaction.completed", 7_655, 790),
-    ("session.completed", 7_655, 2),
+    ("tool.call.completed", 1_237, 14_226),
+    ("tool.call.started", 1_187, 578),
+    ("model.thinking.delta", 982, 299),
+    ("runner.exec.completed", 952, 1_832),
+    ("runner.exec.started", 952, 559),
+    ("request.footprint.recorded", 845, 3_778),
+    ("model.started", 845, 339),
+    ("tool.exposure.recorded", 832, 544),
+    ("model.completed", 831, 7_694),
+    ("environment.lifecycle.transition", 553, 498),
+    ("interaction.started", 79, 713),
+    ("session.started", 79, 828),
+    ("turn.completed", 79, 479),
+    ("interaction.completed", 77, 790),
+    ("session.completed", 77, 2),
 )
 TARGET_SECONDS = 0.5
 
@@ -78,7 +78,7 @@ def _payload(event_type: str, size: int, rng: random.Random) -> dict[str, Any]:
 
 
 def build_rows(count: int, *, seed: int = 3939) -> list[sqlite3.Row]:
-    """``count`` stored event rows with the production type mix."""
+    """``count`` stored event rows with that type mix."""
 
     rng = random.Random(seed)
     types = [event_type for event_type, _, _ in TYPE_MIX]

@@ -1,7 +1,7 @@
 """Record, or check, how `cayu new --preset b2b` matches the b2b reference project.
 
-The reference project (a private repository) is a `cayu new --preset b2b`
-project changed by hand until it is what the generator should write. CI can't read it, so
+The reference project is a `cayu new --preset b2b` project changed by hand until it is
+what the generator should write. It lives outside this repository, so
 `tests/fixtures/b2b_reference/` keeps what the generator writes for the files that work
 covers, and `manifest.json` says, for each, whether it is byte for byte the reference's file
 (with that file's SHA-256, so anyone with the reference can verify the claim) or why it

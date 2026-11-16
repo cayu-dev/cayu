@@ -10,7 +10,7 @@ from cayu.cli import main
 from cayu.cli._import_helper_calls import MAX_HELPER_DEPTH
 from cayu.cli.scaffold_check import check_declared_scaffold_source
 
-# A real Agent's configuration/settings.py and agents/scout.py.
+# An Agent's configuration and agent module.
 _SCOUT_SETTINGS = '''"""Settings."""
 
 import os
@@ -50,7 +50,7 @@ HUNTER = AgentSpec(
     system_prompt="Hunt.",
 )
 """
-# The same Agent's operations/coding.py.
+# The same Agent's coding operations module.
 _SCOUT_EXCLUSIONS = """_FILE_PATTERNS = (".env", "*.pem", "credentials")
 _PATH_PATTERNS = (
     "data",
