@@ -5,6 +5,7 @@ from contextlib import suppress
 
 import pytest
 
+from cayu._exception_groups import exception_tree_leaves
 from cayu.verification._leased_adapter_runner import (
     LeasedAdapterLease,
     LeasedAdapterRunner,
@@ -217,6 +218,42 @@ def test_worker_settlement_retains_cleanup_failure_and_repeated_caller_cancellat
         assert captured.value.args == ("first request",)
         assert operation.cancelling() == 2
         assert "owned cleanup failed" in str(captured.value.__cause__)
+        await asyncio.sleep(0)
+        assert runner.active_adapter_count == runner.active_heartbeat_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_failure_does_not_surface_its_forwarded_cancellation_as_a_failure() -> None:
+    """Work interrupted mid-operation reports the operation's failure, not our cancel.
+
+    A store operation that fails after the runner cancelled its caller reports both
+    its own failure and that cancellation. The cancellation is the runner's own
+    signal, so the worker's failure must stay an ordinary ``Exception``.
+    """
+
+    async def scenario() -> None:
+        runner = LeasedAdapterRunner[object]()
+        in_operation = asyncio.Event()
+
+        async def adapter() -> None:
+            try:
+                in_operation.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise BaseExceptionGroup(
+                    "Store operation failed after caller cancellation.",
+                    [LookupError("the claim expired"), asyncio.CancelledError("store cancelled")],
+                ) from cancellation
+
+        async def heartbeat(stop: asyncio.Event) -> bool:
+            await in_operation.wait()
+            raise LookupError("the lease was lost")
+
+        with pytest.raises(ExceptionGroup) as captured:
+            await runner.run_to_settlement(adapter, heartbeat)
+        leaves = exception_tree_leaves(captured.value)
+        assert [str(leaf) for leaf in leaves] == ["the lease was lost", "the claim expired"]
         await asyncio.sleep(0)
         assert runner.active_adapter_count == runner.active_heartbeat_count == 0
 

@@ -815,14 +815,32 @@ async def _sleep_then_die_in_the_woken_round(app, tasks, clock, *, attempt_lease
     return task_id
 
 
+def _expire_postgres_lease(store, task_id: str) -> None:
+    """End a PostgreSQL task's lease now by the database clock its leases follow."""
+
+    import psycopg
+
+    with psycopg.connect(store._conninfo, autocommit=True) as connection:
+        connection.execute(
+            "UPDATE cayu_tasks SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' "
+            "WHERE id = %s",
+            (task_id,),
+        )
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_a_wake_attempt_outliving_its_cancelled_task_is_settled_once_its_lease_expires(
     backend, tmp_path, request, monkeypatch
 ) -> None:
-    """The dying worker's own lease is longer than its continuation claim on the task."""
+    """The dying worker's own lease is longer than its continuation claim on the task.
+
+    PostgreSQL leases follow the database's clock, so there the claim is waited out
+    and the attempt's long lease is then expired explicitly: a runner slow enough to
+    spend the gap between two short real leases must not expire the attempt early.
+    """
 
     postgres = backend == "postgres"
-    claim_lease, attempt_lease = (3, 6) if postgres else (1, 600)
+    claim_lease, attempt_lease = (3 if postgres else 1), 600
     monkeypatch.setattr(session_wakes, "_CONTINUATION_LEASE_SECONDS", claim_lease)
 
     async def scenario() -> None:
@@ -846,7 +864,7 @@ def test_a_wake_attempt_outliving_its_cancelled_task_is_settled_once_its_lease_e
             # Once it expires too, a later pass settles it.
             clock.advance(attempt_lease + 1)
             if postgres:
-                await asyncio.sleep(attempt_lease - claim_lease)
+                _expire_postgres_lease(tasks, attempt.id)
             assert not (await _next_worker(app)).attention_required
             assert (await tasks.load_task(attempt.id)).status is TaskStatus.CANCELLED
             assert len(provider.requests) == 2 and charge.calls == 1

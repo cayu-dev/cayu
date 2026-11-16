@@ -792,6 +792,7 @@ def test_event_inspection_precedes_execution_entry(
         task = await app.create_task(TaskCreate(type="job"))
         original = store.task_event_remaining_seconds
         inspected = asyncio.Event()
+        observed = asyncio.Event()
         ran = []
 
         async def inspect(key):
@@ -800,7 +801,8 @@ def test_event_inspection_precedes_execution_entry(
                 raise RuntimeError("inspection unavailable")
             if inspection == "cancelled":
                 await asyncio.Event().wait()
-            await asyncio.sleep(0.8)
+            # The slow read lasts until the claim it holds has been observed.
+            await observed.wait()
             return await original(key)
 
         async def handler(runtime, claimed, worker_id):
@@ -808,15 +810,21 @@ def test_event_inspection_precedes_execution_entry(
             await complete_managed_task(store, claimed, worker_id, {"done": True})
 
         monkeypatch.setattr(store, "task_event_remaining_seconds", inspect)
+        # A failed or cancelled read leaves a claim that expires for the replacement
+        # below. The slow read must not outlast its claim: on PostgreSQL leases
+        # follow the database's clock, and a loaded runner can spend a short one
+        # before the worker renews it for dispatch.
+        lease_seconds = 30 if inspection == "slow" else 1
         try:
             worker = asyncio.create_task(
                 run_task_worker(
-                    app, store, handler, worker_id="owner", max_tasks=1, lease_seconds=1
+                    app, store, handler, worker_id="owner", max_tasks=1, lease_seconds=lease_seconds
                 )
             )
             await asyncio.wait_for(inspected.wait(), 5)
             # Reads have not published dispatch evidence, even while the claim is held.
             assert (await store.load_task(task.id)).started_at is None
+            observed.set()
             if inspection == "cancelled":
                 worker.cancel()
                 with pytest.raises(asyncio.CancelledError):

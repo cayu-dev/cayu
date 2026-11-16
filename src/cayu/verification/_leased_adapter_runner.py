@@ -14,7 +14,12 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar, cast
 
-from cayu._exception_groups import exception_cause, iter_exception_tree, set_exception_cause
+from cayu._exception_groups import (
+    exception_cause,
+    exception_group_children,
+    iter_exception_tree,
+    set_exception_cause,
+)
 from cayu._task_wait import (
     CapturedAwaitableOutcome,
     ShieldedTaskOutcome,
@@ -433,8 +438,8 @@ class LeasedAdapterRunner(Generic[_DrainT]):
             child_error = settled.error or (
                 None if settled.result is None else settled.result.error
             )
-            if forwarded and isinstance(child_error, asyncio.CancelledError):
-                child_error = exception_cause(child_error)
+            if forwarded:
+                child_error = _without_forwarded_cancellation(child_error)
             failure = merge_owned_failures(failure, child_error)
             failure = merge_owned_failures(failure, settled.cancellation)
         finally:
@@ -452,6 +457,62 @@ class LeasedAdapterRunner(Generic[_DrainT]):
         if failure is not None:
             raise failure from exception_cause(failure)
         return cast("_T", result)
+
+
+_BASE_EXCEPTION_GROUP_MESSAGE_DESCRIPTOR = BaseExceptionGroup.__dict__["message"]
+
+
+def _without_forwarded_cancellation(error: BaseException | None) -> BaseException | None:
+    """The work's failure without the cancellation this runner forwarded to it.
+
+    The forwarded cancellation is the runner's own signal, not a failure of the
+    work. It can come back bare, or as a leaf of the failure group of an
+    operation it interrupted, such as a store call that failed after it was
+    cancelled. Either way only the cancellation's retained cause is kept, so a
+    lost lease never surfaces as a cancellation nobody requested.
+    """
+
+    if error is None:
+        return None
+    # Rebuild groups bottom-up without recursion; untouched groups keep their identity.
+    pending: list[tuple[BaseException, bool]] = [(error, False)]
+    stripped: dict[int, BaseException | None] = {}
+    while pending:
+        node, expanded = pending.pop()
+        if id(node) in stripped:
+            continue
+        if isinstance(node, asyncio.CancelledError):
+            stripped[id(node)] = exception_cause(node)
+            continue
+        if not isinstance(node, BaseExceptionGroup):
+            stripped[id(node)] = node
+            continue
+        children = exception_group_children(node)
+        if children is None:
+            stripped[id(node)] = node
+            continue
+        if not expanded:
+            pending.append((node, True))
+            pending.extend((child, False) for child in children if id(child) not in stripped)
+            continue
+        kept = [stripped.get(id(child), child) for child in children]
+        if all(new is old for new, old in zip(kept, children, strict=True)):
+            stripped[id(node)] = node
+            continue
+        remaining = [child for child in kept if child is not None]
+        if not remaining:
+            stripped[id(node)] = None
+            continue
+        try:
+            message = _BASE_EXCEPTION_GROUP_MESSAGE_DESCRIPTOR.__get__(node, BaseExceptionGroup)
+        except BaseException:
+            message = None
+        rebuilt = BaseExceptionGroup(
+            message if type(message) is str else "Verified task owned failures", remaining
+        )
+        set_exception_cause(rebuilt, exception_cause(node))
+        stripped[id(node)] = rebuilt
+    return stripped[id(error)]
 
 
 def merge_owned_failures(

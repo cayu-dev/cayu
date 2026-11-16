@@ -11,6 +11,28 @@ from tests.core._clarification_recovery_flow import cleanup_in_fresh_process
 from cayu.collaboration.base import CollaborationInitialization
 
 
+async def _create_schema(dsn: str) -> None:
+    """Migrate the module's fresh database before the journey under test starts.
+
+    Otherwise the child's first collaboration call creates the whole schema inside
+    its bounded acknowledgement wait, and a slow runner reports that wait as
+    unavailable before the journey reaches the process-loss barrier.
+    """
+
+    from cayu.storage.collaboration_postgres import PostgresCollaborationStore
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    for store in (
+        PostgresCollaborationStore(dsn, schema_mode=SchemaMode.CREATE),
+        PostgresSessionStore(dsn, schema_mode=SchemaMode.CREATE),
+    ):
+        try:
+            await store.ensure_schema()
+        finally:
+            await store.close()
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 @pytest.mark.parametrize("phase", ["released", "dispatched"])
@@ -22,6 +44,7 @@ async def test_public_service_process_loss_reconciles_without_redispatch(
     descriptor = {"backend": backend, "directory": str(tmp_path), "phase": phase}
     if backend == "postgres":
         descriptor["dsn"] = request.getfixturevalue("postgres_dsn")
+        await _create_schema(descriptor["dsn"])
     child = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
