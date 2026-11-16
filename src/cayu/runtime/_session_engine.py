@@ -6441,16 +6441,22 @@ class SessionEngine(BeforeStopPolicies):
             # Successful structured/final-tool outcomes are whole-turn boundaries,
             # just like before-stop COMPLETE, for an external or a participant wait
             # alike. Park before terminalizing the writer.
+            nonlocal decided_outcome
             assert execution_to_wait is not None
             await execution_to_wait.park(invocation_context)
-            async for event in self._session_outcomes.publish_stop_interruption(
+            decided_outcome = self._session_outcomes.publish_stop_interruption(
                 outcome_context(),
                 BeforeStopDecision(
                     action=BeforeStopAction.INTERRUPT,
                     reason="Explicit continuation wait reached a whole-turn boundary.",
                 ),
-            ):
-                yield event
+            )
+            try:
+                async for event in decided_outcome:
+                    yield event
+                decided_outcome_published()
+            finally:
+                await close_undecided_outcome(decided_outcome)
 
         async def finalize_abandoned_run(deadline_expired: bool, **evidence: Any) -> Event | None:
             if deadline_expired and invocation_context.work_attempt is not None:
