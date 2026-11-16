@@ -42,7 +42,9 @@ class RunnerAdapterIdentity:
     trusted_error_types: frozenset[str] = frozenset()
 
 
-BUILTIN_RUNNER_ADAPTER_NAMES = frozenset({"docker", "e2b", "lambda-microvm", "local"})
+BUILTIN_RUNNER_ADAPTER_NAMES = frozenset(
+    {"docker", "e2b", "kubernetes-sandbox", "lambda-microvm", "local"}
+)
 
 _registration_lock = threading.Lock()
 # Copy-on-write snapshots: readers never take the lock and always observe one

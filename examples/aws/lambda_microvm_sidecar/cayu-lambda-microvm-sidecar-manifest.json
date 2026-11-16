@@ -1,7 +1,7 @@
 {
   "artifact_version": 1,
   "cayu_version": "0.20.0",
-  "content_digest": "sha256:a7db4226cef75d8e56ece3b010204ae230c7134eba805e76eeabcbb3160d574e",
+  "content_digest": "sha256:cef3616c58d928eaf86b4fb6b044d803356791d76179c9e5a5e1f54cecef9438",
   "files": [
     {
       "path": "Dockerfile",
@@ -10,8 +10,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "sha256:eb9834f0d8f4116f57b4f6ce759afdbde4149d8b6dd79d587e80cbed49e21ee1",
-      "size": 32558
+      "sha256": "sha256:e160825f125ca3e71752bfe12aa274a24d9fc9d2e5755b2845bae8e23d3f59ba",
+      "size": 32941
     },
     {
       "path": "__init__.py",

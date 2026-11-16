@@ -16007,6 +16007,58 @@ bodies are streamed with a ceiling of twice the maximum base64 channel size
 plus 64 KiB for metadata, before JSON parsing. Compressed response bodies are
 rejected so decompression cannot bypass the bound.
 
+`KubernetesSandboxRunner` drives the same sidecar image running in Kubernetes mode
+(`CAYU_SIDECAR_MODE=kubernetes`) inside a sandbox pod, such as a gVisor Agent Sandbox.
+The pod runs the image as two non-root containers that share no volume: a supervisor container
+(the sidecar the runner talks to, which holds the token, TLS key, owner fence, command records and
+output limits) and an agent container whose PID 1 is a small command executor running as the
+agent's UID. The supervisor drives the executor over an abstract Unix socket in the pod's shared
+network namespace, and the executor serves only the supervisor's UID by its peer credentials
+(`SO_PEERCRED`). The executor runs every command in user, mount and PID namespaces of its own
+making, so agent processes can neither signal nor inspect it, and renews them, with a new boot ID,
+if their init dies or a new supervisor session begins. The sidecar's README documents the two
+containers, the executor's protocol and the credential file rules: the token and key may be owned by root or by the supervisor's UID and
+read by its group, but not written by the group or reached by others.
+It shares the Lambda MicroVM runner's command protocol: owner claims and `owner_epoch`,
+`carry_commands`, `detach_commands`, `resume_exec`, command cleanup policies, port forwards,
+output and stdin ceilings, and the retry and throttle bounds above. A runner constructed with
+`owner_epoch` and `carry_commands` claims ownership in its first `resume_exec` of a command it
+asked to carry, which carries the commands over. The control plane that owns
+the pod creates, suspends, resumes and deletes it; the runner has no lifecycle methods, and
+`close()` only stops serving commands and closes the transport it owns. `endpoint` is an explicit
+`https://` URL, which a Kubernetes-mode sidecar always serves; `http://` is refused, so the token
+never crosses the network in clear. `verify` names a CA bundle path or an `ssl.SSLContext` for the
+built-in transport; a context made with `ssl.create_default_context(cadata=...)` from the sandbox's
+own self-signed certificate, issued for the host name in `endpoint`, trusts that certificate alone
+and refuses any other. Every request carries
+`Authorization: Bearer <token>`; `token` is a string or a callable (sync or async) that the runner
+calls again once whenever the sidecar answers a request HTTP 401, a running command's state
+polls included, so a token rotated mid-command is picked up without failing it. Before its
+first claim the runner checks `/health` and refuses a sidecar that does not advertise
+`bearer_auth` and `boot_id` (a Lambda-mode sidecar authenticates nothing itself) with
+`SidecarProtocolError`, before any command is sent. `boot_id` holds the boot ID that check last
+saw and `observe_boot_id()` reads it again. The sidecar derives it from the supervisor's and the
+executor's boot IDs, so it changes when either container restarts or the agent's processes are
+lost; a new value means every command, forward and owner claim is gone (on an executor restart
+the supervisor drops them itself), so the next fenced call raises `SidecarOwnershipSuperseded` and
+the host attaches a new runner. While the executor is unreachable, health and command starts
+answer HTTP 503. The runner's errors are the neutral sidecar classes that the
+Lambda MicroVM errors also derive from (`SidecarRunnerError`, `SidecarProtocolError`,
+`SidecarEndpointUnauthorized`, `SidecarEndpointTransientError`, `SidecarOwnershipSuperseded`,
+`SidecarStaleOwnerEpoch`). `system_execution_mode` is `"shared"`: the pod has no separate trusted
+lane, so `exec_system()` runs as the agent. An interactive process runs in a PID namespace of its
+own when the sandbox allows nested namespaces, and `close()` then confirms that its whole tree
+exited; otherwise it runs in a `process_group` tree: `close()` stops the command and signals its
+process group, and a descendant that left the group keeps running until the agent namespace
+ends. Executable
+admission binds its evidence to the sandbox's namespace and name, the endpoint, the working
+root, the overlay's variable names, the protocol version, the boot ID from authenticated health,
+and the output of the optional `identity_observer` (an async callable returning a small string
+mapping, for example the pod UID and image digest read from the Kubernetes API); any change between
+the reads before and after the probes fails closed. `execution_profile_identity` is
+`cayu.kubernetes_sandbox_runner` version `1`, versioned by the working root, the overlay's
+variable names and the protocol version.
+
 The installed distribution provides the matching guest build context through
 `cayu lambda-microvm sidecar export DESTINATION`. Export is local and credential-free; it does
 not require `cayu[aws]` or perform AWS discovery. Its versioned manifest binds an exact,

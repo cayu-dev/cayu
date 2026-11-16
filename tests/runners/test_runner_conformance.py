@@ -19,7 +19,10 @@ from tests.runners.conformance import (
     RunnerHarness,
 )
 from tests.runners.lambda_microvm_harness import (
+    DEFAULT_SIDECAR_BOOT_ID,
+    KUBERNETES_SANDBOX_TOKEN,
     ConformanceLambdaClient,
+    KubernetesSupervisorTransport,
     OwnerFencedTransport,
     SupervisorTransport,
     guest_lifecycle_hook,
@@ -28,6 +31,8 @@ from tests.runners.lambda_microvm_harness import (
 import cayu.runners
 import cayu.runners as runners_module
 from cayu.runners._cleanup import RunnerCleanupPolicy
+from cayu.runners._sidecar_runner import SidecarLimits
+from cayu.runners._sidecar_transport import SidecarEndpointTransientError, SidecarProtocolError
 from cayu.runners._subprocess import SubprocessCommand, run_subprocess
 from cayu.runners.aws_lambda_microvm import (
     LAMBDA_MICROVM_PROTOCOL_VERSION,
@@ -44,6 +49,7 @@ from cayu.runners.base import (
 )
 from cayu.runners.docker import DockerRunner
 from cayu.runners.e2b import E2BRunner
+from cayu.runners.kubernetes_sandbox import KubernetesSandboxRunner
 from cayu.runners.launched import LaunchedRunner
 from cayu.runners.local import LocalRunner
 
@@ -481,20 +487,10 @@ class _DelayedSupervisorTransport(SupervisorTransport):
         return result
 
 
-async def _probe_lambda_microvm_ambiguous_start(
-    root: Path,
-    _monkeypatch: pytest.MonkeyPatch,
+async def _assert_ambiguous_start_is_fenced(
+    root: Path, runner: Runner, transport: _DelayedSupervisorTransport
 ) -> None:
-    transport = _DelayedSupervisorTransport(root)
-    runner = LambdaMicroVMRunner(
-        ConformanceLambdaClient(),
-        microvm_id="mvm-conformance-ambiguous",
-        endpoint="conformance.lambda-microvm.invalid",
-        default_cwd=str(root),
-        close_action="none",
-        endpoint_transport=transport,
-        poll_interval_s=0,
-    )
+    """A start cancelled before its answer never runs late, and the runner stays usable."""
     marker = root / "late.txt"
     task = asyncio.create_task(
         runner.exec(
@@ -516,6 +512,23 @@ async def _probe_lambda_microvm_ambiguous_start(
     result = await runner.exec(ExecCommand.process(sys.executable, "-c", "print('safe')"))
     assert result.stdout == "safe\n"
     await runner.close()
+
+
+async def _probe_lambda_microvm_ambiguous_start(
+    root: Path,
+    _monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _DelayedSupervisorTransport(root)
+    runner = LambdaMicroVMRunner(
+        ConformanceLambdaClient(),
+        microvm_id="mvm-conformance-ambiguous",
+        endpoint="conformance.lambda-microvm.invalid",
+        default_cwd=str(root),
+        close_action="none",
+        endpoint_transport=transport,
+        poll_interval_s=0,
+    )
+    await _assert_ambiguous_start_is_fenced(root, runner, transport)
 
 
 class _ProtocolTransport(OwnerFencedTransport):
@@ -699,6 +712,151 @@ async def _probe_lambda_microvm_lifecycle(
     assert client.terminate_calls == 1
 
 
+def _kubernetes_sandbox_runner(
+    root: Path, transport: Any, **options: Any
+) -> KubernetesSandboxRunner:
+    return KubernetesSandboxRunner(
+        endpoint="https://sandbox.conformance.invalid:8080",
+        token=KUBERNETES_SANDBOX_TOKEN,
+        sandbox=("conformance", "sandbox"),
+        endpoint_transport=transport,
+        default_cwd=str(root),
+        **options,
+    )
+
+
+async def _kubernetes_sandbox_factory(
+    root: Path,
+    _monkeypatch: pytest.MonkeyPatch,
+) -> RunnerHarness:
+    return await _kubernetes_sandbox_cleanup_factory(root, _monkeypatch, "command")
+
+
+async def _kubernetes_sandbox_cleanup_factory(
+    root: Path,
+    _monkeypatch: pytest.MonkeyPatch,
+    cleanup_policy: RunnerCleanupPolicy,
+) -> RunnerHarness:
+    return RunnerHarness(
+        _kubernetes_sandbox_runner(
+            root,
+            KubernetesSupervisorTransport(root),
+            poll_interval_s=0,
+            cancellation_cleanup=cleanup_policy,
+            timeout_cleanup=cleanup_policy,
+        ),
+        root,
+    )
+
+
+class _DelayedKubernetesSupervisorTransport(
+    KubernetesSupervisorTransport, _DelayedSupervisorTransport
+):
+    pass
+
+
+async def _probe_kubernetes_sandbox_ambiguous_start(
+    root: Path,
+    _monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _DelayedKubernetesSupervisorTransport(root)
+    runner = _kubernetes_sandbox_runner(root, transport, poll_interval_s=0)
+    await _assert_ambiguous_start_is_fenced(root, runner, transport)
+
+
+class _KubernetesProtocolTransport(_ProtocolTransport):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.health_response.setdefault("capabilities", ["bearer_auth", "boot_id"])
+        self.health_response.setdefault("boot_id", DEFAULT_SIDECAR_BOOT_ID)
+        self.started = 0
+
+    async def start_command(self, *, command_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.started += 1
+        return await super().start_command(command_id=command_id, **kwargs)
+
+
+async def _probe_kubernetes_sandbox_protocol(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, bool]:
+    observed: dict[str, bool] = {}
+    mismatch = _KubernetesProtocolTransport(health={"status": "ok", "protocol_version": "1"})
+    runner = _kubernetes_sandbox_runner(root, mismatch, poll_interval_s=0)
+    try:
+        await runner.exec(ExecCommand.process(sys.executable, "-c", "print('probe')"))
+    except SidecarProtocolError as exc:
+        observed["protocol_mismatch"] = "protocol version" in str(exc)
+    else:
+        observed["protocol_mismatch"] = False
+    # The control plane owns the pod: refusing its sidecar must start no command.
+    observed["protocol_mismatch_cleanup"] = mismatch.started == 0
+    await runner.close()
+
+    for key, response, message in (
+        ("unknown_command", {"state": "not_found"}, "unsupported state"),
+        ("malformed_state", {"state": 3}, "state must be a string"),
+        (
+            "incomplete_terminal_snapshot",
+            {"state": "completed"},
+            "exit_code must be an integer",
+        ),
+    ):
+        runner = _kubernetes_sandbox_runner(
+            root, _KubernetesProtocolTransport(command=response), poll_interval_s=0
+        )
+        try:
+            await runner.exec(ExecCommand.process(sys.executable, "-c", "print('probe')"))
+        except SidecarProtocolError as exc:
+            observed[key] = message in str(exc)
+        else:
+            observed[key] = False
+        await runner.close()
+    for scenario in ("transient_poll", "oversized_output"):
+
+        class BoundaryTransport(_KubernetesProtocolTransport):
+            polls = 0
+            case = scenario
+
+            async def get_command(self, *, command_id: str, **kwargs: Any) -> dict[str, Any]:
+                self.polls += 1
+                if self.case == "transient_poll" and self.polls < 3:
+                    raise SidecarEndpointTransientError("retryable read")
+                return {
+                    "command_id": command_id,
+                    "state": "completed",
+                    "exit_code": 0,
+                    "stdout_base64": "" if self.case == "transient_poll" else "A" * 16,
+                    "timed_out": False,
+                    "cancelled": False,
+                    "stderr_base64": "",
+                    "stdout_bytes": 0 if self.case == "transient_poll" else 12,
+                    "stderr_bytes": 0,
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+
+        transport = BoundaryTransport()
+        runner = _kubernetes_sandbox_runner(root, transport, request_timeout_s=1)
+        try:
+            if scenario == "transient_poll":
+                result = await runner.exec(ExecCommand.process("true"))
+                observed[scenario] = result.exit_code == 0 and transport.polls == 3
+            else:
+                with monkeypatch.context() as scoped:
+                    scoped.setattr(
+                        runner,
+                        "_sidecar_limits",
+                        lambda: SidecarLimits(max_encoded_output_bytes=12),
+                    )
+                    with pytest.raises(SidecarProtocolError, match="byte ceiling"):
+                        await runner.exec(ExecCommand.process("true"))
+                observed[scenario] = transport.polls == 1
+        finally:
+            await runner.close()
+    return observed
+
+
 LOCAL = RunnerConformanceRegistration(
     name="local",
     runner_type=LocalRunner,
@@ -799,7 +957,29 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
     suspend_resume_probe=_probe_lambda_microvm_lifecycle,
 )
 
-REGISTRATIONS = (LOCAL, LAUNCHED_LOCAL, DOCKER, E2B, LAMBDA_MICROVM)
+KUBERNETES_SANDBOX = RunnerConformanceRegistration(
+    name="kubernetes-sandbox",
+    runner_type=KubernetesSandboxRunner,
+    factory=_kubernetes_sandbox_factory,
+    system_execution_mode="shared",
+    capabilities=RunnerCapabilities(
+        command_cleanup=CapabilityClaim.supported(),
+        sandbox_cleanup=CapabilityClaim.not_applicable(
+            "The control plane, not the runner, owns the sandbox pod's lifecycle."
+        ),
+        no_cleanup=CapabilityClaim.supported(),
+        ambiguous_start=CapabilityClaim.supported(),
+        remote_protocol=CapabilityClaim.supported(),
+        suspend_resume=CapabilityClaim.not_applicable(
+            "The control plane suspends and resumes the sandbox pod, not the runner."
+        ),
+    ),
+    cleanup_factory=_kubernetes_sandbox_cleanup_factory,
+    ambiguous_start_probe=_probe_kubernetes_sandbox_ambiguous_start,
+    remote_protocol_probe=_probe_kubernetes_sandbox_protocol,
+)
+
+REGISTRATIONS = (LOCAL, LAUNCHED_LOCAL, DOCKER, E2B, LAMBDA_MICROVM, KUBERNETES_SANDBOX)
 OVERLAY_REGISTRATIONS = (DOCKER, E2B, LAMBDA_MICROVM)
 CLEANUP_CASES = tuple(
     (registration, policy)
@@ -847,6 +1027,7 @@ def test_runner_contract_declares_shared_or_separate_system_execution() -> None:
     assert Runner.system_execution_mode == "shared"
     assert LocalRunner.system_execution_mode == "shared"
     assert LambdaMicroVMRunner.system_execution_mode == "separate"
+    assert KubernetesSandboxRunner.system_execution_mode == "shared"
 
 
 @pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)

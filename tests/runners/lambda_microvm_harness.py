@@ -14,6 +14,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from examples.aws.lambda_microvm_sidecar.remote_processes import RemoteProcesses
 from examples.aws.lambda_microvm_sidecar.supervisor import (
     CommandSupervisor,
     OwnerFence,
@@ -21,8 +22,13 @@ from examples.aws.lambda_microvm_sidecar.supervisor import (
     OwnerSupersededError,
     StaleOwnerEpochError,
 )
+from tests.runners.sidecar_executor_harness import InProcessExecutor
 
-from cayu.runners import LambdaMicroVMOwnershipSuperseded, LambdaMicroVMStaleOwnerEpoch
+from cayu.runners import (
+    LambdaMicroVMOwnershipSuperseded,
+    LambdaMicroVMStaleOwnerEpoch,
+    SidecarEndpointUnauthorized,
+)
 from cayu.runners.aws_lambda_microvm import (
     LAMBDA_MICROVM_PROTOCOL_VERSION,
     LambdaMicroVMLifecycleInProgress,
@@ -243,6 +249,10 @@ class SupervisorTransport(OwnerFencedTransport):
         self.supervisor.cancel_all(reason="owner_superseded", before_generation=generation)
 
 
+KUBERNETES_SANDBOX_TOKEN = "k" * 40
+DEFAULT_SIDECAR_BOOT_ID = "1c2d3e4f-5061-4728-9394-a5b6c7d8e9f0"
+
+
 def write_sidecar_tls(directory: Path, host: str = "localhost") -> tuple[Path, Path]:
     """Write a self-signed certificate for ``host`` and its key, as a sandbox's own, and return
     their paths; the key is readable by its owner alone, as the sidecar requires."""
@@ -280,6 +290,74 @@ def write_sidecar_tls(directory: Path, host: str = "localhost") -> tuple[Path, P
     )
     key_path.chmod(0o600)
     return certificate_path, key_path
+
+
+class KubernetesSupervisorTransport(SupervisorTransport):
+    """A sidecar in Kubernetes mode: every call needs the host's bearer token.
+
+    Its supervisor runs commands through an ``InProcessExecutor``, as the real
+    sidecar does through the agent container's executor.
+
+    Health advertises ``bearer_auth`` and ``boot_id`` and reports ``boot_id``,
+    as the real sidecar does in that mode; a call with any other token is
+    rejected as HTTP 401 would be.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        token: str = KUBERNETES_SANDBOX_TOKEN,
+        sidecar_boot_id: str = DEFAULT_SIDECAR_BOOT_ID,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(root, **kwargs)
+        # Commands run through an executor, as in the sandbox's agent container.
+        self.executor = InProcessExecutor(root)
+        self.supervisor = CommandSupervisor(
+            root=root, processes=RemoteProcesses(self.executor.client())
+        )
+        self.token = token
+        self.sidecar_boot_id = sidecar_boot_id
+        self.tokens_seen: list[str] = []
+
+    def _authenticate(self, token: str) -> None:
+        self.tokens_seen.append(token)
+        if token != self.token:
+            raise SidecarEndpointUnauthorized("Kubernetes sandbox endpoint token was rejected.")
+
+    async def health(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return {
+            "status": "ok",
+            "protocol_version": LAMBDA_MICROVM_PROTOCOL_VERSION,
+            "capabilities": ["owner_epoch", "bearer_auth", "boot_id"],
+            "boot_id": self.sidecar_boot_id,
+        }
+
+    async def start_command(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return await super().start_command(**kwargs)
+
+    async def get_command(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return await super().get_command(**kwargs)
+
+    async def cancel_command(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return await super().cancel_command(**kwargs)
+
+    async def release_command(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return await super().release_command(**kwargs)
+
+    async def claim_owner(self, *, token: str, **kwargs: Any) -> dict[str, Any]:
+        self._authenticate(token)
+        return await super().claim_owner(**kwargs)
+
+    async def check_owner(self, *, token: str, **kwargs: Any) -> dict[str, bool]:
+        self._authenticate(token)
+        return await super().check_owner(**kwargs)
 
 
 def _terminal_result(command_id: str, *, exit_code: int, stdout: str = "") -> dict[str, Any]:

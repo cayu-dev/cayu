@@ -66,7 +66,7 @@ class _KillRaises:
 
 def test_builtin_identities_are_seeded_without_extra_error_types() -> None:
     identities = extension_runners.registered_runner_adapter_identities()
-    assert set(identities) == {"docker", "e2b", "lambda-microvm", "local"}
+    assert set(identities) == {"docker", "e2b", "kubernetes-sandbox", "lambda-microvm", "local"}
     for name, identity in identities.items():
         assert identity == extension_runners.RunnerAdapterIdentity(name=name)
     with pytest.raises(TypeError):
@@ -220,7 +220,7 @@ def test_trusted_error_type_is_retained_only_after_registration() -> None:
 
 
 def test_builtin_diagnostics_are_unchanged() -> None:
-    for adapter in ("docker", "e2b", "lambda-microvm", "local"):
+    for adapter in ("docker", "e2b", "kubernetes-sandbox", "lambda-microvm", "local"):
         assert runner_execution_error(TimeoutError(), adapter=adapter).diagnostic == {
             "type": "cayu.runner_execution_error.v1",
             "adapter": adapter,

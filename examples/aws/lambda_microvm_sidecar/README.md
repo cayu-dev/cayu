@@ -329,6 +329,11 @@ Agent Sandbox. Set `CAYU_SIDECAR_MODE=kubernetes` on the supervisor container. T
 `lambda`; any other value stops the sidecar at startup. The protocol version stays `8`, and Lambda
 mode is unchanged.
 
+On the host, `cayu.runners.KubernetesSandboxRunner` drives a sidecar in this mode: it sends the
+bearer token, refuses a sidecar whose health lacks `bearer_auth` and `boot_id`, and exposes the
+boot ID it last saw. See the `KubernetesSandboxRunner` section of
+[Runtime Contracts](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md).
+
 ### Two containers
 
 A sandbox policy that refuses root containers and added capabilities rules out the Lambda shape,
@@ -458,9 +463,10 @@ load as a pair, or when the key file fails the token file's checks above, and it
 to any request that did not arrive over TLS. Mount the key from the same kind of Secret volume as
 the token. A self-signed certificate issued per sandbox for the host name the host connects to
 (for example its Service's `<name>.<namespace>.svc.cluster.local`) lets the host pin exactly that
-certificate, for example with `ssl.create_default_context(cadata=...)`. Uvicorn loads the
-certificate once at startup, so a pod restored from a snapshot keeps serving the one it started
-with; replace the sandbox, rather than its Secret, to change it.
+certificate, as `KubernetesSandboxRunner`'s `verify` does with
+`ssl.create_default_context(cadata=...)`. Uvicorn loads the certificate once at startup, so a pod
+restored from a snapshot keeps serving the one it started with; replace the sandbox, rather than
+its Secret, to change it.
 
 ### Routes and network
 

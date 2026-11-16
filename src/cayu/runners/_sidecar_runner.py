@@ -322,12 +322,19 @@ class SidecarProtocolRunner(Runner):
         it stops the command; at its end the result is read and released.
         ``timeout_s`` bounds this wait (the command's own timeout, which the
         sidecar enforces, still applies); ``None`` waits for the command's end.
+        A directly constructed successor that asked to carry the command claims
+        ownership first, which carries it over.
         """
 
-        if command_id not in self._carried_commands:
+        claim_first = not self._owner_claimed and command_id in self._carry_requested
+        if command_id not in self._carried_commands and not claim_first:
             raise ValueError("resume_exec takes only a command this runner carried over.")
         timeout = validate_timeout(timeout_s)
         self._ensure_exec_open()
+        if claim_first:
+            await self._claim_to_resume(command_id)
+            if command_id not in self._carried_commands:
+                raise ValueError("resume_exec takes only a command this runner carried over.")
         return await self._await_command(
             command_id,
             payload=None,
@@ -335,6 +342,32 @@ class SidecarProtocolRunner(Runner):
             output_redactor=None,
             output_limit=self._sidecar_limits().max_output_bytes,
         )
+
+    async def _claim_to_resume(self, command_id: str) -> None:
+        """Claim ownership, which carries ``command_id`` over, before resuming it.
+
+        A cancellation waits for the claim's outcome: once the claim has carried
+        the command, it is stopped as a cancelled wait for it would stop it.
+        """
+
+        outcome = await await_shielded_task_outcome(asyncio.ensure_future(self._claim_owner()))
+        if isinstance(outcome.error, SidecarOwnershipSuperseded):
+            self._mark_superseded()
+        if outcome.cancellation is not None and command_id in self._carried_commands:
+            cleanup = await self._cleanup_exec_command(
+                handle=_SidecarCommandHandle(self, command_id),
+                policy=self.cancellation_cleanup,
+                start_acknowledged=True,
+                cancellation=outcome.cancellation,
+            )
+            attach_cancellation_artifacts(outcome.cancellation, [cleanup.artifact])
+        restore_task_cancellation_requests(
+            outcome.cancellation_requests_consumed, cancellation=outcome.cancellation
+        )
+        if outcome.cancellation is not None:
+            raise outcome.cancellation
+        if outcome.error is not None:
+            raise outcome.error
 
     async def exec_redacted(
         self,
@@ -965,8 +998,7 @@ class SidecarProtocolRunner(Runner):
         self, method_name: str, *, deadline: float | None = None, **kwargs: Any
     ) -> Mapping[str, Any]:
         method = getattr(self._endpoint_transport, method_name)
-        attempts = 1 if method_name == "get_command" else 2
-        attempt = 0
+        rejected = False
         refresh_token = False
         throttled = 0
         loop = asyncio.get_running_loop()
@@ -990,11 +1022,12 @@ class SidecarProtocolRunner(Runner):
                     **kwargs,
                 )
             except SidecarEndpointUnauthorized:
-                attempt += 1
-                if attempt < attempts:
-                    refresh_token = True
-                    continue
-                raise
+                # One fresh token per call, so a token rotated mid-command doesn't fail it.
+                if rejected:
+                    raise
+                rejected = True
+                refresh_token = True
+                continue
             except SidecarEndpointThrottled as exc:
                 # Refused before the guest acted, so sending it again can't repeat any effect.
                 throttled += 1

@@ -20,6 +20,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "DEFAULT_E2B_PROTECTED_FILE_MAX_BYTES",
     ),
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES": ("cayu.runners.base", "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES"),
+    "DEFAULT_KUBERNETES_SANDBOX_CWD": (
+        "cayu.runners.kubernetes_sandbox",
+        "DEFAULT_KUBERNETES_SANDBOX_CWD",
+    ),
     "DEFAULT_LAMBDA_MICROVM_CWD": ("cayu.runners.aws_lambda_microvm", "DEFAULT_LAMBDA_MICROVM_CWD"),
     "DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY": (
         "cayu.runners._cleanup",
@@ -46,10 +50,15 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "E2B_SANDBOX_ID_MAX_BYTES": ("cayu.runners.e2b", "E2B_SANDBOX_ID_MAX_BYTES"),
     "ExecCommand": ("cayu.runners.base", "ExecCommand"),
     "ExecResult": ("cayu.runners.base", "ExecResult"),
+    "HttpxKubernetesSandboxEndpointTransport": (
+        "cayu.runners.kubernetes_sandbox",
+        "HttpxKubernetesSandboxEndpointTransport",
+    ),
     "HttpxLambdaMicroVMEndpointTransport": (
         "cayu.runners.aws_lambda_microvm",
         "HttpxLambdaMicroVMEndpointTransport",
     ),
+    "KubernetesSandboxRunner": ("cayu.runners.kubernetes_sandbox", "KubernetesSandboxRunner"),
     "LambdaMicroVMAllocationTerminated": (
         "cayu.runners.aws_lambda_microvm",
         "LambdaMicroVMAllocationTerminated",
@@ -126,6 +135,31 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "RunnerUnavailableError": ("cayu.runners.base", "RunnerUnavailableError"),
     "RunnerWorkloadAuthority": ("cayu.runners.base", "RunnerWorkloadAuthority"),
     "RunnerWorkspaceCapability": ("cayu.runners.base", "RunnerWorkspaceCapability"),
+    "SidecarEndpointThrottled": ("cayu.runners._sidecar_transport", "SidecarEndpointThrottled"),
+    "SidecarEndpointTransientError": (
+        "cayu.runners._sidecar_transport",
+        "SidecarEndpointTransientError",
+    ),
+    "SidecarEndpointTransport": ("cayu.runners._sidecar_transport", "SidecarEndpointTransport"),
+    "SidecarEndpointUnauthorized": (
+        "cayu.runners._sidecar_transport",
+        "SidecarEndpointUnauthorized",
+    ),
+    "SidecarLifecycleInProgress": (
+        "cayu.runners._sidecar_transport",
+        "SidecarLifecycleInProgress",
+    ),
+    "SidecarOwnershipSuperseded": (
+        "cayu.runners._sidecar_transport",
+        "SidecarOwnershipSuperseded",
+    ),
+    "SidecarOwnershipUnverified": (
+        "cayu.runners._sidecar_transport",
+        "SidecarOwnershipUnverified",
+    ),
+    "SidecarProtocolError": ("cayu.runners._sidecar_transport", "SidecarProtocolError"),
+    "SidecarRunnerError": ("cayu.runners._sidecar_transport", "SidecarRunnerError"),
+    "SidecarStaleOwnerEpoch": ("cayu.runners._sidecar_transport", "SidecarStaleOwnerEpoch"),
     "attach_cancellation_artifacts": ("cayu.runners.base", "attach_cancellation_artifacts"),
 }
 
@@ -140,6 +174,7 @@ PUBLIC_NAMES = [
     "DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS",
     "DEFAULT_E2B_PROTECTED_FILE_MAX_BYTES",
     "DEFAULT_EXEC_OUTPUT_LIMIT_BYTES",
+    "DEFAULT_KUBERNETES_SANDBOX_CWD",
     "DEFAULT_LAMBDA_MICROVM_CWD",
     "DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY",
     "DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY",
@@ -160,7 +195,9 @@ PUBLIC_NAMES = [
     "E2B_SANDBOX_ID_MAX_BYTES",
     "ExecCommand",
     "ExecResult",
+    "HttpxKubernetesSandboxEndpointTransport",
     "HttpxLambdaMicroVMEndpointTransport",
+    "KubernetesSandboxRunner",
     "LambdaMicroVMAllocationTerminated",
     "LambdaMicroVMBrowserWorkloadError",
     "LambdaMicroVMClientTokenConflict",
@@ -198,5 +235,15 @@ PUBLIC_NAMES = [
     "RunnerUnavailableError",
     "RunnerWorkloadAuthority",
     "RunnerWorkspaceCapability",
+    "SidecarEndpointThrottled",
+    "SidecarEndpointTransientError",
+    "SidecarEndpointTransport",
+    "SidecarEndpointUnauthorized",
+    "SidecarLifecycleInProgress",
+    "SidecarOwnershipSuperseded",
+    "SidecarOwnershipUnverified",
+    "SidecarProtocolError",
+    "SidecarRunnerError",
+    "SidecarStaleOwnerEpoch",
     "attach_cancellation_artifacts",
 ]

@@ -7,6 +7,20 @@ from cayu.runners._cleanup import (
     DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY as DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
 )
 from cayu.runners._cleanup import RunnerCleanupPolicy as RunnerCleanupPolicy
+from cayu.runners._sidecar_transport import SidecarEndpointThrottled as SidecarEndpointThrottled
+from cayu.runners._sidecar_transport import (
+    SidecarEndpointTransientError as SidecarEndpointTransientError,
+)
+from cayu.runners._sidecar_transport import SidecarEndpointTransport as SidecarEndpointTransport
+from cayu.runners._sidecar_transport import (
+    SidecarEndpointUnauthorized as SidecarEndpointUnauthorized,
+)
+from cayu.runners._sidecar_transport import SidecarLifecycleInProgress as SidecarLifecycleInProgress
+from cayu.runners._sidecar_transport import SidecarOwnershipSuperseded as SidecarOwnershipSuperseded
+from cayu.runners._sidecar_transport import SidecarOwnershipUnverified as SidecarOwnershipUnverified
+from cayu.runners._sidecar_transport import SidecarProtocolError as SidecarProtocolError
+from cayu.runners._sidecar_transport import SidecarRunnerError as SidecarRunnerError
+from cayu.runners._sidecar_transport import SidecarStaleOwnerEpoch as SidecarStaleOwnerEpoch
 from cayu.runners.aws_lambda_microvm import DEFAULT_LAMBDA_MICROVM_CWD as DEFAULT_LAMBDA_MICROVM_CWD
 from cayu.runners.aws_lambda_microvm import (
     HttpxLambdaMicroVMEndpointTransport as HttpxLambdaMicroVMEndpointTransport,
@@ -96,6 +110,13 @@ from cayu.runners.e2b import E2BGuestProvisioner as E2BGuestProvisioner
 from cayu.runners.e2b import E2BRunner as E2BRunner
 from cayu.runners.e2b import E2BWorkspaceCapability as E2BWorkspaceCapability
 from cayu.runners.e2b import E2BWorkspaceEntry as E2BWorkspaceEntry
+from cayu.runners.kubernetes_sandbox import (
+    DEFAULT_KUBERNETES_SANDBOX_CWD as DEFAULT_KUBERNETES_SANDBOX_CWD,
+)
+from cayu.runners.kubernetes_sandbox import (
+    HttpxKubernetesSandboxEndpointTransport as HttpxKubernetesSandboxEndpointTransport,
+)
+from cayu.runners.kubernetes_sandbox import KubernetesSandboxRunner as KubernetesSandboxRunner
 from cayu.runners.launched import CommandLauncher as CommandLauncher
 from cayu.runners.launched import LaunchedRunner as LaunchedRunner
 from cayu.runners.local import LocalRunner as LocalRunner

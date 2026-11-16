@@ -1008,7 +1008,8 @@ async def test_command_state_permanent_failure_is_not_retried(error_type):
     )
     with pytest.raises(error_type):
         await runner.exec(ExecCommand.process("true"))
-    assert calls == 1
+    # A rejected token is refreshed once, as for every endpoint call; nothing else is retried.
+    assert calls == (2 if error_type is LambdaMicroVMEndpointUnauthorized else 1)
 
 
 @pytest.mark.anyio

@@ -8,8 +8,10 @@ built against [Modal](https://modal.com) Sandboxes, but the contract is the same
 for any backend.
 
 The built-in runners (`LocalRunner`, `DockerRunner`, `E2BRunner`,
-`LambdaMicroVMRunner`) all implement this same contract;
-read their source in `src/cayu/runners/` alongside this guide.
+`LambdaMicroVMRunner`, `KubernetesSandboxRunner`) all implement this same contract;
+read their source in `src/cayu/runners/` alongside this guide. The last two drive the
+same Cayu command sidecar and share its protocol code; a runner for another platform
+that hosts that sidecar can do the same.
 
 If you only want an existing runner's commands to go through your own wrapper
 (`sudo` to another user, bubblewrap, firejail, a `docker exec`), you don't need
@@ -443,6 +445,31 @@ app.register_environment(Environment(EnvironmentSpec(name="modal"), runner=runne
 Any agent in that environment whose tools include `ExecCommandTool` then runs its
 commands through your runner.
 
+A built-in runner registers the same way. For example, `KubernetesSandboxRunner`
+attaches to a sandbox pod that a control plane created, with the sidecar in
+Kubernetes mode:
+
+```python
+import ssl
+
+from cayu.runners import KubernetesSandboxRunner
+
+runner = KubernetesSandboxRunner(
+    endpoint="https://sandbox-1.example.test:8080",
+    token=read_sidecar_token,  # str, or a sync or async callable returning it
+    sandbox=("sandboxes", "sandbox-1"),
+    # Trust only this sandbox's own self-signed certificate, issued for its Service name.
+    verify=ssl.create_default_context(cadata=sandbox_certificate_pem),
+)
+app.register_environment(Environment(EnvironmentSpec(name="sandbox"), runner=runner))
+```
+
+A runner that ships inside Cayu is also registered for conformance: add it to
+`REGISTRATIONS` in `tests/runners/test_runner_conformance.py` (a test fails when an
+exported runner is missing), declare each capability as supported or not
+applicable with a reason, and give it a probe for each supported optional
+capability.
+
 ## Extension seams (experimental)
 
 Cayu's own sandbox runners share cleanup, redaction, and validation helpers. The
@@ -480,7 +507,7 @@ register_runner_adapter_identity(
 - Registration is process-wide and permanent. Repeating an identical
   registration returns the existing `RunnerAdapterIdentity`; registering the
   same name with a different error-type set raises `ValueError`. Built-in
-  identities (`docker`, `e2b`, `lambda-microvm`, `local`) are
+  identities (`docker`, `e2b`, `kubernetes-sandbox`, `lambda-microvm`, `local`) are
   pre-registered and cannot be widened.
 - `registered_runner_adapter_identities()` returns a read-only snapshot.
 - Cayu never discovers adapters automatically (no entry points). An adapter
@@ -574,3 +601,6 @@ contract; keep the leading underscore, and do not override them.
       unchanged.
 - [ ] Lazy-import the optional SDK with an injectable module hook for tests.
 - [ ] Return a real `ExecResult`.
+- [ ] For a runner shipped in Cayu: export it from `cayu.runners`, add its
+      `isolation` label to the built-in adapter identities, and register it in the
+      runner conformance suite.
