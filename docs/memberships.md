@@ -100,8 +100,11 @@ two organizations recalls only the current conversation's organization's knowled
 `copy_session_labels` labels each note from the conversation; the store refuses a note with
 no `organization`, or another one's, whatever the model asked for. Outside a conversation
 (`app.access(subject).knowledge(...)` in the web app) the grant alone decides, so a member sees
-all their organizations' knowledge. Operator and background work outside any member's
-binding isn't narrowed: curate one organization at a time with `cayu knowledge list --status
+all their organizations' knowledge. Work the application starts itself for an organization,
+with no member behind it (`app.run` with the conversation's labels, a schedule, an operator
+task), is pinned the same way by its own `organization` label: its recall and knowledge tools
+get that organization's knowledge only. Operator and background work with no `organization`
+label isn't narrowed: curate one organization at a time with `cayu knowledge list --status
 pending --label organization=ID`. What it writes is checked, though: an active or pending
 entry written through a scope with `session_label_keys` must carry each of those labels,
 since no conversation could read it otherwise, so the store refuses one without

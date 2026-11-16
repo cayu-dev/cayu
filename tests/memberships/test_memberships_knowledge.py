@@ -16,7 +16,7 @@ import pytest
 
 from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu.knowledge._revision_rules import _default_chunk_for_entry
-from cayu.knowledge.access import ScopedKnowledgeAccess
+from cayu.knowledge.access import ScopedKnowledgeAccess, session_knowledge_labels
 from cayu.knowledge.scopes import knowledge_access_scope_sha256
 from cayu.memberships import (
     InMemoryMembershipDirectory,
@@ -465,3 +465,217 @@ def test_projects_without_organizations_read_and_write_as_before(tmp_path: Path)
 
     plain_hits = asyncio.run(run(plain))
     assert len(plain_hits) == 1
+
+
+async def _seed_both_organizations(store) -> None:
+    for organization in ("acme", "globex"):
+        await store.create_entry(
+            KnowledgeEntry(
+                id=f"{organization}-invoices",
+                namespace=NAMESPACE,
+                text=f"{organization}: {NOTE}",
+                status=KnowledgeStatus.ACTIVE,
+                labels={"organization": organization},
+            )
+        )
+
+
+async def _readable(store) -> set[str]:
+    """The entries a search, a listing and a lookup each return here, together. Only this
+    test's entries count: the PostgreSQL database is shared by the module's tests."""
+
+    ours = {"acme-invoices", "globex-invoices", "acme-own"}
+    hits = await store.search(KnowledgeQuery(text="invoices second approver", namespace=NAMESPACE))
+    listed = await store.list_entries(KnowledgeListQuery(limit=100))
+    seen = {hit.entry.id for hit in hits.hits} & ours
+    assert seen == {item.entry.id for item in listed.entries} & ours
+    for entry_id in ("acme-invoices", "globex-invoices"):
+        assert (await store.get_entry(entry_id) is not None) == (entry_id in seen)
+    return seen
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_work_for_an_organization_without_a_member_reads_and_writes_only_its_own(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    """A schedule, an operator task or an `app.run` session labelled with an organization is
+    that organization's work even with no member binding: its knowledge is pinned to the
+    label, as a member's conversation is. Work with no organization label stays
+    operator-wide."""
+
+    async def run() -> None:
+        store = _store(backend, request, _scope())
+        try:
+            await _seed_both_organizations(store)
+            both = {"acme-invoices", "globex-invoices"}
+            # Operators, curation and maintenance see every organization.
+            assert await _readable(store) == both
+            with session_knowledge_labels({"purpose": "maintenance"}):
+                assert await _readable(store) == both
+
+            with session_knowledge_labels({"organization": "acme", "purpose": "digest"}):
+                assert await _readable(store) == {"acme-invoices"}
+                # Nor can it write into another organization's knowledge.
+                with pytest.raises(PermissionError):
+                    await store.create_entry(
+                        KnowledgeEntry(
+                            id="foreign",
+                            namespace=NAMESPACE,
+                            text=NOTE,
+                            labels={"organization": "globex"},
+                        )
+                    )
+                own = await store.create_entry(
+                    KnowledgeEntry(
+                        id="acme-own",
+                        namespace=NAMESPACE,
+                        text=NOTE,
+                        labels={"organization": "acme"},
+                    )
+                )
+                assert own.labels == {"organization": "acme"}
+                # Its own pending notes can be kept and its entries deleted.
+                await store.create_entry(
+                    KnowledgeEntry(
+                        id="acme-proposal",
+                        namespace=NAMESPACE,
+                        text=NOTE,
+                        status=KnowledgeStatus.PENDING,
+                        labels={"organization": "acme"},
+                    )
+                )
+                kept = await KnowledgeReviewWorkflow(store, namespace=NAMESPACE).approve(
+                    "acme-proposal",
+                    operation_id="keep-acme-proposal",
+                    reviewer_identity="operator",
+                    reviewer_version="1",
+                )
+                assert kept.entry.status is KnowledgeStatus.ACTIVE
+                assert await store.delete_entry("acme-proposal", expected_revision=2) is not None
+                assert await store.get_entry("acme-proposal") is None
+                # A run started inside it without the label, such as a child session, is
+                # still acme's work; one labelled for another organization gets nothing.
+                with session_knowledge_labels({}):
+                    assert await _readable(store) == {"acme-invoices", "acme-own"}
+                with (
+                    session_knowledge_labels({"organization": "globex"}),
+                    pytest.raises(ResourceAccessDenied),
+                ):
+                    await store.list_entries(KnowledgeListQuery(limit=100))
+
+            with session_knowledge_labels({"organization": "globex"}):
+                assert await _readable(store) == {"globex-invoices"}
+            assert await _readable(store) == both | {"acme-own"}
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+def test_a_scope_naming_another_organization_is_refused_in_an_organizations_work() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(
+            [
+                KnowledgeEntry(
+                    id=f"{organization}-invoices",
+                    namespace=NAMESPACE,
+                    text=NOTE,
+                    labels={"organization": organization},
+                )
+                for organization in ("acme", "globex")
+            ]
+        )
+        globex = KnowledgeAccessScope(
+            allowed_namespaces=[NAMESPACE],
+            required_labels={"organization": "globex"},
+            session_label_keys=("organization",),
+        )
+        query = KnowledgeListQuery(limit=100)
+        listed = await store.list_entries(query, access_scope=globex)
+        assert {item.entry.id for item in listed.entries} == {"globex-invoices"}
+        with (
+            session_knowledge_labels({"organization": "acme"}),
+            pytest.raises(ResourceAccessDenied),
+        ):
+            await store.list_entries(query, access_scope=globex)
+
+    asyncio.run(run())
+
+
+def test_a_member_handle_used_in_an_organizations_work_is_pinned_to_it() -> None:
+    async def run() -> None:
+        policy = MembershipAccessPolicy(_directory(), knowledge=True)
+        store = InMemoryKnowledgeStore(access_scope=_scope())
+        await _seed_both_organizations(store)
+        # erin belongs to both organizations; outside any session the grant alone decides.
+        handle = ScopedKnowledgeAccess(store, binding=await _binding(policy, "erin"), policy=policy)
+        query = KnowledgeListQuery(limit=100)
+        listed = await handle.list_entries(query)
+        assert {item.entry.id for item in listed.entries} == {"acme-invoices", "globex-invoices"}
+        with session_knowledge_labels({"organization": "globex"}):
+            listed = await handle.list_entries(query)
+        assert {item.entry.id for item in listed.entries} == {"globex-invoices"}
+
+    asyncio.run(run())
+
+
+def test_an_app_run_labelled_with_an_organization_gets_only_its_knowledge() -> None:
+    """The runtime pins a tool's knowledge to its session's labels without a binding."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.memory import InMemorySessionStore
+    from cayu.sessions.requests import RunRequest
+    from cayu.tools import Tool, ToolResult, ToolSpec
+
+    store = InMemoryKnowledgeStore(access_scope=_scope())
+    seen: list[set[str]] = []
+
+    class LooksUp(Tool):
+        """A tool that reads the store itself and filters nothing."""
+
+        spec = ToolSpec(
+            name="look_up",
+            description="Look up invoice knowledge.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            seen.append(await _readable(store))
+            return ToolResult(content="ok")
+
+    async def run(labels: dict[str, str]) -> set[str]:
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(id="call_1", name="look_up", arguments={}),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[LooksUp()])
+        try:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant", labels=labels, messages=[Message.text("user", "go")]
+                )
+            ):
+                pass
+        finally:
+            await app.aclose()
+        return seen.pop()
+
+    async def scenario() -> None:
+        await _seed_both_organizations(store)
+        assert await run(_labels("carol", "acme")) == {"acme-invoices"}
+        assert await run(_labels("dave", "globex")) == {"globex-invoices"}
+        assert await run({}) == {"acme-invoices", "globex-invoices"}
+
+    asyncio.run(scenario())

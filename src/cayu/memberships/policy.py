@@ -55,7 +55,8 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
     ``knowledge=True`` grants knowledge too: a member reads, creates and revises entries
     labelled with one of their organizations (``organization`` can't be changed), and nothing
     else. Pair it with a knowledge scope whose ``session_label_keys`` names ``organization``,
-    so inside a conversation only that conversation's organization's knowledge is used. Off
+    so inside a conversation, or any session labelled with an organization, only that
+    organization's knowledge is used. Off
     by default, which denies all knowledge, as before.
     """
 

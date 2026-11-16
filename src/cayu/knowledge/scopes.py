@@ -51,10 +51,12 @@ class KnowledgeAccessScope(BaseModel):
     #: resource-access binding, an entry is read or written only when its value for each key
     #: equals the session's verified label, so a person in several organizations sees only
     #: the current conversation's organization's knowledge, and a note can't be written into
-    #: another one. A binding whose session lacks one of these labels is refused. Outside a
-    #: binding (operators, curation, maintenance) the keys don't narrow reads, but an active
-    #: or pending entry written there must still carry every key, since no conversation could
-    #: ever read it otherwise.
+    #: another one. A binding whose session lacks one of these labels is refused. A session
+    #: without a binding (an `app.run` session, a schedule, an operator task) is pinned the
+    #: same way for each key it carries, in its tool calls and automatic recall; one that
+    #: carries none of them, like operator code outside any session, curation and
+    #: maintenance, isn't narrowed. An active or pending entry written outside a binding must
+    #: still carry every key, since no conversation could ever read it otherwise.
     session_label_keys: tuple[str, ...] = Field(default=(), exclude_if=lambda v: not v)
 
     @field_validator("session_label_keys", mode="before")

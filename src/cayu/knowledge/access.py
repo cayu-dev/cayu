@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING
@@ -20,6 +22,28 @@ _constraints: ContextVar[tuple[str, ...] | None] = ContextVar(
     "knowledge_resource_constraints", default=None
 )
 
+#: Labels of each session whose work is running here, outermost first. The runtime sets them
+#: around a session's tool calls and context building, bound or not, so a scope's
+#: ``session_label_keys`` pin that work even when no member binding is present.
+_session_labels: ContextVar[tuple[tuple[tuple[str, str], ...], ...]] = ContextVar(
+    "knowledge_session_labels", default=()
+)
+
+
+@contextmanager
+def session_knowledge_labels(labels: Mapping[str, str]) -> Iterator[None]:
+    """Run the enclosed work as the session labelled ``labels`` for knowledge access.
+
+    Nested sessions add to the outer ones rather than replace them: a run started inside
+    another session's tool call stays pinned to the outer session's labels too.
+    """
+
+    token = _session_labels.set((*_session_labels.get(), tuple(labels.items())))
+    try:
+        yield
+    finally:
+        _session_labels.reset(token)
+
 
 def validate_constraints(values):
     from cayu.resource_access import decode_scope, encode_scope
@@ -36,7 +60,12 @@ def intersect_scope(scope):
 
         if current_binding() is not None:
             raise ResourceAccessDenied()
-        return scope
+        if not scope.session_label_keys:
+            return scope
+        required = _session_pinned_labels(scope)
+        if required == scope.required_labels:
+            return scope
+        return scope.model_copy(update={"required_labels": required})
     # A caller may already have narrower resource predicates. Retain all of
     # them; reject overflow rather than dropping an intersection.
     combined = tuple(dict.fromkeys((*scope.resource_constraints, *constraints)))
@@ -55,7 +84,16 @@ def _session_pinned_labels(scope):
 
     required = dict(scope.required_labels)
     if current_binding() is None:
-        # An explicit scoped handle outside any session: the grant alone decides.
+        # Work without a member binding: operator code, an `app.run` session, a schedule or
+        # an operator task. A session that carries one of the keys is that label's work, so
+        # it is pinned to it as a bound one is; work that carries none of them (operator
+        # tooling, curation, maintenance) keeps the scope as it is.
+        for frame in _session_labels.get():
+            labels = dict(frame)
+            for key in scope.session_label_keys:
+                value = labels.get(key)
+                if value is not None and required.setdefault(key, value) != value:
+                    raise ResourceAccessDenied()
         return required
     labels = current_execution_labels()
     for key in scope.session_label_keys:

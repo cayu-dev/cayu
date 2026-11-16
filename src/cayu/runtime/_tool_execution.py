@@ -21,6 +21,7 @@ from cayu._validation import (
 from cayu.deadlines import ExecutionDeadlineExceeded, current_execution_deadline
 from cayu.environments.admission import ExecutionAdmissionError
 from cayu.failure_evidence import FailureEvidence, exception_evidence
+from cayu.knowledge.access import session_knowledge_labels
 from cayu.resource_access import model_data_access
 from cayu.runners._adapter_identity import trusted_runner_adapter_name
 from cayu.runners.base import (
@@ -771,15 +772,23 @@ async def _run_tool(
                 run_time_stops_at = (
                     timer.stops_at() if timer is not None and run_time_limited else None
                 )
+                # Knowledge the tool reads or writes is pinned to its session's labels
+                # (a scope's `session_label_keys`), with or without a member binding.
                 if inference_scope is not None:
                     async with inference_scope.lifetime():
                         with tool_invocation_lifetime(ctx, run_time_stops_at=run_time_stops_at):
                             async with model_data_access():
-                                with phase_scope("execution"):
+                                with (
+                                    session_knowledge_labels(ctx.session_labels),
+                                    phase_scope("execution"),
+                                ):
                                     return await tool.run(ctx, arguments)
                 with tool_invocation_lifetime(ctx, run_time_stops_at=run_time_stops_at):
                     async with model_data_access():
-                        with phase_scope("execution"):
+                        with (
+                            session_knowledge_labels(ctx.session_labels),
+                            phase_scope("execution"),
+                        ):
                             return await tool.run(ctx, arguments)
             if registered_schema is None:
                 raise IsolatedToolPreDispatchFailure("registered_schema_missing")

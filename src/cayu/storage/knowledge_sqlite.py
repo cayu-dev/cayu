@@ -1082,7 +1082,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         authority = copy_knowledge_activation_authority(authority)
         request = authority.request
-        _validate_review_approval_authority(authority, access_scope=scope)
+        # The authority binds the scope its caller presented; `scope` decides access.
+        _validate_review_approval_authority(
+            authority, access_scope=self._presented_access_scope(access_scope)
+        )
         expected_namespace = (
             require_clean_nonblank(expected_namespace, "expected_namespace")
             if expected_namespace is not None

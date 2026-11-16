@@ -5973,6 +5973,7 @@ async def _build_context(
     list[ContextRecallTelemetry],
     MemoryEvidenceReference | None,
 ]:
+    from cayu.knowledge.access import session_knowledge_labels
     from cayu.resource_access import current_binding
 
     if (
@@ -6028,6 +6029,7 @@ async def _build_context(
             )
         try:
             with (
+                session_knowledge_labels(session.labels),
                 _context_secret_redactor_scope(secret_redactor),
                 _context_recall_telemetry_publisher_scope(publish_recall_telemetry),
                 _defer_billing_identity_cancellation_scope(),
@@ -6083,7 +6085,7 @@ async def _build_context(
             reference,
         )
 
-    with _context_secret_redactor_scope(secret_redactor):
+    with session_knowledge_labels(session.labels), _context_secret_redactor_scope(secret_redactor):
         result = await context_policy.build(request)
     return copy_context_messages(result), None, None, [], [], None
 

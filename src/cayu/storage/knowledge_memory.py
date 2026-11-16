@@ -637,10 +637,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 self._evidence.pop(key, None)
             self._record_change(change, before_entry=entry, after_entry=None)
             return copy_knowledge_entry(entry)
+        # The nested operation narrows the presented scope itself; handing it the narrowed
+        # one would read as an override of the store's bound scope.
         return await self.transition_entry_status(
             clean_id,
             expected_revision=expected_revision,
-            access_scope=scope,
+            access_scope=access_scope,
             from_status=entry.status,
             to_status=KnowledgeStatus.DELETED,
         )
@@ -1556,7 +1558,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         scope = self._operation_access_scope(access_scope)
         authority = copy_knowledge_activation_authority(authority)
         request = authority.request
-        _activation_rules._validate_review_approval_authority(authority, access_scope=scope)
+        # The authority binds the scope its caller presented; `scope` decides access.
+        _activation_rules._validate_review_approval_authority(
+            authority, access_scope=self._presented_access_scope(access_scope)
+        )
         expected_namespace = (
             require_clean_nonblank(expected_namespace, "expected_namespace")
             if expected_namespace is not None

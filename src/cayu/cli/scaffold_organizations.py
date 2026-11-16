@@ -2021,10 +2021,17 @@ async def _remember_in_alices_conversation(store: InMemoryKnowledgeStore) -> str
 
 
 async def _conversation(
-    store: InMemoryKnowledgeStore, monkeypatch, subject: str, membership: Membership, note: str
+    store: InMemoryKnowledgeStore,
+    monkeypatch,
+    subject: str,
+    membership: Membership,
+    note: str,
+    *,
+    as_member: bool = True,
 ) -> list[str]:
     """What the model was given at each step of `subject`'s conversation, in which it
-    searches knowledge and reads `note` by its ID."""
+    searches knowledge and reads `note` by its ID. With `as_member=False` the application
+    starts it itself, as a schedule or an operator task does, rather than for `subject`."""
 
     directory = InMemoryMembershipDirectory({"alice": [ALICE], "carol": [CAROL], "dave": [DAVE]})
     monkeypatch.setattr(policies.access, "memberships", lambda: directory)
@@ -2054,12 +2061,12 @@ async def _conversation(
         knowledge_store=store,
         access_policy=policies.access.build_access_policy(),
     ) as app:
-        access = await app.access(subject)
+        runner = await app.access(subject) if as_member else app
         labels = conversation_labels(subject=subject, membership=membership, sharing="personal")
         question = Message.text("user", "Do invoices over ten thousand need a second approver?")
         failed = [
             event
-            async for event in access.run(
+            async for event in runner.run(
                 RunRequest(agent_name="__AGENT_NAME__", messages=[question], labels=labels)
             )
             if event.type in (EventType.TOOL_CALL_FAILED, EventType.SESSION_FAILED)
@@ -2096,6 +2103,13 @@ def test_one_organizations_knowledge_never_reaches_another_organizations_member(
         assert NOTE in answered and KEPT in answered
         # ...and a member of globex gets neither, though the model asked for one by its ID.
         for step in await _conversation(store, monkeypatch, "dave", DAVE, note):
+            assert KEPT not in step and NOTE not in step
+
+        # Work the application starts itself for an organization (a schedule, an operator
+        # task, `app.run`) is pinned to its `organization` label the same way.
+        steps = await _conversation(store, monkeypatch, "carol", CAROL, note, as_member=False)
+        assert NOTE in steps[-1] and KEPT in steps[-1]
+        for step in await _conversation(store, monkeypatch, "dave", DAVE, note, as_member=False):
             assert KEPT not in step and NOTE not in step
 
     asyncio.run(run())
@@ -2153,7 +2167,8 @@ that forgets to filter still can't reach another organization's.
   their organizations' knowledge, and nothing else.
 - `knowledge/retrieval.py` sets `session_label_keys=("organization",)`: inside a
   conversation, recall, the knowledge tools and pending notes are that conversation's
-  organization's only.
+  organization's only. So is any run labelled with an `organization`, such as one a schedule
+  or an operator task starts with `app.run`.
 - `remember_knowledge` labels each note with the conversation's organization
   (`copy_session_labels`), never one the model names.
 - Review one organization's pending notes with `uv run --no-sync cayu knowledge list
