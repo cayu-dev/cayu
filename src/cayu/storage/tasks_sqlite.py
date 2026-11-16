@@ -355,6 +355,7 @@ from cayu.tasks.retry import (
     _replay_task_retry_settlement,
     _scheduled_task_nonexecution,
     _settled_task_retry_attempt,
+    _task_retry_attempt_elapsed,
     _task_retry_events,
     _validated_task_retry_terminal_accounting,
     prepare_task_retry_settlement,
@@ -6981,6 +6982,9 @@ class SQLiteTaskStore(TaskStore):
                 ).fetchall()
                 for expired_row in expired_rows:
                     expired_task = self._require_task_unlocked(expired_row["id"])
+                    # Earlier group transitions may already have cancelled this member.
+                    if not _task_retry_attempt_elapsed(expired_task, series_now=availability_now):
+                        continue
                     expiration = _expired_task_retry_settlement(
                         expired_task,
                         committed_at=now,
