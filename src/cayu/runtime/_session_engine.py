@@ -1,4 +1,57 @@
-"""Deep owner for session orchestration behind :class:`CayuApp`."""
+"""Deep owner for session orchestration behind :class:`CayuApp`.
+
+Several behaviours here are deliberate but easy to misread as missing cleanup
+or lost state. The ones that come up most often:
+
+Exit ownership
+    An admitted run's exit is settled by its :class:`RunLedger` through
+    :class:`RunSettlement`, not by whichever ``finally`` block happens to run
+    last. Once an outcome is decided (a committed completion, failure or pause),
+    the rest of its publication is retained in the ledger and settlement
+    finishes it after any exit, before the environment and then the run fence
+    are released. Releasing the fence is itself conditional:
+    ``EnvironmentLifecycle.release_run_fence_after_environment_cleanup`` only
+    releases on exact settlement or terminal-event evidence, keeps the fence for
+    recovery otherwise, and does nothing when the durable epoch is already newer
+    than the cleaning context. Process-control exits (``SystemExit``,
+    ``KeyboardInterrupt``) and authenticated fence loss are left unsettled on
+    purpose, so a session still ``RUNNING`` after a bare process stop belongs to
+    recovery. Public ``run``/``resume`` streams are closed by
+    ``_close_delegated_event_stream``, which finishes closing them even when the
+    consumer is cancelled; consumer cancellation does not reach the engine's
+    ``GeneratorExit`` handlers directly.
+
+Queued successor interactions
+    A queued message delivered after an interaction completes starts a new
+    interaction inside the same invocation and run epoch. The successor keeps
+    the exact execution-profile object, the selected failover candidate and the
+    invocation's model-step numbering and ``max_steps``; it gets a fresh
+    tool-completion result and none of the predecessor's targeted tool grants.
+    ``NEXT_TURN`` input waits for the whole current interaction, including any
+    tool round, not just the next model step.
+
+Continuations without new input
+    ``ResumeRequest`` refuses an empty message list, so the no-input branches
+    here are reached from approval and user-input resolution, which call
+    :meth:`SessionEngine.continue_run` with ``messages_to_append=[]`` after the
+    gate's closure has committed. Those callers keep fence cleanup themselves
+    (``release_run_fence_on_exit=False``).
+
+Index spaces
+    Recall anchors, runtime-authored message anchors and compaction cursors in a
+    checkpoint are positions in the model-facing message list. Before-stop
+    provenance and ``TranscriptSnapshot.cursor``/``TranscriptRecord.index`` are
+    durable transcript row indexes. A model-target projection can omit rows from
+    the model-facing list, so the two are not interchangeable.
+
+Loop policies and steering
+    Generic before-stop policies run only for ordinary final assistant steps;
+    with a ``StructuredOutputSpec`` the structured-output owner decides retry and
+    completion instead (see "Before-Stop Loop Policies" in
+    ``docs/runtime-contracts.md``). A cooperative stop is enforced by the store's
+    new-work admission as well as by the loop's boundary polls, so a stop that
+    lands after a poll still prevents the next model dispatch.
+"""
 
 from __future__ import annotations
 
@@ -2720,6 +2773,18 @@ class SessionEngine(BeforeStopPolicies):
         structured_output_pending: bool,
         cancellation_baseline: int,
     ) -> None:
+        """Settle an admission whose outcome was lost with its acknowledgement.
+
+        ``RunSettlement.settle_lost_admission`` skips a command proven not
+        committed (an exact receipt replay found no receipt; a failed replay
+        read proves nothing), fence loss and process-control exits. Otherwise it
+        rereads the session and settles only if the durable run epoch and the
+        full active profile, interaction included, match the command's target,
+        so a newer epoch is never settled in its place. Participant-root
+        execution has its own exact-retry path instead: retrying the same
+        request reconciles the admission it already committed.
+        """
+
         def ledger_for(session: Session) -> RunLedger:
             context = prepared_context.with_admitted_session(session)
             return RunLedger(
@@ -2843,7 +2908,14 @@ class SessionEngine(BeforeStopPolicies):
         store_resolved_source_session_id: str | None = None,
         expected_authorized_target_instance_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
-        """Durably queue user steering for delivery by the active controller."""
+        """Durably queue user steering for delivery by the active controller.
+
+        The queued input and its ``SESSION_MESSAGE_QUEUED`` event commit
+        together, and a native store records the event's side-effect obligation
+        with it. A replayed enqueue skips the immediate fan-out below because
+        ``RuntimeEventWriter.recover_persisted_side_effects`` owns delivering an
+        event whose first fan-out was cancelled or failed.
+        """
 
         redacted_request = session_request_boundary.prepare_enqueue_message_request(
             request,
@@ -2949,6 +3021,27 @@ class SessionEngine(BeforeStopPolicies):
         before_successor_admission: Callable[[], Awaitable[None]] | None = None,
         on_successor: Callable[[InvocationContext], None] | None = None,
     ) -> tuple[list[Event], InvocationContext | None]:
+        """Deliver queued input in bounded batches, possibly starting a successor.
+
+        Without ``continue_active_interaction``, the first batch that carries
+        messages atomically starts a new interaction in the same run epoch,
+        checked against the predecessor's ``INTERACTION_COMPLETED`` settlement
+        and an exact profile handoff. A batch that only rejects messages starts
+        nothing, so the next batch is again a first delivery with new identity.
+
+        An ordinary store error is retried once with the same ``delivery_id``.
+        Native stores keep delivery receipts, so a retry after a lost
+        acknowledgement replays the committed batch instead of appending the
+        input twice. ``eligible_through`` is fixed from the first returned batch,
+        so later batches stay within the messages that were eligible then.
+
+        Atomic successor handoff is attested by
+        ``queued_interaction_profile_handoff_version = 1`` on both the store and
+        the class that defines ``deliver_queued_session_messages``. A subclass
+        that overrides that method has to declare the version again; inheriting
+        it is refused on purpose, since the override may not keep the handoff
+        atomic.
+        """
         if invocation_context is not None and invocation_context.work_attempt is not None:
             # Acceptance may have come from another app without this TaskStore.
             # Do not publish input or a successor outside the exact admission.
@@ -3160,6 +3253,16 @@ class SessionEngine(BeforeStopPolicies):
         tool_completion_result: ToolCompletionResult | None = None,
         completion: SessionOutcomeContext | None = None,
     ) -> tuple[Session, Event | None, bool, dict[str, Any] | None]:
+        """Complete the session only if no queued input is waiting.
+
+        When the bound workspace needs successful finalization before the
+        session may complete, the transition installs
+        ``pending_completion_finalization`` and leaves the status ``RUNNING``
+        while copy-back runs. That marker closes queue admission inside the
+        store transaction (``require_open_admission``), so a message cannot be
+        enqueued behind the empty-queue decision even though the session still
+        reads as running.
+        """
         completion_marker: dict[str, Any] | None = None
         checkpoint_mutation: dict[str, Any] | None = None
         binding = (
@@ -3566,9 +3669,6 @@ class SessionEngine(BeforeStopPolicies):
     ) -> _ResumePreparation:
         if request.failover is not None:
             self.session_store._require_model_failover_stage_protocol()
-        # Resume profile admission and the resumed dispatch must observe one
-        # application-budget snapshot even if the app configuration is changed
-        # while the interaction-start event is being consumed.
         if (type(request) is ForegroundChildResumeRequest) != (
             required_foreground_wait is not None
         ):
@@ -3587,6 +3687,10 @@ class SessionEngine(BeforeStopPolicies):
         ):
             raise TypeError("Attached foreground continuation conflicts with its original request.")
 
+        # Resume profile admission and the resumed dispatch must observe one
+        # application-budget snapshot even if the app configuration is changed
+        # while the interaction-start event is being consumed. ``resume`` and
+        # ``_run_session_with_deadline`` read this copy, never the live settings.
         budget_policy = copy_budget_policy(self._get_budget_policy())
         if (source_execution_profile is None) != (required_execution_profile is None):
             raise ValueError(
@@ -3712,7 +3816,35 @@ class SessionEngine(BeforeStopPolicies):
         *,
         on_admitted: Callable[[Session], None] | None = None,
     ) -> AsyncGenerator[Event, None]:
-        """Execute a prepared continuation after abandoned-owner recovery settles."""
+        """Execute a prepared continuation after abandoned-owner recovery settles.
+
+        Unlike :meth:`run`, this method does not detach provider or billing
+        cancellations for public callers. ``SessionRecoveryRuntime.resume`` wraps
+        this stream and does that before the error leaves the runtime.
+
+        Admission is checked against what is durable immediately before it, not
+        against what was read earlier. The checkpoint is reloaded after any
+        egress cutover, the execution-snapshot binding is checked again on that
+        reload, and the admission command carries its digest, so a snapshot
+        reservation or checkpoint write after the recheck invalidates admission.
+        The store transaction also requires the predecessor's typed release
+        receipt before it compares the digest; a fresh reload is never enough to
+        resume an unreleased predecessor. Egress cutover refuses to write while
+        the session is ``RUNNING`` or ``INTERRUPTING``, and this method refuses
+        to admit while a transition is ``INSTALLING`` or ``AMBIGUOUS``, so the
+        two cannot interleave.
+
+        Ordinary resume input is appended durably before execution starts
+        (``messages_already_persisted``). A continuation from a recovery
+        boundary instead defers its input (``messages_deferred``) and
+        materializes it through the deferred-interaction store before the first
+        provider request.
+
+        ``ResumeRequest`` carries no task ID. A task-backed session that
+        stopped at an interruption leaves its task ``RUNNING``, and the attached
+        task is found again through ``SessionTaskLifecycle``; the resumed
+        terminal outcome completes or fails it.
+        """
         request = preparation.request
         task_id = preparation.task_id
         start_event_payload_extra = preparation.start_event_payload_extra
@@ -5671,6 +5803,17 @@ class SessionEngine(BeforeStopPolicies):
         self,
         request: RecoverySessionRunRequest,
     ) -> AsyncGenerator[Event, None]:
+        """Continue an invocation that a recovery owner has already admitted.
+
+        Human-gated continuations (approval and user-input resolution) arrive
+        here from ``RecoveryCoordinator`` only after the gate's closure has
+        committed and removed the pending tool round. They keep the original
+        interaction, pass ``messages_to_append=[]`` and
+        ``completed_tool_round_model_step`` so model-step bounds carry over, and
+        set ``release_run_fence_on_exit=False``: the caller keeps fence cleanup
+        and finalizes abandonment if the stream is closed early, so missing
+        inner finalization on those paths is expected.
+        """
         await self._require_participant_execution(request.session, request.participant_context)
         await self._session_tasks.require_continuation_task_authority(
             session_id=request.session.id,
@@ -5983,6 +6126,11 @@ class SessionEngine(BeforeStopPolicies):
             # operation. A new zero-duration timer would cancel its stop write
             # and cleanup, rather than stop any execution (none can be admitted).
             return stream
+        # deadline_stream binds the deadline only while it advances or closes
+        # the producer, never across a yield to the consumer. A deadline that
+        # passes between events is seen at the next advance, which closes the
+        # suspended producer with GeneratorExit under the expired timer instead
+        # of raising CancelledError inside it. Cleanup has to handle both.
         return deadline_stream(stream, boundary)
 
     async def _run_session_with_group_observation(
@@ -6077,6 +6225,34 @@ class SessionEngine(BeforeStopPolicies):
         retain_completion_controls: bool = False,
         run_ledger: RunLedger | None = None,
     ) -> AsyncGenerator[Event, None]:
+        """Run the admitted model/tool loop for one invocation.
+
+        Queued successor interactions run inside this same call (see
+        ``install_queued_invocation_context``), so one call can publish several
+        interactions under one run epoch.
+
+        What happens at an exit depends on whether an outcome was already
+        decided. ``owe_completion`` and ``retain_decided_outcome`` put the exact
+        publication generator of a committed completion, failure or pause into
+        ``run_ledger`` before its first event is yielded; pause publishers call
+        ``on_outcome_decided`` after committing the transition and before
+        yielding the interaction event. While that remainder is owed, this
+        function's own finalizer leaves environment and fence release to
+        ``RunSettlement``, which finishes the remainder first. Closing the
+        stream at ``INTERACTION_COMPLETED`` keeps the session ``COMPLETED``; it
+        is not an unfinished interaction.
+
+        A run closed while a new pending tool round is open can be settled as
+        ``INTERRUPTED`` with ``INTERACTION_PAUSED`` (pending action
+        ``tool_recovery``) rather than a terminal interaction event, so the
+        round stays recoverable. A failure after the interaction already has a
+        terminal event changes only the session status and leaves that
+        interaction's outcome as it is.
+
+        Before a provider result enters the model-facing message list or the
+        tool runner, its durable pending-round marker must match the round's
+        identity and tool-call requests.
+        """
         outcome_state = SessionOutcomeState(session=session)
         decided_outcome: AsyncGenerator[Event, None] | None = None
         local_outcome_ledger: RunLedger | None = None
@@ -6489,6 +6665,16 @@ class SessionEngine(BeforeStopPolicies):
                 await close_undecided_outcome(decided_outcome)
 
         async def finalize_abandoned_run(deadline_expired: bool, **evidence: Any) -> Event | None:
+            """Interrupt an abandoned run and, after a deadline, fail its task.
+
+            ``finalize_abandoned_session_run`` records ``classification:
+            "deadline"`` only when a live, expired runtime timer owns the
+            interruption. ``fail_task_for_execution_deadline`` then requires
+            exactly that evidence for the current run epoch and leaves the task
+            alone after a generic abandonment. No lease argument is passed for a
+            managed task worker: the call resolves the worker's current lease and
+            claim generation from the inherited task-lease authority.
+            """
             if deadline_expired and invocation_context.work_attempt is not None:
                 if self.task_store is None:
                     raise RuntimeError("Governed deadline stop requires its task store.")
@@ -7746,6 +7932,18 @@ class SessionEngine(BeforeStopPolicies):
             def install_queued_invocation_context(
                 rebound: InvocationContext | None,
             ) -> None:
+                """Move this loop onto a queued successor interaction.
+
+                The successor stays in this invocation and run epoch.
+                ``InvocationContext.with_queued_interaction`` refuses a changed
+                profile and hands back the predecessor's exact profile object,
+                so ``execution_profile`` and the selected failover candidate
+                stay valid, and model-step numbering and ``max_steps`` carry
+                on. What belongs to the finished interaction is reset: the
+                tool-completion result here, and targeted tool grants in
+                ``rebind_queued_interaction``. A completed predecessor
+                therefore does not make the successor's turn terminal.
+                """
                 nonlocal invocation_context, tool_completion_result, tool_completion
                 tool_completion_result = None
                 if (

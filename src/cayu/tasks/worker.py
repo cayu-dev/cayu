@@ -210,6 +210,44 @@ if TYPE_CHECKING:
     from cayu.tasks.retry_budgets import TaskRetryKeyState
     from cayu.tasks.scheduling import TaskScheduleWakeup
 
+# Notes on ownership and identity in this module, for readers checking whether
+# a path is safe:
+#
+# - ``worker_id`` is a slot name, not an execution identity. Every concurrency
+#   slot uses the same caller-supplied name, and names are reused across
+#   interrupted continuations. Store mutations authenticate the exact lease
+#   expiry, claim generation and ``interrupted_handoff_id`` (including None).
+#   A claim generation does not waive lease liveness either: fenced mutations
+#   still require an unexpired lease.
+# - Each retry-series attempt is its own task, with an ID derived from the
+#   series and attempt number, so keys built from ``task_id`` and ``worker_id``
+#   do not collide across attempts. Retry-series attempts cannot attach to a
+#   session, so the interrupted-handoff and continuation paths only ever see
+#   ordinary tasks.
+# - Once execution start is published, an expired claim is fenced as a
+#   cancellation request rather than returned to pending: lease expiry does not
+#   prove the callback stopped. Event-deadline expiry before dispatch also
+#   leaves a cancellation request, which the worker settles without calling the
+#   handler.
+# - A cancellation request is honoured by waiting for the handler, not by
+#   cancelling it. ``_quiesce_task_retry_handler_before_terminalization`` takes
+#   over lease renewal and waits for the callback to finish, because threads
+#   and subprocesses it started can outlive cancellation of its asyncio task.
+#   The optional interrupt after the grace period is scheduled separately, so a
+#   stalled renewal does not delay it.
+# - A plain ``CancelledError`` raised out of a handler is treated as the
+#   owner's control signal (see ``cayu.runtime._run_exit``), not as one task's
+#   failure, so it stops the worker instead of being isolated.
+# - With task-group quiescence, a task's terminal status and cleared lease do
+#   not settle its execution obligation. The callback owner acknowledges it
+#   through ``TaskExecutionSettlement``; a receipt-backed continuation opens its
+#   execution at claim time, so it needs that acknowledgement even when it
+#   fails before the handler is called.
+# - The handler time limit measures the callback only. ``callback_done`` is set
+#   when the handler returns or raises, before the execution acknowledgement is
+#   written, so slow acknowledgement storage neither counts toward the limit nor
+#   makes the timeout fence treat a stopped handler as still running.
+
 
 class TaskHandlerOutcome(StrEnum):
     """Explicit non-terminal outcomes supported by :func:`run_task_worker`."""
@@ -2764,6 +2802,19 @@ async def _restart_task_handler_after_shutdown(
     owner_cancellation: asyncio.CancelledError,
     handler_cancellation_delivered: bool,
 ) -> None:
+    """Cancel a restartable root handler on owner shutdown, then requeue it.
+
+    Only fresh root attempts come here; a restartable continuation of an
+    interrupted session drains like any other continuation. ``restartable=True``
+    is the caller's promise that the handler joins its delegated work when
+    cancelled, which is why this path cancels instead of waiting (see
+    "Restartable queue jobs" in ``docs/triggering-runs.md``). The lease is
+    renewed until the handler's cleanup has joined, then renewal stops before
+    ``restart_task``. That last write is not covered by renewal: if storage is
+    slow enough for the lease to lapse, reclaim or owner-loss settlement can
+    turn the intended restart into a cancellation, so ``restartable=True`` does
+    not guarantee a requeue after every shutdown.
+    """
     heartbeat_task = _heartbeat_during_quiescence(
         task_store,
         task,
@@ -5253,7 +5304,12 @@ async def _settle_pending_runtime_task_failure_owner(
     lease_authority: _TaskLeaseAuthority,
     pending: RuntimeTaskFailureTerminalizationPending,
 ) -> None:
-    """Settle only the worker whose exact durable failure decision is active."""
+    """Settle only the worker whose exact durable failure decision is active.
+
+    This settles the task under the runtime's elected failure decision and
+    nothing else. The session can stay ``RUNNING`` afterwards; incomplete-session
+    recovery repairs it and publishes the terminal events it retained.
+    """
 
     if type(pending) is not RuntimeTaskFailureTerminalizationPending:
         raise TypeError("pending must be a RuntimeTaskFailureTerminalizationPending.")
