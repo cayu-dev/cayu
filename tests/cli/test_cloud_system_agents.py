@@ -41,12 +41,12 @@ _ITEMS = [
         "agent": None,
     },
     {
-        "entry": "cayu-arena-cases",
+        "entry": "eval-cases",
         "organization_id": None,
-        "agent_id": "cayu-arena-cases",
+        "agent_id": "eval-cases",
         "setting": "CAYU_AGENT_ALWAYS_ON",
         "deprecated": True,
-        "agent": {"organization_id": "org_arena", "lifecycle": "active", "recorded_system": None},
+        "agent": {"organization_id": "org_evals", "lifecycle": "active", "recorded_system": None},
     },
 ]
 
@@ -104,8 +104,8 @@ def test_the_table_marks_deprecated_entries_wrong_ones_and_services_to_restart(
     ]
     assert "not system until restarted" in rows["org_cayu/cayu-compass"]
     assert "no such Agent" in rows["org_cayu/misspelt"]
-    assert "CAYU_AGENT_ALWAYS_ON (deprecated)" in rows["cayu-arena-cases"]
-    assert "not recorded" in rows["cayu-arena-cases"]
+    assert "CAYU_AGENT_ALWAYS_ON (deprecated)" in rows["eval-cases"]
+    assert "not recorded" in rows["eval-cases"]
     assert "Recorded as not a system Agent: org_cayu/cayu-compass." in out
     assert "check its ids" in out
 

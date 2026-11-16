@@ -14,7 +14,7 @@ from tests.evals._browser_acceptance_operator_live import PRIVATE_CANARY
 
 @pytest.mark.skipif(
     os.environ.get("CAYU_BROWSER_ACCEPTANCE_OPERATOR_LIVE") != "1",
-    reason="Requires existing controller image, Docker CLI and WebSocket dependencies.",
+    reason="Requires a controller image (CAYU_OPERATOR_CONTROLLER_IMAGE), Docker CLI and WebSocket dependencies.",
 )
 def test_canonical_operator_case_through_real_docker(tmp_path):
     from cryptography import x509
@@ -25,6 +25,7 @@ def test_canonical_operator_case_through_real_docker(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     deps = Path(os.environ["CAYU_OPERATOR_CHANNEL_DEPS"]).resolve()
     cli = Path(os.environ["CAYU_OPERATOR_DOCKER_CLI"]).resolve()
+    image = os.environ["CAYU_OPERATOR_CONTROLLER_IMAGE"]
     proof = tmp_path.resolve()
     (proof / "trust").mkdir()
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -110,7 +111,7 @@ def test_canonical_operator_case_through_real_docker(tmp_path):
             f"TMPDIR={proof}",
             "--entrypoint",
             "python",
-            "cayu-review-agent:local",
+            image,
             str(Path(__file__).with_name("_browser_acceptance_operator_live.py").resolve()),
             "controller",
         )
