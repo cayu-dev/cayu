@@ -53,7 +53,7 @@ from cayu.sessions._assistant_tool_round_publication import (
 from cayu.sessions._checkpoint_secret_validation import durable_value_contains_secret
 from cayu.sessions.checkpoints import AMBIGUOUS_PENDING_USER_INPUT_CHECKPOINT_KEY
 from cayu.tools._policy_evidence import ToolPolicyEvidence
-from cayu.tools.catalogue import CALL_TOOL_NAME
+from cayu.tools.catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
 from cayu.tools.exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
@@ -515,7 +515,7 @@ class PendingUserInput(BaseModel):
         if unexposed_calls and self.tool_exposure is None:
             raise ValueError("Unexposed user-input siblings require a frozen exposure snapshot.")
         if self.tool_exposure is not None:
-            exposed_names = frozenset(self.tool_exposure.tool_names)
+            exposed_names = frozenset((*self.tool_exposure.tool_names, SEARCH_TOOLS_NAME))
             if any(call.tool_name in exposed_names for call in unexposed_calls):
                 raise ValueError(
                     "Unexposed user-input sibling evidence conflicts with the snapshot."
