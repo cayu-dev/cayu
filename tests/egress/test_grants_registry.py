@@ -425,3 +425,27 @@ def test_zero_ttl_is_rejected() -> None:
             credential_kind="stripe_bearer",
             ttl_seconds=0,
         )
+
+
+def test_an_api_key_header_is_a_presented_credential_only_when_it_holds_a_virtual_value() -> None:
+    from cayu.egress.credential_kinds import PresentedCredential, extract_presented_credential
+
+    virtual = "cayu_vc_" + "ab" * 24
+    assert extract_presented_credential({"X-Api-Key": virtual}) == PresentedCredential(
+        virtual, None, header="x-api-key"
+    )
+    assert extract_presented_credential({"x-goog-api-key": f" {virtual} "}) == PresentedCredential(
+        virtual, None, header="x-goog-api-key"
+    )
+    # A workload's own key there is left untouched.
+    assert extract_presented_credential({"x-api-key": "sk-ant-own-key"}) is None
+    # Authorization keeps precedence, unless only the API key header holds a virtual value.
+    assert extract_presented_credential(
+        {"Authorization": "Bearer other", "x-api-key": virtual}
+    ) == PresentedCredential(virtual, None, header="x-api-key")
+    assert extract_presented_credential(
+        {"Authorization": f"Bearer {virtual}", "x-api-key": "cayu_vc_" + "cd" * 24}
+    ) == PresentedCredential(virtual, "bearer")
+    assert extract_presented_credential(
+        {"Authorization": "Bearer other", "x-api-key": "own"}
+    ) == PresentedCredential("other", "bearer")

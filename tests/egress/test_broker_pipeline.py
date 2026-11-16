@@ -858,6 +858,100 @@ def test_opaque_token_request_injects_real_secret_upstream_only() -> None:
     _no_real_secret(decisions)
 
 
+def _model_api_policy(host: str) -> HttpEgressPolicy:
+    return HttpEgressPolicy(
+        name="model-api",
+        allowed_hosts=[host],
+        allowed_endpoints=[("POST", "/v1/messages")],
+    )
+
+
+@pytest.mark.parametrize(
+    ("credential_kind", "header", "host"),
+    [
+        ("opaque_x_api_key", "x-api-key", "api.anthropic.com"),
+        ("opaque_x_goog_api_key", "x-goog-api-key", "generativelanguage.googleapis.com"),
+    ],
+)
+def test_api_key_header_request_injects_real_secret_in_its_own_header(
+    credential_kind: str, header: str, host: str
+) -> None:
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+    broker, registry, resolver, decisions = _build(
+        upstream=upstream, policies={"model-api": _model_api_policy(host)}
+    )
+    grant = _mint(
+        registry,
+        env_name="MODEL_API_KEY",
+        secret=SecretRef(name="github_token"),
+        destination=host,
+        credential_kind=credential_kind,
+        policy_name="model-api",
+    )
+    request = CapturedRequest(
+        method="POST",
+        host=host,
+        path="/v1/messages",
+        headers={header.title(): grant.presented_value, "anthropic-version": "2023-06-01"},
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 200
+    assert upstream.sent is not None
+    sent = {name.lower(): value for name, value in upstream.sent.headers.items()}
+    assert sent[header] == GITHUB_SECRET
+    assert "authorization" not in sent
+    assert sent["anthropic-version"] == "2023-06-01"
+    assert grant.presented_value not in str(upstream.sent.headers)
+    assert resolver.resolve_count == 1
+    assert decisions[-1].allowed is True
+    _no_real_secret(decisions)
+
+
+@pytest.mark.parametrize(
+    ("credential_kind", "headers"),
+    [
+        # A header kind presented as a bearer token, or in the other API key header.
+        ("opaque_x_api_key", {"Authorization": "Bearer {credential}"}),
+        ("opaque_x_api_key", {"x-goog-api-key": "{credential}"}),
+        # A bearer kind presented in an API key header.
+        ("opaque_bearer", {"x-api-key": "{credential}"}),
+    ],
+)
+def test_api_key_header_kinds_reject_a_credential_presented_elsewhere(
+    credential_kind: str, headers: dict[str, str]
+) -> None:
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+    broker, registry, resolver, decisions = _build(
+        upstream=upstream, policies={"model-api": _model_api_policy("api.anthropic.com")}
+    )
+    grant = _mint(
+        registry,
+        env_name="MODEL_API_KEY",
+        secret=SecretRef(name="github_token"),
+        destination="api.anthropic.com",
+        credential_kind=credential_kind,
+        policy_name="model-api",
+    )
+    request = CapturedRequest(
+        method="POST",
+        host="api.anthropic.com",
+        path="/v1/messages",
+        headers={
+            name: value.format(credential=grant.presented_value) for name, value in headers.items()
+        },
+    )
+
+    response = asyncio.run(broker.handle_request(request))
+
+    assert response.status_code == 403
+    assert b"authentication scheme does not match" in response.body
+    assert resolver.resolve_count == 0
+    assert upstream.sent is None
+    assert decisions[-1].allowed is False
+
+
 @pytest.mark.parametrize(
     ("credential_kind", "authorization_template"),
     [

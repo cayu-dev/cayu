@@ -13210,7 +13210,13 @@ driver examples and own their allocation durability obligations.
 contract. `stripe_bearer` accepts `Authorization: Bearer` and Stripe-style
 Basic username presentation, then forwards the resolved secret as Bearer;
 `opaque_bearer` accepts and forwards Bearer; `opaque_token` accepts and forwards
-the literal `Authorization: token …` scheme used by GitHub CLI. The broker
+the literal `Authorization: token …` scheme used by GitHub CLI.
+`opaque_x_api_key` and `opaque_x_goog_api_key` accept the bare virtual value in
+the `x-api-key` or `x-goog-api-key` header and forward the resolved secret in
+that header alone. Such a header is a presented credential only when its value
+uses a registered Cayu virtual-credential prefix, and `Authorization` takes
+precedence unless only the API key header holds a virtual value. A credential
+presented in a header its grant kind doesn't name is denied before resolution. The broker
 retains the presented scheme during extraction and requires it to match the
 grant kind before resolving the vault reference. A mismatched or unsupported
 scheme is denied without resolving or forwarding the real credential. A bare

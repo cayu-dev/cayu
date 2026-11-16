@@ -267,10 +267,14 @@ prepared and then accidentally discarded by an unrelated runner factory. Keep
 provider-specific business authorization in the app, provider-scoped
 credentials, or a custom policy.
 Supported credential shapes are closed for now: `stripe_bearer`,
-`opaque_bearer`, and `opaque_token`. The last shape carries an opaque secret as
-`Authorization: token …`; see the
+`opaque_bearer`, `opaque_token`, `opaque_x_api_key` and `opaque_x_goog_api_key`.
+`opaque_token` carries an opaque secret as `Authorization: token …`; see the
 [GitHub CLI recipe](recipes/github-cli-virtual-egress.md) for the executable
-proof and its compatibility boundary.
+proof and its compatibility boundary. `opaque_x_api_key` and
+`opaque_x_goog_api_key` carry the whole key in an `x-api-key` or
+`x-goog-api-key` header, as Anthropic's and Google's Gemini APIs take it: the
+workload's SDK sends the virtual value there and the broker forwards the real
+key in the same header.
 
 Install the TLS/Docker pieces with the optional extra:
 

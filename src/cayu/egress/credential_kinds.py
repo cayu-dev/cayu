@@ -12,16 +12,26 @@ _VIRTUAL_VALUE_TOKEN_HEX_CHARS = _VIRTUAL_VALUE_ENTROPY_BYTES * 2
 _HEX_CHARS = frozenset("0123456789abcdef")
 
 HeaderRewriter = Callable[[str, Mapping[str, str]], dict[str, str]]
-CredentialKind: TypeAlias = Literal["stripe_bearer", "opaque_bearer", "opaque_token"]
+CredentialKind: TypeAlias = Literal[
+    "stripe_bearer", "opaque_bearer", "opaque_token", "opaque_x_api_key", "opaque_x_goog_api_key"
+]
 AuthorizationScheme: TypeAlias = Literal["basic", "bearer", "token"]
+
+
+# Request headers that carry a whole API key on their own, instead of in ``Authorization``:
+# ``x-api-key`` (Anthropic's API and others) and ``x-goog-api-key`` (Google's Gemini API).
+API_KEY_HEADERS: tuple[str, ...] = ("x-api-key", "x-goog-api-key")
 
 
 @dataclass(frozen=True)
 class PresentedCredential:
-    """A credential value plus the normalized HTTP authorization scheme used."""
+    """A credential value plus where it came from: the normalized HTTP authorization scheme
+    for an ``Authorization`` header, or the API key header (``API_KEY_HEADERS``) that carried
+    it, lowercased, with no scheme."""
 
     value: str
     authorization_scheme: AuthorizationScheme | None
+    header: str = "authorization"
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,9 @@ class CredentialKindDescriptor:
     accepted_authorization_schemes: tuple[AuthorizationScheme, ...]
     header_rewriter: HeaderRewriter | None = None
     test_mode_real_secret_prefixes: tuple[str, ...] = ()
+    # The header the credential is presented and forwarded in; ``authorization`` uses
+    # ``accepted_authorization_schemes``, an API key header carries the bare value.
+    credential_header: str = "authorization"
 
     def rewrite_headers(self, secret: str, headers: Mapping[str, str]) -> dict[str, str]:
         if self.header_rewriter is None:
@@ -40,6 +53,10 @@ class CredentialKindDescriptor:
         return self.header_rewriter(secret, headers)
 
     def accepts(self, presented: PresentedCredential) -> bool:
+        if presented.header != self.credential_header:
+            return False
+        if self.credential_header != "authorization":
+            return presented.authorization_scheme is None
         return presented.authorization_scheme in self.accepted_authorization_schemes
 
     def validate_presented_value(self, value: str) -> None:
@@ -73,9 +90,36 @@ def _authorization_rewriter(scheme: str) -> HeaderRewriter:
     return rewrite
 
 
-def extract_presented_credential(headers: Mapping[str, str]) -> PresentedCredential | None:
-    """Extract one authorization credential without losing its supported scheme."""
+def _api_key_header_rewriter(header: str) -> HeaderRewriter:
+    def rewrite(secret: str, headers: Mapping[str, str]) -> dict[str, str]:
+        rewritten = _without_header(headers, header)
+        rewritten[header] = secret
+        return rewritten
 
+    return rewrite
+
+
+def extract_presented_credential(headers: Mapping[str, str]) -> PresentedCredential | None:
+    """Extract one credential without losing where it was presented.
+
+    ``Authorization`` comes first, with its scheme. An API key header (``API_KEY_HEADERS``)
+    is taken only when it holds a value in Cayu's virtual credential namespace and
+    ``Authorization`` doesn't: any other value there is the workload's own and is left
+    untouched."""
+
+    authorization = _extract_authorization(headers)
+    if authorization is not None and uses_virtual_credential_namespace(authorization.value):
+        return authorization
+    for header in API_KEY_HEADERS:
+        value = next(
+            (item.strip() for name, item in headers.items() if name.lower() == header), None
+        )
+        if value and uses_virtual_credential_namespace(value):
+            return PresentedCredential(value, None, header=header)
+    return authorization
+
+
+def _extract_authorization(headers: Mapping[str, str]) -> PresentedCredential | None:
     value = next(
         (header_value for name, header_value in headers.items() if name.lower() == "authorization"),
         None,
@@ -125,6 +169,20 @@ SUPPORTED_CREDENTIAL_KINDS: dict[str, CredentialKindDescriptor] = {
         virtual_prefix=_GENERIC_PREFIX,
         accepted_authorization_schemes=("token",),
         header_rewriter=_authorization_rewriter("token"),
+    ),
+    "opaque_x_api_key": CredentialKindDescriptor(
+        credential_kind="opaque_x_api_key",
+        virtual_prefix=_GENERIC_PREFIX,
+        accepted_authorization_schemes=(),
+        header_rewriter=_api_key_header_rewriter("x-api-key"),
+        credential_header="x-api-key",
+    ),
+    "opaque_x_goog_api_key": CredentialKindDescriptor(
+        credential_kind="opaque_x_goog_api_key",
+        virtual_prefix=_GENERIC_PREFIX,
+        accepted_authorization_schemes=(),
+        header_rewriter=_api_key_header_rewriter("x-goog-api-key"),
+        credential_header="x-goog-api-key",
     ),
 }
 
