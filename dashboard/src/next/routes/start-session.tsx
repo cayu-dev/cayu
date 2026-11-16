@@ -158,6 +158,7 @@ function StartSessionForm({ onClose, initialMode, onPendingChange }: StartSessio
   }, [agent, specialists.data])
   useEffect(() => {
     if (types.length && !types.some((t) => t.name === typeName)) setTypeName(types[0]?.name ?? "")
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- the effect only corrects a selection that is no longer offered
   }, [types, typeName])
   const taskType: TaskType | undefined = types.find((t) => t.name === typeName)
   const fields = taskType ? schemaFields(taskType.input_schema) : null

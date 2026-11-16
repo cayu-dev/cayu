@@ -47,7 +47,9 @@ export function BrowserOperator({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     return () => {
+      // oxlint-disable-next-line react-hooks/exhaustive-deps -- cleanup acts on whatever these refs hold when the operator unmounts
       generation.current++
+      // oxlint-disable-next-line react-hooks/exhaustive-deps -- cleanup acts on whatever these refs hold when the operator unmounts
       if (privateText.current) privateText.current.value = ""
       inputOwner.current?.stop()
       inputOwner.current = null

@@ -1,6 +1,6 @@
-import path from "path";
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
+import path from "path"
+import { defineConfig } from "vite-plus"
+import react from "@vitejs/plugin-react"
 
 // The parts in src/parts as an ES module library (`npm run build:parts`): one file per
 // source module, with react, react-query and the app's `@kit` left for the app to provide.
@@ -19,13 +19,7 @@ export default defineConfig({
       formats: ["es"],
     },
     rolldownOptions: {
-      external: [
-        "react",
-        "react-dom",
-        "react/jsx-runtime",
-        "@tanstack/react-query",
-        /^@kit\//,
-      ],
+      external: ["react", "react-dom", "react/jsx-runtime", "@tanstack/react-query", /^@kit\//],
       output: {
         preserveModules: true,
         preserveModulesRoot: path.resolve(import.meta.dirname, "src"),
@@ -33,4 +27,4 @@ export default defineConfig({
       },
     },
   },
-});
+})

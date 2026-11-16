@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { applyViewerAccess } from "../src/lib/dashboard-access.ts"
 import { validateEnvironmentSearch } from "../src/lib/environment-search.ts"
 import * as model from "../src/next/routes/environments/environment-model.ts"

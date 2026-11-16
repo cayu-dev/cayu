@@ -48,7 +48,9 @@ After changing `web/src`, run `npm --prefix web ci` and `npm --prefix web run bu
 and commit `web/static`, so running and deploying need no Node.
 `npm --prefix web run check:build` fails when `web/static` isn't the build of
 `web/src`, and `npm --prefix web run dev` reloads the app live against
-`cayu serve --dev`.
+`cayu serve --dev`. The app builds, lints and formats with Vite+ (`vp`, settings in
+`web/vite.config.ts`): `npm --prefix web run lint`, and `npm --prefix web run format`
+(or `format:check`).
 
 ### Areas
 

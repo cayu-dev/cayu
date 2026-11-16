@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { TaskOperation } from "../src/next/app/task-operation.ts"
 
 test("lost acknowledgement retains exact operation and copied input until retry", async () => {

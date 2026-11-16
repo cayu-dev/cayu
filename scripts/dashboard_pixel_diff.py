@@ -1,6 +1,6 @@
 """Compare two prototype builds of the Developer dashboard pixel by pixel.
 
-Build the prototype (``CAYU_PROTOTYPE=1 npx vite build`` in ``dashboard/``, which
+Build the prototype (``CAYU_PROTOTYPE=1 npx vp build`` in ``dashboard/``, which
 writes ``dist/prototype``) once from the base commit and once from the change, then
 run::
 

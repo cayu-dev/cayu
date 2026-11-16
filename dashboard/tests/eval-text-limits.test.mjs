@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import { newEvalSuiteDraft, validateEvalSuiteDraft } from "../src/lib/eval-suite-authoring.ts"
 import {

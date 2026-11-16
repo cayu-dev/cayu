@@ -96,7 +96,7 @@ export function startPrivateBrowserViewer(
         clear()
         // A decoding bitmap can outlive the message callback. Join its disposal
         // before promising that no old frame remains renderable.
-        void Promise.allSettled([...decoding]).then(() => {
+        void Promise.allSettled(decoding).then(() => {
           clear()
           if (!closed) {
             purgeAcknowledged = true

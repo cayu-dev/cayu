@@ -8,8 +8,12 @@
     <script>
       ;(function () {
         try {
-          var t = localStorage.getItem("cayu-dashboard-theme") || document.documentElement.getAttribute("data-theme")
-          var dark = t === "dark" || (t !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches)
+          var t =
+            localStorage.getItem("cayu-dashboard-theme") ||
+            document.documentElement.getAttribute("data-theme")
+          var dark =
+            t === "dark" ||
+            (t !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches)
           document.documentElement.classList.toggle("dark", dark)
         } catch (e) {}
       })()

@@ -68,7 +68,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
         const id = replay.state.taskId!
         replay.clear()
         void cache.invalidateQueries({ queryKey: ["tasks"] })
-        go(taskRoute(id))
+        void go(taskRoute(id))
       }
     } finally {
       replayStarting.current = false
@@ -172,7 +172,7 @@ export function TaskActions({ task }: { task: TaskInfo }) {
           onClick={() => {
             const id = replayState.taskId!
             replay.clear()
-            go(taskRoute(id))
+            void go(taskRoute(id))
           }}
         >
           Open replayed task

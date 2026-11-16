@@ -4,27 +4,27 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=22.18.0"
+    "node": "^22.18.0 || ^24.11.0 || >=26.0.0"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build && node scripts/finalize-third-party-licenses.mjs dist && node scripts/check-third-party-licenses.mjs dist",
-    "build:package": "tsc && vite build --outDir ../src/cayu/server/dashboard --emptyOutDir && node scripts/finalize-third-party-licenses.mjs ../src/cayu/server/dashboard && node scripts/check-third-party-licenses.mjs ../src/cayu/server/dashboard",
+    "dev": "vp dev",
+    "build": "tsc && vp build && node scripts/finalize-third-party-licenses.mjs dist && node scripts/check-third-party-licenses.mjs dist",
+    "build:package": "tsc && vp build --outDir ../src/cayu/server/dashboard --emptyOutDir && node scripts/finalize-third-party-licenses.mjs ../src/cayu/server/dashboard && node scripts/check-third-party-licenses.mjs ../src/cayu/server/dashboard",
     "build:parts": "node scripts/pack-parts.mjs",
-    "preview": "vite preview",
+    "preview": "vp preview",
     "generate:api": "node scripts/run-python.mjs scripts/generate-api-types.py",
     "generate:api:repo": "node scripts/run-python.mjs --repository scripts/generate-api-types.py",
     "check:api": "node scripts/run-python.mjs scripts/generate-api-types.py --check",
     "check:api:repo": "node scripts/run-python.mjs --repository scripts/generate-api-types.py --check",
-    "lint": "biome check src/ tests/",
-    "lint:fix": "biome check --fix src/ tests/",
-    "format": "biome format --write src/ tests/",
-    "test": "node --experimental-strip-types --test",
-    "test:prototype": "CAYU_PROTOTYPE=1 vite build && playwright test",
+    "lint": "vp lint --deny-warnings",
+    "lint:fix": "vp lint --fix",
+    "format": "vp fmt",
+    "format:check": "vp fmt --check",
+    "test": "vp test run",
+    "test:prototype": "CAYU_PROTOTYPE=1 vp build && playwright test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.16",
     "@hey-api/openapi-ts": "0.99.0",
     "@playwright/test": "1.64.1",
     "@tailwindcss/vite": "^4.3.0",
@@ -35,7 +35,8 @@
     "@vitejs/plugin-react": "^6.0.2",
     "tailwindcss": "^4.3.0",
     "typescript": "~6.0.2",
-    "vite": "^8.3.5"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0-rc.1",
+    "vite-plus": "1.0.0-rc.1"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
@@ -53,6 +54,7 @@
   },
   "overrides": {
     "js-yaml": "4.3.2",
-    "seroval": "1.7.9"
+    "seroval": "1.7.9",
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0-rc.1"
   }
 }

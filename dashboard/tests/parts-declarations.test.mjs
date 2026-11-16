@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import path from "node:path"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import { declarationName, shipsDeclaration } from "../scripts/parts-declarations.mjs"
 

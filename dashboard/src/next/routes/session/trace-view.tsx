@@ -298,6 +298,7 @@ function TraceViewContent({
           !runtimePage?.spans.some((span) => span.id === spanId)))
     )
       void runtime.loadMore()
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- the fields of `runtime` this reads are listed; the object itself is new on every render
   }, [
     transcriptPosition,
     spanId,
@@ -323,6 +324,7 @@ function TraceViewContent({
       runtimePage && !prototype
         ? buildRuntimeTrace(runtimePage)
         : buildTrace(session.id, all, now(), state ? (TERMINAL[state] ?? null) : null),
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- `all` is rebuilt on every render, so the trace is too
     [session.id, all, now, state, runtimePage, prototype],
   )
   const selected = useMemo(() => {

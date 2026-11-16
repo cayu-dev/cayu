@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { fileURLToPath } from "node:url"
 
 const runner = fileURLToPath(new URL("../scripts/run-python.mjs", import.meta.url))

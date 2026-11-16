@@ -76,7 +76,6 @@ REQUIRED_SOURCE_FILES = GENERATED_SOURCE_FILES | frozenset(
         "README.md",
         "REDISTRIBUTION.md",
         "THIRD_PARTY_LICENSES.md",
-        "biome.json",
         "package-lock.json",
         "package.json",
         "scripts/check-third-party-licenses.mjs",

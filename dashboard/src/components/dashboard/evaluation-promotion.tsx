@@ -884,7 +884,9 @@ function PromotionEvidenceSummary({
         {preview.scenario_conversion.available && preview.scenario_conversion.scenario ? (
           <>
             <CheckCircle2 className="mr-1.5 inline h-3.5 w-3.5 text-emerald-600" />
-            Production scenario captured with {preview.scenario_conversion.scenario.events.length}{" "}
+            Production scenario captured with {
+              preview.scenario_conversion.scenario.events.length
+            }{" "}
             ordered
             {preview.scenario_conversion.scenario.events.length === 1 ? " stage" : " stages"}.
           </>
@@ -1359,7 +1361,7 @@ export function ExpectedBehaviorEditor({
       <CardContent className="space-y-3">
         {assertions.map((assertion, index) => (
           <AssertionEditor
-            // biome-ignore lint/suspicious/noArrayIndexKey: rows never reorder and own no local state.
+            // oxlint-disable-next-line react/no-array-index-key -- rows never reorder and own no local state.
             key={index}
             assertion={assertion}
             index={index}
@@ -1638,7 +1640,7 @@ export function AssertionFields({
             <div className="space-y-2">
               {assertion.tool_names.map((toolName, toolIndex) => (
                 <div
-                  // biome-ignore lint/suspicious/noArrayIndexKey: ordered names own no local state.
+                  // oxlint-disable-next-line react/no-array-index-key -- ordered names own no local state.
                   key={toolIndex}
                   className="flex items-start gap-2"
                 >
@@ -1725,7 +1727,7 @@ export function AssertionFields({
           <div className="space-y-2">
             {assertion.events.map((processEvent, eventIndex) => (
               <div
-                // biome-ignore lint/suspicious/noArrayIndexKey: ordered values own no local state.
+                // oxlint-disable-next-line react/no-array-index-key -- ordered values own no local state.
                 key={eventIndex}
                 className="flex items-start gap-2"
               >

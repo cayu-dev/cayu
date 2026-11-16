@@ -14,16 +14,16 @@ capability gates and sidebar. The ported pages live under `src/next/routes/`;
 If you customised the replaced dashboard, move those changes to their current
 owners before rebuilding:
 
-| Removed source | Current owner |
-| --- | --- |
-| `src/Layout.tsx` | `src/app/layout.tsx` and `src/app/router.tsx` |
-| `src/routes/dashboard.tsx`, `run.tsx` | `src/next/routes/home-page.tsx` and the shared Start form |
-| `src/routes/sessions.tsx`, `session-detail.tsx` | `src/next/routes/sessions-page.tsx` and `src/next/routes/session/` |
-| `src/routes/pending-actions.tsx` | `src/next/routes/inbox-page.tsx` and shared session decision controls |
-| `src/routes/agents.tsx`, `knowledge.tsx` | Specialists, Tools and Knowledge pages in `src/next/routes/` |
-| `src/routes/tasks.tsx` | `src/next/routes/tasks-page.tsx` and `task-page.tsx` |
-| `src/routes/evals.tsx` | `src/next/routes/evals/` and shared editors in `src/components/dashboard/` |
-| `src/routes/usage.tsx`, `environments.tsx`, `artifacts.tsx`, `system.tsx` | Corresponding pages and helpers in `src/next/routes/` |
+| Removed source                                                            | Current owner                                                              |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `src/Layout.tsx`                                                          | `src/app/layout.tsx` and `src/app/router.tsx`                              |
+| `src/routes/dashboard.tsx`, `run.tsx`                                     | `src/next/routes/home-page.tsx` and the shared Start form                  |
+| `src/routes/sessions.tsx`, `session-detail.tsx`                           | `src/next/routes/sessions-page.tsx` and `src/next/routes/session/`         |
+| `src/routes/pending-actions.tsx`                                          | `src/next/routes/inbox-page.tsx` and shared session decision controls      |
+| `src/routes/agents.tsx`, `knowledge.tsx`                                  | Specialists, Tools and Knowledge pages in `src/next/routes/`               |
+| `src/routes/tasks.tsx`                                                    | `src/next/routes/tasks-page.tsx` and `task-page.tsx`                       |
+| `src/routes/evals.tsx`                                                    | `src/next/routes/evals/` and shared editors in `src/components/dashboard/` |
+| `src/routes/usage.tsx`, `environments.tsx`, `artifacts.tsx`, `system.tsx` | Corresponding pages and helpers in `src/next/routes/`                      |
 
 The full workflow inspector is embedded
 in Session Trace. The `/sessions/:id/workflow` alias opens it; `/agents`,
@@ -64,7 +64,7 @@ to the shared page components; it is not the production integration or proof
 of runtime permissions and durability.
 
 With the development server running, open `/prototype.html`. To build only that
-harness, run `CAYU_PROTOTYPE=1 npx vite build`; it writes `dist/prototype/`.
+harness, run `CAYU_PROTOTYPE=1 npx vp build`; it writes `dist/prototype/`.
 The ordinary build uses `src/main.tsx` and the real API. The prototype sources
 are included in the editable archive, but its separate output is not the stock
 dashboard served by Cayu.
@@ -95,14 +95,14 @@ page against its fake API. Tailwind scans `next/` for the components used in pro
 
 ## Develop and build
 
-Install Node.js 22.18.0 or newer, then run:
+Install Node.js 22.18 or newer (22.18+, 24.11+ or 26+, the versions Vite+ supports), then run:
 
 ```bash
 npm ci
 npm run dev
 ```
 
-The Vite development server proxies `/api` to `http://localhost:8000`. Run a compatible Cayu
+The development server (`vp dev`) proxies `/api` to `http://localhost:8000`. Run a compatible Cayu
 server there, or update `vite.config.ts` for your local server.
 
 The stock dashboard follows the server's capability contract. A completely configured
@@ -111,17 +111,22 @@ launch/status/cancellation, complete result inspection, compatible comparison, a
 JSON/HTML downloads. The browser never receives executable target wiring or provider
 credentials; it uses the attached server target and generated API contract.
 
+The toolchain is Vite+ (`vite-plus`, pinned exactly): `vp dev`, `vp build`, `vp lint`,
+`vp fmt` and `vp test`, with test, lint and format settings in `vite.config.ts`. Format with
+`npm run format`.
+
 Create production assets with:
 
 ```bash
 npm run lint
+npm run format:check
 npm run test
 npm run typecheck
 npm run check:api:repo
 npm run build
 ```
 
-Normal development builds support Node.js 22.18.0 or newer. In the Cayu repository,
+Normal development builds support Node.js 22.18 or newer (22.18+, 24.11+ or 26+). In the Cayu repository,
 regenerate the assets shipped in Python packages from the repository root with:
 
 ```bash

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import { unicodeScalarLength } from "../src/lib/durable-text.ts"
 import { LABEL_LIMITS } from "../src/lib/generated/label-limits.ts"

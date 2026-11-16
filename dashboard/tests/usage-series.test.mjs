@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { mockTimeBuckets } from "../src/next/mock/time-series.ts"
 import { histogramRequest, joinedSeriesBuckets } from "../src/next/routes/usage/usage-series.ts"
 

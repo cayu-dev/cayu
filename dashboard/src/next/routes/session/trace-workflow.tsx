@@ -1613,6 +1613,7 @@ export function TraceWorkflow({
     setTopologyRefreshFailures(0)
     void readTopology(undefined, topologyRef.current === undefined ? "initial" : "refresh")
     return () => {
+      // oxlint-disable-next-line react-hooks/exhaustive-deps -- cancel the coordinator that is current when the view goes
       topologyCoordinator.current.cancel()
       pendingTicketRef.current = null
       topologyPendingRef.current = false

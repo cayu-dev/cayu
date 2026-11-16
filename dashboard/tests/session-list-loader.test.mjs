@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { loadSessionList } from "../src/next/app/session-list-loader.ts"
 
 const session = (id, labels = {}) => ({ id, labels })

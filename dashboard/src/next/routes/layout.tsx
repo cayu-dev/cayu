@@ -48,7 +48,7 @@ export function Layout() {
     }),
     [sidebarHidden, mobileOpen],
   )
-  // biome-ignore lint/correctness/useExhaustiveDependencies: close the mobile sidebar on navigation
+  // Close the mobile sidebar on navigation
   useEffect(() => setMobileOpen(false), [pathname])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -230,7 +230,7 @@ function Sidebar({ searchRef }: { searchRef: React.RefObject<HTMLInputElement | 
         <form
           onSubmit={(e) => {
             e.preventDefault()
-            go({ to: "/sessions", search: query.trim() ? { q: query.trim() } : {} })
+            void go({ to: "/sessions", search: query.trim() ? { q: query.trim() } : {} })
           }}
           className="flex h-8 items-center gap-2 rounded-lg px-2.5 text-sm text-muted-foreground focus-within:bg-sidebar-accent hover:bg-sidebar-accent"
         >

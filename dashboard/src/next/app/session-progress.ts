@@ -33,7 +33,7 @@ export function useSessionProgress({
     update()
     return () => document.removeEventListener("visibilitychange", update)
   }, [])
-  // biome-ignore lint/correctness/useExhaustiveDependencies: revision explicitly restarts observation after retry.
+  // Revision explicitly restarts observation after retry.
   useEffect(() => {
     if (!enabled || !visible) return
     const controller = new AbortController()

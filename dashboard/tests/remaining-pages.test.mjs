@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { validateUsageRollupSearch } from "../src/lib/usage-rollup-search.ts"
 import { RANGE_CHOICES, rangeOf, resolveWindow } from "../src/next/routes/usage/usage-window.ts"
 
@@ -105,9 +105,8 @@ test("unknown environment component names stay readable instead of resolving pro
 })
 
 test("observed branch handles retain terminal states and incomplete evidence", async () => {
-  const { branchObservationText } = await import(
-    "../src/next/routes/environments/environment-model.ts"
-  )
+  const { branchObservationText } =
+    await import("../src/next/routes/environments/environment-model.ts")
   assert.match(
     branchObservationText({ attached_count: 1, statuses: ["committed"], truncated: false }),
     /1 committed/,

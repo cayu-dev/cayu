@@ -65,7 +65,6 @@ function App() {
   )
   // The production shell mounts pages only after its contract and identity gates pass;
   // stand in for both with the fake server's contract and an open local deployment's viewer.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: the viewer follows the seed.
   const viewer = useMemo<AppInfoResponse>(() => {
     const { app } = api.records()
     return {
@@ -76,6 +75,7 @@ function App() {
       human_review_required: false,
       human_review_purpose: null,
     }
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- the viewer follows the seed.
   }, [seedId])
   return (
     <QueryClientProvider client={queryClient}>

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { relativeTime } from "../src/next/app/session-model.ts"
 import { when } from "../src/next/app/task-model.ts"
 

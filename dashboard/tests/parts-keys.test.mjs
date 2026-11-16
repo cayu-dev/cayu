@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import { readdirSync, readFileSync } from "node:fs"
 import { dirname, join, relative, resolve } from "node:path"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { fileURLToPath } from "node:url"
 import { inboxKeys, refreshAfterChange } from "../src/parts/inbox/keys.ts"
 import { partKeys } from "../src/parts/keys.ts"

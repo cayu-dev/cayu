@@ -226,7 +226,7 @@ export function SessionPage({
     const next = { ...search, ...patch }
     for (const k of Object.keys(next))
       if (next[k as keyof typeof next] === undefined) delete next[k as keyof typeof next]
-    go({ ...sessionRoute(sessionId), search: next })
+    void go({ ...sessionRoute(sessionId), search: next })
   }
   const setPanel = (tab: PanelTab | undefined) => setSearch({ panel: tab })
   const openTrace = (span?: string) => setSearch({ view: "trace", span, log: undefined })
@@ -482,7 +482,6 @@ export function SessionPage({
     )
   }, [savedReading, conversation, transcriptLoaded, transcriptOffset, filterKey, readingKey])
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: follow new transcript and decision content only while pinned, and once Conversation shows
   useEffect(() => {
     const element = conversationRef.current
     if (!element || !pinned || navigation.current !== null) return
@@ -493,8 +492,9 @@ export function SessionPage({
     const observer = new ResizeObserver(follow)
     observer.observe(element)
     return () => observer.disconnect()
+    // oxlint-disable-next-line react-hooks/exhaustive-deps -- follow new transcript and decision content only while pinned, and once Conversation shows
   }, [pinned, navigation.current, transcript.data, inbox.data?.items.length, conversation])
-  // biome-ignore lint/correctness/useExhaustiveDependencies: close the menus when the session changes
+  // Close the menus when the session changes
   useEffect(() => {
     setMenuOpen(false)
     setConfirmingStop(false)
@@ -567,6 +567,7 @@ export function SessionPage({
         <TopBar
           actions={
             <>
+              {/* oxlint-disable-next-line jsx-a11y/interactive-supports-focus -- the tabs inside take focus; the list moves it between them with the arrow keys */}
               <div
                 className="mr-1 flex rounded-lg border border-border p-0.5"
                 role="tablist"
@@ -1044,7 +1045,7 @@ export function SessionPage({
                       <span className="text-xs text-muted-foreground">{message.role}</span>
                       {message.content.map((part, index) =>
                         part.type === "structured_output" && !structuredOutputEnabled ? null : (
-                          // biome-ignore lint/suspicious/noArrayIndexKey: parts have stable positions within immutable transcript records
+                          // oxlint-disable-next-line react/no-array-index-key -- parts have stable positions within immutable transcript records
                           <TranscriptPart key={index} part={part} />
                         ),
                       )}
@@ -1146,7 +1147,7 @@ export function SessionPage({
                           <Button
                             variant="outline"
                             disabled={inbox.isFetching}
-                            onClick={() => void inbox.fetchNextPage()}
+                            onClick={() => inbox.fetchNextPage()}
                           >
                             Load more actions
                           </Button>
@@ -1398,6 +1399,7 @@ function StopConfirm({
 }) {
   const [reason, setReason] = useState("")
   return (
+    // oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape closes the confirmation from any control inside it
     <div
       role="dialog"
       aria-labelledby="stop-confirm-title"
@@ -1426,7 +1428,7 @@ function StopConfirm({
       </label>
       <textarea
         id="stop-reason"
-        // biome-ignore lint/a11y/noAutofocus: the popover opens on Stop, so typing the reason comes next
+        // The popover opens on Stop, so typing the reason comes next
         autoFocus
         rows={2}
         value={reason}

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { reportedCostText } from "../src/lib/reported-cost.ts"
 
 test("reported amounts stay exact and distinct from pending and estimates", () => {

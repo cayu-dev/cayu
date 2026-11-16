@@ -31,7 +31,7 @@ OLD = "0.0.1"
 SIDECAR_SUFFIX = f".cayu-{VERSION}"
 
 UNEDITED_CHANGED = "src/main.tsx"
-EDITED_UNCHANGED = "biome.json"
+EDITED_UNCHANGED = "tsconfig.parts.json"
 EDITED_CHANGED = "vite.config.ts"
 ADDED = "src/kit/ui.ts"
 REMOVED_UNEDITED = "src/legacy/old.ts"

@@ -116,7 +116,7 @@ function NewSuite({ onClose }: { onClose: () => void }) {
       }),
     onSuccess: ({ suite_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(suiteRoute(suite_id))
+      void go(suiteRoute(suite_id))
     },
   })
   const field =

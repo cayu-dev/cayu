@@ -27,7 +27,7 @@ export function ReadinessSummary({
     >
       <div className="font-medium">{title}</div>
       {diagnostics.map((diagnostic, index) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: diagnostics are immutable preview rows.
+        // oxlint-disable-next-line react/no-array-index-key -- diagnostics are immutable preview rows.
         <div key={`${diagnostic.case_id ?? "suite"}:${index}`} className="mt-1 text-xs">
           {diagnostic.case_id ? `${diagnostic.case_id}: ` : ""}
           {diagnostic.message}

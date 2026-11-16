@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import {
   capturedAssertionSuggestionUnavailable,
@@ -773,9 +773,8 @@ test("promotion API forwards encoded identity, cancellation, and server filename
     })
   }
   try {
-    const { exportEvaluationPromotion, previewEvaluationPromotion } = await import(
-      "../src/lib/api.ts"
-    )
+    const { exportEvaluationPromotion, previewEvaluationPromotion } =
+      await import("../src/lib/api.ts")
     const controller = new AbortController()
     const draft = draftFromCandidate()
     await previewEvaluationPromotion("session/one", draft, controller.signal)

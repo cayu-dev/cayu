@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { reviewApiFromCayuClient } from "../src/parts/review-api.ts"
 
 test("protected review reads through client.js with the purpose, reference and signal", async () => {

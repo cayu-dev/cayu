@@ -75,10 +75,6 @@
       "reference_sha256": "790e3169bc19b046fe55ba1da6d13b976c28363c8c00462a2195fe5faf260910",
       "same": true
     },
-    "web/biome.json": {
-      "reference_sha256": "154dd387935d5cc9575ac3820a7cba92421cbb1f49daf0b358b229ce96661db6",
-      "deviation": "The schema is the locked Biome 2.6.3's and the linter uses `rules.preset` instead of the deprecated `rules.recommended`, so `npm run lint` prints no notice (#4073)."
-    },
     "web/e2e/.gitignore": {
       "reference_sha256": null,
       "deviation": "The smoke test's package and Playwright configuration, shared with the operator app (#4022) and now part of the generic app; the reference has no smoke test (#4023)."
@@ -105,27 +101,27 @@
     },
     "web/package-lock.json": {
       "reference_sha256": "071b7864fe7dea9377fe48f02c9b78497930abb78f49d31651fcf4093990e147",
-      "deviation": "Without lucide-react, which only the imported Inbox part used. Requires Biome ^2.6.3, the locked version its biome.json is written for (#4073)."
+      "deviation": "Without lucide-react, which only the imported Inbox part used. Locks Vite+ instead of Biome and Vite (#4134)."
     },
     "web/package.json": {
       "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Requires Biome ^2.6.3, the locked version its biome.json is written for (#4073)."
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports (#4134)."
     },
     "web/scripts/add-licenses.mjs": {
       "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",
-      "same": true
+      "deviation": "Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/scripts/check-build.mjs": {
       "reference_sha256": "5ed85208594e8af82542fc6edb16969d089d638944f9acfef26ea9fe1f40287d",
-      "deviation": "Runs Vite and add-licenses.mjs with the running Node instead of through npx, which spawnSync can't start on Windows, and removes its temporary folder when a step fails or the build is stale (the reference exits inside the try block)."
+      "deviation": "Runs Vite+ (`vp build`, #4134) and add-licenses.mjs with the running Node instead of through npx, which spawnSync can't start on Windows, and removes its temporary folder when a step fails or the build is stale (the reference exits inside the try block)."
     },
     "web/src/agent/api.ts": {
       "reference_sha256": "ed1aaa1fe4390cd7a543da1b07a9ff7a9fc08aec2fe09f4c03fb1872d904292d",
-      "deviation": "The conversation list query is marked read: true; unused demoSignOut removed; statusOf has one branch (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3."
+      "deviation": "The conversation list query is marked read: true; unused demoSignOut removed; statusOf has one branch (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/src/agent/conversations.tsx": {
       "reference_sha256": "fa380b682c42072b9b220b0d2b6790a02a49ced2c745f814dfa382abf97ba165",
-      "deviation": "Creating a conversation and replying invalidate the conversation lists; a failed /app/me shows an error with a retry instead of loading forever; NoOrganization moved to organization.tsx; conversationPath exported (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3."
+      "deviation": "Creating a conversation and replying invalidate the conversation lists; a failed /app/me shows an error with a retry instead of loading forever; NoOrganization moved to organization.tsx; conversationPath exported (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`); navigation promises are voided and lint suppressions are Oxlint's (#4134)."
     },
     "web/src/agent/index.tsx": {
       "reference_sha256": "4b92b6bad8409859dc707a116eaae51b7c6d71dedbdb36bf99b93a64326068fc",
@@ -133,11 +129,11 @@
     },
     "web/src/agent/markdown.tsx": {
       "reference_sha256": "8346a8d7e9866f44e8577e2d75a5ef144dfcf03ccbd713e5b1200b08e7d1a6b2",
-      "same": true
+      "deviation": "Formatted with Vite+ (`vp fmt`), and says why its headings have content, which Oxlint's heading-has-content can't see (#4134)."
     },
     "web/src/agent/members.tsx": {
       "reference_sha256": "ff8708373304fe532298f154836b9e2daf4ead57946131ecb4b22d11c8b9744a",
-      "deviation": "A failed /app/me shows an error with a retry; invalidations use membersQuery's key and whoamiKey (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3."
+      "deviation": "A failed /app/me shows an error with a retry; invalidations use membersQuery's key and whoamiKey (review of #3841). No departments: Cayu's organizations have members and roles only, and grouping people inside an organization is the application's choice (#4122); the reference moves under cayu-b2b-reference#3. Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/src/agent/organization.tsx": {
       "reference_sha256": "9c84cb94f93f00b3094ff5bf9c1a34b33cbd76cd736e8ba137250478521af25f",
@@ -173,7 +169,7 @@
     },
     "web/src/app/routes.tsx": {
       "reference_sha256": "bec83f26f132fb94775608490c2803622e21fd055ec1307d86964d488b8878d0",
-      "same": true
+      "deviation": "Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/src/app/services.tsx": {
       "reference_sha256": "f5a6419e455a1088ab6835c510b766f1c3a23d0d0862dcd58453d704e85b385a",
@@ -185,11 +181,11 @@
     },
     "web/src/blocks/task-runs.tsx": {
       "reference_sha256": "0c5d2e7283eb0a0a2bdb3b4d8ea3db1502a397ca64dc987604a2320d0633f56c",
-      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839). Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval (#3860)."
+      "deviation": "The comment no longer names a private issue. Labels the `partial` run status (review of #3839). Exports taskRunsApi and taskRunsQuery, which follows /app/task-runs with the kit's watchInterval (#3860). Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/src/generated/overview/index.tsx": {
       "reference_sha256": "1cfb58c9154f94508a2533e757926bfbf2152e1cdfa80ce3f2825dd7a21e3cb7",
-      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860). Says when it last read the overview (dataUpdatedAt), since a 304 keeps the earlier answer's as_of (#4005)."
+      "deviation": "Follows /app/overview with the kit's watchInterval (Cayu's watch cadence, ignoring as_of) instead of a 30-second timer (#3860). Says when it last read the overview (dataUpdatedAt), since a 304 keeps the earlier answer's as_of (#4005). Formatted with Vite+ (`vp fmt`), and its lint suppression is Oxlint's (#4134)."
     },
     "web/src/generated/settings/index.tsx": {
       "reference_sha256": "27ec9dc65bf76e3c8a538b051286a71da4abcb0fec9c5369aa18689ae999922c",
@@ -197,7 +193,7 @@
     },
     "web/src/generated/settings/page.tsx": {
       "reference_sha256": "63ce0183f60e8391f0269fcca2b9e8881a6fb6749ffb94b6a6f9e2c8eb6ed96f",
-      "deviation": "A comment says the kit's settings rows instead of naming the private kit."
+      "deviation": "A comment says the kit's settings rows instead of naming the private kit. Formatted with Vite+ (`vp fmt`) (#4134)."
     },
     "web/src/kit/shadcn/components/alert.tsx": {
       "reference_sha256": "d5f89fec55b16abccbde138f856a3e45b2b656e0c58ef62b2f5833c87cc2720c",
@@ -425,7 +421,7 @@
     },
     "web/src/main.tsx": {
       "reference_sha256": "1ccd124f71fded2eea9a24bb0402273194216c63c3f333d99c9f497b4206273f",
-      "deviation": "The browser router has no /app/ui basename. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+      "deviation": "The browser router has no /app/ui basename. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Calls `session.expire()` from an arrow function, as Oxlint's unbound-method rule asks (#4134)."
     },
     "web/third_party/shadcn-ui.LICENSE": {
       "reference_sha256": "1564074e13439397221ffd522e2e504d56561994a23d371aa5e3ad43e4f5423f",
@@ -433,7 +429,7 @@
     },
     "web/tsconfig.base.json": {
       "reference_sha256": "77d412588912fafd07329be35644386e62c2078c3907bd4e5124036cbc7f9b06",
-      "same": true
+      "deviation": "Uses Vite+'s client types (`vite-plus/client`) instead of Vite's (#4134)."
     },
     "web/tsconfig.json": {
       "reference_sha256": "505560fc20927ebead0630a69eaa83b57c426fc16b78f26c5dc6de6fb5aa37d2",
@@ -441,12 +437,13 @@
     },
     "web/vite.config.ts": {
       "reference_sha256": "a9d0a487695315f8e32a880eeafebf299719fe67daeec58dae9759a760787075",
-      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839)."
+      "deviation": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. No alias or dedupe for the ejected dashboard's parts. base is \"/\" and the dev server proxies /app, /api and /cayu. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router (#3846, #3839). Imports defineConfig from vite-plus and holds the lint and format settings (#4134)."
     }
   },
   "not_generated": {
     "integrations/web.py": "The project no longer serves its pages; `cayu serve` serves web/static at / ([tool.cayu.serve] ui) (#3846).",
     "web/.npmrc": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",
+    "web/biome.json": "Vite+ lints and formats the app instead of Biome; its settings are in vite.config.ts (#4134).",
     "web/src/api/inbox.ts": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
     "web/src/generated/inbox/index.tsx": "The reference imports the Developer dashboard's Inbox from an ejected dashboard/, which generated projects don't have (until #3835 ships it as a part). The shell links to /cayu/inbox instead.",
     "web/src/kit/design/data.ts": "The reference also builds on a second, private component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone.",

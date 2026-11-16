@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import {
   CoalescedAsyncRunner,
@@ -94,7 +94,7 @@ test("coalesced async runners discard queued work after cancellation or failure"
     }
 
     const firstRequest = runner.request(task)
-    runner.request(task)
+    void runner.request(task)
     if (stop === "clear") runner.clearPending()
     firstRelease.resolve()
     await firstRequest
@@ -115,7 +115,7 @@ test("coalesced async runners reset after an unexpected task error", async () =>
   }
 
   const firstRequest = runner.request(failingTask)
-  runner.request(failingTask)
+  void runner.request(failingTask)
   firstRelease.resolve()
   await assert.rejects(firstRequest, /read failed/)
 

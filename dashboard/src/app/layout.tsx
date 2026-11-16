@@ -309,7 +309,8 @@ function DashboardShell() {
         previous.isConnected &&
         previous.getClientRects().length > 0
           ? previous
-          : openRef.current
+          : // oxlint-disable-next-line react-hooks/exhaustive-deps -- focus returns to the opener as it is when the sidebar closes
+            openRef.current
       target?.focus()
     }
   }, [mobileOpen])
@@ -356,7 +357,7 @@ function DashboardShell() {
             onClick={() => setMobileOpen(false)}
           />
         )}
-        {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-modal is present only with the mobile dialog role. */}
+        {/* aria-modal is present only with the mobile dialog role. */}
         <aside
           ref={sidebarRef}
           aria-label="Sidebar"

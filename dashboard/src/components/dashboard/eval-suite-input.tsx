@@ -52,7 +52,7 @@ export function SimpleInputEditor({
       </CardHeader>
       <CardContent className="space-y-3">
         {messages.map((message, index) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: message rows hold no local state.
+          // oxlint-disable-next-line react/no-array-index-key -- message rows hold no local state.
           <div key={`${index}:${messages.length}`} className="flex items-start gap-2">
             <Textarea
               rows={3}

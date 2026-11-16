@@ -1,6 +1,6 @@
 import { defineConfig, devices } from "@playwright/test"
 
-// Serves the consumer's production build (`vite build`) and drives it in one browser.
+// Serves the consumer's production build (`vp build`) and drives it in one browser.
 const PORT = 4179
 
 export default defineConfig({
@@ -12,7 +12,7 @@ export default defineConfig({
   use: { baseURL: `http://127.0.0.1:${PORT}` },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: `npx vite preview --host 127.0.0.1 --port ${PORT} --strictPort`,
+    command: `npx vp preview --host 127.0.0.1 --port ${PORT} --strictPort`,
     url: `http://127.0.0.1:${PORT}/`,
     reuseExistingServer: false,
   },

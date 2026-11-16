@@ -36,7 +36,7 @@ const run = (command, args) =>
 
 rmSync(stage, { recursive: true, force: true })
 rmSync(types, { recursive: true, force: true })
-run("npx", ["vite", "build", "--config", "vite.parts.config.ts", "--logLevel", "warn"])
+run("npx", ["vp", "build", "--config", "vite.parts.config.ts", "--logLevel", "warn"])
 run("npx", ["tsc", "-p", "tsconfig.parts.json"])
 
 // The parts' declarations and the release metadata they name, with their relative

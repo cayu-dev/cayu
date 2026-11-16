@@ -142,7 +142,7 @@ export function ArtifactsPage() {
               maxLength={256}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") filter({ q: e.currentTarget.value || undefined })
+                if (e.key === "Enter") void filter({ q: e.currentTarget.value || undefined })
               }}
               onBlur={(e) => filter({ q: e.currentTarget.value || undefined })}
               placeholder="Search by file name, kind or session"
@@ -207,7 +207,7 @@ export function ArtifactsPage() {
               size="sm"
               onClick={() => {
                 setDraft("")
-                go({ to: "/artifacts", search: {}, replace: true, resetScroll: false })
+                void go({ to: "/artifacts", search: {}, replace: true, resetScroll: false })
               }}
             >
               Clear filters

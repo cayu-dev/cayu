@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test, vi } from "vite-plus/test"
+import { useFakeTimeouts } from "./fake-timeouts.mjs"
 import {
   encodePrivateBrowserText,
   startPrivateBrowserInput,
@@ -85,8 +86,8 @@ test("wrong-generation and malformed acknowledgements never settle input", async
   }
 })
 
-test("deadline after send closes waiting and never retransmits", async (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] })
+test("deadline after send closes waiting and never retransmits", async () => {
+  useFakeTimeouts()
   const transport = socket()
   const input = startPrivateBrowserInput(
     transport,
@@ -96,7 +97,7 @@ test("deadline after send closes waiting and never retransmits", async (t) => {
   )
   transport.onopen()
   transport.onmessage({ data: "ready" })
-  t.mock.timers.tick(30_000)
+  vi.advanceTimersByTime(30_000)
   await assert.rejects(input.settled, /do not resend/)
   assert.equal(transport.sent.length, 2)
   assert.equal(transport.closed, 1)

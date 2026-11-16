@@ -5,12 +5,7 @@ import { AppLayout } from "./layout";
 import { AppNotFoundPage, AppRouteErrorPage } from "./status-pages";
 
 /** GENERATED. Every area's routes under one layout. */
-export function createRoutes(
-  agent: AgentIdentity,
-  areas: readonly AppArea[],
-  context: Omit<AreaContext, "areas">,
-  shell: ShellParts = {},
-): RouteObject[] {
+export function createRoutes(agent: AgentIdentity, areas: readonly AppArea[], context: Omit<AreaContext, "areas">, shell: ShellParts = {}): RouteObject[] {
   return [
     {
       path: "/",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { onTestFinished, test, vi } from "vite-plus/test"
 
 import {
   environmentManager,
@@ -163,15 +163,15 @@ test("unchanged responses are counted once per response and reset on change", ()
   assert.equal(responseFingerprint(undefined), null)
 })
 
-test("a query observer follows the waiting backoff and restarts after a reset", async (t) => {
+test("a query observer follows the waiting backoff and restarts after a reset", async () => {
   const timers = new ManualTimers()
   timeoutManager.setTimeoutProvider(timers)
   // Query Core disables refetch intervals outside a browser.
   environmentManager.setIsServer(() => false)
-  t.after(() => {
+  onTestFinished(() => {
     environmentManager.setIsServer(() => typeof window === "undefined")
     // Restoring the global timers makes Query Core warn about the provider switch.
-    t.mock.method(console, "error", () => {})
+    vi.spyOn(console, "error").mockImplementation(() => {})
     timeoutManager.setTimeoutProvider({
       setTimeout: (callback, delay) => setTimeout(callback, delay),
       clearTimeout: (id) => clearTimeout(id),

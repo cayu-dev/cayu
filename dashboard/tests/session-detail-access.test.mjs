@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { applyViewerAccess } from "../src/lib/dashboard-access.ts"
 
 test("members can read structured transcript evidence without acquiring execution rights", () => {

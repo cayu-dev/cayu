@@ -242,6 +242,7 @@ export function SessionAnnotations({
                   }}
                   rows={10}
                   spellCheck={false}
+                  // oxlint-disable-next-line jsx-a11y/no-autofocus -- the editor opens on Edit, so typing comes next
                   autoFocus
                   disabled={labelsSaving}
                   aria-invalid={labelsEditor.error !== null}
@@ -344,6 +345,7 @@ export function SessionAnnotations({
                   }}
                   rows={10}
                   spellCheck={false}
+                  // oxlint-disable-next-line jsx-a11y/no-autofocus -- the editor opens on Edit, so typing comes next
                   autoFocus
                   disabled={metadataSaving}
                   aria-invalid={metadataEditor.error !== null}

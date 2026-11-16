@@ -169,7 +169,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
               size="sm"
               onClick={() => {
                 setSearchReset((version) => version + 1)
-                go({ to: "/sessions", search: sessionIndexSearchWithoutFilters(search) })
+                void go({ to: "/sessions", search: sessionIndexSearchWithoutFilters(search) })
               }}
             >
               Clear filters
@@ -272,7 +272,7 @@ export function SessionsPage({ canStart = true }: { canStart?: boolean } = {}) {
         {rows.length > 0 && (
           <section
             aria-label="Session results"
-            // biome-ignore lint/a11y/noNoninteractiveTabindex: keyboard users must be able to scroll the wide results table.
+            // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- keyboard users must be able to scroll the wide results table.
             tabIndex={0}
             className="mt-3 overflow-x-auto rounded-xl border border-border focus-visible:outline-2 focus-visible:outline-ring"
           >

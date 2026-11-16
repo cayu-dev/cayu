@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { parseDashboardSearch, stringifyDashboardSearch } from "../src/lib/search-params.ts"
 import {
   DEFAULT_SESSION_ORDER,

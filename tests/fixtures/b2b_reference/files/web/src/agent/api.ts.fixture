@@ -124,8 +124,7 @@ export function b2bApi(request: Requester) {
     },
     members: (organization: string, signal?: AbortSignal) =>
       request(`organizations/${encodeURIComponent(organization)}/members`, { signal, schema: z.array(membership) }),
-    putMember: (organization: string, subject: string, role: Role) =>
-      request(memberPath(organization, subject), { method: "PUT", body: { role } }),
+    putMember: (organization: string, subject: string, role: Role) => request(memberPath(organization, subject), { method: "PUT", body: { role } }),
     removeMember: (organization: string, subject: string) => request(memberPath(organization, subject), { method: "DELETE" }),
   };
 }

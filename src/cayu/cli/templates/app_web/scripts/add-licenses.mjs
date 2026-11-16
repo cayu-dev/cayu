@@ -20,9 +20,7 @@ async function packageLicense(name) {
 const additions = [
   await packageLicense("tailwindcss"),
   await packageLicense("tw-animate-css"),
-  `## shadcn/ui (MIT)\n\nSource: https://github.com/shadcn-ui/ui\n\n${(
-    await readFile(path.join(root, "third_party", "shadcn-ui.LICENSE"), "utf8")
-  ).trim()}\n`,
+  `## shadcn/ui (MIT)\n\nSource: https://github.com/shadcn-ui/ui\n\n${(await readFile(path.join(root, "third_party", "shadcn-ui.LICENSE"), "utf8")).trim()}\n`,
 ];
 const existing = await readFile(output, "utf8");
 await writeFile(output, `${existing.trimEnd()}\n\n${additions.join("\n")}`);

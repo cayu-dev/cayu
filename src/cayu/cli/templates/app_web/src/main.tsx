@@ -17,7 +17,7 @@ import { areas, identity, shell } from "./agent";
  * same origin with the person's sign-in cookie; a 401 shows the sign-in page.
  */
 const request = createRequester({ baseUrl: new URL("/app/", window.location.origin).href });
-const queryClient = createQueryClient({ onUnauthorized: session.expire });
+const queryClient = createQueryClient({ onUnauthorized: () => session.expire() });
 const router = createBrowserRouter(createRoutes(identity, areas, { request, queryClient }, shell));
 
 const root = document.getElementById("root");

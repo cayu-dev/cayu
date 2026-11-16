@@ -1,7 +1,7 @@
 import path from "node:path"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
-import { defineConfig } from "vite"
+import { defineConfig } from "vite-plus"
 
 // `@kit` is the app's own kit; nothing maps the package, react or react-query.
 const kit = path.resolve(import.meta.dirname, "src/kit/shadcn")

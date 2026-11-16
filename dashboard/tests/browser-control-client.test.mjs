@@ -1,6 +1,17 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test, vi } from "vite-plus/test"
 import { createBrowserControlClient } from "../src/lib/browser-control-client.ts"
+
+// One case of a test; a failure names the case.
+async function step(name, run) {
+  try {
+    await run()
+  } catch (error) {
+    throw new Error(`${name}: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    })
+  }
+}
 
 const root = new URL("https://dashboard.example/api/browser-control")
 const browser = {
@@ -300,7 +311,7 @@ test("takeover acknowledgement loss preserves continuity for readback without re
   client.dispose()
 })
 
-test("takeover binds an explicit finite checkpoint decision before requesting authority", async (t) => {
+test("takeover binds an explicit finite checkpoint decision before requesting authority", async () => {
   for (const consent of [
     "allow",
     "deny",
@@ -312,7 +323,7 @@ test("takeover binds an explicit finite checkpoint decision before requesting au
     "private-consent-canary",
     {},
   ]) {
-    await t.test(String(consent), async () => {
+    await step(String(consent), async () => {
       const calls = []
       const client = createBrowserControlClient(root, "session", async (url, init) => {
         calls.push({ path: url.pathname, ...init })
@@ -383,8 +394,8 @@ test("handback and sensitive entry require and forward the discovered self-owned
   client.dispose()
 })
 
-test("renewal preserves the source lease and never extends the takeover maximum", async (t) => {
-  t.mock.method(Date, "now", () => 2000)
+test("renewal preserves the source lease and never extends the takeover maximum", async () => {
+  vi.spyOn(Date, "now").mockImplementation(() => 2000)
   const controlled = {
     ...browser,
     state: "operator_controlled",
@@ -427,8 +438,8 @@ test("renewal preserves the source lease and never extends the takeover maximum"
   client.dispose()
 })
 
-test("private input ticket contains only exact control authority and requires settled capture", async (t) => {
-  t.mock.method(Date, "now", () => 2000)
+test("private input ticket contains only exact control authority and requires settled capture", async () => {
+  vi.spyOn(Date, "now").mockImplementation(() => 2000)
   const controlled = {
     ...browser,
     state: "operator_controlled",
@@ -483,10 +494,9 @@ test("private input ticket contains only exact control authority and requires se
 })
 
 // Exercise the same refresh sequence used by the explicit View page handler.
-test("fresh views bind new revisions and refuse replacements, missing pages and races", async (t) => {
-  const { requestFreshBrowserView, browserViewFailureMessage } = await import(
-    "../src/lib/browser-control-client.ts"
-  )
+test("fresh views bind new revisions and refuse replacements, missing pages and races", async () => {
+  const { requestFreshBrowserView, browserViewFailureMessage } =
+    await import("../src/lib/browser-control-client.ts")
   const fresh = { ...browser, revision: 9, control_epoch: 3 }
   const page = { page_id: "page", revision: "navigated", control_epoch: 3 }
   const replacements = Object.entries(browser.identity).map(([key, value]) => ({
@@ -545,7 +555,7 @@ test("fresh views bind new revisions and refuse replacements, missing pages and 
     { name: "closed during pages", cancelAt: "pages", count: 3 },
   ]
   for (const scenario of cases)
-    await t.test(scenario.name, async () => {
+    await step(scenario.name, async () => {
       const calls = []
       let current = true
       const client = createBrowserControlClient(root, "session", async (url, init) => {

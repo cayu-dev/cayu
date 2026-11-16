@@ -225,7 +225,7 @@ export function ProtectedReviewPart({
               <dl>
                 {view.fields?.map((field, index) => (
                   // The server permits duplicate labels; this is a static snapshot.
-                  // biome-ignore lint/suspicious/noArrayIndexKey: fields have no unique IDs
+                  // oxlint-disable-next-line react/no-array-index-key -- fields have no unique IDs
                   <div key={index}>
                     <dt>{reviewText(field.label)}</dt>
                     <dd className="whitespace-pre-wrap">{reviewText(field.text)}</dd>

@@ -27,7 +27,7 @@ function Value({ value, depth }: { value: unknown; depth: number }) {
       return (
         <ul className="list-disc space-y-0.5 pl-4">
           {value.map((v, i) => (
-            // biome-ignore lint/suspicious/noArrayIndexKey: output values have no identity
+            // oxlint-disable-next-line react/no-array-index-key -- output values have no identity
             <li key={i}>
               <Scalar value={v} />
             </li>
@@ -38,7 +38,7 @@ function Value({ value, depth }: { value: unknown; depth: number }) {
     return (
       <div className="space-y-2">
         {value.map((v, i) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: output values have no identity
+          // oxlint-disable-next-line react/no-array-index-key -- output values have no identity
           <Card key={i} value={v} depth={depth + 1} />
         ))}
       </div>

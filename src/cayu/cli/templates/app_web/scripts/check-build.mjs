@@ -27,15 +27,14 @@ async function files(directory, prefix = "") {
   const found = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const relative = path.join(prefix, entry.name);
-    if (entry.isDirectory())
-      found.push(...(await files(path.join(directory, entry.name), relative)));
+    if (entry.isDirectory()) found.push(...(await files(path.join(directory, entry.name), relative)));
     else found.push(relative);
   }
-  return found.sort();
+  return found.sort((a, b) => a.localeCompare(b));
 }
 
 try {
-  node(["node_modules/vite/bin/vite.js", "build", "--logLevel", "warn"], { WEB_OUT_DIR: fresh });
+  node(["node_modules/vite-plus/bin/vp", "build", "--logLevel", "warn"], { WEB_OUT_DIR: fresh });
   node(["scripts/add-licenses.mjs", fresh]);
   const [want, have] = [await files(fresh), await files(committed)];
   const differences = [
@@ -43,16 +42,11 @@ try {
     ...have.filter((name) => !want.includes(name)).map((name) => `not in a fresh build: ${name}`),
   ];
   for (const name of want.filter((name) => have.includes(name))) {
-    const [a, b] = await Promise.all([
-      readFile(path.join(fresh, name)),
-      readFile(path.join(committed, name)),
-    ]);
+    const [a, b] = await Promise.all([readFile(path.join(fresh, name)), readFile(path.join(committed, name))]);
     if (!a.equals(b)) differences.push(`differs: ${name}`);
   }
   if (differences.length) {
-    console.error(
-      `web/static doesn't match web/src. Run \`npm run build\` and commit web/static.\n${differences.join("\n")}`,
-    );
+    console.error(`web/static doesn't match web/src. Run \`npm run build\` and commit web/static.\n${differences.join("\n")}`);
     process.exitCode = 1;
   } else {
     console.log(`web/static matches a fresh build (${want.length} files).`);

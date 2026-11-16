@@ -136,7 +136,7 @@ export function BrowserRecordings({ sessionId }: { sessionId: string }) {
           </p>
           {playable && source && (
             <>
-              {/* biome-ignore lint/a11y/useMediaCaption: Silent browser recording; gaps are described below. */}
+              {/* oxlint-disable-next-line jsx-a11y/media-has-caption -- Silent browser recording; gaps are described below. */}
               <video
                 key={recording.recording_id}
                 className="max-h-[36rem] w-full rounded bg-black"

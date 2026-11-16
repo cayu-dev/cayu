@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { InboxSettleError, inboxApiFromCayuClient } from "../src/parts/inbox/cayu-client.ts"
 import { isProfileChangedConflict } from "../src/parts/inbox/inbox-adoption.ts"
 

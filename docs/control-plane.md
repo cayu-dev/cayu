@@ -285,11 +285,12 @@ npm ci
 npm run dev
 ```
 
-The Vite server proxies `/api` to `http://localhost:8000` by default. Build application-owned
+The development server (`vp dev`) proxies `/api` to `http://localhost:8000` by default. Build application-owned
 production assets with:
 
 ```bash
 npm run lint
+npm run format:check
 npm run test
 npm run typecheck
 npm run check:api

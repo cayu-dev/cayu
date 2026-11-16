@@ -4,7 +4,7 @@
     "module": "esnext",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
-    "types": ["vite/client"],
+    "types": ["vite-plus/client"],
     "skipLibCheck": true,
 
     /* Bundler mode */
@@ -19,9 +19,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noUncheckedIndexedAccess": true,
-    "baseUrl": ".",
     "paths": { "@/*": ["./src/*"], "@kit/*": ["./src/kit/*"] },
-    "ignoreDeprecations": "6.0",
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },

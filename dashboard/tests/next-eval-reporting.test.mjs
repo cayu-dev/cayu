@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import * as model from "../src/next/app/eval-view-model.ts"
 
 test("reported origin keeps authenticated publisher distinct from submitted branch and tested commit", () => {

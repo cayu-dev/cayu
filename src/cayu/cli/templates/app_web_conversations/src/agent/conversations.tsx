@@ -95,7 +95,12 @@ function ConversationsPage() {
               </Link>
             ),
           },
-          { key: "status", label: "Status", sortValue: (row) => row.status, cell: (row) => <StatusBadge tone={STATUS_TONE[row.status] ?? "neutral"}>{row.status}</StatusBadge> },
+          {
+            key: "status",
+            label: "Status",
+            sortValue: (row) => row.status,
+            cell: (row) => <StatusBadge tone={STATUS_TONE[row.status] ?? "neutral"}>{row.status}</StatusBadge>,
+          },
           {
             key: "activity",
             label: "Last activity",
@@ -165,13 +170,13 @@ function NewConversationForm({ agent }: { agent: string }) {
       const id = await stream("run", { agent, prompt: text, title: title.trim() || undefined }, (next) => shown.current && setReply(next));
       // The lists don't have it yet, whether or not this page is still shown.
       void queryClient.invalidateQueries({ queryKey: conversationsKey });
-      if (shown.current) navigate(conversationPath(id));
+      if (shown.current) void navigate(conversationPath(id));
     } catch (caught) {
       // Once it has started, the conversation exists: open it, with what went wrong, rather
       // than start another.
       if (caught instanceof ReplyFailed && caught.sessionId) {
         void queryClient.invalidateQueries({ queryKey: conversationsKey });
-        if (shown.current) navigate(conversationPath(caught.sessionId), { state: { error: messageOf(caught) } });
+        if (shown.current) void navigate(conversationPath(caught.sessionId), { state: { error: messageOf(caught) } });
         return;
       }
       if (!shown.current) return;
@@ -242,7 +247,9 @@ function ConversationPage() {
               title={titleOf(loaded.data.conversation)}
               status={loaded.data.conversation.status}
               startError={started?.error ?? null}
-              messages={loaded.data.messages.map((item) => ({ role: item.role, text: textOf(item) })).filter((item) => (item.role === "user" || item.role === "assistant") && item.text)}
+              messages={loaded.data.messages
+                .map((item) => ({ role: item.role, text: textOf(item) }))
+                .filter((item) => (item.role === "user" || item.role === "assistant") && item.text)}
               agent={agent ?? loaded.data.conversation.agent_name}
               mayContinue={mayChange}
               // Its transcript, and its place and last activity in the lists.
@@ -285,7 +292,7 @@ function ConversationView({
   const following = React.useRef(true);
 
   // Open at the latest message, and follow a reply as it streams.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scrolls when any of these change
+  // It scrolls when any of these change.
   React.useEffect(() => {
     if (following.current) scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
   }, [messages, sent, reply, busy]);
@@ -330,11 +337,17 @@ function ConversationView({
         {messages.length === 0 && !sent ? <p className="text-body-sm text-text-secondary">No messages yet.</p> : null}
         {messages.map((item, index) => (
           // Transcript records have no ID; their order is fixed.
-          // biome-ignore lint/suspicious/noArrayIndexKey: an append-only transcript
+          // oxlint-disable-next-line react/no-array-index-key -- an append-only transcript
           <Bubble key={index} mine={item.role === "user"} author={author(item.role)} text={item.text} />
         ))}
         {sent ? <Bubble mine author={author("user")} text={sent} /> : null}
-        {busy ? reply ? <Bubble mine={false} author={agent} text={reply} /> : <p className="animate-pulse text-body-sm text-text-secondary">{agent} is thinking…</p> : null}
+        {busy ? (
+          reply ? (
+            <Bubble mine={false} author={agent} text={reply} />
+          ) : (
+            <p className="animate-pulse text-body-sm text-text-secondary">{agent} is thinking…</p>
+          )
+        ) : null}
       </div>
       {mayContinue ? (
         <div className="flex items-end gap-2">

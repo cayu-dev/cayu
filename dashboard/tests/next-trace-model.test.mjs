@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import {
   buildTrace,
   findSpan,
@@ -373,14 +373,14 @@ test("parallel approvals use explicit IDs for reversed decisions and settle both
     spans
       .filter((s) => s.kind === "tool")
       .map((s) => s.end)
-      .sort(),
+      .sort((a, b) => a - b),
     [T0 + 200, T0 + 400],
   )
   assert.deepEqual(
     spans
       .filter((s) => s.kind === "wait")
       .map((s) => s.end)
-      .sort(),
+      .sort((a, b) => a - b),
     [T0 + 100, T0 + 300],
   )
 })

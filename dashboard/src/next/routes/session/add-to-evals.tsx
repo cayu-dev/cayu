@@ -55,7 +55,7 @@ export function AddToEvalsDialog({
       }),
     onSuccess: ({ suite_id, run_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(run_id ? runRoute(run_id) : suiteRoute(suite_id))
+      void go(run_id ? runRoute(run_id) : suiteRoute(suite_id))
     },
   })
   useEffect(() => {
@@ -93,6 +93,7 @@ export function AddToEvalsDialog({
         <fieldset className="space-y-2">
           <legend className="sr-only">How to add it</legend>
           {MODES.map((m) => (
+            // oxlint-disable-next-line jsx-a11y/label-has-associated-control -- the label wraps its radio, and its text is the mode's
             <label
               key={m.id}
               className={cn(

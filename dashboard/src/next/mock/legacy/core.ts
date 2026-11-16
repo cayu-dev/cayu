@@ -1775,14 +1775,12 @@ export const coreRoutes: LegacyRoute[] = [
       ["block", "blocked"],
       ["needs-attention", "needs_attention"],
     ] as const
-  ).map(
-    ([path, status]): LegacyRoute => ({
-      method: "POST",
-      path: `/tasks/:taskId/${path}`,
-      handle: ({ params, body }, context) =>
-        holdTask(context, params.taskId ?? "", status, record(body)),
-    }),
-  ),
+  ).map(([path, status]): LegacyRoute => ({
+    method: "POST",
+    path: `/tasks/:taskId/${path}`,
+    handle: ({ params, body }, context) =>
+      holdTask(context, params.taskId ?? "", status, record(body)),
+  })),
   {
     method: "POST",
     path: "/tasks/:taskId/resume",

@@ -39,8 +39,8 @@ export function SettingsPage() {
         <div className="flex flex-col gap-1">
           <AppPageTitle>Settings</AppPageTitle>
           <AppPageDescription>
-            Each setting is set in Cayu Cloud, which checks your role and keeps who changed what. The Agent reads a change within 25 seconds, and each
-            setting says when it applies.
+            Each setting is set in Cayu Cloud, which checks your role and keeps who changed what. The Agent reads a change within 25 seconds, and each setting
+            says when it applies.
           </AppPageDescription>
         </div>
       </AppPageHeader>
@@ -76,13 +76,15 @@ function SettingsContent({ view }: { view: SettingsView }) {
           Who changed what: <code className="wrap-anywhere">{view.history}</code>.
         </p>
       </AppPageSection>
-      {view.read_only.length ? <AppPageSection title="Need a redeploy" description="Read once when a process starts, so a change applies on the next deploy.">
-        <SettingsSection>
-          {view.read_only.map((row) => (
-            <FixedRow key={row.name} row={row} />
-          ))}
-        </SettingsSection>
-      </AppPageSection> : null}
+      {view.read_only.length ? (
+        <AppPageSection title="Need a redeploy" description="Read once when a process starts, so a change applies on the next deploy.">
+          <SettingsSection>
+            {view.read_only.map((row) => (
+              <FixedRow key={row.name} row={row} />
+            ))}
+          </SettingsSection>
+        </AppPageSection>
+      ) : null}
     </div>
   );
 }

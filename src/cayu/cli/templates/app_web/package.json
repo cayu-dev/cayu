@@ -5,14 +5,16 @@
   "type": "module",
   "description": "The application's web app, served by `cayu serve` at / ([tool.cayu.serve] ui). `npm run build` writes ./static, which the server serves.",
   "engines": {
-    "node": ">=22.18.0"
+    "node": "^22.18.0 || ^24.11.0 || >=26.0.0"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit -p tsconfig.json && vite build && node scripts/add-licenses.mjs static",
+    "dev": "vp dev",
+    "build": "tsc --noEmit -p tsconfig.json && vp build && node scripts/add-licenses.mjs static",
     "check:build": "node scripts/check-build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "biome check src scripts"
+    "lint": "vp lint --deny-warnings src scripts vite.config.ts",
+    "format": "vp fmt",
+    "format:check": "vp fmt --check"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -34,7 +36,6 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.3",
     "@tailwindcss/vite": "^4.3.0",
     "@types/node": "^22.20.5",
     "@types/react": "^19.2.15",
@@ -42,6 +43,10 @@
     "@vitejs/plugin-react": "^6.0.2",
     "tailwindcss": "^4.3.0",
     "typescript": "~6.0.2",
-    "vite": "^8.3.5"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0-rc.1",
+    "vite-plus": "1.0.0-rc.1"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0-rc.1"
   }
 }

@@ -120,7 +120,7 @@ export function KnowledgePage({
                   <Button
                     variant="outline"
                     disabled={knowledge.isFetching}
-                    onClick={() => void knowledge.fetchNextPage()}
+                    onClick={() => knowledge.fetchNextPage()}
                   >
                     {knowledge.isFetching ? "Loading…" : "Load more knowledge"}
                   </Button>
@@ -197,11 +197,7 @@ function Reviews() {
           </p>
         )}
       {inbox.hasNextPage && (
-        <Button
-          variant="outline"
-          disabled={inbox.isFetching}
-          onClick={() => void inbox.fetchNextPage()}
-        >
+        <Button variant="outline" disabled={inbox.isFetching} onClick={() => inbox.fetchNextPage()}>
           Load more proposals
         </Button>
       )}

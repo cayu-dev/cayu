@@ -1097,7 +1097,7 @@ function ScenarioInputEditor({
         </label>
       )}
       {event.input.messages.map((message, messageIndex) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: ordered scenario messages have no portable UI identity.
+        // oxlint-disable-next-line react/no-array-index-key -- ordered scenario messages have no portable UI identity.
         <div key={messageIndex} className="rounded-md bg-muted/30 p-2.5">
           <div className="mb-2 flex items-center justify-between gap-2">
             <span className="text-xs font-medium">User message {messageIndex + 1}</span>
@@ -1119,7 +1119,7 @@ function ScenarioInputEditor({
           <div className="space-y-2">
             {message.content.map((part, partIndex) => (
               <ScenarioPartEditor
-                // biome-ignore lint/suspicious/noArrayIndexKey: ordered scenario parts have no portable UI identity.
+                // oxlint-disable-next-line react/no-array-index-key -- ordered scenario parts have no portable UI identity.
                 key={partIndex}
                 part={part}
                 artifactRequirementIds={artifactRequirementIds}
@@ -1361,7 +1361,7 @@ function ScenarioRequirementsEditor({
         <div className="text-xs text-muted-foreground">No explicit secret requirements.</div>
       ) : (
         secrets.map((secret, index) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: requirement rows have no separate UI identity and cannot be reordered.
+          // oxlint-disable-next-line react/no-array-index-key -- requirement rows have no separate UI identity and cannot be reordered.
           <div key={index} className="grid gap-2 md:grid-cols-[1fr_10rem_2fr_auto]">
             <Input
               aria-label={`Secret requirement ${index + 1} ID`}

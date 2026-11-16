@@ -409,6 +409,7 @@ function ToolDetail({
               ) : (
                 <ul className="list-disc space-y-1 pl-4">
                   {tool.policy_conditions.map((condition, index) => (
+                    // oxlint-disable-next-line react/no-array-index-key -- policy conditions are an ordered list of strings that may repeat
                     <li key={index}>{condition}</li>
                   ))}
                 </ul>

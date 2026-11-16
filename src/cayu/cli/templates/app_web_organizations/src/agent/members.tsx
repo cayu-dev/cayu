@@ -111,7 +111,9 @@ function MemberList({ organization, admin }: { organization: string; admin: bool
                         <Button
                           size="sm"
                           aria-label={`Confirm removing ${row.subject}`}
-                          onClick={() => change(() => api.removeMember(organization, row.subject), `Removed ${row.subject}`).then((made) => made && setConfirming(null))}
+                          onClick={() =>
+                            change(() => api.removeMember(organization, row.subject), `Removed ${row.subject}`).then((made) => made && setConfirming(null))
+                          }
                         >
                           Confirm remove
                         </Button>

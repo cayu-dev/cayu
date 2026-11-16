@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 
 import { sessionDeadlineState, sessionExecutionLabel } from "../src/lib/session-execution.ts"
 

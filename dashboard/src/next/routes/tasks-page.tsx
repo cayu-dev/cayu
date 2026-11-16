@@ -61,7 +61,7 @@ export function TasksPage() {
   const [draft, setDraft] = useState(search.q ?? "")
   useEffect(() => setDraft(search.q ?? ""), [search.q])
   useEffect(() => {
-    if (search.task_id) go({ ...taskRoute(search.task_id), replace: true })
+    if (search.task_id) void go({ ...taskRoute(search.task_id), replace: true })
   }, [search.task_id, go])
   const set = (patch: Partial<Filters>) =>
     go({ to: "/tasks", search: { ...search, ...patch }, replace: true, resetScroll: false })
@@ -175,7 +175,7 @@ export function TasksPage() {
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") set({ q: e.currentTarget.value || undefined })
+                if (e.key === "Enter") void set({ q: e.currentTarget.value || undefined })
               }}
               onBlur={(e) => set({ q: e.currentTarget.value || undefined })}
               placeholder="Search by title, ID, session or reason"
@@ -241,7 +241,7 @@ export function TasksPage() {
           variant="ghost"
           onClick={() => {
             setDraft("")
-            go({ to: "/tasks", search: {}, replace: true, resetScroll: false })
+            void go({ to: "/tasks", search: {}, replace: true, resetScroll: false })
           }}
         >
           Clear filters

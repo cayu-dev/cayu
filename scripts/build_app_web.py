@@ -14,7 +14,7 @@ is composed and built in a temporary folder:
   the layer's `static/`.
 
 Without `--check` each app is built, and a committed build is replaced with the fresh one.
-With `--check` each is linted and typechecked; one with a committed build then runs its own
+With `--check` each is linted, format-checked and typechecked; one with a committed build then runs its own
 `npm run check:build`, the check a generated project runs, which fails when the committed build
 differs from a fresh build of the source, and one without is built.
 """
@@ -47,7 +47,9 @@ def _composition():
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--check", action="store_true", help="lint, typecheck and fail on a stale build"
+        "--check",
+        action="store_true",
+        help="lint, check formatting, typecheck and fail on a stale build",
     )
     args = parser.parse_args(argv)
     web = _composition()
@@ -80,7 +82,7 @@ def _build(web, layers: tuple[str, ...], *, check: bool) -> bool:
             (work / path).write_bytes(source.read_bytes())
         steps: list[list[str]] = [["ci", "--no-audit", "--no-fund"]]
         if check:
-            steps += [["run", "lint"], ["run", "typecheck"]]
+            steps += [["run", "lint"], ["run", "format:check"], ["run", "typecheck"]]
             # A fresh build compared with the committed one, else just a build.
             steps.append(["run", "check:build"] if owner is not None else ["run", "build"])
         else:

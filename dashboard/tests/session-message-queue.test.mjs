@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { fileURLToPath } from "node:url"
-import { rolldown } from "rolldown"
+import { rolldown } from "vite/rolldown"
 
 const bundle = await rolldown({
   cwd: fileURLToPath(new URL("..", import.meta.url)),

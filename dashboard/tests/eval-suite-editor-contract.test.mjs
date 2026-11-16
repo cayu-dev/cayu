@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { newStructuredJudgeAssertion } from "../src/lib/eval-judge-authoring.ts"
 import {
   authoredSuiteCostBudgetContract,
@@ -88,9 +88,8 @@ test("all twenty authored check types survive a loaded revision and unrelated ed
 })
 
 test("exact launch recovery retains all admission fields and fences late settlement", async () => {
-  const { saveSuiteLaunchAttempt, readSuiteLaunchAttempt, clearSuiteLaunchAttempt } = await import(
-    "../src/lib/eval-suite-launch-attempt.ts"
-  )
+  const { saveSuiteLaunchAttempt, readSuiteLaunchAttempt, clearSuiteLaunchAttempt } =
+    await import("../src/lib/eval-suite-launch-attempt.ts")
   const entries = new Map()
   const storage = {
     getItem: (key) => entries.get(key) ?? null,
@@ -125,9 +124,8 @@ test("exact launch recovery retains all admission fields and fences late settlem
 })
 
 test("published currency identifiers survive exact launch recovery", async () => {
-  const { saveSuiteLaunchAttempt, readSuiteLaunchAttempt } = await import(
-    "../src/lib/eval-suite-launch-attempt.ts"
-  )
+  const { saveSuiteLaunchAttempt, readSuiteLaunchAttempt } =
+    await import("../src/lib/eval-suite-launch-attempt.ts")
   for (const currency of ["USD", "A", "USDC.E", "USD_CREDIT", "X-2", "A123456789012345"]) {
     const entries = new Map()
     const storage = {

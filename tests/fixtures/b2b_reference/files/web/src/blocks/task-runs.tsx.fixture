@@ -28,8 +28,7 @@ export type TaskRun = z.infer<typeof taskRun>;
 /** `GET /app/task-runs` (integrations/http/generated/task_runs.py): the newest runs first. */
 export function taskRunsApi(request: Requester) {
   return {
-    list: (filter: { type?: string; limit?: number } = {}, signal?: AbortSignal) =>
-      request("task-runs", { query: filter, signal, schema: z.array(taskRun) }),
+    list: (filter: { type?: string; limit?: number } = {}, signal?: AbortSignal) => request("task-runs", { query: filter, signal, schema: z.array(taskRun) }),
   };
 }
 export type TaskRunsApi = ReturnType<typeof taskRunsApi>;
@@ -128,7 +127,17 @@ export function TaskRuns<T extends TaskRun>({
           { key: "status", label: "Status", sortValue: (row) => row.status, cell: (row) => <taskRunStatus.Badge status={row.status} /> },
           ...extraColumns,
           ...(summary
-            ? [{ key: "summary", label: "What it did", cell: (row: T) => <span className="block max-w-96 text-body-sm" data-origin="own">{summary(row)}</span> }]
+            ? [
+                {
+                  key: "summary",
+                  label: "What it did",
+                  cell: (row: T) => (
+                    <span className="block max-w-96 text-body-sm" data-origin="own">
+                      {summary(row)}
+                    </span>
+                  ),
+                },
+              ]
             : []),
         ]}
       />

@@ -225,6 +225,7 @@ export function createMockApi(initial = SEEDS[0]?.id ?? "month-end"): MockApi {
         m.content.filter((p) => p.type === "tool_result").map((p) => p.tool_call_id),
       ),
     )
+    // oxlint-disable-next-line unicorn/no-useless-spread -- the loop appends to the transcript it walks
     for (const m of [...s.transcript]) {
       for (const p of m.content) {
         if (p.type === "tool_call" && !answered.has(p.tool_call_id)) {

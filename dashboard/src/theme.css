@@ -130,7 +130,12 @@ body {
   color: var(--foreground);
 }
 
-:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
 
 /* These native fields delegate the focus indicator to their enclosing group. */
-.grouped-field-input:focus-visible { outline: none; }
+.grouped-field-input:focus-visible {
+  outline: none;
+}

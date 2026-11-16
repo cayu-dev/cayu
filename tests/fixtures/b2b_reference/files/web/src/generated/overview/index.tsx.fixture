@@ -54,7 +54,7 @@ function OverviewPage({ description, sections }: { description: string; sections
         {overview.data ? <OverviewContent data={overview.data} /> : null}
       </AsyncContent>
       {sections.map((Section, index) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: the Agent's sections are a fixed list
+        // oxlint-disable-next-line react/no-array-index-key -- the Agent's sections are a fixed list
         <div key={index} data-origin="own">
           <Section />
         </div>
@@ -80,20 +80,20 @@ function OverviewContent({ data }: { data: Overview }) {
             <AlertDescription>{data.inbox.unavailable}</AlertDescription>
           </Alert>
         ) : (
-        <DataTable
-          label="Waiting for a person"
-          showHeading={false}
-          rows={data.inbox.by_kind}
-          rowId={(row) => row.kind}
-          itemLabel={{ singular: "kind", plural: "kinds" }}
-          emptyTitle="Nothing is waiting"
-          emptyDescription={data.inbox.empty}
-          columns={[
-            { key: "label", label: "Kind", cell: (row) => row.label },
-            { key: "count", label: "Waiting", cell: (row) => <span className="tabular-nums">{row.count}</span> },
-            { key: "to", label: "", cell: (row) => (row.to ? <DecideLink to={row.to} /> : "—") },
-          ]}
-        />
+          <DataTable
+            label="Waiting for a person"
+            showHeading={false}
+            rows={data.inbox.by_kind}
+            rowId={(row) => row.kind}
+            itemLabel={{ singular: "kind", plural: "kinds" }}
+            emptyTitle="Nothing is waiting"
+            emptyDescription={data.inbox.empty}
+            columns={[
+              { key: "label", label: "Kind", cell: (row) => row.label },
+              { key: "count", label: "Waiting", cell: (row) => <span className="tabular-nums">{row.count}</span> },
+              { key: "to", label: "", cell: (row) => (row.to ? <DecideLink to={row.to} /> : "—") },
+            ]}
+          />
         )}
       </AppPageSection>
     </div>

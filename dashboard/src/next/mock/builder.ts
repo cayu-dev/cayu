@@ -424,7 +424,7 @@ export function buildSession(
   )
 
   const inputTokens = 4000 + toolCalls * 5200 + modelSteps * 1800
-  const metadata: Record<string, unknown> = { ...(spec.metadata ?? {}) }
+  const metadata: Record<string, unknown> = { ...spec.metadata }
   if (spec.title) metadata["cayu:title"] = spec.title
   if (spec.summary) metadata["cayu:summary"] = spec.summary
   if (spec.summaryTone) metadata["cayu:summary_tone"] = spec.summaryTone

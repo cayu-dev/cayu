@@ -35,7 +35,8 @@ def prototype_url(tmp_path_factory):
         server = subprocess.Popen(
             [
                 node,
-                str(dashboard / "node_modules/vite/bin/vite.js"),
+                str(dashboard / "node_modules/vite-plus/bin/vp"),
+                "dev",
                 "--host",
                 "127.0.0.1",
                 "--port",

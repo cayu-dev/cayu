@@ -39,7 +39,7 @@ export function TrialDots({
     >
       {Array.from({ length: total }, (_, i) => (
         <span
-          // biome-ignore lint/suspicious/noArrayIndexKey: trials are positional
+          // Trials are positional
           key={i}
           className={cn(
             "size-2 rounded-full border border-current",
@@ -67,7 +67,7 @@ export function EvalSuitePage() {
     mutationFn: () => api.runEvalSuite(suiteId),
     onSuccess: ({ run_id }) => {
       void queryClient.invalidateQueries({ queryKey: ["evals"] })
-      go(runRoute(run_id))
+      void go(runRoute(run_id))
     },
   })
 

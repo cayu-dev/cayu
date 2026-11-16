@@ -25,7 +25,7 @@ export function useTraceHistory(sessionId: string, enabled: boolean, expectedIns
   const [loadingMore, setLoadingMore] = useState(false)
   const [pageError, setPageError] = useState<unknown>(null)
   const olderAbort = useRef<AbortController | null>(null)
-  // biome-ignore lint/correctness/useExhaustiveDependencies: changing session must abort its historical read.
+  // Changing session must abort its historical read.
   useEffect(() => () => olderAbort.current?.abort(), [identity])
   const query = useQuery({
     queryKey,

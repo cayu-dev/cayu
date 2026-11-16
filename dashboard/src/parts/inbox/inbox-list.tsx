@@ -120,7 +120,7 @@ export function InboxList({ search, pageSize = 50 }: { search: InboxSearch; page
           <Button
             variant="outline"
             disabled={inbox.isFetching}
-            onClick={() => void inbox.fetchNextPage()}
+            onClick={() => inbox.fetchNextPage()}
           >
             {items.length === 0 ? "Continue scanning" : "Load more"}
           </Button>

@@ -309,6 +309,7 @@ function AdditionForm({
                 <legend className="sr-only">How to add this session</legend>
                 <div className="space-y-2">
                   {modes.map((item) => (
+                    // oxlint-disable-next-line jsx-a11y/label-has-associated-control -- the label wraps its radio, and its text is the mode's
                     <label
                       key={item.id}
                       className={cn(

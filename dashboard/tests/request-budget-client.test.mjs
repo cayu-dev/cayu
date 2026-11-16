@@ -1,9 +1,9 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { fileURLToPath } from "node:url"
 
 import { QueryClient, QueryObserver } from "@tanstack/react-query"
-import { rolldown } from "rolldown"
+import { rolldown } from "vite/rolldown"
 
 import { ConditionalGetCache, REVALIDATED_HEADER } from "../src/lib/conditional-get.ts"
 import {
@@ -362,12 +362,12 @@ test("ticks are coalesced into at most one refresh per interval", async () => {
       interval: 2000,
       now: () => now,
     })
-    throttle.add(["trace"])
+    void throttle.add(["trace"])
     assert.deepEqual(flushes, [["trace"]])
     now = 500
-    throttle.add(["overview"])
+    void throttle.add(["overview"])
     now = 900
-    throttle.add(["trace", "transcript"])
+    void throttle.add(["trace", "transcript"])
     assert.equal(flushes.length, 1)
     assert.equal(timers.length, 1)
     assert.equal(timers[0].at, 2000)
@@ -375,11 +375,11 @@ test("ticks are coalesced into at most one refresh per interval", async () => {
     timers.shift().fn()
     assert.deepEqual(flushes[1], ["overview", "trace", "transcript"])
     now = 2100
-    throttle.add(["trace"])
-    throttle.flushNow(["state"])
+    void throttle.add(["trace"])
+    void throttle.flushNow(["state"])
     assert.deepEqual(flushes[2], ["state", "trace"])
     assert.equal(timers.length, 0)
-    throttle.add(["trace"])
+    void throttle.add(["trace"])
     throttle.dispose()
     assert.equal(timers.length, 0)
     assert.equal(flushes.length, 3)
@@ -403,8 +403,8 @@ test("a session refresh waits for the one still running instead of overlapping i
   const first = throttle.add(["trace"])
   assert.equal(flushes.length, 1)
   // Ticks while the first refresh is still reading queue up; nothing new starts.
-  throttle.add(["transcript"])
-  throttle.add(["trace"])
+  void throttle.add(["transcript"])
+  void throttle.add(["trace"])
   assert.equal(flushes.length, 1)
   now = 5000
   releases.shift()()
@@ -412,7 +412,7 @@ test("a session refresh waits for the one still running instead of overlapping i
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(flushes[1], ["trace", "transcript"])
   // A terminal drain during a refresh runs after it, with everything queued.
-  throttle.add(["overview"])
+  void throttle.add(["overview"])
   const drain = throttle.flushNow(["state"])
   assert.equal(flushes.length, 2)
   releases.shift()()

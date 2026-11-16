@@ -963,6 +963,7 @@ def _run_dashboard(runner: LocalCiRunner) -> None:
     for label, npm_args in (
         ("Dashboard install", ("ci",)),
         ("Dashboard lint", ("run", "lint")),
+        ("Dashboard format", ("run", "format:check")),
         ("Dashboard tests", ("run", "test")),
         ("Dashboard typecheck", ("run", "typecheck")),
         ("Dashboard API drift", ("run", "check:api:repo")),

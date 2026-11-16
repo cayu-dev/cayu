@@ -228,7 +228,7 @@ export function StructuredJudgeEditor({
           </div>
           {assertion.rubric.criteria.map((criterion, index) => (
             <div
-              // biome-ignore lint/suspicious/noArrayIndexKey: criterion rows do not own local state, and their editable IDs may temporarily collide.
+              // oxlint-disable-next-line react/no-array-index-key -- criterion rows do not own local state, and their editable IDs may temporarily collide.
               key={`${index}:${assertion.rubric.criteria.length}`}
               className="grid gap-2 rounded-md border border-border p-3 @min-[36rem]/judge:grid-cols-[minmax(8rem,0.7fr)_minmax(10rem,1fr)_7rem_auto]"
             >

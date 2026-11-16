@@ -47,7 +47,7 @@ try {
   const installed = join(app, "node_modules/@cayu-tech/dashboard-parts")
   if (lstatSync(installed).isSymbolicLink()) throw new Error("npm linked the package instead of copying it.")
   run("npx", ["tsc", "-p", "tsconfig.json"])
-  run("npx", ["vite", "build", "--logLevel", "warn"])
+  run("npx", ["vp", "build", "--logLevel", "warn"])
   run("npx", ["playwright", "test", "--workers=1"])
 } finally {
   if (keep) console.log(`Kept the consumer app in ${app}`)

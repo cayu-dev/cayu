@@ -71,7 +71,7 @@ export const conversations = {
   conversation: async (id: string, signal?: AbortSignal) => {
     const found = await cayuRequest(`sessions/${encodeURIComponent(id)}`, { signal, schema: detail });
     const messages: Message[] = [];
-    for (let offset = 0; ; ) {
+    for (let offset = 0; ;) {
       const page = await cayuRequest(`sessions/${encodeURIComponent(id)}/transcript`, {
         query: { offset, limit: TRANSCRIPT_PAGE, include_thinking: false },
         signal,

@@ -92,17 +92,29 @@ def test_the_generic_app_names_no_organizations_members_or_departments() -> None
     assert not (app / "static").exists()
 
 
-def test_the_biome_config_is_for_the_locked_biome() -> None:
-    # Biome prints a notice on every `npm run lint` when the configuration's schema isn't
-    # the CLI's version, or the configuration uses a field it has deprecated.
-    app = TEMPLATES / APP
-    config = json.loads((app / "biome.json").read_text(encoding="utf-8"))
-    lock = json.loads((app / "package-lock.json").read_text(encoding="utf-8"))
-    locked = lock["packages"]["node_modules/@biomejs/biome"]["version"]
+def test_the_web_app_and_the_dashboard_pin_one_vite_plus() -> None:
+    # Vite+ is a release candidate, pinned exactly. `vite` is its core under Vite's name, the
+    # same version, also for any dependency that asks for `vite`; a project that resolved
+    # another `vite` would build with a different bundler than the one it lints and tests with.
+    for root in (TEMPLATES / APP, REPOSITORY / "dashboard"):
+        manifest = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+        packages = lock["packages"]
+        version = packages["node_modules/vite-plus"]["version"]
+        core = f"npm:@voidzero-dev/vite-plus-core@{version}"
 
-    assert config["$schema"] == f"https://biomejs.dev/schemas/{locked}/schema.json"
-    assert lock["packages"][""]["devDependencies"]["@biomejs/biome"] == f"^{locked}"
-    assert config["linter"]["rules"] == {"preset": "recommended"}
+        assert re.fullmatch(r"\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?", version), root
+        assert manifest["devDependencies"]["vite-plus"] == version, root
+        assert manifest["devDependencies"]["vite"] == core, root
+        assert manifest["overrides"]["vite"] == core, root
+        assert packages[""]["devDependencies"] == manifest["devDependencies"], root
+        assert packages["node_modules/vite"]["name"] == "@voidzero-dev/vite-plus-core", root
+        assert packages["node_modules/vite"]["version"] == version, root
+        assert not [path for path in packages if "biome" in path], root
+        assert not (root / "biome.json").exists(), root
+    template = json.loads((TEMPLATES / APP / "package.json").read_text(encoding="utf-8"))
+    dashboard = json.loads((REPOSITORY / "dashboard/package.json").read_text(encoding="utf-8"))
+    assert template["devDependencies"]["vite-plus"] == dashboard["devDependencies"]["vite-plus"]
 
 
 def test_the_operator_app_is_the_generic_app_with_the_operators_layer() -> None:

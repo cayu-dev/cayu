@@ -19,10 +19,6 @@ export const identity: AgentIdentity = {
   description: "What the Agent does, and what waits for a person",
 };
 
-export const areas: AppArea[] = [
-  overviewArea({ description: "The Agent's metrics, and what waits for a person." }),
-  taskRunsArea,
-  settingsArea,
-];
+export const areas: AppArea[] = [overviewArea({ description: "The Agent's metrics, and what waits for a person." }), taskRunsArea, settingsArea];
 
 export const shell: ShellParts = {};

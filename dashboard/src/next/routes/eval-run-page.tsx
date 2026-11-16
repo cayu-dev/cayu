@@ -258,7 +258,7 @@ export function EvalRunPage() {
     mutationFn: () => api.runEvalSuite(r?.suite.id ?? ""),
     onSuccess: ({ run_id }) => {
       refresh()
-      go(runRoute(run_id))
+      void go(runRoute(run_id))
     },
   })
 
@@ -472,7 +472,7 @@ export function EvalRunPage() {
                   tabIndex={0}
                   onClick={() => set({ case: x.case.id })}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") set({ case: x.case.id })
+                    if (e.key === "Enter") void set({ case: x.case.id })
                   }}
                   className="cursor-pointer border-b border-border last:border-0 hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none"
                 >

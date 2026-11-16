@@ -19,6 +19,19 @@ concurrently.
   The dashboard no longer follows up to 25 empty pages.
 - `GET /api/sessions/overview/counts` groups summary rows by state.
 - `sessions?ids=` resolves public aliases and loads sessions in one read each.
+- The web app `cayu new` writes into `web/`, and the bundled and editable
+  dashboard, build, lint, format and test with Vite+ (`vite-plus` 1.0.0-rc.1)
+  instead of Biome and plain Vite. Vite+ 1.0.0-rc.1 is a release
+  candidate, pinned exactly; `vite` resolves to its core
+  (`@voidzero-dev/vite-plus-core`) at the same version. `npm run lint` runs
+  `vp lint --deny-warnings`, and the new `npm run format` and
+  `npm run format:check` run `vp fmt`; lint and format settings live in
+  `vite.config.ts`, and `biome.json` is gone. The dashboard's unit tests run
+  with `vp test run`. Node.js 22.18+, 24.11+ or 26+ is required. An existing
+  project can keep Biome; to switch, take `web/package.json`,
+  `web/package-lock.json`, `web/vite.config.ts`, `web/tsconfig.base.json` and
+  `web/scripts/check-build.mjs` from a freshly generated project, delete
+  `web/biome.json`, and rebuild `web/static`.
 
 ## v0.20.0
 

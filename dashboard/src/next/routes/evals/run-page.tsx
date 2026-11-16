@@ -335,9 +335,11 @@ export function EvalRunViewPage() {
           ? await (operation.format === "json" ? downloadEvalResultJson : downloadEvalResultHtml)(
               r.native_run_id,
             )
-          : await (operation.format === "json"
-              ? downloadCatalogEvalResultJson
-              : downloadCatalogEvalResultHtml)(r.result_revision)
+          : await (
+              operation.format === "json"
+                ? downloadCatalogEvalResultJson
+                : downloadCatalogEvalResultHtml
+            )(r.result_revision)
         downloadBlob(file.blob, file.filename)
         return
       }

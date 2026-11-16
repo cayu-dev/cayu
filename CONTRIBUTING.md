@@ -353,11 +353,13 @@ archives with `uv run python scripts/check_release_artifacts.py dist/*`.
 
 ### Dashboard
 
-Dashboard source checks require Node.js ≥ 22.18.0 and npm. Run them from `dashboard/`:
+Dashboard source checks require Node.js 22.18+, 24.11+ or 26+ (the versions Vite+ supports) and
+npm. Lint, format, tests and the build run through Vite+ (`vp`). Run them from `dashboard/`:
 
 ```bash
 npm ci
 npm run lint
+npm run format:check
 npm run test
 npm run typecheck
 npm run check:api:repo

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import test from "node:test"
+import { test } from "vite-plus/test"
 import { passing, passRate, percent } from "../src/next/app/eval-model.ts"
 
 test("flaky variability overlaps settled outcomes and cannot inflate passing totals", () => {
