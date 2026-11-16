@@ -656,6 +656,27 @@ class _ActiveEnvironmentSetup:
         )
 
 
+def _cancelled_finalization_retained_for_retry(owner: _ActiveEnvironmentSetup) -> bool:
+    """Return whether an earlier finalization's cancellation is now retry state.
+
+    A cancelled binding finalization whose failure evidence is durable keeps
+    its exact owner for a later bounded retry. Its cancellation belonged to the
+    cancelled caller; replaying it into a later terminal publication (such as
+    an interruption elected while completion copy-back waited) would strand
+    that publication instead of letting the retained owner retry.
+    """
+
+    error = owner.cleanup_error
+    return (
+        error is not None
+        and binding_finalize_fatal_signal(error) is None
+        and binding_finalize_explicit_cancellation(error) is not None
+        and owner.cleanup_release_safe
+        and owner.pending_finalize_failure_event is None
+        and owner.cleanup_requires_finalize_retry
+    )
+
+
 def _retain_cleanup_execution_profile(
     owner: _ActiveEnvironmentSetup,
     execution_profile: ExecutionProfileIdentity | None,
@@ -6761,6 +6782,63 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
                 type(error).__name__,
             )
 
+    async def _retarget_retained_completion_finalization(
+        self,
+        *,
+        session: Session,
+        setup_owner: _ActiveEnvironmentSetup,
+        event: Event,
+    ) -> None:
+        """Carry a retained completion copy-back over to a later interruption.
+
+        A completed-outcome marker is only recoverable while the session is
+        RUNNING or FAILED. When an interruption is published instead, the
+        retained copy-back must be owed by that interruption, both for the
+        process-local retry and for durable recovery after a worker loss.
+        """
+
+        if _binding_outcome_for_terminal_event(event.type) != "interrupted":
+            return
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        marker = completion_finalization.pending_completion_finalization_from_checkpoint(checkpoint)
+        if marker is not None and marker["outcome"] == "completed":
+
+            def retarget_marker(
+                current_session: Session,
+                current_checkpoint: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                if (
+                    current_session.instance_id != session.instance_id
+                    or current_session.run_epoch != session.run_epoch
+                ):
+                    raise SessionRunFenced(
+                        "Session changed before completion finalization was retargeted."
+                    )
+                copied = (
+                    {}
+                    if current_checkpoint is None
+                    else copy_durable_record(current_checkpoint, "checkpoint")
+                )
+                current = completion_finalization.pending_completion_finalization_from_checkpoint(
+                    copied
+                )
+                if not _same_completion_marker(current, marker):
+                    raise RuntimeError("Completion finalization marker changed before retarget.")
+                retargeted = copy_json_value(marker, "pending completion finalization")
+                retargeted["outcome"] = "interrupted"
+                copied[completion_finalization.PENDING_COMPLETION_FINALIZATION_CHECKPOINT_KEY] = (
+                    retargeted
+                )
+                return copied
+
+            await self._session_store.transform_checkpoint(session.id, retarget_marker)
+        if marker is not None and marker["outcome"] in ("completed", "interrupted"):
+            setup_owner.cleanup_retry_outcome = "interrupted"
+            setup_owner.cleanup_retry_metadata = {
+                "event_type": str(event.type),
+                "session_id": session.id,
+            }
+
     async def _finalize_terminal_event_once(
         self,
         *,
@@ -6782,7 +6860,13 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         if setup_owner is not None:
             if setup_owner.cleanup_started:
                 if setup_owner.cleanup_error is not None:
-                    raise setup_owner.cleanup_error
+                    if not _cancelled_finalization_retained_for_retry(setup_owner):
+                        raise setup_owner.cleanup_error
+                    await self._retarget_retained_completion_finalization(
+                        session=session,
+                        setup_owner=setup_owner,
+                        event=event,
+                    )
                 return EnvironmentBindingFinalizeResult(event=event, events=[])
             setup_owner.cleanup_started = True
             registered_environment = setup_owner.registered_environment

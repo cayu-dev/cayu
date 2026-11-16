@@ -9029,12 +9029,22 @@ class SessionEngine(BeforeStopPolicies):
                     # Exact committed evidence, or inability to classify it,
                     # forbids a later cleanup branch from rewriting status.
                     raise
-            if transition_settled or _latest_session_invocation_interaction_is_settled(
-                outcome_state.session.id
+            interaction_settled = (
+                transition_settled
+                or _latest_session_invocation_interaction_is_settled(outcome_state.session.id)
+            )
+            if interaction_settled and not (
+                await self._recovery_ownership.interrupt_requested_for_exit(
+                    cancellation,
+                    lambda: self._session_control.is_interrupting(outcome_state.session.id),
+                )
             ):
                 # The authoritative interaction/session decision already
                 # committed. Its durable side-effect handoff remains
                 # recoverable, so abandoned-run cleanup must not rewrite it.
+                # Deferred completion finalization keeps the session live
+                # after its interaction settles, so an operator interruption
+                # elected meanwhile still owes its own settlement below.
                 raise
             billing_identity_cancellation = detach_billing_identity_cancellation(cancellation)
             if (
@@ -9169,6 +9179,9 @@ class SessionEngine(BeforeStopPolicies):
                 for event in interruption_events:
                     yield event
                 return
+            if interaction_settled:
+                # Never rewrite a committed interaction decision as abandoned.
+                raise
             if (
                 preserve_failure_until_initial_provider_dispatch
                 and not initial_provider_dispatch_started
