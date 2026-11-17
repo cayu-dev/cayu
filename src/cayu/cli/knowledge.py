@@ -1,9 +1,10 @@
-"""`cayu knowledge`: read knowledge entries from a local store or a Cayu Cloud Agent."""
+"""`cayu knowledge`: read, add and review knowledge entries, locally or on a Cayu Cloud Agent."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any, cast
 
 from cayu.cli._cloud_agent_api import open_cloud_agent_api
@@ -33,7 +34,7 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
     knowledge = subparsers.add_parser(
         "knowledge",
-        help="Inspect knowledge, keep or drop proposals, and archive kept entries.",
+        help="Inspect and add knowledge, keep or drop proposals, and archive kept entries.",
         description=(
             "Read knowledge entries from a local store (--sqlite, --postgres, or the "
             "project's store) or from a Cayu Cloud Agent (--application NAME). Start with "
@@ -100,6 +101,56 @@ def add_knowledge_parser(subparsers: Any) -> None:
                 ),
             )
         add_action_target_options(action)
+
+    add_parser = commands.add_parser(
+        "add",
+        help="Add a knowledge entry, kept or for review.",
+        description=(
+            "Add one knowledge entry to a running agent (--server-url) or a Cayu Cloud "
+            "Agent (--application NAME), through the same store rules as the library. The "
+            "entry is kept (active) at once, so knowledge search finds it; with --pending it "
+            "is a proposal that someone else keeps or drops (`cayu knowledge keep`/`drop`), "
+            "since whoever adds a proposal can't keep it too (a server without "
+            "authentication refuses --pending for that reason). When the agent's knowledge "
+            "scope pins knowledge to a conversation's labels (session_label_keys, such as "
+            "`organization`), the entry must carry each one: pass --label organization=ID. "
+            "Adding the same text, kind and labels again returns the entry it added "
+            '("created": false). Prints the entry as one JSON document.'
+        ),
+    )
+    text_source = add_parser.add_mutually_exclusive_group(required=True)
+    text_source.add_argument("text", nargs="?", help="The entry's text.")
+    text_source.add_argument(
+        "--file",
+        type=Path,
+        metavar="PATH",
+        help="Read the entry's text from this UTF-8 file; - reads standard input.",
+    )
+    add_parser.add_argument(
+        "--kind", help="What the entry is, such as policy or faq (default: fact)."
+    )
+    add_parser.add_argument("--title", help="A short title, shown in lists.")
+    add_parser.add_argument(
+        "--namespace",
+        help=(
+            "The namespace to add to (default: the agent's review namespace, or its only "
+            "allowed one)."
+        ),
+    )
+    add_parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="A label on the entry, such as organization=ID; repeat for several.",
+    )
+    add_parser.add_argument("--source-uri", help="Where the text comes from, recorded with it.")
+    add_parser.add_argument(
+        "--pending",
+        action="store_true",
+        help="Add it as a proposal for review instead of keeping it at once.",
+    )
+    add_action_target_options(add_parser, output_format="json")
 
     list_parser = commands.add_parser(
         "list",
@@ -188,7 +239,7 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
 
 def run_knowledge(args: argparse.Namespace) -> int:
-    if args.knowledge_command in {"keep", "drop", "archive"}:
+    if args.knowledge_command in {"add", "keep", "drop", "archive"}:
         from cayu.cli._control_plane_actions import run_action
 
         return run_action(args)

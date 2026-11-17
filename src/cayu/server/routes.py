@@ -217,6 +217,7 @@ from cayu.server._kept_knowledge import (
     reviewed_decision_entry,
     reviewed_decision_revision,
 )
+from cayu.server._knowledge_additions import register_knowledge_addition
 from cayu.server._knowledge_preview import knowledge_preview
 from cayu.server._memory_report_routes import register_memory_report_routes
 from cayu.server._model_check_routes import register_model_check_route
@@ -9520,6 +9521,28 @@ def create_router(
         if entry is not None:
             await inbox_gate.require_knowledge(auth_context, entry)
 
+    async def _refuse_keeping_own_proposal(
+        workflow: KnowledgeReviewWorkflow, entry_id: str, reviewer_identity: str
+    ) -> None:
+        """Say plainly why keeping refuses the one who added a proposal (the activation rules
+        forbid an entry's creator authorizing it), instead of the rule's own error."""
+
+        try:
+            entry = await workflow.get_entry(entry_id)
+        except (PermissionError, ValueError):
+            return  # The approval itself reports these.
+        if (
+            entry is not None
+            and entry.status is KnowledgeStatus.PENDING
+            and entry.created_by == reviewer_identity
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "You added this proposal, so someone else must keep it; you can still drop it."
+                ),
+            )
+
     async def _apply_knowledge_review_action(action, entry_id: str):
         try:
             result = await action(entry_id)
@@ -9659,6 +9682,7 @@ def create_router(
         await _require_knowledge_access(auth_context, workflow, entry_id)
         operation_id = idempotency_key or f"server-knowledge-review-{uuid4().hex}"
         reviewer_identity, reviewer_annotations = _knowledge_reviewer_attribution(auth_context)
+        await _refuse_keeping_own_proposal(workflow, entry_id, reviewer_identity)
         if body is not None and body.reason is not None:
             # Where the inbox's keep records its reason too.
             reviewer_annotations["reason"] = cayu_app.redact_json(body.reason)
@@ -9751,6 +9775,15 @@ def create_router(
         serialize_chunk=_serialize_knowledge_chunk,
         parse_labels=_parse_knowledge_label_filters,
         parse_strings=_parse_knowledge_string_filters,
+    )
+    register_knowledge_addition(
+        bounded_control_plane_router,
+        app=cayu_app,
+        protected=protected,
+        workflow=_knowledge_review_workflow,
+        gate=inbox_gate,
+        optional_auth_context=optional_auth_context,
+        serialize_entry=_serialize_knowledge_entry_base,
     )
 
     register_inbox_routes(

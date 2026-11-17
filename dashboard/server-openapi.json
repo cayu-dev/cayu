@@ -19,6 +19,274 @@
         "title": "AccountingContract",
         "type": "object"
       },
+      "AddKnowledgeRequest": {
+        "additionalProperties": false,
+        "description": "One knowledge entry an operator adds (`POST /api/knowledge`).\n\nThe entry goes through the same store rules as the library's own writes: the\napplication's knowledge scope decides the namespaces and labels it may have, and a\nscope with ``session_label_keys`` refuses an entry without each of those labels.\n``status`` is ``active`` (kept, so knowledge search finds it now) or ``pending`` (a\nproposal that waits for someone else to keep or drop it).",
+        "properties": {
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Namespace"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "default": "active",
+            "enum": [
+              "active",
+              "pending"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "text": {
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "AddKnowledgeRequest",
+        "type": "object"
+      },
+      "AddKnowledgeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "aspects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Aspects",
+            "type": "array"
+          },
+          "chunk_count": {
+            "minimum": 1.0,
+            "title": "Chunk Count",
+            "type": "integer"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "created_by_type": {
+            "title": "Created By Type",
+            "type": "string"
+          },
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "string"
+          },
+          "impact_targets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Impact Targets",
+            "type": "array"
+          },
+          "importance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance"
+          },
+          "importance_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance Source"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "text_preview": {
+            "title": "Text Preview",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id",
+          "revision",
+          "namespace",
+          "kind",
+          "visibility",
+          "status",
+          "title",
+          "labels",
+          "aspects",
+          "impact_targets",
+          "source_type",
+          "source_uri",
+          "source_id",
+          "created_by_type",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "importance",
+          "importance_source",
+          "confidence",
+          "chunk_count",
+          "text_preview",
+          "created"
+        ],
+        "title": "AddKnowledgeResponse",
+        "type": "object"
+      },
       "AgentAuthoringState": {
         "description": "Explicit application-authoring state carried by an agent specification.",
         "enum": [
@@ -42467,7 +42735,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "91",
+            "default": "92",
             "title": "Contract Version",
             "type": "string"
           },
@@ -51499,7 +51767,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "91",
+            "default": "92",
             "title": "Contract Version",
             "type": "string"
           }
@@ -58107,6 +58375,43 @@
           }
         },
         "summary": "Kept Knowledge"
+      },
+      "post": {
+        "description": "Add one knowledge entry, kept (``active``) or as a proposal (``pending``).\n\nThe entry's id comes from its namespace, kind, labels and text, so sending the same\nrequest again returns the entry it added (``created: false``) instead of a copy.",
+        "operationId": "add_knowledge_api_knowledge_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddKnowledgeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddKnowledgeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Knowledge"
       }
     },
     "/api/knowledge/archived": {

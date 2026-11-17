@@ -130,6 +130,15 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
             or not _task_action_settled(args.task_command, result)
         ):
             raise invalid
+    elif args.knowledge_command == "add":
+        if (
+            not _receipt_identity(result.get("entry_id"))
+            or result.get("status") != body["status"]
+            or type(result.get("revision")) is not int
+            or result["revision"] < 1
+            or type(result.get("created")) is not bool
+        ):
+            raise invalid
     elif (
         not _receipt_identity(result.get("entry_id"))
         or result["entry_id"] != args.entry_id
@@ -146,6 +155,49 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
             file=sys.stderr,
         )
     return _redact_sensitive(result)
+
+
+#: The most text `cayu knowledge add` sends, in UTF-8 bytes; the server's own bound.
+KNOWLEDGE_ADD_TEXT_MAX_BYTES = 512 * 1024
+
+
+def knowledge_addition_body(args: argparse.Namespace) -> dict[str, Any]:
+    """The `POST /knowledge` body for `cayu knowledge add`: its text, fields and labels."""
+
+    from cayu.cli.session import _parse_labels
+
+    if args.file is not None:
+        if str(args.file) == "-":
+            raw = sys.stdin.buffer.read(KNOWLEDGE_ADD_TEXT_MAX_BYTES + 1)
+        else:
+            with args.file.open("rb") as handle:
+                raw = handle.read(KNOWLEDGE_ADD_TEXT_MAX_BYTES + 1)
+        if len(raw) > KNOWLEDGE_ADD_TEXT_MAX_BYTES:
+            raise ValueError(
+                f"The text is longer than one entry holds ({KNOWLEDGE_ADD_TEXT_MAX_BYTES} bytes)."
+            )
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("--file must hold UTF-8 text.") from None
+    else:
+        # argparse requires the text or --file.
+        text = args.text
+    if len(text.encode("utf-8")) > KNOWLEDGE_ADD_TEXT_MAX_BYTES:
+        raise ValueError(
+            f"The text is longer than one entry holds ({KNOWLEDGE_ADD_TEXT_MAX_BYTES} bytes)."
+        )
+    text = require_durable_nonblank(text, "text")
+    body: dict[str, Any] = {
+        "text": text,
+        "labels": _parse_labels(args.label),
+        "status": "pending" if args.pending else "active",
+    }
+    for name in ("kind", "title", "namespace", "source_uri"):
+        value = getattr(args, name)
+        if value is not None:
+            body[name] = require_durable_clean_nonblank(value, f"--{name.replace('_', '-')}")
+    return body
 
 
 def _task_action_settled(command: str, task: dict[str, Any]) -> bool:
@@ -271,6 +323,8 @@ def run_action(args: argparse.Namespace) -> int:
                             "reason": args.reason,
                             "payload": json_object_file(args.payload_file),
                         }
+                elif args.knowledge_command == "add":
+                    path, body = "/knowledge", knowledge_addition_body(args)
                 else:
                     action = {"keep": "approve", "drop": "reject", "archive": "retire"}[
                         args.knowledge_command

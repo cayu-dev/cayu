@@ -214,7 +214,9 @@ enforces it, so no tool has to remember to filter:
   nobody sees, corrects or forgets another organization's.
 - Knowledge you add yourself (seeding, operator scripts, curation) needs an `organization`
   label, since no member could read it without one: the store refuses an active or pending
-  entry without it and says what to add. Entries stored before this rule can still be
+  entry without it and says what to add. From the command line, `cayu knowledge add "TEXT"
+  --label organization=acme` (or `--file policy.md`) adds one to a running agent or a Cloud
+  Agent (`--application NAME`). Entries stored before this rule can still be
   revised to add the label, or archived.
 
 Work queued before you turn on `knowledge=True` keeps the grant it was admitted with, which

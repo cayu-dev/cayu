@@ -18,6 +18,150 @@ export type AccountingContract = {
 };
 
 /**
+ * AddKnowledgeRequest
+ *
+ * One knowledge entry an operator adds (`POST /api/knowledge`).
+ *
+ * The entry goes through the same store rules as the library's own writes: the
+ * application's knowledge scope decides the namespaces and labels it may have, and a
+ * scope with ``session_label_keys`` refuses an entry without each of those labels.
+ * ``status`` is ``active`` (kept, so knowledge search finds it now) or ``pending`` (a
+ * proposal that waits for someone else to keep or drop it).
+ */
+export type AddKnowledgeRequest = {
+    /**
+     * Kind
+     */
+    kind?: string | null;
+    /**
+     * Labels
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    /**
+     * Namespace
+     */
+    namespace?: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri?: string | null;
+    /**
+     * Status
+     */
+    status?: 'active' | 'pending';
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Title
+     */
+    title?: string | null;
+};
+
+/**
+ * AddKnowledgeResponse
+ */
+export type AddKnowledgeResponse = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Chunk Count
+     */
+    chunk_count: number;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Created
+     */
+    created: boolean;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text Preview
+     */
+    text_preview: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
  * AgentAuthoringState
  *
  * Explicit application-authoring state carried by an agent specification.
@@ -30300,6 +30444,31 @@ export type KeptKnowledgeApiKnowledgeGetResponses = {
 };
 
 export type KeptKnowledgeApiKnowledgeGetResponse = KeptKnowledgeApiKnowledgeGetResponses[keyof KeptKnowledgeApiKnowledgeGetResponses];
+
+export type AddKnowledgeApiKnowledgePostData = {
+    body: AddKnowledgeRequest;
+    path?: never;
+    query?: never;
+    url: '/api/knowledge';
+};
+
+export type AddKnowledgeApiKnowledgePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type AddKnowledgeApiKnowledgePostError = AddKnowledgeApiKnowledgePostErrors[keyof AddKnowledgeApiKnowledgePostErrors];
+
+export type AddKnowledgeApiKnowledgePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: AddKnowledgeResponse;
+};
+
+export type AddKnowledgeApiKnowledgePostResponse = AddKnowledgeApiKnowledgePostResponses[keyof AddKnowledgeApiKnowledgePostResponses];
 
 export type ArchivedKnowledgeApiKnowledgeArchivedGetData = {
     body?: never;

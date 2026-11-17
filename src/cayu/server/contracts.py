@@ -3885,6 +3885,45 @@ class RetireKnowledgeRequest(_KnowledgeReviewReason):
     expected_revision: StrictInt | None = Field(default=None, ge=1, le=MAX_KNOWLEDGE_REVISION)
 
 
+#: The most text one added knowledge entry may hold, in UTF-8 bytes.
+ADD_KNOWLEDGE_TEXT_MAX_BYTES = 512 * 1024
+
+
+class AddKnowledgeRequest(ApiBaseModel):
+    """One knowledge entry an operator adds (`POST /api/knowledge`).
+
+    The entry goes through the same store rules as the library's own writes: the
+    application's knowledge scope decides the namespaces and labels it may have, and a
+    scope with ``session_label_keys`` refuses an entry without each of those labels.
+    ``status`` is ``active`` (kept, so knowledge search finds it now) or ``pending`` (a
+    proposal that waits for someone else to keep or drop it).
+    """
+
+    text: StrictStr = Field(min_length=1)
+    kind: StrictStr | None = None
+    title: StrictStr | None = None
+    namespace: StrictStr | None = None
+    labels: dict[StrictStr, StrictStr] = Field(default_factory=dict)
+    source_uri: StrictStr | None = None
+    status: Literal["active", "pending"] = "active"
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        value = require_durable_nonblank(value, "text")
+        if len(value.encode("utf-8")) > ADD_KNOWLEDGE_TEXT_MAX_BYTES:
+            raise ValueError(f"text must be at most {ADD_KNOWLEDGE_TEXT_MAX_BYTES} UTF-8 bytes")
+        return value
+
+
+class AddKnowledgeResponse(ApiKnowledgeEntryBase):
+    chunk_count: StrictInt = Field(ge=1)
+    text_preview: str
+    #: False when the same entry (text, kind, namespace, labels and fields) already
+    #: existed, so the request changed nothing.
+    created: StrictBool
+
+
 class PendingKnowledgeListResponse(ApiBaseModel):
     entries: list[ApiKnowledgeListItem]
     next_cursor: str | None

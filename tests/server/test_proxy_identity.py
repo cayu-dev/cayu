@@ -303,6 +303,7 @@ _FULL_ACCESS_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
             ("PATCH", "/sessions/{session_id}/metadata"),
             ("POST", "/artifacts/index/reindex"),
             ("POST", "/diagnostics/model-check"),
+            ("POST", "/knowledge"),
             ("POST", "/knowledge/{entry_id}/retire"),
             ("POST", "/provider-operations/resolve"),
             ("POST", "/resume"),

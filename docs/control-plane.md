@@ -1250,6 +1250,25 @@ receipt. A Drop with neither archives the
 proposal as before, without attribution. Both responses carry the recorded `reason`,
 or null.
 
+Full-access callers add an entry with `POST /api/knowledge` and
+`{"text": "...", "kind": "policy", "title": "...", "labels": {"organization": "acme"}}`
+(also `namespace`, `source_uri`, and `status`: `active`, the default, or `pending`). The
+entry is written through the server's knowledge scope, so the store's rules apply as they
+do to the library's own writes: a namespace or label the scope doesn't admit is refused,
+and when the scope has `session_label_keys` an entry without each of those labels returns
+422 naming the missing one. The namespace defaults to the review namespace, or to the
+scope's only allowed namespace; a scope with several needs one named. The entry records
+the caller (the verified `AuthContext.subject`, as when keeping an entry) as `created_by`, with
+`created_by_type` `user`. Its id comes from its namespace, kind, labels and text, so the
+same request again returns the entry with `created: false`; the same text and labels with
+other fields, or an id an archived or dropped entry used, returns 409. A `pending` entry
+is a proposal like a remembered one, and `cayu knowledge keep` refuses the caller who added it (409, "You
+added this proposal"), so someone else reviews it. A server without authentication has
+one caller, so it refuses `pending` (422), and so does a proposal whose text and chunks
+wouldn't fit the activation request that keeping builds (413); an `active` entry is kept at once, by the operator who added it, without
+an activation receipt (the kept list shows `attribution_unavailable_reason:
+not_recorded`). Text is at most 512 KiB, chunked as the indexer chunks it.
+
 `cayu knowledge list` and `cayu knowledge show ENTRY_ID` read the same entries
 from the command line, from a local store (`--sqlite`, `--postgres`, or the
 project's store, opened read-only with every namespace visible) or from a Cayu
@@ -1262,15 +1281,28 @@ cayu knowledge list --status pending --namespace reviews --json
 cayu knowledge show ENTRY_ID
 ```
 
-To review proposals, and archive kept entries, against a running server or a Cloud
-Agent (`--application NAME`):
+To add entries, review proposals, and archive kept entries, against a running server or
+a Cloud Agent (`--application NAME`):
 
 ```bash
+cayu knowledge add "Invoices over 10,000 need a second approver." --kind policy --label organization=acme
+cayu knowledge add --file refunds.md --title "Refund policy" --label organization=acme --pending --application acme-agent
+cat faq.md | cayu knowledge add --file - --kind faq --label organization=globex
 cayu knowledge list --status pending --server-url http://127.0.0.1:8000 --json
 cayu knowledge keep ENTRY_ID --operation-id review-2026-10-29 --reason "Matches the runbook" --json
 cayu knowledge drop ENTRY_ID --operation-id drop-2026-10-29 --reason "Duplicates ENTRY_ID2" --json
 cayu knowledge archive ENTRY_ID --reason "The worker now runs three processes" --json
 ```
+
+Add sends one entry to `POST /api/knowledge` and prints it as one JSON document. It takes
+the text as an argument or from `--file PATH` (`-` reads standard input), and `--kind`,
+`--title`, `--namespace`, `--source-uri` and repeated `--label KEY=VALUE`. The entry is
+kept at once: an operator adding knowledge is already the one who would keep it. With
+`--pending` it is a proposal that goes through the same keep and drop as remembered
+entries, which someone other than the one who added it keeps; a server without
+authentication refuses it, since there nobody else could keep it. In an organizations project
+an entry without an `organization` label is refused, as the store refuses it; list what
+you added with `cayu knowledge list --label organization=ID`. Adding needs full access.
 
 Keep calls the existing approval workflow with an explicit idempotency key;
 repeating that key returns the approved-entry projection using the durable
