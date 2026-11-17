@@ -84,6 +84,8 @@ def run_isolated(
     }
     if arguments.max_parallel_trials is not None:
         body["max_parallel_trials"] = arguments.max_parallel_trials
+    if arguments.max_run_cost is not None:
+        body["max_run_cost"] = {"amount": arguments.max_run_cost, "currency": "USD"}
     environment = {
         name: value
         for name, value in (("database", arguments.database), ("isolation", arguments.isolation))
@@ -105,6 +107,7 @@ def run_isolated(
         "max_concurrency": arguments.max_concurrency,
         "timeout_seconds_per_trial": suite.timeout_seconds,
         "environment": environment or None,
+        "max_run_cost": arguments.max_run_cost,
     }
     note(_bound_text(bound))
     commands = _continuation(
@@ -128,6 +131,13 @@ def run_isolated(
                 "isolated_runs_unavailable",
                 "This Cayu Cloud doesn't run corpus suites in an isolated environment yet "
                 f"({exc.code}); run the suite on the live Agent with --on live.",
+                details={"code": exc.code},
+            ) from None
+        if exc.code == "run_cost_unsupported":
+            raise error(
+                "run_cost_unsupported",
+                "This Cayu Cloud can't hold an isolated run to --max-run-cost: its trials don't "
+                "call a Gateway of its own. Run it without --max-run-cost.",
                 details={"code": exc.code},
             ) from None
         if exc.code == "database_unsupported":
@@ -402,6 +412,7 @@ def _continuation(
     ]
     for option, value in (
         ("--max-parallel-trials", arguments.max_parallel_trials),
+        ("--max-run-cost", arguments.max_run_cost),
         ("--target", arguments.target),
         ("--database", arguments.database),
         ("--isolation", arguments.isolation),
@@ -434,6 +445,13 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
         if parallel == 1
         else f" Up to {parallel} allocations run at once, as far as the install allows."
     )
+    cap = bound.get("max_run_cost")
+    capped = (
+        ""
+        if cap is None
+        else f" The whole run may spend at most {cap} USD on model calls; Cloud's Gateway "
+        "refuses calls past it."
+    )
     return "\n".join(
         [
             f"Isolated evaluation of Release {bound['release_id']}, suite {bound['suite_id']}: "
@@ -442,7 +460,8 @@ def _bound_text(bound: Mapping[str, Any]) -> str:
             f"{count(bound['total_trials'], 'trial')}, at most {bound['max_concurrency']} "
             "running at a time in each allocation.",
             f"Each trial: {bound['timeout_seconds_per_trial']}s. Each allocation gets {where} "
-            f"(isolation {isolation}); nothing reaches the live Agent's stores.{at_once}",
+            f"(isolation {isolation}); nothing reaches the live Agent's stores.{at_once}"
+            f"{capped}",
         ]
     )
 

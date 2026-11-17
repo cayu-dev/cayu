@@ -231,6 +231,7 @@ def test_each_place_refuses_the_options_only_the_other_takes(
         (("--on", "live", "--isolation", "run"), "--isolation"),
         (("--on", "live", "--max-parallel-trials", "2"), "--max-parallel-trials"),
         (("--max-parallel-trials", "11"), "--max-parallel-trials"),
+        (("--on", "live", "--max-run-cost", "5"), "--max-run-cost"),
     ):
         code, answer, _ = _eval(capsys, *_run(tmp_path, *extra))
         assert code == 2, answer
@@ -408,6 +409,55 @@ def test_a_run_without_parallel_trials_sends_none_and_says_so_when_asked(
     )
     assert code == 0
     assert "Up to 3 allocations run at once" in progress
+
+
+def test_a_run_cost_cap_reaches_the_request_its_bound_and_its_continuation(
+    tmp_path: Path, cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, answer, progress = _eval(capsys, *_run(tmp_path, "--max-run-cost", "2.50", "--no-wait"))
+    assert code == 0, answer
+    (body,) = cloud.submitted
+    assert body["max_run_cost"] == {"amount": "2.50", "currency": "USD"}
+    assert "at most 2.50 USD on model calls" in progress
+    again = shlex.split(answer["result"]["commands"]["continue"])
+    assert again[again.index("--max-run-cost") + 1] == "2.50"
+    # Without it, nothing is capped and the request says nothing of it.
+    assert _eval(capsys, *_run(tmp_path, "--no-wait"))[0] == 0
+    assert "max_run_cost" not in cloud.submitted[-1]
+
+
+def test_a_run_cost_cap_outside_clouds_bounds_is_refused_before_any_request(
+    tmp_path: Path, cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for amount in ("0", "-1", "10000.5", "0.0000000001", "nan", "five"):
+        code, answer, _ = _eval(capsys, *_run(tmp_path, "--max-run-cost", amount))
+        assert code == 2, (amount, answer)
+        assert "--max-run-cost" in answer["error"]["message"]
+    assert cloud.requests == []
+
+
+def test_a_cloud_that_cant_hold_a_cap_says_to_run_without_it(
+    tmp_path: Path, cloud: _EvaluationsCloud, capsys: pytest.CaptureFixture[str], monkeypatch
+) -> None:
+    original = cloud.request
+
+    def refusing(method: str, path: str, **options: Any) -> dict[str, Any]:
+        from cayu.cli._cloud_api import CloudApiError
+
+        if method == "POST" and path.endswith("/evaluations"):
+            raise CloudApiError(
+                "api_request_rejected",
+                "Cayu Cloud API returned HTTP 409.",
+                status_code=409,
+                code="run_cost_unsupported",
+            )
+        return original(method, path, **options)
+
+    monkeypatch.setattr(cloud, "request", refusing)
+    code, answer, _ = _eval(capsys, *_run(tmp_path, "--max-run-cost", "1"))
+    assert code != 0
+    assert answer["error"]["category"] == "run_cost_unsupported"
+    assert "without --max-run-cost" in answer["error"]["message"]
 
 
 _ENVIRONMENT = {

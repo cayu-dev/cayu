@@ -128,6 +128,8 @@ _REPORTED_API_REFUSALS = frozenset(
         # `cayu cloud eval run`: an evaluation service without isolated corpus runs, or an eval
         # database, on this installation.
         (409, "database_unsupported"),
+        # ... or a run spend cap (--max-run-cost) it can't hold.
+        (409, "run_cost_unsupported"),
         (422, "suite_kind_unsupported"),
         (503, "evaluations_unavailable"),
         # `cayu cloud service check`: why Cloud couldn't run the Agent's operator check.

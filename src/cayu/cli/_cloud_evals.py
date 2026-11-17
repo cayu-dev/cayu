@@ -69,7 +69,14 @@ _LIVE_WARNING = (
 )
 # Options only one place takes.
 _LIVE_ONLY = ("max_cost", "currency", "execution_profile_revision")
-_ISOLATED_ONLY = ("release", "target", "database", "isolation", "max_parallel_trials")
+_ISOLATED_ONLY = (
+    "release",
+    "target",
+    "database",
+    "isolation",
+    "max_parallel_trials",
+    "max_run_cost",
+)
 TERMINAL_RUN_STATUSES = frozenset(RUN_STATUSES[3:])
 # The Agent accepts up to 512 characters; the CLI's other operation IDs stop at 256.
 _OPERATION_ID_MAX_CHARS = 256
@@ -188,6 +195,16 @@ def add_eval_parser(
             "Isolated only: how many of the --trials allocations run at once (default 1), at "
             "most what the install allows. A run sharing one database (--isolation run) runs "
             "them one at a time."
+        ),
+    )
+    run.add_argument(
+        "--max-run-cost",
+        type=_run_cost_amount,
+        metavar="AMOUNT",
+        help=(
+            "Isolated only: the most the whole run may spend on model calls, in USD, such as "
+            "5.00. Cloud's Gateway refuses calls past it and the run fails as "
+            "run_cost_exceeded. Needs a Cayu Cloud whose trials call its own Gateway."
         ),
     )
     run.add_argument(
@@ -1662,6 +1679,17 @@ def _cost_amount(value: str) -> Decimal:
     if not amount.is_finite() or amount <= 0:
         raise argparse.ArgumentTypeError("must be a positive amount")
     return amount
+
+
+def _run_cost_amount(value: str) -> str:
+    """A USD amount above 0 and at most 10000, to at most nine decimal places (what Cayu
+    Cloud's evaluation service accepts as max_run_cost), as a plain decimal string."""
+
+    amount = _cost_amount(value)
+    exponent = amount.as_tuple().exponent
+    if amount > 10_000 or not isinstance(exponent, int) or exponent < -9:
+        raise argparse.ArgumentTypeError("must be at most 10000, to at most nine decimal places")
+    return format(amount, "f")
 
 
 def _currency(value: str) -> str:
