@@ -71,8 +71,8 @@ dev = [
   "hypothesis>=6,<7",
   # Official SDK fixture verifies the pinned 2026-07-28 stdio wire contract.
   "mcp==2.2.0",
-  "opentelemetry-api>=1.45.1",
-  "opentelemetry-sdk>=1.45.1",
+  "opentelemetry-api>=1.45.2",
+  "opentelemetry-sdk>=1.45.2",
   "packaging>=24",
   "pillow>=13.0.0",
   "psycopg[binary]>=3.2",
@@ -125,8 +125,8 @@ egress = [
   "cryptography>=42",
 ]
 otel = [
-  "opentelemetry-api>=1.45.1",
-  "opentelemetry-sdk>=1.45.1",
+  "opentelemetry-api>=1.45.2",
+  "opentelemetry-sdk>=1.45.2",
 ]
 vertex = [
   "google-auth[requests]>=2,<3",
@@ -165,8 +165,8 @@ all = [
   "fastapi>=0.115,<0.137",
   "google-auth[requests]>=2,<3",
   "ipython>=9,<10",
-  "opentelemetry-api>=1.45.1",
-  "opentelemetry-sdk>=1.45.1",
+  "opentelemetry-api>=1.45.2",
+  "opentelemetry-sdk>=1.45.2",
   "pillow>=13.0.0",
   "psycopg[binary]>=3.2",
   "psycopg_pool>=3.2",

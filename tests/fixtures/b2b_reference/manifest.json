@@ -105,7 +105,7 @@
     },
     "web/package.json": {
       "reference_sha256": "284c3fc05ff01c2c8f7c1237452d2c7c121feead6900d7611a5b4000ece4731a",
-      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Builds, lints and formats with Vite+ (`vite-plus` 1.0.0-rc.1 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports."
+      "deviation": "The reference also builds on a second component kit; Cayu ships only the shadcn kit, so its scripts, aliases and comments are gone. Without lucide-react, which only the imported Inbox part used. The description says it is served at /. Served at / by `cayu serve` ([tool.cayu.serve] ui), not under /app/ui/ by the project's own router. Builds, lints and formats with Vite+ (`vite-plus` 1.6.0 pinned exactly, `vite` aliased to its core) instead of Biome and Vite, with `format` and `format:check` scripts, on the Node versions Vite+ supports."
     },
     "web/scripts/add-licenses.mjs": {
       "reference_sha256": "4ecc9863b708a5e7a2ac8f9a4bda1e1e22268d46dc1d5eb8278a39270ab8ef5e",
