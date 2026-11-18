@@ -293,6 +293,15 @@ def test_resolved_postgres_export_failure_never_prints_connection_string(
         "rds-pitr:2026-09-29T12:00:00.123456Z",
         "rds-pitr:2026-09-29t12:00:00z",
         "rds-pitr:2024-02-29T23:59:59+00:00",
+        "pitr:cloudsql:2026-09-29T12:00:00Z",
+        "pitr:cloudsql:2026-09-29T12:00:00.123456Z",
+        "pitr:cloudsql:2026-09-29t12:00:00z",
+        "pitr:cloudsql:2024-02-29T23:59:59+00:00",
+        "pitr:azure:2026-09-29T12:00:00Z",
+        "pitr:cnpg:2026-09-29T12:00:00Z",
+        "pitr:a:2026-09-29T12:00:00Z",
+        "pitr:on-prem-2:2026-09-29T12:00:00Z",
+        "pitr:a" + "b" * 31 + ":2026-09-29T12:00:00Z",
     ],
 )
 def test_managed_backup_reference_accepts_documented_forms(reference: str) -> None:
@@ -315,9 +324,30 @@ def test_managed_backup_reference_accepts_documented_forms(reference: str) -> No
         ("rds-pitr:2026-09-29T12:00:00-00:00", "RFC 3339 UTC timestamp"),
         ("rds-pitr:2026-02-30T12:00:00Z", "RFC 3339 UTC timestamp"),
         ("rds-pitr:2026-09-29 12:00:00Z", "RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql", "pitr:cloudsql: requires an RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:", "pitr:cloudsql: requires an RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-09-29", "pitr:cloudsql: requires an RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-09-29T12:00:00", "RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-09-29T12:00:00+02:00", "RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-09-29T12:00:00-00:00", "RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-02-30T12:00:00Z", "RFC 3339 UTC timestamp"),
+        ("pitr:cloudsql:2026-09-29 12:00:00Z", "RFC 3339 UTC timestamp"),
+        ("pitr:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:", "pitr: requires a provider name"),
+        ("pitr::2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:Cloud SQL:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:CloudSQL:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:cloud_sql:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:1cloud:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:-cloud:2026-09-29T12:00:00Z", "pitr: requires a provider name"),
+        ("pitr:a" + "b" * 32 + ":2026-09-29T12:00:00Z", "pitr: requires a provider name"),
         ("snapshot:cayu", "must be rds-snapshot:"),
         ("rds-snapshot", "must be rds-snapshot:"),
         ("RDS-PITR:2026-09-29T12:00:00Z", "must be rds-snapshot:"),
+        ("PITR:cloudsql:2026-09-29T12:00:00Z", "pitr:<provider>:<RFC 3339 UTC timestamp>"),
+        ("cloudsql-pitr:2026-09-29T12:00:00Z", "must be rds-snapshot:"),
+        ("cloudsql-backup:1700000000000", "must be rds-snapshot:"),
+        ("pitr", "must be rds-snapshot:"),
     ],
 )
 def test_malformed_managed_backup_reference_fails_before_connecting(
@@ -623,7 +653,12 @@ def test_postgres_direct_url_migration_records_managed_backup_for_empty_database
     assert f"managed backup: {reference}" in capsys.readouterr().out
 
 
-def test_postgres_project_env_target_and_managed_snapshot_receipt(
+@pytest.mark.parametrize(
+    "reference",
+    ["rds-snapshot:pre-migration-42", "pitr:cloudsql:2026-09-29T12:00:00Z"],
+)
+def test_postgres_project_env_target_and_managed_backup_receipt(
+    reference: str,
     postgres_dsn: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -653,7 +688,6 @@ def test_postgres_project_env_target_and_managed_snapshot_receipt(
     assert _postgres_revision(postgres_dsn) == _LATEST_BREAKING - 1
     assert _pending_receipt_count(postgres_dsn) == 0
 
-    reference = "rds-snapshot:cayu-pre-release-42"
     assert main(["storage", "migrate", "--backup-managed", reference, *acknowledgement]) == 0
     output = capsys.readouterr().out
     assert url not in output

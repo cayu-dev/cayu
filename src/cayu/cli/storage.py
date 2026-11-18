@@ -70,6 +70,7 @@ STATUS_EXIT_INCOMPATIBLE = 4
 DIRECT_DATABASE_URL_ENV = "CAYU_DATABASE_DIRECT_URL"
 
 _RDS_SNAPSHOT_IDENTIFIER = re.compile(r"(?:rds:)?[A-Za-z](?:-?[A-Za-z0-9])*")
+_PITR_PROVIDER = re.compile(r"[a-z][a-z0-9-]{0,31}")
 _RFC3339_UTC_TIMESTAMP = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:[Zz]|\+00:00)"
 )
@@ -173,8 +174,10 @@ def add_storage_parser(subparsers: Any) -> None:
                     metavar="REF",
                     help=(
                         "Record a provider-managed Postgres backup: "
-                        "rds-snapshot:<snapshot identifier> or "
-                        "rds-pitr:<RFC 3339 UTC timestamp>."
+                        "rds-snapshot:<snapshot identifier>, "
+                        "rds-pitr:<RFC 3339 UTC timestamp>, or "
+                        "pitr:<provider>:<RFC 3339 UTC timestamp>, where provider is "
+                        "the platform's own name for its point-in-time recovery."
                     ),
                 )
                 backup.add_argument(
@@ -1661,22 +1664,42 @@ def _managed_backup_reference(value: str) -> str:
             "most 255 characters (automated snapshots may keep their rds: prefix)."
         )
     if separator and kind == "rds-pitr":
-        match = _RFC3339_UTC_TIMESTAMP.fullmatch(detail)
-        if match is not None:
-            try:
-                datetime(*(int(part) for part in match.groups()[:6]), tzinfo=UTC)
-            except ValueError:
-                match = None
-        if match is not None:
+        if _is_rfc3339_utc_timestamp(detail):
             return value
         raise ValueError(
             "--backup-managed rds-pitr: requires an RFC 3339 UTC timestamp such as "
             "2026-09-29T12:00:00Z."
         )
+    if separator and kind == "pitr":
+        provider, provider_separator, timestamp = detail.partition(":")
+        if _PITR_PROVIDER.fullmatch(provider) is None:
+            raise ValueError(
+                "--backup-managed pitr: requires a provider name of lowercase letters, "
+                "digits, and hyphens, starting with a letter, at most 32 characters, "
+                "such as pitr:cloudsql:2026-09-29T12:00:00Z."
+            )
+        if provider_separator and _is_rfc3339_utc_timestamp(timestamp):
+            return value
+        raise ValueError(
+            f"--backup-managed pitr:{provider}: requires an RFC 3339 UTC timestamp such "
+            "as 2026-09-29T12:00:00Z."
+        )
     raise ValueError(
-        "--backup-managed must be rds-snapshot:<snapshot identifier> or "
-        "rds-pitr:<RFC 3339 UTC timestamp>."
+        "--backup-managed must be rds-snapshot:<snapshot identifier>, "
+        "rds-pitr:<RFC 3339 UTC timestamp>, or pitr:<provider>:<RFC 3339 UTC timestamp>, "
+        "where provider is the platform's own name for its point-in-time recovery."
     )
+
+
+def _is_rfc3339_utc_timestamp(value: str) -> bool:
+    match = _RFC3339_UTC_TIMESTAMP.fullmatch(value)
+    if match is None:
+        return False
+    try:
+        datetime(*(int(part) for part in match.groups()[:6]), tzinfo=UTC)
+    except ValueError:
+        return False
+    return True
 
 
 def _sqlite_migration_receipt_paths(path: Path) -> tuple[Path, Path]:

@@ -303,6 +303,13 @@ backup authority in the migration receipt. Pass exactly one of:
 - `--backup-managed rds-pitr:<timestamp>` for an RDS point-in-time recovery
   target. The timestamp is RFC 3339 in UTC, for example
   `2026-09-29T12:00:00Z` (`+00:00` is also accepted).
+- `--backup-managed pitr:<provider>:<timestamp>` for a point-in-time recovery
+  target on any other platform, with the same timestamp format as `rds-pitr`.
+  The provider is the platform's own name for its point-in-time recovery, for
+  example `pitr:cloudsql:2026-09-29T12:00:00Z`: lowercase letters, digits, and
+  hyphens, starting with a letter, at most 32 characters. Cayu calls no
+  provider API; it checks the form and records the reference as given, so a new
+  platform needs no Cayu change.
 - `--backup-sha256 SHA256` for an application-consistent backup you hold.
 - `--waive-backup` for an explicit operator waiver.
 
@@ -317,4 +324,5 @@ accepted and recorded as given, so a platform may always pass one.
 
 A receipt binds its exact invocation. If a migration is interrupted, rerun the
 same command with the same backup option; a new reference (for example a new
-`rds-pitr` timestamp) is rejected as a different migration invocation.
+`rds-pitr` or `pitr:<provider>:` timestamp) is rejected as a different migration
+invocation.

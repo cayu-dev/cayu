@@ -507,9 +507,9 @@ claim parked tasks. Before you start this version:
 1. Stop every worker and server running an older version.
 2. Back up the database. `cayu storage migrate` keeps a SQLite backup by default.
    On PostgreSQL, take an application-consistent backup first and pass exactly one
-   of `--backup-sha256 SHA256`, `--backup-managed` (an RDS snapshot or
-   point-in-time target) or the explicit operator waiver `--waive-backup`; see
-   [backup authority](session-store-targets.md#backup-authority).
+   of `--backup-sha256 SHA256`, `--backup-managed` (an RDS snapshot, or an
+   RDS or other provider's point-in-time target) or the explicit operator waiver
+   `--waive-backup`; see [backup authority](session-store-targets.md#backup-authority).
 3. Run `cayu storage migrate`. On an existing database, acknowledge each breaking
    revision it applies with `--acknowledge-breaking`, including
    `--acknowledge-breaking 137`; the command names any it still needs.
