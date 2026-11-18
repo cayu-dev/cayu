@@ -1056,6 +1056,14 @@ for another Cloud are refused together. The URL is compared in one spelling (low
 and host, the host in IDNA, no default port or trailing slash), so `https://Cloud.cayu.dev:443/`
 is production. The directories Cayu creates for it are private to the user (mode `0700`).
 
+A login to production selects no context, but it also writes production a `context.json` in
+its own `installs/` directory, naming production's `api_url` and the default login file by its
+absolute path. It isn't selected, so commands without a context act as before; it lets a
+command name production with `--context PATH` exactly as it names any other install, which a
+script or a coding agent uses to pin a change to production. Every login reports the context
+file that names its Cloud in `result.context_file`; for another install it is the selected
+`result.context`. Signing out through production's context removes the production login.
+
 `cayu cloud logout` and `organizations use` act on the login of the selected install context,
 and `context show` reports its `authentication` as `workos`. `logout` reports the `api_url` and
 the `login` file it removed. It always removes an install's own `installs/<install>/auth.json`,

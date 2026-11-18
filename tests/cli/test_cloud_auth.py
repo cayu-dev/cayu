@@ -502,15 +502,25 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
         login_streams = capsys.readouterr()
         login = json.loads(login_streams.out)
         assert login["operation"] == "login"
+        production_context = cloud_cli._install_directory(api_url) / "context.json"
         assert login["result"] == {
             "api_url": api_url,
             "authentication": "workos",
-            # Production's login selects no context.
+            # Production's login selects no context, but writes one a command can name.
             "context": None,
+            "context_file": str(production_context),
             "organization_id": "org_test",
             "status": "signed_in",
             "user_id": "user_test",
         }
+        assert production_context.parent.parent.parent == tmp_path
+        assert json.loads(production_context.read_text()) == {
+            "api_url": api_url,
+            "login_file": str(auth_path.resolve()),
+            "schema_version": 1,
+            "status": "ready",
+        }
+        assert stat.S_IMODE(production_context.stat().st_mode) == 0o600
         assert "CAYU-TEST" in login_streams.err
         assert "https://auth.example.test/device" in login_streams.err
         assert device_code not in login_streams.err
@@ -532,6 +542,13 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
         identity = json.loads(capsys.readouterr().out)
         assert identity["result"]["organization_id"] == "org_test"
         assert identity["result"]["user_id"] == "user_test"
+
+        # Naming production's context acts with the same login, and still selects nothing.
+        assert main(["cloud", "--context", str(production_context), "whoami"]) == 0
+        named = json.loads(capsys.readouterr().out)
+        assert named["result"]["organization_id"] == "org_test"
+        assert named["result"]["user_id"] == "user_test"
+        assert not config_path.exists()
 
         context_key = tmp_path / "context-api-key"
         context_key.write_text("context-credential\n")

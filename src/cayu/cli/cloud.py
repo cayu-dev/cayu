@@ -2730,6 +2730,9 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
     if install is None:
         _clear_active_context()
         context_path = None
+        # Nothing is selected, but production gets a context file too, so a command can name
+        # production with `--context` as it names any other install.
+        context_file = _write_production_context(api_url, store.path)
     else:
         # The install's context names its own login, and is selected like any other context.
         context_path = install / _INSTALL_CONTEXT_FILE
@@ -2743,12 +2746,16 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
             },
         )
         _activate_context(context_path)
+        context_file = context_path
     return {
         "operation": "login",
         "result": {
             "api_url": api_url,
             "authentication": "workos",
+            # The selected context; None for production, whose login selects none.
             "context": None if context_path is None else str(context_path),
+            # The context file to name this Cloud with `--context`, production's included.
+            "context_file": str(context_file),
             "organization_id": credentials.organization_id,
             "status": "signed_in",
             "user_id": credentials.user_id,
@@ -2919,6 +2926,29 @@ def _install_directory(api_url: str) -> Path:
     digest = hashlib.sha256(api_url.encode("utf-8")).hexdigest()[:12]
     name = f"{_slug(urlsplit(api_url).netloc)}-{digest}"
     return _active_config_path().parent / _INSTALLS_DIRECTORY / name
+
+
+def _write_production_context(api_url: str, login: Path) -> Path:
+    """Write, without selecting, a context for production's default login.
+
+    Production's login lives in the one default login file and selects no context; this file
+    only lets a command name production with `--context PATH`. It names that login file by its
+    absolute path, so signing out through it deletes the same login `logout` deletes.
+    """
+
+    directory = _install_directory(api_url)
+    _create_install_directory(directory)
+    path = directory / _INSTALL_CONTEXT_FILE
+    _write_private_json(
+        path,
+        {
+            "api_url": api_url,
+            "login_file": str(login.expanduser().resolve()),
+            "schema_version": 1,
+            "status": "ready",
+        },
+    )
+    return path
 
 
 def _create_install_directory(directory: Path) -> None:

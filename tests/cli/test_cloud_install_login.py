@@ -362,7 +362,36 @@ def test_another_spelling_of_production_signs_in_to_production(
 
     result = json.loads(capsys.readouterr().out)["result"]
     assert (signed_in, result["api_url"], result["context"]) == ([_PRODUCTION], _PRODUCTION, None)
-    assert not (config / "installs").exists()
+    # No install of its own: only production's unselected context, naming the default login.
+    production = cloud_cli._install_directory(_PRODUCTION)
+    assert result["context_file"] == str(production / "context.json")
+    assert sorted(path.name for path in (config / "installs").iterdir()) == [production.name]
+    assert [path.name for path in production.iterdir()] == ["context.json"]
+
+
+def test_production_s_context_names_its_default_login_until_logout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config: Path,
+    cloud: list[tuple[str, str]],
+) -> None:
+    _browser_signs_in(monkeypatch, "production-again")
+    assert main(["cloud", "login", "--no-browser"]) == 0
+    context = json.loads(capsys.readouterr().out)["result"]["context_file"]
+
+    # The same login, through the context: nothing selected, nothing copied.
+    assert main(["cloud", "--context", context, "whoami"]) == 0
+    capsys.readouterr()
+    assert not (config / "config.json").exists()
+    assert _marker(CloudAuthStore().load().access_token) == "production-again"
+
+    # Signing out through it deletes production's login, and the context is left to name it.
+    assert main(["cloud", "--context", context, "logout"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["signed_out"] is True
+    assert CloudAuthStore().load() is None
+    assert Path(context).exists()
+    assert main(["cloud", "--context", context, "whoami"]) != 0
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "login_required"
 
 
 @pytest.mark.parametrize(
