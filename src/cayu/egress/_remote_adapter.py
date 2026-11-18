@@ -263,9 +263,15 @@ async def run_enforcement_preflight(
     return datetime.now(UTC)
 
 
-async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest) -> None:
+async def run_setup_commands(
+    runner: Runner,
+    request: VirtualEgressRunnerRequest,
+    *,
+    shell: Callable[[str], ExecCommand] = ExecCommand.bash,
+) -> None:
     """Run each setup command through ``Runner.exec_system``; fail on the first error.
 
+    ``shell`` turns a command string into the command to run (bash by default).
     Each command is bounded by ``request.setup_command_timeout_s``. The error
     ends with the last lines of the command's output, with the environment
     overlay's values redacted and credential shapes masked.
@@ -273,7 +279,7 @@ async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest
 
     for command in request.setup_commands:
         result = await runner.exec_system(
-            ExecCommand.bash(command),
+            shell(command),
             timeout_s=request.setup_command_timeout_s,
         )
         if result.exit_code != 0 or result.timed_out:
@@ -287,6 +293,73 @@ async def run_setup_commands(runner: Runner, request: VirtualEgressRunnerRequest
                     ),
                 )
             )
+
+
+# Exit codes are the probe's whole protocol so that no guest-controlled text is
+# interpreted by the control plane.
+AGENT_PRIVILEGE_PROBE_FAILURES = {
+    10: "agent commands run with a root user or group id",
+    11: "agent commands can gain privileges (no_new_privs is not set)",
+    12: "agent commands retain Linux capabilities",
+    13: "agent command environment contains AWS credential variables",
+    14: "agent commands can read an AWS credentials file",
+    15: "agent commands can read the egress proxy transport token",
+}
+AGENT_PRIVILEGE_PROBE_SCRIPT = """
+import os, sys
+fields = {}
+with open('/proc/self/status') as status:
+    for line in status:
+        key, _, value = line.partition(':')
+        fields[key] = value.strip()
+ids = [int(part) for part in fields['Uid'].split() + fields['Gid'].split()]
+if 0 in ids:
+    sys.exit(10)
+if fields.get('NoNewPrivs') != '1':
+    sys.exit(11)
+if any(int(fields.get(name, '0'), 16) for name in ('CapEff', 'CapPrm', 'CapAmb')):
+    sys.exit(12)
+markers = ('ACCESS_KEY', 'SECRET', 'SESSION_TOKEN', 'CONTAINER_CREDENTIALS', 'WEB_IDENTITY')
+if any(key.startswith('AWS_') and any(m in key for m in markers) for key in os.environ):
+    sys.exit(13)
+for path in ('/root/.aws/credentials', os.path.expanduser('~/.aws/credentials')):
+    try:
+        open(path).close()
+    except OSError:
+        continue
+    sys.exit(14)
+if 'CAYU_EGRESS_PROXY_TRANSPORT_TOKEN' in os.environ:
+    sys.exit(15)
+"""
+
+
+async def verify_agent_privilege_boundary(
+    runner: Runner,
+    *,
+    runner_kind: str,
+    timeout_s: int,
+    remediation: str,
+) -> None:
+    """Prove agent commands run unprivileged, without AWS credentials or the transport token.
+
+    Raises ``UnsupportedEgressCapabilityError`` for capability
+    ``guest_privilege_containment`` naming the first failed check.
+    """
+
+    result = await runner.exec(
+        ExecCommand.process("python3", "-c", AGENT_PRIVILEGE_PROBE_SCRIPT),
+        timeout_s=timeout_s,
+    )
+    if result.timed_out or result.exit_code != 0:
+        reason = AGENT_PRIVILEGE_PROBE_FAILURES.get(
+            result.exit_code, "the agent privilege probe did not complete"
+        )
+        raise UnsupportedEgressCapabilityError(
+            runner_kind=runner_kind,
+            capability="guest_privilege_containment",
+            reason=reason,
+            remediation=remediation,
+        )
 
 
 def _preflight_script(

@@ -76,6 +76,12 @@ ALLOWED: dict[str, dict[str, int]] = {
         # cleanup has nothing left to stop.
         "LambdaMicroVMEgressAdapter._admit_runner": 2,
     },
+    "egress/kubernetes_sandbox_adapter.py": {
+        # Best-effort cleanup inside a handler that re-raises the cancellation or
+        # failure it caught, or raises its own: a second cancellation during the
+        # cleanup has nothing left to stop.
+        "KubernetesSandboxEgressAdapter._admit_runner": 2,
+    },
     "egress/transitions.py": {
         # Best-effort cleanup inside a handler that re-raises the cancellation or
         # failure it caught, or raises its own: a second cancellation during the

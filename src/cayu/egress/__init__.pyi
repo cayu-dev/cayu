@@ -72,12 +72,16 @@ from cayu.egress.errors import VirtualCredentialError as VirtualCredentialError
 from cayu.egress.grants import VirtualCredentialGrant as VirtualCredentialGrant
 from cayu.egress.grants import VirtualCredentialLease as VirtualCredentialLease
 from cayu.egress.grants import VirtualCredentialRegistry as VirtualCredentialRegistry
+from cayu.egress.kubernetes_sandbox_adapter import (
+    KubernetesSandboxEgressAdapter as KubernetesSandboxEgressAdapter,
+)
 from cayu.egress.policy import BrowserEgressPolicy as BrowserEgressPolicy
 from cayu.egress.policy import EgressPolicy as EgressPolicy
 from cayu.egress.policy import EgressRequest as EgressRequest
 from cayu.egress.policy import HttpEgressPolicy as HttpEgressPolicy
 from cayu.egress.policy import OpenInternetEgressPolicy as OpenInternetEgressPolicy
 from cayu.egress.policy import PublicWebEgressPolicy as PublicWebEgressPolicy
+from cayu.egress.proxy_exposure import PodNetworkProxyExposure as PodNetworkProxyExposure
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure as VpcTaskProxyExposure
 from cayu.egress.runtime import VIRTUAL_EGRESS_EVENT_TYPES as VIRTUAL_EGRESS_EVENT_TYPES
 from cayu.egress.runtime import VIRTUAL_EGRESS_RECONNECT_VERSION as VIRTUAL_EGRESS_RECONNECT_VERSION

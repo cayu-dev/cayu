@@ -16,9 +16,10 @@ import os
 import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import Any, ClassVar
+from ipaddress import IPv4Address
+from typing import Any, ClassVar, Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -154,6 +155,8 @@ class KubernetesSandboxRunner(SidecarProtocolRunner):
     # interactive command down by its process group; a descendant that leaves
     # the group is not stopped with it.
     _interactive_process_trees = frozenset({"pid_namespace", "process_group"})
+    # Health capabilities the sidecar must advertise before the first claim.
+    _required_capabilities: ClassVar[tuple[str, ...]] = _REQUIRED_CAPABILITIES
 
     def __init__(
         self,
@@ -270,11 +273,13 @@ class KubernetesSandboxRunner(SidecarProtocolRunner):
         return not self._owner_epoch_verified
 
     def _observe_health(self, response: Mapping[str, Any], capabilities: object) -> None:
+        required = self._required_capabilities
         if not isinstance(capabilities, list) or not all(
-            capability in capabilities for capability in _REQUIRED_CAPABILITIES
+            capability in capabilities for capability in required
         ):
+            named = ", ".join(required[:-1]) + " and " + required[-1]
             raise self._errors.version_mismatch(
-                "Kubernetes sandbox sidecar does not advertise bearer_auth and boot_id; "
+                f"Kubernetes sandbox sidecar does not advertise {named}; "
                 "run it with CAYU_SIDECAR_MODE=kubernetes."
             )
         boot_id = response.get("boot_id")
@@ -413,6 +418,128 @@ class _KubernetesAdmissionObserver(_SidecarAdmissionObserver):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class KubernetesSandboxSpec:
+    """The sandbox pod a :class:`KubernetesSandboxAllocator` creates.
+
+    ``name`` is deterministic for ``allocation_id``, which the pod records (for
+    example in an annotation) so a later :meth:`KubernetesSandboxAllocator.observe`
+    reports it. ``image`` is the agent container's image. ``ca_certificate_pem``
+    is the public CA the agent container must trust, mounted read-only at
+    ``ca_path``: the sandbox has no trusted lane to install it afterwards.
+    """
+
+    namespace: str
+    name: str
+    allocation_id: str
+    image: str
+    ca_certificate_pem: bytes = field(repr=False)
+    ca_path: str
+
+    def __post_init__(self) -> None:
+        for name in ("namespace", "name", "allocation_id", "image", "ca_path"):
+            require_durable_clean_nonblank(getattr(self, name), name)
+        if not self.ca_path.startswith("/"):
+            raise ValueError("ca_path must be an absolute path.")
+        if type(self.ca_certificate_pem) is not bytes or not self.ca_certificate_pem:
+            raise ValueError("ca_certificate_pem must be nonempty PEM bytes.")
+
+
+@dataclass(frozen=True, slots=True)
+class KubernetesSandboxAllocation:
+    """One running sandbox pod, as a :class:`KubernetesSandboxAllocator` observed it.
+
+    ``uid`` is the pod's UID, which changes when a pod of the same name is
+    recreated. ``allocation_id`` is the value the pod recorded at creation.
+    ``pod_ip`` is the pod's IPv4 address, from which its sandbox reaches Cayu.
+    ``endpoint``, ``token`` and ``verify`` reach the pod's sidecar as
+    :class:`KubernetesSandboxRunner` takes them, and ``workspace_root`` is the
+    agent container's workspace (``CAYU_MICROVM_WORKSPACE_ROOT``). ``identity``
+    holds further facts that identify the running pod, such as its containers'
+    image digests and runtime class; admission evidence is bound to them and to
+    ``uid``.
+    """
+
+    namespace: str
+    name: str
+    uid: str
+    allocation_id: str
+    pod_ip: str
+    endpoint: str
+    token: KubernetesSandboxToken = field(repr=False)
+    verify: str | os.PathLike[str] | ssl.SSLContext | None = None
+    workspace_root: str = DEFAULT_KUBERNETES_SANDBOX_CWD
+    identity: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("namespace", "name", "uid", "allocation_id", "pod_ip"):
+            require_durable_clean_nonblank(getattr(self, name), name)
+        try:
+            IPv4Address(self.pod_ip)
+        except ValueError as exc:
+            raise ValueError("pod_ip must be an IPv4 address literal.") from exc
+        _endpoint_base_url(self.endpoint)
+        _validate_token_source(self.token)
+        _validate_sandbox_root(self.workspace_root)
+        if not isinstance(self.identity, Mapping) or len(self.identity) >= (
+            _MAX_SANDBOX_IDENTITY_ENTRIES
+        ):
+            raise ValueError(
+                f"identity must be a mapping of fewer than {_MAX_SANDBOX_IDENTITY_ENTRIES} entries."
+            )
+        for key, value in self.identity.items():
+            if type(key) is not str or type(value) is not str:
+                raise TypeError("identity keys and values must be strings.")
+            require_durable_clean_nonblank(key, "identity key")
+            require_durable_clean_nonblank(value, "identity value")
+        object.__setattr__(self, "identity", dict(self.identity))
+
+
+class KubernetesSandboxAllocator(Protocol):
+    """Creates, observes and deletes sandbox pods for Cayu; the host implements it.
+
+    Cayu ships no Kubernetes client: the platform that owns the cluster
+    implements this with its own client, RBAC and pod shape (a supervisor
+    container running the sidecar in Kubernetes mode beside the agent
+    container), and an adapter such as
+    ``cayu.egress.KubernetesSandboxEgressAdapter`` calls it.
+    """
+
+    async def create(self, spec: KubernetesSandboxSpec) -> KubernetesSandboxAllocation:
+        """Create the pod and return it once it is running with an IP.
+
+        If a pod of that name already exists, return it as observed instead of
+        creating another; the caller checks its ``allocation_id``. Raise when
+        the pod cannot be created or does not start.
+        """
+        ...
+
+    async def observe(self, namespace: str, name: str) -> KubernetesSandboxAllocation | None:
+        """Return the named running pod, or ``None`` only if no such pod exists.
+
+        It is read before and after admission probes, so answer promptly. Raise
+        when the pod exists but is not running, failed, or cannot be read.
+        ``None`` must be positive evidence of absence from the API server, never
+        a read error. Cleanup never depends on it.
+        """
+        ...
+
+    async def delete(self, namespace: str, name: str, *, allocation_id: str) -> bool:
+        """Delete the named pod, and the objects it owns, if it records ``allocation_id``.
+
+        Ownership is checked in any phase (pending, failed, terminating) against
+        the allocation id the pod recorded at creation. Delete with the UID of
+        the pod that was read as a precondition, so a pod recreated in between
+        is never deleted. A pod of another allocation is left alone.
+
+        Return ``True`` only when a read confirms no pod of that name records
+        ``allocation_id``: it is absent, or it belongs to another allocation.
+        Return ``False`` while this allocation's pod still exists, for example
+        while it terminates. Raise when the outcome cannot be read.
+        """
+        ...
+
+
 def _endpoint_base_url(endpoint: str) -> str:
     value = require_clean_nonblank(endpoint, "endpoint").rstrip("/")
     try:
@@ -466,5 +593,8 @@ def _ssl_context(verify: str | os.PathLike[str] | ssl.SSLContext) -> ssl.SSLCont
 __all__ = [
     "DEFAULT_KUBERNETES_SANDBOX_CWD",
     "HttpxKubernetesSandboxEndpointTransport",
+    "KubernetesSandboxAllocation",
+    "KubernetesSandboxAllocator",
     "KubernetesSandboxRunner",
+    "KubernetesSandboxSpec",
 ]

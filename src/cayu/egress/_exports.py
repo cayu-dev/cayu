@@ -80,6 +80,11 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.egress.errors",
         "InvalidEgressReconnectMetadataError",
     ),
+    "KubernetesSandboxEgressAdapter": (
+        "cayu.egress.kubernetes_sandbox_adapter",
+        "KubernetesSandboxEgressAdapter",
+    ),
+    "PodNetworkProxyExposure": ("cayu.egress.proxy_exposure", "PodNetworkProxyExposure"),
     "RunnerFinalizationResult": ("cayu.egress.adapter", "RunnerFinalizationResult"),
     "SandboxEgressAdapter": ("cayu.egress.adapter", "SandboxEgressAdapter"),
     "SessionCheckpointEgressAuthorityTransitionStore": (
@@ -199,6 +204,8 @@ PUBLIC_NAMES = [
     "HttpEgressPolicy",
     "HttpxUpstream",
     "InvalidEgressReconnectMetadataError",
+    "KubernetesSandboxEgressAdapter",
+    "PodNetworkProxyExposure",
     "RunnerFinalizationResult",
     "SandboxCodingEnvironmentFactory",
     "SandboxEgressAdapter",

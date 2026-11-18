@@ -51,8 +51,10 @@ _CONTROL_TYPES = frozenset(
 # (module, function qualname) -> count of handlers that may absorb a cleanup failure.
 _ALLOWED: dict[tuple[str, str], int] = {
     # Concrete runners, processes and transports that never hand off their
-    # teardown; brokered sandboxes are destroyed by the broker once their lease lapses.
+    # teardown; brokered sandboxes are destroyed by the broker once their lease lapses,
+    # and Kubernetes sandbox pods by their allocation's reap.
     ("egress/aws_lambda_microvm_adapter.py", "LambdaMicroVMEgressAdapter._admit_runner"): 1,
+    ("egress/kubernetes_sandbox_adapter.py", "KubernetesSandboxEgressAdapter._admit_runner"): 1,
     ("environments/aws_lambda_microvm.py", "_close_quietly"): 1,
     ("runners/_exit_cleanup.py", "close_runners_at_exit"): 1,
     ("runners/_subprocess.py", "_detach_process"): 1,
@@ -75,7 +77,7 @@ _ALLOWED: dict[tuple[str, str], int] = {
     ("egress/docker_adapter.py", "DockerEgressAdapter._teardown"): 2,
     ("egress/docker_adapter.py", "DockerEgressAdapter.cutover_authority"): 2,
     ("egress/e2b_adapter.py", "E2BEgressAdapter.cutover_authority"): 2,
-    ("egress/proxy_server.py", "TransparentEgressProxyServer._accept_loop"): 2,
+    ("egress/proxy_server.py", "TransparentEgressProxyServer._accept_loop"): 4,
     ("egress/proxy_server.py", "TransparentEgressProxyServer._close_owned_resources"): 3,
     ("egress/proxy_server.py", "TransparentEgressProxyServer._handle_connect"): 1,
     ("egress/proxy_server.py", "TransparentEgressProxyServer._safe_handle"): 1,

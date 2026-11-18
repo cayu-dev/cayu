@@ -14,11 +14,14 @@ from math import isfinite
 from typing import Any, Literal, TypedDict
 
 from cayu.egress._remote_adapter import (
+    AGENT_PRIVILEGE_PROBE_FAILURES,
+    AGENT_PRIVILEGE_PROBE_SCRIPT,
     DEFAULT_PROXY_SERVER_FACTORY,
     ProxyServerFactory,
     prepare_exposed_proxy_binding,
     run_enforcement_preflight,
     run_setup_commands,
+    verify_agent_privilege_boundary,
 )
 from cayu.egress.adapter import (
     EgressBinding,
@@ -33,7 +36,6 @@ from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.capabilities import EgressCapabilityClaim, EgressCapabilityEvidence
 from cayu.egress.errors import (
     InvalidEgressReconnectMetadataError,
-    UnsupportedEgressCapabilityError,
     UnsupportedEgressError,
 )
 from cayu.egress.grants import VirtualCredentialGrant
@@ -890,65 +892,24 @@ async def _ready(runner: LambdaMicroVMRunner) -> LambdaMicroVMRunner:
     return runner
 
 
-# Exit codes are the probe's whole protocol so that no guest-controlled text is
-# interpreted by the control plane.
-_PRIVILEGE_PROBE_FAILURES = {
-    10: "agent commands run with a root user or group id",
-    11: "agent commands can gain privileges (no_new_privs is not set)",
-    12: "agent commands retain Linux capabilities",
-    13: "agent command environment contains AWS credential variables",
-    14: "agent commands can read an AWS credentials file",
-    15: "agent commands can read the egress proxy transport token",
-}
-_PRIVILEGE_PROBE_SCRIPT = """
-import os, sys
-fields = {}
-with open('/proc/self/status') as status:
-    for line in status:
-        key, _, value = line.partition(':')
-        fields[key] = value.strip()
-ids = [int(part) for part in fields['Uid'].split() + fields['Gid'].split()]
-if 0 in ids:
-    sys.exit(10)
-if fields.get('NoNewPrivs') != '1':
-    sys.exit(11)
-if any(int(fields.get(name, '0'), 16) for name in ('CapEff', 'CapPrm', 'CapAmb')):
-    sys.exit(12)
-markers = ('ACCESS_KEY', 'SECRET', 'SESSION_TOKEN', 'CONTAINER_CREDENTIALS', 'WEB_IDENTITY')
-if any(key.startswith('AWS_') and any(m in key for m in markers) for key in os.environ):
-    sys.exit(13)
-for path in ('/root/.aws/credentials', os.path.expanduser('~/.aws/credentials')):
-    try:
-        open(path).close()
-    except OSError:
-        continue
-    sys.exit(14)
-if 'CAYU_EGRESS_PROXY_TRANSPORT_TOKEN' in os.environ:
-    sys.exit(15)
-"""
+# Kept under these names for the readers that patch or execute them.
+_PRIVILEGE_PROBE_FAILURES = AGENT_PRIVILEGE_PROBE_FAILURES
+_PRIVILEGE_PROBE_SCRIPT = AGENT_PRIVILEGE_PROBE_SCRIPT
 
 
 async def _verify_agent_privilege_boundary(runner: Runner, *, timeout_s: int) -> None:
     """Prove the agent command profile is unprivileged and holds no AWS credentials."""
 
-    result = await runner.exec(
-        ExecCommand.process("python3", "-c", _PRIVILEGE_PROBE_SCRIPT),
+    await verify_agent_privilege_boundary(
+        runner,
+        runner_kind="lambda-microvm",
         timeout_s=timeout_s,
+        remediation=(
+            "use the first-party image, which runs agent commands as UID/GID 1000 with "
+            "no capabilities and no_new_privs, or select metadata_isolation='unverified' "
+            "and do not treat the environment as fully verified"
+        ),
     )
-    if result.timed_out or result.exit_code != 0:
-        reason = _PRIVILEGE_PROBE_FAILURES.get(
-            result.exit_code, "the agent privilege probe did not complete"
-        )
-        raise UnsupportedEgressCapabilityError(
-            runner_kind="lambda-microvm",
-            capability="guest_privilege_containment",
-            reason=reason,
-            remediation=(
-                "use the first-party image, which runs agent commands as UID/GID 1000 with "
-                "no capabilities and no_new_privs, or select metadata_isolation='unverified' "
-                "and do not treat the environment as fully verified"
-            ),
-        )
 
 
 def _lambda_environment_fingerprint(microvm_id: str) -> str:

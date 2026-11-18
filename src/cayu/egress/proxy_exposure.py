@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from ipaddress import IPv4Address, ip_address
+from ipaddress import IPv4Address, IPv4Network, ip_address
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -100,6 +100,54 @@ class VpcTaskProxyExposure:
         if local_port <= 0:
             raise ValueError("local_port must be positive.")
         return ExposedProxy(proxy_url=f"http://{self.task_ipv4}:{local_port}")
+
+
+class PodNetworkProxyExposure:
+    """Advertise a proxy listener through the pod IPv4 of a Kubernetes control-plane pod.
+
+    For sandboxes that run as pods in the same cluster: they reach the
+    in-process proxy over the pod network, where a NetworkPolicy admits only
+    the sandbox pods. Pod ranges need not be RFC 1918 (GKE and AKS also use
+    100.64.0.0/10 and other non-public ranges), so any IPv4 unicast address
+    outside the public internet is accepted; public, loopback, link-local,
+    multicast, unspecified and reserved addresses are refused so that an
+    accidental public or host-local listener cannot become the
+    credential-broker boundary. The listener must be bound to ``0.0.0.0`` or
+    to this address.
+    """
+
+    def __init__(self, pod_ipv4: str) -> None:
+        try:
+            address = ip_address(pod_ipv4)
+        except ValueError as exc:
+            raise ValueError("pod_ipv4 must be a non-public IPv4 unicast address.") from exc
+        if not isinstance(address, IPv4Address) or not _is_pod_network_unicast(address):
+            raise ValueError("pod_ipv4 must be a non-public IPv4 unicast address.")
+        self.pod_ipv4 = str(address)
+
+    async def expose(self, *, local_host: str, local_port: int) -> ExposedProxy:
+        if local_host.strip() not in {"0.0.0.0", self.pod_ipv4}:
+            raise UnsupportedEgressError(
+                "Pod network proxy exposure requires Cayu to listen on 0.0.0.0 or the pod IP."
+            )
+        if local_port <= 0:
+            raise ValueError("local_port must be positive.")
+        return ExposedProxy(proxy_url=f"http://{self.pod_ipv4}:{local_port}")
+
+
+def _is_pod_network_unicast(address: IPv4Address) -> bool:
+    return not (
+        address.is_global
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+        or address.is_reserved
+        or address in _THIS_NETWORK
+    )
+
+
+_THIS_NETWORK = IPv4Network("0.0.0.0/8")
 
 
 def _is_rfc1918(address: IPv4Address) -> bool:

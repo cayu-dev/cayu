@@ -116,7 +116,12 @@ from cayu.runners.kubernetes_sandbox import (
 from cayu.runners.kubernetes_sandbox import (
     HttpxKubernetesSandboxEndpointTransport as HttpxKubernetesSandboxEndpointTransport,
 )
+from cayu.runners.kubernetes_sandbox import (
+    KubernetesSandboxAllocation as KubernetesSandboxAllocation,
+)
+from cayu.runners.kubernetes_sandbox import KubernetesSandboxAllocator as KubernetesSandboxAllocator
 from cayu.runners.kubernetes_sandbox import KubernetesSandboxRunner as KubernetesSandboxRunner
+from cayu.runners.kubernetes_sandbox import KubernetesSandboxSpec as KubernetesSandboxSpec
 from cayu.runners.launched import CommandLauncher as CommandLauncher
 from cayu.runners.launched import LaunchedRunner as LaunchedRunner
 from cayu.runners.local import LocalRunner as LocalRunner

@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from urllib.parse import urlsplit
 
 from cryptography import x509
@@ -354,6 +355,7 @@ class TransparentEgressProxyServer:
         self._stop = threading.Event()
         self._connections: set[socket.socket] = set()
         self._connections_lock = threading.Lock()
+        self._allowed_peer: IPv4Address | IPv6Address | None = None
         self._close_task: asyncio.Task[None] | None = None
 
     @property
@@ -365,6 +367,40 @@ class TransparentEgressProxyServer:
         if not self._sockets:
             raise RuntimeError("Proxy server is not started.")
         return self._sockets[0].getsockname()[1]
+
+    def restrict_peer(self, address: str) -> None:
+        """Serve only connections whose source address is ``address`` from now on.
+
+        New connections from any other source are closed before a byte is read
+        from or written to them, and ones already accepted from elsewhere are
+        interrupted. The restriction is
+        set once: a second call with a different address raises. It is
+        defence in depth beside ``transport_auth_token``, never a replacement:
+        sandbox addresses such as pod IPs are reused.
+        """
+
+        try:
+            allowed = _peer_address(address)
+        except ValueError as exc:
+            raise ValueError("Egress proxy peer must be an IP address literal.") from exc
+        with self._connections_lock:
+            if self._allowed_peer is not None and self._allowed_peer != allowed:
+                raise RuntimeError("Egress proxy peer restriction is already set.")
+            self._allowed_peer = allowed
+            foreign = tuple(
+                connection for connection in self._connections if not self._peer_allowed(connection)
+            )
+        for connection in foreign:
+            _interrupt(connection)
+
+    def _peer_allowed(self, connection: socket.socket) -> bool:
+        allowed = self._allowed_peer
+        if allowed is None:
+            return True
+        try:
+            return _peer_address(connection.getpeername()[0]) == allowed
+        except (OSError, ValueError, IndexError):
+            return False
 
     async def start(self) -> int:
         listeners: list[socket.socket] = []
@@ -495,6 +531,10 @@ class TransparentEgressProxyServer:
                 continue
             except OSError:
                 break
+            if not self._peer_allowed(conn):
+                with contextlib.suppress(OSError):
+                    conn.close()
+                continue
             if not self._connection_slots.acquire(blocking=False):
                 with contextlib.suppress(Exception):
                     _send_all(
@@ -509,13 +549,21 @@ class TransparentEgressProxyServer:
             with self._connections_lock:
                 if self._stop.is_set():
                     should_close = True
+                    foreign = False
                 else:
-                    self._connections.add(conn)
+                    # Checked again under the lock, so a restriction set after the
+                    # first check still closes this connection.
+                    foreign = not self._peer_allowed(conn)
+                    if not foreign:
+                        self._connections.add(conn)
                     should_close = False
-            if should_close:
-                conn.close()
+            if should_close or foreign:
+                with contextlib.suppress(OSError):
+                    conn.close()
                 self._connection_slots.release()
-                break
+                if should_close:
+                    break
+                continue
             try:
                 self._executor.submit(self._safe_handle, conn)
             except BaseException:
@@ -1409,6 +1457,18 @@ def _shutdown(sock: socket.socket) -> None:
         sock.shutdown(socket.SHUT_RDWR)
     with contextlib.suppress(OSError):
         sock.close()
+
+
+def _peer_address(address: str) -> IPv4Address | IPv6Address:
+    """Parse a peer address, reading an IPv4-mapped IPv6 address as its IPv4 address.
+
+    A dual-stack listener reports IPv4 clients as ``::ffff:a.b.c.d``.
+    """
+
+    parsed = ip_address(address)
+    if isinstance(parsed, IPv6Address) and parsed.ipv4_mapped is not None:
+        return parsed.ipv4_mapped
+    return parsed
 
 
 def _interrupt(sock: socket.socket) -> None:

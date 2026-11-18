@@ -1157,6 +1157,114 @@ def test_transport_auth_rejects_clients_without_the_sidecar_identity() -> None:
     assert accepted.startswith(b"HTTP/1.1 200 Connection Established")
 
 
+def _transport_connect(port: int, token: bytes) -> bytes:
+    """Open the authenticated transport tunnel and return the proxy's first answer."""
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as conn:
+            encoded = base64.b64encode(b"cayu:" + token)
+            conn.sendall(
+                b"CONNECT cayu-transport.invalid:443 HTTP/1.1\r\n"
+                b"Proxy-authorization: Basic " + encoded + b"\r\n\r\n"
+            )
+            return conn.recv(1024)
+    except OSError:
+        return b""
+
+
+@pytest.mark.parametrize(("allowed_peer", "served"), [("127.0.0.1", True), ("100.64.0.9", False)])
+def test_restricted_peer_serves_only_its_source_address(allowed_peer: str, served: bool) -> None:
+    token = b"a" * 64
+
+    async def run() -> bytes:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(
+            broker, loop=asyncio.get_running_loop(), transport_auth_token=token
+        )
+        server.restrict_peer(allowed_peer)
+        port = await server.start()
+        try:
+            return await asyncio.to_thread(_transport_connect, port, token)
+        finally:
+            await server.close()
+
+    answer = asyncio.run(run())
+
+    if served:
+        assert answer.startswith(b"HTTP/1.1 200 Connection Established")
+    else:
+        # Closed before a byte is read or written, even with the right token.
+        assert answer == b""
+
+
+def test_restricting_the_peer_closes_connections_already_accepted_from_elsewhere() -> None:
+    async def run() -> tuple[bytes, float]:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(
+            broker, loop=asyncio.get_running_loop(), transport_auth_token=b"a" * 64
+        )
+        port = await server.start()
+        conn = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        try:
+            for _ in range(200):
+                with server._connections_lock:
+                    if server._connections:
+                        break
+                await asyncio.sleep(0.01)
+            server.restrict_peer("100.64.0.9")
+            started = time.monotonic()
+            answer = await asyncio.to_thread(conn.recv, 1024)
+            return answer, time.monotonic() - started
+        finally:
+            conn.close()
+            await server.close()
+
+    answer, waited = asyncio.run(run())
+
+    assert answer == b""
+    assert waited < 4.0
+
+
+def test_peer_restriction_is_an_ip_literal_set_once() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(broker, loop=loop)
+        with pytest.raises(ValueError, match="IP address literal"):
+            server.restrict_peer("trial-pod.example")
+        server.restrict_peer("100.64.0.9")
+        server.restrict_peer("100.64.0.9")
+        with pytest.raises(RuntimeError, match="already set"):
+            server.restrict_peer("100.64.0.10")
+        server._executor.shutdown()
+    finally:
+        loop.close()
+
+
+def test_peer_restriction_reads_ipv4_mapped_addresses_as_ipv4() -> None:
+    class Peer:
+        def __init__(self, address: str) -> None:
+            self.address = address
+
+        def getpeername(self) -> tuple[Any, ...]:
+            return (self.address, 40000, 0, 0)
+
+    loop = asyncio.new_event_loop()
+    try:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(broker, loop=loop)
+        server.restrict_peer("::ffff:100.64.0.9")
+        # A dual-stack listener reports an IPv4 client in its mapped form.
+        assert server._peer_allowed(Peer("::ffff:100.64.0.9"))  # type: ignore[arg-type]
+        assert server._peer_allowed(Peer("100.64.0.9"))  # type: ignore[arg-type]
+        assert not server._peer_allowed(Peer("::ffff:100.64.0.10"))  # type: ignore[arg-type]
+        assert not server._peer_allowed(Peer("::1"))  # type: ignore[arg-type]
+        server.restrict_peer("100.64.0.9")
+        server._executor.shutdown()
+    finally:
+        loop.close()
+
+
 def test_transport_auth_token_requires_nonempty_bytes() -> None:
     loop = asyncio.new_event_loop()
     try:

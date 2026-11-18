@@ -1342,6 +1342,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; opt-in local reconnect. Container isolation is not a secure sandbox boundary. |
 | `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. In `metadata_isolation="required"` mode that relay authenticates each connection with a per-session transport token, which admits credentialless routes (including the browser); crash-safe client-token creation, recovery, and reaping; same-MicroVM factory reconnect with fresh authority. |
+| `kubernetes-sandbox` | Enforced by the host: `KubernetesSandboxEgressAdapter` creates each sandbox pod through the host's `KubernetesSandboxAllocator`, its sidecar relays agent egress with a per-session transport token held outside the agent container, the listener serves only the pod's IP, and a preflight proves brokered reachability and denied direct and metadata egress. The pod network boundary (a NetworkPolicy) and the sandboxing runtime are the host's. Crash-safe creation by deterministic pod name and reaping in any pod phase; a pod whose creating worker stopped is deleted rather than recovered; no reconnect. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
 Notes on the Docker adapter:
@@ -1434,6 +1435,77 @@ yet have a durable external claim that prevents two orchestrators from
 simultaneously reconfiguring the same MicroVM. Applications must choose an
 explicit rebuild or trusted recovery flow instead of treating that attach as a
 secure virtual-egress reconnect.
+
+For sandboxes that run as pods in the same Kubernetes cluster as Cayu,
+`PodNetworkProxyExposure(pod_ip)` advertises the proxy at the Cayu pod's own IP.
+It accepts any IPv4 unicast address outside the public internet, including
+`100.64.0.0/10`, which GKE and AKS may use for pods, and refuses public,
+loopback, link-local, multicast, unspecified and reserved addresses. Once the
+sandbox's address is known, `TransparentEgressProxyServer.restrict_peer(address)`
+closes every new connection from any other source before a byte is read, and
+interrupts connections already accepted from elsewhere. Pod IPs are reused, so the restriction is defence
+in depth beside the per-session transport token, never a replacement for it.
+
+`KubernetesSandboxEgressAdapter` runs each sandbox as a pod in the same cluster.
+Cayu ships no Kubernetes client: the host implements
+`cayu.runners.KubernetesSandboxAllocator` (`create`, `observe` and `delete` of
+one pod) with its own client and pod shape, a supervisor container running the
+sidecar in Kubernetes mode beside the agent container, and the adapter calls it:
+
+```python
+from cayu.egress import (
+    KubernetesSandboxEgressAdapter,
+    PodNetworkProxyExposure,
+    VirtualEgressEnvironmentFactory,
+)
+
+adapter = KubernetesSandboxEgressAdapter(
+    allocator=my_pod_allocator,                   # the host's KubernetesSandboxAllocator
+    exposure=PodNetworkProxyExposure(os.environ["POD_IP"]),
+    namespace="sandboxes",
+    untrusted_isolation=True,                     # only when pods run under gVisor or similar
+)
+factory = VirtualEgressEnvironmentFactory(..., adapter=adapter, image=agent_image)
+```
+
+- Creation is crash-safe: before the first pod call the adapter pins the
+  namespace, a pod name derived from the allocation id (a 53-character DNS
+  label) and the image in the durable allocation intent. Only the dispatching
+  worker calls `create`; a pod that already has that name is admitted only when
+  it records the same allocation id.
+- `create` receives the session CA (public) and its path, to mount read-only in
+  the agent container: the sandbox has no trusted lane to install it later.
+  Because the pod trusts only its creating worker's CA, a pod is never
+  recovered: a worker that finds the intent dispatched by a worker that stopped
+  deletes that pod without running anything in it and fails the environment
+  with "Kubernetes sandbox pods are not recovered after their creating worker
+  stops". The intent stays pending until incomplete-session recovery reaps it;
+  only then can the environment create a new pod.
+- Every deletion (finalization, a failed admission, recovery and cleanup of an
+  abandoned intent) calls `delete` with the allocation id. The allocator checks
+  that the pod records it in any phase, so a pod that is pending, failed or
+  terminating is deleted and a pod of another allocation is never deleted, and
+  deletes with the UID it read as a precondition. Cleanup returns only once
+  `delete` confirms the allocation's pod is gone, and never needs `observe`.
+- The sidecar must advertise `egress_relay`; one that does not is refused and
+  its pod deleted. Its supervisor container keeps the transport token, and
+  agent commands reach the proxy only through its loopback relay.
+- Once the sidecar answers, the listener is restricted to the pod's IP, setup
+  commands run with `/bin/sh` as the agent (the image may lack bash), and the
+  preflight proves the proxy and session CA work, that direct public and
+  link-local metadata connections fail, and that agent commands run
+  unprivileged without the transport token. These probes run `python3` from the
+  default command `PATH`, so the agent image needs one there. The allocation's `identity` (for
+  example the containers' image digests) and the pod UID are re-read for
+  admission evidence and fail closed when the pod is replaced.
+- The host owns the network boundary: a NetworkPolicy that lets the sandbox
+  pods reach only the Cayu pod's listener ports and nothing else (no DNS), and
+  a runtime class such as gVisor for untrusted code. Finalization deletes the
+  pod; reconnect is not supported.
+
+The executor in the agent container uses only the standard library, so the
+agent container can run the application's own image with the executor copied in
+by an init container; see `examples/aws/lambda_microvm_sidecar/README.md`.
 
 `examples/aws/lambda_microvm_agent` composes this adapter with an EFS access
 point (default), an opt-in S3 Files access point, S3 artifacts, Secrets Manager,
