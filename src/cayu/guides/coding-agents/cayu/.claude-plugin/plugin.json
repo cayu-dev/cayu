@@ -1,0 +1,9 @@
+{
+  "name": "cayu",
+  "description": "Skills for working with Cayu: operating Agents on Cayu Cloud with the cayu CLI.",
+  "author": {
+    "name": "Cayu"
+  },
+  "homepage": "https://cloud.cayu.dev",
+  "license": "Apache-2.0"
+}

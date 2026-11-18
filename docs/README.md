@@ -27,6 +27,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [External agents source pointer](external-agents.md): redirects to the packaged guide
 - [External agents](../src/cayu/guides/external-agents.md) (`cayu guide external-agents`): Claude Code and Codex runs as Cayu sessions, with tokens, cost, deadlines and secret scrubbing
 - [Running untrusted code](../src/cayu/guides/untrusted-code.md) (`cayu guide untrusted-code`): hardened Docker with allowlisted egress locally, Lambda MicroVM in production
+- [Cayu Cloud from the command line](../src/cayu/guides/coding-agents/cayu/skills/cayu-cloud/SKILL.md) (`cayu guide cloud`): operating Agents on Cayu Cloud, also a Claude Code and Codex skill
 
 - [Advanced runtime examples](advanced-runtime-examples.md)
 - [Agent-authoring evaluations](authoring-evals.md)

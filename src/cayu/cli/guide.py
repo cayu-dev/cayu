@@ -6,11 +6,16 @@ import json
 import re
 import sys
 from importlib.resources import files
+from pathlib import Path
 from typing import Any
 
 from cayu._version import package_version
 from cayu.cli._identity import CAYU_IDENTITY, identity_markdown
 
+# The Claude Code and Codex plugin shipped with the package: a marketplace root that lists one
+# plugin, `cayu`, whose skills are plain SKILL.md folders usable on their own.
+_PLUGIN_MARKETPLACE = "coding-agents"
+_CLOUD_SKILL = f"{_PLUGIN_MARKETPLACE}/cayu/skills/cayu-cloud/SKILL.md"
 _GUIDES = {
     "order-support": (
         "order-support.md",
@@ -32,6 +37,10 @@ _GUIDES = {
         "Generated application convention, placement, planning, and drift checks.",
     ),
     "authoring": ("authoring.md", "Concept map and the supported authoring loop."),
+    "cloud": (
+        _CLOUD_SKILL,
+        "Operate Agents on Cayu Cloud with the CLI; also a Claude Code and Codex skill.",
+    ),
     "diagnostics": (
         "diagnostics.md",
         "Stable `cayu check` findings and fixes, and the request-cost check.",
@@ -109,6 +118,7 @@ _RELATED = {
     "app-ui": ("anatomy", "human-attention", "references", "b2b"),
     "b2b": ("app-ui", "applications", "references"),
     "applications": ("anatomy", "authoring", "diagnostics", "references"),
+    "cloud": ("anatomy", "long-running", "human-attention"),
     "authoring": (
         "anatomy",
         "tool-effects",
@@ -207,9 +217,55 @@ def add_guide_parser(subparsers: Any) -> None:
         action="store_true",
         help="Emit stable topic, section, package, relationship, and verification metadata.",
     )
+    parser.add_argument(
+        "--plugin-dir",
+        action="store_true",
+        help=(
+            "Print the directory of the Claude Code and Codex plugin this package ships, "
+            "to add as a plugin marketplace (`cayu guide cloud` says how)."
+        ),
+    )
+
+
+def plugin_marketplace_dir() -> Path:
+    """The installed package's Claude Code and Codex plugin marketplace directory."""
+
+    return Path(str(files("cayu.guides").joinpath(_PLUGIN_MARKETPLACE))).resolve()
+
+
+def _without_front_matter(content: str) -> str:
+    """A skill's text without its YAML front matter, which only Claude Code and Codex read."""
+
+    if not content.startswith("---\n"):
+        return content
+    end = content.find("\n---\n", 4)
+    if end == -1:
+        raise RuntimeError("guide front matter is not closed")
+    return content[end + len("\n---\n") :].lstrip("\n")
 
 
 def run_guide(args: argparse.Namespace) -> int:
+    if args.plugin_dir:
+        if args.name is not None:
+            print("error: --plugin-dir takes no topic", file=sys.stderr)
+            return 2
+        directory = plugin_marketplace_dir()
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "installed_cayu_version": package_version(),
+                        "plugin_dir": str(directory),
+                        "plugin": "cayu",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(directory)
+        return 0
     if args.name is None:
         if args.json:
             print(
@@ -279,7 +335,7 @@ def run_guide(args: argparse.Namespace) -> int:
         print("error: guide section after `#` must not be empty", file=sys.stderr)
         return 2
     guide = files("cayu.guides").joinpath(guide_record[0])
-    content = _render_includes(guide.read_text(encoding="utf-8"))
+    content = _render_includes(_without_front_matter(guide.read_text(encoding="utf-8")))
     if anchor:
         section = _guide_section(content, anchor)
         if section is None:

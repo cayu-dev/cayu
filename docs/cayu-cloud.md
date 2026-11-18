@@ -20,7 +20,9 @@ cayu cloud service status --application my-agent
 
 ## Command inventory
 
-`cayu cloud --help` is the authoritative summary. The top-level commands are:
+`cayu cloud --help` is the authoritative summary, and `cayu guide cloud` the workflow for a
+coding agent ([Teaching a coding agent the CLI](#teaching-a-coding-agent-the-cli)). The
+top-level commands are:
 
 - `login`, `logout`, and `whoami` for interactive identity, and `organizations` to
   [list and choose your Organizations](#organizations);
@@ -93,6 +95,35 @@ service to run which Release, and what it still runs). The error also carries
 message, which includes how long the web process has been starting. A timed-out service
 teardown similarly reports `service_deletion_still_running`; neither result marks the
 retained Cloud operation as failed.
+
+## Teaching a coding agent the CLI
+
+`cayu guide cloud` prints the workflow for operating an Agent from the CLI: check where a
+command acts and pin each change there (`--organization` on `cayu cloud` changes, `--context`
+when there is one), then the commands for deploys, status and logs, releases and rollback,
+environment, settings and schedules, sessions and tasks, and the inbox. It points to each
+command's `--help` for options.
+
+The same page is the `cayu-cloud` skill for Claude Code and Codex. It ships in the `cayu`
+package as a plugin, `cayu`, inside a plugin marketplace directory that `cayu guide
+--plugin-dir` prints, so the skill an agent reads matches the CLI that project installs.
+From the Agent's repository:
+
+```console
+claude plugin marketplace add "$(uv run cayu guide --plugin-dir)"
+claude plugin install cayu@cayu
+codex plugin marketplace add "$(uv run cayu guide --plugin-dir)"
+```
+
+and in Codex enable `cayu@cayu` (`[plugins."cayu@cayu"]` with `enabled = true` in
+`.codex/config.toml`). For one Claude Code session, `claude --plugin-dir "$(uv run cayu guide
+--plugin-dir)/cayu"` loads it without installing. The marketplace names the directory inside
+that environment, so after recreating the environment somewhere else, add it again.
+
+The skill is a plain `SKILL.md` folder and works without the plugin: copy
+`cayu/skills/cayu-cloud` from that directory into a repository's `.claude/skills/` (Claude
+Code) or `.agents/skills/` (Codex). A copy doesn't follow upgrades of `cayu`; the skill's
+first step has the agent compare it with `cayu guide cloud`.
 
 ## What an Agent runs
 

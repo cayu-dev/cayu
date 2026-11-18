@@ -293,6 +293,10 @@ cayu cloud init
 cayu cloud deploy
 ```
 
+`cayu guide cloud` is the workflow for operating an Agent from the CLI, and ships as a
+Claude Code and Codex skill too; see
+[Teaching a coding agent the CLI](https://github.com/cayu-dev/cayu/blob/main/docs/cayu-cloud.md#teaching-a-coding-agent-the-cli).
+
 Login uses WorkOS device authorization. It opens the browser when possible and always
 prints a verification URL and one-time user code for SSH, containers, Cursor, Codex,
 and Claude Code. The resulting Organization-scoped session is stored privately and

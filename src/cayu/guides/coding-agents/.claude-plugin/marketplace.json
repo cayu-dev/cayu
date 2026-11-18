@@ -1,0 +1,14 @@
+{
+  "name": "cayu",
+  "description": "The Cayu plugin shipped with the installed cayu package.",
+  "owner": {
+    "name": "Cayu"
+  },
+  "plugins": [
+    {
+      "name": "cayu",
+      "source": "./cayu",
+      "description": "Skills for working with Cayu: operating Agents on Cayu Cloud with the cayu CLI."
+    }
+  ]
+}
