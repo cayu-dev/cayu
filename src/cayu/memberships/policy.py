@@ -10,7 +10,9 @@ Grouping people inside an organization is the application's: a policy of its own
 rules for its groups to this one's grant.
 
 With ``knowledge=True`` each person also reads, and the agent remembers into, the knowledge of
-the organizations they belong to, and nothing of any other organization's.
+the organizations they belong to, and nothing of any other organization's. Work admitted
+before that was turned on keeps a grant without knowledge until an operator grants it
+(``cayu memberships grant-knowledge``, :mod:`cayu.memberships.knowledge_grants`).
 """
 
 from __future__ import annotations
@@ -18,12 +20,16 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from cayu._resource_access_binding import ResourceExecutionBinding
 from cayu.memberships.directory import MembershipDirectory
+from cayu.memberships.knowledge_grants import KnowledgeGrants
 from cayu.memberships.sharing import SHARING_LABELS
 from cayu.resource_access import (
     ResourceAccessDecision,
     ResourceAccessGrant,
     ResourceAccessPolicy,
+    admitted_scope,
+    binding_sha256,
 )
 from cayu.sessions import SessionAccessRule, SessionAccessScope, SessionAccessSelector
 
@@ -56,8 +62,13 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
     labelled with one of their organizations (``organization`` can't be changed), and nothing
     else. Pair it with a knowledge scope whose ``session_label_keys`` names ``organization``,
     so inside a conversation, or any session labelled with an organization, only that
-    organization's knowledge is used. Off
-    by default, which denies all knowledge, as before.
+    organization's knowledge is used. Off by default, which denies all knowledge, as before.
+
+    Work admitted before ``knowledge=True`` keeps the grant it was admitted with, which has no
+    knowledge. ``knowledge_grants`` is where an operator's decision to grant it is recorded
+    (``cayu memberships grant-knowledge``); such work then gets the knowledge of the
+    organizations it was admitted in. It defaults to the directory's own
+    (``PostgresMemberships.knowledge_grants``), when it has one.
     """
 
     def __init__(
@@ -68,6 +79,7 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
         decision_lifetime: timedelta = DEFAULT_DECISION_LIFETIME,
         max_memberships: int = DEFAULT_MAX_MEMBERSHIPS,
         knowledge: bool = False,
+        knowledge_grants: KnowledgeGrants | None = None,
     ) -> None:
         if not isinstance(authority, str) or not authority.strip():
             raise ValueError("A membership policy's authority is a non-blank string.")
@@ -82,10 +94,30 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
         self._decision_lifetime = decision_lifetime
         self._max_memberships = max_memberships
         self._knowledge = knowledge
+        self._knowledge_grants = (
+            getattr(directory, "knowledge_grants", None)
+            if knowledge_grants is None
+            else knowledge_grants
+        )
 
     @property
     def authority(self) -> str:
         return self._authority
+
+    async def knowledge_admission(
+        self, binding: ResourceExecutionBinding
+    ) -> SessionAccessScope | None:
+        """The knowledge of the organizations ``binding``'s work was admitted in, once an
+        operator has granted it; ``None`` until then, or without ``knowledge=True``."""
+
+        if not self._knowledge or self._knowledge_grants is None:
+            return None
+        if binding.authority != self._authority:
+            return None
+        organizations = admitted_organizations(binding)
+        if not organizations or not await self._knowledge_grants.granted(binding_sha256(binding)):
+            return None
+        return _knowledge_within(organizations)
 
     async def resolve(self, subject: str) -> ResourceAccessDecision:
         snapshot = await self._directory.current(subject)
@@ -122,11 +154,7 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
         # owner creates them in any conversation of their own. Whatever their sharing, nobody
         # else sees one unless it is shared with an organization they belong to.
         outputs = replace(conversations, create=own)
-        knowledge = None
-        if self._knowledge:
-            # Knowledge is shared by a whole organization, whichever conversation it came from.
-            within = (_rule(organization=organizations),)
-            knowledge = SessionAccessScope(read=within, create=within, modify=within)
+        knowledge = _knowledge_within(organizations) if self._knowledge else None
         return ResourceAccessDecision(
             ResourceAccessGrant(
                 sessions=conversations, tasks=outputs, artifacts=outputs, knowledge=knowledge
@@ -134,3 +162,21 @@ class MembershipAccessPolicy(ResourceAccessPolicy):
             revision=snapshot.revision,
             valid_until=datetime.now(UTC) + self._decision_lifetime,
         )
+
+
+def _knowledge_within(organizations: list[str]) -> SessionAccessScope:
+    # Knowledge is shared by a whole organization, whichever conversation it came from.
+    within = (_rule(organization=organizations),)
+    return SessionAccessScope(read=within, create=within, modify=within)
+
+
+def admitted_organizations(binding: ResourceExecutionBinding) -> list[str]:
+    """The organizations ``binding``'s work was admitted in: those its stored grant lets it
+    read conversations of, sorted."""
+
+    organizations: set[str] = set()
+    for rule in admitted_scope(binding, "sessions").read:
+        for selector in rule.selectors:
+            if selector.key == "organization" and selector.operator == "in":
+                organizations.update(selector.values)
+    return sorted(organizations)

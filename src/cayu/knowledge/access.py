@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -43,6 +43,68 @@ def session_knowledge_labels(labels: Mapping[str, str]) -> Iterator[None]:
         yield
     finally:
         _session_labels.reset(token)
+
+
+def inherited_session_labels(
+    parent_labels: Mapping[str, str],
+    labels: Mapping[str, str],
+    pinned_keys: Iterable[str] = (),
+) -> dict[str, str]:
+    """The labels a session started from ``parent_labels``' session is admitted with.
+
+    Work admitted now and run later, perhaps by another worker process, has no outer
+    session around it to keep it pinned, so it carries its parent's labels on its own
+    record: each one it doesn't set itself, whichever store's scope pins it. A value of its
+    own for a key knowledge is known to be pinned to (``pinned_keys``, a scope's
+    ``session_label_keys``) that differs from its parent's is refused, as it is for work
+    run inside the parent's tool call. Its other labels are its own.
+    """
+
+    inherited = {**parent_labels, **labels}
+    for key in pinned_keys:
+        value = parent_labels.get(key)
+        if value is not None and inherited[key] != value:
+            raise ResourceAccessDenied()
+    return inherited
+
+
+def pinned_label_keys(scope) -> tuple[str, ...]:
+    """The session labels ``scope`` (a knowledge scope or ``None``) pins knowledge to."""
+
+    return () if scope is None else tuple(scope.session_label_keys)
+
+
+#: What a knowledge tool says when its work was admitted before its policy granted knowledge.
+KNOWLEDGE_NOT_ADMITTED_MESSAGE = (
+    "Knowledge isn't available here: this work was admitted before its access policy "
+    "granted knowledge, so its knowledge reads find nothing and its writes are refused. "
+    "A new conversation gets knowledge, and an operator can grant it to existing work."
+)
+
+
+async def knowledge_not_admitted(action: str = "read") -> bool:
+    """Whether the running work's knowledge ``action`` finds nothing only because of when it
+    was admitted.
+
+    True when the work runs under a binding whose stored grant has no knowledge, no operator
+    decision admits it to any (``ResourceAccessPolicy.knowledge_admission``), and the policy's
+    current decision does grant ``action``. A store answers such work as if it had no
+    knowledge at all; this tells the two apart. Work outside a binding, work admitted with
+    knowledge and work whose policy grants none are never reported, so legitimately empty
+    reads stay as they are.
+    """
+
+    from cayu.resource_access import _active, admitted_scope, effective_bounds
+    from cayu.sessions._access_rules import SessionAccessScope
+
+    execution = _active.get()
+    if execution is None:
+        return False
+    # The stored grant alone settles most work without asking the policy.
+    if admitted_scope(execution.binding, "knowledge") != SessionAccessScope():
+        return False
+    bounds = await effective_bounds(execution.binding, execution.policy, "knowledge")
+    return not getattr(bounds.admitted, action) and bool(getattr(bounds.current, action))
 
 
 def validate_constraints(values):

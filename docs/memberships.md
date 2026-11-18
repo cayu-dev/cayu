@@ -19,7 +19,9 @@ its own over the same directory.
 | `MembershipAccessPolicy` | A `ResourceAccessPolicy` that turns current memberships into Cayu grants |
 | `conversation_labels`, `Sharing`, `SHARING_LABELS` | The labels a new conversation takes: personal or organization sharing |
 | `check_membership_tables` | Checks the tables are the shape `PostgresMemberships` relies on |
+| `KnowledgeGrant`, `KnowledgeGrants`, `PostgresKnowledgeGrants`, `InMemoryKnowledgeGrants`, `admitted_organizations` | Operators' grants of knowledge to work admitted before `knowledge=True` |
 | `cayu memberships list\|add\|remove` | The same store from the command line |
+| `cayu memberships grant-knowledge` | Grants knowledge to work admitted before `knowledge=True` |
 
 ## The policy
 
@@ -54,7 +56,8 @@ The policy refuses a person with more than `max_memberships` memberships (`Value
 which one stored grant can't hold.
 
 `MembershipAccessPolicy(directory, *, authority="b2b-membership-v1",
-decision_lifetime=timedelta(seconds=60), max_memberships=16, knowledge=False)`:
+decision_lifetime=timedelta(seconds=60), max_memberships=16, knowledge=False,
+knowledge_grants=None)`:
 
 - `authority` is stored with every piece of work Cayu admits, and Cayu refuses work whose
   authority differs from the policy's. Keep the default unless you mean to strand queued
@@ -68,6 +71,33 @@ decision_lifetime=timedelta(seconds=60), max_memberships=16, knowledge=False)`:
   entries labelled with one of their organizations, `organization` can't be changed on an
   entry, and nobody deletes through the grant. Off, the grant has no knowledge, as before,
   so a project without knowledge gets exactly the grant it always had.
+- `knowledge_grants` is where an operator's grants of knowledge to earlier work are recorded
+  (see below). It defaults to the directory's own: `PostgresMemberships.knowledge_grants`
+  or `InMemoryMembershipDirectory.knowledge_grants`.
+
+### Work admitted before `knowledge=True`
+
+Cayu stores the grant each conversation and task was admitted with and never widens it on its
+own, so work admitted before `knowledge=True` keeps a grant without knowledge. Its recall
+finds nothing and the knowledge tools return a `knowledge_not_admitted` error that says why.
+Granting it knowledge is an explicit decision:
+
+```bash
+cayu memberships grant-knowledge --dry-run      # list it: one row per admission
+cayu memberships grant-knowledge [--subject alice]
+```
+
+Both print one JSON document: each admission's digest, subject, organizations, sessions and
+unfinished tasks, and whether it `would_grant`, was `granted`, was `already_granted`, or has
+`no_organization` to grant. Without `--dry-run` it records a `KnowledgeGrant` for each with
+`PostgresKnowledgeGrants`, in a table of its own next to Cayu's tables so the application's
+migrations never see it. The policy's `knowledge_admission` reads it: such
+work gets the knowledge of the organizations it was admitted in, intersected with the
+person's current memberships at every step, and so does whatever it starts later, which
+carries the same admission. The library pieces compose on their own:
+`cayu.resource_access.work_admitted_without_knowledge(session_store, task_store,
+authority=...)` finds the work, `admitted_organizations(binding)` names its organizations and
+`KnowledgeGrants.record` records the decision.
 
 ### Knowledge scoped by organization
 

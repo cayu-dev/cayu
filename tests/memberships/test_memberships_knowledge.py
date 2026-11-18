@@ -61,7 +61,13 @@ def _scope(*, session_label_keys: tuple[str, ...] = ("organization",)) -> Knowle
 BACKENDS = ["memory", "sqlite", "postgres"]
 
 
-def _store(backend: str, request: pytest.FixtureRequest, scope: KnowledgeAccessScope):
+def _store(
+    backend: str,
+    request: pytest.FixtureRequest,
+    scope: KnowledgeAccessScope,
+    *,
+    postgres_fixture: str = "postgres_dsn",
+):
     if backend == "memory":
         return InMemoryKnowledgeStore(access_scope=scope)
     if backend == "sqlite":
@@ -71,7 +77,7 @@ def _store(backend: str, request: pytest.FixtureRequest, scope: KnowledgeAccessS
     from cayu.storage.migrations import SchemaMode
 
     return PostgresKnowledgeStore(
-        request.getfixturevalue("postgres_dsn"),
+        request.getfixturevalue(postgres_fixture),
         schema_mode=SchemaMode.CREATE,
         access_scope=scope,
     )
@@ -679,3 +685,295 @@ def test_an_app_run_labelled_with_an_organization_gets_only_its_knowledge() -> N
         assert await run({}) == {"acme-invoices", "globex-invoices"}
 
     asyncio.run(scenario())
+
+
+def _session_and_task_stores(backend: str, request: pytest.FixtureRequest):
+    if backend == "memory":
+        from cayu.sessions.memory import InMemorySessionStore
+        from cayu.tasks.memory import InMemoryTaskStore
+
+        return InMemorySessionStore(), InMemoryTaskStore()
+    if backend == "sqlite":
+        from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
+
+        path = request.getfixturevalue("tmp_path")
+        return SQLiteSessionStore(path / "sessions.db"), SQLiteTaskStore(path / "tasks.db")
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+    from cayu.storage.tasks_postgres import PostgresTaskStore
+
+    # A database of the test's own: the module's is shared with the other tests' entries.
+    dsn = request.getfixturevalue("postgres_test_dsn")
+    return (
+        PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE),
+        PostgresTaskStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE),
+    )
+
+
+def _identity(name: str):
+    from cayu.runtime.execution_identity import ExecutionProfileBehaviorIdentity
+
+    return ExecutionProfileBehaviorIdentity(
+        name=f"tests:{name}", behavior_version="1", implementation_version="1"
+    )
+
+
+class _ChildLabelsOverride:
+    """A runtime handing durable subagents a label of their own, as custom code could."""
+
+    def __init__(self, app, labels: dict[str, str]) -> None:
+        self._app = app
+        self._labels = labels
+
+    def __getattr__(self, name):
+        return getattr(self._app, name)
+
+    async def _submit_durable_subagent(self, *, request, **kwargs):
+        return await self._app._submit_durable_subagent(
+            request=request.model_copy(update={"labels": self._labels}), **kwargs
+        )
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("held_by", ["app", "tool"])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_durable_subagent_run_later_by_a_worker_keeps_its_organizations_knowledge(
+    backend: str, held_by: str, request: pytest.FixtureRequest
+) -> None:
+    """A durable subagent spawned from an organization's session runs later, in a worker
+    with no outer session around it. It carries the parent's labels on its own record, so
+    its knowledge stays pinned to the parent's organization; a label naming another
+    organization is refused when it's admitted. The store may be the app's or one a tool
+    holds itself: each pins to the session's own labels."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.queries import SessionQuery
+    from cayu.sessions.requests import RunRequest
+    from cayu.tasks.dispatch import TaskStoreDispatcher
+    from cayu.tools import Tool, ToolResult, ToolSpec
+    from cayu.tools.subagents import SubagentExecutionMode, SubagentSpec, SubagentTool
+
+    seen: list[set[str]] = []
+
+    def spawn_turns() -> list:
+        return [
+            [
+                ModelStreamEvent.tool_call(
+                    id="spawn",
+                    name="subagent",
+                    arguments={"agent": "researcher", "task": "look up invoices"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+
+    # One provider for every process: the parent, then the worker's child, then a second
+    # parent whose child is refused.
+    provider = ScriptedModelProvider(
+        [
+            *spawn_turns(),
+            [
+                ModelStreamEvent.tool_call(id="look", name="look_up", arguments={}),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            *spawn_turns(),
+        ]
+    )
+
+    async def run() -> None:
+        knowledge = _store(backend, request, _scope(), postgres_fixture="postgres_test_dsn")
+        sessions, tasks = _session_and_task_stores(backend, request)
+
+        class LooksUp(Tool):
+            spec = ToolSpec(
+                name="look_up",
+                description="Look up invoice knowledge.",
+                input_schema={"type": "object", "properties": {}},
+                execution_profile_identity=_identity("look-up"),
+                max_terminal_payload_bytes=1024,
+            )
+
+            async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+                seen.append(await _readable(knowledge))
+                return ToolResult(content="ok")
+
+        def build(*, child_labels=None):
+            dispatcher = TaskStoreDispatcher(tasks)
+            app = CayuApp(
+                session_store=sessions,
+                task_store=tasks,
+                knowledge_store=knowledge if held_by == "app" else None,
+                dispatcher=dispatcher,
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            runtime = app if child_labels is None else _ChildLabelsOverride(app, child_labels)
+            app.register_agent(
+                AgentSpec(name="parent", model="model"),
+                tools=[
+                    SubagentTool(
+                        runtime,
+                        execution_profile_identity=_identity("subagent"),
+                        agents={
+                            "researcher": SubagentSpec(
+                                agent_name="researcher", mode=SubagentExecutionMode.DURABLE
+                            )
+                        },
+                    )
+                ],
+            )
+            app.register_agent(AgentSpec(name="researcher", model="model"), tools=[LooksUp()])
+            return app, dispatcher
+
+        async def spawn(session_id: str, *, child_labels=None) -> list:
+            app, _ = build(child_labels=child_labels)
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="parent",
+                        session_id=session_id,
+                        labels={"organization": "acme", "purpose": "digest"},
+                        messages=[Message.text("user", "parent")],
+                    )
+                )
+            ]
+            return events
+
+        try:
+            await _seed_both_organizations(knowledge)
+            await spawn("acme-parent")
+            children = (
+                await sessions.list_sessions(SessionQuery(parent_session_id="acme-parent"))
+            ).sessions
+            assert len(children) == 1
+            # It carries its parent's labels on its own record.
+            parent_labels = {"organization": "acme", "purpose": "digest"}
+            assert children[0].labels == parent_labels
+            # The parent is relabelled, even to another organization, before a worker gets to
+            # the child: the child runs as it was submitted, with the labels it took then.
+            await sessions.update_labels(
+                "acme-parent", {"organization": "globex", "purpose": "digest", "reviewed": "yes"}
+            )
+
+            # A worker, outside the parent's run, picks the child up later.
+            worker, dispatcher = build()
+            handle = await dispatcher.process_next(worker, worker_id="worker")
+            assert handle is not None and handle.status.value == "completed"
+            assert seen == [{"acme-invoices"}]
+            assert (await sessions.load(children[0].id)).labels == parent_labels
+            if held_by == "tool":
+                # Only a scope the app knows names the keys a child's own label may not
+                # contradict; the application code that sets a child's labels is trusted.
+                return
+
+            # A child labelled for another organization is refused before it exists.
+            events = await spawn("acme-parent-relabelled", child_labels={"organization": "globex"})
+            (failed,) = [event for event in events if event.type.value == "tool.call.failed"]
+            assert failed.payload["result"]["structured"]["status"] == "submission_failed"
+            assert failed.payload["result"]["structured"]["error_type"] == "ResourceAccessDenied"
+            assert not (
+                await sessions.list_sessions(
+                    SessionQuery(parent_session_id="acme-parent-relabelled")
+                )
+            ).sessions
+        finally:
+            await _close(knowledge)
+            for store in (sessions, tasks):
+                close = getattr(store, "close", None)
+                if close is not None:
+                    await close()
+
+    asyncio.run(run())
+
+
+def test_a_child_run_admitted_outside_its_parent_keeps_the_parents_organization() -> None:
+    """A child session admitted from a stored parent, with no outer session around it,
+    takes the parent's labels; one naming another organization, the label knowledge is
+    pinned to, is refused. A label of its own for any other key stays its own."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.memory import InMemorySessionStore
+    from cayu.sessions.requests import RunRequest
+
+    def provider() -> ScriptedModelProvider:
+        return ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+            * 3
+        )
+
+    async def run() -> None:
+        sessions = InMemorySessionStore()
+        app = CayuApp(
+            session_store=sessions,
+            knowledge_store=InMemoryKnowledgeStore(access_scope=_scope()),
+            enable_logging=False,
+        )
+        app.register_provider(provider(), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        try:
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="acme-parent",
+                    labels={"organization": "acme", "team": "red"},
+                    messages=[Message.text("user", "go")],
+                )
+            ):
+                pass
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="acme-child",
+                    parent_session_id="acme-parent",
+                    messages=[Message.text("user", "go")],
+                )
+            ):
+                pass
+            child = await sessions.load("acme-child")
+            assert child is not None and child.labels == {"organization": "acme", "team": "red"}
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="blue-child",
+                    parent_session_id="acme-parent",
+                    labels={"team": "blue"},
+                    messages=[Message.text("user", "go")],
+                )
+            ):
+                pass
+            blue = await sessions.load("blue-child")
+            assert blue is not None and blue.labels == {"team": "blue", "organization": "acme"}
+            with pytest.raises(ResourceAccessDenied):
+                async for _event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="globex-child",
+                        parent_session_id="acme-parent",
+                        labels={"organization": "globex"},
+                        messages=[Message.text("user", "go")],
+                    )
+                ):
+                    pass
+            assert await sessions.load("globex-child") is None
+        finally:
+            await app.aclose()
+
+    asyncio.run(run())

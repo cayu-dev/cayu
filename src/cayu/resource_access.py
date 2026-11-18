@@ -141,6 +141,22 @@ class ResourceAccessPolicy(ABC):
         self, subject: str
     ) -> ResourceAccessDecision | ResourceAccessGrant | SessionAccessScope: ...
 
+    async def knowledge_admission(
+        self, binding: ResourceExecutionBinding
+    ) -> SessionAccessScope | None:
+        """The knowledge ``binding``'s work may use although it was admitted with none.
+
+        Cayu stores the grant each piece of work was admitted with and never widens it on its
+        own, so work admitted before a policy granted knowledge keeps none. An operator who
+        decides otherwise records that decision where the policy can read it, and the policy
+        returns here the knowledge scope that work is now admitted with. Cayu asks only for
+        work whose stored grant has no knowledge, uses the answer as its admitted knowledge,
+        and still intersects it with the current decision at every step; the stored binding
+        doesn't change. ``None``, the default, keeps such work without knowledge.
+        """
+
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class _ExecutionAccess:
@@ -178,7 +194,111 @@ async def effective_bounds(binding, policy, kind="sessions"):
         current = getattr(current, kind)
     elif type(current) is not SessionAccessScope:
         raise ResourceAccessDenied()
-    return _SessionAccessBounds(admitted_scope(binding, kind), current, binding)
+    admitted = admitted_scope(binding, kind)
+    if kind == "knowledge" and admitted == SessionAccessScope():
+        # Work admitted before its policy granted knowledge: only an operator's recorded
+        # decision, which the policy reports, admits it to any.
+        granted = await policy.knowledge_admission(binding)
+        if granted is not None:
+            if type(granted) is not SessionAccessScope:
+                raise ResourceAccessDenied()
+            admitted = granted
+    return _SessionAccessBounds(admitted, current, binding)
+
+
+def binding_sha256(binding: ResourceExecutionBinding) -> str:
+    """A stable digest naming one stored admission: its authority, subject, grant and revision.
+
+    Work started inside admitted work (child sessions, the tasks it creates) carries the same
+    binding, so the digest names all of it.
+    """
+
+    from hashlib import sha256
+
+    material = json.dumps(
+        {
+            "admitted": json.loads(binding.admitted_json),
+            "authority": binding.authority,
+            "policy_revision": binding.policy_revision,
+            "subject": binding.subject,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return sha256(material.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedWork:
+    """Stored work that shares one admission: its binding and the sessions and tasks under it."""
+
+    binding: ResourceExecutionBinding
+    binding_sha256: str
+    session_ids: tuple[str, ...]
+    task_ids: tuple[str, ...]
+
+
+async def work_admitted_without_knowledge(
+    session_store, task_store=None, *, authority: str, subject: str | None = None
+) -> tuple[AdmittedWork, ...]:
+    """Sessions and unfinished tasks under ``authority`` whose stored grant has no knowledge.
+
+    Grouped by admission and ordered by subject and digest. Every session counts, finished or
+    not, since a finished conversation is continued by its next message; finished tasks don't
+    run again and are left out. ``subject`` narrows it to one person's work. It reads every
+    session and task in the stores, so it is an operator's tool, not a per-request check.
+    """
+
+    from cayu.sessions._access_rules import SessionAccessScope
+    from cayu.sessions.queries import SessionOrder, SessionQuery
+    from cayu.tasks.queries import TaskOrder, TaskQuery
+    from cayu.tasks.records import _TERMINAL_TASK_STATUSES
+
+    found: dict[str, tuple[ResourceExecutionBinding, list[str], list[str]]] = {}
+
+    def note(binding, *, session_id=None, task_id=None):
+        if binding is None or binding.authority != authority:
+            return
+        if subject is not None and binding.subject != subject:
+            return
+        if admitted_scope(binding, "knowledge") != SessionAccessScope():
+            return
+        digest = binding_sha256(binding)
+        entry = found.setdefault(digest, (binding, [], []))
+        if session_id is not None:
+            entry[1].append(session_id)
+        if task_id is not None:
+            entry[2].append(task_id)
+
+    cursor = None
+    while True:
+        page = await session_store.list_sessions(
+            SessionQuery(limit=1000, cursor=cursor, order_by=SessionOrder.CREATED_AT_ASC)
+        )
+        for session in page.sessions:
+            note(session.invocation.resource_access, session_id=session.id)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+    if task_store is not None:
+        offset = 0
+        while True:
+            tasks = await task_store.list_tasks(
+                TaskQuery(limit=1000, offset=offset, order_by=TaskOrder.CREATED_AT_ASC)
+            )
+            for task in tasks:
+                if task.status not in _TERMINAL_TASK_STATUSES:
+                    note(task.invocation.resource_access, task_id=task.id)
+            if len(tasks) < 1000:
+                break
+            offset += len(tasks)
+    return tuple(
+        AdmittedWork(binding, digest, tuple(sessions), tuple(tasks))
+        for digest, (binding, sessions, tasks) in sorted(
+            found.items(), key=lambda item: (item[1][0].subject, item[0])
+        )
+    )
 
 
 async def require_dispatch() -> None:

@@ -153,7 +153,15 @@ broader subject or current default. A different subject's access to shared data
 does not automatically transfer authority to resume that subject's execution.
 
 Legacy unbound executions are not adopted implicitly by scoped resume. Operators
-must make an explicit migration/adoption decision. A trusted explicit `allow_all`
+must make an explicit migration/adoption decision. Stored grants are never rewritten either. Work
+admitted under a grant with no knowledge family can be admitted to knowledge only through
+`ResourceAccessPolicy.knowledge_admission(binding)`: Cayu asks it only for such work, uses
+the scope it returns as that work's admitted knowledge, and still intersects it with the
+current decision at every step. The default returns `None`. A policy answers from a
+recorded operator decision keyed by `binding_sha256(binding)`, as `MembershipAccessPolicy`
+does with `cayu memberships grant-knowledge`. Inside such work, while the current decision
+grants knowledge and nothing admits it, the knowledge tools return `knowledge_not_admitted`
+instead of empty results; automatic recall stays empty rather than failing the turn. A trusted explicit `allow_all`
 grant can read otherwise unclassified data; applications that require a label
 should use positive selectors requiring that label.
 

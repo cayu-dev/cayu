@@ -1,5 +1,8 @@
 """`cayu memberships`: list, add and remove an application's members from the command line.
 
+`cayu memberships grant-knowledge` grants organization knowledge to work admitted before the
+policy granted any (:mod:`cayu.memberships.knowledge_grants`).
+
 It reads and writes the application's own membership tables through
 :class:`cayu.memberships.PostgresMemberships`, in the database Cayu uses
 (`CAYU_DATABASE_URL`, then `[tool.cayu.session_store]`, or `--postgres`). Every change raises
@@ -64,6 +67,37 @@ def add_memberships_parser(subparsers: Any) -> None:
         command.add_argument("subject", metavar="SUBJECT", help="The person's sign-in subject.")
         command.add_argument("organization", metavar="ORGANIZATION", help="The organization ID.")
     add.add_argument("--role", choices=("member", "admin"), default="member")
+    grant = commands.add_parser(
+        "grant-knowledge",
+        help="Grant knowledge to conversations and tasks admitted before the policy had it.",
+        description=(
+            "Find the conversations and unfinished tasks admitted under AUTHORITY whose stored "
+            "grant has no knowledge, which is all work admitted before "
+            "MembershipAccessPolicy(knowledge=True) was turned on, and record that each of "
+            "them may use the knowledge of the organizations it was admitted in. Stored work "
+            "is left as it is; the policy reads the records, which are also the audit of "
+            "what was granted. --dry-run only lists. Prints one JSON document."
+        ),
+    )
+    grant.add_argument(
+        "--dry-run", action="store_true", help="List what would be granted; record nothing."
+    )
+    grant.add_argument("--subject", help="Only this person's work.")
+    grant.add_argument(
+        "--authority",
+        default=None,
+        help="The policy's authority (default: MembershipAccessPolicy's default authority).",
+    )
+    grant.add_argument(
+        "--postgres",
+        metavar="DSN",
+        help=(
+            "The application's PostgreSQL database, where Cayu's sessions and tasks are too "
+            "(default: CAYU_DATABASE_URL). Prefer CAYU_DATABASE_URL to keep credentials off "
+            "the command line."
+        ),
+    )
+    add_output_options(grant, formats=("json",), default="json")
     for command in (listing, add, remove):
         command.add_argument(
             "--postgres",
@@ -104,6 +138,8 @@ def run_memberships(args: argparse.Namespace) -> int:
 async def _run(args: argparse.Namespace) -> str:
     from cayu.memberships import PostgresMemberships, check_membership_tables
 
+    if args.memberships_command == "grant-knowledge":
+        return _json(await _grant_knowledge(args, _database(args)))
     connect = partial(_connect(), _database(args))
     memberships = PostgresMemberships(connect, schema=args.schema)
     connection = connect()
@@ -138,6 +174,83 @@ async def _run(args: argparse.Namespace) -> str:
     if removed:
         return f"Removed {subject} from {organization}.\n"
     return f"{subject} wasn't a member of {organization}; nothing changed.\n"
+
+
+async def _grant_knowledge(args: argparse.Namespace, dsn: str) -> dict[str, Any]:
+    from datetime import UTC, datetime
+
+    from cayu.memberships import KnowledgeGrant, PostgresKnowledgeGrants, admitted_organizations
+    from cayu.memberships.policy import DEFAULT_AUTHORITY
+    from cayu.resource_access import work_admitted_without_knowledge
+    from cayu.storage import PostgresSessionStore, PostgresTaskStore
+    from cayu.storage.migrations import SchemaMode
+
+    authority = DEFAULT_AUTHORITY if args.authority is None else args.authority
+    grants = PostgresKnowledgeGrants(partial(_connect(), dsn))
+    sessions = PostgresSessionStore(dsn, schema_mode=SchemaMode.VALIDATE, read_only=True)
+    try:
+        tasks = PostgresTaskStore(dsn, schema_mode=SchemaMode.VALIDATE, read_only=True)
+        try:
+            work = await work_admitted_without_knowledge(
+                sessions, tasks, authority=authority, subject=args.subject
+            )
+        finally:
+            await tasks.close()
+    finally:
+        await sessions.close()
+    now = datetime.now(UTC)
+    rows: list[dict[str, Any]] = []
+    pending: list[KnowledgeGrant] = []
+    for item in work:
+        organizations = admitted_organizations(item.binding)
+        row: dict[str, Any] = {
+            "binding_sha256": item.binding_sha256,
+            "subject": item.binding.subject,
+            "organizations": organizations,
+            "session_ids": list(item.session_ids),
+            "task_ids": list(item.task_ids),
+        }
+        if not organizations:
+            # Admitted with no memberships: there is no organization's knowledge to grant.
+            row["status"] = "no_organization"
+        elif await grants.granted(item.binding_sha256):
+            row["status"] = "already_granted"
+        else:
+            row["status"] = "would_grant" if args.dry_run else "granted"
+            pending.append(
+                KnowledgeGrant(
+                    binding_sha256=item.binding_sha256,
+                    authority=authority,
+                    subject=item.binding.subject,
+                    organizations=tuple(organizations),
+                    sessions=len(item.session_ids),
+                    tasks=len(item.task_ids),
+                    granted_at=now,
+                )
+            )
+        rows.append(row)
+    if pending and not args.dry_run:
+        recorded = {grant.binding_sha256 for grant in await grants.record(pending)}
+        for row in rows:
+            if row["status"] == "granted" and row["binding_sha256"] not in recorded:
+                # Another run recorded it first.
+                row["status"] = "already_granted"
+    granting = "would_grant" if args.dry_run else "granted"
+    counts = {granting: 0, "already_granted": 0, "no_organization": 0}
+    for row in rows:
+        counts[row["status"]] += 1
+    return {
+        "authority": authority,
+        "dry_run": args.dry_run,
+        "subject": args.subject,
+        "counts": {
+            **counts,
+            "sessions": sum(len(row["session_ids"]) for row in rows),
+            "tasks": sum(len(row["task_ids"]) for row in rows),
+        },
+        "admissions": rows,
+        "granted_at": None if args.dry_run else now.isoformat(),
+    }
 
 
 def _database(args: argparse.Namespace) -> str:

@@ -13,7 +13,12 @@ from cayu.memberships.directory import Member as Member
 from cayu.memberships.directory import Membership as Membership
 from cayu.memberships.directory import MembershipDirectory as MembershipDirectory
 from cayu.memberships.directory import Role as Role
+from cayu.memberships.knowledge_grants import InMemoryKnowledgeGrants as InMemoryKnowledgeGrants
+from cayu.memberships.knowledge_grants import KnowledgeGrant as KnowledgeGrant
+from cayu.memberships.knowledge_grants import KnowledgeGrants as KnowledgeGrants
+from cayu.memberships.knowledge_grants import PostgresKnowledgeGrants as PostgresKnowledgeGrants
 from cayu.memberships.policy import MembershipAccessPolicy as MembershipAccessPolicy
+from cayu.memberships.policy import admitted_organizations as admitted_organizations
 from cayu.memberships.postgres import MembershipTablesInvalid as MembershipTablesInvalid
 from cayu.memberships.postgres import PostgresMemberships as PostgresMemberships
 from cayu.memberships.postgres import check_membership_tables as check_membership_tables

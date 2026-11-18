@@ -2,7 +2,10 @@
 
 EXPORTS: dict[str, tuple[str, str]] = {
     "AccessSnapshot": ("cayu.memberships.directory", "AccessSnapshot"),
+    "InMemoryKnowledgeGrants": ("cayu.memberships.knowledge_grants", "InMemoryKnowledgeGrants"),
     "InMemoryMembershipDirectory": ("cayu.memberships.directory", "InMemoryMembershipDirectory"),
+    "KnowledgeGrant": ("cayu.memberships.knowledge_grants", "KnowledgeGrant"),
+    "KnowledgeGrants": ("cayu.memberships.knowledge_grants", "KnowledgeGrants"),
     "LastAdmin": ("cayu.memberships.changes", "LastAdmin"),
     "Member": ("cayu.memberships.directory", "Member"),
     "MemberChange": ("cayu.memberships.changes", "MemberChange"),
@@ -12,6 +15,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "MembershipDirectory": ("cayu.memberships.directory", "MembershipDirectory"),
     "MembershipTablesInvalid": ("cayu.memberships.postgres", "MembershipTablesInvalid"),
     "NotAnAdmin": ("cayu.memberships.changes", "NotAnAdmin"),
+    "PostgresKnowledgeGrants": ("cayu.memberships.knowledge_grants", "PostgresKnowledgeGrants"),
     "PostgresMemberships": ("cayu.memberships.postgres", "PostgresMemberships"),
     "RemoveMember": ("cayu.memberships.changes", "RemoveMember"),
     "Role": ("cayu.memberships.directory", "Role"),
@@ -19,13 +23,17 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "SetMember": ("cayu.memberships.changes", "SetMember"),
     "Sharing": ("cayu.memberships.sharing", "Sharing"),
     "UnknownOrganization": ("cayu.memberships.changes", "UnknownOrganization"),
+    "admitted_organizations": ("cayu.memberships.policy", "admitted_organizations"),
     "check_membership_tables": ("cayu.memberships.postgres", "check_membership_tables"),
     "conversation_labels": ("cayu.memberships.sharing", "conversation_labels"),
 }
 
 PUBLIC_NAMES = [
     "AccessSnapshot",
+    "InMemoryKnowledgeGrants",
     "InMemoryMembershipDirectory",
+    "KnowledgeGrant",
+    "KnowledgeGrants",
     "LastAdmin",
     "Member",
     "MemberChange",
@@ -35,6 +43,7 @@ PUBLIC_NAMES = [
     "MembershipDirectory",
     "MembershipTablesInvalid",
     "NotAnAdmin",
+    "PostgresKnowledgeGrants",
     "PostgresMemberships",
     "RemoveMember",
     "Role",
@@ -42,6 +51,7 @@ PUBLIC_NAMES = [
     "SetMember",
     "Sharing",
     "UnknownOrganization",
+    "admitted_organizations",
     "check_membership_tables",
     "conversation_labels",
 ]

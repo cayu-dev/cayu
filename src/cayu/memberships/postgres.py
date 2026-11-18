@@ -37,11 +37,11 @@ reuses the application's own pool. Calls run in a worker thread.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from cayu.memberships._transactions import run_transaction
 from cayu.memberships.changes import (
     LastAdmin,
     MemberChange,
@@ -51,6 +51,7 @@ from cayu.memberships.changes import (
     UnknownOrganization,
 )
 from cayu.memberships.directory import ROLES, AccessSnapshot, Member, Membership, Role
+from cayu.memberships.knowledge_grants import PostgresKnowledgeGrants
 
 # The single row of `access_revision`.
 _REVISION_ROW = 1
@@ -109,6 +110,13 @@ class PostgresMemberships:
     @property
     def schema(self) -> str:
         return self._schema
+
+    @property
+    def knowledge_grants(self) -> PostgresKnowledgeGrants:
+        """The knowledge operators granted to work admitted before the policy granted any,
+        over the same connections (:mod:`cayu.memberships.knowledge_grants`)."""
+
+        return PostgresKnowledgeGrants(self._connect)
 
     async def current(self, subject: str) -> AccessSnapshot:
         """``subject``'s memberships and the revision they belong to, from one snapshot."""
@@ -248,29 +256,7 @@ class PostgresMemberships:
         return {row[0] for row in cursor.fetchall()}
 
     def _transaction(self, work: Callable[[Any], Any], *, commit: bool = False) -> Any:
-        connection = self._connect()
-        if getattr(connection, "autocommit", False):
-            connection.close()
-            # Each statement would commit on its own: a refused change would stay made.
-            raise ValueError("PostgresMemberships needs connections with autocommit off.")
-        try:
-            cursor = connection.cursor()
-            try:
-                result = work(cursor)
-            finally:
-                cursor.close()
-            if commit:
-                connection.commit()
-            else:
-                connection.rollback()
-            return result
-        except BaseException:
-            # A broken connection can't roll back; closing it is all that's left to do.
-            with contextlib.suppress(Exception):
-                connection.rollback()
-            raise
-        finally:
-            connection.close()
+        return run_transaction(self._connect, work, commit=commit, owner="PostgresMemberships")
 
 
 _TEXT_TYPES = frozenset({"varchar", "text", "bpchar"})

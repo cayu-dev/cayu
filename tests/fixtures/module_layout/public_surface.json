@@ -2675,8 +2675,15 @@
           "Membership",
           "MembershipDirectory"
         ],
+        "cayu.memberships.knowledge_grants": [
+          "InMemoryKnowledgeGrants",
+          "KnowledgeGrant",
+          "KnowledgeGrants",
+          "PostgresKnowledgeGrants"
+        ],
         "cayu.memberships.policy": [
-          "MembershipAccessPolicy"
+          "MembershipAccessPolicy",
+          "admitted_organizations"
         ],
         "cayu.memberships.postgres": [
           "MembershipTablesInvalid",

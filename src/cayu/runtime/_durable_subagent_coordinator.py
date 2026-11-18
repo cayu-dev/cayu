@@ -12,6 +12,7 @@ from cayu.events import Event
 from cayu.execution_profiles import (
     ExecutionProfileIdentity,
 )
+from cayu.knowledge.access import inherited_session_labels
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._checkpoint_store import load_runtime_session_checkpoint_snapshot
@@ -163,6 +164,7 @@ class DurableSubagentCoordinator:
         ],
         acknowledge_dispatch: Callable[..., Awaitable[None]],
         session_settings: Callable[[ToolPolicy], dict[str, Any] | None] | None = None,
+        knowledge_label_keys: Callable[[], tuple[str, ...]] = tuple,
     ) -> None:
         self.session_store = session_store
         self._runtime_session_store = runtime_session_store
@@ -178,6 +180,7 @@ class DurableSubagentCoordinator:
         self._classify_dispatch_settlement = classify_dispatch_settlement
         self._acknowledge_dispatch = acknowledge_dispatch
         self._session_settings = session_settings
+        self._knowledge_label_keys = knowledge_label_keys
 
     def _route_registered_provider_for_model(
         self,
@@ -309,7 +312,12 @@ class DurableSubagentCoordinator:
                 "tool_capability_ceiling": resolve_tool_capability_ceiling(
                     request.tool_capability_ceiling,
                     registered_child.tool_capabilities,
-                )
+                ),
+                # The child runs later in a worker, outside the parent's tool call, so it
+                # carries the parent's labels on its own record to stay pinned to them.
+                "labels": inherited_session_labels(
+                    parent.labels, request.labels, self._knowledge_label_keys()
+                ),
             }
         )
         dispatch_id = durable_subagent_dispatch_id(

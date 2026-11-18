@@ -29,6 +29,7 @@ from cayu.knowledge._publication import (
     KnowledgePublicationScope,
     RetainedKnowledgePublicationOwner,
 )
+from cayu.knowledge.access import KNOWLEDGE_NOT_ADMITTED_MESSAGE, knowledge_not_admitted
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationAuthority,
     KnowledgeActivationDisposition,
@@ -594,6 +595,8 @@ class SearchKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
+        if await knowledge_not_admitted("read"):
+            return _knowledge_not_admitted_result()
         search_modes = _knowledge_search_modes_payload(store)
         with tool_argument_validation():
             if "min_score" in args and not self._allow_score_override:
@@ -887,6 +890,8 @@ class RememberKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
+        if await knowledge_not_admitted("create"):
+            return _knowledge_not_admitted_result()
         with tool_argument_validation():
             policy = _copy_remember_knowledge_policy(self._policy)
             text = _require_arg_string(args, "text")
@@ -2286,6 +2291,8 @@ class ListKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
+        if await knowledge_not_admitted("read"):
+            return _knowledge_not_admitted_result()
         with tool_argument_validation():
             query = KnowledgeListQuery(
                 namespace=_optional_arg_string(args, "namespace"),
@@ -2472,6 +2479,8 @@ class ReadKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
+        if await knowledge_not_admitted("read"):
+            return _knowledge_not_admitted_result()
         with tool_argument_validation():
             entry_id = require_unicode_scalar_text(
                 require_clean_nonblank(_require_arg_string(args, "entry_id"), "entry_id"),
@@ -2652,6 +2661,14 @@ class _ScopedKnowledgeStoreHandle:
             operation_id,
             access_scope=self._access_scope,
         )
+
+
+def _knowledge_not_admitted_result() -> ToolResult:
+    return ToolResult(
+        content=KNOWLEDGE_NOT_ADMITTED_MESSAGE,
+        structured={"error": "knowledge_not_admitted"},
+        is_error=True,
+    )
 
 
 def _missing_knowledge_store_result() -> ToolResult:

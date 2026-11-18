@@ -63,6 +63,10 @@ class InMemoryMembershipDirectory:
             subject: tuple(items) for subject, items in (memberships or {}).items()
         }
         self._revision = 0
+        from cayu.memberships.knowledge_grants import InMemoryKnowledgeGrants
+
+        #: The knowledge operators granted to work admitted before the policy granted any.
+        self.knowledge_grants = InMemoryKnowledgeGrants()
 
     async def current(self, subject: str) -> AccessSnapshot:
         return AccessSnapshot(self._memberships.get(subject, ()), self._revision)

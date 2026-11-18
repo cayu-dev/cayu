@@ -97,3 +97,78 @@ def test_it_says_when_the_tables_or_the_database_are_missing(database, capsys, m
     monkeypatch.delenv("CAYU_DATABASE_URL")
     assert main(["memberships", "list", "--organization", "acme"]) == 1
     assert "set CAYU_DATABASE_URL" in capsys.readouterr().err
+
+
+def test_knowledge_is_granted_to_work_admitted_before_the_policy_had_it(database, capsys) -> None:
+    """`grant-knowledge` lists the conversations admitted without knowledge, records a grant
+    for each admission only when not a dry run, and the policy then admits that work."""
+
+    import asyncio
+    from functools import partial
+
+    from cayu import CayuApp
+    from cayu.memberships import MembershipAccessPolicy, PostgresMemberships, conversation_labels
+    from cayu.memberships.directory import Membership
+    from cayu.sessions.records import SessionIdentity
+    from cayu.sessions.requests import RunRequest
+    from cayu.storage import PostgresSessionStore, PostgresTaskStore
+    from cayu.storage.migrations import SchemaMode
+
+    assert main(["memberships", "add", "alice", "acme", "--role", "admin"]) == 0
+    capsys.readouterr()
+    memberships = PostgresMemberships(partial(psycopg.connect, database))
+
+    async def start(knowledge: bool) -> tuple[str, object]:
+        sessions = PostgresSessionStore(database, schema_mode=SchemaMode.CREATE)
+        tasks = PostgresTaskStore(database, schema_mode=SchemaMode.CREATE)
+        try:
+            app = CayuApp(
+                session_store=sessions,
+                task_store=tasks,
+                resource_access_policy=MembershipAccessPolicy(memberships, knowledge=knowledge),
+                enable_logging=False,
+            )
+            access = await app.access("alice")
+            created = await access.sessions.create(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[],
+                    labels=conversation_labels(
+                        subject="alice", membership=Membership("acme"), sharing="organization"
+                    ),
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake"),
+            )
+            await app.aclose()
+            return created.id, created.invocation.resource_access
+        finally:
+            await tasks.close()
+            await sessions.close()
+
+    old_id, old_binding = asyncio.run(start(knowledge=False))
+    asyncio.run(start(knowledge=True))
+    policy = MembershipAccessPolicy(memberships, knowledge=True)
+
+    status, listed = _json(capsys, "grant-knowledge", "--dry-run")
+    assert status == 0
+    assert listed["dry_run"] is True
+    (admission,) = listed["admissions"]
+    assert admission["subject"] == "alice"
+    assert admission["organizations"] == ["acme"]
+    assert admission["session_ids"] == [old_id]
+    assert admission["status"] == "would_grant"
+    assert listed["counts"]["would_grant"] == 1
+    assert asyncio.run(policy.knowledge_admission(old_binding)) is None
+
+    status, granted = _json(capsys, "grant-knowledge")
+    assert status == 0
+    assert [row["status"] for row in granted["admissions"]] == ["granted"]
+    assert asyncio.run(policy.knowledge_admission(old_binding)) is not None
+    # The record is the audit of what was granted.
+    (grant,) = asyncio.run(memberships.knowledge_grants.list())
+    assert (grant.subject, grant.organizations, grant.sessions) == ("alice", ("acme",), 1)
+    assert grant.binding_sha256 == admission["binding_sha256"]
+
+    status, again = _json(capsys, "grant-knowledge")
+    assert [row["status"] for row in again["admissions"]] == ["already_granted"]
+    assert again["counts"]["granted"] == 0

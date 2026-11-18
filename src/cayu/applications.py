@@ -332,6 +332,7 @@ from cayu.fork_controllers import (
     require_verified_fork_controller,
 )
 from cayu.knowledge._publication import KnowledgePublicationScope
+from cayu.knowledge.access import inherited_session_labels, pinned_label_keys
 from cayu.knowledge.base import KnowledgeStore
 from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
@@ -698,6 +699,7 @@ from cayu.sessions.requests import (
     copy_resume_request,
     run_request_with_runtime_generated_authority,
     runtime_model_slot,
+    runtime_prepared_session_authority,
     with_event_base_deadline,
 )
 from cayu.sessions.store import SessionStore
@@ -2039,6 +2041,7 @@ class CayuApp(
             classify_dispatch_settlement=self._queued_dispatch_settlement_state,
             acknowledge_dispatch=self._acknowledge_queued_dispatch,
             session_settings=self._session_settings,
+            knowledge_label_keys=lambda: pinned_label_keys(self.knowledge_access_scope),
         )
 
         self._queued_dispatch_coordinator = QueuedDispatchCoordinator(
@@ -7148,6 +7151,13 @@ class CayuApp(
                     ),
                 }
             )
+        elif parent is not None and runtime_prepared_session_authority(request) is None:
+            # Kept on the child's own record: a worker may resume it outside the parent's run.
+            # A prepared durable child took them at submission and must stay as submitted.
+            labels = inherited_session_labels(
+                parent.labels, request.labels, pinned_label_keys(self.knowledge_access_scope)
+            )
+            request = request.model_copy(update={"labels": labels})
         admission = DeadlineOutcomeAdmission(handler_limit=handler_limit)
         stream = self._session_engine.run(
             request=request,

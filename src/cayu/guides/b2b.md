@@ -219,8 +219,23 @@ enforces it, so no tool has to remember to filter:
   Agent (`--application NAME`). Entries stored before this rule can still be
   revised to add the label, or archived.
 
-Work queued before you turn on `knowledge=True` keeps the grant it was admitted with, which
-has no knowledge, so its knowledge reads are refused.
+Conversations and tasks admitted before you turn on `knowledge=True` keep the grant they were
+admitted with, which has no knowledge: Cayu never widens a stored grant on its own. Their
+automatic recall finds nothing, and `search_knowledge`, `read_knowledge`, `list_knowledge` and
+`remember_knowledge` return a `knowledge_not_admitted` error saying the work was admitted
+before knowledge was granted. A new conversation gets knowledge. To give it to the earlier
+ones too, list them and then record the grant:
+
+```bash
+uv run --no-sync cayu memberships grant-knowledge --dry-run
+uv run --no-sync cayu memberships grant-knowledge
+```
+
+Each admission it lists (`--subject` narrows it to one person) gets the knowledge of the
+organizations it was admitted in, still within the person's current memberships at every
+step, and so does whatever that work starts later. The stored work isn't changed: the grants
+are kept in a table of their own next to Cayu's tables (`PostgresKnowledgeGrants`), and are the
+record of who was granted what and when.
 
 ## Move to `cayu.memberships`
 
