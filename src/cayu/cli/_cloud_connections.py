@@ -7,10 +7,10 @@ admin changes which Agents may use one, rotates its credential or removes it.
 
 Credentials are read from files, never from the command line: `--key-file PATH` for an API key,
 `--credential FIELD=@PATH` for a field kept in a file (a private key) and `--credential
-FIELD=VALUE` only for a field that isn't secret (`account`, `user`, a GitHub App's `app_id`,
-and SAP's `base_url`, `token_url`, `client_id`, `oauth_scope`, `sap_client`). No answer ever
-holds a credential. `connections check` asks Cloud to test a connection that can be checked,
-such as SAP or a GitHub App, and prints each service's result. A GitHub App's binding names
+FIELD=VALUE` only for a one-line field that isn't secret (`account`, `user`, a GitHub App's
+`app_id`, SAP's `base_url`), as Cloud's `GET /v1/connectors` describes each connector's fields.
+No answer ever holds a credential. `connections check` asks Cloud to test a connection that can
+be checked, such as SAP or a GitHub App, and prints each service's result. A GitHub App's binding names
 the repositories its slot may call with `bind --repository OWNER/NAME` (or `OWNER/*`).
 
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
@@ -25,7 +25,8 @@ the slot's default.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -37,8 +38,9 @@ from cayu.cli._cloud_settings import _table
 _CONNECTIONS = "/v1/connections"
 #: The `connections` actions on one Agent's slots, which name the Agent with --application.
 AGENT_ACTIONS = frozenset({"bound", "bind", "unbind"})
-#: The credential fields that aren't secret, which --credential may give as FIELD=VALUE; every
-#: other field is read from a file (FIELD=@PATH).
+#: For a Cayu Cloud whose `GET /v1/connectors` doesn't describe each connector's fields (one from
+#: before it did): the credential fields that aren't secret, which --credential may give as
+#: FIELD=VALUE; every other field is read from a file (FIELD=@PATH).
 PLAIN_FIELDS = frozenset(
     {
         "account",
@@ -51,8 +53,8 @@ PLAIN_FIELDS = frozenset(
         "sap_client",
     }
 )
-#: The credential fields Cayu Cloud's connectors take; an error names only these, since anything
-#: else given as a field name may be a mistyped secret.
+#: For such a Cayu Cloud, the credential fields its connectors take; an error names only these,
+#: since anything else given as a field name may be a mistyped secret.
 KNOWN_FIELDS = PLAIN_FIELDS | {
     "api_key",
     "private_key",
@@ -75,6 +77,22 @@ CONNECTIONS_UNAVAILABLE = (
 
 class CredentialArgumentError(ValueError):
     """A credential argument names no field, or its file can't be read."""
+
+
+@dataclass(frozen=True)
+class CredentialFields:
+    """The credential fields a connection's connector takes, and those of them --credential may
+    give as FIELD=VALUE."""
+
+    known: Collection[str]
+    plain: Collection[str]
+    #: The fields that aren't secret but span lines (a PEM certificate), read from a file too.
+    multiline: Collection[str] = ()
+    #: The connector, where Cloud described its fields; None for the lists above.
+    connector: str | None = None
+
+
+_OLDER_CLOUD_FIELDS = CredentialFields(known=KNOWN_FIELDS, plain=PLAIN_FIELDS)
 
 
 def add_connections_parsers(
@@ -498,7 +516,9 @@ def _connections_action(
         payload: dict[str, object] = {"connector": arguments.connector, "name": arguments.name}
         # None given: a connector that signs in, which Cloud answers with where to approve it.
         if arguments.key_file is not None or arguments.credential is not None:
-            payload["credential"] = _credential(arguments)
+            payload["credential"] = _credential(
+                arguments, lambda: _credential_fields(client, arguments.connector)
+            )
         if arguments.scope is not None:
             payload["scopes"] = arguments.scope
         if agents is not None:
@@ -519,9 +539,11 @@ def _connections_action(
                 "PUT", f"{path}/agents", payload={"agents": None if arguments.all else agents}
             )
         elif action == "rotate":
-            result = client.request(
-                "PUT", f"{path}/credential", payload={"credential": _credential(arguments)}
+            credential = _credential(
+                arguments,
+                lambda: _credential_fields(client, client.request("GET", path).get("connector")),
             )
+            result = client.request("PUT", f"{path}/credential", payload={"credential": credential})
         else:
             client.request("DELETE", path)
             result = {"name": arguments.name, "removed": True}
@@ -571,25 +593,65 @@ def _model_slot_action(
     return {"application_id": application_id, "slot": arguments.slot, "unbound": True}
 
 
-def _credential(arguments: argparse.Namespace) -> dict[str, str]:
+def _credential_fields(client: CloudApiClient, connector: object) -> CredentialFields:
+    """The fields ``connector`` takes, as Cloud describes them; the lists above where it
+    doesn't (an older Cloud, or a connector it doesn't offer, which it then refuses)."""
+
+    listed = client.request("GET", "/v1/connectors")
+    items = listed.get("items") if isinstance(listed, dict) else None
+    spec = next(
+        (item for item in items or () if isinstance(item, dict) and item.get("id") == connector),
+        None,
+    )
+    fields = None if spec is None else spec.get("fields")
+    if not isinstance(fields, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("name"), str) for item in fields
+    ):
+        return _OLDER_CLOUD_FIELDS
+    unsecret = [item for item in fields if item.get("secret") is False]
+    return CredentialFields(
+        known=tuple(item["name"] for item in fields),
+        plain=frozenset(item["name"] for item in unsecret if item.get("multiline") is False),
+        multiline=frozenset(item["name"] for item in unsecret if item.get("multiline") is True),
+        connector=str(connector),
+    )
+
+
+def _credential(
+    arguments: argparse.Namespace, described: Callable[[], CredentialFields]
+) -> dict[str, str]:
+    """The credential the arguments give; ``described`` tells which fields it may have, asked
+    only for --credential."""
+
     if arguments.key_file is not None:
         return {"api_key": _read(arguments.key_file)}
-    fields: dict[str, str] = {}
-    for given in arguments.credential:
-        name, separator, value = given.partition("=")
+    given: list[tuple[str, str]] = []
+    for item in arguments.credential:
+        name, separator, value = item.partition("=")
         # Never repeat a malformed argument: it may be a mistyped secret.
         if not separator or not name.isidentifier() or not value:
             raise CredentialArgumentError("A credential field is FIELD=@PATH or FIELD=VALUE.")
-        shown = name if name in KNOWN_FIELDS else "FIELD"
+        given.append((name, value))
+    takes = described()
+    fields: dict[str, str] = {}
+    for name, value in given:
+        # Never repeat a field name the connector doesn't take: it may be a mistyped secret.
+        if name not in takes.known and takes.connector is not None:
+            raise CredentialArgumentError(
+                f"A credential field isn't one the {takes.connector} connector takes: "
+                f"{', '.join(takes.known) or 'it takes none'}."
+            )
+        shown = name if name in takes.known else "FIELD"
         if name in fields:
             raise CredentialArgumentError(f"The credential field {shown} is given twice.")
         if value.startswith("@"):
             fields[name] = _read(Path(value[1:]))
-        elif name in PLAIN_FIELDS:
+        elif name in takes.plain:
             fields[name] = value
         else:
+            why = "multi-line" if name in takes.multiline else "secret"
             raise CredentialArgumentError(
-                f"The credential field {shown} is secret: give it from a file, {shown}=@PATH."
+                f"The credential field {shown} is {why}: give it from a file, {shown}=@PATH."
             )
     return fields
 

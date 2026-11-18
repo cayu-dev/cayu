@@ -19,6 +19,68 @@ _CONNECTION = {"name": "team-anthropic", "connector": "anthropic", "status": "re
 _AGENTS = {"items": [{"id": "support-desk", "name": "Support desk"}]}
 
 
+def _field(
+    name: str, *, secret: bool = True, optional: bool = False, multiline: bool = False
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "title": name.replace("_", " ").capitalize(),
+        "secret": secret,
+        "optional": optional,
+        "multiline": multiline,
+        "pem": multiline,
+        "hint": None,
+    }
+
+
+_SAP_SETTINGS = [
+    _field("base_url", secret=False),
+    _field("token_url", secret=False),
+    _field("client_id", secret=False),
+    _field("client_secret"),
+    _field("oauth_scope", secret=False, optional=True),
+    _field("sap_client", secret=False, optional=True),
+    _field("ca_bundle", secret=False, optional=True, multiline=True),
+]
+#: Cloud's `GET /v1/connectors`, with each connector's credential fields.
+_CONNECTORS = {
+    "items": [
+        {"id": "anthropic", "fields": [_field("api_key")]},
+        {
+            "id": "snowflake",
+            "fields": [
+                _field("account", secret=False),
+                _field("user", secret=False),
+                _field("private_key", multiline=True),
+            ],
+        },
+        {
+            "id": "github-app",
+            "fields": [_field("app_id", secret=False), _field("private_key", multiline=True)],
+        },
+        {"id": "sap", "fields": _SAP_SETTINGS},
+        {
+            "id": "sap-certificate",
+            "fields": [
+                _field("base_url", secret=False),
+                _field("client_certificate", secret=False, multiline=True),
+                _field("client_key", multiline=True),
+                _field("sap_client", secret=False, optional=True),
+                _field("ca_bundle", secret=False, optional=True, multiline=True),
+            ],
+        },
+    ]
+}
+_LIST_CONNECTORS = ("GET", "/v1/connectors")
+
+
+def _sent(fake: Any) -> dict[str, Any]:
+    """What the command sent Cloud: its one write."""
+
+    (write,) = (request for request in fake.requests if request.method in {"POST", "PUT"})
+    return json.loads(write.content)
+
+
 def _run(arguments: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
     code = main(["cloud", *arguments])
     return code, json.loads(capsys.readouterr().out)
@@ -66,7 +128,12 @@ def test_add_reads_the_key_from_a_file_and_never_prints_it(
 def test_a_key_pair_takes_its_secret_field_from_a_file(
     cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
     private_key = tmp_path / "snowflake.p8"
     private_key.write_text("-----BEGIN PRIVATE KEY-----\n")
 
@@ -88,7 +155,7 @@ def test_a_key_pair_takes_its_secret_field_from_a_file(
     )
 
     assert code == 0
-    assert json.loads(fake.requests[0].content)["credential"] == {
+    assert _sent(fake)["credential"] == {
         "account": "acme",
         "user": "cayu",
         "private_key": "-----BEGIN PRIVATE KEY-----",
@@ -122,16 +189,145 @@ def test_an_unreadable_credential_file_asks_cloud_nothing(
 def test_a_secret_field_given_on_the_command_line_is_refused_unrepeated(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fake = cloud({})
+    fake = cloud({_LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS)})
 
-    for given in ("private_key=sk-live-secret", "sk-live-secret", "sk_live_secret=x"):
+    for given, said in (
+        ("private_key=sk-live-secret", "private_key is secret: give it from a file"),
+        ("sk-live-secret", "FIELD=@PATH or FIELD=VALUE"),
+        (
+            "sk_live_secret=x",
+            "isn't one the snowflake connector takes: account, user, private_key.",
+        ),
+    ):
         code, output = _run(
             ["connections", "add", "snowflake", "--name", "warehouse", "--credential", given],
             capsys,
         )
         assert code == 2
+        assert said in output["error"]["message"]
         assert "sk-live-secret" not in json.dumps(output)
-    assert fake.requests == []
+        assert "sk_live_secret" not in json.dumps(output)
+    # Cloud was only asked which fields the connector takes.
+    assert {(request.method, request.url.path) for request in fake.requests} == {_LIST_CONNECTORS}
+
+
+def test_a_plain_field_cloud_describes_is_taken_plain(
+    cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A connector this CLI has no list for takes the plain fields Cloud says it has."""
+
+    connectors = {
+        "items": [
+            {
+                "id": "acme",
+                "fields": [_field("region", secret=False), _field("client_secret")],
+            }
+        ]
+    }
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=connectors),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
+    secret = tmp_path / "acme-secret"
+    secret.write_text("acme-secret-value\n")
+
+    code, _ = _run(
+        [
+            "connections",
+            "add",
+            "acme",
+            "--name",
+            "acme",
+            "--credential",
+            "region=eu",
+            "--credential",
+            f"client_secret=@{secret}",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert _sent(fake)["credential"] == {"region": "eu", "client_secret": "acme-secret-value"}
+
+
+def test_an_older_cloud_without_field_descriptions_uses_the_known_fields(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    older = {"items": [{"id": "snowflake", "credential_fields": ["account", "user"]}]}
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=older),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
+
+    for given, said in (
+        ("private_key=sk-live-secret", "The credential field private_key is secret"),
+        ("sk_live_secret=x", "The credential field FIELD is secret"),
+    ):
+        code, output = _run(
+            ["connections", "add", "snowflake", "--name", "warehouse", "--credential", given],
+            capsys,
+        )
+        assert code == 2
+        assert said in output["error"]["message"]
+        assert "sk_live_secret" not in json.dumps(output)
+
+    code, _ = _run(
+        [
+            "connections",
+            "add",
+            "snowflake",
+            "--name",
+            "warehouse",
+            "--credential",
+            "account=acme",
+            "--credential",
+            "user=cayu",
+        ],
+        capsys,
+    )
+    assert code == 0
+    assert _sent(fake)["credential"] == {"account": "acme", "user": "cayu"}
+
+
+def test_rotate_reads_the_fields_of_the_connections_connector(
+    cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    warehouse = {"name": "warehouse", "connector": "snowflake", "status": "ready"}
+    fake = cloud(
+        {
+            ("GET", "/v1/connections/warehouse"): httpx.Response(200, json=warehouse),
+            _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+            ("PUT", "/v1/connections/warehouse/credential"): httpx.Response(200, json=warehouse),
+        }
+    )
+    private_key = tmp_path / "snowflake.p8"
+    private_key.write_text("key-pair-material\n")
+
+    code, _ = _run(
+        [
+            "connections",
+            "rotate",
+            "warehouse",
+            "--credential",
+            "account=acme",
+            "--credential",
+            "user=cayu",
+            "--credential",
+            f"private_key=@{private_key}",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert _sent(fake)["credential"] == {
+        "account": "acme",
+        "user": "cayu",
+        "private_key": "key-pair-material",
+    }
 
 
 def test_many_agents_are_resolved_from_one_list(
@@ -294,7 +490,12 @@ def test_a_model_slot_takes_no_repositories(cloud, capsys: pytest.CaptureFixture
 def test_a_github_app_takes_its_id_plain_and_its_key_from_a_file(
     cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
     pem = tmp_path / "app.pem"
     pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n")
 
@@ -314,7 +515,7 @@ def test_a_github_app_takes_its_id_plain_and_its_key_from_a_file(
     )
 
     assert code == 0
-    assert json.loads(fake.requests[0].content)["credential"] == {
+    assert _sent(fake)["credential"] == {
         "app_id": "123456",
         "private_key": "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
     }
@@ -472,7 +673,12 @@ def test_reconnecting_a_ready_connection_says_it_keeps_working(
 def test_an_sap_connection_takes_its_settings_plain_and_its_secrets_from_files(
     cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
     secret = tmp_path / "sap-secret"
     secret.write_text("fake-client-value\n")
     plain = {
@@ -504,23 +710,28 @@ def test_an_sap_connection_takes_its_settings_plain_and_its_secrets_from_files(
     )
 
     assert code == 0
-    sent = json.loads(fake.requests[0].content)
+    sent = _sent(fake)
     assert sent["credential"] == {**plain, "client_secret": "fake-client-value"}
     assert sent["scopes"] == ["API_BUSINESS_PARTNER.read"]
     assert "fake-client-value" not in json.dumps(output)
 
 
-def test_sap_secret_fields_given_on_the_command_line_are_refused_unrepeated(
+def test_sap_secret_and_multi_line_fields_given_plain_are_refused_unrepeated(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fake = cloud({})
+    fake = cloud({_LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS)})
 
-    for field in ("client_secret", "client_certificate", "client_key", "ca_bundle", "api_key"):
+    for connector, field in (
+        ("sap", "client_secret"),
+        ("sap", "ca_bundle"),
+        ("sap-certificate", "client_certificate"),
+        ("sap-certificate", "client_key"),
+    ):
         code, output = _run(
             [
                 "connections",
                 "add",
-                "sap-certificate",
+                connector,
                 "--name",
                 "erp",
                 "--credential",
@@ -529,15 +740,23 @@ def test_sap_secret_fields_given_on_the_command_line_are_refused_unrepeated(
             capsys,
         )
         assert code == 2
-        assert f"{field}=@PATH" in output["error"]["message"]
+        why = "secret" if field in {"client_secret", "client_key"} else "multi-line"
+        assert output["error"]["message"] == (
+            f"The credential field {field} is {why}: give it from a file, {field}=@PATH."
+        )
         assert "not-a-file-value" not in json.dumps(output)
-    assert fake.requests == []
+    assert all(request.method == "GET" for request in fake.requests)
 
 
 def test_a_certificate_connection_reads_its_pem_fields_from_files(
     cloud, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION)})
+    fake = cloud(
+        {
+            _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+            ("POST", "/v1/connections"): httpx.Response(201, json=_CONNECTION),
+        }
+    )
     files = {}
     for field in ("client_certificate", "client_key", "ca_bundle"):
         files[field] = tmp_path / f"{field}.pem"
@@ -562,7 +781,7 @@ def test_a_certificate_connection_reads_its_pem_fields_from_files(
     )
 
     assert code == 0
-    assert json.loads(fake.requests[0].content)["credential"] == {
+    assert _sent(fake)["credential"] == {
         "base_url": "https://s4.example.test",
         **{field: f"-----BEGIN TEST {field}-----" for field in files},
     }

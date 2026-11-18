@@ -2378,8 +2378,9 @@ cayu cloud connections remove warehouse
 ```
 
 Credentials come from files: `--key-file` for an API key and `--credential FIELD=@PATH` for
-any other field; `--credential FIELD=VALUE` is refused except for the fields that aren't secret
-(`account`, `user`). `--agent` and `--application` take an Agent's id or name. No result
+any other field; `--credential FIELD=VALUE` is refused except for the one-line fields that aren't
+secret, as Cayu Cloud's `GET /v1/connectors` describes each connector's fields (Snowflake's
+`account` and `user`, a GitHub App's `app_id`). `--agent` and `--application` take an Agent's id or name. No result
 prints a credential. Developers and admins add connections and bind them to an Agent's slots; a
 developer names the Agents a new connection is for with `--agent`, and an admin who names none
 makes it available to every Agent. Only an admin changes which Agents may use one (`agents`),
