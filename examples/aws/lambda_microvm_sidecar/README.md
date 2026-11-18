@@ -348,7 +348,18 @@ as two non-root containers that share no volume:
   1000, `cayu-agent`), and mounts the workspace at `/workspace`:
   `command: ["python3.11", "-m", "lambda_microvm_sidecar.executor"]` with the image's working
   directory, `/opt/cayu`. The executor spawns, feeds, drains, signals and confirms commands on
-  the supervisor's behalf and holds nothing else.
+  the supervisor's behalf and holds nothing else. It uses only the standard library (Python 3.11
+  or later), so the agent container may also run another image, such as an application's own,
+  with the executor copied into a read-only volume (for example `/opt/cayu-exec`, filled by an
+  init container from this image) and started by that image's base interpreter in isolated mode:
+  `["/usr/local/bin/python3", "-I", "-S", "-c", "import sys; sys.path.insert(0, '/opt/cayu-exec');
+  import runpy; runpy.run_module('lambda_microvm_sidecar.executor', run_name='__main__',
+  alter_sys=True)"]`. Name the base interpreter rather than `python3` from `PATH`, which may be an
+  application virtual environment whose `.pth` files would run inside the executor. Every
+  command's launcher also runs that interpreter and its standard library outside the agent
+  namespace, as the agent's UID, so neither may be writable by the agent user: keep them
+  root-owned, or set `readOnlyRootFilesystem: true`. Such an image may lack `/bin/bash`, so send
+  it process commands rather than shell commands.
 
 Set `runAsNonRoot: true`, `allowPrivilegeEscalation: false` and `capabilities: {drop: ["ALL"]}` on
 both containers, and request at least 1 GiB of memory per requested vCPU, which GKE's sandbox
@@ -371,10 +382,12 @@ read its memory or environment.
 
 The executor runs every agent command in an agent namespace: user, mount and PID namespaces it
 creates at start, whose user namespace maps only its own UID and GID and whose init mounts a
-`/proc` of its own and reaps orphans. Commands enter it through `nsenter`, which runs with only
-the default `PATH`; the command's environment is applied by `env -i` inside, so values such as
-`LD_PRELOAD` never run where they could reach the executor, and an agent command's program and
-environment names must not contain `=`. The executor stays outside, so no agent command can
+`/proc` of its own and reaps orphans. Commands enter it through a launcher that the executor's
+own interpreter runs in isolated mode with only the default `PATH`: it enters the namespaces with
+`setns`, changes to the working directory inside, and executes the command with exactly its
+environment, so values such as `LD_PRELOAD` never run where they could reach the executor. An
+agent command's environment names must not contain `=`. The executor needs only its interpreter,
+no `nsenter`, `env` or shell from the image. The executor stays outside, so no agent command can
 signal it or see it in `/proc` (a sandbox's PID 1 is not protected from `kill -9` by its own
 processes under gVisor). If an agent kills the namespace's init, every agent process dies with
 it; the executor creates a new agent namespace and draws a new boot ID. Files are untouched. A

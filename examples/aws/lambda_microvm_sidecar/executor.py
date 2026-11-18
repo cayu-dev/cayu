@@ -8,7 +8,8 @@ See ``executor_protocol`` for the transport.
 
 Agent commands run as the same user, so the executor keeps them out of its own
 PID namespace: at start it creates one user, mount and PID namespace (the agent
-namespace) and runs every command in it through ``nsenter``. No agent process
+namespace) and runs every command in it through a small launcher of its own
+interpreter (``NAMESPACE_ENTER``), so it needs no binary from the agent's image. No agent process
 can signal the executor or see it in ``/proc``. If the agent namespace's init
 dies, every agent process dies with it; the executor creates a new one and
 draws a new boot ID, so the host sees the loss. A new supervisor session
@@ -97,7 +98,6 @@ _CONNECTION_TIMEOUT_SECONDS = 30.0
 _NAMESPACE_START_TIMEOUT_SECONDS = 10.0
 _INIT_START_TIMEOUT_SECONDS = 5.0
 _PR_SET_DUMPABLE = 4
-NSENTER = "/usr/bin/nsenter"
 # The agent namespace: user, mount and PID namespaces whose user maps only the
 # executor's own UID and GID. Its init mounts a /proc of its own, reports
 # "ready" (or the error) on stdout, and reaps orphans; it dies with its launcher.
@@ -161,12 +161,87 @@ child = os.fork()
 if child == 0:
     try:
         libc.prctl(1, signal.SIGKILL)
-        os.execv(sys.executable, [sys.executable, "-I", "-c", init_source, *argv])
+        os.execv(sys.executable, [sys.executable, "-I", "-S", "-c", init_source, *argv])
     finally:
         os._exit(127)
 _, raw = os.waitpid(child, 0)
 if os.WIFSIGNALED(raw):
-    signal.signal(os.WTERMSIG(raw), signal.SIG_DFL)
+    try:
+        signal.signal(os.WTERMSIG(raw), signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass  # SIGKILL and SIGSTOP keep their default action.
+    os.kill(os.getpid(), os.WTERMSIG(raw))
+sys.exit(os.waitstatus_to_exitcode(raw))
+"""
+# Runs a command in the agent namespace as ``nsenter --target=INIT --user --mount --pid
+# --preserve-credentials --wd=CWD -- env -i -- ENV... ARGV`` would, with the interpreter alone:
+# ``INIT CWD COUNT NAME=VALUE... ARGV...``. It opens the init's namespaces before entering any
+# (the user namespace changes what it may open), enters the user, mount and PID namespaces in
+# that order, and forks, as the PID namespace applies only to children. The child changes to the
+# working directory only inside the mount namespace (busybox ``nsenter --wd`` changes it before,
+# which leaves ``getcwd`` failing) and executes the command with exactly its environment; the
+# launcher exits with the command's status or dies of its signal. Exit statuses follow nsenter and
+# env: 1 when the namespace or directory cannot be entered, 127 for a missing program, 126 for
+# one that cannot run.
+NAMESPACE_ENTER = """
+import ctypes, errno, os, signal, sys
+libc = ctypes.CDLL(None, use_errno=True)
+init, cwd, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+env = dict(item.split("=", 1) for item in sys.argv[4:4 + count])
+argv = sys.argv[4 + count:]
+try:
+    namespaces = [(name, os.open(f"/proc/{init}/ns/{name}", os.O_RDONLY)) for name in ("user", "mnt", "pid")]
+    for name, descriptor in namespaces:
+        if libc.setns(descriptor, 0) != 0:
+            raise OSError(ctypes.get_errno(), f"setns {name}")
+        os.close(descriptor)
+    child = os.fork()
+except OSError as exc:
+    print(f"cayu: cannot enter the agent namespace: {exc}", file=sys.stderr, flush=True)
+    sys.exit(1)
+if child == 0:
+    try:
+        os.chdir(cwd)
+    except OSError as exc:
+        print(f"cayu: cannot change directory to {cwd}: {exc.strerror}", file=sys.stderr, flush=True)
+        os._exit(1)
+    # The interpreter ignores these; a command starts with their default actions, as from env.
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+    # As execvp(3): a program without a slash is looked up in the command's PATH, and a file the
+    # kernel cannot execute (a script without a shebang) runs with /bin/sh.
+    if "/" in argv[0]:
+        paths = [argv[0]]
+    else:
+        paths = [os.path.join(directory, argv[0]) for directory in os.get_exec_path(env)]
+    # The search goes on past the errors execvp skips, and reports a denied file over a missing one.
+    skipped = (errno.EACCES, errno.ENOENT, errno.ESTALE, errno.ENOTDIR, errno.ENODEV, errno.ETIMEDOUT)
+    error = denied = None
+    for path in paths:
+        try:
+            try:
+                os.execve(path, argv, env)
+            except OSError as exc:
+                if exc.errno != errno.ENOEXEC:
+                    raise
+                os.execve("/bin/sh", ["/bin/sh", path, *argv[1:]], env)
+        except OSError as exc:
+            error = exc
+            if exc.errno == errno.EACCES:
+                denied = exc
+            elif exc.errno not in skipped:
+                break
+    else:
+        error = denied or error
+    print(f"{argv[0]}: {error.strerror}", file=sys.stderr, flush=True)
+    os._exit(127 if error.errno == errno.ENOENT else 126)
+_, raw = os.waitpid(child, 0)
+if os.WIFSIGNALED(raw):
+    try:
+        signal.signal(os.WTERMSIG(raw), signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass  # SIGKILL and SIGSTOP keep their default action.
     os.kill(os.getpid(), os.WTERMSIG(raw))
 sys.exit(os.waitstatus_to_exitcode(raw))
 """
@@ -181,8 +256,9 @@ class AgentNamespace:
     """The agent namespace every command runs in; see the module docstring."""
 
     def __init__(self, interpreter: str) -> None:
+        self.interpreter = interpreter
         self.process = subprocess.Popen(
-            [interpreter, "-I", "-c", NAMESPACE_HOLDER],
+            [interpreter, "-I", "-S", "-c", NAMESPACE_HOLDER],
             env={},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -198,9 +274,9 @@ class AgentNamespace:
                 raise RuntimeError("the agent namespace's init was not found")
             self.init_pid = children[0]
             # Interactive commands get a PID namespace of their own where nesting works.
-            probe = [interpreter, "-I", "-c", f"print({_PROBE_MARKER!r})"]
+            probe = [interpreter, "-I", "-S", "-c", f"print({_PROBE_MARKER!r})"]
             self.isolates_process_trees = self._prints_marker(
-                [interpreter, "-I", "-c", NAMESPACE_LAUNCHER, PID_NAMESPACE_INIT, *probe]
+                [interpreter, "-I", "-S", "-c", NAMESPACE_LAUNCHER, PID_NAMESPACE_INIT, *probe]
             )
         except BaseException:
             self.process.kill()
@@ -210,28 +286,23 @@ class AgentNamespace:
     def command(self, argv: list[str], env: dict[str, str], *, cwd: str) -> list[str]:
         """The launcher argv that runs ``argv`` in the namespace with exactly ``env``.
 
-        ``nsenter`` runs outside the namespace with ``LAUNCHER_ENVIRONMENT``, so
-        nothing from the command's environment (such as ``LD_PRELOAD``) runs
-        where it could reach the executor; ``env -i`` applies it inside.
+        The launcher runs in isolated mode (``-I -S``) with ``LAUNCHER_ENVIRONMENT``,
+        so nothing from the command's environment (such as ``LD_PRELOAD`` or
+        ``PYTHONPATH``) runs where it could reach the executor; it applies the
+        environment only when it executes the command inside.
         """
-        if "=" in argv[0]:
-            # env(1) would read the program as another NAME=VALUE assignment.
-            raise CommandRequestError("agent command program must not contain '='")
         for key in env:
             if "=" in key:
                 raise CommandRequestError("env key must not contain '='")
         return [
-            NSENTER,
-            f"--target={self.init_pid}",
-            "--user",
-            "--mount",
-            "--pid",
-            "--preserve-credentials",
-            f"--wd={cwd}",
-            "--",
-            "/usr/bin/env",
-            "-i",
-            "--",
+            self.interpreter,
+            "-I",
+            "-S",
+            "-c",
+            NAMESPACE_ENTER,
+            str(self.init_pid),
+            cwd,
+            str(len(env)),
             *(f"{key}={value}" for key, value in env.items()),
             *argv,
         ]
@@ -487,7 +558,15 @@ class Executor:
             record = _CommandRecord(command_id=identifier, payload_fingerprint=fingerprint)
             record.process_tree = cast("str", process_tree)
             if process_tree == "pid_namespace":
-                argv = [self.interpreter, "-I", "-c", NAMESPACE_LAUNCHER, PID_NAMESPACE_INIT, *argv]
+                argv = [
+                    self.interpreter,
+                    "-I",
+                    "-S",
+                    "-c",
+                    NAMESPACE_LAUNCHER,
+                    PID_NAMESPACE_INIT,
+                    *argv,
+                ]
             with self._lock:
                 namespace = self._namespace
             # Only the given environment: nothing of the executor's own reaches the command.
@@ -640,8 +719,9 @@ def _await_nested_init(
 ) -> tuple[int, str] | None:
     """Find an interactive command's namespace init, with its start time.
 
-    ``nsenter`` forks the launcher into the agent namespace, and the launcher
-    forks the init, so the init is the spawned process's grandchild.
+    The namespace launcher forks the PID-namespace launcher into the agent
+    namespace, and that forks the init, so the init is the spawned process's
+    grandchild.
     """
     deadline = time.monotonic() + timeout_s
     while process.poll() is None:

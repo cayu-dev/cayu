@@ -11,7 +11,6 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from examples.aws.lambda_microvm_sidecar import executor as executor_module
 from examples.aws.lambda_microvm_sidecar.executor import AgentNamespace, Executor, ExecutorServer
 from examples.aws.lambda_microvm_sidecar.executor_protocol import ExecutorClient, listen, peer_uid
 
@@ -23,8 +22,6 @@ def agent_namespace_unavailable() -> str | None:
     """Why this host cannot create the executor's agent namespace, or None when it can."""
     if sys.platform != "linux":
         return "the agent namespace needs Linux"
-    if not Path(executor_module.NSENTER).exists():
-        return f"the agent namespace needs {executor_module.NSENTER}"
     try:
         namespace = AgentNamespace(sys.executable)
     except (OSError, RuntimeError) as exc:

@@ -48,6 +48,10 @@ argv = sys.argv[1:]
 child = os.fork()
 if child == 0:
     try:
+        # The interpreter ignores these; the command starts with their default actions.
+        for name in ("SIGPIPE", "SIGXFSZ"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), signal.SIG_DFL)
         os.execvp(argv[0], argv)
     finally:
         os._exit(127)

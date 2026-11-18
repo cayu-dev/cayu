@@ -260,6 +260,27 @@ def test_namespace_init_runs_reaps_and_returns_the_command_status() -> None:
     assert completed.returncode == 3
 
 
+def test_namespace_init_starts_the_command_with_default_sigpipe() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            sidecar.PID_NAMESPACE_INIT,
+            "/bin/sh",
+            "-c",
+            "(yes; echo $? >&2) | head -n 1 >/dev/null",
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    # The writer of a closed pipe dies of SIGPIPE instead of seeing EPIPE.
+    assert completed.stderr.strip() == b"141"
+    assert completed.returncode == 0
+
+
 def _write_stat(root: Path, pid: int, *, state: str, ppid: int, start: str) -> None:
     fields = [state, str(ppid), *["0"] * 17, start, "0"]
     (root / str(pid)).mkdir(parents=True, exist_ok=True)

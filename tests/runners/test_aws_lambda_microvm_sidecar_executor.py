@@ -2,8 +2,8 @@
 
 Most tests serve the executor from this process. Abstract sockets, peer
 credentials, the executor's entry point and the agent namespace need Linux;
-the agent namespace also needs unprivileged user namespaces and ``nsenter``.
-Those tests skip elsewhere.
+the agent namespace also needs unprivileged user namespaces. Those tests skip
+elsewhere.
 """
 
 from __future__ import annotations
@@ -582,6 +582,196 @@ def test_the_executor_entry_point_refuses_an_unsafe_configuration(
     )
     assert refused.returncode != 0
     assert message in refused.stderr
+
+
+def test_commands_enter_the_agent_namespace_with_only_the_executor_interpreter() -> None:
+    namespace = object.__new__(executor_module.AgentNamespace)
+    namespace.interpreter = "/usr/local/bin/python3"
+    namespace.init_pid = 42
+
+    argv = namespace.command(
+        ["git", "status"], {"PATH": "/usr/bin", "A": "x=y"}, cwd="/workspace/repo"
+    )
+
+    # Isolated mode, and no nsenter, env or shell from the agent's image.
+    assert argv == [
+        "/usr/local/bin/python3",
+        "-I",
+        "-S",
+        "-c",
+        executor_module.NAMESPACE_ENTER,
+        "42",
+        "/workspace/repo",
+        "2",
+        "PATH=/usr/bin",
+        "A=x=y",
+        "git",
+        "status",
+    ]
+    with pytest.raises(CommandRequestError, match="env key"):
+        namespace.command(["true"], {"A=B": "1"}, cwd="/")
+
+
+def test_the_agent_namespace_holder_runs_without_the_interpreter_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[list[str]] = []
+
+    class Stop(Exception):
+        pass
+
+    def popen(argv: list[str], **kwargs: Any) -> None:
+        del kwargs
+        started.append(argv)
+        raise Stop
+
+    monkeypatch.setattr(executor_module.subprocess, "Popen", popen)
+    with pytest.raises(Stop):
+        executor_module.AgentNamespace("/usr/local/bin/python3")
+
+    # No .pth file of the base interpreter runs outside the agent namespace.
+    assert started == [
+        ["/usr/local/bin/python3", "-I", "-S", "-c", executor_module.NAMESPACE_HOLDER]
+    ]
+
+
+@_needs_agent_namespace
+def test_agent_commands_run_in_their_directory_with_exactly_their_environment(
+    tmp_path: Path,
+) -> None:
+    served = InProcessExecutor(tmp_path, isolate=True)
+    supervisor = _supervisor(served, tmp_path)
+    (tmp_path / "repo").mkdir()
+    script = "import os, sys; print(os.getcwd()); print(os.getuid()); sys.exit(7)"
+    try:
+        supervisor.start(
+            "cwd",
+            {
+                "kind": "process",
+                "argv": [sys.executable, "-I", "-c", script],
+                "cwd": str(tmp_path / "repo"),
+            },
+        )
+        result = _terminal(supervisor, "cwd")
+        lines = base64.b64decode(result["stdout_base64"]).decode().splitlines()
+        assert result["exit_code"] == 7
+        assert lines == [str((tmp_path / "repo").resolve()), str(os.getuid())]
+
+        supervisor.start(
+            "env",
+            {
+                "kind": "process",
+                "argv": ["env"],
+                "cwd": str(tmp_path),
+                "env": {"ONLY": "a=b", "EMPTY": ""},
+            },
+        )
+        listed = base64.b64decode(_terminal(supervisor, "env")["stdout_base64"]).decode()
+        assert sorted(listed.splitlines()) == ["EMPTY=", "ONLY=a=b", f"PATH={DEFAULT_COMMAND_PATH}"]
+
+        supervisor.start("pwd", {"kind": "process", "argv": ["pwd"], "cwd": str(tmp_path)})
+        pwd = _terminal(supervisor, "pwd")
+        assert base64.b64decode(pwd["stdout_base64"]).decode().strip() == str(tmp_path.resolve())
+
+        supervisor.start(
+            "missing", {"kind": "process", "argv": ["missing-cayu-program"], "cwd": str(tmp_path)}
+        )
+        missing = _terminal(supervisor, "missing")
+        assert missing["exit_code"] == 127
+        assert b"missing-cayu-program" in base64.b64decode(missing["stderr_base64"])
+
+        supervisor.start(
+            "signal",
+            {"kind": "process", "argv": ["sh", "-c", "kill -TERM $$"], "cwd": str(tmp_path)},
+        )
+        assert _terminal(supervisor, "signal")["exit_code"] == -signal.SIGTERM
+        supervisor.start(
+            "killed",
+            {"kind": "process", "argv": ["sh", "-c", "kill -KILL $$"], "cwd": str(tmp_path)},
+        )
+        killed = _terminal(supervisor, "killed")
+        assert killed["exit_code"] == -signal.SIGKILL
+        assert base64.b64decode(killed["stderr_base64"]) == b""
+        # Commands start with SIGPIPE at its default action, so a pipeline's writer dies of it.
+        supervisor.start(
+            "pipe",
+            {
+                "kind": "process",
+                "argv": ["sh", "-c", "(yes; echo $? >&2) | head -n 1 >/dev/null"],
+                "cwd": str(tmp_path),
+            },
+        )
+        piped = _terminal(supervisor, "pipe")
+        assert base64.b64decode(piped["stderr_base64"]).strip() == b"141"
+    finally:
+        served.close()
+
+
+@_needs_agent_namespace
+def test_agent_commands_run_scripts_without_a_shebang_with_the_shell(tmp_path: Path) -> None:
+    served = InProcessExecutor(tmp_path, isolate=True)
+    supervisor = _supervisor(served, tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "cayu-script"
+    script.write_text('echo "$0|$*|$MARK"\nexit 5\n')
+    script.chmod(0o755)
+    unexecutable = bin_dir / "cayu-unexecutable"
+    unexecutable.write_text("exit 0\n")
+    denied_dir = tmp_path / "denied"
+    denied_dir.mkdir()
+    (denied_dir / "cayu-script").write_text("exit 9\n")
+    try:
+        # As execvp(3): the file is run with /bin/sh, its path as $0, the arguments and env kept.
+        supervisor.start(
+            "direct",
+            {
+                "kind": "process",
+                "argv": [str(script), "a b", "c"],
+                "cwd": str(tmp_path),
+                "env": {"MARK": "direct"},
+            },
+        )
+        direct = _terminal(supervisor, "direct")
+        assert direct["exit_code"] == 5
+        assert base64.b64decode(direct["stdout_base64"]).decode() == f"{script}|a b c|direct\n"
+
+        supervisor.start(
+            "path",
+            {
+                "kind": "process",
+                "argv": ["cayu-script", "x"],
+                "cwd": str(tmp_path),
+                "env": {"PATH": f"{tmp_path / 'missing'}:{denied_dir}:{bin_dir}", "MARK": "path"},
+            },
+        )
+        found = _terminal(supervisor, "path")
+        assert found["exit_code"] == 5
+        assert base64.b64decode(found["stdout_base64"]).decode() == f"{script}|x|path\n"
+
+        supervisor.start(
+            "unexecutable",
+            {"kind": "process", "argv": [str(unexecutable)], "cwd": str(tmp_path)},
+        )
+        refused = _terminal(supervisor, "unexecutable")
+        assert refused["exit_code"] == 126
+        assert b"Permission denied" in base64.b64decode(refused["stderr_base64"])
+
+        # A file found but not executable is reported over the later entries that lack it.
+        supervisor.start(
+            "denied",
+            {
+                "kind": "process",
+                "argv": ["cayu-script"],
+                "cwd": str(tmp_path),
+                "env": {"PATH": f"{denied_dir}:{tmp_path / 'missing'}"},
+            },
+        )
+        denied = _terminal(supervisor, "denied")
+        assert denied["exit_code"] == 126
+        assert b"Permission denied" in base64.b64decode(denied["stderr_base64"])
+    finally:
+        served.close()
 
 
 @_needs_agent_namespace
