@@ -513,8 +513,13 @@ def build_service(*, mode):
 
     monkeypatch.setattr(logging.getLogger("uvicorn"), "handlers", [])
     monkeypatch.setattr(logging.getLogger("uvicorn"), "propagate", True)
-    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "handlers", [])
-    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "propagate", True)
+    # Captured on the logger itself, enabled and at INFO, so no logging setup an earlier test in
+    # the same worker left behind can keep the records from the test.
+    error_logger = logging.getLogger("uvicorn.error")
+    monkeypatch.setattr(error_logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(error_logger, "propagate", False)
+    monkeypatch.setattr(error_logger, "disabled", False)
+    monkeypatch.setattr(error_logger, "level", logging.INFO)
     monkeypatch.setenv(
         "_CAYU_SERVE_RELOAD", json.dumps({"root": str(tmp_path), "arguments": ["--dev"]})
     )

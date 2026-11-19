@@ -48,7 +48,7 @@ top-level commands are:
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
-- `connectors` and `connections list|show|add|authorize|check|agents|rotate|remove|bound|bind|unbind` for the
+- `connectors` and `connections list|show|add|authorize|check|activity|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents),
@@ -2485,6 +2485,24 @@ new one, to finish a pending connection, retry one in error or reconnect a ready
 prints the JSON envelope instead, with the link as the result's `authorization_url`. A connection
 that signed in shows the account it connected, for Slack the workspace, as `account` (`id` and
 `name`) in `list` and `show`.
+
+`connections activity NAME` (developers and admins) lists the calls the Organization's Agents
+made through the connection, newest first: the time, the Agent (its name, its id for one Cayu
+Cloud no longer has, or `connection check` for a call a check made), the slot, the method and
+path, the connector's status or the code Cloud refused the call with, and how long it took; never
+a query, body or credential. `--since` takes a duration back from now (`30m`, `24h`, `7d`) or a
+time with its offset (`2026-11-19T09:00:00Z`), the last 24 hours by default; `--limit N` (1-500,
+100 by default) caps a page, and when more follow the command prints the `--cursor` and the
+`--since` instant that read the page, which the next page needs so it reads the same window
+(a relative `--since` would move with the clock). `--json` prints the JSON envelope, with Cloud's
+`items`, `next_cursor`, `since`, `until` and `retention_days`. A Cayu Cloud from before paging
+answers no `next_cursor`; `--cursor` then fails with `activity_paging_unavailable` instead of
+printing the first page again. Cloud keeps each call for its install's retention,
+30 days by default, and deletes older ones.
+
+```console
+cayu cloud connections activity warehouse --since 7d --limit 50
+```
 
 An install with connections turned off doesn't serve their routes. When `cayu cloud
 connectors`, `cayu cloud connections` or `cayu cloud models` gets a plain HTTP 404, it asks

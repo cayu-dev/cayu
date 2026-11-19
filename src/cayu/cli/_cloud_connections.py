@@ -17,6 +17,11 @@ A connector that signs in (Slack) takes no credential: an admin adds it without 
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
 approves it, which these commands print.
 
+`connections activity` lists the calls Agents made through a connection, newest first, since
+`--since` (a duration such as `7d` or a time with its offset; Cloud's default is the last 24
+hours), a page at a time: the answer's `next_cursor` goes on with `--cursor`, given with the
+`--since` instant the answer names so every page reads the same window.
+
 `cayu cloud models list` shows an Agent's model slots; `connections bind SLOT --model MODEL` binds
 one to an approved model and `connections unbind SLOT --model` unbinds it, so new sessions use
 the slot's default.
@@ -25,8 +30,10 @@ the slot's default.
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -73,6 +80,15 @@ CONNECTIONS_UNAVAILABLE = (
     "This Cayu Cloud doesn't serve connections: they're turned off in this installation, or "
     "it predates them. `cayu cloud platform` shows which revision it runs."
 )
+ACTIVITY_PAGING_UNAVAILABLE = (
+    "This Cayu Cloud doesn't page a connection's activity, so --cursor can't go on: list it "
+    "without --cursor, narrowing it with --since and --limit."
+)
+
+#: The most calls one `connections activity` page asks for, as Cloud allows.
+MAX_ACTIVITY_LIMIT = 500
+_DURATION = re.compile(r"([1-9][0-9]{0,5})([mhd])")
+_DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days"}
 
 
 class CredentialArgumentError(ValueError):
@@ -105,7 +121,7 @@ def add_connections_parsers(
     )
     connections = commands.add_parser(
         "connections",
-        help="Add, list, bind, change or remove the Organization's connections.",
+        help="Add, list, bind, change or remove the Organization's connections; read their calls.",
         description=(
             "Manage the Organization's connections: its model credentials and app connectors, "
             "which Agents use through Cayu Cloud without holding the credential."
@@ -177,6 +193,41 @@ def add_connections_parsers(
     )
     rotate.add_argument("name")
     _add_credential_arguments(rotate)
+
+    activity = actions.add_parser(
+        "activity",
+        help="List the calls Agents made through a connection.",
+        description=(
+            "List the calls the Organization's Agents made through the connection, newest "
+            "first: when, which Agent and slot, the method and path, the connector's status or "
+            "why Cloud refused the call, and how long it took. Never a query, body or "
+            "credential. Cloud keeps each call for its install's retention, 30 days by default."
+        ),
+    )
+    activity.add_argument("name")
+    activity.add_argument(
+        "--since",
+        type=_since,
+        metavar="DURATION|TIME",
+        help=(
+            "Only calls since then: a duration back from now (30m, 24h, 7d) or a time with "
+            "its offset (2026-11-19T09:00:00Z). Cloud's default is the last 24 hours."
+        ),
+    )
+    activity.add_argument(
+        "--limit",
+        type=_activity_limit,
+        metavar="N",
+        help=f"At most N calls, 1-{MAX_ACTIVITY_LIMIT}. Cloud's default is 100.",
+    )
+    activity.add_argument(
+        "--cursor",
+        help="Go on after an earlier listing, from its next_cursor, with the --since it printed.",
+    )
+    activity.add_argument(
+        "--json", action="store_true", help="Print the JSON envelope instead of a table."
+    )
+    activity.set_defaults(_cloud_render=render_activity)
 
     check = actions.add_parser(
         "check",
@@ -405,6 +456,71 @@ def render_check(outcome: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_activity(outcome: Mapping[str, Any]) -> str:
+    """A connection's calls as a table, newest first, then how to read on where more follow."""
+
+    result = outcome["result"]
+    items = result.get("items") or []
+    since = result.get("since")
+    window = f" since {since}" if since else ""
+    if not items:
+        return f"No calls{window}."
+    lines = _table(
+        ("TIME", "AGENT", "SLOT", "REQUEST", "RESULT", "DURATION"),
+        [
+            (
+                str(item.get("at")),
+                _agent_cell(item),
+                str(item.get("slot")),
+                f"{item.get('method')} {item.get('path')}",
+                str(item.get("status") if item.get("status") is not None else item.get("error")),
+                f"{item.get('duration_ms')} ms",
+            )
+            for item in items
+        ],
+    )
+    lines.extend(["", f"{len(items)} {'call' if len(items) == 1 else 'calls'}{window}."])
+    cursor = result.get("next_cursor")
+    if isinstance(cursor, str):
+        # The window this page read, as an instant: a relative --since would move with the clock.
+        then = f" --since {since}" if since else ""
+        lines.append(f"More calls follow: pass --cursor {cursor}{then}.")
+    return "\n".join(lines)
+
+
+def _agent_cell(item: Mapping[str, Any]) -> str:
+    """The Agent's name, else its id; a connection check's calls (slot `check`) have none."""
+
+    if not item.get("application_id"):
+        return "connection check"
+    return str(item.get("application_name") or item.get("application_id"))
+
+
+def _since(value: str) -> str:
+    """`--since`: a duration back from now, or a time with its offset, as Cloud's RFC 3339."""
+
+    duration = _DURATION.fullmatch(value)
+    if duration:
+        back = timedelta(**{_DURATION_UNITS[duration.group(2)]: int(duration.group(1))})
+        return (datetime.now(UTC) - back).isoformat()
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        moment = None
+    if moment is None or moment.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            "give a duration such as 30m, 24h or 7d, or a time with its offset, such as "
+            "2026-11-19T09:00:00Z"
+        )
+    return moment.isoformat()
+
+
+def _activity_limit(value: str) -> int:
+    if not value.isdecimal() or not 1 <= int(value) <= MAX_ACTIVITY_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be a whole number from 1 to {MAX_ACTIVITY_LIMIT}")
+    return int(value)
+
+
 def _yes_no(value: object) -> str:
     return "unknown" if value is None else "yes" if value else "no"
 
@@ -534,6 +650,20 @@ def _connections_action(
             result = client.request("POST", f"{path}/authorize")
         elif action == "check":
             result = client.request("POST", f"{path}/check")
+        elif action == "activity":
+            query = {
+                key: str(value)
+                for key, value in (
+                    ("since", arguments.since),
+                    ("limit", arguments.limit),
+                    ("cursor", arguments.cursor),
+                )
+                if value is not None
+            }
+            result = client.request("GET", f"{path}/activity", query=query)
+            if arguments.cursor is not None and "next_cursor" not in result:
+                # A Cayu Cloud from before paging ignores the cursor and answers the first page.
+                raise _command_error("activity_paging_unavailable", ACTIVITY_PAGING_UNAVAILABLE)
         elif action == "agents":
             result = client.request(
                 "PUT", f"{path}/agents", payload={"agents": None if arguments.all else agents}

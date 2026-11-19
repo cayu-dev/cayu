@@ -37,6 +37,10 @@ _SAFE_API_ERROR_DETAILS = {
     (422, "invalid_cursor"): (
         "The cursor isn't one this listing returned; list again without --cursor."
     ),
+    (422, "invalid_time_range"): (
+        "Cayu Cloud refused the time range: give --since as a duration such as 7d or a time "
+        "with its offset, such as 2026-11-19T09:00:00Z."
+    ),
     (403, "organization_admin_required"): (
         "A signed-in organization administrator is required; run `cayu cloud login`."
     ),

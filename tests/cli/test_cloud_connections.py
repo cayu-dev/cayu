@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1026,3 +1027,201 @@ def test_a_missing_connection_is_still_reported_as_missing(
     assert code != 0
     assert output["error"]["code"] == "connection_not_found"
     assert not any(request.url.path == "/v1/connections-status" for request in fake.requests)
+
+
+class _AnyQuery(dict[tuple[str, str], Any]):
+    """Routes answered whatever query the request carries."""
+
+    def __missing__(self, key: tuple[str, str]) -> Any:
+        method, target = key
+        return self[(method, target.split("?", 1)[0])]
+
+
+_ACTIVITY = {
+    "items": [
+        {
+            "id": "call_" + "1" * 24,
+            "at": "2026-11-19T09:05:00+00:00",
+            "application_id": "sample-agent",
+            "application_name": "Sample Agent",
+            "slot": "warehouse",
+            "method": "POST",
+            "path": "/api/v2/statements",
+            "status": 200,
+            "error": None,
+            "request_bytes": 120,
+            "response_bytes": 2048,
+            "duration_ms": 231,
+        },
+        {
+            "id": "call_" + "2" * 24,
+            "at": "2026-11-19T09:00:00+00:00",
+            "application_id": "gone-agent",
+            "application_name": None,
+            "slot": "warehouse",
+            "method": "GET",
+            "path": "/api/v2/other",
+            "status": None,
+            "error": "path_not_allowed",
+            "request_bytes": 0,
+            "response_bytes": 0,
+            "duration_ms": 1,
+        },
+    ],
+    "next_cursor": "MjAyNi0xMS0xOQ==",
+    "since": "2026-11-18T09:10:00+00:00",
+    "retention_days": 30,
+}
+
+
+def test_activity_prints_the_calls_newest_first_and_how_to_read_on(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {("GET", "/v1/connections/warehouse/activity"): httpx.Response(200, json=_ACTIVITY)}
+    )
+
+    assert main(["cloud", "connections", "activity", "warehouse"]) == 0
+
+    [read] = fake.requests
+    assert (read.method, read.url.path, dict(read.url.params)) == (
+        "GET",
+        "/v1/connections/warehouse/activity",
+        {},
+    )
+    assert capsys.readouterr().out.splitlines() == [
+        "TIME                       AGENT         SLOT       REQUEST                  RESULT"
+        "            DURATION",
+        # The Agent's name, or its id for one Cloud no longer has.
+        "2026-11-19T09:05:00+00:00  Sample Agent  warehouse  POST /api/v2/statements  200"
+        "               231 ms",
+        "2026-11-19T09:00:00+00:00  gone-agent    warehouse  GET /api/v2/other        path_not_allowed"
+        "  1 ms",
+        "",
+        "2 calls since 2026-11-18T09:10:00+00:00.",
+        # The window as an instant: a relative --since would read a later one next time.
+        "More calls follow: pass --cursor MjAyNi0xMS0xOQ== --since 2026-11-18T09:10:00+00:00.",
+    ]
+
+
+def test_activity_sends_since_limit_and_cursor_and_prints_json(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        _AnyQuery(
+            {("GET", "/v1/connections/warehouse/activity"): httpx.Response(200, json=_ACTIVITY)}
+        )
+    )
+
+    code, output = _run(
+        [
+            "connections",
+            "activity",
+            "warehouse",
+            "--since",
+            "7d",
+            "--limit",
+            "2",
+            "--cursor",
+            "c1",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert output["operation"] == "connections.activity"
+    assert output["result"] == _ACTIVITY
+    [read] = fake.requests
+    sent = dict(read.url.params)
+    since = datetime.fromisoformat(sent.pop("since"))
+    assert abs(datetime.now(UTC) - timedelta(days=7) - since) < timedelta(minutes=1)
+    assert sent == {"limit": "2", "cursor": "c1"}
+
+    assert (
+        main(["cloud", "connections", "activity", "warehouse", "--since", "2026-11-19T09:00:00Z"])
+        == 0
+    )
+    assert dict(fake.requests[-1].url.params) == {"since": "2026-11-19T09:00:00+00:00"}
+
+
+def test_activity_with_no_calls_says_so(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    empty = {"items": [], "next_cursor": None, "since": "2026-11-18T09:10:00+00:00"}
+    cloud({("GET", "/v1/connections/warehouse/activity"): httpx.Response(200, json=empty)})
+
+    assert main(["cloud", "connections", "activity", "warehouse"]) == 0
+    assert capsys.readouterr().out == "No calls since 2026-11-18T09:10:00+00:00.\n"
+
+
+def test_a_connection_checks_calls_are_labelled_as_such(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checked = {
+        **_ACTIVITY["items"][0],
+        "application_id": "",
+        "application_name": None,
+        "slot": "check",
+    }
+    answer = {"items": [checked], "next_cursor": None, "since": _ACTIVITY["since"]}
+    cloud({("GET", "/v1/connections/warehouse/activity"): httpx.Response(200, json=answer)})
+
+    assert main(["cloud", "connections", "activity", "warehouse"]) == 0
+    row = capsys.readouterr().out.splitlines()[1]
+    assert row.split("  ")[1:3] == ["connection check", "check"]
+
+
+def test_activity_names_a_refused_time_range_in_words(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    refused = {"detail": {"code": "invalid_time_range", "message": "until must be after since."}}
+    cloud(
+        _AnyQuery(
+            {("GET", "/v1/connections/warehouse/activity"): httpx.Response(422, json=refused)}
+        )
+    )
+
+    code, output = _run(["connections", "activity", "warehouse", "--since", "1h"], capsys)
+
+    assert code != 0
+    assert "Cayu Cloud refused the time range: give --since" in output["error"]["message"]
+
+
+def test_activity_refuses_a_cursor_a_cloud_before_paging_would_ignore(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Such a Cloud answers only `items`, the first page again.
+    older = {"items": _ACTIVITY["items"]}
+    cloud(
+        _AnyQuery({("GET", "/v1/connections/warehouse/activity"): httpx.Response(200, json=older)})
+    )
+
+    code, output = _run(["connections", "activity", "warehouse", "--cursor", "c1"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "activity_paging_unavailable"
+    assert "doesn't page a connection's activity" in output["error"]["message"]
+
+    # Without --cursor its answer still prints.
+    assert main(["cloud", "connections", "activity", "warehouse"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "2 calls."
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--since", "yesterday"],
+        ["--since", "2026-11-19T09:00:00"],
+        ["--since", "0d"],
+        ["--limit", "0"],
+        ["--limit", "501"],
+    ],
+)
+def test_activity_refuses_a_malformed_since_or_limit_before_asking_cloud(
+    cloud, capsys: pytest.CaptureFixture[str], arguments: list[str]
+) -> None:
+    fake = cloud({})
+
+    code, output = _run(["connections", "activity", "warehouse", *arguments], capsys)
+
+    assert (code, output["error"]["category"]) == (2, "invalid_input")
+    assert fake.requests == []
