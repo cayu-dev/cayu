@@ -15,7 +15,8 @@ the repositories its slot may call with `bind --repository OWNER/NAME` (or `OWNE
 
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
-approves it, which these commands print.
+approves it, which these commands print and open. They then wait for the sign-in to come back
+to them and complete it (`_cloud_sign_in`), or, with `--no-wait`, leave it to the portal.
 
 `connections activity` lists the calls Agents made through a connection, newest first, since
 `--since` (a duration such as `7d` or a time with its offset; Cloud's default is the last 24
@@ -31,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
+import webbrowser
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,6 +44,17 @@ from urllib.parse import quote
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_settings import _table
+from cayu.cli._cloud_sign_in import (
+    DEFAULT_SIGN_IN_WAIT_SECONDS,
+    LINK_REUSED,
+    SignInLinkReused,
+    SignInLinkShared,
+    SignInMayHaveCompleted,
+    SignInReturn,
+    SignInTimedOut,
+    connected,
+    returning_state,
+)
 
 _CONNECTIONS = "/v1/connections"
 #: The `connections` actions on one Agent's slots, which name the Agent with --application.
@@ -113,6 +127,8 @@ _OLDER_CLOUD_FIELDS = CredentialFields(known=KNOWN_FIELDS, plain=PLAIN_FIELDS)
 
 def add_connections_parsers(
     commands: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    seconds: Callable[[str], float],
 ) -> None:
     commands.add_parser(
         "connectors",
@@ -153,7 +169,7 @@ def add_connections_parsers(
             "Add a connection to CONNECTOR under --name. A developer names the Agents that may "
             "use it with --agent; an admin who names none makes it available to every Agent. "
             "A connector that signs in (slack) takes no credential and only an admin adds it: "
-            "the command prints the link where you approve it."
+            "the command opens the link where you approve it and waits until it is connected."
         ),
     )
     add.add_argument("connector", help="The connector, from `cayu cloud connectors`.")
@@ -163,18 +179,19 @@ def add_connections_parsers(
         "--scope", action="append", help="A scope it may hold; repeat. None: all it can hold."
     )
     add.add_argument("--agent", action="append", help="An Agent that may use it; repeat for each.")
-    _add_sign_in_output(add)
+    _add_sign_in_output(add, seconds)
 
     authorize = actions.add_parser(
         "authorize",
         help="Start a connection's sign-in again (admins).",
         description=(
             "Start the sign-in of a connection that signs in again: to finish a pending one, "
-            "retry one in error, or reconnect a ready one. Prints a new link where you approve it."
+            "retry one in error, or reconnect a ready one. Opens a new link where you approve "
+            "it and waits until it is connected."
         ),
     )
     authorize.add_argument("name")
-    _add_sign_in_output(authorize)
+    _add_sign_in_output(authorize, seconds)
 
     agents = actions.add_parser(
         "agents",
@@ -339,19 +356,60 @@ def _add_credential_arguments(parser: argparse.ArgumentParser, *, required: bool
     )
 
 
-def _add_sign_in_output(parser: argparse.ArgumentParser) -> None:
+def _add_sign_in_output(parser: argparse.ArgumentParser, seconds: Callable[[str], float]) -> None:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Print the JSON envelope, with the link as the result's authorization_url.",
+        help=(
+            "Print the JSON envelope: the connected connection, or with --no-wait the link as "
+            "the result's authorization_url."
+        ),
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help=(
+            "Print the link and return: the portal finishes the sign-in, in a browser signed in "
+            "to it as you. For scripts, or a terminal on another machine than the browser."
+        ),
+    )
+    parser.add_argument(
+        "--wait-seconds",
+        type=seconds,
+        default=DEFAULT_SIGN_IN_WAIT_SECONDS,
+        help="How long to wait for the sign-in to come back (default: 600, as long as a link works).",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true", help="Print the link without opening a browser."
+    )
+    parser.add_argument(
+        "--port",
+        type=_loopback_port,
+        help=(
+            "The port on 127.0.0.1 to wait on (default: any free one), for example one forwarded "
+            "with `ssh -L PORT:127.0.0.1:PORT` from the computer with the browser."
+        ),
     )
     parser.set_defaults(_cloud_render=render_sign_in)
 
 
+def _loopback_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        port = 0
+    if not 1024 <= port <= 65535:
+        raise argparse.ArgumentTypeError("must be a port from 1024 to 65535")
+    return port
+
+
 def render_sign_in(outcome: Mapping[str, Any]) -> str | None:
-    """A started sign-in as text: the link to open. Any other result has no text form."""
+    """A sign-in as text: the connection it connected, or, for one left to the portal, the link
+    to open. Any other result has no text form."""
 
     result = outcome["result"]
+    if outcome.get("sign_in") == "completed":
+        return connected(result)
     url = result.get("authorization_url")
     if not isinstance(url, str):
         return None
@@ -639,6 +697,16 @@ def _connections_action(
             payload["scopes"] = arguments.scope
         if agents is not None:
             payload["agents"] = agents
+        if "credential" not in payload and not arguments.no_wait:
+            return _signed_in(
+                arguments,
+                client,
+                lambda port: client.request(
+                    "POST",
+                    _CONNECTIONS,
+                    payload=payload if port is None else {**payload, "return_port": port},
+                ),
+            )
         result = client.request("POST", _CONNECTIONS, payload=payload)
     elif action in AGENT_ACTIONS:
         result = _agent_action(arguments, client, application_id)
@@ -646,6 +714,16 @@ def _connections_action(
         path = f"{_CONNECTIONS}/{quote(arguments.name, safe='')}"
         if action == "show":
             result = client.request("GET", path)
+        elif action == "authorize" and not arguments.no_wait:
+            return _signed_in(
+                arguments,
+                client,
+                lambda port: client.request(
+                    "POST",
+                    f"{path}/authorize",
+                    payload=None if port is None else {"return_port": port},
+                ),
+            )
         elif action == "authorize":
             result = client.request("POST", f"{path}/authorize")
         elif action == "check":
@@ -679,6 +757,111 @@ def _connections_action(
             result = {"name": arguments.name, "removed": True}
     kind = "models" if action in {"bind", "unbind"} and arguments.model else "connections"
     return {"operation": f"{kind}.{action}", "result": result}
+
+
+def _signed_in(
+    arguments: argparse.Namespace,
+    client: CloudApiClient,
+    start: Callable[[int | None], dict[str, Any]],
+) -> dict[str, Any]:
+    """Start a sign-in that returns to this command (``start`` with its loopback port), wait for
+    it, and complete it: the connected connection. Stopping leaves the connection `pending`.
+
+    A Cayu Cloud from before command-line sign-ins either refuses the port before creating
+    anything (``start`` again without it) or ignores it: then the link it answered is printed
+    to finish in the portal, as with --no-wait."""
+
+    operation = f"connections.{arguments.connections_command}"
+    try:
+        opened = SignInReturn(arguments.port or 0)
+    except OSError:
+        raise _command_error(
+            "sign_in_port_unavailable",
+            f"Can't listen on 127.0.0.1:{arguments.port} for the sign-in; it is in use or not "
+            "allowed. Choose another with --port, or leave it out for any free port.",
+        ) from None
+    with opened as listener:
+        try:
+            started = start(listener.port)
+        except CloudApiError as exc:
+            if not _return_port_refused(exc):
+                raise
+            started = start(None)
+        url = started["authorization_url"]
+        state = returning_state(url, listener.port)
+        if state is None:
+            print(_PORTAL_ONLY, file=sys.stderr)
+            return {"operation": operation, "result": started}
+        name = started["name"]
+        again = f"cayu cloud connections authorize {name}"
+        link = listener.opening(url)
+        print(
+            f"Approve {name} in your browser; this command finishes connecting it. If no "
+            f"browser opens, open this link on this computer:\n\n  {link}\n",
+            file=sys.stderr,
+        )
+        if not arguments.no_browser:
+            webbrowser.open(link)
+        print(
+            f"Waiting for the sign-in on 127.0.0.1:{listener.port}. Ctrl-C stops waiting.",
+            file=sys.stderr,
+        )
+        try:
+            result = listener.wait(
+                state=state,
+                finish=lambda returned: client.request(
+                    "POST", f"{_CONNECTIONS}/sign-in/complete", payload={**returned}
+                ),
+                seconds=arguments.wait_seconds,
+            )
+        except SignInTimedOut:
+            raise _command_error(
+                "sign_in_timed_out",
+                f"The sign-in didn't come back in time. {name} stays as it was; for a new link: "
+                f"{again}",
+            ) from None
+        except SignInLinkReused:
+            raise _command_error("sign_in_link_reused", LINK_REUSED) from None
+        except SignInLinkShared as shared:
+            account = shared.connection.get("account")
+            workspace = account.get("name") if isinstance(account, Mapping) else None
+            raise _command_error(
+                "sign_in_link_shared",
+                f"{name} was connected, but another browser also opened its sign-in link, so it "
+                f"may be connected to someone else's workspace ({workspace or 'unknown'}). Check "
+                f"it with `cayu cloud connections show {name}`; if it isn't yours, remove it and "
+                "connect again from a computer only you use.",
+            ) from None
+        except SignInMayHaveCompleted:
+            raise _command_error(
+                "sign_in_interrupted",
+                f"Stopped while the sign-in was being completed: {name} may be connected. "
+                f"Check with cayu cloud connections show {name}.",
+            ) from None
+        except KeyboardInterrupt:
+            raise _command_error(
+                "sign_in_interrupted",
+                f"Stopped waiting. {name} stays as it was; for a new link: {again}",
+            ) from None
+    return {"operation": operation, "result": result, "sign_in": "completed"}
+
+
+_PORTAL_ONLY = (
+    "This Cayu Cloud can't finish a sign-in from the terminal: finish it in the portal as below."
+)
+
+
+def _return_port_refused(exc: CloudApiError) -> bool:
+    """Whether Cloud refused the request only for naming a return port (one from before
+    command-line sign-ins, which refuses fields it doesn't know before acting)."""
+
+    errors = exc.body.get("errors") if exc.status_code == 422 and exc.body else None
+    return (
+        exc.code == "invalid_request"
+        and isinstance(errors, list)
+        and len(errors) > 0
+        and all(isinstance(item, dict) and item.get("loc") == ["return_port"] for item in errors)
+    )
 
 
 def _agent_action(

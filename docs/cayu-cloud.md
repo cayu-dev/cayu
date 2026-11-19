@@ -2469,22 +2469,67 @@ cayu cloud connections check triage-app
 ```
 
 A connector that signs in, such as Slack where the install has its Slack app, takes no
-credential: an admin adds it, and the command prints the link where the connection is approved.
+credential: an admin adds it, and the command opens the link where the connection is approved
+and waits until it is connected.
 
 ```console
-cayu cloud connections add slack --name eng-slack --scope chat:write --scope channels:read
-cayu cloud connections authorize eng-slack
+cayu cloud connections add slack --name example-slack --scope chat:write --scope channels:read
+cayu cloud connections authorize example-slack
 ```
 
-Open the link in a browser where you're signed in to the Cayu Cloud portal as the same person, in
-the same Organization, that started it (the admin who ran the command), and approve it; the
-portal then finishes connecting it. Anyone else's portal refuses it (`sign_in_not_yours`). The connection is `pending`
-until then, and `error` if the sign-in fails, with the reason in `error` (for example
-`access_denied` or `state_expired`). A link works once, within 10 minutes: `authorize` prints a
-new one, to finish a pending connection, retry one in error or reconnect a ready one. `--json`
-prints the JSON envelope instead, with the link as the result's `authorization_url`. A connection
-that signed in shows the account it connected, for Slack the workspace, as `account` (`id` and
+Approve it in the browser that opens (or open the printed link,
+`http://127.0.0.1:<port>/cayu-cloud/sign-in/start?k=<secret>`, on the same computer); you don't
+need to be signed in to the Cayu Cloud portal there. Slack sends the browser back to the portal,
+which sends it on to the command, listening on a loopback port (`127.0.0.1`) for the sign-in it
+started and no other. The command completes the sign-in as you and prints the connection and the
+account it connected, for Slack the workspace (`example-slack is connected to Example
+Workspace.`); the browser tab says the same and can be closed. `--json` prints the JSON envelope
+instead, with the connection as `result` and `"sign_in": "completed"`. If the sign-in fails, the
+command exits with Cloud's reason as the error's `code` (for example `access_denied` when the
+approval was refused, `state_expired`, or `account_changed` for another workspace than the
+connection's); a new connection is then `error`, with that reason in `error`, and a ready one
+keeps working.
+
+The command waits up to `--wait-seconds` (600, as long as a link works), on any free port unless
+`--port` names one (`sign_in_port_unavailable` if it is in use); the waiting message names it.
+`--no-browser` only prints that link. When the time is up (`sign_in_timed_out`) or you press
+Ctrl-C (`sign_in_interrupted`), the connection stays as it was, `pending` for a new one;
+`authorize` starts again with a new link, to finish a pending connection, retry one in error or
+reconnect a ready one, which keeps working meanwhile. No output prints the code Slack sends
+back, and the browser ends on a page (`/cayu-cloud/sign-in/done`) whose address holds neither
+the code nor the state.
+
+On a terminal on another computer than the browser, such as over SSH, the browser's `127.0.0.1`
+isn't the command's: forward a port and name it, `ssh -L 8765:127.0.0.1:8765 host` and then `cayu
+cloud connections add slack --name example-slack --port 8765 --no-browser`, and open the printed
+link in your browser. Or use `--no-wait`, which prints Slack's approval link and returns at once,
+also for scripts. Then open that link in a browser where you're signed in to the Cayu Cloud portal
+as the same person, in the same Organization, that started it, and approve it; the portal finishes
+connecting it. Anyone else's portal refuses it (`sign_in_not_yours`). With `--json` the link is
+the result's `authorization_url`. A Cayu Cloud from before command-line sign-ins can't finish one
+from the terminal: a waiting command says so and prints its link to finish in the portal, as with
+`--no-wait`. A connection that signed in shows the account it connected as `account` (`id` and
 `name`) in `list` and `show`.
+
+A waiting command never prints or opens the sign-in's state, and `--json` doesn't carry it
+either. The state leaves the command only through the start page, and only to a visit with the
+start link's secret (`k`), which is shown only in your terminal; a visit without it gets "Not
+this sign-in's link." and changes nothing, so finding the port is not enough. The first visit
+with the secret is sent on to Slack's approval link with a one-time cookie for `127.0.0.1`, and
+the command takes the sign-in back only from the browser carrying that cookie, refusing any
+other (the wait goes on). A second visit with the secret means someone else has the link: if no
+sign-in has come back yet, the command stops at once with `sign_in_link_reused` ("Another
+browser opened this sign-in's link, so the command stopped. Nothing was connected. Run it
+again."); if one already has, it can't be undone, and the command fails with
+`sign_in_link_shared`, saying the connection may be connected to someone else's workspace and
+to check it with `cayu cloud connections show NAME`, and remove it and connect again from a
+computer only you use if it isn't yours.
+
+With `--no-browser` (and over SSH) only you have the link. When the command opens the browser
+itself, other users of a shared Linux host can read the browser command's arguments, as with
+any command-line sign-in that opens one (`gh auth login`, `gcloud auth login`), and so the link.
+On a shared host use `--no-browser`, or `--no-wait` and finish in the portal, where only your
+own session completes it.
 
 `connections activity NAME` (developers and admins) lists the calls the Organization's Agents
 made through the connection, newest first: the time, the Agent (its name, its id for one Cayu

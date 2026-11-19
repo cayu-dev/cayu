@@ -180,6 +180,18 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "scope_not_allowed"),
         (422, "scope_required"),
         (422, "too_many_agents"),
+        # `connections add|authorize`: why a sign-in that came back to the command didn't connect.
+        (403, "sign_in_not_yours"),
+        (404, "connection_removed"),
+        (404, "sign_in_unavailable"),
+        (404, "state_unknown"),
+        (409, "access_denied"),
+        (409, "account_changed"),
+        (409, "exchange_failed"),
+        (409, "state_expired"),
+        (409, "state_reused"),
+        (422, "invalid_request"),
+        (422, "return_port_invalid"),
         # `cayu cloud models` and `connections bind --model`: why Cloud refused a model slot.
         (409, "model_not_approved"),
         (409, "models_unavailable"),

@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import _thread
+import contextlib
 import json
+import re
+import socket
+import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import httpx
 import pytest
 from tests.cli.test_cloud_api_keys import cloud as _cloud
 
-from cayu.cli import main
+from cayu.cli import _cloud_connections, _cloud_sign_in, main
 
 cloud = _cloud
 
@@ -546,7 +557,7 @@ def test_a_refused_removal_reports_clouds_reason(cloud, capsys: pytest.CaptureFi
 
 
 _SIGN_IN = {
-    "name": "eng-slack",
+    "name": "example-slack",
     "connector": "slack",
     "status": "pending",
     "account": None,
@@ -561,19 +572,29 @@ def test_add_without_a_credential_prints_where_to_approve_it(
     fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
 
     code = main(
-        ["cloud", "connections", "add", "slack", "--name", "eng-slack", "--scope", "chat:write"]
+        [
+            "cloud",
+            "connections",
+            "add",
+            "slack",
+            "--name",
+            "example-slack",
+            "--scope",
+            "chat:write",
+            "--no-wait",
+        ]
     )
 
     assert code == 0
     assert json.loads(fake.requests[-1].content) == {
         "connector": "slack",
-        "name": "eng-slack",
+        "name": "example-slack",
         "scopes": ["chat:write"],
     }
     printed = capsys.readouterr().out
     assert "  https://slack.com/oauth/v2/authorize?state=abc\n" in printed
     assert "signed in to the Cayu Cloud portal as the same person" in " ".join(printed.split())
-    assert "cayu cloud connections authorize eng-slack" in printed
+    assert "cayu cloud connections authorize example-slack" in printed
 
 
 def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
@@ -581,7 +602,9 @@ def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
 ) -> None:
     cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
 
-    code, output = _run(["connections", "add", "slack", "--name", "eng-slack", "--json"], capsys)
+    code, output = _run(
+        ["connections", "add", "slack", "--name", "example-slack", "--json", "--no-wait"], capsys
+    )
 
     assert code == 0
     assert output["operation"] == "connections.add"
@@ -591,17 +614,19 @@ def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
 def test_authorize_prints_a_new_link(cloud, capsys: pytest.CaptureFixture[str]) -> None:
     fake = cloud(
         {
-            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+            ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 200, json={**_SIGN_IN, "authorization_url": "https://slack.com/new"}
             )
         }
     )
 
-    assert main(["cloud", "connections", "authorize", "eng-slack"]) == 0
+    assert main(["cloud", "connections", "authorize", "example-slack", "--no-wait"]) == 0
     assert fake.requests[-1].content == b""
     assert "  https://slack.com/new\n" in capsys.readouterr().out
 
-    code, output = _run(["connections", "authorize", "eng-slack", "--json"], capsys)
+    code, output = _run(
+        ["connections", "authorize", "example-slack", "--json", "--no-wait"], capsys
+    )
     assert code == 0
     assert output["operation"] == "connections.authorize"
     assert output["result"]["authorization_url"] == "https://slack.com/new"
@@ -610,7 +635,7 @@ def test_authorize_prints_a_new_link(cloud, capsys: pytest.CaptureFixture[str]) 
 def test_a_refused_sign_in_reports_clouds_reason(cloud, capsys: pytest.CaptureFixture[str]) -> None:
     cloud(
         {
-            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+            ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 403,
                 json={
                     "detail": {
@@ -622,10 +647,858 @@ def test_a_refused_sign_in_reports_clouds_reason(cloud, capsys: pytest.CaptureFi
         }
     )
 
-    code, output = _run(["connections", "authorize", "eng-slack"], capsys)
+    code, output = _run(["connections", "authorize", "example-slack", "--no-wait"], capsys)
 
     assert code != 0
     assert output["error"]["code"] == "admin_required"
+
+
+_STATE = "s" * 43
+_READY = {
+    **{key: value for key, value in _SIGN_IN.items() if key != "authorization_url"},
+    "status": "ready",
+    "account": {"id": "T0123", "name": "Example Workspace"},
+}
+_COMPLETE = ("POST", "/v1/connections/sign-in/complete")
+
+
+def _returning(request: httpx.Request, *, status: int = 201) -> httpx.Response:
+    """Cloud's answer to a sign-in that returns to the command: a state ending in its port."""
+
+    port = json.loads(request.content)["return_port"]
+    url = f"https://slack.com/oauth/v2/authorize?state={_STATE}.{port}"
+    return httpx.Response(status, json={**_SIGN_IN, "authorization_url": url})
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _status(opener: Any, url: str, cookie: str = "") -> tuple[int, str]:
+    try:
+        request = Request(url, headers={"Cookie": cookie} if cookie else {})
+        with opener.open(request, timeout=10) as answer:
+            return answer.status, answer.headers.get("Location", "")
+    except HTTPError as refused:
+        return refused.code, refused.headers.get("Location", "")
+    except URLError:
+        # Nothing listens any more: the command already stopped.
+        return 0, ""
+
+
+def _begin(start: str) -> tuple[str, str]:
+    """What a browser opening the command's start page gets: the sign-in's state, from the
+    approval page it is sent on to, and the cookie it then carries back (``name=value``)."""
+
+    try:
+        with _NOT_FOLLOWING.open(start, timeout=10) as answer:
+            headers = answer.headers
+    except HTTPError as redirected:
+        headers = redirected.headers
+    approval = headers["Location"]
+    cookie = headers["Set-Cookie"].split(";")[0]
+    return parse_qs(urlsplit(approval).query)["state"][0], cookie
+
+
+class _Browser:
+    """The browser and the portal: given the link, it opens the command's start page, then comes
+    back to the command's loopback port once for each visit, ``visit(state)`` naming the path
+    and the query (and, as a third item, False to come back without the start page's cookie)."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *visits: Callable[[str], tuple[Any, ...]],
+    ) -> None:
+        self.visits = visits
+        self.answers: list[tuple[int, str]] = []
+        #: Where each visit ended, after any redirect: what the address bar shows.
+        self.addresses: list[str] = []
+        self.opened: list[str] = []
+        self.thread: threading.Thread | None = None
+        monkeypatch.setattr(_cloud_connections.webbrowser, "open", self.open)
+
+    def open(self, url: str) -> bool:
+        self.opened.append(url)
+        self.thread = threading.Thread(target=self._return, args=(url,), daemon=True)
+        self.thread.start()
+        return True
+
+    def _return(self, url: str) -> None:
+        # The command's own start page sends the browser on to the approval page.
+        try:
+            state, cookie = _begin(url)
+        except URLError:
+            return
+        port = _port_of(url)
+        for visit in self.visits:
+            path, query, *carried = visit(state)
+            headers = {"Cookie": cookie} if carried != [False] else {}
+            address = f"http://127.0.0.1:{port}{path}?{urlencode(query)}"
+            try:
+                with _DIRECT.open(Request(address, headers=headers)) as answer:
+                    self.answers.append((answer.status, answer.read().decode()))
+                    self.addresses.append(answer.geturl())
+            except HTTPError as refused:
+                self.answers.append((refused.code, refused.read().decode()))
+                self.addresses.append(refused.geturl())
+            except URLError:
+                # The command stopped listening (Ctrl-C) before the browser came back.
+                self.answers.append((0, ""))
+
+    def joined(self) -> list[tuple[int, str]]:
+        assert self.thread is not None
+        self.thread.join(timeout=10)
+        return self.answers
+
+
+_RETURN = "/cayu-cloud/sign-in"
+_DIRECT = build_opener(ProxyHandler({}))
+#: A browser that shows where a redirect goes instead of following it.
+_NOT_FOLLOWING = build_opener(ProxyHandler({}), _NoRedirect)
+
+
+def test_add_waits_for_the_sign_in_and_completes_only_its_own_state(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections"): _returning,
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    browser = _Browser(
+        monkeypatch,
+        lambda state: ("/elsewhere", {"state": state, "code": "the-code"}),
+        lambda state: (_RETURN, {"state": f"{_STATE}.1", "code": "the-code"}),
+        lambda state: (_RETURN, {"state": state}),
+        lambda state: (_RETURN, {"state": state, "code": "the-code"}),
+    )
+
+    code = main(["cloud", "connections", "add", "slack", "--name", "example-slack"])
+
+    assert code == 0
+    started = json.loads(fake.requests[0].content)
+    assert started == {
+        "connector": "slack",
+        "name": "example-slack",
+        "return_port": started["return_port"],
+    }
+    state = f"{_STATE}.{started['return_port']}"
+    # Only the state it started, once, with what came back and nothing else.
+    completions = [request for request in fake.requests if request.url.path == _COMPLETE[1]]
+    assert [json.loads(request.content) for request in completions] == [
+        {"state": state, "code": "the-code"}
+    ]
+    answers = browser.joined()
+    assert [status for status, _text in answers] == [400, 400, 400, 200]
+    assert (
+        "example-slack is connected to Example Workspace. You can close this tab." in answers[-1][1]
+    )
+    # The browser ends on a page whose address holds neither the code nor the state.
+    port = started["return_port"]
+    ended = urlsplit(browser.addresses[-1])
+    assert (ended.netloc, ended.path) == (f"127.0.0.1:{port}", "/cayu-cloud/sign-in/done")
+    assert set(parse_qs(ended.query)) == {"t"}
+    printed = capsys.readouterr()
+    assert printed.out == "example-slack is connected to Example Workspace.\n"
+    assert f"Waiting for the sign-in on 127.0.0.1:{port}." in printed.err
+    # The browser is opened, and the link printed, at the command's start page with its own
+    # secret: no state.
+    (opened,) = browser.opened
+    start = urlsplit(opened)
+    assert (start.netloc, start.path) == (f"127.0.0.1:{port}", "/cayu-cloud/sign-in/start")
+    (key,) = parse_qs(start.query)["k"]
+    assert len(key) >= 43
+    assert f"  {opened}\n" in printed.err
+    for secret in (state, _STATE, "the-code"):
+        assert secret not in printed.out + printed.err + opened
+    # The start page's secret never goes to Cloud.
+    for request in fake.requests:
+        assert key not in str(request.url) + request.content.decode()
+
+
+def test_authorize_waits_and_json_prints_the_connected_connection(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    _Browser(monkeypatch, lambda state: (_RETURN, {"state": state, "code": "the-code"}))
+
+    code, output = _run(["connections", "authorize", "example-slack", "--json"], capsys)
+
+    assert code == 0
+    assert set(json.loads(fake.requests[0].content)) == {"return_port"}
+    assert (output["operation"], output["result"], output["sign_in"]) == (
+        "connections.authorize",
+        _READY,
+        "completed",
+    )
+
+
+def test_a_refused_approval_reports_clouds_reason_to_the_browser_and_the_terminal(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(
+                409,
+                json={"detail": {"code": "access_denied", "message": "The person refused."}},
+            ),
+        }
+    )
+    browser = _Browser(
+        monkeypatch, lambda state: (_RETURN, {"state": state, "error": "access_denied"})
+    )
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "access_denied"
+    assert json.loads(fake.requests[-1].content)["error"] == "access_denied"
+    ((status, text),) = browser.joined()
+    assert status == 200, text
+    assert text == "Couldn't connect (access_denied). See your terminal for more.\n"
+
+
+def test_waiting_stops_after_its_time_and_leaves_the_connection_as_it_was(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200)}
+    )
+    browser = _Browser(monkeypatch)
+
+    code = main(
+        [
+            "cloud",
+            "connections",
+            "authorize",
+            "example-slack",
+            "--no-browser",
+            "--wait-seconds",
+            "0.2",
+        ]
+    )
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_timed_out"
+    assert "cayu cloud connections authorize example-slack" in output["error"]["message"]
+    assert browser.opened == []
+    # Without a browser the link to open is still the start page, never the state.
+    printed = captured.err
+    assert re.search(r"  http://127\.0\.0\.1:\d+/cayu-cloud/sign-in/start\?k=[\w-]{43}\n", printed)
+    assert _STATE not in printed
+    assert [request.url.path for request in fake.requests] == [
+        "/v1/connections/example-slack/authorize"
+    ]
+
+
+def test_ctrl_c_stops_waiting_and_says_how_to_go_on(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200)})
+    _Browser(monkeypatch)
+
+    def interrupted(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_cloud_sign_in.SignInReturn, "wait", interrupted)
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_interrupted"
+    assert "cayu cloud connections authorize example-slack" in output["error"]["message"]
+
+
+def test_authorize_on_a_cloud_that_ignores_the_port_prints_its_link_for_the_portal(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({("POST", "/v1/connections/example-slack/authorize"): httpx.Response(200, json=_SIGN_IN)})
+    browser = _Browser(monkeypatch)
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+
+    printed = capsys.readouterr()
+    assert "can't finish a sign-in from the terminal" in printed.err
+    assert "  https://slack.com/oauth/v2/authorize?state=abc\n" in printed.out
+    assert "signed in to the Cayu Cloud portal as the same person" in " ".join(printed.out.split())
+    assert browser.opened == []
+
+
+def test_add_on_a_cloud_that_refuses_the_port_adds_it_again_for_the_portal(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def older(request: httpx.Request) -> httpx.Response:
+        if "return_port" in json.loads(request.content):
+            refusal = {
+                "code": "invalid_request",
+                "message": "The request doesn't have the shape this route takes.",
+                "errors": [{"loc": ["return_port"], "msg": "Extra inputs are not permitted"}],
+            }
+            return httpx.Response(422, json={"detail": refusal})
+        return httpx.Response(201, json=_SIGN_IN)
+
+    fake = cloud({("POST", "/v1/connections"): older})
+    _Browser(monkeypatch)
+
+    code, output = _run(
+        ["connections", "add", "slack", "--name", "example-slack", "--json"], capsys
+    )
+
+    assert code == 0
+    assert output["result"] == _SIGN_IN
+    assert [set(json.loads(request.content)) for request in fake.requests] == [
+        {"connector", "name", "return_port"},
+        {"connector", "name"},
+    ]
+
+
+def test_another_invalid_request_is_not_taken_for_an_older_cloud(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refusal = {
+        "code": "invalid_request",
+        "message": "The request doesn't have the shape this route takes.",
+        "errors": [{"loc": ["scopes", 0], "msg": "String should have at most 128 characters"}],
+    }
+    fake = cloud({("POST", "/v1/connections"): httpx.Response(422, json={"detail": refusal})})
+    _Browser(monkeypatch)
+
+    code, output = _run(["connections", "add", "slack", "--name", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "invalid_request"
+    assert len(fake.requests) == 1
+
+
+def test_an_idle_connection_doesnt_hold_the_command_past_its_wait(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200)})
+    idle: list[socket.socket] = []
+
+    def preconnect(url: str) -> bool:
+        port = _port_of(url)
+        idle.append(socket.create_connection(("127.0.0.1", port)))
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", preconnect)
+    began = time.monotonic()
+
+    code, output = _run(
+        ["connections", "authorize", "example-slack", "--wait-seconds", "0.5"], capsys
+    )
+
+    assert time.monotonic() - began < 5
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_timed_out"
+    assert len(idle) == 1
+    idle[0].close()
+
+
+def _port_of(url: str) -> int:
+    """The command's loopback port, from the start page the browser is opened at."""
+
+    port = urlsplit(url).port
+    assert port is not None
+    return port
+
+
+def test_an_idle_connection_doesnt_delay_the_approval(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    idle: list[socket.socket] = []
+    took: list[float] = []
+
+    def approve(url: str) -> bool:
+        port = _port_of(url)
+        # A browser's preconnect: open, and nothing sent.
+        idle.append(socket.create_connection(("127.0.0.1", port)))
+
+        def come_back() -> None:
+            state, cookie = _begin(url)
+            time.sleep(0.2)
+            began = time.monotonic()
+            query = urlencode({"state": state, "code": "the-code"})
+            address = f"http://127.0.0.1:{port}{_RETURN}?{query}"
+            with _DIRECT.open(Request(address, headers={"Cookie": cookie})) as answer:
+                answer.read()
+            took.append(time.monotonic() - began)
+
+        threading.Thread(target=come_back, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", approve)
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+    assert len(took) == 1
+    assert took[0] < 1
+    idle[0].close()
+
+
+def test_a_trickling_connection_cant_hold_the_command_past_its_wait(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200)})
+    cut: list[float] = []
+
+    def trickle(url: str) -> bool:
+        port = _port_of(url)
+
+        def send() -> None:
+            began = time.monotonic()
+            with socket.create_connection(("127.0.0.1", port)) as connection:
+                try:
+                    for byte in b"GET /cayu-cloud/sign-in?state=" + b"x" * 100:
+                        connection.sendall(bytes([byte]))
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+            cut.append(time.monotonic() - began)
+
+        threading.Thread(target=send, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", trickle)
+    began = time.monotonic()
+
+    code, output = _run(
+        ["connections", "authorize", "example-slack", "--wait-seconds", "1"], capsys
+    )
+
+    assert time.monotonic() - began < 2
+    assert output["error"]["category"] == "sign_in_timed_out"
+    assert code != 0
+    # Its connection is cut once its time is up, not kept while it trickles on.
+    deadline = time.monotonic() + 3
+    while not cut and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert cut and cut[0] < 2.5
+
+
+def test_two_callbacks_at_once_complete_the_sign_in_once(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slowly(_request: httpx.Request) -> httpx.Response:
+        time.sleep(0.3)
+        return httpx.Response(200, json=_READY)
+
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: slowly,
+        }
+    )
+    answers: list[int] = []
+    lock = threading.Lock()
+
+    def twice(url: str) -> bool:
+        port = _port_of(url)
+        start = threading.Barrier(2)
+
+        def come_back(state: str, cookie: str) -> None:
+            query = urlencode({"state": state, "code": "the-code"})
+            address = f"http://127.0.0.1:{port}{_RETURN}?{query}"
+            start.wait()
+            try:
+                with _DIRECT.open(Request(address, headers={"Cookie": cookie})) as answer:
+                    status = answer.status
+            except HTTPError as refused:
+                status = refused.code
+            with lock:
+                answers.append(status)
+
+        def open_then_come_back_twice() -> None:
+            state, cookie = _begin(url)
+            for _ in range(2):
+                threading.Thread(target=come_back, args=(state, cookie), daemon=True).start()
+
+        threading.Thread(target=open_then_come_back_twice, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", twice)
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+    completions = [request for request in fake.requests if request.url.path == _COMPLETE[1]]
+    assert len(completions) == 1
+    deadline = time.monotonic() + 5
+    while len(answers) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sorted(answers) == [200, 400]
+
+
+_APPROVAL = "https://slack.com/oauth/v2/authorize?state=the-state"
+
+
+def test_only_the_browser_that_completed_ends_the_wait_on_the_done_page() -> None:
+    finishing = _NOT_FOLLOWING
+    results: list[dict[str, Any]] = []
+    with _cloud_sign_in.SignInReturn() as listener:
+        base = f"http://127.0.0.1:{listener.port}"
+        opened = listener.opening(_APPROVAL)
+        waiting = threading.Thread(
+            target=lambda: results.append(
+                listener.wait(state="the-state", finish=lambda _r: _READY, seconds=10)
+            ),
+            daemon=True,
+        )
+        waiting.start()
+        _state, cookie = _begin(opened)
+        callback = f"{base}{_RETURN}?state=the-state&code=c"
+        status, location = _status(finishing, callback, cookie)
+        assert (status, location.startswith("/cayu-cloud/sign-in/done?t=")) == (303, True)
+        for stray, carried in (
+            ("/cayu-cloud/sign-in/done", cookie),
+            ("/cayu-cloud/sign-in/done?t=guess", cookie),
+            (location, ""),
+        ):
+            assert _status(finishing, f"{base}{stray}", carried)[0] == 400
+        assert not listener.shown.is_set()
+        assert _status(finishing, f"{base}{location}", cookie)[0] == 200
+        waiting.join(timeout=5)
+    assert results == [_READY]
+
+
+def test_the_start_page_sends_one_browser_on_and_only_its_callback_counts() -> None:
+    completed: list[dict[str, str]] = []
+    results: list[dict[str, Any]] = []
+    with _cloud_sign_in.SignInReturn() as listener:
+        base = f"http://127.0.0.1:{listener.port}"
+        opened = listener.opening(_APPROVAL)
+        assert "state" not in opened
+        waiting = threading.Thread(
+            target=lambda: results.append(
+                listener.wait(
+                    state="the-state",
+                    finish=lambda returned: completed.append(returned) or _READY,
+                    seconds=10,
+                )
+            ),
+            daemon=True,
+        )
+        waiting.start()
+        try:
+            with _NOT_FOLLOWING.open(opened) as answer:
+                headers = answer.headers
+        except HTTPError as redirected:
+            headers = redirected.headers
+        assert headers["Location"] == _APPROVAL
+        cookie = headers["Set-Cookie"]
+        assert cookie.startswith(f"cayu_sign_in_{listener.port}=")
+        assert {"Path=/cayu-cloud/sign-in", "HttpOnly", "SameSite=Lax"} <= {
+            part.strip() for part in cookie.split(";")
+        }
+        callback = f"{base}{_RETURN}?state=the-state&code=c"
+        # Without the cookie, or with another one, it isn't this browser: the wait goes on.
+        for carried in ("", f"cayu_sign_in_{listener.port}=guess"):
+            assert _status(_NOT_FOLLOWING, callback, carried)[0] == 400
+        assert not listener.finished.is_set()
+        status, done = _status(_NOT_FOLLOWING, callback, cookie.split(";")[0])
+        assert status == 303
+        assert _status(_NOT_FOLLOWING, f"{base}{done}", cookie.split(";")[0])[0] == 200
+        waiting.join(timeout=5)
+    assert results == [_READY]
+    assert completed == [{"state": "the-state", "code": "c"}]
+
+
+def test_the_start_page_without_its_secret_is_not_found_and_changes_nothing() -> None:
+    with _cloud_sign_in.SignInReturn() as listener:
+        opened = listener.opening(_APPROVAL)
+        base = opened.split("?")[0]
+
+        def wait() -> None:
+            with contextlib.suppress(_cloud_sign_in.SignInTimedOut):
+                listener.wait(state="the-state", finish=lambda _r: _READY, seconds=1)
+
+        waiting = threading.Thread(target=wait, daemon=True)
+        waiting.start()
+        for guess in (base, f"{base}?k=guess", f"{base}?k="):
+            try:
+                _DIRECT.open(guess)
+                raise AssertionError("A guess was sent on.")
+            except HTTPError as missing:
+                assert (missing.code, missing.read().decode()) == (
+                    404,
+                    "Not this sign-in's link.\n",
+                )
+        assert not (listener.started or listener.reused)
+        first = _status(_NOT_FOLLOWING, opened)
+        waiting.join(timeout=5)
+    assert first == (303, _APPROVAL)
+
+
+def test_a_second_opener_of_the_start_page_stops_the_command() -> None:
+    completed: list[dict[str, str]] = []
+    failures: list[Exception] = []
+    with _cloud_sign_in.SignInReturn() as listener:
+        base = f"http://127.0.0.1:{listener.port}"
+        opened = listener.opening(_APPROVAL)
+
+        def wait() -> None:
+            try:
+                listener.wait(
+                    state="the-state",
+                    finish=lambda returned: completed.append(returned) or _READY,
+                    seconds=10,
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        waiting = threading.Thread(target=wait, daemon=True)
+        waiting.start()
+        _state, cookie = _begin(opened)
+        try:
+            _DIRECT.open(opened)
+            raise AssertionError("A second opener was sent on.")
+        except HTTPError as gone:
+            assert (gone.code, gone.read().decode()) == (410, f"{_cloud_sign_in.LINK_REUSED}\n")
+        # The command stops; a callback even with the first browser's cookie connects nothing.
+        status = _status(_NOT_FOLLOWING, f"{base}{_RETURN}?state=the-state&code=c", cookie)
+        waiting.join(timeout=5)
+    assert status[0] in {0, 400}
+    assert completed == []
+    assert [type(failure) for failure in failures] == [_cloud_sign_in.SignInLinkReused]
+
+
+def test_ctrl_c_on_the_way_to_the_done_page_keeps_the_completed_sign_in() -> None:
+    with _cloud_sign_in.SignInReturn() as listener:
+        base = f"http://127.0.0.1:{listener.port}"
+        opened = listener.opening(_APPROVAL)
+
+        def come_back() -> None:
+            # Completes, but never comes back for the done page; then Ctrl-C.
+            _state, cookie = _begin(opened)
+            _status(_NOT_FOLLOWING, f"{base}{_RETURN}?state=the-state&code=c", cookie)
+            listener.finished.wait(5)
+            _thread.interrupt_main()
+
+        threading.Thread(target=come_back, daemon=True).start()
+        result = listener.wait(state="the-state", finish=lambda _r: _READY, seconds=10)
+    assert result == _READY
+
+
+def test_a_callback_from_another_browser_is_refused_and_the_wait_goes_on(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    browser = _Browser(
+        monkeypatch,
+        lambda state: (_RETURN, {"state": state, "code": "theirs"}, False),
+        lambda state: (_RETURN, {"state": state, "code": "the-code"}),
+    )
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+
+    assert [status for status, _text in browser.joined()] == [400, 200]
+    completions = [request for request in fake.requests if request.url.path == _COMPLETE[1]]
+    assert [json.loads(request.content)["code"] for request in completions] == ["the-code"]
+
+
+def test_a_sign_in_another_opener_came_back_with_first_fails_loudly(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    late: list[int] = []
+
+    def raced(url: str) -> bool:
+        def attacker_then_victim() -> None:
+            # Someone who read the link opens it first and comes straight back with a code of
+            # their own; the person's browser opens it after.
+            state, cookie = _begin(url)
+            query = urlencode({"state": state, "code": "theirs"})
+            _status(_NOT_FOLLOWING, f"{url.split('?')[0].rsplit('/', 1)[0]}?{query}", cookie)
+            late.append(_status(_NOT_FOLLOWING, url)[0])
+
+        threading.Thread(target=attacker_then_victim, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", raced)
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_link_shared"
+    message = output["error"]["message"]
+    assert "may be connected to someone else's workspace (Example Workspace)" in message
+    assert "cayu cloud connections show example-slack" in message
+    assert "Nothing was connected" not in message
+    assert late == [410]
+    completions = [request for request in fake.requests if request.url.path == _COMPLETE[1]]
+    assert [json.loads(request.content)["code"] for request in completions] == ["theirs"]
+
+
+def test_another_opener_of_the_link_stops_the_command_with_nothing_connected(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    second: list[int] = []
+
+    def raced(url: str) -> bool:
+        def both() -> None:
+            _begin(url)
+            second.append(_status(_NOT_FOLLOWING, url)[0])
+
+        threading.Thread(target=both, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", raced)
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_link_reused"
+    assert output["error"]["message"] == _cloud_sign_in.LINK_REUSED
+    assert second == [410]
+    assert all(request.url.path != _COMPLETE[1] for request in fake.requests)
+
+
+def test_a_failure_after_cloud_answers_ends_the_wait_with_an_error(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    _Browser(monkeypatch, lambda state: (_RETURN, {"state": state, "code": "the-code"}))
+
+    def broken(_connection: object) -> str:
+        raise ValueError("An answer this command can't read.")
+
+    monkeypatch.setattr(_cloud_sign_in, "connected", broken)
+    began = time.monotonic()
+
+    code, output = _run(
+        ["connections", "authorize", "example-slack", "--wait-seconds", "30"], capsys
+    )
+
+    assert time.monotonic() - began < 10
+    assert code != 0
+    assert output["error"]["message"] == "An answer this command can't read."
+
+
+def test_a_flood_of_connections_is_closed_quietly_and_the_approval_still_completes(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    flood: list[socket.socket] = []
+
+    def flooded(url: str) -> bool:
+        port = _port_of(url)
+
+        def come_back() -> None:
+            state, cookie = _begin(url)
+            # More idle connections than are served at once, then let them go.
+            for _ in range(_cloud_sign_in.MAX_CONNECTIONS * 3):
+                flood.append(socket.create_connection(("127.0.0.1", port)))
+            time.sleep(0.2)
+            for connection in flood:
+                connection.close()
+            time.sleep(0.3)
+            query = urlencode({"state": state, "code": "the-code"})
+            address = f"http://127.0.0.1:{port}{_RETURN}?{query}"
+            with _DIRECT.open(Request(address, headers={"Cookie": cookie})) as answer:
+                answer.read()
+
+        threading.Thread(target=come_back, daemon=True).start()
+        return True
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", flooded)
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+    printed = capsys.readouterr()
+    assert "connected" in printed.out
+    assert "Traceback" not in printed.err
+
+
+def test_ctrl_c_while_the_sign_in_is_being_completed_says_it_may_have_connected(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(_request: httpx.Request) -> httpx.Response:
+        _thread.interrupt_main()
+        time.sleep(0.5)
+        return httpx.Response(200, json=_READY)
+
+    cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: interrupted,
+        }
+    )
+    _Browser(monkeypatch, lambda state: (_RETURN, {"state": state, "code": "the-code"}))
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_interrupted"
+    assert "cayu cloud connections show example-slack" in output["error"]["message"]
+
+
+def test_port_waits_on_the_port_given_and_says_when_it_is_taken(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200),
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    _Browser(monkeypatch, lambda state: (_RETURN, {"state": state, "code": "the-code"}))
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    assert main(["cloud", "connections", "authorize", "example-slack", "--port", str(port)]) == 0
+    assert json.loads(fake.requests[0].content) == {"return_port": port}
+    assert f"127.0.0.1:{port}" in capsys.readouterr().err
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        busy = taken.getsockname()[1]
+        code, output = _run(
+            ["connections", "authorize", "example-slack", "--port", str(busy)], capsys
+        )
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_port_unavailable"
+    assert len(fake.requests) == 2
 
 
 def test_show_carries_the_account_status_and_why_it_failed(
@@ -637,12 +1510,12 @@ def test_show_carries_the_account_status_and_why_it_failed(
     ready["account"] = {"id": "T0123", "name": "Halden"}
     cloud(
         {
-            ("GET", "/v1/connections/eng-slack"): httpx.Response(200, json=failed),
+            ("GET", "/v1/connections/example-slack"): httpx.Response(200, json=failed),
             ("GET", "/v1/connections"): httpx.Response(200, json={"items": [failed, ready]}),
         }
     )
 
-    code, output = _run(["connections", "show", "eng-slack"], capsys)
+    code, output = _run(["connections", "show", "example-slack"], capsys)
     assert code == 0
     assert (output["result"]["status"], output["result"]["error"]) == ("error", "access_denied")
 
@@ -659,15 +1532,17 @@ def test_reconnecting_a_ready_connection_says_it_keeps_working(
 ) -> None:
     cloud(
         {
-            ("POST", "/v1/connections/eng-slack/authorize"): httpx.Response(
+            ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 200, json={**_SIGN_IN, "status": "ready"}
             )
         }
     )
 
-    assert main(["cloud", "connections", "authorize", "eng-slack"]) == 0
+    assert main(["cloud", "connections", "authorize", "example-slack", "--no-wait"]) == 0
     printed = capsys.readouterr().out
-    assert printed.startswith("eng-slack keeps working until you sign in again. To reconnect it,")
+    assert printed.startswith(
+        "example-slack keeps working until you sign in again. To reconnect it,"
+    )
     assert "waiting for its sign-in" not in printed
 
 

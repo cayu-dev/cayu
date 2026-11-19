@@ -1532,7 +1532,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_api_keys_parser(commands)
 
-    add_connections_parsers(commands)
+    add_connections_parsers(commands, seconds=_positive_finite_seconds)
     add_models_parser(commands)
 
     add_admin_parser(commands, application=_application_slug)
