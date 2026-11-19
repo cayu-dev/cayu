@@ -40,7 +40,7 @@ top-level commands are:
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
-- `sandboxes list|show|archives` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
+- `sandboxes list|show|archives|logs` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
 - `activity status` to [read how Cloud reads an Agent's activity](#clouds-activity-reader);
 - `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings` for
   [Compass](#compass);
@@ -2799,6 +2799,8 @@ cayu cloud sandboxes list --application my-agent --task task_7 --since 2h
 cayu cloud sandboxes list --application my-agent --label mission=m-17 --label role=builder
 cayu cloud sandboxes show --application my-agent sbx_7f2c...      # with its events
 cayu cloud sandboxes archives --application my-agent             # copy-in archives kept
+cayu cloud sandboxes logs --application my-agent sbx_7f2c...      # the broker's lines about it
+cayu cloud sandboxes logs --application my-agent --event sandbox_egress_refused --since 1d
 ```
 
 `list` starts with the Agent's capacity now (how many places are held under
@@ -2843,6 +2845,25 @@ archives lapse on its own, and nothing gives one up on request. It reads up to
 `--limit` (default 50), newest first; `--cursor` starts from an earlier list's
 `next_cursor`. It needs a Cayu Cloud that keeps copy-in archives; an older
 one answers `sandbox_archives_unsupported`.
+
+`logs` prints the sandbox broker's own lines: egress it refused and why,
+preflights that failed, sandboxes that became ready, failed or were destroyed,
+and commands it couldn't run. Each line shows its time, level, event, sandbox
+and fields, such as `host=pypi.org reason=connect_failed status=502`. With a
+sandbox id it reads that sandbox's lines over its life, oldest first, until 15
+minutes after it was destroyed; without one, the Agent's newest lines from the
+last 7 days. `--since`, `--until` (`15m`, `2h`, `2d` or an ISO 8601 time, at
+most 7 days apart) and `--event` choose lines, `--limit` (default 100, at most
+1000) says how many, and `--cursor` goes on from an earlier page's
+`next_cursor` with the same `--until` and `--event`. When Cloud's read stops a
+page short, the command reads on, for up to two minutes. `--follow` keeps
+printing new lines every two seconds until the read ends or Ctrl-C, then says
+where to go on. Cloud keeps the lines credential-safe: it redacts URLs,
+addresses and internal names, and never shows the broker's own task, worker
+or MicroVM ids. An install that doesn't keep its broker's log where Cloud can
+read it refuses the read (HTTP 503), and so does a Cloud that can't reach its
+log store right now or runs no sandbox broker; an older Cloud answers that it
+has no such sandbox.
 
 Cloud also logs every create it refuses for a full limit, with the limit, how
 many held a place and when the soonest lease runs out (`sandbox_quota_refused`

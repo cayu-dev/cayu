@@ -1,5 +1,6 @@
-"""`cayu cloud sandboxes list|show|archives --application NAME`: an Agent's brokered sandboxes
-in Cayu Cloud, who created each, what holds its places, and the archives kept for its copies.
+"""`cayu cloud sandboxes list|show|archives|logs --application NAME`: an Agent's brokered
+sandboxes in Cayu Cloud, who created each, what holds its places, the archives kept for its
+copies, and the broker's own log lines about them (`_cloud_sandbox_logs`).
 
 The commands read Cloud's sandbox broker routes (`GET /v1/applications/{id}/sandboxes`, one
 sandbox, its events and the capacity; contract `cayu.cloud.sandbox` v1) with the `cayu cloud
@@ -41,6 +42,7 @@ from urllib.parse import quote
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_releases import _when, add_output_argument, render_failure
+from cayu.cli._cloud_sandbox_logs import add_sandbox_logs_arguments, render_logs, sandbox_logs
 from cayu.cli._cloud_service_logs import log_time
 from cayu.cli._cloud_settings import _cell, _table
 
@@ -200,10 +202,20 @@ def add_sandboxes_parser(commands: argparse._SubParsersAction[argparse.ArgumentP
         type=_cursor,
         help="Start after the archives an earlier list showed (its next_cursor).",
     )
+    logs = actions.add_parser(
+        "logs",
+        description=(
+            "Print the sandbox broker's own lines: egress it refused, preflights that failed, "
+            "sandboxes that became ready, failed or were destroyed. With SANDBOX_ID, that "
+            "sandbox's lines over its life, oldest first; without it, the Agent's newest lines."
+        ),
+    )
+    add_sandbox_logs_arguments(logs, limit=_limit, sandbox_id=_sandbox_id)
     for parser, render in (
         (listing, render_sandboxes),
         (showing, render_sandbox),
         (archives, render_archives),
+        (logs, render_logs),
     ):
         parser.add_argument("--application", required=True, help=APPLICATION_HELP)
         add_output_argument(parser, render, failure=render_failure)
@@ -215,6 +227,8 @@ def sandboxes_command(
     base = f"/v1/applications/{quote(application_id, safe='')}"
     if arguments.sandboxes_command == "archives":
         return _archives(arguments, client=client, base=base, application_id=application_id)
+    if arguments.sandboxes_command == "logs":
+        return sandbox_logs(arguments, client=client, base=base, application_id=application_id)
     selected = _selected_release(client, base)
     if arguments.sandboxes_command == "show":
         path = f"{base}/sandboxes/{quote(arguments.sandbox_id, safe='')}"
