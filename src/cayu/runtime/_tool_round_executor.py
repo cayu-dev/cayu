@@ -2436,6 +2436,16 @@ class ToolRoundRun:
             [] for _ in tool_calls
         ]
         child_cancellations: list[asyncio.CancelledError | None] = [None] * len(tool_calls)
+        publication_snapshots: dict[str, invocation_secrets.InvocationPublicationSnapshot] = {}
+
+        async def record_publication_snapshot(
+            tool_call_id: str,
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            if publication_snapshot_observer is not None:
+                await publication_snapshot_observer(tool_call_id, snapshot)
+            publication_snapshots[tool_call_id] = snapshot
+
         # Calls whose concurrency slot came only after the run's time ran out.
         out_of_time: set[int] = set()
 
@@ -2474,7 +2484,7 @@ class ToolRoundRun:
                         deferred_terminal_stager=deferred_terminal_stager,
                         deferred_terminal_capture_recorder=deferred_terminal_capture_recorder,
                         resolved_redactor_observer=resolved_redactor_observer,
-                        publication_snapshot_observer=publication_snapshot_observer,
+                        publication_snapshot_observer=record_publication_snapshot,
                         run_time_left=self._limit_gate.tool_seconds_left,
                     )
                     async with aclosing(stream) as owned_stream:
@@ -2653,17 +2663,26 @@ class ToolRoundRun:
         if current_cancellation_failure is not None:
             raise current_cancellation_failure
         for index, tool_call in enumerate(tool_calls):
-            if (
-                index not in out_of_time
-                and deferred_terminal_stager is None
-                and all(outcome is None for _, outcome in buffers[index])
-            ):
-                buffers[index].append(
-                    await self._abnormal_tool_termination_item(
-                        tool_call=tool_call,
-                        tool_round_identity=tool_round_identity,
-                    )
+            if index not in out_of_time and all(outcome is None for _, outcome in buffers[index]):
+                if deferred_terminal_stager is not None:
+                    # Deferred stages already contribute outcomes to the round.
+                    if any(outcome.call.id == tool_call.id for outcome in tool_outcomes):
+                        continue
+                    registered_tool = self._registered_agent.executable_tool(tool_call.name)
+                    if (
+                        registered_tool is not None
+                        and registered_tool.effect is ToolEffect.EXTERNAL
+                    ):
+                        # A cancelled external effect must remain unresolved.
+                        continue
+                item = await self._abnormal_tool_termination_item(
+                    tool_call=tool_call,
+                    tool_round_identity=tool_round_identity,
+                    deferred_terminal_stager=deferred_terminal_stager,
+                    publication_snapshot=publication_snapshots.get(tool_call.id),
                 )
+                if item is not None:
+                    buffers[index].append(item)
         for buffer in buffers:
             for item in buffer:
                 yield item
@@ -2689,7 +2708,9 @@ class ToolRoundRun:
         *,
         tool_call: runtime_records.ToolCallRequest,
         tool_round_identity: ToolRoundIdentity,
-    ) -> tuple[Event, runtime_records.ToolCallOutcome]:
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
+    ) -> tuple[Event, runtime_records.ToolCallOutcome] | None:
         result = ToolResult(
             content="Tool call did not complete: the parallel task terminated abnormally.",
             structured={
@@ -2712,32 +2733,38 @@ class ToolRoundRun:
             **tool_argument_publication.unavailable_argument_projection().payload_fields(),
             **copy_tool_round_identity(tool_round_identity).payload(),
         }
-        event = await self._executor._event_writer.emit(
-            _event_with_targeted_tool_invocation_authority(
-                _event_with_tool_round_authority(
-                    event_with_execution_profile_authority(
-                        Event(
-                            type=EventType.TOOL_CALL_FAILED,
-                            session_id=self._session.id,
-                            agent_name=self._registered_agent.spec.name,
-                            environment_name=self._environment_name,
-                            tool_name=tool_call.name,
-                            payload=payload,
-                        ),
-                        self._execution_profile,
+        event = _event_with_targeted_tool_invocation_authority(
+            _event_with_tool_round_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_FAILED,
+                        session_id=self._session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        tool_name=tool_call.name,
+                        payload=payload,
                     ),
-                    tool_round_identity,
+                    self._execution_profile,
                 ),
-                tool_call,
-            )
-        )
-        return (
-            event,
-            runtime_records.ToolCallOutcome(
-                call=replace(tool_call, arguments={}, arguments_state="unavailable"),
-                result=result,
+                tool_round_identity,
             ),
+            tool_call,
         )
+        outcome = runtime_records.ToolCallOutcome(
+            call=replace(tool_call, arguments={}, arguments_state="unavailable"),
+            result=result,
+        )
+        if deferred_terminal_stager is not None:
+            if publication_snapshot is None:
+                # Missing sealed evidence cannot establish a complete secret scope.
+                publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
+                    redactor=self._executor._secret_redactor,
+                    unsafe_output=True,
+                    secret_scope_incomplete=True,
+                )
+            await deferred_terminal_stager(event, outcome, False, False, publication_snapshot)
+            return None
+        return await self._executor._event_writer.emit(event), outcome
 
 
 def ordered_tool_result_messages(
