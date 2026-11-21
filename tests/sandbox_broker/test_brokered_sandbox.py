@@ -2417,6 +2417,86 @@ def test_deny_by_default_follows_the_egress_guarantee_of_each_mode(tmp_path: Pat
     asyncio.run(scenario())
 
 
+def _claim_states(guarantees: SandboxGuarantees) -> dict[str, str]:
+    claims = sandbox_capability_claims(guarantees, egress_mode="none", declared=False)
+    return {claim.capability: claim.state for claim in claims}
+
+
+def test_host_filesystem_isolation_is_backed_by_its_own_kernel() -> None:
+    base = ("no_provider_credentials", "unprivileged_commands", "egress_only_via_broker")
+    gvisor = SandboxGuarantees(version=3, boundary="user_space_kernel", items=(*base, "own_kernel"))
+    virtual_machine = SandboxGuarantees(
+        version=3,
+        boundary="virtual_machine",
+        items=(*base, "own_kernel", "untrusted_code_isolation"),
+    )
+    # Older Clouds: a version 2 virtual machine carries no own_kernel; GKE carries neither.
+    lambda_v2 = SandboxGuarantees(version=2, items=(*base, "untrusted_code_isolation"))
+    gke_v2 = SandboxGuarantees(version=2, items=base)
+    expected = {
+        gvisor: ("available", "unsupported"),
+        virtual_machine: ("available", "available"),
+        lambda_v2: ("available", "available"),
+        gke_v2: ("unsupported", "unsupported"),
+    }
+    for guarantees, (host_filesystem, untrusted_code) in expected.items():
+        states = _claim_states(guarantees)
+        assert states["host_filesystem_isolation"] == host_filesystem, guarantees
+        assert states["untrusted_code_isolation"] == untrusted_code, guarantees
+
+
+def test_a_sandbox_record_reads_its_boundary_when_it_is_a_string() -> None:
+    def boundary(guarantees: dict) -> str | None:
+        return SandboxGuarantees.model_validate(guarantees).boundary
+
+    assert boundary({"version": 3, "boundary": "user_space_kernel"}) == "user_space_kernel"
+    assert boundary({"version": 3, "boundary": {"kind": "vm"}}) is None
+    assert boundary({"version": 3, "boundary": None}) is None
+    assert boundary({"version": 2, "items": ["own_kernel"]}) is None
+
+
+def test_a_user_space_kernel_admits_trusted_coding_but_not_untrusted_code(
+    tmp_path: Path,
+) -> None:
+    broker = FakeBroker(tmp_path / "cloud")
+    broker.guarantees_version = 3
+    broker.guarantees = (
+        "own_kernel",
+        "no_provider_credentials",
+        "unprivileged_commands",
+        "egress_only_via_broker",
+    )
+    coding = ExecutionRequirements.trusted(
+        host_filesystem="isolated",
+        real_secret_visibility="non_possession",
+        guest_privilege="contained",
+        cancellation="confirmed",
+        cleanup="confirmed",
+        network_access="deny_by_default",
+        minimum_evidence="available",
+    )
+
+    def decision(candidate, requirements):
+        return evaluate_execution_admission(
+            candidate=candidate.candidate,
+            requirements=requirements,
+            evidence=candidate.evidence,
+            stage="pre_exposure",
+        )
+
+    async def scenario():
+        runner = await _ready_runner(broker, egress="none")
+        admitted = decision(runner.execution_admission_candidate(), coding)
+        assert admitted.status == "admitted", admitted.refusals
+        refused = decision(
+            runner.execution_admission_candidate(), ExecutionRequirements.untrusted()
+        )
+        assert {refusal.capability for refusal in refused.refusals} == {"untrusted_code_isolation"}
+        await runner.close()
+
+    asyncio.run(scenario())
+
+
 def test_executable_admission_probes_the_exact_sandbox(tmp_path: Path) -> None:
     broker = FakeBroker(tmp_path / "cloud")
 

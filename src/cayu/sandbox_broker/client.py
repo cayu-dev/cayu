@@ -410,12 +410,25 @@ class SandboxGit(BaseModel):
 
 
 class SandboxGuarantees(BaseModel):
-    """What Cloud enforces for a sandbox, as a versioned list of items."""
+    """What Cloud enforces for a sandbox, as a versioned list of items.
+
+    From version 3, ``boundary`` names what separates the sandbox's commands from the
+    host (``virtual_machine`` or ``user_space_kernel``). It is descriptive only: the
+    items alone back admission.
+    """
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     version: int
+    boundary: str | None = None
     items: tuple[str, ...] = ()
+
+    @field_validator("boundary", mode="before")
+    @classmethod
+    def _boundary(cls, value: Any) -> Any:
+        # A shape this client doesn't understand reports none rather than invalidating
+        # the record.
+        return value if type(value) is str else None
 
     def has(self, item: str) -> bool:
         # Version 1 items are never removed in later versions.

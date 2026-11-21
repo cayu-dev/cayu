@@ -153,7 +153,13 @@ def sandbox_capability_claims(
 
     ``declared`` builds pre-create claims from the configuration; otherwise a
     capability is ``available`` only when the sandbox record carries the
-    guarantee item that backs it, and ``unsupported`` when it doesn't.
+    guarantee items of one of its backings, and ``unsupported`` when it doesn't.
+
+    ``host_filesystem_isolation`` is backed by ``own_kernel`` (guarantees
+    version 3: a virtual machine or a user-space kernel such as gVisor) or by
+    ``untrusted_code_isolation``, which a version 2 virtual machine record
+    carries without ``own_kernel``. ``untrusted_code_isolation`` is backed only
+    by its own item, which Cloud sets only on a virtual machine.
 
     ``deny_by_default_network`` follows the record's egress guarantee:
 
@@ -175,29 +181,29 @@ def sandbox_capability_claims(
     """
 
     items = set() if guarantees is None or guarantees.version < 1 else set(guarantees.items)
-    backing: dict[str, tuple[str, ...]] = {
-        "untrusted_code_isolation": ("untrusted_code_isolation",),
-        "host_filesystem_isolation": ("untrusted_code_isolation",),
-        "real_credential_non_possession": ("no_provider_credentials",),
-        "guest_privilege_containment": ("unprivileged_commands",),
-        "unprivileged_guest": ("unprivileged_commands",),
+    # Each capability's alternative backings; the record must carry every item of one.
+    backing: dict[str, tuple[tuple[str, ...], ...]] = {
+        "untrusted_code_isolation": (("untrusted_code_isolation",),),
+        "host_filesystem_isolation": (("own_kernel",), ("untrusted_code_isolation",)),
+        "real_credential_non_possession": (("no_provider_credentials",),),
+        "guest_privilege_containment": (("unprivileged_commands",),),
+        "unprivileged_guest": (("unprivileged_commands",),),
     }
     if egress_mode != "public_web":
         if declared:
             if egress_mode in ("none", "allowlist"):
-                backing["deny_by_default_network"] = ()
+                backing["deny_by_default_network"] = ((),)
         elif guarantees is not None and guarantees.version >= 2:
             backing["deny_by_default_network"] = (
-                "egress_only_via_broker",
-                "egress_deny_by_default",
+                ("egress_only_via_broker", "egress_deny_by_default"),
             )
         elif egress_mode == "none":
-            backing["deny_by_default_network"] = ("egress_only_via_broker",)
+            backing["deny_by_default_network"] = (("egress_only_via_broker",),)
     claims: list[ExecutionCapabilityClaim] = []
-    for capability, required in backing.items():
+    for capability, alternatives in backing.items():
         if declared:
             claims.append(ExecutionCapabilityClaim.declared(capability))
-        elif items.issuperset(required):
+        elif any(items.issuperset(required) for required in alternatives):
             claims.append(ExecutionCapabilityClaim.available(capability))
         else:
             claims.append(

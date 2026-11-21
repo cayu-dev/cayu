@@ -941,7 +941,14 @@ is the one-command clean above.
 Final admission uses the sandbox record's versioned `guarantees`. A capability
 such as `untrusted_code_isolation`, `real_credential_non_possession`,
 `guest_privilege_containment` or `deny_by_default_network` is available only
-when the guarantee item behind it is present. From guarantees version 2,
+when the guarantee item behind it is present. `host_filesystem_isolation` is
+backed by `own_kernel` (guarantees version 3, carried by virtual machine and
+gVisor sandboxes, whose commands never run on the host's kernel) or by
+`untrusted_code_isolation`, which only a virtual machine carries; so a gVisor
+sandbox admits a trusted coding agent that needs `host_filesystem="isolated"`
+but never `ExecutionRequirements.untrusted()`. A version 3 record also names its
+`boundary` (`virtual_machine` or `user_space_kernel`), which admission doesn't
+read. From guarantees version 2,
 `deny_by_default_network` needs the `egress_deny_by_default` item, which Cloud
 sets on `none` and `allowlist` sandboxes; a version 1 record backs it only for
 `egress="none"`, so an allowlist on an older Cloud fails closed. `public_web`
