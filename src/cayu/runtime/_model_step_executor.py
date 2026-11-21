@@ -2768,6 +2768,7 @@ class ModelStepRun:
             interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
         self._interaction_id = interaction_id
         self._recall_anchor_index_map: dict[int, int] | None = None
+        self._finish_position_map: dict[int, int] | None = None
         self._refresh_request_configuration()
 
     def _refresh_request_configuration(self) -> None:
@@ -3143,6 +3144,22 @@ class ModelStepRun:
             messages = list(portable.messages)
             portable_history_cursor = source_transcript_cursor
 
+    def _context_position_map(self) -> dict[int, int] | None:
+        """Map checkpoint model positions onto the list this candidate builds context from.
+
+        Fallback projection and the finishing projection can each drop rows. Until
+        fallback preparation commits, the checkpoint addresses the predecessor's list;
+        the finishing projection is never committed, so it is always applied here.
+        """
+
+        fallback = self._recall_anchor_index_map
+        finish = self._finish_position_map
+        if fallback is None or finish is None:
+            return fallback if finish is None else finish
+        return {
+            source: finish[position] for source, position in fallback.items() if position in finish
+        }
+
     async def _candidate_disposition(
         self, exhausted: _ModelFailoverCandidateExhausted
     ) -> ModelFailoverTransition | _ModelFailoverFinalEvidence | None:
@@ -3287,8 +3304,9 @@ class ModelStepRun:
             )
         targeted_projection_kind = None if finish_up else self._targeted_tool_projection_kind
         discovery_projection_kind = None if finish_up else self._tool_discovery_projection_kind
+        self._finish_position_map = None
         if finish_up:
-            messages = _finish_request_messages(messages)
+            messages, self._finish_position_map = _finish_request_projection(messages)
             tool_exposure = ResolvedToolExposure(
                 profile_id=_LIMIT_FINISH_TOOL_EXPOSURE_PROFILE_ID,
                 catalogue_revision=self._registered_agent.tool_catalogue.revision,
@@ -3440,7 +3458,7 @@ class ModelStepRun:
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=compaction.run,
                 publish_recall_telemetry=compaction.publish_recall,
-                recall_anchor_index_map=self._recall_anchor_index_map,
+                recall_anchor_index_map=self._context_position_map(),
             )
         except ContextBuildError as exc:
             (
@@ -4806,7 +4824,7 @@ class ModelStepRun:
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=compaction.run,
                 publish_recall_telemetry=compaction.publish_recall,
-                recall_anchor_index_map=self._recall_anchor_index_map,
+                recall_anchor_index_map=self._context_position_map(),
                 force_bounded_compaction=True,
             )
         except ContextBuildError as exc:
@@ -5784,15 +5802,32 @@ def _tool_capability_ceiling_exposure(
 def _finish_request_messages(messages: list[Message]) -> list[Message]:
     """Withdraw native tool state while retaining same-provider signed thinking."""
 
-    projected = []
-    for message in messages:
+    return _finish_request_projection(messages)[0]
+
+
+def _finish_request_projection(
+    messages: list[Message],
+) -> tuple[list[Message], dict[int, int]]:
+    """Finishing messages plus each kept source position's new position.
+
+    An assistant row left with only provider state is dropped and has no entry.
+    The end of the source list maps to the end of the projection, as
+    :func:`projection_position_map` does for model-target projection.
+    """
+
+    projected: list[Message] = []
+    position_map: dict[int, int] = {}
+    for position, message in enumerate(messages):
         if message.role is not MessageRole.ASSISTANT:
+            position_map[position] = len(projected)
             projected.append(detach_message(message))
             continue
         parts = tuple(part for part in message.content if type(part) is not ProviderStatePart)
         if parts:
+            position_map[position] = len(projected)
             projected.append(Message(role=message.role, content=parts))
-    return projected
+    position_map[len(messages)] = len(projected)
+    return projected, position_map
 
 
 def _model_request_messages(
