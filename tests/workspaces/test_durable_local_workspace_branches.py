@@ -8,7 +8,7 @@ import signal
 import threading
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
@@ -446,6 +446,24 @@ class _RewritePublicationAuthorityStore(_TemporarySQLiteSessionStore):
                 record["record_digest"] = hashlib.sha256(
                     canonical_durable_json_bytes(payload, "workspace_branch.record")
                 ).hexdigest()
+        return record
+
+
+class _RunAfterNextLoadStore(_TemporarySQLiteSessionStore):
+    """Run one operation after the next record load, before its caller resumes."""
+
+    invocation_lifecycle_command_version = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.after_next_load: Callable[[], Awaitable[object]] | None = None
+
+    async def load_session_operation(self, session_id: str, idempotency_key: str, **kwargs):
+        record = await super().load_session_operation(session_id, idempotency_key, **kwargs)
+        after_load = self.after_next_load
+        if after_load is not None:
+            self.after_next_load = None
+            await after_load()
         return record
 
 
@@ -4893,6 +4911,38 @@ def test_attached_terminal_cleanup_dual_failure_retains_owner_until_assisted(
         )
         await _assert_terminal_handle_released_capacity(root, store)
         assert len(branch_module._DURABLE_TERMINAL_SETTLEMENTS) == 0
+
+    asyncio.run(scenario())
+
+
+def test_rollback_reports_concurrent_private_mutation_as_journal_conflict(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = _RunAfterNextLoadStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        _source, branch, _request = await _durable_branch(root, store)
+        await branch.write_bytes("first.txt", b"first")
+        rollback_request = WorkspaceBranchRollbackRequest(
+            branch_id=branch.branch_id,
+            idempotency_key="rollback-alpha",
+            expected_run_epoch=0,
+            binding_generation="binding-1",
+        )
+
+        # The mutation commits after rollback loaded its record, so the private
+        # overlay is newer than the record rollback is about to replace.
+        store.after_next_load = lambda: branch.write_bytes("second.txt", b"second")
+        with pytest.raises(WorkspaceBranchOperationConflict, match="changed under another"):
+            await branch.rollback(rollback_request)
+        assert store.after_next_load is None
+        assert (await branch.read_bytes("second.txt")).content == b"second"
+
+        rolled_back = await branch.rollback(rollback_request)
+        assert rolled_back.status is WorkspaceBranchOutcomeStatus.ROLLED_BACK
+        assert len(rolled_back.evidence.affected_path_sha256) == 2
 
     asyncio.run(scenario())
 

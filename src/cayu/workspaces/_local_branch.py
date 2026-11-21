@@ -5816,7 +5816,10 @@ class LocalWorkspaceBranch(WorkspaceBranch):
             raise WorkspaceBranchClosedError(f"Durable workspace branch is {current.state.value}.")
         try:
             if current.state is not WorkspaceBranchDurableState.ROLLBACK_INTENT:
-                paths = tuple(sorted(self._overlay.keys() | self._tombstones))
+                # Take paths from the record this transition replaces, not from
+                # live private state: a mutation that committed after ``current``
+                # was loaded must surface as the journal conflict below.
+                paths = tuple(sorted((*current.overlay, *current.tombstones)))
                 intended = current.model_copy(
                     update={
                         "state": WorkspaceBranchDurableState.ROLLBACK_INTENT,
