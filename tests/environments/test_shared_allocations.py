@@ -326,6 +326,108 @@ def test_a_session_whose_scope_owner_is_not_running_is_refused(tmp_path):
     assert factory.finalizations() == ["completed"]
 
 
+def _orchestrator_app(
+    tmp_path: Path, *, scope: str
+) -> tuple[CayuApp, _RecordingFactory, ScriptedModelProvider]:
+    """An orchestrator without a workspace binding, whose helper shares ``scope``."""
+
+    from cayu.tools import SubagentSpec, SubagentTool
+
+    factory = _RecordingFactory(tmp_path)
+    app = CayuApp(enable_logging=False)
+    planner = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="spawn", name="subagent", arguments={"agent": "helper", "task": "help"}
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            _text("planned"),
+        ],
+        name="planner-provider",
+    )
+    helper = ScriptedModelProvider([_text("helped")], name="helper-provider")
+    app.register_provider(planner, default=True)
+    app.register_provider(helper)
+    # It only delegates, so it needs no workspace of its own.
+    app.register_environment(Environment(EnvironmentSpec(name="orchestrator")), default=True)
+    app.register_environment_factory(
+        EnvironmentSpec(name="shared"), factory, allocation_scope=scope
+    )
+    app.register_agent(AgentSpec(name="helper", model="scripted", provider_name=helper.name))
+    app.register_agent(
+        AgentSpec(name="planner", model="scripted", provider_name=planner.name),
+        tools=[
+            SubagentTool(
+                app,
+                agents={"helper": SubagentSpec(agent_name="helper", environment_name="shared")},
+            )
+        ],
+    )
+    return app, factory, helper
+
+
+@pytest.mark.parametrize("scope", ["parent", "causal_budget"])
+def test_a_running_parent_without_a_binding_owns_its_subagents_scope(tmp_path, scope):
+    app, factory, helper = _orchestrator_app(tmp_path, scope=scope)
+
+    async def scenario():
+        return [
+            event
+            async for event in app.run(
+                RunRequest(
+                    session_id="orchestrator-root",
+                    agent_name="planner",
+                    messages=[Message.text("user", "delegate")],
+                )
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    assert events[-1].type == EventType.SESSION_COMPLETED, events[-1].payload
+    # The helper reached its model instead of being refused a closed scope.
+    assert helper.requests
+    # The orchestrator owned the helper's allocation and released it at its end.
+    assert _owners(factory) == ["orchestrator-root"]
+    assert factory.finalizations() == ["completed"]
+
+
+def test_a_finished_parent_without_a_binding_owns_no_scope(tmp_path):
+    app, factory, _ = _orchestrator_app(tmp_path, scope="parent")
+
+    async def scenario():
+        parent = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    session_id="finished-orchestrator",
+                    agent_name="planner",
+                    messages=[Message.text("user", "delegate")],
+                )
+            )
+        ]
+        assert parent[-1].type == EventType.SESSION_COMPLETED, parent[-1].payload
+        return [
+            event
+            async for event in app.run(
+                RunRequest(
+                    session_id="late-helper",
+                    agent_name="helper",
+                    environment_name="shared",
+                    parent_session_id="finished-orchestrator",
+                    messages=[Message.text("user", "help")],
+                )
+            )
+        ]
+
+    events = asyncio.run(scenario())
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "is not running in this process" in str(events[-1].payload)
+    # Only the subagent that ran while the orchestrator did got an allocation.
+    assert _owners(factory) == ["finished-orchestrator"]
+
+
 def test_run_metadata_cannot_opt_a_session_into_sharing(tmp_path):
     app, factory = _app(tmp_path, turns=2)
 

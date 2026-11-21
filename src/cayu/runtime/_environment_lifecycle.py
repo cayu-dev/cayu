@@ -242,6 +242,7 @@ from cayu.runtime._retained_environment_end import (
     RetainedEnvironmentEndWatches,
     release_is_retained,
 )
+from cayu.runtime._session_control import SessionControl
 from cayu.runtime._shared_environment_allocations import SharedEnvironmentAllocations
 from cayu.runtime._tool_execution_requirements import effective_execution_requirements
 from cayu.runtime._workspace_observation_keyring import (
@@ -836,6 +837,7 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
         execution_presence_stopped: Callable[[str, int], Awaitable[None]] | None = None,
         shared_allocations: SharedEnvironmentAllocations | None = None,
+        session_runs: Callable[[], SessionControl[Any]] | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -855,12 +857,19 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         self._egress_authority_adoption_handler = egress_authority_adoption_handler
         self._execution_presence_stopped = execution_presence_stopped
         # Allocations shared by the sessions of one allocation scope. An agent
-        # session owns its scope while its environment is set up here.
+        # session owns its scope while its environment is set up here, or while
+        # its run is in progress here: an environment without a workspace
+        # binding sets nothing up, and its session still owns the scope, as
+        # the run its invocation admitted.
+        self._session_runs = session_runs
         self.shared_allocations = shared_allocations or SharedEnvironmentAllocations(
             session_store=session_store
         )
         self.shared_allocations.bind_session_presence(
-            lambda session_id: session_id in self._active_environment_setups,
+            lambda session_id: (
+                session_id in self._active_environment_setups
+                or (session_runs is not None and session_runs().has_active_run(session_id))
+            ),
             session_run_here=self._session_run_here,
         )
         # A workflow run's shared allocations are recorded in its checkpoint,
@@ -934,6 +943,10 @@ class EnvironmentLifecycle(EnvironmentExitOwnership):
         owner = self._active_environment_setups.get(session_id)
         context = None if owner is None else owner.invocation_context
         if context is None:
+            # No environment setup saw the run (an environment without a
+            # workspace binding); its invocation, still in progress, did.
+            if owner is None and self._session_runs is not None:
+                return self._session_runs().active_run_identity(session_id)
             return None
         return context.binding.session_instance_id, context.binding.run_epoch
 

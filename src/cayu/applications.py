@@ -1359,6 +1359,7 @@ class CayuApp(
                 )
             ),
             shared_allocations=self._environment_registry.shared_allocations,
+            session_runs=lambda: self._session_control,
         )
         self._run_limit_controller = RunLimitController(
             session_store=self._runtime_session_store,

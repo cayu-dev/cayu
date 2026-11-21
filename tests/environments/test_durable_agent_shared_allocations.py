@@ -46,7 +46,7 @@ from cayu.sessions.recovery import (
     IncompleteSessionsRecoveryRequest,
 )
 from cayu.storage import SQLiteSessionStore
-from cayu.tools import SubagentTool
+from cayu.tools import SubagentSpec, SubagentTool
 from cayu.tools.base import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.tools.policy import AllowAllToolPolicy
 from cayu.workspaces import LocalWorkspace
@@ -202,7 +202,15 @@ class _World:
         self.seen: list[bytes] = []
         self.leads: dict[int, _Provider] = {}
 
-    def app(self, lead_turns=(), helper_turns=(), *, stall=False) -> CayuApp:
+    def app(
+        self, lead_turns=(), helper_turns=(), *, stall=False, bindingless_lead=False
+    ) -> CayuApp:
+        """An app whose lead shares its sandbox with its helper.
+
+        With ``bindingless_lead`` the lead itself works in an environment
+        without a workspace: it only owns the scope its helper's sandbox is in.
+        """
+
         keyring = _keyring()
         store = SQLiteSessionStore(
             self.database, public_authority_alias_codec=PublicAuthorityAliasCodec(keyring)
@@ -215,10 +223,19 @@ class _World:
         helper = _Provider(list(helper_turns), name="helper-provider")
         app.register_provider(lead, default=True)
         app.register_provider(helper)
+        if bindingless_lead:
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(
+                        name="orchestrator", execution_profile_identity=identity("orchestrator")
+                    )
+                ),
+                default=True,
+            )
         app.register_environment_factory(
             EnvironmentSpec(name="sandbox", execution_profile_identity=identity("sandboxes")),
             _SandboxFactory(self.sandboxes),
-            default=True,
+            default=not bindingless_lead,
             allocation_scope="parent",
         )
         app.register_agent(
@@ -231,7 +248,9 @@ class _World:
             tools=[
                 SubagentTool(
                     app,
-                    agents={"helper": "helper"},
+                    agents={
+                        "helper": SubagentSpec(agent_name="helper", environment_name="sandbox")
+                    },
                     execution_profile_identity=identity("subagent"),
                 ),
                 _ReadNotes(self.seen),
@@ -266,7 +285,7 @@ async def _drain(stream) -> list:
 
 
 async def _crash_after_the_helper_wrote(
-    world: _World, session_id: str, *, forget: bool = True
+    world: _World, session_id: str, *, forget: bool = True, bindingless_lead: bool = False
 ) -> CayuApp:
     """Run the lead until its helper wrote notes.md, then let the process die.
 
@@ -280,6 +299,7 @@ async def _crash_after_the_helper_wrote(
         [_call("subagent", agent="helper", task="take notes")],
         [_call("write_notes"), _done()],
         stall=True,
+        bindingless_lead=bindingless_lead,
     )
 
     async def died_before_releasing(session, event) -> None:
@@ -689,5 +709,66 @@ def test_a_resumed_agent_releases_its_crashed_runs_sandbox_without_using_it_agai
     # tool using it, and releases it at its terminal event.
     assert reconnected.operation is EnvironmentFactoryOperation.RECONNECT
     assert reconnected.session_id == created.session_id
+    assert world.sandboxes.disposed == [sha256(created.session_id.encode()).hexdigest()[:16]]
+    assert records == {}
+
+
+def test_a_lead_without_a_workspace_records_its_helpers_sandbox_for_recovery(tmp_path):
+    world = _World(tmp_path)
+
+    async def scenario():
+        try:
+            first = await _crash_after_the_helper_wrote(
+                world, "lead-bindingless", bindingless_lead=True
+            )
+            stored = await first.session_store.load("lead-bindingless")
+            assert stored is not None
+            records = (await _records(first, "lead-bindingless"))["records"]
+            recovering = world.app(bindingless_lead=True)
+            closed = await recovering.close_session(
+                "lead-bindingless", reason="nobody will continue"
+            )
+            return stored, records, closed, await _records(recovering, "lead-bindingless")
+        finally:
+            await world.close()
+
+    stored, records, closed, remaining = asyncio.run(scenario())
+    # The lead has no workspace of its own, yet its run owned the helper's
+    # sandbox and recorded it before the factory created it.
+    (record,) = records.values()
+    assert record["state"] == "live"
+    assert record["attempt_id"].startswith(f"run:{stored.instance_id}:")
+    created = world.sandboxes.requests[0]
+    assert created.operation is EnvironmentFactoryOperation.CREATE
+    assert created.session_id.startswith("lead-bindingless.shared-")
+    # So the crash left nothing untracked: closing the session reaps it.
+    assert IncompleteSessionRecoveryAction.REAPED_ALLOCATION in closed.actions, closed
+    assert world.sandboxes.disposed == [sha256(created.session_id.encode()).hexdigest()[:16]]
+    assert remaining == {}
+
+
+def test_a_resumed_lead_without_a_workspace_releases_its_crashed_runs_sandbox(tmp_path):
+    world = _World(tmp_path)
+
+    async def scenario():
+        try:
+            await _crash_after_the_helper_wrote(world, "lead-unbound", bindingless_lead=True)
+            second = world.app([_done()], bindingless_lead=True)
+            events = await _drain(
+                second.resume(
+                    ResumeRequest(
+                        session_id="lead-unbound", messages=[Message.text("user", "wrap up")]
+                    )
+                )
+            )
+            return events, await _records(second, "lead-unbound")
+        finally:
+            await world.close()
+
+    events, records = asyncio.run(scenario())
+    assert events[-1].type == EventType.SESSION_COMPLETED, events[-1].payload
+    created = world.sandboxes.requests[0]
+    # The resumed run, as the scope's owner, released what the crashed run
+    # recorded although nothing in it used the sandbox again.
     assert world.sandboxes.disposed == [sha256(created.session_id.encode()).hexdigest()[:16]]
     assert records == {}

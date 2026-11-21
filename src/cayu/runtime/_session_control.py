@@ -52,6 +52,8 @@ class ActiveSessionRun(Generic[UsageTrackerT]):
     turn_environment_name: str | None = None
     turn_started_at: float | None = None
     turn_usage_tracker: UsageTrackerT | None = None
+    # The incarnation and run epoch this run executes, once admitted.
+    run_identity: tuple[str, int] | None = None
     turn_completed_event: Event | None = None
     turn_completed_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     out_of_band_events: asyncio.Queue[Event] = field(default_factory=asyncio.Queue)
@@ -267,6 +269,7 @@ class SessionControl(Generic[UsageTrackerT]):
         turn_environment_name: str | None = None,
         turn_started_at: float | None = None,
         turn_usage_tracker: UsageTrackerT | None = None,
+        run_identity: tuple[str, int] | None = None,
     ) -> ActiveSessionRun[UsageTrackerT]:
         session_id = require_clean_nonblank(session_id, "session_id")
         active_run = ActiveSessionRun(
@@ -278,6 +281,7 @@ class SessionControl(Generic[UsageTrackerT]):
             turn_environment_name=turn_environment_name,
             turn_started_at=turn_started_at,
             turn_usage_tracker=turn_usage_tracker,
+            run_identity=run_identity,
         )
         self._active_runs.setdefault(session_id, {})[task] = active_run
         if self._session_store.supports_session_execution:
@@ -340,14 +344,34 @@ class SessionControl(Generic[UsageTrackerT]):
         if not control_tasks:
             self._active_control_tasks.pop(session_id, None)
 
+    def has_active_run(self, session_id: str) -> bool:
+        """Whether a run of ``session_id`` is in progress in this process."""
+
+        return any(
+            not active_run.runtime_task.done() for active_run in self.active_runs(session_id)
+        )
+
+    def active_run_identity(self, session_id: str) -> tuple[str, int] | None:
+        """The incarnation and run epoch of ``session_id``'s run in progress here, if known.
+
+        None when no admitted run is in progress, or when its runs here disagree.
+        A run not admitted yet (a recovery claim, say) names none.
+        """
+
+        identities = {
+            active_run.run_identity
+            for active_run in self.active_runs(session_id)
+            if not active_run.runtime_task.done() and active_run.run_identity is not None
+        }
+        if len(identities) != 1:
+            return None
+        return identities.pop()
+
     def has_active_tasks(
         self, session_id: str, *, exclude_current_control_task: bool = False
     ) -> bool:
-        active_run_exists = any(
-            not active_run.runtime_task.done() for active_run in self.active_runs(session_id)
-        )
         current = asyncio.current_task() if exclude_current_control_task else None
-        return active_run_exists or any(
+        return self.has_active_run(session_id) or any(
             task is not current and not task.done()
             for task in self._active_control_tasks.get(session_id, ())
         )

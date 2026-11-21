@@ -1945,6 +1945,10 @@ class SessionEngine(BeforeStopPolicies):
                     task_id=request.task_id,
                     task_started=False,
                     task_finished=False,
+                    run_identity=(
+                        invocation_context.binding.session_instance_id,
+                        invocation_context.binding.run_epoch,
+                    ),
                 )
                 active_factory_run.structured_output_pending = request.structured_output is not None
             # The run fence belongs to this pre-run setup until control is handed to
@@ -6812,6 +6816,10 @@ class SessionEngine(BeforeStopPolicies):
                     turn_environment_name=environment_name,
                     turn_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
+                    run_identity=(
+                        invocation_context.binding.session_instance_id,
+                        invocation_context.binding.run_epoch,
+                    ),
                 )
                 active_run.structured_output_pending = structured_output is not None
                 await self._session_control.execution_presence.ensure(
