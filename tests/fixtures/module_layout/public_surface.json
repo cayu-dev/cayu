@@ -798,6 +798,13 @@
     },
     "cayu.connections": {
       "defined_in": {
+        "cayu.connections._tool_catalog": [
+          "ConnectorToolsError"
+        ],
+        "cayu.connections._tools": [
+          "ConnectorPackageTool",
+          "tools"
+        ],
         "cayu.connections.client": [
           "CloudConnectionBroker",
           "ConnectionCallError",
@@ -818,6 +825,7 @@
       },
       "identities": {},
       "present": [
+        "CONNECTOR_TOOLS_API",
         "DEFAULT_TIMEOUT_SECONDS",
         "MAX_BODY_BYTES",
         "MAX_RETRY_AFTER_SECONDS",

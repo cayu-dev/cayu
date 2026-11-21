@@ -179,6 +179,7 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     },
     ("connections", "bind"): "agent",
     ("connections", "unbind"): "agent",
+    ("connections", "run-tool"): "agent",
 }
 _ORGANIZATION_HELP = (
     "The Organization (its id) this command must act in; it's refused in any other. Naming it "
@@ -2621,7 +2622,7 @@ def _client_command(
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
     if arguments.command == "connectors":
-        return connectors_command(client)
+        return connectors_command(arguments, client)
     if arguments.command == "connections":
         return connections_command(
             arguments,
@@ -6442,6 +6443,22 @@ def _cloud_client(
         "login_required",
         "Sign in with `cayu cloud login`, select a private context, or provide an API key.",
     )
+
+
+def member_client(*, timeout_seconds: float) -> CloudApiClient | None:
+    """The client a `cayu cloud` command given no options acts with: `CAYU_CLOUD_API_KEY`, the
+    selected context or the saved login; None when none of them signs in. A local process's
+    connector tools read their catalog and run with it (`cayu.connections.tools`)."""
+
+    arguments = argparse.Namespace(context=None, api_key_file=None, timeout_seconds=timeout_seconds)
+    context_path = _selected_context_path(None)
+    context = _read_context(context_path) if context_path is not None else {}
+    try:
+        return _cloud_client(arguments, context=context, context_path=context_path)
+    except CloudAuthError as exc:
+        if exc.category == "login_required":
+            return None
+        raise
 
 
 def _login_client(

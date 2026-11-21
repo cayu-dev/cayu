@@ -54,6 +54,88 @@ app.require_connection("erp", description="Supplier invoices to reconcile")
 A package's own toolkit declares its slots the same way: set `Tool.connection_slots` to a
 `cayu.connections.ConnectionSlot` on each tool it returns.
 
+## Connector package tools
+
+Provisional ([stability](stability.md)). A connector package in Cayu Cloud can define its Agent
+tools itself. Cloud runs them on the slot's binding, through the same broker rules, so a new tool
+or a fix needs no `cayu` release. One generic adapter serves every such package:
+
+```python
+import cayu.connections as connections
+
+app.register_agent(spec, tools=connections.tools("ramp"))
+app.register_agent(other, tools=connections.tools("ramp", "examplechat", writes=True))
+app.register_agent(eu, tools=connections.tools("ramp", slot="ramp-eu"))
+```
+
+`tools(*toolsets, slot=None, writes=False)` names toolsets, not connectors: one toolset serves
+each of its connectors (`ramp`, `ramp-sandbox`). Its tools declare the toolset's `default_slot`
+with the toolset's connectors and the scopes the chosen tools need; `slot` names another, for one
+toolset per call. On the default slot the tools keep the package's names; on another, the slot
+names them (`ramp-eu`: `ramp_eu_list_bills`), so two slots of one toolset can serve one Agent.
+Only the tools without an effect come unless `writes=True`. A tool with an effect asks for a
+person's approval itself, with the package's reason naming its arguments (`Post a message to
+C0123.`): `register_agent` puts every tool's `Tool.approval_reason` under the Agent's
+`tool_policy` as an `ApprovalFloorToolPolicy`, so there is no `tool_policy=` line to write and
+`cayu check` reads the writes as guarded. What the Agent's own policy denies stays denied.
+
+Call `tools()` where the application registers its agents: it reads each catalog once,
+synchronously, before it returns, with a client of its own, so it never uses the caller's event
+loop and works at import or in a factory a command builds inside its own loop. Each tool is a
+`ConnectorPackageTool`. A process reads each toolset once, from the first source that applies:
+
+1. `CAYU_CONNECTOR_TOOLS=snapshot`, for tests and CI: the project's saved snapshot, else the
+   cached copy, with no network. The tools are declared as Cloud last described them and answer
+   `no_connection_client` when run.
+2. `CAYU_CONNECTIONS_URL` and `CAYU_CONNECTIONS_TOKEN`, which Cayu Cloud sets for the Agent: the
+   Agent's routes, and each run uses its own binding.
+3. The context `cayu cloud` commands use (`CAYU_CLOUD_API_KEY`, the selected context or the
+   saved login): the catalog as you read it, and each run uses the binding of the Agent the
+   project's `cayu-cloud.toml` names (`application`), recorded as a local run by you. A project
+   that names no Agent still loads the tools; their runs answer `connection_unbound` with the
+   bind command; an Agent Cloud doesn't know answers `agent_not_found`, and a name several
+   Agents answer to `agent_ambiguous`. Each read refreshes
+   a copy in your cache directory, never in the project. When Cloud is unreachable, times out or
+   answers 5xx or 429, or the saved login can't be refreshed or the API key file read, the tools
+   come from the saved snapshot, else the cached copy, with a warning naming it, and still run
+   through Cloud once it answers and you are signed in again.
+4. Offline, with no credential: the saved snapshot (`cayu cloud connectors tools TOOLSET --save`
+   writes `.cayu/connector-tools/TOOLSET.json`), else the cached copy, whose tools answer
+   `no_connection_client` when run.
+
+With none of these, `tools()` raises `ValueError` naming the ways. An Agent that can't reach
+Cloud keeps asking for 20 seconds, honouring a `Retry-After`, then fails to start with
+`ConnectorToolsError` (`connector_catalog_unreachable`) naming Cloud's URL, so its platform
+restarts it; the broker is Cloud too, so starting without the tools would only hide the outage.
+A refusal without a code is `connector_catalog_refused`, and a catalog this Runtime can't serve
+is `connector_catalog_invalid`. A toolset Cloud no longer offers starts without its tools, logs
+`connector_tools_unavailable` and declares nothing for it: the slot's binding stays in Cloud,
+`connections bound` still shows it, and a running Agent's calls to its tools answer
+`connector_unavailable`.
+
+A run sends the tool's arguments, the catalog's digest of the tool and the call's id. Cloud's
+refusals and the tool's own errors come back as tool errors with their code and advice, as the
+toolkits' do; `invalid_arguments` names the argument's path, and a write that may have taken
+effect (`tool_timed_out`, `tool_failed`, or a tool error marked `ambiguous`) is never advised to
+be retried before checking. A login that can't be refreshed answers `cloud_login_required`.
+When the package changed a tool's effect, scopes or approval since the process read it, the run
+is refused with `tool_changed` (logged once) until the Agent restarts, so a running Agent never
+skips an approval a new version adds. Cloud validates each run's arguments against the tool's
+current schema at once, but the model sees a new description or input schema only after the
+Agent restarts. `classify_tool_source` reports each tool as `kind="package"` with the connector
+package's name and version. Each tool's execution identity is its package, toolset and name
+with Cloud's digest, not the package's version, so eval baselines compare across restarts and
+description fixes, and a change to its effect, scopes or approval starts a new one. The wire
+contract is `cayu.connector-tools/v1`
+([ADR 0003](adr/0003-connections-runtime-contract.md#connector-package-tools)); see
+[Connector package tools](cayu-cloud.md#connector-package-tools) for the commands.
+
+Trust: a catalog comes from a signed connector package that Cloud serves, and its tools run in
+Cloud. The local approval floor follows what the catalog says: a package that labels a write
+`effect: none` gives it no approval floor, so its review belongs to the package's signing and
+release checks. The floor isn't a defence against a compromised Cloud, which could also change
+what a tool does.
+
 ## The client
 
 `tools(client=None, slot=...)` calls through `client`, a `cayu.connections.ConnectionClient`.

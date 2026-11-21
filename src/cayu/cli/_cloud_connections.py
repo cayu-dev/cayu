@@ -44,6 +44,12 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_connector_tools import (
+    add_connector_tools_parser,
+    add_run_tool_parser,
+    connector_tools_command,
+    run_tool_command,
+)
 from cayu.cli._cloud_diagnostics import safe_text
 from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_settings import _cell, _table, _value_cell
@@ -61,7 +67,7 @@ from cayu.cli._cloud_sign_in import (
 
 _CONNECTIONS = "/v1/connections"
 #: The `connections` actions on one Agent's slots, which name the Agent with --application.
-AGENT_ACTIONS = frozenset({"bound", "bind", "unbind"})
+AGENT_ACTIONS = frozenset({"bound", "bind", "unbind", "run-tool"})
 #: For a Cayu Cloud whose `GET /v1/connectors` doesn't describe each connector's fields (one from
 #: before it did): the credential fields that aren't secret, which --credential may give as
 #: FIELD=VALUE; every other field is read from a file (FIELD=@PATH).
@@ -143,11 +149,12 @@ def add_connections_parsers(
     *,
     seconds: Callable[[str], float],
 ) -> None:
-    commands.add_parser(
+    connectors = commands.add_parser(
         "connectors",
-        help="List the connectors this Cayu Cloud offers.",
+        help="List the connectors this Cayu Cloud offers, or a connector package's tools.",
         description="List the connectors this install offers: what a connection can be made to.",
     )
+    add_connector_tools_parser(connectors)
     connections = commands.add_parser(
         "connections",
         help="Add, list, bind, change or remove the Organization's connections; read their calls.",
@@ -288,6 +295,8 @@ def add_connections_parsers(
         "--json", action="store_true", help="Print the JSON envelope instead of a table."
     )
     repositories.set_defaults(_cloud_render=render_repositories)
+
+    add_run_tool_parser(actions)
 
     remove = actions.add_parser(
         "remove",
@@ -713,7 +722,9 @@ def _models(application_id: str) -> str:
     return f"/v1/applications/{quote(application_id, safe='')}/models"
 
 
-def connectors_command(client: CloudApiClient) -> dict[str, Any]:
+def connectors_command(arguments: argparse.Namespace, client: CloudApiClient) -> dict[str, Any]:
+    if arguments.connectors_command == "tools":
+        return _connections_served(client, lambda: connector_tools_command(arguments, client))
     return _connections_served(
         client,
         lambda: {"operation": "connectors.list", "result": client.request("GET", "/v1/connectors")},
@@ -796,6 +807,9 @@ def _connections_action(
     agents: list[str] | None,
 ) -> dict[str, Any]:
     action = arguments.connections_command
+    if action == "run-tool":
+        assert application_id is not None
+        return run_tool_command(arguments, client, application_id)
     if action == "list":
         result = client.request("GET", _CONNECTIONS)
     elif action == "add":

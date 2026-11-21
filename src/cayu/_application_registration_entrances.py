@@ -6,16 +6,17 @@ limit.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cayu._application_registration import _registration_site
 from cayu.fork_controllers import fork_controller_access
 from cayu.tasks import session_wakes as _session_wakes
+from cayu.tools.base import Tool
+from cayu.tools.policy import ApprovalFloorToolPolicy, ToolPolicy
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
-
     from cayu.agents import AgentSpec
     from cayu.applications import CayuApp
     from cayu.context.base import ContextPolicy
@@ -30,10 +31,8 @@ if TYPE_CHECKING:
     from cayu.runtime.loop_policies import LoopPolicy
     from cayu.runtime.tool_effects import ToolEffectReconciliationRegistration
     from cayu.sessions.child_context import ChildSessionContextContributor
-    from cayu.tools.base import Tool
     from cayu.tools.discovery import ToolDiscoveryMode
     from cayu.tools.exposure import ToolExposureMode, ToolExposurePolicy
-    from cayu.tools.policy import ToolPolicy
     from cayu.tools.targeted_projection import TargetedToolMode
 
 
@@ -68,6 +67,7 @@ class RegistrationEntrances:
             spec, settings, default_thinking=self._config.run.thinking
         )
         tools, proposal_tools, kits = self._toolkit_slots(tools, proposal_tools)
+        tool_policy = _with_approval_floor(tool_policy, tools, proposal_tools)
         connections = {*self._connection_slot_declarations, *kits}
         slot, setting_slot = self._agent_model_slot(spec, model_slot, declared, connections)
         registered = self._agent_registry.register_agent(
@@ -124,3 +124,26 @@ class RegistrationEntrances:
         )
         self._add_managed_settings(declared)
         return registered
+
+
+def _with_approval_floor(
+    tool_policy: ToolPolicy | None, *groups: Iterable[Tool] | None
+) -> ToolPolicy | None:
+    """``tool_policy`` under the approvals the tools ask for themselves (``Tool.approval_reason``),
+    as an ``ApprovalFloorToolPolicy``; as given when none asks, or when it isn't a policy, for
+    the registry to refuse."""
+
+    reasons: dict[str, str | Callable[[Mapping[str, Any]], str]] = {}
+    for group in groups:
+        for tool in group if isinstance(group, list) else ():
+            reason = getattr(tool, "approval_reason", None) if isinstance(tool, Tool) else None
+            if reason is None:
+                continue
+            if not isinstance(reason, str) and not callable(reason):
+                raise TypeError(
+                    f"Tool {tool.name!r}'s approval_reason is neither a string nor a function."
+                )
+            reasons[tool.name] = reason
+    if not reasons or not (tool_policy is None or isinstance(tool_policy, ToolPolicy)):
+        return tool_policy
+    return ApprovalFloorToolPolicy(reasons, tool_policy)

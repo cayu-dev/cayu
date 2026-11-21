@@ -17,6 +17,7 @@ policy for their write tools and an argument-review preset ([connector toolkits]
 App credentials, and on Cloud a `github-app` connection bound with its repositories.
 They take their client as an argument until `ToolContext.connections` exists. Model slots are
 built ([Models](#models)), and so are connection slot declarations ([Declarations](#declarations)).
+Connector package tools are built ([Connector package tools](#connector-package-tools)).
 `ToolContext.connections`, tool-level slot requirements and MCP through a slot are still
 proposals.
 
@@ -224,6 +225,61 @@ app.register_agent(triage_spec, model_slot="fast")
   next release. `CAYU_MODEL` keeps working until the scaffolds no longer need it; `cayu new`
   declares a `primary` slot whose default is the agent's model.
 - Without a broker (outside Cloud) a slot uses its declared default, recorded as `default`.
+
+## Connector package tools
+
+Addendum, 2026-11-21. Built.
+
+A connector toolkit in `cayu.connectors` needs a `cayu` release for each new connector or tool
+fix. A connector package in Cayu Cloud now defines its Agent tools beside its broker rules, and
+Cloud runs them; the Runtime has one generic adapter, `cayu.connections.tools(*toolsets, slot=None,
+writes=False)` ([Connector package tools](../connector-toolkits.md#connector-package-tools)).
+New connectors' tools live in Cloud packages. What runs in the Agent's process or workspace (a
+git credential helper, workspace files) and any wait over Cloud's 25-second run stays in the
+Runtime.
+
+The wire contract is `cayu.connector-tools/v1`, under `/v1`:
+
+| Route | Who | Answers |
+| --- | --- | --- |
+| `GET /v1/agent-connections/toolsets/{toolset}` | the Agent's connections token | the catalog |
+| `POST /v1/agent-connections/{slot}/tools/{tool}` | the Agent's connections token | a run on the Agent's binding |
+| `GET /v1/connector-tools/{toolset}` | a member (an API key with `read`) | the catalog |
+| `POST /v1/applications/{application_id}/connections/{slot}/tools/{tool}` | a member who can change the Agent | a local run on its binding |
+
+- The catalog is `{"api": "cayu.connector-tools/v1", toolset, package, version, connectors,
+  default_slot, description, tools: [{name, description, input_schema, effect, scopes, approval,
+  max_answer_bytes, digest}]}`, by toolset, not binding, so it is read before anything is bound.
+  A toolset Cloud doesn't offer is 404 `connector_unavailable`. `effect` uses the Runtime's words
+  (`none`, `idempotent`, `external`); a tool with an effect has an `approval` template naming its
+  arguments.
+- A run's body is `{"arguments", "digest", "call_id"}`, at most 1 MiB. It answers 200
+  `{"result": {"content", "structured", "truncated"}}` or 200 `{"error": {code, message, advice,
+  retryable, retry_after_seconds, ambiguous, ...}}`; a refusal keeps the request route's statuses
+  and `detail`: 404 `connection_unbound`, 409 as for a call, 409 `connector_mismatch`, 404
+  `tool_unavailable`, 409 `tool_changed`, 422 `scope_not_allowed`, 502 `tool_failed` and 502
+  `tool_timed_out`. Refusals before the run are never ambiguous; a write that failed after it
+  started is.
+- `digest` is Cloud's digest of the tool's `name`, `effect`, `scopes` and `approval`, which the
+  Agent's policy and slot declaration were built from (64 hex characters); the Runtime sends it
+  back as given. When it differs, Cloud refuses with `tool_changed` and the Agent restarts to read
+  it again. Cloud validates a run's arguments against the tool's current schema at once, but the
+  model sees a new description or schema only after the Agent restarts.
+- Trust: the catalog comes from a signed package. The Runtime's approval floor follows the
+  catalog's `effect` and `approval`, so a package that labels a write `effect: none` bypasses it;
+  the floor isn't a defence against a compromised Cloud.
+
+The adapter (provisional) reads a catalog once per process and toolset: in Cloud with the
+Agent's token, failing the start after 20 seconds without Cloud; locally as the developer,
+falling back to a saved snapshot or the cache while Cloud is unreachable; or offline from a
+saved snapshot whose tools can't run, which `CAYU_CONNECTOR_TOOLS=snapshot` pins for tests and
+CI. A toolset
+Cloud no longer offers starts without its tools and declares nothing for it; the binding stays
+in Cloud. Tools declare
+their slot (`Tool.connection_slots`) and ask for approval themselves through the new
+`Tool.approval_reason`, which `register_agent` collects into an `ApprovalFloorToolPolicy` around
+the Agent's `tool_policy`. Tool names are stable within a package's major version: they key
+approvals, traces, usage and evals.
 
 ## Notification content
 

@@ -90,6 +90,7 @@ def classify_tool_source(
     name_limit: int | None = None,
     version_limit: int | None = None,
 ) -> ToolSource:
+    from cayu.connections._tools import ConnectorPackageTool
     from cayu.mcp.tools import McpToolAdapter
 
     if isinstance(registered, McpToolAdapter):
@@ -97,6 +98,13 @@ def classify_tool_source(
         return (
             ToolSource(kind="unknown") if server is None else ToolSource(kind="mcp", server=server)
         )
+    if isinstance(registered, ConnectorPackageTool):
+        # The connector package Cayu Cloud runs it from, not the module that calls Cloud.
+        name = _line(sanitize(registered.package), name_limit)
+        version = _line(sanitize(registered.version), version_limit)
+        if name is None or version is None:
+            return ToolSource(kind="unknown")
+        return ToolSource(kind="package", package=name, version=version)
     provenance = tool.implementation_provenance
     if provenance.kind == "external":
         module = provenance.symbol.partition(":")[0]

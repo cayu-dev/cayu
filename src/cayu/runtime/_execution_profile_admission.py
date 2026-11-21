@@ -1283,8 +1283,26 @@ def _cayu_policy_material_extractors() -> dict[type[object], _ExecutionProfileMa
 
 
 def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
-    from cayu.tools.policy import GuardedToolPolicy, RequiredArguments
+    from cayu.runtime.execution_identity import copy_execution_profile_behavior_identity
+    from cayu.tools.policy import ApprovalFloorToolPolicy, GuardedToolPolicy, RequiredArguments
     from cayu.tools.policy_router import ToolPolicyRouter
+
+    if type(policy) is ApprovalFloorToolPolicy:
+        # The floor's reasons (a text, or a reason function's declared identity) and the inner
+        # policy's own material or identity; a reason function without one stays process-local.
+        floor: dict[str, Any] = {}
+        for name, reason in sorted(policy.reasons.items()):
+            if isinstance(reason, str):
+                floor[name] = {"reason": reason}
+                continue
+            identity = copy_execution_profile_behavior_identity(
+                getattr(reason, "execution_profile_identity", None)
+            )
+            if identity is None:
+                return None
+            floor[name] = {"identity": identity.model_dump(mode="json")}
+        inner = _policy_component(policy.inner)
+        return None if inner is None else {"floor": floor, "inner": inner}
 
     if type(policy) is ToolPolicyRouter:
         # A route's own material or declared identity; the router adds only the routing.

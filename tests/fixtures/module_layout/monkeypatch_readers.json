@@ -703,6 +703,10 @@
   "cayu.cli._release_check:release_cache_path": [
     "latest_release"
   ],
+  "cayu.cli._release_check:user_cache_directory": [
+    "cayu.connections._tool_catalog:cache_path",
+    "release_cache_path"
+  ],
   "cayu.cli._serve_reload:WatchFilesReload": [
     "run_reload"
   ],
@@ -744,13 +748,18 @@
   ],
   "cayu.cli.cloud:_cloud_client": [
     "_execute",
-    "cloud_client"
+    "cloud_client",
+    "member_client"
   ],
   "cayu.cli.cloud:_deploy": [
     "_client_command"
   ],
   "cayu.cli.cloud:_execute": [
     "_run_cloud"
+  ],
+  "cayu.cli.cloud:_listed_agents": [
+    "_application_id",
+    "_application_ids"
   ],
   "cayu.cli.cloud:_read_context": [
     "_activate_context",
@@ -779,6 +788,9 @@
   "cayu.cli.cloud:fresh_cloud_credentials": [
     "_login_client",
     "_login_client.<locals>.current_access_token"
+  ],
+  "cayu.cli.cloud:member_client": [
+    "cayu.connections._tool_catalog:_Member.signed_in"
   ],
   "cayu.cli.cloud:resolve_application_id": [
     "cayu.cli._cloud_agent_api:open_cloud_agent_api",
@@ -1149,6 +1161,20 @@
   ],
   "cayu.collaboration._validation_snapshot:_MAX_CONTAINERS": [
     "ValidationSnapshots.remember"
+  ],
+  "cayu.connections._tool_catalog:_clock": [
+    "_fetched"
+  ],
+  "cayu.connections._tool_catalog:_read": [
+    "load",
+    "summary"
+  ],
+  "cayu.connections._tool_catalog:_sleep": [
+    "_fetched"
+  ],
+  "cayu.connections._tool_catalog:_transport": [
+    "get",
+    "post"
   ],
   "cayu.context.base:_bounded_default_compaction_prompt": [
     "ModelCompactor._compact_with_invocation_identity"

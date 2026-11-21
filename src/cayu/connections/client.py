@@ -58,10 +58,12 @@ class ConnectionResponse:
 #: couldn't be renewed for). Cayu Cloud's broker refuses with these before forwarding, as the
 #: clients here do before sending. ``scope_not_allowed`` also refuses a read's answer once it
 #: has come (Slack's email addresses), never a write's: a host refuses a call with an effect
-#: after sending it only with a code not in this set.
+#: after sending it only with a code not in this set. Cloud refuses a connector package tool's
+#: run before running it with these too, and with the run's own (``tool_changed``, ...).
 _REFUSED_BEFORE_SENDING = frozenset(
     {
         "agent_credential_invalid",
+        "agent_not_found",
         "auth_failed",
         "body_invalid",
         "body_not_allowed",
@@ -69,7 +71,9 @@ _REFUSED_BEFORE_SENDING = frozenset(
         "connection_not_ready",
         "connection_unavailable",
         "connection_unbound",
+        "connector_mismatch",
         "connector_not_brokered",
+        "connector_unavailable",
         "credential_invalid",
         "credential_unavailable",
         "header_not_allowed",
@@ -85,6 +89,8 @@ _REFUSED_BEFORE_SENDING = frozenset(
         "slot_invalid",
         "token_url_unreachable",
         "too_many_calls",
+        "tool_changed",
+        "tool_unavailable",
     }
 )
 
@@ -229,26 +235,31 @@ class CloudConnectionBroker:
             raise ConnectionCallError(
                 f"The connection broker is unreachable ({type(exc).__name__})."
             ) from exc
-        if not 200 <= response.status_code < 300:
-            code = message = None
-            with contextlib.suppress(ValueError, AttributeError, TypeError):
-                detail = response.json().get("detail")
-                code, message = detail.get("code"), detail.get("message")
-            raise ConnectionCallError(
-                message
-                if isinstance(message, str)
-                else f"The broker answered {response.status_code}.",
-                code=code if isinstance(code, str) else None,
-                status=response.status_code,
-                retry_after=retry_after_seconds(response.headers.get("retry-after")),
-            )
-        try:
-            answer = response.json()
-        except ValueError as exc:
-            raise ConnectionCallError("The connection broker answered with invalid JSON.") from exc
-        if not isinstance(answer, dict):
-            raise ConnectionCallError("The connection broker's answer is malformed.")
-        return answer
+        return broker_answer(response)
+
+
+def broker_answer(response: httpx.Response) -> dict[str, Any]:
+    """A Cayu Cloud connection route's JSON object; its refusal (``{"detail": {"code",
+    "message"}}``, or a bare status) as a ``ConnectionCallError``."""
+
+    if not 200 <= response.status_code < 300:
+        code = message = None
+        with contextlib.suppress(ValueError, AttributeError, TypeError):
+            detail = response.json().get("detail")
+            code, message = detail.get("code"), detail.get("message")
+        raise ConnectionCallError(
+            message if isinstance(message, str) else f"The broker answered {response.status_code}.",
+            code=code if isinstance(code, str) else None,
+            status=response.status_code,
+            retry_after=retry_after_seconds(response.headers.get("retry-after")),
+        )
+    try:
+        answer = response.json()
+    except ValueError as exc:
+        raise ConnectionCallError("The connection broker answered with invalid JSON.") from exc
+    if not isinstance(answer, dict):
+        raise ConnectionCallError("The connection broker's answer is malformed.")
+    return answer
 
 
 @dataclass(frozen=True)

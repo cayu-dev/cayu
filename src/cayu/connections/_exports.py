@@ -1,8 +1,11 @@
 """Explicit public exports; implementations load on first access."""
 
 EXPORTS: dict[str, tuple[str, str]] = {
+    "CONNECTOR_TOOLS_API": ("cayu.connections._tool_catalog", "CONNECTOR_TOOLS_API"),
     "CloudConnectionBroker": ("cayu.connections.client", "CloudConnectionBroker"),
     "ConnectionSlot": ("cayu.connections.slots", "ConnectionSlot"),
+    "ConnectorPackageTool": ("cayu.connections._tools", "ConnectorPackageTool"),
+    "ConnectorToolsError": ("cayu.connections._tool_catalog", "ConnectorToolsError"),
     "ConnectionCallError": ("cayu.connections.client", "ConnectionCallError"),
     "ConnectionClient": ("cayu.connections.client", "ConnectionClient"),
     "ConnectionResponse": ("cayu.connections.client", "ConnectionResponse"),
@@ -18,6 +21,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TOKEN_ENVIRONMENT": ("cayu.connections.client", "TOKEN_ENVIRONMENT"),
     "URL_ENVIRONMENT": ("cayu.connections.client", "URL_ENVIRONMENT"),
     "retry_after_seconds": ("cayu.connections.client", "retry_after_seconds"),
+    "tools": ("cayu.connections._tools", "tools"),
 }
 
 PUBLIC_NAMES = sorted(EXPORTS)

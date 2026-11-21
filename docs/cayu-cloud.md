@@ -2607,6 +2607,54 @@ the binding's connection and scopes decide what calls through the slot may do, a
 nobody declared can still be bound. See
 [ADR 0003](adr/0003-connections-runtime-contract.md#declarations).
 
+### Connector package tools
+
+A connector package can also define the Agent tools for its connectors, by toolset (`ramp`).
+Cayu Cloud runs them on the slot's binding, so a new tool or a fix reaches Agents without a
+`cayu` release. The application names the toolset:
+
+```python
+import cayu.connections as connections
+
+app.register_agent(spec, tools=connections.tools("ramp"))
+```
+
+See [Connector package tools](connector-toolkits.md#connector-package-tools) for the slot,
+writes and approval. In Cayu Cloud the Agent reads the toolset's catalog with its own
+connections token. Locally, a process reads it as you, with the context `cayu cloud` commands
+use, and runs each tool on the binding of the Agent the project's `cayu-cloud.toml` names
+(`application`); every run is recorded as a local run by you. `cayu serve` prints which Cloud and
+Agent its tools come from:
+
+```console
+Connector tools: ramp 0.1.0 from https://cloud.example.com, Agent example-agent
+```
+
+```console
+cayu cloud connectors tools ramp
+cayu cloud connectors tools ramp --json
+cayu cloud connectors tools ramp --save
+cayu cloud connections run-tool --application example-agent ramp ramp_list_bills \
+  --arguments-file arguments.json
+```
+
+`connectors tools TOOLSET` prints the toolset's package and version, its connectors and default
+slot, then each tool with its effect, the scopes it needs and its approval reason; `--json`
+prints Cloud's whole catalog (`cayu.connector-tools/v1`). It refreshes the copy kept in your
+cache directory. `--save` also writes it to the project as `.cayu/connector-tools/TOOLSET.json`,
+so CI can load the tools without a credential: set `CAYU_CONNECTOR_TOOLS=snapshot` there to
+read only the snapshot (then the cache) with no network. Tools loaded that way answer
+`no_connection_client` when run; a signed-in process uses the snapshot only while Cloud is
+unreachable, and its tools still run through Cloud. A toolset this Cloud doesn't offer is refused with
+`connector_unavailable`.
+
+`connections run-tool --application AGENT SLOT TOOL --arguments-file F` runs one tool, named as
+its package names it, on the Agent's binding of SLOT with the JSON object in F, and prints
+Cloud's answer: `result` (`content`, `structured`, `truncated`) or the tool's `error`. Developers
+and admins can run them, as they can deploy code that makes the same calls. A refusal keeps its
+code: `connection_unbound`, `connector_mismatch`, `tool_unavailable`, `scope_not_allowed`, and
+`tool_changed` when the tool's effect, scopes or approval changed since the catalog was read.
+
 ### Model slots
 
 An Agent declares the models it needs as named model slots, each with a default, and the

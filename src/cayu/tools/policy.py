@@ -426,6 +426,12 @@ class ApprovalFloorToolPolicy(ToolPolicy):
     def tools(self) -> frozenset[str]:
         return self._tools
 
+    @property
+    def reasons(self) -> Mapping[str, str | Callable[[Mapping[str, Any]], str]]:
+        """Each named tool's reason, as given."""
+
+        return self._reasons
+
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         decided = await self._inner.authorize(request)
         reason = self._reasons.get(request.tool_name)

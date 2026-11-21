@@ -49,9 +49,11 @@ def _isolated_interpreter_exit_cleanup() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _no_release_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep `cayu new` and the after-command notice away from PyPI and the user's cache."""
+    """Keep `cayu new` and the after-command notice away from PyPI and the user's cache, and
+    connector tools' catalogs out of the user's cache."""
     monkeypatch.setattr(release_check, "fetch_latest_release", lambda: None)
     monkeypatch.setattr(release_check, "release_cache_path", lambda: None)
+    monkeypatch.setattr(release_check, "user_cache_directory", lambda: None)
 
 
 @pytest.fixture

@@ -71,6 +71,7 @@ release with a release-note entry.
 | `cayu.testing` helpers | Still being shaped. |
 | Provider options, bundled model catalog and price book | Provider APIs change outside Cayu's control; catalog and price refreshes ship in patches. |
 | Cayu Cloud CLI commands (`cayu cloud ...`) | Tied to a hosted service that is still changing. |
+| Connector package tools: `cayu.connections.tools`, `ConnectorPackageTool`, `ConnectorToolsError` and `Tool.approval_reason` | New, and tied to Cayu Cloud's `cayu.connector-tools/v1` contract. See [connector-toolkits.md](connector-toolkits.md#connector-package-tools). |
 
 ### Experimental
 

@@ -101,6 +101,13 @@ def fetch_latest_release() -> str | None:
 
 
 def release_cache_path() -> Path | None:
+    directory = user_cache_directory()
+    return None if directory is None else directory / _CACHE_FILENAME
+
+
+def user_cache_directory() -> Path | None:
+    """Cayu's folder in the user's cache directory; None when there is no home to find it in."""
+
     try:
         if sys.platform == "darwin":
             root = Path.home() / "Library" / "Caches"
@@ -116,7 +123,7 @@ def release_cache_path() -> Path | None:
             )
     except RuntimeError:
         return None
-    return root / "cayu" / _CACHE_FILENAME
+    return root / "cayu"
 
 
 def _release_key(release: str) -> tuple[int, ...]:

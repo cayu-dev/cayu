@@ -359,6 +359,7 @@ def _build_serve_app(
             "Cayu Developer dashboard: "
             f"{_control_plane_url(args.host, args.port, service.manifest.control_plane_path)}"
         )
+        _print_connector_tools()
     else:
         auth = None if args.dev else _load_auth(auth_target)
         if identity_proxy is not None:
@@ -438,11 +439,22 @@ def _build_serve_app(
             "Cayu Developer dashboard: "
             f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
         )
+        _print_connector_tools()
         if settings.routers:
             print("Project routes: " + ", ".join(settings.routers))
         if settings.ui is not None:
             print(f"Web app: {_control_plane_url(args.host, args.port, '/')}")
     return server
+
+
+def _print_connector_tools() -> None:
+    """Say where the project's connector tools came from: which Cayu Cloud and Agent."""
+
+    from cayu.connections import _tool_catalog
+
+    line = _tool_catalog.summary()
+    if line is not None:
+        print(line)
 
 
 def register_demo_provider(app: Any) -> bool:

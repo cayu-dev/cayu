@@ -15,6 +15,12 @@ Model slots are the models an application declares by name (``CayuApp.require_mo
 the Organization binds per Agent in Cayu Cloud: ``ModelSlots`` reads the bindings from the broker
 and a new session resolves its agent's slot when it starts.
 
+``tools("ramp")`` answers the tools of a connector package's toolset, which Cayu Cloud serves
+and runs on the slot's binding (wire contract ``cayu.connector-tools/v1``): in Cloud as the
+Agent, locally as the developer signed in with ``cayu cloud``, offline from a saved snapshot.
+Each is a ``ConnectorPackageTool`` that declares its slot and, when it has an effect, asks for
+a person's approval itself. See ``docs/connector-toolkits.md``.
+
 The connector's status is the answer's, whatever it is; ``ConnectionCallError`` is raised when
 the call failed without one: the slot is unbound, the host refused to send it, or the
 connector couldn't be reached or answered too much. ``ConnectionCallError.ambiguous`` says

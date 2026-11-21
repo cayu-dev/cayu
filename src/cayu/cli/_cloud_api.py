@@ -191,6 +191,15 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "repository_invalid"),
         (429, "too_many_calls"),
         (502, "upstream_failed"),
+        # `connectors tools` and `connections run-tool`: why Cloud refused a connector package's
+        # catalog or one of its tools; each message names the toolset, tool or slot.
+        (404, "connection_unbound"),
+        (404, "connector_unavailable"),
+        (404, "tool_unavailable"),
+        (409, "connector_mismatch"),
+        (409, "tool_changed"),
+        (502, "tool_failed"),
+        (502, "tool_timed_out"),
         # `connections add|authorize`: why a sign-in that came back to the command didn't connect.
         (403, "sign_in_not_yours"),
         (404, "connection_removed"),

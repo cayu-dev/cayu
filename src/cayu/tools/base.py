@@ -1408,6 +1408,11 @@ class Tool(ABC):
     #: The connection slots the tool calls through, which registering it with an agent declares
     #: for the application (``cayu.connections.ConnectionSlot``); a connector toolkit sets them.
     connection_slots: tuple[ConnectionSlot, ...] = ()
+    #: Why a person approves each call before it runs: a reason, or a function of the call's
+    #: arguments answering one. Registering the tool with an agent puts it under the agent's
+    #: tool policy as an ``ApprovalFloorToolPolicy``; None asks for no approval of its own.
+    #: Provisional.
+    approval_reason: str | Callable[[Mapping[str, Any]], str] | None = None
 
     def __init__(self, spec: ToolSpec | None = None) -> None:
         if spec is not None:
