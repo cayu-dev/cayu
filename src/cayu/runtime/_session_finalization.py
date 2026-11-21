@@ -117,6 +117,7 @@ from cayu.providers._credential_boundary import (
 from cayu.providers.base import ModelStreamDeadlineError
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
@@ -211,12 +212,16 @@ from cayu.runtime._terminal_evidence_reader import (
     TerminalEvidenceReader,
 )
 from cayu.runtime._tool_effect_state import ToolEffectReconciliationRequired
+from cayu.runtime._tool_invocation.context import _restore_targeted_tool_invocation_event_authority
 from cayu.runtime._tool_round_executor import (
     ToolRoundFinishCutoffRequest,
     ToolRoundLimitRequest,
     ordered_tool_result_messages,
 )
-from cayu.runtime._tool_round_staging import _redactor_for_tool_calls
+from cayu.runtime._tool_round_staging import (
+    _redactor_for_tool_calls,
+    _ToolRoundPublicationCoordinator,
+)
 from cayu.runtime._work_attempt_session_mutation import (
     record_work_attempt_execution_stop,
 )
@@ -233,6 +238,7 @@ from cayu.runtime.tool_completion import (
 from cayu.sessions import _model_completion_publication as model_completion_publication
 from cayu.sessions import _pending_approval_reader as pending_approval_reader
 from cayu.sessions import _pending_tool_round_reader as pending_round_reader
+from cayu.sessions import _staged_tool_terminal_reader as staged_terminal_reader
 from cayu.sessions._checkpoint_mutations import (
     SessionRuntimePublicationConflict,
     runtime_publication_checkpoint_value_digest,
@@ -4160,7 +4166,79 @@ class SessionFinalization:
         tool_round_identity: ToolRoundIdentity,
         execution_profile: ExecutionProfileIdentity | None,
     ) -> AsyncGenerator[Event, None]:
+        source_checkpoint, publication_round = await pending_round_reader.load_pending_tool_round(
+            self.session_store,
+            session.id,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+            runtime_session=session,
+        )
+        if (
+            publication_round is None
+            or ToolRoundIdentity(
+                tool_round_id=publication_round.tool_round_id,
+                model_step_id=publication_round.model_step_id,
+                model_attempt_id=publication_round.model_attempt_id,
+            )
+            != tool_round_identity
+        ):
+            raise RuntimeError("Pending approval round changed before limit closure.")
+        completed_tool_outcomes = list(completed_tool_outcomes)
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
+        pending_calls = {call.tool_call_id: call for call in publication_round.tool_calls}
+        coordinator = _ToolRoundPublicationCoordinator(
+            session_id=session.id,
+            session_instance_id=session.instance_id,
+            run_epoch=session.run_epoch,
+            tool_round_identity=tool_round_identity,
+            session_store=self.session_store,
+            redactor=self._secret_redactor,
+            execution_profile=execution_profile,
+            tool_exposure=publication_round.tool_exposure,
+            clock=self._clock,
+        )
+        # Staged terminals already own call outcomes, even before their public
+        # append. Publish them before deciding which calls a limit may skip.
+        for staged in staged_terminal_reader.staged_terminal_records(publication_round):
+            if staged.tool_call_id in completed_ids:
+                continue
+            if staged.hooks_state != "completed":
+                # Like ordinary approval recovery, do not replay hooks whose
+                # invocation-secret scope was lost with the worker.
+                await self.session_store.transform_checkpoint(
+                    session.id,
+                    tool_round_recovery.completed_staged_terminal_transform(
+                        tool_round_identity=tool_round_identity,
+                        event=tool_round_recovery.hook_scope_unavailable_recovery_event(
+                            staged.event
+                        ),
+                    ),
+                )
+                staged = next(
+                    item
+                    for item in staged_terminal_reader.checkpoint_staged_terminals(
+                        await self.session_store.load_checkpoint(session.id),
+                        tool_round_identity=tool_round_identity,
+                    )
+                    if item.tool_call_id == staged.tool_call_id
+                )
+            staged = await coordinator.start_publication(staged)
+            pending_call = pending_calls[staged.tool_call_id]
+            terminal = _restore_targeted_tool_invocation_event_authority(
+                coordinator.restore_started_publication_authority(staged),
+                approval_support.tool_call_request_from_pending(pending_call),
+                redactor=self._secret_redactor,
+            )
+            terminal = event_with_runtime_payload_authority(terminal, "approval_id")
+            yield await self._event_writer.emit(terminal)
+            coordinator.terminal_published(terminal.id)
+            completed_tool_outcomes.append(
+                resume_ledger.tool_call_outcome_from_terminal_event(
+                    event=terminal,
+                    pending_tool_call=pending_call,
+                )
+            )
+            completed_ids.add(staged.tool_call_id)
         remaining_tool_calls = [
             tool_call for tool_call in tool_calls if tool_call.id not in completed_ids
         ]
@@ -4169,16 +4247,8 @@ class SessionFinalization:
             decision=decision,
             tool_round_identity=tool_round_identity,
         )
-        source_checkpoint, publication_round = await pending_round_reader.load_pending_tool_round(
-            self.session_store,
-            session.id,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-            runtime_session=session,
-        )
         legacy_publication_scope = (
-            publication_round is not None
-            and publication_round.assistant_message_state == "quarantined"
+            publication_round.assistant_message_state == "quarantined"
             and publication_round.assistant_publication is None
         )
         # A gating call a person approved with changes is told so even when a
@@ -4274,7 +4344,10 @@ class SessionFinalization:
             tool_round_identity=tool_round_identity,
         )
         tool_result_messages = ordered_tool_result_messages(
-            tool_calls,
+            [
+                approval_support.tool_call_request_from_pending(call)
+                for call in pending_round.tool_calls
+            ],
             [*completed_tool_outcomes, *skipped_outcomes],
             parallel=True,
             tool_round_identity=tool_round_identity,
