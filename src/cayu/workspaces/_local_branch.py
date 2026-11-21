@@ -4145,6 +4145,13 @@ class LocalWorkspaceBranch(WorkspaceBranch):
 
     @property
     def resource_key(self) -> tuple[object, ...]:
+        if self._durable is not None:
+            return (
+                "local-workspace-branch",
+                self._source_key,
+                self._branch_id,
+                str(self._private_root),
+            )
         return ("local-workspace-branch", self._source_key, self._branch_id)
 
     def bounded_read_limit(self, max_bytes: int) -> int:

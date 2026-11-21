@@ -1352,6 +1352,7 @@ def test_fresh_owner_recovers_open_branch_and_private_changes(
 
         assert recovered.state is WorkspaceBranchDurableState.OPEN
         assert recovered.branch is not None
+        assert recovered.branch.resource_key == branch.resource_key
         assert await recovered.branch.read_bytes("kept.txt") == await branch.read_bytes("kept.txt")
         assert (await recovered.branch.read_bytes("created.txt")).content == b"created"
         with pytest.raises(FileNotFoundError):
