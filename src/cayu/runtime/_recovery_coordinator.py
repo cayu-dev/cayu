@@ -2356,6 +2356,38 @@ class RecoveryCoordinator:
                 redactor=self._secret_redactor,
                 runtime_session=_current_session,
             )
+            if profile_adoption is not None:
+                # Retained recovery authority must move with the active profile
+                # in the same claim, so an interruption remains exactly retryable.
+                profile_update = {
+                    "execution_profile_fingerprint": execution_profile_snapshot.profile.fingerprint
+                }
+                pending_approval = pending_approval.model_copy(update=profile_update)
+                pending_round = pending_round.model_copy(update=profile_update)
+                approval_payload = pending_approval.model_dump(mode="json")
+                claimed_checkpoint = copy_durable_record(claimed_checkpoint, "checkpoint")
+                claimed_checkpoint[pending_approval_reader.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY] = (
+                    approval_payload
+                )
+                claimed_checkpoint[pending_rounds.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
+                    pending_round.model_dump(mode="json")
+                )
+                if (
+                    current_intent is not None
+                    and current_intent.reviewed_approval_digest is not None
+                ):
+                    # Preserve the accepted request and arguments while rebinding
+                    # its validated content binding to the adopted approval.
+                    current_intent = current_intent.model_copy(
+                        update={
+                            "reviewed_approval_digest": runtime_publication_checkpoint_value_digest(
+                                approval_payload
+                            )
+                        }
+                    )
+                    claimed_checkpoint[
+                        pending_approval_reader.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY
+                    ] = current_intent.model_dump(mode="json")
             if current_intent is not None:
                 claimed_intent = current_intent
                 if foreground_gate is not None:

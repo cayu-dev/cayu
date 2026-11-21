@@ -555,3 +555,54 @@ def test_a_retried_edit_is_checked_with_the_arguments_its_claim_pinned(monkeypat
             )
         )
     assert tool.calls == []
+
+
+@pytest.mark.parametrize("claimed_before_upgrade", [False, True])
+def test_reviewed_approval_remains_bound_and_retryable_after_adoption(
+    monkeypatch, claimed_before_upgrade: bool
+) -> None:
+    from tests.core.test_human_review import (
+        CONTEXT,
+        ReviewPolicy,
+        decision,
+        make_app,
+        pause,
+        resolve,
+    )
+
+    async def scenario() -> None:
+        store = _StopBeforeDispatch()
+        _use_cayu(monkeypatch, "0.15.0")
+        original, _, original_tool = make_app(store, ReviewPolicy(), approval=True)
+        upgraded = None
+        try:
+            await pause(original)
+            view = await original.inspect_human_review("review-session", context=CONTEXT)
+            assert view.status == "permitted"
+            request = decision(view, approval=True)
+            if claimed_before_upgrade:
+                interrupted = await resolve(original, request)
+                assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+                assert original_tool.calls == []
+                store.stopped = False
+            await original.aclose()
+
+            _use_cayu(monkeypatch, "0.16.0")
+            upgraded, _, tool = make_app(store, ReviewPolicy(), approval=True, resumed=True)
+            interrupted = await resolve(upgraded, request)
+            assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
+            assert len(_decided(interrupted)) == 1
+            assert tool.calls == []
+
+            # Neither a new review nor a new resolution may be needed after
+            # the accepted approval's profile and content binding move together.
+            completed = await resolve(upgraded, request)
+            assert completed[-1].type is EventType.SESSION_COMPLETED
+            assert _decided(completed) == []
+            assert tool.calls == [{"value": "morning"}]
+        finally:
+            if upgraded is not None:
+                await upgraded.aclose()
+            await original.aclose()
+
+    asyncio.run(scenario())
