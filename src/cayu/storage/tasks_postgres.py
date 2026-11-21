@@ -5712,6 +5712,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                 )
                 reclaimed: list[Task] = []
                 if not fenced:
+                    # Transitions retain shared event-budget locks until commit.
+                    # Prelock them in canonical order across filtered batches.
+                    event_keys = {
+                        task.invocation.event_retry_key
+                        for task in expired
+                        if task.invocation.event_retry_key is not None
+                    }
+                    for event_key in sorted(event_keys):
+                        await self._lock_verified_work_identity(cur, "retry-key", event_key)
                     now = rows[0][-1] if rows else None
                     for task in expired:
                         assert now is not None
