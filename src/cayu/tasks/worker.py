@@ -2260,12 +2260,9 @@ async def _await_task_handler(
 
     async def invoke_handler() -> TaskHandlerOutcome | TaskRetryAttemptReport | None:
         from cayu.deadlines import task_event_deadline_scope
+        from cayu.knowledge.access import session_knowledge_labels
         from cayu.resource_access import execution_access
 
-        if task.invocation.access_labels and task.invocation.resource_access is None:
-            from cayu._resource_access_errors import ResourceAccessDenied
-
-            raise ResourceAccessDenied()
         if event_dispatch_deadline is not None and time_limit is not None:
             # Task scheduling and access admission consume the existing budget;
             # entering the cancellation owner must not start that duration again.
@@ -2290,7 +2287,9 @@ async def _await_task_handler(
                 kind="tasks",
             ),
         ):
+            # A task runs as its labels: knowledge scopes pin it to them, bound or not.
             with (
+                session_knowledge_labels(task.invocation.access_labels),
                 cancellation.signal.bind(),
                 default_run_deadline(
                     ExecutionDeadline.after(None, source="task_worker")

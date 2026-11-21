@@ -40,7 +40,7 @@ def creation_invocation(invocation, request, parent):
     access = _creation.get()
     execution = execution_active.get()
     if access is None and execution is None:
-        return invocation
+        return _labelled_invocation(invocation, request)
     if request.concurrency_key is not None or request.retry_key is not None:
         # Keys arbitrate store-wide resources. Only the trusted, unscoped host
         # may choose their namespace; caller-supplied tenant prefixes are not authority.
@@ -61,6 +61,32 @@ def creation_invocation(invocation, request, parent):
             raise ResourceAccessDenied()
         if invocation.resource_access != execution.binding:
             raise ResourceAccessDenied()
+    # Admitted work runs as the labels it was admitted with: a task may restate them only.
+    if any(labels.get(key) != value for key, value in request.labels.items()):
+        raise ResourceAccessDenied()
+    return TaskInvocation.model_validate({**invocation.model_dump(), "access_labels": labels})
+
+
+def _labelled_invocation(invocation, request):
+    """``invocation`` carrying the labels a task created with no member binding runs as.
+
+    It keeps its parent task's labels and takes those of the session creating it (an inner
+    session's over an outer one's, as knowledge reads see them), so a worker that runs it
+    later is pinned as they are; ``request.labels`` (operator code naming the task's
+    organization) add to them. Created with none of these, it has none. A store can't tell
+    which keys each knowledge scope pins, so a session label that differs from the parent
+    task's, or a request label that changes any inherited one, is refused: that covers every
+    pinned key.
+    """
+
+    from cayu.knowledge.access import inherited_session_labels, running_session_labels
+    from cayu.sessions.invocation import TaskInvocation
+
+    parent = invocation.access_labels
+    inherited = inherited_session_labels(parent, running_session_labels(), parent)
+    labels = inherited_session_labels(inherited, request.labels, inherited)
+    if labels == parent:
+        return invocation
     return TaskInvocation.model_validate({**invocation.model_dump(), "access_labels": labels})
 
 
@@ -286,14 +312,14 @@ def require_collection(receipt):
 def graph_access_invocation(tasks):
     values = list(tasks)
     first = values[0].invocation
-    if not first.access_labels and first.resource_access is None:
-        return None
     if any(
         task.invocation.access_labels != first.access_labels
         or task.invocation.resource_access != first.resource_access
         for task in values
     ):
         raise ResourceAccessDenied()
+    if not first.access_labels and first.resource_access is None:
+        return None
     return first
 
 

@@ -45,6 +45,19 @@ def session_knowledge_labels(labels: Mapping[str, str]) -> Iterator[None]:
         _session_labels.reset(token)
 
 
+def running_session_labels() -> dict[str, str]:
+    """The labels of the sessions whose work is running here, an inner one's over an outer's.
+
+    Work they start for later, such as a task, carries these so whoever runs it is pinned
+    as they are.
+    """
+
+    labels: dict[str, str] = {}
+    for frame in _session_labels.get():
+        labels.update(frame)
+    return labels
+
+
 def inherited_session_labels(
     parent_labels: Mapping[str, str],
     labels: Mapping[str, str],

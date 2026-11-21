@@ -133,7 +133,13 @@ no `organization`, or another one's, whatever the model asked for. Outside a con
 all their organizations' knowledge. Work the application starts itself for an organization,
 with no member behind it (`app.run` with the conversation's labels, a schedule, an operator
 task), is pinned the same way by its own `organization` label: its recall and knowledge tools
-get that organization's knowledge only. Operator and background work with no `organization`
+get that organization's knowledge only. A task keeps its labels on its own record
+(`TaskInvocation.access_labels`), so the worker that runs it later, and the session it runs, are
+pinned by them. One created inside a conversation, by a tool or a task store, takes the
+conversation's labels; a child task takes its parent's; operator code names them with
+`TaskCreate(labels={"organization": ...})`; a replay keeps its source's. A label that changes
+one the task inherits, or a conversation's label that differs from its parent task's, is refused
+(`ResourceAccessDenied`); labels it adds are its own. Operator and background work with no `organization`
 label isn't narrowed: curate one organization at a time with `cayu knowledge list --status
 pending --label organization=ID`. What it writes is checked, though: an active or pending
 entry written through a scope with `session_label_keys` must carry each of those labels,

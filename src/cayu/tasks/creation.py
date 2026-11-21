@@ -19,7 +19,12 @@ from pydantic import (
 )
 
 from cayu._clock import normalize_utc_datetime
-from cayu._validation import copy_durable_json_object, copy_durable_metadata, revalidate_model_input
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_durable_metadata,
+    copy_label_map,
+    revalidate_model_input,
+)
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu._validation import require_durable_nonblank as require_nonblank
 from cayu.sessions.invocation import (
@@ -142,6 +147,11 @@ class TaskCreate(BaseModel):
     )
     work_contract: WorkContractRef | None = None
     invocation_origin: InvocationOriginClaim | None = None
+    #: Labels the task runs as, kept on its invocation (``TaskInvocation.access_labels``).
+    #: Knowledge scopes pin a worker running it to them as they pin a session to its own.
+    #: A task created inside a session already carries that session's labels; these may
+    #: add to them but not change one.
+    labels: dict[str, str] = Field(default_factory=dict, exclude_if=lambda value: not value)
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: TaskExecutionSource | None = PrivateAttr(default=None)
     _runtime_session_binding: SessionInvocationBinding | None = PrivateAttr(default=None)
@@ -179,6 +189,11 @@ class TaskCreate(BaseModel):
     @classmethod
     def validate_retry_key(cls, value: str | None) -> str | None:
         return None if value is None else validate_task_retry_key(value)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_labels(cls, value: object) -> dict[str, str]:
+        return copy_label_map(value, "labels", allow_reserved=False)
 
     @field_validator("retry_budget", mode="before")
     @classmethod
@@ -320,6 +335,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         retry_budget=copy_task_retry_budget(request.retry_budget),
         work_contract=copy_work_contract_ref(request.work_contract),
         invocation_origin=copy_invocation_origin_claim(request.invocation_origin),
+        labels=request.labels,
     )
     copied._verified_invocation_origin = (
         None

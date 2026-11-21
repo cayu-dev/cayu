@@ -35,6 +35,7 @@ from cayu.execution_profiles import (
     changed_execution_profile_components,
     unavailable_execution_profile_components,
 )
+from cayu.knowledge.access import inherited_session_labels
 from cayu.messages import Message
 from cayu.providers.retry_policy import RetryPolicy
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
@@ -229,6 +230,7 @@ class SessionPreparation:
         model_slot: Callable[[str], ModelSlotResolution | None] | None = None,
         model_slot_name: Callable[[str], str | None] | None = None,
         session_settings: Callable[[ToolPolicy], dict[str, Any] | None] | None = None,
+        knowledge_label_keys: Callable[[], tuple[str, ...]] = tuple,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -265,6 +267,7 @@ class SessionPreparation:
         self._model_slot = model_slot
         self._model_slot_name = model_slot_name
         self._session_settings = session_settings
+        self._knowledge_label_keys = knowledge_label_keys
 
     def resolve_new_run_environment(
         self,
@@ -564,6 +567,19 @@ class SessionPreparation:
                     request,
                     source_task,
                 )
+                task_labels = source_task.invocation.access_labels
+                if (
+                    task_labels
+                    and source_task.invocation.resource_access is None
+                    and runtime_prepared_session_authority(request) is None
+                ):
+                    # A task's session runs as the task's labels, kept on its own record so
+                    # it stays pinned when resumed; a child session merges them with what it
+                    # took from its parent. A bound task's come from its binding.
+                    labels = inherited_session_labels(
+                        task_labels, request.labels, self._knowledge_label_keys()
+                    )
+                    request = request.model_copy(update={"labels": labels})
         # Freeze application-budget authority before any await can expose the
         # prepared invocation. The same snapshot must govern both the durable
         # execution profile and the model dispatch that follows it.

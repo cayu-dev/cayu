@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import canonical_durable_json_bytes, require_durable_clean_nonblank
+from cayu._validation import (
+    _RESERVED_LABEL_PREFIX,
+    canonical_durable_json_bytes,
+    require_durable_clean_nonblank,
+)
 from cayu.tasks.types import TaskTypeSpec, copy_task_type, task_input_validator
 
 if TYPE_CHECKING:
@@ -148,6 +152,7 @@ def prepare_creation_operation(
         ):
             raise TaskCreationConflict("Task replay source does not match the declared type.")
         prepared.input = source.input
+        prepared.labels = replay_labels(source, prepared.labels)
         prepared = copy_task_create(prepared)
     try:
         valid = task_input_validator(operation.declaration).is_valid(prepared.input)
@@ -156,6 +161,30 @@ def prepare_creation_operation(
     if not valid:
         raise ValueError("Task input does not match its declared schema.")
     return prepared
+
+
+def replay_labels(source: Task, labels: dict[str, str]) -> dict[str, str]:
+    """The labels a replay of ``source`` created with no member binding runs as.
+
+    It is the same work again, so it keeps the source's labels (all but runtime-reserved
+    ones) and may add to them, as a child task does. Admitted work's replays take the
+    labels it was admitted with instead.
+    """
+
+    from cayu.knowledge.access import inherited_session_labels
+    from cayu.resource_access import current_binding
+    from cayu.tasks.access import _creation
+
+    if source.invocation.resource_access is not None or (
+        current_binding() is not None or _creation.get() is not None
+    ):
+        return labels
+    inherited = {
+        key: value
+        for key, value in source.invocation.access_labels.items()
+        if not key.startswith(_RESERVED_LABEL_PREFIX)
+    }
+    return inherited_session_labels(inherited, labels, inherited)
 
 
 def verify_creation_receipt(

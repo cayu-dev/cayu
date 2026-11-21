@@ -1731,6 +1731,7 @@ class CayuApp(
             model_slot=self._session_model_slot,
             model_slot_name=self._model_slot_name,
             session_settings=self._session_settings,
+            knowledge_label_keys=lambda: pinned_label_keys(self.knowledge_access_scope),
         )
 
         self._session_tasks = SessionTaskLifecycle(

@@ -977,3 +977,321 @@ def test_a_child_run_admitted_outside_its_parent_keeps_the_parents_organization(
             await app.aclose()
 
     asyncio.run(run())
+
+
+async def _close_stores(*stores) -> None:
+    for store in stores:
+        close = getattr(store, "close", None)
+        if close is not None:
+            await close()
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_task_created_in_an_organizations_session_is_pinned_when_a_worker_runs_it(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    """A tool in an organization's session creates tasks, with no member binding, and a
+    worker runs them later with no session around it. Each task carries the session's labels
+    on its own record, so its knowledge stays pinned to the organization, and so does a
+    child task it creates. A label of its own may add to them; one naming another
+    organization is refused and nothing is created."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.requests import RunRequest
+    from cayu.tasks import TaskCreate
+    from cayu.tasks.worker import run_task_worker
+    from cayu.tools import Tool, ToolResult, ToolSpec
+
+    session_labels = {"organization": "acme", "purpose": "digest"}
+    refused: list[str] = []
+    seen: dict[str, set[str]] = {}
+
+    async def run() -> None:
+        knowledge = _store(backend, request, _scope(), postgres_fixture="postgres_test_dsn")
+        sessions, tasks = _session_and_task_stores(backend, request)
+
+        def build() -> CayuApp:
+            return CayuApp(
+                session_store=sessions,
+                task_store=tasks,
+                knowledge_store=knowledge,
+                enable_logging=False,
+            )
+
+        app = build()
+
+        class FilesDigests(Tool):
+            spec = ToolSpec(
+                name="file_digests",
+                description="Queue digest work.",
+                input_schema={"type": "object", "properties": {}},
+                execution_profile_identity=_identity("file-digests"),
+                max_terminal_payload_bytes=1024,
+            )
+
+            async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+                await tasks.create_task(TaskCreate(task_id="digest", type="digest"))
+                await app.create_task(
+                    TaskCreate(task_id="emailed", type="digest", labels={"channel": "email"})
+                )
+                try:
+                    await app.create_task(
+                        TaskCreate(
+                            task_id="foreign", type="digest", labels={"organization": "globex"}
+                        )
+                    )
+                except ResourceAccessDenied:
+                    refused.append("foreign")
+                return ToolResult(content="queued")
+
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="file", name="file_digests", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="model"), tools=[FilesDigests()])
+        try:
+            await _seed_both_organizations(knowledge)
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="acme-session",
+                    labels=session_labels,
+                    messages=[Message.text("user", "queue the digests")],
+                )
+            ):
+                pass
+            assert refused == ["foreign"]
+            assert await tasks.load_task("foreign") is None
+            assert (await tasks.load_task("digest")).invocation.access_labels == session_labels
+            assert (await tasks.load_task("emailed")).invocation.access_labels == {
+                **session_labels,
+                "channel": "email",
+            }
+
+            # A worker, in a process of its own, runs them later.
+            worker = build()
+
+            async def handler(app, task, worker_id) -> None:
+                seen[task.id] = await _readable(knowledge)
+                if task.id == "digest":
+                    await app.create_task(
+                        TaskCreate(task_id="follow-up", type="digest", parent_task_id=task.id)
+                    )
+
+            handled = await run_task_worker(worker, tasks, handler, worker_id="worker", max_tasks=3)
+            assert handled == 3
+            assert seen == {
+                "digest": {"acme-invoices"},
+                "emailed": {"acme-invoices"},
+                "follow-up": {"acme-invoices"},
+            }
+            assert (await tasks.load_task("follow-up")).invocation.access_labels == session_labels
+        finally:
+            await _close(knowledge)
+            await _close_stores(sessions, tasks)
+
+    asyncio.run(run())
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_operator_tasks_labelled_with_an_organization_get_only_its_knowledge(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    """Operator code creates a task for one organization by naming its labels; the worker
+    running it, and the session it runs, are pinned to that organization. A task with no
+    session and no labels reads every organization's knowledge, as before."""
+
+    from cayu import AgentSpec, CayuApp, Message
+    from cayu.evals import ScriptedModelProvider
+    from cayu.providers import ModelStreamEvent
+    from cayu.sessions.requests import RunRequest
+    from cayu.tasks import TaskCreate
+    from cayu.tasks.worker import run_task_worker
+    from cayu.tools import Tool, ToolResult, ToolSpec
+
+    seen: dict[str, set[str]] = {}
+
+    async def run() -> None:
+        knowledge = _store(backend, request, _scope(), postgres_fixture="postgres_test_dsn")
+        sessions, tasks = _session_and_task_stores(backend, request)
+
+        class LooksUp(Tool):
+            spec = ToolSpec(
+                name="look_up",
+                description="Look up invoice knowledge.",
+                input_schema={"type": "object", "properties": {}},
+                execution_profile_identity=_identity("look-up"),
+                max_terminal_payload_bytes=1024,
+            )
+
+            async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+                seen["agent-session"] = await _readable(knowledge)
+                return ToolResult(content="ok")
+
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            knowledge_store=knowledge,
+            enable_logging=False,
+        )
+        app.register_provider(
+            ScriptedModelProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(id="look", name="look_up", arguments={}),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="model"), tools=[LooksUp()])
+
+        async def handler(app, task, worker_id) -> None:
+            seen[task.id] = await _readable(knowledge)
+            if task.type == "agent":
+                async for _event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="agent-session",
+                        task_id=task.id,
+                        task_worker_id=worker_id,
+                        task_lease_expires_at=task.lease_expires_at,
+                        messages=[Message.text("user", "look it up")],
+                    )
+                ):
+                    pass
+
+        try:
+            await _seed_both_organizations(knowledge)
+            globex = {"organization": "globex"}
+            report = await app.create_task(
+                TaskCreate(task_id="report", type="report", labels=globex)
+            )
+            assert report.invocation.access_labels == globex
+            plain = await app.create_task(TaskCreate(task_id="plain", type="report"))
+            assert plain.invocation.access_labels == {}
+            await app.create_task(TaskCreate(task_id="agent", type="agent", labels=globex))
+
+            handled = await run_task_worker(app, tasks, handler, worker_id="worker", max_tasks=3)
+            assert handled == 3
+            assert seen == {
+                "report": {"globex-invoices"},
+                "plain": {"acme-invoices", "globex-invoices"},
+                "agent": {"globex-invoices"},
+                "agent-session": {"globex-invoices"},
+            }
+            # The session the task ran carries its labels, so it stays pinned when resumed.
+            assert (await sessions.load("agent-session")).labels == globex
+        finally:
+            await _close(knowledge)
+            await _close_stores(sessions, tasks)
+
+    asyncio.run(run())
+
+
+def test_task_labels_restate_a_member_bindings_labels_only() -> None:
+    """Work admitted for a member runs as the labels it was admitted with: a task it creates
+    may restate them, and one that changes or adds a label is refused."""
+
+    from cayu.tasks import TaskCreate
+    from cayu.tasks.memory import InMemoryTaskStore
+
+    policy = MembershipAccessPolicy(_directory(), knowledge=True)
+
+    async def run() -> None:
+        tasks = InMemoryTaskStore()
+        labels = _labels("alice", "acme")
+        async with execution_access(await _binding(policy, "alice"), policy, labels, kind="tasks"):
+            same = await tasks.create_task(TaskCreate(type="digest", labels=labels))
+            assert same.invocation.access_labels == labels
+            for own in ({"organization": "globex"}, {"channel": "email"}):
+                with pytest.raises(ResourceAccessDenied):
+                    await tasks.create_task(TaskCreate(type="digest", labels=own))
+        assert len(await tasks.list_tasks()) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.store_semantics
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_task_labels_from_conflicting_sources_and_replays_stay_the_organizations(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    """A child task created inside another organization's session is refused rather than
+    taking either organization; a replay of an organization's task keeps its labels; and a
+    graph whose members carry different labels is refused whichever member comes first."""
+
+    from cayu import CayuApp
+    from cayu.tasks import TaskCreate
+    from cayu.tasks.graphs import TaskGraphCreate, TaskGraphNode
+    from cayu.tasks.operations import TaskCreationOperation, task_replay_source
+    from cayu.tasks.types import TaskTypeSpec
+
+    async def run() -> None:
+        sessions, tasks = _session_and_task_stores(backend, request)
+        app = CayuApp(session_store=sessions, task_store=tasks, enable_logging=False)
+        spec = TaskTypeSpec(name="digest", input_schema={"type": "object"})
+        app.register_task_type(spec)
+        acme = {"organization": "acme"}
+        try:
+            parent = await app.create_task(TaskCreate(task_id="parent", type="digest", labels=acme))
+            with (
+                session_knowledge_labels({"organization": "globex"}),
+                pytest.raises(ResourceAccessDenied),
+            ):
+                await app.create_task(
+                    TaskCreate(task_id="mixed", type="digest", parent_task_id=parent.id)
+                )
+            assert await tasks.load_task("mixed") is None
+            with session_knowledge_labels({**acme, "channel": "email"}):
+                child = await app.create_task(
+                    TaskCreate(task_id="child", type="digest", parent_task_id=parent.id)
+                )
+            assert child.invocation.access_labels == {**acme, "channel": "email"}
+
+            replay = TaskCreationOperation(
+                operation_id="replay", declaration=spec, replay_source=task_replay_source(parent)
+            )
+            replayed = await app.create_task_operation(
+                TaskCreate(task_id="replayed", type="digest"), replay
+            )
+            assert replayed.invocation.access_labels == acme
+
+            # Members sort by task id: a labelled one first, then an unlabelled one, and back.
+            for number, (a, b) in enumerate(((acme, {}), ({}, acme))):
+                nodes = tuple(
+                    TaskGraphNode(
+                        task=TaskCreate(task_id=f"g{number}-{key}", type="digest", labels=labels)
+                    )
+                    for key, labels in (("a", a), ("b", b))
+                )
+                with pytest.raises(ResourceAccessDenied):
+                    await tasks.create_task_graph(
+                        TaskGraphCreate(graph_id=f"mixed-{number}", nodes=nodes)
+                    )
+                assert await tasks.load_task(f"g{number}-a") is None
+        finally:
+            await app.aclose()
+            await _close_stores(sessions, tasks)
+
+    asyncio.run(run())

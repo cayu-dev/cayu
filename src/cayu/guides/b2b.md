@@ -206,7 +206,9 @@ enforces it, so no tool has to remember to filter:
   maintenance run takes `labels={"organization": ...}` for one organization. Work started
   without a member (`app.run`, schedules, operator tasks) is pinned by its own
   `organization` label the same way; operator and background work with no `organization`
-  label isn't narrowed.
+  label isn't narrowed. A task created inside a conversation keeps the conversation's labels
+  for the worker that runs it later; operator code gives one its organization with
+  `TaskCreate(labels={"organization": ...})`.
 - The web app's Knowledge area (`/app/knowledge`, `cayu guide app-ui`) shows each member what
   the Agent knows in their organizations, read through the same policy, and the suggestions
   waiting there. An organization's admins correct its statements or have them forgotten; the

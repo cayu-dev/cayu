@@ -7973,6 +7973,18 @@ classify trusted webhook and scheduled roots. Authenticated server and product
 boundaries mint `server_verified` origins internally; public request JSON cannot
 claim those sources or that trust level.
 
+`TaskInvocation.access_labels` are the labels a task runs as. Work admitted under a
+resource-access binding gives its tasks the labels it was admitted with, and
+`TaskCreate.labels` may only restate them. A task created without a binding takes its
+parent task's labels and those of the sessions running where it is created (an inner
+session's over an outer one's), and `TaskCreate.labels` may add to them; a session label
+that differs from the parent task's, or a request label that changes an inherited one, is
+refused (`ResourceAccessDenied`). A replay keeps its source's labels, except
+runtime-reserved ones. With none of these a task has no labels. Workers run a task's handler as its labels, so knowledge
+scopes' `session_label_keys` pin it with or without a binding, and a new session the task
+runs without a binding takes them under the same rule as a child session. Labels are
+fixed at creation: tasks stored before this rule keep the labels they have.
+
 `Task.id`, `Task.parent_task_id`, and `Task.session_id` remain the canonical
 task/session graph. Child tasks inherit their parent's exact root origin and
 invocation ID while their own source identifies the creation boundary. Claim,
