@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-11-12",
-  "generated_at": "2026-11-12",
+  "catalog_version": "2026-11-20",
+  "generated_at": "2026-11-20",
   "models": [
     {
       "aliases": [],
@@ -416,7 +416,7 @@
       "model": "gpt-5.5",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-29",
+        "as_of": "2026-11-20",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
