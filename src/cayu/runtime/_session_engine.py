@@ -4851,9 +4851,15 @@ class SessionEngine(BeforeStopPolicies):
         # execution profile has been frozen and any ordinary-resume drift has
         # been rejected. It remains before the durable status transition.
         try:
-            _require_native_structured_output_support(
-                request.structured_output, registered_provider=registered_provider
+            candidate_providers = (
+                (registered_provider,)
+                if model_failover is None
+                else model_failover.registered_providers
             )
+            for candidate_provider in candidate_providers:
+                _require_native_structured_output_support(
+                    request.structured_output, registered_provider=candidate_provider
+                )
         except (
             NativeStructuredOutputSchemaInvalid,
             NativeStructuredOutputUnsupported,
