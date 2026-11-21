@@ -3941,6 +3941,10 @@ export type AppManifest = {
      * Capabilities
      */
     capabilities: Array<CapabilityManifest>;
+    /**
+     * Connection Slots
+     */
+    connection_slots?: Array<ConnectionSlotManifest>;
     defaults: ApplicationDefaultsManifest;
     /**
      * Environments
@@ -3962,7 +3966,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '18';
+    schema_version?: '18' | '19';
     settings?: ManagedSettingsManifest | null;
     stores: StoreManifest;
 };
@@ -5834,6 +5838,30 @@ export type ConfigurationFieldProvenanceManifest = {
      * Source
      */
     source: 'framework' | 'application' | 'managed' | 'explicit';
+};
+
+/**
+ * ConnectionSlotManifest
+ *
+ * One declared connection slot: the connectors it expects and the scopes it needs.
+ */
+export type ConnectionSlotManifest = {
+    /**
+     * Connectors
+     */
+    connectors: Array<string>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Scopes
+     */
+    scopes: Array<string>;
 };
 
 /**

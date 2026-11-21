@@ -6,18 +6,21 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, TypeVar
 
 from cayu.connections import (
     CloudConnectionBroker,
     ConnectionCallError,
     ConnectionClient,
     ConnectionResponse,
+    ConnectionSlot,
     retry_after_seconds,
 )
 from cayu.tools._errors import invalid_tool_arguments_result
-from cayu.tools.base import ToolResult
+from cayu.tools.base import Tool, ToolResult
 from cayu.tools.policy import ApprovalFloorToolPolicy, ToolPolicy
+
+_T = TypeVar("_T", bound=Tool)
 
 #: The largest answer the model reads: a result's ``content``, in UTF-8 bytes.
 ANSWER_BUDGET_BYTES = 60 * 1024
@@ -52,6 +55,18 @@ _ADVICE = {
 }
 TEMPORARY = "A temporary failure; retry later."
 _RATE_LIMITED = "Too many calls; retry after {delay}."
+
+
+def declaring(
+    tool: _T, slot: str, *, connectors: tuple[str, ...], scopes: tuple[str, ...], description: str
+) -> _T:
+    """``tool``, declaring the slot it calls through: the toolkit's connectors, the scopes the
+    tool needs and the toolkit's description (``Tool.connection_slots``)."""
+
+    tool.connection_slots = (
+        ConnectionSlot(name=slot, connectors=connectors, scopes=scopes, description=description),
+    )
+    return tool
 
 
 def resolved_client(client: ConnectionClient | None) -> ConnectionClient | None:

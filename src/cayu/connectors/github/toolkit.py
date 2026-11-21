@@ -38,6 +38,10 @@ from cayu.tools.policy import ToolPolicy
 
 #: The longest comment GitHub accepts.
 MAX_COMMENT_CHARACTERS = 65_536
+#: The Cayu Cloud connectors a slot of these tools may be bound to.
+CONNECTORS = ("github-app",)
+#: The permission every GitHub App token holds.
+METADATA_SCOPE = "metadata:read"
 
 READ_PULL = "github_read_pull"
 LIST_PULLS = "github_list_pulls"
@@ -118,10 +122,11 @@ def tools(
 
     resolved = _common.resolved_client(client)
     gh = None if resolved is None else GitHubClient(resolved, slot)
+    writes_through = slot if write_slot is None else write_slot
     allowed = None if repositories is None else _allowed(repositories)
     kinds: tuple[type[_GitHubTool], ...] = (_ReadPull, _ListPulls, _ReadIssue, _ReadJobLog)
     reads = None if gh is None else gh.read_only_view()
-    made: list[Tool] = [kind(reads, allowed, reviewer_app) for kind in kinds]
+    made: list[_GitHubTool] = [kind(reads, allowed, reviewer_app) for kind in kinds]
     if include_writes is True:
         writes = gh
         if resolved is not None and write_slot is not None and write_slot != slot:
@@ -129,7 +134,16 @@ def tools(
         made.append(_Comment(writes, allowed, reviewer_app, plain=plain_comments))
         kinds = (_RerunFailedJobs, _UpdateBranch, _MergePull)
         made.extend(kind(writes, allowed, reviewer_app) for kind in kinds)
-    return made
+    return [
+        _common.declaring(
+            tool,
+            writes_through if tool.EFFECT is not ToolEffect.NONE else slot,
+            connectors=CONNECTORS,
+            scopes=(METADATA_SCOPE, *tool.SCOPES),
+            description="GitHub repositories, pull requests and issues",
+        )
+        for tool in made
+    ]
 
 
 def approval_policy(inner: ToolPolicy | None = None) -> ToolPolicy:
@@ -207,6 +221,8 @@ class _GitHubTool(Tool):
     PROPERTIES: ClassVar[dict[str, Any]]
     REQUIRED: ClassVar[tuple[str, ...]]
     EFFECT: ClassVar[ToolEffect] = ToolEffect.NONE
+    #: The GitHub App permissions the tool's calls need, beside ``metadata:read``.
+    SCOPES: ClassVar[tuple[str, ...]] = ()
     #: How to tell whether a write that failed ambiguous took effect.
     CHECK: ClassVar[str] = "check whether it did"
 
@@ -536,6 +552,14 @@ def _pull(facts: PullRequestFacts, limit: int) -> dict[str, Any]:
 
 class _ReadPull(_GitHubTool):
     NAME = READ_PULL
+    SCOPES = (
+        "actions:read",
+        "checks:read",
+        "contents:read",
+        "issues:read",
+        "pull_requests:read",
+        "statuses:read",
+    )
     DESCRIPTION = (
         "Read a pull request's facts: state, labels, head commit, mergeability, how far behind "
         "its base, CI checks (failed ones with their job_id and run_id), standing reviews and "
@@ -568,6 +592,7 @@ class _ReadPull(_GitHubTool):
 
 class _ListPulls(_GitHubTool):
     NAME = LIST_PULLS
+    SCOPES = ("actions:read", "checks:read", "pull_requests:read", "statuses:read")
     DESCRIPTION = (
         "List a repository's pull requests, most recently updated first: number, title, "
         "author, labels, head commit, mergeability, CI state with failed check names and "
@@ -626,6 +651,7 @@ class _ListPulls(_GitHubTool):
 
 class _ReadIssue(_GitHubTool):
     NAME = READ_ISSUE
+    SCOPES = ("issues:read",)
     DESCRIPTION = (
         "Read an issue, or a pull request's conversation, by number: title, state, labels, "
         "body and its newest comments."
@@ -697,6 +723,7 @@ async def _newest_comments(
 
 class _ReadJobLog(_GitHubTool):
     NAME = READ_JOB_LOG
+    SCOPES = ("actions:read",)
     DESCRIPTION = (
         "Read the end of a GitHub Actions job's log, by the job_id github_read_pull gives a "
         "failed check."
@@ -744,6 +771,7 @@ class _ReadJobLog(_GitHubTool):
 
 class _Comment(_GitHubTool):
     NAME = COMMENT
+    SCOPES = ("issues:write",)
     DESCRIPTION = (
         "Comment on a pull request or an issue, in GitHub Markdown. It may need a person's "
         "approval first."
@@ -779,6 +807,7 @@ class _Comment(_GitHubTool):
 
 class _RerunFailedJobs(_GitHubTool):
     NAME = RERUN_FAILED_JOBS
+    SCOPES = ("actions:write",)
     DESCRIPTION = (
         "Rerun the failed jobs of a GitHub Actions workflow run, by the run_id github_read_pull "
         "gives a failed check. It may need a person's approval first."
@@ -817,6 +846,7 @@ class _RerunFailedJobs(_GitHubTool):
 
 class _UpdateBranch(_GitHubTool):
     NAME = UPDATE_BRANCH
+    SCOPES = ("pull_requests:write",)
     DESCRIPTION = (
         "Merge a pull request's base branch into its head branch, when the head is still "
         "head_sha. GitHub does it shortly after accepting. It may need a person's approval first."
@@ -840,6 +870,7 @@ class _UpdateBranch(_GitHubTool):
 
 class _MergePull(_GitHubTool):
     NAME = MERGE_PULL
+    SCOPES = ("contents:write", "pull_requests:write")
     DESCRIPTION = (
         "Merge a pull request, only if its head is still head_sha. merge_method defaults to "
         "a merge commit. It may need a person's approval first."

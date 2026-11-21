@@ -16,8 +16,9 @@ policy for their write tools and an argument-review preset ([connector toolkits]
 `cayu.connectors.github` is a client for code on a `github` slot, with local token and GitHub
 App credentials, and on Cloud a `github-app` connection bound with its repositories.
 They take their client as an argument until `ToolContext.connections` exists. Model slots are
-built ([Models](#models)). Connection slot declarations, the manifest document,
-`ToolContext.connections` and MCP through a slot are still proposals.
+built ([Models](#models)), and so are connection slot declarations ([Declarations](#declarations)).
+`ToolContext.connections`, tool-level slot requirements and MCP through a slot are still
+proposals.
 
 ## Decision summary
 
@@ -47,20 +48,46 @@ Checked at `110b2ab40`:
 
 ## Declarations
 
+Built.
+
 ```python
-app.require_connection("mailbox", connector="gmail", scopes=["gmail.send", "gmail.readonly"])
-app.require_connection("warehouse", connector="snowflake", optional=True)
+app.register_agent(spec, tools=sap.tools(slot="sap"))  # declares sap: SAP's connectors, its reads
+app.require_connection("mailbox", connectors=("gmail",), scopes=("gmail.readonly",))
 ```
 
-- `ConnectionRequirement(slot, connector, scopes, optional)` is a frozen model, beside the built
-  `ModelSlot` ([Models](#models)). Slot names are 1-63 lowercase letters, digits or interior
-  hyphens, unique across connection and model slots.
-- The manifest carries `manifest["connections"]`, a sorted `cayu.connection-requirements/v1`
-  document with its own digest, assembled like `managed_settings_schema_document`, so Cloud
-  reads it the way it reads `settings`. It holds no credential and no Organization name.
-- The first slice declares slots at the application level only. A tool-level
-  `ToolExecutionRequirement` alternative of kind `connection` (a tool offered only while its slot
-  is bound) follows once a host reports slot state.
+- **From tools.** A tool carries the slots it calls through (`Tool.connection_slots`); each
+  built-in connector toolkit sets its slot, its connectors, the scopes that tool needs and a
+  description, and `register_agent` declares them from `tools` and `proposal_tools` once the
+  agent registers. One slot from several tools takes their scopes together, the connectors
+  both accept (none accepts any) and the description of the first tool registered with it, in
+  registration order; tools whose connectors share none are refused, naming both. That refusal
+  comes first: an application's own declaration can't reconcile them, so such toolkits need
+  their own slots. A package's own toolkit sets the attribute the same way.
+- **Declaration.** `CayuApp.require_connection(slot, *, connectors=(), scopes=(),
+  description=None)` declares a connection slot (`cayu.connections.ConnectionSlot`, frozen).
+  `connectors` are the connector ids a connection bound to it may be for (at most 16; none
+  accepts any), `scopes` the scopes its calls need (at most 64, each 1-128 printable characters
+  without spaces) and `description` one line of at most 200 characters. Slot names follow the
+  slot rule, are declared once and are unique across connection and model slots; an
+  application declares at most 64, from tools and declarations together. For a slot tools
+  declare too, a declaration's connectors and description win where it gives them and the
+  scopes are both's. A declaration holds no credential and no Organization name, and one that
+  contains a secret is refused.
+- **What it decides.** Nothing at run time: it tells the people binding the Agent's slots which
+  slots it reads, which connectors fit each one and which scopes to grant. The broker serves
+  whatever a slot is bound to, with the binding's scopes, and a slot nobody declared can still
+  be bound and called.
+- **Publication.** The agent registry registration carries `connection_slots` (`[{"name",
+  "connectors", "scopes", "description"?}]`, lists sorted), left out when the Release declares
+  none. A 422 `connection_slots_invalid` (or another part's refusal whose `detail.also` names
+  it) keeps the rest of the registration, and the process registers without them from then on.
+  A Cayu Cloud from before connection slots refuses the whole registration for the unknown
+  field (`registration_invalid` on `registration`, naming it); the process then registers
+  without the field named, and so on for model slots against a Cloud older still. Either way they stay out until the process restarts.
+  The app manifest (schema 19) lists `connection_slots`, left out when there are none; a schema
+  18 manifest, recorded before them, still loads and declares none.
+- **Later.** A tool-level `ToolExecutionRequirement` alternative of kind `connection` (a tool
+  offered only while its slot is bound) follows once a host reports slot state.
 
 ## ConnectionClient
 
@@ -190,7 +217,9 @@ app.register_agent(triage_spec, model_slot="fast")
   a slot named after the agent (`_` as `-`, as Cloud moves its stored value there), declared
   with the agent's own model as its default; a bound slot wins over the setting's value, and
   `cayu check` reports `MODEL_SETTING_DEPRECATED`. Declaring a slot with `require_model` that is
-  such an agent's slot name is refused. `ModelPolicyController`,
+  such an agent's slot name is refused. When that name is already a model slot or a connection
+  slot (its own tools', earlier agents' or a `require_connection`), the agent gets no slot and
+  keeps its setting's value. `ModelPolicyController`,
   `CayuApp(model_policy=...)` and `CAYU_MODEL_POLICY_CONFIG` are deprecated and removed in the
   next release. `CAYU_MODEL` keeps working until the scaffolds no longer need it; `cayu new`
   declares a `primary` slot whose default is the agent's model.

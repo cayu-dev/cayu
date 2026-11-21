@@ -27,6 +27,33 @@ tools with the toolkits' `approval_policy()`, as above, so a person approves eac
 `write_slot` to one whose role can write. A team may name the same slot for both. Slack keeps one
 slot: the broker already checks each method against the binding's scopes.
 
+Each toolkit's tools declare the slots they call through, so registering them is all it takes
+for Cayu Cloud to offer those slots when an admin binds the Agent's, with the toolkit's
+connectors and the scopes the chosen tools need
+([Declarations](adr/0003-connections-runtime-contract.md#declarations)):
+
+| Toolkit | Connectors | Scopes the tools need |
+| --- | --- | --- |
+| `sap` | `sap`, `sap-certificate`, `sap-sandbox` | each named read's service (`API_SUPPLIERINVOICE_PROCESS_SRV.read`, ...); `sap_read` names none |
+| `slack` | `slack` | `channels:read`, `channels:history`, `users:read`, `users:read.email` (looking a person up by email); writes add `chat:write` |
+| `snowflake` | `snowflake` | none (the role decides); `write_slot` is declared for `snowflake_execute` |
+| `github` | `github-app` | `metadata:read` and each tool's permissions (`github_read_pull` also `contents:read` and `actions:read`, `github_list_pulls` also `actions:read`); the write tools' on `write_slot` |
+
+When tools of several toolkits share a slot, the declaration takes their scopes together, the
+connectors they all accept and the description of the first tool registered with it, unless
+`require_connection` gives one. Toolkits whose connectors share none can't share a slot.
+
+Only a slot the application calls through a `ConnectionClient` itself needs
+`app.require_connection(...)`; it can also give a toolkit's slot a description or other
+connectors:
+
+```python
+app.require_connection("erp", description="Supplier invoices to reconcile")
+```
+
+A package's own toolkit declares its slots the same way: set `Tool.connection_slots` to a
+`cayu.connections.ConnectionSlot` on each tool it returns.
+
 ## The client
 
 `tools(client=None, slot=...)` calls through `client`, a `cayu.connections.ConnectionClient`.
@@ -521,6 +548,9 @@ approval before each, naming its target (`Merge acme/widgets#7 at head 1a2b3c4 (
 `review_fields()` shows the approver the repository, the number, the head commit and the merge
 method, the run id and head of a rerun, or the body of a comment.
 
+- **Workflow files.** Updating a branch whose head changes files under `.github/workflows`
+  needs GitHub's `workflows` permission too, which Cayu Cloud doesn't broker, so GitHub refuses
+  that update through a slot.
 - **Head guards.** A branch update sends `expected_head_sha` and a merge `sha`, so an approval
   given for one head commit can't act on a later push: GitHub refuses it, and the tool answers
   `github_conflict` with advice to read the pull request again. `head_sha` is the full commit.

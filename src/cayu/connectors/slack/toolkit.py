@@ -12,6 +12,9 @@ from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools.policy import ToolPolicy
 
 DEFAULT_SLOT = "slack"
+#: The Cayu Cloud connectors a slot of these tools may be bound to.
+CONNECTORS = ("slack",)
+_DESCRIPTION = "Slack channels, threads and people"
 #: Messages, replies or channels one read answers unless the call asks for another number.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
@@ -60,7 +63,16 @@ def tools(
     kinds: tuple[type[_SlackTool], ...] = (_ListChannels, _ReadChannel, _ReadThread, _LookupUser)
     if include_writes is True:
         kinds = (_PostMessage, _UpdateMessage, *kinds)
-    return [kind(resolved, slot) for kind in kinds]
+    return [
+        _common.declaring(
+            kind(resolved, slot),
+            slot,
+            connectors=CONNECTORS,
+            scopes=kind.SCOPES,
+            description=_DESCRIPTION,
+        )
+        for kind in kinds
+    ]
 
 
 def approval_policy(inner: ToolPolicy | None = None) -> ToolPolicy:
@@ -107,6 +119,9 @@ class _InvalidArguments(ValueError):
 
 
 class _SlackTool(Tool):
+    #: The bot scopes of the Slack methods the tool calls.
+    SCOPES: tuple[str, ...] = ()
+
     def __init__(self, client: ConnectionClient | None, slot: str) -> None:
         super().__init__()
         self._client = client
@@ -268,6 +283,7 @@ def _spec(
 
 
 class _PostMessage(_SlackTool):
+    SCOPES = ("chat:write",)
     spec = _spec(
         POST_MESSAGE,
         "Post a message to a public Slack channel, or reply in a thread with thread_ts. It may "
@@ -294,6 +310,7 @@ class _PostMessage(_SlackTool):
 
 
 class _UpdateMessage(_SlackTool):
+    SCOPES = ("chat:write",)
     spec = _spec(
         UPDATE_MESSAGE,
         "Replace the text of a message this app posted, in the channel given by its ID. It may "
@@ -328,6 +345,7 @@ def _message_text(args: Mapping[str, Any]) -> str:
 
 
 class _ListChannels(_SlackTool):
+    SCOPES = ("channels:read",)
     spec = _spec(
         LIST_CHANNELS,
         "List the workspace's public channels, a page at a time.",
@@ -379,6 +397,7 @@ def _channel(item: Mapping[str, Any], topic_limit: int) -> dict[str, Any]:
 
 
 class _ReadChannel(_SlackTool):
+    SCOPES = ("channels:history",)
     spec = _spec(
         READ_CHANNEL,
         "Read a public channel's messages, newest first, a page at a time. oldest and latest "
@@ -404,6 +423,7 @@ class _ReadChannel(_SlackTool):
 
 
 class _ReadThread(_SlackTool):
+    SCOPES = ("channels:history",)
     spec = _spec(
         READ_THREAD,
         "Read a thread: its parent message, then its replies, a page at a time.",
@@ -423,6 +443,7 @@ class _ReadThread(_SlackTool):
 
 
 class _LookupUser(_SlackTool):
+    SCOPES = ("users:read", "users:read.email")
     spec = _spec(
         LOOKUP_USER,
         "Look up a Slack user by user_id (U...) or by email; give exactly one.",

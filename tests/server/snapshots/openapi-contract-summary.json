@@ -7747,6 +7747,14 @@
           "title": "Capabilities",
           "type": "array"
         },
+        "connection_slots": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/ConnectionSlotManifest"
+          },
+          "title": "Connection Slots",
+          "type": "array"
+        },
         "defaults": {
           "$ref": "#/components/schemas/ApplicationDefaultsManifest"
         },
@@ -7780,8 +7788,11 @@
           "$ref": "#/components/schemas/RuntimeManifest"
         },
         "schema_version": {
-          "const": "18",
-          "default": "18",
+          "default": "19",
+          "enum": [
+            "18",
+            "19"
+          ],
           "title": "Schema Version",
           "type": "string"
         },
@@ -9360,6 +9371,48 @@
         "source"
       ],
       "title": "ConfigurationFieldProvenanceManifest",
+      "type": "object"
+    },
+    "ConnectionSlotManifest": {
+      "additionalProperties": false,
+      "description": "One declared connection slot: the connectors it expects and the scopes it needs.",
+      "properties": {
+        "connectors": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Connectors",
+          "type": "array"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Scopes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "connectors",
+        "scopes"
+      ],
+      "title": "ConnectionSlotManifest",
       "type": "object"
     },
     "ContextExposureEvidenceKind": {

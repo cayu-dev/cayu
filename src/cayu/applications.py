@@ -26,6 +26,7 @@ from cayu import _application_event_batches as event_batches
 from cayu import _application_task_creation as task_creation
 from cayu import external_wait_tasks as _external_wait_tasks
 from cayu._application_agent_registry import ApplicationAgentRegistry
+from cayu._application_connection_slots import ConnectionSlotEntrances
 from cayu._application_environment_maintenance import (
     SessionEnvironments,
     ensure_session_environment,
@@ -39,6 +40,7 @@ from cayu._application_managed_settings import ManagedSettingsEntrances
 from cayu._application_model_slots import ModelSlotEntrances
 from cayu._application_provider_registry import ApplicationProviderRegistry
 from cayu._application_registration import _registration_site, _validate_runtime_hooks
+from cayu._application_registration_entrances import RegistrationEntrances
 from cayu._application_session_abandonment import SessionAbandonmentEntrances
 from cayu._application_session_deletion import delete_app_session, export_app_session_closure
 from cayu._application_task_types import ApplicationTaskTypes
@@ -54,7 +56,6 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
-from cayu.agents import AgentSpec
 from cayu.approvals.review import (
     HumanReviewPolicy,
 )
@@ -274,9 +275,6 @@ from cayu.configuration import (
     copy_cayu_config,
 )
 from cayu.connections.models import ModelSlots
-from cayu.context.base import (
-    ContextPolicy,
-)
 from cayu.context.counting import (
     ContextCountingConfig,
     copy_context_counting_config,
@@ -299,8 +297,7 @@ from cayu.egress.transitions import (
     EgressAuthorityAdoptionHandler,
     _drain_parked_egress_authority_allocations,
 )
-from cayu.environments.admission import ExecutionRequirements
-from cayu.environments.base import Environment, EnvironmentSpec, NoEnvironment
+from cayu.environments.base import Environment, EnvironmentSpec
 from cayu.environments.factory import EnvironmentFactory
 from cayu.environments.rebuild import EnvironmentRebuilder
 from cayu.environments.snapshot_lifecycle import ExecutionSnapshots
@@ -324,11 +321,8 @@ from cayu.external_agents._session_control import require_native_session
 from cayu.external_wait_hosting import external_wait_hosting as _external_wait_hosting
 from cayu.external_wait_hosting import host_external_waits as _host_external_waits
 from cayu.fork_controllers import (
-    ForkController,
-    ForkControllerAccess,
     ForkControllerDenied,
     VerifiedForkController,
-    fork_controller_access,
     require_verified_fork_controller,
 )
 from cayu.knowledge._publication import KnowledgePublicationScope
@@ -362,7 +356,6 @@ from cayu.observability.timing import (
 )
 from cayu.observability.watchers import EventWatcherStore, _clock_or_utc_now
 from cayu.providers.base import ModelProvider, ModelRequest
-from cayu.providers.hosted import OpenAIWebSearch
 from cayu.providers.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.releases import ReleaseIdentity, resolve_release_identity
 from cayu.resource_access import (
@@ -590,7 +583,6 @@ from cayu.runtime.session_steering import (
 from cayu.runtime.tool_effects import (
     ToolEffectConflict,
     ToolEffectReceipt,
-    ToolEffectReconciliationRegistration,
     ToolEffectReconciliationRequest,
     ToolEffectReconciliationTarget,
 )
@@ -613,7 +605,6 @@ from cayu.sessions._terminal_evidence import (
     QueuedDispatchTerminalReceiptQuery,
 )
 from cayu.sessions.authority import SessionRunFenced
-from cayu.sessions.child_context import ChildSessionContextContributor
 from cayu.sessions.cleanup import (
     RecoveryCleanupOwner,
     RecoveryCleanupSessionSnapshot,
@@ -761,7 +752,6 @@ from cayu.tasks.store import TaskStore
 from cayu.tasks.types import TaskTypeSpec
 from cayu.tasks.worker import abandoned_task_lease_operations
 from cayu.tools.base import (
-    Tool,
     ToolContext,
     ToolResult,
 )
@@ -769,7 +759,6 @@ from cayu.tools.browser_control_config import BrowserControlConfig
 from cayu.tools.discovery import (
     TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-    ToolDiscoveryMode,
     ToolDiscoveryViewInconsistentError,
     ToolDiscoveryViewInspection,
     ToolDiscoveryViewNotEnabledError,
@@ -778,17 +767,12 @@ from cayu.tools.discovery import (
     tool_discovery_view_inspection,
 )
 from cayu.tools.exposure import (
-    ToolExposureMode,
-    ToolExposurePolicy,
     tool_capability_ceiling_from_session_metadata,
 )
 from cayu.tools.grants import (
     TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
     TargetedToolGrantInspection,
     targeted_tool_grant_inspection,
-)
-from cayu.tools.policy import (
-    ToolPolicy,
 )
 from cayu.tools.result_projection import (
     ToolResultProjectionPolicy,
@@ -797,9 +781,6 @@ from cayu.tools.result_projection import (
 from cayu.tools.rounds import (
     ToolRoundRecoveryRequest,
     copy_tool_round_recovery_request,
-)
-from cayu.tools.targeted_projection import (
-    TargetedToolMode,
 )
 from cayu.tools.terminal_publication import (
     ToolTerminalPublicationGovernor,
@@ -951,6 +932,8 @@ class CayuApp(
     WorkflowEntrances,
     ManagedSettingsEntrances,
     ModelSlotEntrances,
+    ConnectionSlotEntrances,
+    RegistrationEntrances,
     HumanReviewEntrances,
     SessionAbandonmentEntrances,
 ):
@@ -6002,93 +5985,6 @@ class CayuApp(
         """Return detached public task declarations."""
         return self._task_types.list_types()
 
-    def register_agent(
-        self,
-        spec: AgentSpec,
-        *,
-        tools: Iterable[Tool] | None = None,
-        proposal_tools: Iterable[Tool] | None = None,
-        tool_effect_reconcilers: Mapping[str, ToolEffectReconciliationRegistration] | None = None,
-        mcp_toolsets: Iterable[McpToolset] | None = None,
-        hosted_tools: Iterable[OpenAIWebSearch] | None = None,
-        context_policy: ContextPolicy | None = None,
-        context_overflow_policy: ContextPolicy | None = None,
-        child_session_context: ChildSessionContextContributor | None = None,
-        tool_exposure_policy: ToolExposurePolicy | None = None,
-        tool_exposure_mode: ToolExposureMode | str | None = None,
-        targeted_tool_mode: TargetedToolMode | str | None = None,
-        tool_discovery_mode: ToolDiscoveryMode | str | None = None,
-        tool_policy: ToolPolicy | None = None,
-        runtime_hooks: Iterable[RuntimeHook] | None = None,
-        loop_policies: Iterable[LoopPolicy] | None = None,
-        execution_requirements: ExecutionRequirements | None = None,
-        environment_name: str | NoEnvironment | None = None,
-        settings: Iterable[ManagedSetting] | None = None,
-        model_slot: str | None = None,
-    ) -> AgentSpec:
-        spec, declared = self._agent_managed_settings(
-            spec, settings, default_thinking=self._config.run.thinking
-        )
-        slot, setting_slot = self._agent_model_slot(spec, model_slot, declared)
-        registered = self._agent_registry.register_agent(
-            spec,
-            default_thinking=self._config.run.thinking,
-            default_thinking_source=self._config_sources["run.thinking"],
-            registration_site=_registration_site(),
-            tools=tools,
-            proposal_tools=proposal_tools,
-            pause_check=partial(_session_wakes._require_servable_pause, self),
-            tool_effect_reconcilers=tool_effect_reconcilers,
-            mcp_toolsets=mcp_toolsets,
-            hosted_tools=hosted_tools,
-            context_policy=context_policy,
-            context_overflow_policy=context_overflow_policy,
-            child_session_context=child_session_context,
-            tool_exposure_policy=tool_exposure_policy,
-            tool_exposure_mode=tool_exposure_mode,
-            targeted_tool_mode=targeted_tool_mode,
-            tool_discovery_mode=tool_discovery_mode,
-            tool_policy=tool_policy,
-            runtime_hooks=runtime_hooks,
-            loop_policies=loop_policies,
-            execution_requirements=execution_requirements,
-            environment_name=environment_name,
-            model_slot=slot,
-        )
-        self._add_managed_settings(declared)
-        if setting_slot is not None:
-            self._add_setting_model_slot(registered.name, setting_slot)
-        return registered
-
-    def enroll_fork_controller(self, controller: ForkController) -> None:
-        """Let one outside controller fork the named agents with its own overlay."""
-        self._agent_registry.enroll_fork_controller(controller, budget_ledger=self.budget_ledger)
-
-    def fork_controller_access(self, subject: str) -> ForkControllerAccess:
-        """Return the overlay entrance for a subject the host already authenticated."""
-        return fork_controller_access(self, subject, self._agent_registry.fork_controllers)
-
-    async def _release_mcp_toolsets(self, timeout_s: float) -> bool:
-        return await self._agent_registry.release_mcp_toolsets(timeout_s)
-
-    async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
-        if self._admission.sealed:
-            # Fail rather than return: the toolset retries a refresh that returns
-            # while its source is still dirty, and that retry never yields.
-            raise ApplicationAdmissionsSealed("The application is shutting down.")
-        current = self._agent_registry.current_mcp_toolset(source_key)
-        if current is None:
-            return
-        await self.refresh_mcp_toolset(current)
-
-    @_admitted_entrance
-    async def refresh_mcp_toolset(
-        self,
-        toolset: McpToolset,
-    ) -> McpToolsetRefreshResult:
-        """Re-list and atomically publish one explicitly registered MCP source."""
-        return await self._agent_registry.refresh_mcp_toolset(toolset)
-
     def register_completion_verifier(
         self,
         reference: CompletionVerifierRef,
@@ -6140,23 +6036,26 @@ class CayuApp(
         del reference, resolver
         return registered
 
-    def register_provider(
+    async def _release_mcp_toolsets(self, timeout_s: float) -> bool:
+        return await self._agent_registry.release_mcp_toolsets(timeout_s)
+
+    async def _refresh_mcp_toolset_after_notification(self, source_key: int) -> None:
+        if self._admission.sealed:
+            # Fail rather than return: the toolset retries a refresh that returns
+            # while its source is still dirty, and that retry never yields.
+            raise ApplicationAdmissionsSealed("The application is shutting down.")
+        current = self._agent_registry.current_mcp_toolset(source_key)
+        if current is None:
+            return
+        await self.refresh_mcp_toolset(current)
+
+    @_admitted_entrance
+    async def refresh_mcp_toolset(
         self,
-        provider: ModelProvider,
-        *,
-        default: bool = False,
-        model_patterns: Iterable[str] | None = None,
-        settings: Iterable[ManagedSetting] | None = None,
-    ) -> ModelProvider:
-        declared = self._part_managed_settings(settings, part="provider", name=provider.name)
-        registered = self._provider_registry.register(
-            provider,
-            default=default,
-            model_patterns=model_patterns,
-            registration_site=_registration_site(),
-        )
-        self._add_managed_settings(declared)
-        return registered
+        toolset: McpToolset,
+    ) -> McpToolsetRefreshResult:
+        """Re-list and atomically publish one explicitly registered MCP source."""
+        return await self._agent_registry.refresh_mcp_toolset(toolset)
 
     def register_workspace_source(self, source: WorkspaceSource) -> WorkspaceSource:
         """Let eval cases name ``source`` as the repository of a workspace fixture.

@@ -14,6 +14,9 @@ from cayu.connectors.sap import _odata
 from cayu.tools.base import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 
 DEFAULT_SLOT = "sap"
+#: The Cayu Cloud connectors a slot of these tools may be bound to.
+CONNECTORS = ("sap", "sap-certificate", "sap-sandbox")
+_DESCRIPTION = "SAP S/4HANA reads"
 _DEFAULT_TOP = 50
 _MAX_TOP = 500
 #: The most values (PO numbers, supplier IDs) one named read looks up.
@@ -153,7 +156,16 @@ def tools(client: ConnectionClient | None = None, slot: str = DEFAULT_SLOT) -> l
         _GoodsReceipts,
         _Suppliers,
     )
-    return [kind(resolved, slot) for kind in kinds]
+    return [
+        _common.declaring(
+            kind(resolved, slot),
+            slot,
+            connectors=CONNECTORS,
+            scopes=kind.SCOPES,
+            description=_DESCRIPTION,
+        )
+        for kind in kinds
+    ]
 
 
 class _SapError(Exception):
@@ -207,6 +219,10 @@ class _Page:
 
 
 class _SapTool(Tool):
+    #: The binding scopes the tool reads: one per SAP service it calls, none for a service the
+    #: model names.
+    SCOPES: tuple[str, ...] = ()
+
     def __init__(self, client: ConnectionClient | None, slot: str) -> None:
         super().__init__()
         self._client = client
@@ -617,6 +633,7 @@ class _Read(_SapTool):
 
 
 class _SupplierInvoices(_SapTool):
+    SCOPES = (f"{_INVOICES}.read",)
     spec = _spec(
         SUPPLIER_INVOICES,
         "Supplier invoices of company codes posted in a date range of at most "
@@ -665,6 +682,7 @@ class _SupplierInvoices(_SapTool):
 
 
 class _PurchaseOrderItems(_SapTool):
+    SCOPES = (f"{_PURCHASE_ORDERS}.read",)
     spec = _spec(
         PURCHASE_ORDER_ITEMS,
         "The items of purchase orders: material, plant, quantity, net price and whether "
@@ -685,6 +703,7 @@ class _PurchaseOrderItems(_SapTool):
 
 
 class _GoodsReceipts(_SapTool):
+    SCOPES = (f"{_MATERIAL_DOCUMENTS}.read",)
     spec = _spec(
         GOODS_RECEIPTS,
         "Goods receipts for purchase orders (movement type 101) and their reversals (102), as "
@@ -709,6 +728,7 @@ class _GoodsReceipts(_SapTool):
 
 
 class _Suppliers(_SapTool):
+    SCOPES = (f"{_BUSINESS_PARTNERS}.read",)
     spec = _spec(
         SUPPLIERS,
         "Suppliers by ID: name, creation date and posting and payment blocks. With "

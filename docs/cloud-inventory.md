@@ -71,6 +71,20 @@ it refused for the rest of the process's life. An unnamed 422 leaves out the mod
 slots first, then the settings schema. See
 [ADR 0003](adr/0003-connections-runtime-contract.md#models).
 
+When the Release declares connection slots (its agents' toolkit tools, or
+`CayuApp.require_connection`), the body
+carries `connection_slots`, `[{"name", "connectors", "scopes", "description"?}]`; it
+is left out when there are none. Cloud answers 422 `connection_slots_invalid` for
+slots it refuses (or names that refusal in another part's `detail.also`) and keeps the
+rest. A Cayu Cloud from before connection slots (or model slots) refuses the whole
+registration for the unknown field, `registration_invalid` on `registration` with a
+message naming it; the reporter then registers again without the field it names, and
+raises such a refusal that names none it sent. Either way it
+leaves them out for the rest of the process's life, so after Cloud is upgraded under a
+running Agent its declarations appear only once the Agent restarts. An unnamed 422
+leaves out the connection slots before the model slots. See
+[ADR 0003](adr/0003-connections-runtime-contract.md#declarations).
+
 Each tool is reported once by name, with every specialist that has it, its
 declared description, effect, approval and source:
 

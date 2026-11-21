@@ -811,6 +811,9 @@
           "ModelSlot",
           "ModelSlotUnavailable",
           "ModelSlots"
+        ],
+        "cayu.connections.slots": [
+          "ConnectionSlot"
         ]
       },
       "identities": {},

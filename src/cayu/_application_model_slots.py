@@ -6,7 +6,7 @@ limit. See ``cayu.connections.models`` for the slot types and the reader of Clou
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -57,6 +57,8 @@ class ModelSlotEntrances:
         """
 
         declared = ModelSlot(name=slot, default=default, label=label)
+        if declared.name in self._connection_slot_names():
+            raise ValueError(f"The slot {declared.name} is already declared as a connection slot.")
         legacy_agent = self._setting_model_slots.get(declared.name)
         if legacy_agent is not None:
             raise ValueError(
@@ -108,14 +110,16 @@ class ModelSlotEntrances:
         spec: AgentSpec,
         model_slot: str | None,
         settings: Iterable[ManagedSetting],
+        connection_slots: Collection[str] = (),
     ) -> tuple[str | None, ModelSlot | None]:
         """The slot an agent about to register uses, and the slot to declare for it once it has.
 
-        ``settings`` are the agent's managed settings, with their full keys.
+        ``settings`` are the agent's managed settings, with their full keys, and
+        ``connection_slots`` the connection slots declared once it registers.
 
         An agent that chooses its model with the deprecated ``model_setting()`` uses a slot
         named after it, declared with the agent's own model as its default, when that name is
-        free.
+        free: neither a model slot nor a connection slot.
         """
 
         uses_setting = any(item.key == f"agent.{spec.name}.model" for item in settings)
@@ -144,6 +148,7 @@ class ModelSlotEntrances:
         if (
             slot is None
             or slot in self._model_slot_declarations
+            or slot in connection_slots
             or len(self._model_slot_declarations) >= MAX_MODEL_SLOTS
             or not MODEL_ID_PATTERN.fullmatch(spec.model)
         ):

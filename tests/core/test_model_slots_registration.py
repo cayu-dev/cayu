@@ -45,7 +45,7 @@ def test_registration_and_manifest_carry_the_declared_slots():
         (body,) = _bodies(cloud)
         assert body["model_slots"] == _DECLARED
         manifest = app.describe()
-        assert manifest.schema_version == "18"
+        assert manifest.schema_version == "19"
         assert [slot.model_dump(mode="json") for slot in manifest.model_slots] == [
             _DECLARED[0],
             {"name": "review", "default": None},

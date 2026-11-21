@@ -53,6 +53,7 @@ from cayu.tools.inference import (
 )
 
 if TYPE_CHECKING:
+    from cayu.connections.slots import ConnectionSlot
     from cayu.runners.base import ExecCommand, ExecResult
     from cayu.workspaces.references import WorkspaceReferenceBinding
 
@@ -1404,6 +1405,9 @@ class Tool(ABC):
     """
 
     spec: ToolSpec
+    #: The connection slots the tool calls through, which registering it with an agent declares
+    #: for the application (``cayu.connections.ConnectionSlot``); a connector toolkit sets them.
+    connection_slots: tuple[ConnectionSlot, ...] = ()
 
     def __init__(self, spec: ToolSpec | None = None) -> None:
         if spec is not None:

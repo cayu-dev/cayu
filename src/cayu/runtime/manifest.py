@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.runtime import _runtime_records as runtime_records
 
-APP_MANIFEST_SCHEMA_VERSION = "18"
+APP_MANIFEST_SCHEMA_VERSION = "19"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -501,8 +501,18 @@ class ModelSlotManifest(_ManifestModel):
     label: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
+class ConnectionSlotManifest(_ManifestModel):
+    """One declared connection slot: the connectors it expects and the scopes it needs."""
+
+    name: str
+    connectors: tuple[str, ...]
+    scopes: tuple[str, ...]
+    description: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
 class AppManifest(_ManifestModel):
-    schema_version: Literal["18"] = APP_MANIFEST_SCHEMA_VERSION
+    # 18 manifests, recorded before connection slots, still load; new ones are 19.
+    schema_version: Literal["18", "19"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     # Booted runtime evidence only; JSON manifests cannot establish this fact.
@@ -521,6 +531,15 @@ class AppManifest(_ManifestModel):
     model_slots: tuple[ModelSlotManifest, ...] = Field(
         default=(), exclude_if=lambda value: not value
     )
+    connection_slots: tuple[ConnectionSlotManifest, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+
+    @model_validator(mode="after")
+    def _connection_slots_need_schema_19(self) -> AppManifest:
+        if self.connection_slots and self.schema_version == "18":
+            raise ValueError("A schema 18 manifest declares no connection slots.")
+        return self
 
 
 def _app_manifest_fingerprint(payload: dict[str, object]) -> str:
@@ -685,6 +704,9 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
     model_slots = [slot.declaration() for slot in app.model_slots()]
     if model_slots:
         structural_payload["model_slots"] = model_slots
+    connection_slots = [slot.declaration() for slot in app.connection_slots()]
+    if connection_slots:
+        structural_payload["connection_slots"] = connection_slots
     manifest = AppManifest.model_validate(
         {
             **normalized_payload,

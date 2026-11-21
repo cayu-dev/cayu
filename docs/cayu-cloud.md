@@ -48,7 +48,7 @@ top-level commands are:
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
-- `connectors` and `connections list|show|add|authorize|check|activity|agents|rotate|remove|bound|bind|unbind` for the
+- `connectors` and `connections list|show|add|authorize|check|activity|repositories|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents),
@@ -2462,11 +2462,36 @@ kept key again.
 ```console
 cayu cloud connections add github-app --name triage-app \
   --credential app_id=123456 --credential private_key=@~/.keys/triage-app.pem
+cayu cloud connections repositories example-app
 cayu cloud connections bind github triage-app --application support-desk \
   --scope issues:write --scope pull_requests:write --scope contents:read \
   --repository acme/widgets --repository 'acme-labs/*'
 cayu cloud connections check triage-app
 ```
+
+`connections repositories NAME` (developers and admins) lists the repositories the App is
+installed on, the ones a binding may name, and whether each is private; `--json` prints the
+JSON envelope, with Cloud's `items` (`name`, `private`) and `complete`. When `complete` is
+false, Cloud stopped at its limit and the command says the App reaches more. It fails with
+Cloud's reason: `too_many_calls` when GitHub limits the App's calls (the message says how long
+to wait), `upstream_failed` when GitHub couldn't be reached, `credential_invalid` when GitHub
+refuses the App's key (an admin replaces it with `rotate`), `connection_not_ready` for a
+connection that isn't ready yet (such as one still `pending`), and `repositories_unavailable`
+for a connection that isn't a GitHub App. A Cayu Cloud from before this list fails with
+`repository_listing_unavailable`.
+
+```console
+$ cayu cloud connections repositories example-app
+NAME              PRIVATE
+acme/widgets      no
+acme-labs/engine  yes
+```
+
+`bind` checks the repositories with GitHub: Cloud refuses a binding naming one the App isn't
+installed on with `repositories_not_installed`, whose message names them (the command repeats
+the first five and counts the rest), and the command adds how to list those it reaches. When GitHub can't be asked, Cloud binds the slot anyway and the
+command prints its `repositories_warning` on standard error (`Warning: Bound, but the
+repositories weren't checked: ...`), beside the usual JSON envelope.
 
 A connector that signs in, such as Slack where the install has its Slack app, takes no
 credential: an admin adds it, and the command opens the link where the connection is approved
@@ -2557,6 +2582,31 @@ Cloud installation." A Cayu Cloud without that route is older; the command then 
 `connections_unavailable` and says connections are turned off there or it predates them.
 `cayu cloud platform` shows which revision the install runs.
 
+### Connection slots
+
+An Agent declares the connection slots it calls through, so the people binding its slots pick
+from them instead of typing a name, with the connectors each one expects and the scopes its
+calls need. A connector toolkit's tools declare theirs, so nothing more is written:
+
+```python
+app.register_agent(spec, tools=sap.tools(slot="erp"))
+```
+
+A slot called through a `ConnectionClient` directly is declared with `require_connection`,
+which also gives a toolkit's slot a description or other connectors:
+
+```python
+app.require_connection("mailbox", connectors=("gmail",), scopes=("gmail.readonly",))
+```
+
+The Release publishes them when it registers, and `cayu cloud connections bound` shows the ones
+nobody bound yet (see [An Agent's slots](#an-agents-slots)); with `--json` it answers them as
+`declared` beside the bound slots (`items`), each with its `description`, `connectors`,
+`scopes` and whether it is `bound`. A declaration only informs:
+the binding's connection and scopes decide what calls through the slot may do, and a slot
+nobody declared can still be bound. See
+[ADR 0003](adr/0003-connections-runtime-contract.md#declarations).
+
 ### Model slots
 
 An Agent declares the models it needs as named model slots, each with a default, and the
@@ -2583,6 +2633,31 @@ If the bound model is later no longer approved, new sessions are refused rather 
 another model. `session.started` records the slot and where its model came from (`bound`,
 `default`, or `unread` when the bindings could not be read since the process started). See
 [ADR 0003](adr/0003-connections-runtime-contract.md#models).
+
+### An Agent's slots
+
+This is what `connections bound` prints. `connections bound --application AGENT` prints a
+table of the Agent's bound slots (the connection, scopes and, for a GitHub App, repositories of
+each), then the connection slots its serving Release declares that nobody bound yet, with the
+connectors each expects and the scopes it needs. A long list in a cell shows its first items
+and how many more (`... (+7 more)`), and a long description is cut at about 60 characters.
+`--json` prints the JSON envelope with Cloud's whole answer: `items`, `declared` (`slot`,
+`description`, `connectors`, `scopes`, `bound`) and `release_id`. Until this release the
+command printed that envelope by default; scripts that read it pass `--json`. A Cayu Cloud
+from before declared slots answers only `items`, and the command prints only the bound slots.
+When Cloud doesn't know which Release serves the Agent (none runs, or it can't be read), its
+`release_id` is null and the command says the declared slots aren't shown.
+
+```console
+$ cayu cloud connections bound --application example-agent
+SLOT    CONNECTION   SCOPES        REPOSITORIES
+github  example-app  issues:write  acme/widgets, acme-labs/*
+
+Declared by release dep_example1 but not bound:
+SLOT       EXPECTS    NEEDS  DESCRIPTION
+warehouse  snowflake  read   Sales figures
+Bind one with `cayu cloud connections bind SLOT CONNECTION --application AGENT`.
+```
 
 ## The install's system Agents
 

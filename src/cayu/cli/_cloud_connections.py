@@ -11,7 +11,9 @@ FIELD=VALUE` only for a one-line field that isn't secret (`account`, `user`, a G
 `app_id`, SAP's `base_url`), as Cloud's `GET /v1/connectors` describes each connector's fields.
 No answer ever holds a credential. `connections check` asks Cloud to test a connection that can
 be checked, such as SAP or a GitHub App, and prints each service's result. A GitHub App's binding names
-the repositories its slot may call with `bind --repository OWNER/NAME` (or `OWNER/*`).
+the repositories its slot may call with `bind --repository OWNER/NAME` (or `OWNER/*`), which Cloud
+checks with GitHub; `connections repositories NAME` lists those the App reaches. `connections
+bound` prints an Agent's bound slots and the ones its serving Release declares but nobody bound.
 
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
@@ -42,8 +44,9 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
+from cayu.cli._cloud_diagnostics import safe_text
 from cayu.cli._cloud_reference import APPLICATION_HELP
-from cayu.cli._cloud_settings import _table
+from cayu.cli._cloud_settings import _cell, _table, _value_cell
 from cayu.cli._cloud_sign_in import (
     DEFAULT_SIGN_IN_WAIT_SECONDS,
     LINK_REUSED,
@@ -94,6 +97,10 @@ CONNECTIONS_UNAVAILABLE = (
     "This Cayu Cloud doesn't serve connections: they're turned off in this installation, or "
     "it predates them. `cayu cloud platform` shows which revision it runs."
 )
+REPOSITORY_LISTING_UNAVAILABLE = (
+    "This Cayu Cloud can't list a connection's repositories: it predates that. Name them with "
+    "`bind --repository OWNER/NAME` as the App's installations in GitHub show them."
+)
 ACTIVITY_PAGING_UNAVAILABLE = (
     "This Cayu Cloud doesn't page a connection's activity, so --cursor can't go on: list it "
     "without --cursor, narrowing it with --since and --limit."
@@ -103,6 +110,12 @@ ACTIVITY_PAGING_UNAVAILABLE = (
 MAX_ACTIVITY_LIMIT = 500
 _DURATION = re.compile(r"([1-9][0-9]{0,5})([mhd])")
 _DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days"}
+#: Cloud's refusal of repositories a GitHub App isn't installed on, which names every one.
+_UNREACHABLE = re.compile(r"(?P<head>.+? can't reach )(?P<names>.+?)(?P<tail>: it isn't .+)")
+#: How many of them the CLI repeats; the rest are counted, and Cloud's message stays short.
+_NAMED_REPOSITORIES = 5
+#: The longest Cloud message (a refusal's, a binding's warning) the CLI repeats.
+_MESSAGE_LIMIT = 512
 
 
 class CredentialArgumentError(ValueError):
@@ -262,6 +275,20 @@ def add_connections_parsers(
     )
     check.set_defaults(_cloud_render=render_check)
 
+    repositories = actions.add_parser(
+        "repositories",
+        help="List the repositories a GitHub App connection reaches.",
+        description=(
+            "List the repositories the connection's GitHub App is installed on, which a "
+            "binding may name with `bind --repository`, and whether each is private."
+        ),
+    )
+    repositories.add_argument("name")
+    repositories.add_argument(
+        "--json", action="store_true", help="Print the JSON envelope instead of a table."
+    )
+    repositories.set_defaults(_cloud_render=render_repositories)
+
     remove = actions.add_parser(
         "remove",
         help="Remove a connection (admins).",
@@ -271,13 +298,18 @@ def add_connections_parsers(
 
     bound = actions.add_parser(
         "bound",
-        help="List an Agent's bound slots.",
+        help="List an Agent's bound slots and the slots it declares.",
         description=(
-            "List the Agent's slots and the connection bound to each. Bind another with "
+            "List the Agent's slots and the connection bound to each, then the slots its "
+            "serving Release declares that nobody bound yet. Bind one with "
             "`cayu cloud connections bind`."
         ),
     )
     bound.add_argument("--application", required=True, help=APPLICATION_HELP)
+    bound.add_argument(
+        "--json", action="store_true", help="Print the JSON envelope instead of a table."
+    )
+    bound.set_defaults(_cloud_render=render_bound)
     bind = actions.add_parser(
         "bind",
         help="Bind one of an Agent's slots to a connection, or its model slot to a model.",
@@ -546,6 +578,86 @@ def render_activity(outcome: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_repositories(outcome: Mapping[str, Any]) -> str:
+    """The repositories a connection reaches as a table, then whether the list is whole."""
+
+    items = outcome["result"].get("items") or []
+    if not items:
+        return "The App reaches no repositories: install it on some in GitHub."
+    lines = _table(
+        ("NAME", "PRIVATE"),
+        [(str(item.get("name")), _yes_no(item.get("private"))) for item in items],
+    )
+    if outcome["result"].get("complete") is False:
+        lines.append(f"Lists the first {len(items)}; the App reaches more.")
+    return "\n".join(lines)
+
+
+def render_bound(outcome: Mapping[str, Any]) -> str:
+    """An Agent's bound slots as a table, then the slots its serving Release declares that
+    aren't bound. A Cayu Cloud from before declared slots answers only the bound ones."""
+
+    result = outcome["result"]
+    items = result.get("items") or []
+    lines = (
+        _table(
+            ("SLOT", "CONNECTION", "SCOPES", "REPOSITORIES"),
+            [
+                (
+                    str(item.get("slot")),
+                    str(item.get("connection")),
+                    _listed(item.get("scopes")),
+                    _listed(item.get("repositories")),
+                )
+                for item in items
+            ],
+        )
+        if items
+        else ["No slots bound."]
+    )
+    if "declared" not in result:
+        return "\n".join(lines)
+    release = result.get("release_id")
+    if release is None:
+        lines.extend(
+            [
+                "",
+                "Cayu Cloud doesn't know which Release serves this Agent, so its declared slots "
+                "aren't shown.",
+            ]
+        )
+        return "\n".join(lines)
+    unbound = [slot for slot in result.get("declared") or [] if not slot.get("bound")]
+    if unbound:
+        lines.extend(["", f"Declared by release {release} but not bound:"])
+        lines.extend(
+            _table(
+                ("SLOT", "EXPECTS", "NEEDS", "DESCRIPTION"),
+                [
+                    (
+                        str(slot.get("slot")),
+                        _listed(slot.get("connectors")),
+                        _listed(slot.get("scopes")),
+                        _cell(slot.get("description") or None),
+                    )
+                    for slot in unbound
+                ],
+            )
+        )
+        lines.append(
+            "Bind one with `cayu cloud connections bind SLOT CONNECTION --application AGENT`."
+        )
+    return "\n".join(lines)
+
+
+def _listed(value: object) -> str:
+    """A list for a table cell: its first items and how many more; `--json` has them all."""
+
+    if not isinstance(value, list) or not value:
+        return "-"
+    return _value_cell(", ".join(str(item) for item in value))
+
+
 def _agent_cell(item: Mapping[str, Any]) -> str:
     """The Agent's name, else its id; a connection check's calls (slot `check`) have none."""
 
@@ -728,6 +840,8 @@ def _connections_action(
             result = client.request("POST", f"{path}/authorize")
         elif action == "check":
             result = client.request("POST", f"{path}/check")
+        elif action == "repositories":
+            result = _repositories(client, arguments.name, path)
         elif action == "activity":
             query = {
                 key: str(value)
@@ -757,6 +871,43 @@ def _connections_action(
             result = {"name": arguments.name, "removed": True}
     kind = "models" if action in {"bind", "unbind"} and arguments.model else "connections"
     return {"operation": f"{kind}.{action}", "result": result}
+
+
+def _repositories(client: CloudApiClient, name: str, path: str) -> dict[str, Any]:
+    """The repositories connection ``name`` reaches. Its route answers a bare 404 on a Cayu
+    Cloud from before it: unless connections are off there, that Cloud can't list them."""
+
+    try:
+        return client.request("GET", f"{path}/repositories")
+    except CloudApiError as exc:
+        if exc.code == "credential_invalid":
+            raise _hinted(
+                exc,
+                "An admin replaces its key with `cayu cloud connections rotate "
+                f"{name} --credential app_id=APP_ID --credential private_key=@PATH`.",
+            ) from None
+        if not _route_missing(exc):
+            raise
+        if _connections_enabled(client) is False:
+            raise _command_error(CONNECTIONS_DISABLED, CONNECTIONS_DISABLED_MESSAGE) from None
+        raise _command_error(
+            "repository_listing_unavailable", REPOSITORY_LISTING_UNAVAILABLE
+        ) from None
+
+
+def _hinted(exc: CloudApiError, hint: str, *, said: str | None = None) -> CloudApiError:
+    """``exc`` with ``hint`` after its message, or after ``said`` in its place, keeping its code
+    and Cloud's answer."""
+
+    return CloudApiError(
+        exc.category,
+        f"{said or exc} {hint}",
+        status_code=exc.status_code,
+        detail=exc.detail,
+        code=exc.code,
+        rejected_fields=exc.rejected_fields,
+        body=exc.body,
+    )
 
 
 def _signed_in(
@@ -883,9 +1034,44 @@ def _agent_action(
             payload["scopes"] = arguments.scope
         if arguments.repository is not None:
             payload["repositories"] = arguments.repository
-        return client.request("PUT", slot, payload=payload)
+        try:
+            bound = client.request("PUT", slot, payload=payload)
+        except CloudApiError as exc:
+            if exc.code != "repositories_not_installed":
+                raise
+            raise _hinted(
+                exc,
+                "See the repositories it reaches with "
+                f"`cayu cloud connections repositories {arguments.connection}`.",
+                said=_unreachable(exc),
+            ) from None
+        warning = bound.get("repositories_warning")
+        if warning:
+            said = safe_text(warning, _MESSAGE_LIMIT)
+            print(
+                f"Warning: {said or 'Bound, but the repositories were not checked.'}",
+                file=sys.stderr,
+            )
+        return bound
     client.request("DELETE", slot)
     return {"application_id": application_id, "slot": arguments.slot, "unbound": True}
+
+
+def _unreachable(exc: CloudApiError) -> str | None:
+    """Cloud's refusal of repositories the App isn't installed on, naming the first few of
+    them: a long list would leave the message too long to repeat. None where Cloud said it
+    otherwise."""
+
+    message = exc.body.get("message") if exc.body else None
+    matched = _UNREACHABLE.fullmatch(message) if isinstance(message, str) else None
+    if matched is None:
+        return None
+    names = matched["names"].split(", ")
+    if len(names) > _NAMED_REPOSITORIES:
+        more = len(names) - _NAMED_REPOSITORIES
+        names = [*names[:_NAMED_REPOSITORIES], f"... (+{more} more)"]
+    said = safe_text(matched["head"] + ", ".join(names) + matched["tail"], _MESSAGE_LIMIT)
+    return None if said is None else f"Cayu Cloud API returned HTTP {exc.status_code}: {said}"
 
 
 def _model_slot_action(

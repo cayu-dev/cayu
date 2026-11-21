@@ -180,6 +180,17 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "scope_not_allowed"),
         (422, "scope_required"),
         (422, "too_many_agents"),
+        # `connections repositories` and a GitHub App's `bind --repository`: why Cloud couldn't
+        # list or bind the App's repositories (or a pending connection's); each message names
+        # them or the wait.
+        (409, "connection_not_ready"),
+        (422, "repositories_not_allowed"),
+        (422, "repositories_not_installed"),
+        (422, "repositories_required"),
+        (422, "repositories_unavailable"),
+        (422, "repository_invalid"),
+        (429, "too_many_calls"),
+        (502, "upstream_failed"),
         # `connections add|authorize`: why a sign-in that came back to the command didn't connect.
         (403, "sign_in_not_yours"),
         (404, "connection_removed"),

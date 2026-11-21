@@ -132,6 +132,16 @@ class CloudRuntime(_Model):
     version: str = __version__
 
 
+#: The optional parts of a registration, newest first.
+_OPTIONAL_PARTS = ("connection_slots", "model_slots", "settings_schema")
+#: The optional parts of a registration Cloud refuses by name, and what each refusal names.
+_REFUSED_PARTS = {
+    "connection_slots_invalid": "connection_slots",
+    "model_slots_invalid": "model_slots",
+    "settings_schema_invalid": "settings_schema",
+}
+
+
 class CloudRegistration(_Model):
     contract: str = CLOUD_REGISTRY_CONTRACT
     runtime: CloudRuntime = Field(default_factory=CloudRuntime)
@@ -148,6 +158,9 @@ class CloudRegistration(_Model):
     settings_schema: dict[str, Any] | None = None
     # The Release's model slots, [{"name", "default", "label"?}]; left out when it declares none.
     model_slots: list[dict[str, Any]] | None = None
+    # The Release's connection slots, [{"name", "connectors", "scopes", "description"?}]; left
+    # out when it declares none.
+    connection_slots: list[dict[str, Any]] | None = None
 
 
 class CloudToolUsage(_Model):
@@ -302,6 +315,7 @@ async def _build_registration(
     replaces_cursor: int | None = None,
     settings_schema: bool = True,
     model_slots: bool = True,
+    connection_slots: bool = True,
 ) -> tuple[CloudRegistration, _Registered]:
     from cayu.mcp.tools import McpToolAdapter
     from cayu.runtime.manifest import describe_inventory_tools
@@ -426,6 +440,12 @@ async def _build_registration(
         registration_value = registration_value.model_copy(
             update={"model_slots": [slot.declaration() for slot in declared_slots]}
         )
+    declared_connections = app.connection_slots() if connection_slots else ()
+    if declared_connections:
+        # Added after redaction too: declaring a connection slot refuses a secret.
+        registration_value = registration_value.model_copy(
+            update={"connection_slots": [slot.declaration() for slot in declared_connections]}
+        )
     registration_value = _fit_registration(registration_value)
     return registration_value, _Registered(
         tools=frozenset(tool.name for tool in registration_value.tools),
@@ -438,8 +458,9 @@ async def _build_registration(
 
 
 def _fit_registration(registration: CloudRegistration) -> CloudRegistration:
-    """Keep the body under Cloud's limit: drop knowledge entries first, then shorten
-    descriptions, never sending a body Cloud would refuse on every retry."""
+    """Keep the body under Cloud's limit: drop the connection slots first, then knowledge
+    entries, then shorten descriptions, never sending a body Cloud would refuse on every
+    retry."""
     # Redaction can lengthen text, so the per-value limits apply again here.
     registration = registration.model_copy(
         update={
@@ -459,6 +480,15 @@ def _fit_registration(registration: CloudRegistration) -> CloudRegistration:
     )
     if len(_encode(registration)) <= MAX_BODY_BYTES:
         return registration
+    if registration.connection_slots is not None:
+        # The declarations only help people bind the slots: they go before any inventory.
+        logger.warning(
+            "This Release's registration is over Cayu Cloud's limit; registering without its "
+            "connection slots, so Cloud can't offer them when its slots are bound."
+        )
+        registration = registration.model_copy(update={"connection_slots": None})
+        if len(_encode(registration)) <= MAX_BODY_BYTES:
+            return registration
     entries = registration.knowledge.entries
     while entries:
         entries = entries[: len(entries) // 2]
@@ -682,11 +712,21 @@ class CloudInventoryConfig(_Model):
 class CloudRegistryRefused(Exception):
     """Cloud's definite refusal: its error code and detail, never a response body."""
 
-    def __init__(self, status: int, code: str | None, detail: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str | None,
+        detail: Mapping[str, Any],
+        *,
+        named_parts: frozenset[str] = frozenset(),
+    ) -> None:
         super().__init__(f"Cayu Cloud refused the agent registry request ({status}).")
         self.status = status
         self.code = code
         self.detail = dict(detail)
+        #: The optional registration parts Cloud's message names, as a Cloud from before one of
+        #: them does when it refuses that unknown field.
+        self.named_parts = named_parts
 
 
 class _ReporterStopped(Exception):
@@ -717,10 +757,11 @@ class CloudInventoryPublisher:
         # A replacement Cloud hasn't answered yet: the cursor replaced and the start sent, kept
         # so a retry doesn't move the start past events written in between.
         self._replacement: tuple[int, int] | None = None
-        # Cloud refuses an invalid settings schema or model slots with 422 and keeps the rest
-        # of the registration; later registrations leave the refused part out.
+        # Cloud refuses an invalid settings schema, model slots or connection slots with 422 and
+        # keeps the rest of the registration; later registrations leave the refused part out.
         self._settings_schema_refused = False
         self._model_slots_refused = False
+        self._connection_slots_refused = False
 
     def _route(self, suffix: str = "") -> str:
         return (
@@ -763,10 +804,16 @@ class CloudInventoryPublisher:
         error = error if isinstance(error, dict) else {}
         code = error.get("code")
         detail = error.get("detail")
+        message = error.get("message")
         raise CloudRegistryRefused(
             response.status_code,
             code if isinstance(code, str) else None,
             detail if isinstance(detail, dict) else {},
+            named_parts=frozenset(
+                part
+                for part in _OPTIONAL_PARTS
+                if isinstance(message, str) and f"`{part}`" in message
+            ),
         )
 
     @staticmethod
@@ -797,6 +844,7 @@ class CloudInventoryPublisher:
                 replaces_cursor=replaces_cursor,
                 settings_schema=not self._settings_schema_refused,
                 model_slots=not self._model_slots_refused,
+                connection_slots=not self._connection_slots_refused,
             )
             try:
                 answer = await self._send("PUT", self._route(), registration)
@@ -815,9 +863,13 @@ class CloudInventoryPublisher:
         """Leave out of later registrations what Cloud refused with 422; False when nothing
         sent can be left out.
 
-        Cloud names the refused part's code (``detail.also`` lists the model slots' refusal
-        when it refused both). An unnamed 422 leaves out the newest optional part first; any
-        other named 422 leaves out only the settings schema.
+        Cloud names the refused part's code (``detail.also`` lists the other parts' refusals
+        when it refused more than one). An unnamed 422 leaves out the newest optional part
+        first. A Cloud from before an optional part refuses the whole registration for the
+        unknown field (``registration_invalid`` on ``registration``, its message naming the
+        field): that part is left out, and such a refusal naming none sent is raised. Any other
+        named 422 leaves out only the settings schema. What is left out stays out for the process's life, so a Cloud
+        upgraded while the process runs gets the declarations only once it restarts.
         """
 
         if refused.status != 422:
@@ -828,32 +880,41 @@ class CloudInventoryPublisher:
             for item in (also if isinstance(also, list) else [also])
             if isinstance(item, dict)
         }
-        slots_sent = registration.model_slots is not None
-        schema_sent = registration.settings_schema is not None
-        if refused.code == "model_slots_invalid":
-            drop_slots, drop_schema = slots_sent, False
-        elif refused.code == "settings_schema_invalid":
-            drop_slots = slots_sent and "model_slots_invalid" in also_codes
-            drop_schema = schema_sent
+        sent = [part for part in _OPTIONAL_PARTS if getattr(registration, part) is not None]
+        if refused.code in _REFUSED_PARTS:
+            dropped = {_REFUSED_PARTS[refused.code]} | {
+                _REFUSED_PARTS[code] for code in also_codes if code in _REFUSED_PARTS
+            }
         elif refused.code is None:
-            drop_slots, drop_schema = slots_sent, schema_sent and not slots_sent
+            dropped = set(sent[:1])
+        elif (
+            refused.code == "registration_invalid" and refused.detail.get("field") == "registration"
+        ):
+            dropped = set(refused.named_parts)
         else:
             # Another named refusal is never about the slots; the settings schema keeps
             # its earlier fallback.
-            drop_slots, drop_schema = False, schema_sent
-        if drop_slots:
+            dropped = {"settings_schema"}
+        dropped &= set(sent)
+        if "connection_slots" in dropped:
+            logger.warning(
+                "Cayu Cloud refused this Release's connection slots; registering without them, "
+                "so Cloud can't offer them when its slots are bound."
+            )
+            self._connection_slots_refused = True
+        if "model_slots" in dropped:
             logger.warning(
                 "Cayu Cloud refused this Release's model slots; registering without them, so "
                 "Cloud can't bind its models and its slots use their declared defaults."
             )
             self._model_slots_refused = True
-        if drop_schema:
+        if "settings_schema" in dropped:
             logger.warning(
                 "Cayu Cloud refused this Release's managed settings schema; "
                 "registering without it, so Cloud can't manage its Agent settings."
             )
             self._settings_schema_refused = True
-        return drop_slots or drop_schema
+        return bool(dropped)
 
     async def _replace_unreachable_cursor(self) -> bool:
         """Hand back a cursor past this store's newest event; return whether Cloud took it.

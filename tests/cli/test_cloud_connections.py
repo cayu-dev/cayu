@@ -2100,3 +2100,449 @@ def test_activity_refuses_a_malformed_since_or_limit_before_asking_cloud(
 
     assert (code, output["error"]["category"]) == (2, "invalid_input")
     assert fake.requests == []
+
+
+_REPOSITORIES = ("GET", "/v1/connections/triage-app/repositories")
+_LISTED = {
+    "items": [
+        {"name": "acme/widgets", "private": False},
+        {"name": "acme-labs/engine", "private": True},
+    ],
+    "complete": True,
+}
+
+
+def _refusal(status: int, code: str, message: str, **headers: str) -> httpx.Response:
+    return httpx.Response(
+        status, json={"detail": {"code": code, "message": message}}, headers=headers
+    )
+
+
+def test_repositories_prints_what_the_app_reaches(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({_REPOSITORIES: httpx.Response(200, json=_LISTED)})
+
+    assert main(["cloud", "connections", "repositories", "triage-app"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "NAME              PRIVATE",
+        "acme/widgets      no",
+        "acme-labs/engine  yes",
+    ]
+
+
+def test_repositories_says_when_the_app_reaches_more(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({_REPOSITORIES: httpx.Response(200, json={**_LISTED, "complete": False})})
+
+    assert main(["cloud", "connections", "repositories", "triage-app"]) == 0
+
+    assert capsys.readouterr().out.splitlines()[-1] == ("Lists the first 2; the App reaches more.")
+
+
+def test_repositories_with_json_prints_the_envelope(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({_REPOSITORIES: httpx.Response(200, json={"items": [], "complete": True})})
+
+    code, output = _run(["connections", "repositories", "triage-app", "--json"], capsys)
+    assert code == 0
+    assert output["operation"] == "connections.repositories"
+    assert output["result"] == {"items": [], "complete": True}
+
+    assert main(["cloud", "connections", "repositories", "triage-app"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "The App reaches no repositories: install it on some in GitHub."
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "code", "said"),
+    [
+        (
+            _refusal(
+                429,
+                "too_many_calls",
+                "GitHub limits the App's calls for its repositories; try again in 42 seconds.",
+                **{"Retry-After": "42"},
+            ),
+            "too_many_calls",
+            "try again in 42 seconds.",
+        ),
+        (
+            _refusal(502, "upstream_failed", "GitHub couldn't be reached."),
+            "upstream_failed",
+            "GitHub couldn't be reached.",
+        ),
+        (
+            _refusal(
+                422,
+                "repositories_unavailable",
+                "This install can't list the repositories warehouse reaches.",
+            ),
+            "repositories_unavailable",
+            "can't list the repositories warehouse reaches.",
+        ),
+        (
+            _refusal(409, "connection_not_ready", "triage-app is pending, not ready."),
+            "connection_not_ready",
+            "triage-app is pending, not ready.",
+        ),
+        (
+            _refusal(
+                422,
+                "credential_invalid",
+                "GitHub refused the App's key for its repositories (401): it was revoked, or "
+                "the App deleted.",
+            ),
+            "credential_invalid",
+            "the App deleted. An admin replaces its key with `cayu cloud connections rotate "
+            "triage-app --credential app_id=APP_ID --credential private_key=@PATH`.",
+        ),
+    ],
+)
+def test_repositories_reports_why_cloud_couldnt_list_them(
+    cloud, capsys: pytest.CaptureFixture[str], answer: httpx.Response, code: str, said: str
+) -> None:
+    fake = cloud({_REPOSITORIES: answer})
+
+    exit_code, output = _run(["connections", "repositories", "triage-app"], capsys)
+
+    assert exit_code != 0
+    assert output["error"]["code"] == code
+    assert output["error"]["message"].endswith(said)
+    assert not any(request.url.path == "/v1/connections-status" for request in fake.requests)
+
+
+def test_repositories_on_a_cloud_that_predates_them_says_so(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            _REPOSITORIES: _MISSING,
+            _STATUS: httpx.Response(200, json={"enabled": True, "message": ""}),
+        }
+    )
+
+    code, output = _run(["connections", "repositories", "triage-app"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "repository_listing_unavailable"
+    assert output["error"]["message"].startswith(
+        "This Cayu Cloud can't list a connection's repositories"
+    )
+
+
+def test_repositories_with_connections_off_says_they_are_off(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud({_REPOSITORIES: _MISSING, _STATUS: _OFF})
+
+    code, output = _run(["connections", "repositories", "triage-app"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "connections_disabled"
+
+
+_GITHUB_SLOT = ("PUT", f"{_APPS}/support-desk/connections/github")
+_BIND_GITHUB = [
+    "connections",
+    "bind",
+    "github",
+    "triage-app",
+    "--application",
+    "support-desk",
+    "--repository",
+    "acme/widgets",
+    "--repository",
+    "acme-labs/*",
+]
+
+
+def test_a_binding_github_couldnt_check_prints_the_warning_beside_its_json(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    warning = "Bound, but the repositories weren't checked: GitHub couldn't be reached."
+    bound = {"slot": "github", "connection": "triage-app", "repositories_warning": warning}
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: httpx.Response(200, json=bound),
+        }
+    )
+
+    assert main(["cloud", *_BIND_GITHUB]) == 0
+
+    printed = capsys.readouterr()
+    assert json.loads(printed.out)["result"] == bound
+    assert printed.err.splitlines()[-1] == f"Warning: {warning}"
+
+
+def test_a_checked_binding_prints_no_warning(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: httpx.Response(
+                200, json={"slot": "github", "repositories_warning": None}
+            ),
+        }
+    )
+
+    assert main(["cloud", *_BIND_GITHUB]) == 0
+
+    assert "Warning" not in capsys.readouterr().err
+
+
+def test_a_binding_to_repositories_the_app_isnt_on_says_how_to_see_those_it_is(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: _refusal(
+                422,
+                "repositories_not_installed",
+                "triage-app can't reach acme/widgets: it isn't installed on it. Install it "
+                "there, or leave it out.",
+            ),
+        }
+    )
+
+    code, output = _run(_BIND_GITHUB, capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "repositories_not_installed"
+    assert output["error"]["message"] == (
+        "Cayu Cloud API returned HTTP 422: triage-app can't reach acme/widgets: it isn't "
+        "installed on it. Install it there, or leave it out. See the repositories it reaches "
+        "with `cayu cloud connections repositories triage-app`."
+    )
+
+
+@pytest.mark.parametrize(
+    "code", ["repositories_required", "repository_invalid", "repositories_not_allowed"]
+)
+def test_a_refused_bindings_repositories_report_clouds_reason(
+    cloud, capsys: pytest.CaptureFixture[str], code: str
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: _refusal(422, code, "Name each repository as owner/name."),
+        }
+    )
+
+    exit_code, output = _run(_BIND_GITHUB, capsys)
+
+    assert exit_code != 0
+    assert output["error"]["code"] == code
+    assert output["error"]["message"].endswith("Name each repository as owner/name.")
+
+
+_BOUND_ROUTE = ("GET", f"{_APPS}/support-desk/connections")
+_BOUND = {
+    "items": [
+        {
+            "application_id": "support-desk",
+            "slot": "github",
+            "connection": "triage-app",
+            "scopes": ["issues:write", "contents:read"],
+            "repositories": ["acme/widgets", "acme-labs/*"],
+        },
+        {
+            "application_id": "support-desk",
+            "slot": "primary",
+            "connection": "team-anthropic",
+            "scopes": [],
+            "repositories": [],
+        },
+    ],
+    "declared": [
+        {
+            "slot": "github",
+            "description": "Triage issues",
+            "connectors": ["github-app"],
+            "scopes": ["issues:write"],
+            "bound": True,
+        },
+        {
+            "slot": "warehouse",
+            "description": "Sales figures",
+            "connectors": ["snowflake"],
+            "scopes": ["read"],
+            "bound": False,
+        },
+    ],
+    "release_id": "dep_8k2m",
+}
+
+
+def _bound(cloud: Any, answer: dict[str, Any]) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _BOUND_ROUTE: httpx.Response(200, json=answer),
+        }
+    )
+
+
+def test_bound_prints_the_bound_slots_then_the_declared_ones_nobody_bound(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bound(cloud, _BOUND)
+
+    assert main(["cloud", "connections", "bound", "--application", "support-desk"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "SLOT     CONNECTION      SCOPES                       REPOSITORIES",
+        "github   triage-app      issues:write, contents:read  acme/widgets, acme-labs/*",
+        "primary  team-anthropic  -                            -",
+        "",
+        "Declared by release dep_8k2m but not bound:",
+        "SLOT       EXPECTS    NEEDS  DESCRIPTION",
+        "warehouse  snowflake  read   Sales figures",
+        "Bind one with `cayu cloud connections bind SLOT CONNECTION --application AGENT`.",
+    ]
+
+
+def test_bound_on_a_cloud_without_declared_slots_prints_the_bound_ones(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bound(cloud, {"items": _BOUND["items"][1:]})
+
+    assert main(["cloud", "connections", "bound", "--application", "support-desk"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "SLOT     CONNECTION      SCOPES  REPOSITORIES",
+        "primary  team-anthropic  -       -",
+    ]
+
+
+def test_bound_without_a_known_release_says_its_slots_arent_shown(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bound(cloud, {"items": [], "declared": [], "release_id": None})
+
+    assert main(["cloud", "connections", "bound", "--application", "support-desk"]) == 0
+
+    assert capsys.readouterr().out.splitlines() == [
+        "No slots bound.",
+        "",
+        "Cayu Cloud doesn't know which Release serves this Agent, so its declared slots "
+        "aren't shown.",
+    ]
+
+
+def test_bound_with_json_prints_clouds_answer(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    _bound(cloud, _BOUND)
+
+    code, output = _run(["connections", "bound", "--application", "support-desk", "--json"], capsys)
+
+    assert code == 0
+    assert output["operation"] == "connections.bound"
+    assert output["result"] == _BOUND
+
+
+def test_bound_shortens_long_lists_and_descriptions_and_json_keeps_them(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    scopes = [
+        "issues:write",
+        "pull_requests:write",
+        "contents:write",
+        "checks:write",
+        "statuses:write",
+        "actions:read",
+        "metadata:read",
+        "workflows:write",
+        "deployments:write",
+    ]
+    repositories = [f"acme/widgets-{number}" for number in range(40)]
+    answer = {
+        "items": [
+            {
+                "slot": "github",
+                "connection": "triage-app",
+                "scopes": scopes,
+                "repositories": repositories,
+            }
+        ],
+        "declared": [
+            {
+                "slot": "warehouse",
+                "description": "Sales figures " * 20,
+                "connectors": ["snowflake"],
+                "scopes": [f"schema_{number}.read" for number in range(30)],
+                "bound": False,
+            }
+        ],
+        "release_id": "dep_8k2m",
+    }
+    _bound(cloud, answer)
+
+    assert main(["cloud", "connections", "bound", "--application", "support-desk"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert all(len(line) <= 200 for line in lines)
+    assert lines[1] == (
+        "github  triage-app  issues:write, pull_requests:write, ... (+7 more)  "
+        "acme/widgets-0, acme/widgets-1, ... (+38 more)"
+    )
+    assert lines[5] == (
+        "warehouse  snowflake  schema_0.read, schema_1.read, schema_2.read, ... (+27 more)  "
+        + ("Sales figures " * 5)[:57]
+        + "..."
+    )
+
+    code, output = _run(["connections", "bound", "--application", "support-desk", "--json"], capsys)
+    assert code == 0
+    assert output["result"] == answer
+
+
+def test_a_bindings_warning_is_repeated_only_when_it_is_safe_to_show(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: httpx.Response(
+                200, json={"slot": "github", "repositories_warning": "Bound\x1b[2J" + "x" * 600}
+            ),
+        }
+    )
+
+    assert main(["cloud", *_BIND_GITHUB]) == 0
+
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        "Warning: Bound, but the repositories were not checked."
+    )
+
+
+def test_a_refusal_naming_many_repositories_names_the_first_and_counts_the_rest(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = ", ".join(f"acme/widgets-{number}" for number in range(50))
+    cloud(
+        {
+            ("GET", f"{_APPS}?lifecycle=all"): httpx.Response(200, json=_AGENTS),
+            _GITHUB_SLOT: _refusal(
+                422,
+                "repositories_not_installed",
+                f"triage-app can't reach {missing}: it isn't installed on them. Install it "
+                "there, or leave them out.",
+            ),
+        }
+    )
+
+    code, output = _run(_BIND_GITHUB, capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "repositories_not_installed"
+    assert output["error"]["message"] == (
+        "Cayu Cloud API returned HTTP 422: triage-app can't reach acme/widgets-0, "
+        "acme/widgets-1, acme/widgets-2, acme/widgets-3, acme/widgets-4, ... (+45 more): it "
+        "isn't installed on them. Install it there, or leave them out. See the repositories it "
+        "reaches with `cayu cloud connections repositories triage-app`."
+    )

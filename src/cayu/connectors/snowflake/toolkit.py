@@ -39,6 +39,9 @@ from cayu.tools.policy import ToolPolicy
 DEFAULT_SLOT = "snowflake"
 #: The slot ``snowflake_execute`` uses unless the toolkit is given another.
 DEFAULT_WRITE_SLOT = "snowflake-write"
+#: The Cayu Cloud connectors a slot of these tools may be bound to; Snowflake's role, not a
+#: scope, decides what a connection can do.
+CONNECTORS = ("snowflake",)
 #: Rows one answer carries unless the toolkit is given another number.
 DEFAULT_MAX_ROWS = 200
 MAX_ROWS = 1_000
@@ -122,9 +125,19 @@ def tools(
         timeout_seconds=float(timeout_seconds),
         context=context,
     )
-    if include_writes is not True:
-        return [_Query(settings)]
-    return [_Query(settings), _Execute(replace(settings, slot=write_slot))]
+    made: list[_SnowflakeTool] = [_Query(settings)]
+    if include_writes is True:
+        made.append(_Execute(replace(settings, slot=write_slot)))
+    return [
+        _common.declaring(
+            tool,
+            tool.settings.slot,
+            connectors=CONNECTORS,
+            scopes=(),
+            description="Snowflake SQL statements",
+        )
+        for tool in made
+    ]
 
 
 def approval_policy(inner: ToolPolicy | None = None) -> ToolPolicy:
@@ -522,6 +535,10 @@ class _SnowflakeTool(Tool):
     def __init__(self, settings: _Settings) -> None:
         super().__init__()
         self._settings = settings
+
+    @property
+    def settings(self) -> _Settings:
+        return self._settings
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         statement = args.get("statement")

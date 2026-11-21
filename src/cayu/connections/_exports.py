@@ -2,6 +2,7 @@
 
 EXPORTS: dict[str, tuple[str, str]] = {
     "CloudConnectionBroker": ("cayu.connections.client", "CloudConnectionBroker"),
+    "ConnectionSlot": ("cayu.connections.slots", "ConnectionSlot"),
     "ConnectionCallError": ("cayu.connections.client", "ConnectionCallError"),
     "ConnectionClient": ("cayu.connections.client", "ConnectionClient"),
     "ConnectionResponse": ("cayu.connections.client", "ConnectionResponse"),
