@@ -2108,11 +2108,15 @@ def _retain_failed_binding_claim_release(claim: _BindingAuthorityClaimLease) -> 
 
 
 def _retry_pending_binding_claim_releases(source_key: tuple[object, ...]) -> None:
-    for key, claim in _BINDING_CLAIM_RELEASES.claim_pending(source_key):
+    pending = _BINDING_CLAIM_RELEASES.claim_pending(source_key)
+    for index, (key, claim) in enumerate(pending):
         try:
             claim.release_after_settlement()
         except BaseException:
-            _BINDING_CLAIM_RELEASES.release_claim(key)
+            # The whole batch was claimed up front; hand back this release and
+            # every later one so the next assistance retries them.
+            for unattempted_key, _claim in pending[index:]:
+                _BINDING_CLAIM_RELEASES.release_claim(unattempted_key)
             raise
         _BINDING_CLAIM_RELEASES.forget(key)
 

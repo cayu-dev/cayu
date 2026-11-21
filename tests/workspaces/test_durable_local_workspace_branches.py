@@ -4646,6 +4646,53 @@ def test_transferred_binding_claim_release_failure_remains_assistable(
     asyncio.run(scenario())
 
 
+def test_failed_binding_claim_release_assistance_leaves_later_releases_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        import cayu.workspaces._local_branch as branch_module
+
+        _isolate_retained_branch_state(monkeypatch, branch_module)
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        provider = _FailOnceReleaseAuthorityProvider(_binding_authority())
+        source, branch, request = await _durable_branch(
+            root,
+            store,
+            resolver=provider,
+        )
+        leases = [
+            branch_module._binding_authority_claim_lease(source, request.authority)
+            for _ in range(2)
+        ]
+        for lease in leases:
+            provider.arm_release_failure()
+            with pytest.raises(ConnectionError, match="binding claim release failed"):
+                branch_module._release_binding_authority_claim_lease(lease)
+        assert len(branch_module._BINDING_CLAIM_RELEASES) == 2
+
+        # Assistance fails on the first retained release, before it reaches the
+        # second one.
+        provider.arm_release_failure()
+        with pytest.raises(ConnectionError, match="binding claim release failed"):
+            await branch.write_bytes("first.txt", b"first")
+        assert len(branch_module._BINDING_CLAIM_RELEASES) == 2
+
+        await branch.write_bytes("second.txt", b"second")
+        assert len(branch_module._BINDING_CLAIM_RELEASES) == 0
+        provider.replace(
+            _binding_authority(
+                generation="binding-2",
+                identity="workspace-alpha@binding-2",
+            )
+        )
+
+    asyncio.run(scenario())
+
+
 def test_cancelling_terminal_assistance_does_not_claim_later_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
