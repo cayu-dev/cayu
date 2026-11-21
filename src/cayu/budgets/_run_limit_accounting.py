@@ -198,7 +198,7 @@ def rebase_run_limit_accounting_context(
     reset_budgets: bool,
     now: datetime,
 ) -> RunLimitAccountingContext | None:
-    """Apply independent continuation overrides without resetting the other authority."""
+    """Rebase changed budget identities independently of the run-limit authority."""
 
     if type(context) is not RunLimitAccountingContext:
         raise TypeError("Run-limit accounting must be a RunLimitAccountingContext.")
@@ -217,8 +217,15 @@ def rebase_run_limit_accounting_context(
         baseline = context.baseline
 
     if reset_budgets:
+        # An adopted definition gets a new origin; unchanged siblings retain
+        # their pre-continuation spending even when limits are reordered.
+        existing = {
+            authority.budget_limit_id: authority for authority in context.run_budget_authorities
+        }
         run_budget_authorities = tuple(
-            RunBudgetAccountingAuthority(
+            existing[_effective_budget_limit_id(limit)]
+            if _effective_budget_limit_id(limit) in existing
+            else RunBudgetAccountingAuthority(
                 budget_limit_id=_effective_budget_limit_id(limit),
                 currency=limit.currency,
                 started_at=now,
@@ -235,4 +242,34 @@ def rebase_run_limit_accounting_context(
         baseline=baseline,
         run_budget_authorities=run_budget_authorities,
         pause_started_at=None if reset_run_limits else context.pause_started_at,
+    )
+
+
+def start_run_limit_accounting_context(
+    *,
+    session_id: str,
+    limits: RunLimits,
+    budget_limits: tuple[BudgetLimit, ...],
+    events: list[Event],
+    now: datetime,
+) -> RunLimitAccountingContext | None:
+    """Open run-scoped accounting at a continuation that had none to carry over."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    if not has_run_limit_accounting_authority(limits, budget_limits):
+        return None
+    started_at = now.astimezone(UTC)
+    return RunLimitAccountingContext(
+        started_at=started_at,
+        baseline=session_usage_summary(session_id, events),
+        run_budget_authorities=tuple(
+            RunBudgetAccountingAuthority(
+                budget_limit_id=_effective_budget_limit_id(limit),
+                currency=limit.currency,
+                started_at=started_at,
+            )
+            for limit in budget_limits
+            if limit.scope == "run"
+        ),
     )

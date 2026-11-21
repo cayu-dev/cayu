@@ -98,6 +98,7 @@ from cayu.budgets._run_limit_accounting import (
     RunLimitAccountingContext,
     rebase_run_limit_accounting_context,
     resume_run_limit_accounting_context,
+    start_run_limit_accounting_context,
 )
 from cayu.budgets.base import (
     BudgetLimit,
@@ -4731,18 +4732,32 @@ class RecoveryCoordinator:
                 causal_budget_id=session.causal_budget_id,
             )
             if continued_run_limit_accounting is not None:
+                assert claimed_resolution_intent is not None
                 continued_run_limit_accounting = rebase_run_limit_accounting_context(
                     continued_run_limit_accounting,
                     session_id=session.id,
                     limits=effective_limits,
                     budget_limits=resolved_budget_limits,
                     events=approval_events,
-                    # Profile admission permits only an exact restatement of the
-                    # frozen invocation semantics. It must not reset the durable
-                    # accounting origin merely because the caller restated it.
+                    # Profile adoption can replace budget semantics. Preserve
+                    # unchanged identities and anchor new ones to the durable
+                    # resolution claim, including on an exact retry.
                     reset_run_limits=False,
-                    reset_budgets=False,
-                    now=self._clock(),
+                    reset_budgets=(
+                        effective_budget_limits != (pending_approval.budget_limits or ())
+                    ),
+                    now=claimed_resolution_intent.pause_resolved_at or self._clock(),
+                )
+            elif claimed_resolution_intent is not None:
+                # Adoption can introduce the first run-scoped authority. Open it
+                # at the durable resolution claim so the approved tool and the
+                # continuation account under the same origin on every retry.
+                continued_run_limit_accounting = start_run_limit_accounting_context(
+                    session_id=session.id,
+                    limits=effective_limits,
+                    budget_limits=resolved_budget_limits,
+                    events=approval_events,
+                    now=claimed_resolution_intent.pause_resolved_at or self._clock(),
                 )
             history = approval_support.approval_resolution_history(
                 events=approval_events,
@@ -5359,7 +5374,7 @@ class RecoveryCoordinator:
                         claimed_resolution_intent, tool_call.id
                     ),
                     request_metadata=request.metadata,
-                    budget_limits=pending_approval.budget_limits or (),
+                    budget_limits=resolved_budget_limits,
                     auxiliary_invocation_policy=AuxiliaryInvocationPolicy(
                         limits=effective_limits,
                         retry_policy=effective_retry_policy,
