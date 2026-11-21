@@ -2536,6 +2536,32 @@ from the terminal: a waiting command says so and prints its link to finish in th
 `--no-wait`. A connection that signed in shows the account it connected as `account` (`id` and
 `name`) in `list` and `show`.
 
+A connector that the install signs in to through its Nango completes by poll instead: Cloud's
+answer says `"completion": "poll"`, and nothing comes back to the command, so there is no
+loopback port or start page. The command prints the approval link (`authorization_url`) and
+opens it unless `--no-browser`, on any computer, then asks Cloud to complete the sign-in
+(`POST /v1/connections/sign-in/complete` with the sign-in's state alone) while Cloud answers
+`"sign_in": "pending"` (HTTP 202), pausing 1 second before the first ask and up to 5 seconds
+between the next, within `--wait-seconds`; an ask that can't reach Cloud is tried once more at
+once. A ready connection being reconnected keeps working meanwhile. `--port` isn't used, and the
+command says so. A `--port` in use doesn't stop a connector that `cayu cloud connectors` lists
+with `"completion": "poll"`, and refuses any other (`sign_in_port_unavailable`) before it
+starts. It ends as above: the connected account, or with `--json` the envelope with
+`"sign_in": "completed"`. Cloud's refusal stops it with its code and what to do next:
+`state_expired` (a sign-in lasts 10 minutes), `state_reused`, `state_unknown`,
+`connection_removed` (add it again), `access_denied`, `exchange_failed`, `account_changed`, or
+`sign_in_not_yours` (only the admin who started it completes it). When the time is up or you
+press Ctrl-C, the connection stays as it was, and `cayu cloud connections authorize NAME`
+starts again.
+
+Only the waiting command completes such a sign-in, and starting one replaces any other still
+waiting, so `--no-wait` refuses a connector that `cayu cloud connectors` lists with
+`"completion": "poll"` before starting anything (`sign_in_needs_wait`), and says to run the
+same command without `--no-wait` or connect it in the portal. Where the catalog doesn't say, the
+sign-in starts, and the command prints that instead of a link: `--json` carries neither the
+link nor the state. A Cayu Cloud whose answer has no `completion` signs in through the loopback
+port, as above.
+
 A waiting command never prints or opens the sign-in's state, and `--json` doesn't carry it
 either. The state leaves the command only through the start page, and only to a visit with the
 start link's secret (`k`), which is shown only in your terminal; a visit without it gets "Not

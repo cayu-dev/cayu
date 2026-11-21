@@ -75,7 +75,11 @@ toolset per call. On the default slot the tools keep the package's names; on ano
 names them (`ramp-eu`: `ramp_eu_list_bills`), so two slots of one toolset can serve one Agent.
 Only the tools without an effect come unless `writes=True`. A tool with an effect asks for a
 person's approval itself, with the package's reason naming its arguments (`Post a message to
-C0123.`): `register_agent` puts every tool's `Tool.approval_reason` under the Agent's
+C0123.`). Each argument is quoted printable and short; a list shows its items joined with ", ",
+`(none)` when empty, and when the items don't all fit, every one that does in full and how many
+more (`Send an email to ana@example.com, ben@example.com and 12 more`), so the approver always
+sees that recipients are left out; an object, or a list inside a list, is quoted as compact JSON.
+`register_agent` puts every tool's `Tool.approval_reason` under the Agent's
 `tool_policy` as an `ApprovalFloorToolPolicy`, so there is no `tool_policy=` line to write and
 `cayu check` reads the writes as guarded. What the Agent's own policy denies stays denied.
 

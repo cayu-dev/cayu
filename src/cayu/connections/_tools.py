@@ -13,8 +13,8 @@ import hashlib
 import json
 import re
 import uuid
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeGuard
 
 from cayu.connections import _tool_catalog
 from cayu.connections._tool_catalog import (
@@ -60,6 +60,8 @@ _ADVICE = {
 }
 _CHECK = "check whether it did"
 _IDENTITY_PREFIX = "cayu.connector-tools/"
+#: The most characters a list argument takes in an approval reason, before "and N more".
+_MAX_LISTED_CHARACTERS = 300
 _OFFLINE = "This process has no connection to Cayu Cloud, which runs these tools."
 _OFFLINE_ADVICE = (
     "These tools were loaded from a saved catalog (CAYU_CONNECTOR_TOOLS=snapshot or offline); "
@@ -263,8 +265,50 @@ class ApprovalTemplate:
 
     def __call__(self, arguments: Mapping[str, Any]) -> str:
         return self.template.format_map(
-            {name: _common.reason_argument(arguments.get(name)) for name in self._names}
+            {name: _quoted(arguments.get(name), listing=True) for name in self._names}
         )
+
+
+def _quoted(value: object, *, listing: bool = False) -> str:
+    """An argument as an approval reason quotes it, printable and short: with ``listing``, a
+    list as its items (`_listed`); an object, or a list inside one, as compact JSON."""
+
+    if listing and _is_list(value):
+        return _listed([_quoted(item) for item in value])
+    if isinstance(value, Mapping) or _is_list(value):
+        value = json.dumps(_plain(value), ensure_ascii=False, separators=(",", ":"), default=str)
+    return _common.reason_argument(value)
+
+
+def _is_list(value: object) -> TypeGuard[Sequence[Any]]:
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)
+
+
+def _plain(value: object) -> object:
+    """``value`` with its mappings and lists (frozen ones too) as dicts and lists, for JSON."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if _is_list(value):
+        return [_plain(item) for item in value]
+    return value
+
+
+def _listed(items: list[str]) -> str:
+    """``items`` joined with ", " within `_MAX_LISTED_CHARACTERS`, each one shown whole, and
+    those that don't fit counted ("and 3 more"), so none is ever left out unsaid."""
+
+    if not items:
+        return "(none)"
+    shown: list[str] = []
+    for index, item in enumerate(items):
+        left = len(items) - index - 1
+        candidate = ", ".join([*shown, item]) + (f" and {left} more" if left else "")
+        if len(candidate) > _MAX_LISTED_CHARACTERS:
+            break
+        shown.append(item)
+    left = len(items) - len(shown)
+    return ", ".join(shown) + (f" and {left} more" if left else "")
 
 
 def _call_id(ctx: ToolContext) -> str:

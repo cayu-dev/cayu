@@ -16,6 +16,11 @@ else has the link: before a sign-in came back the command stops and connects not
 it fails loudly, as the connection may be theirs. The code
 and the state are never printed or logged. A command that stops waiting (its time is up, or
 Ctrl-C) leaves the connection `pending`; `connections authorize` starts again.
+
+A connector signed in through the install's Nango completes by poll instead (Cloud answers
+`completion: "poll"` and the sign-in's state): no browser comes back to the command, which asks
+Cloud to complete the sign-in with that state alone, with a pause that grows, until the person
+has approved it (`polled`).
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from collections.abc import Callable, Mapping
 from http import HTTPStatus
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -61,6 +66,9 @@ LINK_SHARED_PAGE = (
 MAX_CONNECTIONS = 16
 #: How often a waiting command checks its time and Ctrl-C.
 _TICK = 0.1
+#: The first pause between asks of a sign-in that completes by poll, doubling up to the most.
+POLL_FIRST_SECONDS = 1.0
+POLL_MOST_SECONDS = 5.0
 
 #: Completes the sign-in with what came back: the connection, or raises Cloud's refusal.
 Finish = Callable[[dict[str, str]], dict[str, Any]]
@@ -177,6 +185,38 @@ class SignInReturn(ThreadingHTTPServer):
         return self.outcome
 
 
+def polled(complete: Callable[[], dict[str, Any]], *, seconds: float) -> dict[str, Any]:
+    """Cloud's answer once ``complete`` no longer answers the sign-in `pending`, asked after a
+    pause that grows from `POLL_FIRST_SECONDS` to `POLL_MOST_SECONDS`, and once more at once
+    when Cloud can't be reached; raises `SignInTimedOut` after ``seconds``,
+    `SignInMayHaveCompleted` for Ctrl-C while Cloud is asked, or what ``complete`` raised."""
+
+    deadline = monotonic() + seconds
+    pause = POLL_FIRST_SECONDS
+    while True:
+        sleep(max(0.0, min(pause, deadline - monotonic())))
+        try:
+            answer = _asked(complete)
+        except KeyboardInterrupt:
+            raise SignInMayHaveCompleted from None
+        if answer.get("sign_in") != "pending":
+            return answer
+        if monotonic() >= deadline:
+            raise SignInTimedOut
+        pause = min(pause * 2, POLL_MOST_SECONDS)
+
+
+def _asked(complete: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """``complete``'s answer, asked once more when Cloud couldn't be reached the first time."""
+
+    try:
+        return complete()
+    except CloudApiError as exc:
+        if exc.category != "api_unavailable":
+            raise
+    return complete()
+
+
 class SignInTimedOut(Exception):
     """No sign-in came back in time."""
 
@@ -195,7 +235,7 @@ class SignInLinkShared(Exception):
 
 
 class SignInMayHaveCompleted(Exception):
-    """Stopped (Ctrl-C) while a sign-in that came back was being completed."""
+    """Stopped (Ctrl-C) while a sign-in was being completed."""
 
 
 class _ReturnHandler(BaseHTTPRequestHandler):

@@ -17,6 +17,7 @@ from tests.connector_broker_support import context, policy_request
 from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu import AgentSpec, CayuApp
+from cayu._validation import FrozenJsonDict, FrozenJsonList
 from cayu.cli import _release_check
 from cayu.cli import cloud as cloud_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
@@ -28,6 +29,7 @@ from cayu.connections import (
     ConnectorPackageTool,
     ConnectorToolsError,
     _tool_catalog,
+    _tools,
     tools,
 )
 from cayu.connectors import slack
@@ -606,6 +608,48 @@ def test_an_approval_keeps_literal_braces(cloud, in_cloud) -> None:
 
     assert post.approval_reason is not None and not isinstance(post.approval_reason, str)
     assert post.approval_reason({"channel": "C1"}) == "Post {json} to C1."
+
+
+_SEND = "Send an email to {to} (cc {cc}, bcc {bcc}): {subject}"
+
+
+def test_an_approval_lists_every_recipient_of_list_arguments() -> None:
+    reason = _tools.ApprovalTemplate(_SEND)
+
+    assert reason(
+        {
+            "to": ["ana@example.com", "ben@example.com"],
+            "cc": [],
+            "bcc": FrozenJsonList(["audit@example.com\u202e"]),
+            "subject": "Quarterly report",
+        }
+    ) == (
+        "Send an email to ana@example.com, ben@example.com (cc (none), bcc audit@example.com): "
+        "Quarterly report"
+    )
+
+
+def test_a_long_list_shows_whole_items_and_counts_the_rest() -> None:
+    bcc = [f"person{number:03}@example.com" for number in range(40)]
+
+    reason = _tools.ApprovalTemplate(_SEND)(
+        {"to": ["ana@example.com"], "cc": [], "bcc": bcc, "subject": "Hi"}
+    )
+
+    listed = reason.removeprefix("Send an email to ana@example.com (cc (none), bcc ")
+    shown, _, more = listed.removesuffix("): Hi").rpartition(" and ")
+    names = shown.split(", ")
+    assert names == bcc[: len(names)]
+    assert more == f"{len(bcc) - len(names)} more"
+    assert len(shown) + len(" and ") + len(more) <= _tools._MAX_LISTED_CHARACTERS
+
+
+def test_objects_and_nested_lists_are_quoted_as_compact_json() -> None:
+    reason = _tools.ApprovalTemplate("Label {labels} on {target}")
+
+    assert reason({"labels": [["a", "b"], {"k": 1}], "target": FrozenJsonDict({"id": "m1"})}) == (
+        'Label ["a","b"], {"k":1} on {"id":"m1"}'
+    )
 
 
 def test_a_catalog_refused_without_a_code_and_a_retry_after(cloud, in_cloud) -> None:

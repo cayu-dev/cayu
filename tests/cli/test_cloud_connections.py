@@ -564,12 +564,21 @@ _SIGN_IN = {
     "error": None,
     "authorization_url": "https://slack.com/oauth/v2/authorize?state=abc",
 }
+#: What a --no-wait sign-in reads first: the connection's connector, and how it completes.
+_NO_WAIT_READS = {
+    _LIST_CONNECTORS: httpx.Response(200, json=_CONNECTORS),
+    ("GET", "/v1/connections/example-slack"): httpx.Response(
+        200, json={k: v for k, v in _SIGN_IN.items() if k != "authorization_url"}
+    ),
+}
 
 
 def test_add_without_a_credential_prints_where_to_approve_it(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fake = cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
+    fake = cloud(
+        {**_NO_WAIT_READS, ("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)}
+    )
 
     code = main(
         [
@@ -600,7 +609,7 @@ def test_add_without_a_credential_prints_where_to_approve_it(
 def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
     cloud, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cloud({("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
+    cloud({**_NO_WAIT_READS, ("POST", "/v1/connections"): httpx.Response(201, json=_SIGN_IN)})
 
     code, output = _run(
         ["connections", "add", "slack", "--name", "example-slack", "--json", "--no-wait"], capsys
@@ -614,9 +623,10 @@ def test_add_without_a_credential_with_json_prints_the_link_in_the_envelope(
 def test_authorize_prints_a_new_link(cloud, capsys: pytest.CaptureFixture[str]) -> None:
     fake = cloud(
         {
+            **_NO_WAIT_READS,
             ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 200, json={**_SIGN_IN, "authorization_url": "https://slack.com/new"}
-            )
+            ),
         }
     )
 
@@ -635,6 +645,7 @@ def test_authorize_prints_a_new_link(cloud, capsys: pytest.CaptureFixture[str]) 
 def test_a_refused_sign_in_reports_clouds_reason(cloud, capsys: pytest.CaptureFixture[str]) -> None:
     cloud(
         {
+            **_NO_WAIT_READS,
             ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 403,
                 json={
@@ -643,7 +654,7 @@ def test_a_refused_sign_in_reports_clouds_reason(cloud, capsys: pytest.CaptureFi
                         "message": "Only an organization admin can do this.",
                     }
                 },
-            )
+            ),
         }
     )
 
@@ -1489,6 +1500,8 @@ def test_port_waits_on_the_port_given_and_says_when_it_is_taken(
     assert json.loads(fake.requests[0].content) == {"return_port": port}
     assert f"127.0.0.1:{port}" in capsys.readouterr().err
 
+    # The catalog doesn't say the connector completes by poll: refused before it starts.
+    fake.routes.update(_NO_WAIT_READS)
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
         taken.listen()
@@ -1498,7 +1511,420 @@ def test_port_waits_on_the_port_given_and_says_when_it_is_taken(
         )
     assert code != 0
     assert output["error"]["category"] == "sign_in_port_unavailable"
-    assert len(fake.requests) == 2
+    assert [request.method for request in fake.requests[2:]] == ["GET", "GET"]
+
+
+_CHAT_LINK = "https://connect.example.com/session?token=example"
+_CHAT = {
+    "name": "example-chat",
+    "connector": "example-chat",
+    "status": "pending",
+    "account": None,
+    "error": None,
+}
+_CHAT_READY = {**_CHAT, "status": "ready", "account": {"id": "W1", "name": "Example Workspace"}}
+_CHAT_AUTHORIZE = ("POST", "/v1/connections/example-chat/authorize")
+
+
+def _polling(request: httpx.Request, *, status: int = 200) -> httpx.Response:
+    """Cloud's answer to a sign-in it completes by poll: the link, and the state to complete it
+    with (ending in the port it was named, which nothing comes back to)."""
+
+    port = json.loads(request.content or b"{}").get("return_port")
+    state = _STATE if port is None else f"{_STATE}.{port}"
+    started = {**_CHAT, "authorization_url": _CHAT_LINK, "completion": "poll", "state": state}
+    return httpx.Response(status, json=started)
+
+
+def _answers(*answers: httpx.Response) -> Callable[[httpx.Request], httpx.Response]:
+    """Cloud's answers to each ask in turn, the last one repeated."""
+
+    given = iter(answers)
+    last = answers[-1]
+
+    def answer(_request: httpx.Request) -> httpx.Response:
+        return next(given, last)
+
+    return answer
+
+
+_PENDING = httpx.Response(202, json={**_CHAT, "sign_in": "pending"})
+_COMPLETED = httpx.Response(200, json={**_CHAT_READY, "sign_in": "completed"})
+
+
+@pytest.fixture
+def pauses(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The pauses a polling command takes, on a clock that moves only when it pauses."""
+
+    taken: list[float] = []
+    monkeypatch.setattr(_cloud_sign_in, "monotonic", lambda: sum(taken))
+    monkeypatch.setattr(_cloud_sign_in, "sleep", taken.append)
+    return taken
+
+
+def _completions(fake: Any) -> list[dict[str, Any]]:
+    return [json.loads(r.content) for r in fake.requests if r.url.path == _COMPLETE[1]]
+
+
+def test_add_polls_with_a_growing_pause_until_the_sign_in_is_ready(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    fake = cloud(
+        {
+            ("POST", "/v1/connections"): partial(_polling, status=201),
+            _COMPLETE: _answers(*[_PENDING] * 6, _COMPLETED),
+        }
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", opened.append)
+
+    code = main(["cloud", "connections", "add", "example-chat", "--name", "example-chat"])
+
+    assert code == 0
+    assert pauses == [1, 2, 4, 5, 5, 5, 5]
+    port = json.loads(fake.requests[0].content)["return_port"]
+    assert _completions(fake) == [{"state": f"{_STATE}.{port}"}] * 7
+    assert opened == [_CHAT_LINK]
+    printed = capsys.readouterr()
+    assert printed.out == "example-chat is connected to Example Workspace.\n"
+    assert f"  {_CHAT_LINK}\n" in printed.err
+    assert "Waiting for the sign-in. Ctrl-C stops waiting." in printed.err
+    assert "127.0.0.1" not in printed.err
+    assert _STATE not in printed.out + printed.err
+
+
+def test_authorize_polls_and_json_prints_the_connected_connection(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    cloud(
+        {
+            _CHAT_AUTHORIZE: _polling,
+            _COMPLETE: _answers(_PENDING, _COMPLETED),
+        }
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", opened.append)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    code = main(
+        [
+            "cloud",
+            "connections",
+            "authorize",
+            "example-chat",
+            "--json",
+            "--no-browser",
+            "--port",
+            str(port),
+        ]
+    )
+    printed = capsys.readouterr()
+
+    assert code == 0
+    output = json.loads(printed.out)
+    assert (output["operation"], output["result"], output["sign_in"]) == (
+        "connections.authorize",
+        _CHAT_READY,
+        "completed",
+    )
+    assert opened == []
+    assert "--port isn't used" in printed.err
+    assert _STATE not in printed.out + printed.err
+
+
+def test_polling_stops_after_its_time_and_says_how_to_go_on(
+    cloud, capsys: pytest.CaptureFixture[str], pauses: list[float]
+) -> None:
+    fake = cloud({_CHAT_AUTHORIZE: _polling, _COMPLETE: _answers(_PENDING)})
+
+    code, output = _run(
+        ["connections", "authorize", "example-chat", "--no-browser", "--wait-seconds", "10"],
+        capsys,
+    )
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_timed_out"
+    assert "cayu cloud connections authorize example-chat" in output["error"]["message"]
+    assert pauses == [1, 2, 4, 3]
+    assert len(_completions(fake)) == 4
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "hint"),
+    [
+        (409, "state_expired", "A sign-in lasts 10 minutes"),
+        (409, "exchange_failed", "cayu cloud connections authorize example-chat"),
+        (409, "account_changed", "add another connection"),
+        (409, "state_reused", "already completed or replaced"),
+        (404, "state_unknown", "doesn't know this sign-in"),
+        (404, "connection_removed", "removed meanwhile; add it again"),
+        (403, "sign_in_not_yours", "Only the admin who started a sign-in completes it"),
+    ],
+)
+def test_a_refused_poll_stops_with_clouds_reason_and_what_to_do(
+    cloud,
+    capsys: pytest.CaptureFixture[str],
+    pauses: list[float],
+    status: int,
+    code: str,
+    hint: str,
+) -> None:
+    refusal = {"detail": {"code": code, "message": f"Signing in failed: {code}."}}
+    fake = cloud(
+        {
+            _CHAT_AUTHORIZE: _polling,
+            _COMPLETE: _answers(_PENDING, httpx.Response(status, json=refusal)),
+        }
+    )
+
+    exit_code, output = _run(["connections", "authorize", "example-chat", "--no-browser"], capsys)
+
+    assert exit_code != 0
+    assert output["error"]["code"] == code
+    assert f"Signing in failed: {code}." in output["error"]["message"]
+    assert hint in output["error"]["message"]
+    assert len(_completions(fake)) == 2
+
+
+def test_ctrl_c_while_polling_leaves_the_connection_pending_and_says_how_to_go_on(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({_CHAT_AUTHORIZE: _polling, _COMPLETE: _answers(_PENDING)})
+
+    def interrupted(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_cloud_sign_in, "sleep", interrupted)
+
+    code, output = _run(["connections", "authorize", "example-chat", "--no-browser"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_interrupted"
+    assert "stays as it was" in output["error"]["message"]
+    assert "cayu cloud connections authorize example-chat" in output["error"]["message"]
+
+
+def test_ctrl_c_while_cloud_completes_a_poll_says_it_may_have_connected(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupted(_request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    cloud({_CHAT_AUTHORIZE: _polling, _COMPLETE: interrupted})
+
+    code, output = _run(["connections", "authorize", "example-chat", "--no-browser"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_interrupted"
+    assert "cayu cloud connections show example-chat" in output["error"]["message"]
+
+
+def _catalog(completion: str | None) -> dict[tuple[str, str], httpx.Response]:
+    """The catalog with example-chat (completing by ``completion``, unsaid for None) and the
+    example-chat connection, as a --no-wait sign-in reads them."""
+
+    chat = {"id": "example-chat", "fields": []}
+    if completion is not None:
+        chat["completion"] = completion
+    return {
+        _LIST_CONNECTORS: httpx.Response(200, json={"items": [chat]}),
+        ("GET", "/v1/connections/example-chat"): httpx.Response(200, json=_CHAT),
+    }
+
+
+_CHAT_COMMANDS = pytest.mark.parametrize(
+    "command",
+    [
+        ["add", "example-chat", "--name", "example-chat", "--scope", "send"],
+        ["authorize", "example-chat"],
+    ],
+)
+
+
+@_CHAT_COMMANDS
+def test_no_wait_for_a_connector_that_completes_by_poll_starts_nothing(
+    cloud, capsys: pytest.CaptureFixture[str], command: list[str]
+) -> None:
+    fake = cloud(_catalog("poll"))
+
+    code, output = _run(["connections", *command, "--no-wait"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_needs_wait"
+    assert "Run the same command without --no-wait" in output["error"]["message"]
+    assert "connect it in the portal" in output["error"]["message"]
+    assert all(request.method == "GET" for request in fake.requests)
+
+
+def test_no_wait_on_a_polled_sign_in_the_catalog_didnt_name_prints_no_link_nor_state(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({**_catalog(None), _CHAT_AUTHORIZE: _polling})
+
+    assert main(["cloud", "connections", "authorize", "example-chat", "--no-wait"]) == 0
+    printed = capsys.readouterr().out
+    assert "completes only while a command waits for it" in printed
+    assert "`cayu cloud connections authorize example-chat` without --no-wait" in printed
+    assert _CHAT_LINK not in printed
+    assert _STATE not in printed
+
+    code, output = _run(["connections", "authorize", "example-chat", "--no-wait", "--json"], capsys)
+    assert code == 0
+    assert output["result"]["completion"] == "poll"
+    assert not {"state", "authorization_url"} & set(output["result"])
+    assert [request.url.path for request in fake.requests if request.method == "POST"] == [
+        _CHAT_AUTHORIZE[1]
+    ] * 2
+
+
+def test_reconnecting_a_ready_connection_polls_until_the_sign_in_completes(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    def ready(request: httpx.Request) -> httpx.Response:
+        started = json.loads(_polling(request).content)
+        return httpx.Response(
+            200, json={**started, "status": "ready", "account": _CHAT_READY["account"]}
+        )
+
+    waiting = {**_CHAT_READY, "sign_in": "pending"}
+    fake = cloud(
+        {
+            _CHAT_AUTHORIZE: ready,
+            _COMPLETE: _answers(*[httpx.Response(202, json=waiting)] * 2, _COMPLETED),
+        }
+    )
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", lambda _url: True)
+
+    code, output = _run(["connections", "authorize", "example-chat", "--json"], capsys)
+
+    assert code == 0
+    assert (output["result"], output["sign_in"]) == (_CHAT_READY, "completed")
+    assert len(_completions(fake)) == 3
+
+
+@pytest.mark.parametrize("missing", ["state", "authorization_url"])
+def test_a_poll_answer_without_its_state_or_link_stops_with_a_command_error(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    def stateless(request: httpx.Request) -> httpx.Response:
+        started = json.loads(_polling(request).content)
+        return httpx.Response(200, json={k: v for k, v in started.items() if k != missing})
+
+    fake = cloud({_CHAT_AUTHORIZE: stateless})
+    opened: list[str] = []
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", opened.append)
+
+    code, output = _run(["connections", "authorize", "example-chat"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_unfinishable"
+    assert opened == []
+    assert _completions(fake) == []
+
+
+@pytest.mark.parametrize(("failures", "connected"), [(1, True), (2, False)])
+def test_polling_asks_once_more_when_cloud_cant_be_reached(
+    cloud,
+    capsys: pytest.CaptureFixture[str],
+    pauses: list[float],
+    failures: int,
+    connected: bool,
+) -> None:
+    left = [failures]
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if left[0]:
+            left[0] -= 1
+            raise httpx.ConnectError("refused", request=request)
+        return _COMPLETED
+
+    fake = cloud({_CHAT_AUTHORIZE: _polling, _COMPLETE: flaky})
+
+    code = main(["cloud", "connections", "authorize", "example-chat", "--no-browser"])
+    printed = capsys.readouterr().out
+
+    if connected:
+        assert (code, printed) == (0, "example-chat is connected to Example Workspace.\n")
+    else:
+        assert code != 0
+        assert json.loads(printed)["error"]["category"] == "api_unavailable"
+    assert len(_completions(fake)) == 2
+
+
+@_CHAT_COMMANDS
+@pytest.mark.parametrize("completion", ["poll", "redirect", None])
+def test_a_busy_port_refuses_before_starting_unless_the_catalog_says_poll(
+    cloud,
+    capsys: pytest.CaptureFixture[str],
+    pauses: list[float],
+    command: list[str],
+    completion: str | None,
+) -> None:
+    fake = cloud(
+        {
+            **_catalog(completion),
+            ("POST", "/v1/connections"): partial(_polling, status=201),
+            _CHAT_AUTHORIZE: _polling,
+            _COMPLETE: _COMPLETED,
+        }
+    )
+
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        busy = taken.getsockname()[1]
+        code = main(["cloud", "connections", *command, "--no-browser", "--port", str(busy)])
+    printed = capsys.readouterr()
+
+    started = [r for r in fake.requests if r.method == "POST" and r.url.path != _COMPLETE[1]]
+    if completion == "poll":
+        assert code == 0
+        assert "return_port" not in json.loads(started[0].content or b"{}")
+        assert _completions(fake) == [{"state": _STATE}]
+        assert "--port isn't used" in printed.err
+    else:
+        assert code != 0
+        assert json.loads(printed.out)["error"]["category"] == "sign_in_port_unavailable"
+        assert started == []
+
+
+def test_ctrl_c_while_opening_the_browser_stops_waiting_and_says_how_to_go_on(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cloud({("POST", "/v1/connections/example-slack/authorize"): partial(_returning, status=200)})
+
+    def interrupted(_url: str) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_cloud_connections.webbrowser, "open", interrupted)
+
+    code, output = _run(["connections", "authorize", "example-slack"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "sign_in_interrupted"
+    assert "cayu cloud connections authorize example-slack" in output["error"]["message"]
+
+
+def test_a_redirect_completion_still_waits_on_the_loopback_port(
+    cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def redirecting(request: httpx.Request) -> httpx.Response:
+        answer = _returning(request, status=200)
+        return httpx.Response(200, json={**json.loads(answer.content), "completion": "redirect"})
+
+    fake = cloud(
+        {
+            ("POST", "/v1/connections/example-slack/authorize"): redirecting,
+            _COMPLETE: httpx.Response(200, json=_READY),
+        }
+    )
+    _Browser(monkeypatch, lambda state: (_RETURN, {"state": state, "code": "the-code"}))
+
+    assert main(["cloud", "connections", "authorize", "example-slack"]) == 0
+    assert "Waiting for the sign-in on 127.0.0.1:" in capsys.readouterr().err
+    assert _completions(fake)[0]["code"] == "the-code"
 
 
 def test_show_carries_the_account_status_and_why_it_failed(
@@ -1532,9 +1958,10 @@ def test_reconnecting_a_ready_connection_says_it_keeps_working(
 ) -> None:
     cloud(
         {
+            **_NO_WAIT_READS,
             ("POST", "/v1/connections/example-slack/authorize"): httpx.Response(
                 200, json={**_SIGN_IN, "status": "ready"}
-            )
+            ),
         }
     )
 

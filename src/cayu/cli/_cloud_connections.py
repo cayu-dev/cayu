@@ -18,7 +18,9 @@ bound` prints an Agent's bound slots and the ones its serving Release declares b
 A connector that signs in (Slack) takes no credential: an admin adds it without one, or starts
 its sign-in again with `connections authorize`, and Cloud answers the link where the person
 approves it, which these commands print and open. They then wait for the sign-in to come back
-to them and complete it (`_cloud_sign_in`), or, with `--no-wait`, leave it to the portal.
+to them and complete it (`_cloud_sign_in`), or, with `--no-wait`, leave it to the portal. One
+signed in through the install's Nango (`completion: "poll"`) comes back to nobody: the command
+asks Cloud to complete it until the person has approved it.
 
 `connections activity` lists the calls Agents made through a connection, newest first, since
 `--since` (a duration such as `7d` or a time with its offset; Cloud's default is the last 24
@@ -33,6 +35,7 @@ the slot's default.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import sys
 import webbrowser
@@ -62,6 +65,7 @@ from cayu.cli._cloud_sign_in import (
     SignInReturn,
     SignInTimedOut,
     connected,
+    polled,
     returning_state,
 )
 
@@ -403,7 +407,8 @@ def _add_sign_in_output(parser: argparse.ArgumentParser, seconds: Callable[[str]
         action="store_true",
         help=(
             "Print the JSON envelope: the connected connection, or with --no-wait the link as "
-            "the result's authorization_url."
+            "the result's authorization_url (none for a connector signed in through the "
+            "install's Nango)."
         ),
     )
     parser.add_argument(
@@ -411,7 +416,9 @@ def _add_sign_in_output(parser: argparse.ArgumentParser, seconds: Callable[[str]
         action="store_true",
         help=(
             "Print the link and return: the portal finishes the sign-in, in a browser signed in "
-            "to it as you. For scripts, or a terminal on another machine than the browser."
+            "to it as you. For scripts, or a terminal on another machine than the browser. A "
+            "connector signed in through the install's Nango completes only while the command "
+            "waits, so it is refused."
         ),
     )
     parser.add_argument(
@@ -428,7 +435,8 @@ def _add_sign_in_output(parser: argparse.ArgumentParser, seconds: Callable[[str]
         type=_loopback_port,
         help=(
             "The port on 127.0.0.1 to wait on (default: any free one), for example one forwarded "
-            "with `ssh -L PORT:127.0.0.1:PORT` from the computer with the browser."
+            "with `ssh -L PORT:127.0.0.1:PORT` from the computer with the browser. Not used by "
+            "a connector signed in through the install's Nango, which nothing comes back from."
         ),
     )
     parser.set_defaults(_cloud_render=render_sign_in)
@@ -451,6 +459,12 @@ def render_sign_in(outcome: Mapping[str, Any]) -> str | None:
     result = outcome["result"]
     if outcome.get("sign_in") == "completed":
         return connected(result)
+    if result.get("completion") == "poll":
+        return (
+            f"{result['name']} is waiting for its sign-in, which completes only while a command "
+            f"waits for it. To connect it, run `cayu cloud connections authorize {result['name']}` "
+            "without --no-wait, or connect it in the portal."
+        )
     url = result.get("authorization_url")
     if not isinstance(url, str):
         return None
@@ -827,13 +841,16 @@ def _connections_action(
             return _signed_in(
                 arguments,
                 client,
+                lambda: arguments.connector,
                 lambda port: client.request(
                     "POST",
                     _CONNECTIONS,
                     payload=payload if port is None else {**payload, "return_port": port},
                 ),
             )
-        result = client.request("POST", _CONNECTIONS, payload=payload)
+        if "credential" not in payload:
+            _refuse_unwaited(client, arguments.connector)
+        result = _printable(client.request("POST", _CONNECTIONS, payload=payload))
     elif action in AGENT_ACTIONS:
         result = _agent_action(arguments, client, application_id)
     else:
@@ -844,6 +861,7 @@ def _connections_action(
             return _signed_in(
                 arguments,
                 client,
+                lambda: client.request("GET", path).get("connector"),
                 lambda port: client.request(
                     "POST",
                     f"{path}/authorize",
@@ -851,7 +869,8 @@ def _connections_action(
                 ),
             )
         elif action == "authorize":
-            result = client.request("POST", f"{path}/authorize")
+            _refuse_unwaited(client, client.request("GET", path).get("connector"))
+            result = _printable(client.request("POST", f"{path}/authorize"))
         elif action == "check":
             result = client.request("POST", f"{path}/check")
         elif action == "repositories":
@@ -927,39 +946,66 @@ def _hinted(exc: CloudApiError, hint: str, *, said: str | None = None) -> CloudA
 def _signed_in(
     arguments: argparse.Namespace,
     client: CloudApiClient,
+    connector: Callable[[], object],
     start: Callable[[int | None], dict[str, Any]],
 ) -> dict[str, Any]:
     """Start a sign-in that returns to this command (``start`` with its loopback port), wait for
     it, and complete it: the connected connection. Stopping leaves the connection `pending`.
 
-    A Cayu Cloud from before command-line sign-ins either refuses the port before creating
-    anything (``start`` again without it) or ignores it: then the link it answered is printed
-    to finish in the portal, as with --no-wait."""
+    One that Cloud completes by poll (`completion: "poll"`) returns to nobody: it is asked for
+    instead (`_polled`), and needs no port, so a port that can't be listened on refuses only
+    the others' (``connector``'s, as the catalog says), before anything starts. A Cayu Cloud from before command-line sign-ins either refuses the port
+    before creating anything (``start`` again without it) or ignores it: then the link it
+    answered is printed to finish in the portal, as with --no-wait."""
 
-    operation = f"connections.{arguments.connections_command}"
     try:
-        opened = SignInReturn(arguments.port or 0)
+        listener: SignInReturn | None = SignInReturn(arguments.port or 0)
     except OSError:
-        raise _command_error(
-            "sign_in_port_unavailable",
-            f"Can't listen on 127.0.0.1:{arguments.port} for the sign-in; it is in use or not "
-            "allowed. Choose another with --port, or leave it out for any free port.",
-        ) from None
-    with opened as listener:
+        if not _completes_by_poll(client, connector()):
+            raise _port_unavailable(arguments.port) from None
+        listener = None
+    with listener if listener is not None else contextlib.nullcontext():
         try:
-            started = start(listener.port)
+            started = start(None if listener is None else listener.port)
         except CloudApiError as exc:
-            if not _return_port_refused(exc):
+            if listener is None or not _return_port_refused(exc):
                 raise
             started = start(None)
-        url = started["authorization_url"]
-        state = returning_state(url, listener.port)
-        if state is None:
-            print(_PORTAL_ONLY, file=sys.stderr)
-            return {"operation": operation, "result": started}
-        name = started["name"]
-        again = f"cayu cloud connections authorize {name}"
-        link = listener.opening(url)
+        if started.get("completion") != "poll":
+            if listener is None:
+                raise _port_unavailable(
+                    arguments.port, f" Then: cayu cloud connections authorize {started['name']}"
+                )
+            return _returned(arguments, client, listener, started)
+    return _polled(arguments, client, started)
+
+
+def _port_unavailable(port: int | None, then: str = "") -> Exception:
+    return _command_error(
+        "sign_in_port_unavailable",
+        f"Can't listen on 127.0.0.1:{port} for the sign-in; it is in use or not allowed. Choose "
+        f"another with --port, or leave it out for any free port.{then}",
+    )
+
+
+def _returned(
+    arguments: argparse.Namespace,
+    client: CloudApiClient,
+    listener: SignInReturn,
+    started: dict[str, Any],
+) -> dict[str, Any]:
+    """Wait on ``listener`` for the sign-in ``started`` to come back, and complete it."""
+
+    operation = f"connections.{arguments.connections_command}"
+    url = started["authorization_url"]
+    state = returning_state(url, listener.port)
+    if state is None:
+        print(_PORTAL_ONLY, file=sys.stderr)
+        return {"operation": operation, "result": started}
+    name = started["name"]
+    again = f"cayu cloud connections authorize {name}"
+    link = listener.opening(url)
+    try:
         print(
             f"Approve {name} in your browser; this command finishes connecting it. If no "
             f"browser opens, open this link on this computer:\n\n  {link}\n",
@@ -971,44 +1017,161 @@ def _signed_in(
             f"Waiting for the sign-in on 127.0.0.1:{listener.port}. Ctrl-C stops waiting.",
             file=sys.stderr,
         )
-        try:
-            result = listener.wait(
-                state=state,
-                finish=lambda returned: client.request(
-                    "POST", f"{_CONNECTIONS}/sign-in/complete", payload={**returned}
-                ),
-                seconds=arguments.wait_seconds,
-            )
-        except SignInTimedOut:
-            raise _command_error(
-                "sign_in_timed_out",
-                f"The sign-in didn't come back in time. {name} stays as it was; for a new link: "
-                f"{again}",
-            ) from None
-        except SignInLinkReused:
-            raise _command_error("sign_in_link_reused", LINK_REUSED) from None
-        except SignInLinkShared as shared:
-            account = shared.connection.get("account")
-            workspace = account.get("name") if isinstance(account, Mapping) else None
-            raise _command_error(
-                "sign_in_link_shared",
-                f"{name} was connected, but another browser also opened its sign-in link, so it "
-                f"may be connected to someone else's workspace ({workspace or 'unknown'}). Check "
-                f"it with `cayu cloud connections show {name}`; if it isn't yours, remove it and "
-                "connect again from a computer only you use.",
-            ) from None
-        except SignInMayHaveCompleted:
-            raise _command_error(
-                "sign_in_interrupted",
-                f"Stopped while the sign-in was being completed: {name} may be connected. "
-                f"Check with cayu cloud connections show {name}.",
-            ) from None
-        except KeyboardInterrupt:
-            raise _command_error(
-                "sign_in_interrupted",
-                f"Stopped waiting. {name} stays as it was; for a new link: {again}",
-            ) from None
+        result = listener.wait(
+            state=state,
+            finish=lambda returned: client.request(
+                "POST", f"{_CONNECTIONS}/sign-in/complete", payload={**returned}
+            ),
+            seconds=arguments.wait_seconds,
+        )
+    except SignInTimedOut:
+        raise _command_error(
+            "sign_in_timed_out",
+            f"The sign-in didn't come back in time. {name} stays as it was; for a new link: "
+            f"{again}",
+        ) from None
+    except SignInLinkReused:
+        raise _command_error("sign_in_link_reused", LINK_REUSED) from None
+    except SignInLinkShared as shared:
+        account = shared.connection.get("account")
+        workspace = account.get("name") if isinstance(account, Mapping) else None
+        raise _command_error(
+            "sign_in_link_shared",
+            f"{name} was connected, but another browser also opened its sign-in link, so it "
+            f"may be connected to someone else's workspace ({workspace or 'unknown'}). Check "
+            f"it with `cayu cloud connections show {name}`; if it isn't yours, remove it and "
+            "connect again from a computer only you use.",
+        ) from None
+    except SignInMayHaveCompleted:
+        raise _may_have_connected(name) from None
+    except KeyboardInterrupt:
+        raise _stopped_waiting(name) from None
     return {"operation": operation, "result": result, "sign_in": "completed"}
+
+
+def _polled(
+    arguments: argparse.Namespace, client: CloudApiClient, started: dict[str, Any]
+) -> dict[str, Any]:
+    """Open the link of the sign-in ``started``, which Cloud completes by poll, and ask Cloud to
+    complete it with its state until the person has approved it: the connected connection."""
+
+    name = started["name"]
+    again = f"cayu cloud connections authorize {name}"
+    state, url = started.get("state"), started.get("authorization_url")
+    if not isinstance(state, str) or not isinstance(url, str):
+        raise _command_error(
+            "sign_in_unfinishable",
+            f"Cayu Cloud didn't answer the link and the state to complete {name}'s sign-in "
+            f"with. {name} stays as it was; connect it in the portal, or try again: {again}",
+        )
+    try:
+        if arguments.port is not None:
+            print(
+                f"{name} signs in without coming back to this command, so --port isn't used.",
+                file=sys.stderr,
+            )
+        print(
+            f"Approve {name} in your browser; this command finishes connecting it. If no "
+            f"browser opens, open this link:\n\n  {url}\n",
+            file=sys.stderr,
+        )
+        if not arguments.no_browser:
+            webbrowser.open(url)
+        print("Waiting for the sign-in. Ctrl-C stops waiting.", file=sys.stderr)
+        answer = polled(
+            lambda: client.request(
+                "POST", f"{_CONNECTIONS}/sign-in/complete", payload={"state": state}
+            ),
+            seconds=arguments.wait_seconds,
+        )
+    except SignInTimedOut:
+        raise _command_error(
+            "sign_in_timed_out",
+            f"The sign-in wasn't approved in time. {name} stays as it was; for a new link: {again}",
+        ) from None
+    except SignInMayHaveCompleted:
+        raise _may_have_connected(name) from None
+    except KeyboardInterrupt:
+        raise _stopped_waiting(name) from None
+    except CloudApiError as exc:
+        hint = _poll_refusal_hint(exc.code, name)
+        if hint is None:
+            raise
+        raise _hinted(exc, hint) from None
+    return {
+        "operation": f"connections.{arguments.connections_command}",
+        "result": {key: value for key, value in answer.items() if key != "sign_in"},
+        "sign_in": "completed",
+    }
+
+
+def _poll_refusal_hint(code: str | None, name: str) -> str | None:
+    """What to do after Cloud refused to complete a polled sign-in with ``code``."""
+
+    again = f"cayu cloud connections authorize {name}"
+    return {
+        "state_expired": f"A sign-in lasts 10 minutes; for a new link: {again}",
+        "state_reused": f"This sign-in was already completed or replaced; for a new link: {again}",
+        "state_unknown": f"Cayu Cloud doesn't know this sign-in; for a new link: {again}",
+        "access_denied": f"The approval was refused; for a new link: {again}",
+        "exchange_failed": f"The connector couldn't complete it; try again: {again}",
+        "account_changed": (
+            f"It was approved for another account than {name}'s, which keeps its own. To "
+            "connect that account, add another connection."
+        ),
+        "sign_in_not_yours": f"Only the admin who started a sign-in completes it: {again}",
+        "connection_removed": (
+            f"{name} was removed meanwhile; add it again with `cayu cloud connections add`."
+        ),
+    }.get(code or "")
+
+
+def _may_have_connected(name: str) -> Exception:
+    return _command_error(
+        "sign_in_interrupted",
+        f"Stopped while the sign-in was being completed: {name} may be connected. "
+        f"Check with cayu cloud connections show {name}.",
+    )
+
+
+def _stopped_waiting(name: str) -> Exception:
+    return _command_error(
+        "sign_in_interrupted",
+        f"Stopped waiting. {name} stays as it was; for a new link: "
+        f"cayu cloud connections authorize {name}",
+    )
+
+
+def _refuse_unwaited(client: CloudApiClient, connector: object) -> None:
+    """Refuse --no-wait, before anything starts, for a connector the catalog says completes
+    by poll: only a waiting command completes its sign-in, and starting one replaces any other
+    still waiting."""
+
+    if _completes_by_poll(client, connector):
+        raise _command_error(
+            "sign_in_needs_wait",
+            f"{connector} completes its sign-in while the command waits, so --no-wait can't "
+            "connect it. Run the same command without --no-wait, or connect it in the portal.",
+        )
+
+
+def _completes_by_poll(client: CloudApiClient, connector: object) -> bool:
+    """Whether the catalog says ``connector`` completes its sign-in by poll; False where it
+    doesn't say."""
+
+    items = client.request("GET", "/v1/connectors").get("items")
+    return any(
+        isinstance(item, dict) and item.get("id") == connector and item.get("completion") == "poll"
+        for item in items or ()
+    )
+
+
+def _printable(started: dict[str, Any]) -> dict[str, Any]:
+    """A sign-in's answer to print without waiting: never its state, nor for one that
+    completes by poll the link, which connects nothing without a waiting command."""
+
+    hidden = {"state", "authorization_url"} if started.get("completion") == "poll" else {"state"}
+    return {key: value for key, value in started.items() if key not in hidden}
 
 
 _PORTAL_ONLY = (
