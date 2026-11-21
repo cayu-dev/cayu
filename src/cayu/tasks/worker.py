@@ -1305,11 +1305,17 @@ async def run_task_worker(
                 wake_deadlines: list[float] = []
                 # Only the cohort's admitted poller inspects durable deadlines. An
                 # idle handler denied a poll turn must not create another DB poll.
-                schedule_deadline = (
-                    await next_schedule_wake_at(task_store, (query,))
-                    if poller.last_attempted
-                    else None
-                )
+                schedule_deadline = None
+                if poller.last_attempted:
+                    try:
+                        schedule_deadline = await next_schedule_wake_at(task_store, (query,))
+                    except Exception as exc:
+                        # Scheduling hints are advisory; ordinary polling must remain available.
+                        poller.metrics.store_failure()
+                        logger.warning(
+                            "Task schedule wakeup discovery failed (%s); retrying later.",
+                            type(exc).__name__,
+                        )
                 if (
                     recovered_interrupted_task_handler is not None
                     and not until_idle_skips_scan()

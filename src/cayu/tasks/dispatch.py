@@ -2949,11 +2949,18 @@ class TaskStoreDispatcher(Dispatcher):
                     activity=True,
                 )
             wake_deadlines: list[float] = []
-            schedule_deadline = (
-                await next_schedule_wake_at(self._tasks, claim_queries)
-                if poller.last_attempted
-                else None
-            )
+            schedule_deadline = None
+            if poller.last_attempted:
+                try:
+                    schedule_deadline = await next_schedule_wake_at(self._tasks, claim_queries)
+                except Exception as exc:
+                    # Scheduling hints are advisory; ordinary polling must remain available.
+                    poller.metrics.store_failure()
+                    logger.warning(
+                        "dispatch schedule wakeup discovery failed: error_type=%s error=%s",
+                        type(exc).__name__,
+                        _safe_runtime_text(durable_runtime, str(exc)),
+                    )
             if reconcile_terminal_receipts and reconciliation_cadence.next_run_at is not None:
                 wake_deadlines.append(reconciliation_cadence.next_run_at)
             if reclaim_expired_leases and reclaim_cadence.next_run_at is not None:
