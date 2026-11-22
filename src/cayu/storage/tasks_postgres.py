@@ -1657,7 +1657,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     "EXTRACT(EPOCH FROM (%s::timestamptz - available_at)) > "
                     "(schedule->'policy'->>'misfire_grace_seconds')::bigint)), FALSE) "
                     f"FROM cayu_tasks WHERE {scope} "
-                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention') "
+                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention', "
+                    "'waiting_dependencies', 'waiting_group') "
                     "AND schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
                 ),
                 [now, now, now, *params],
