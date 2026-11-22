@@ -340,6 +340,7 @@ async def _show_entry(args: argparse.Namespace, reader: KnowledgeReader) -> int:
     entry = await reader.load_entry(args.entry_id)
     if entry is None:
         raise ValueError(f"Knowledge entry not found: {args.entry_id}")
+    entry = {**entry, **_source_fields(entry.get("metadata"))}
     payload = _redact_sensitive(
         {"schema_version": CLI_SCHEMA_VERSION, "source": reader.source, "entry": entry}
     )
@@ -363,12 +364,28 @@ async def _show_entry(args: argparse.Namespace, reader: KnowledgeReader) -> int:
         "created_at",
         "updated_at",
         "expires_at",
+        "source_count",
     )
     rows = [
         {"field": name, "value": _display(entry.get(name))}
         for name in fields
         if entry.get(name) not in (None, {}, [])
     ]
+    rows.extend(
+        {
+            "field": "corroborated_by",
+            "value": " ".join(
+                part
+                for part in (
+                    _display(source.get("session_id")),
+                    _display(source.get("recorded_at")),
+                    _display(source.get("reason")),
+                )
+                if part
+            ),
+        }
+        for source in entry.get("corroborations") or ()
+    )
     rows.extend(_review_rows(entry.get("metadata")))
     print_table(("field", "value"), rows)
     text = entry.get("text")
@@ -379,6 +396,19 @@ async def _show_entry(args: argparse.Namespace, reader: KnowledgeReader) -> int:
     if isinstance(chunks, list) and len(chunks) > 1:
         print(f"\n{len(chunks)} chunks; --json prints each.")
     return 0
+
+
+def _source_fields(metadata: object) -> dict[str, Any]:
+    """The entry's source count and the sessions that corroborate it, from its metadata."""
+
+    from cayu.knowledge.corroboration import knowledge_corroborations_in_metadata
+
+    recorded = cast("dict[str, Any]", metadata) if isinstance(metadata, dict) else {}
+    sources = knowledge_corroborations_in_metadata(recorded)
+    return {
+        "source_count": 1 + len(sources),
+        "corroborations": [source.metadata_value() for source in sources],
+    }
 
 
 # Where an archived revision records the reviewed drop or archive that wrote it.

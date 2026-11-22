@@ -18468,7 +18468,8 @@ as an explicit capability claim instead of being treated as a pass.
 labels, and allowed kinds. When `allowed_kinds` is configured, the registered tool exposes
 those values as the model-facing `kind` enum while still enforcing them at
 runtime. Model-facing inputs are deliberately limited to `text`, optional
-`title`, optional `kind`, and optional topical `aspects`; namespace, labels,
+`title`, optional `kind`, optional topical `aspects`, and the optional
+corroboration pair `same_as` and `reason` described below; namespace, labels,
 status, visibility, impact targets, importance, and confidence are app-owned for
 this tool.
 
@@ -18481,6 +18482,43 @@ required and copied. With copied labels, the entry id covers them too, so the sa
 text remembered from sessions labelled differently becomes separate entries; a policy
 that copies none keeps the content-derived id. Any tool can read
 `ToolContext.session_labels` the same way.
+
+`same_as=ENTRY_ID` records corroboration instead of a new proposal. When the model
+finds that its fact is already stated by an existing entry, it passes that entry's id,
+with an optional `reason` of at most 280 characters, and the calling session is
+recorded as another source of that entry. No entry is created, and `text` is neither
+stored nor merged in. The target must be readable through the tool's access scope, sit
+in the policy's namespace and carry every label the policy writes (required and copied),
+be live (not archived, deleted or expired), and be pending; a kept (active) entry is
+accepted only when `RememberKnowledgePolicy(corroborate_kept=True)`. Anything else is
+refused with `structured["error"] == "corroboration_refused"` and a `reason` code:
+`target_not_found`, `target_out_of_scope`, `target_not_live`, `target_not_pending`,
+`source_limit_reached` (an entry records at most 50 corroborating sessions),
+`target_unreadable`, `target_locked` (the entry is the replacement in a pending
+maintenance review) or `target_busy`.
+
+Corroboration appends one successor revision through owned publication, with the same
+text, chunks, labels and status. It carries the entry's evidence forward and adds a
+`supporting` `KnowledgeEvidence` record for the session (source type `tool`, source id
+the session id, its `reason` in the evidence metadata), so approval and review keep the
+sources with the entry as they keep any evidence. The same revision updates the entry's
+metadata summary under `cayu:corroboration`:
+`{"source_count": N, "sources": [{"session_id", "recorded_at", "reason"?}]}`.
+`source_count` counts the session that wrote the entry plus every corroborating
+session; an uncorroborated entry has no summary and a count of 1. Read it with
+`cayu.knowledge.corroboration.knowledge_source_count(entry)` (and the sources with
+`knowledge_corroborations(entry)`); `cayu knowledge show` prints both, as
+`source_count` and `corroborations` in its JSON.
+
+One session counts once per entry, whatever the call's idempotency key. Each attempt
+rereads the entry, and one whose sources already name the session (or that the session
+wrote) reports `already_recorded: true` without writing. The store operation id is
+derived from the namespace, the target, the session and the revision it appends to, so
+an acknowledgement lost after a commit is reconciled through the durable receipt rather
+than written again. A concurrent writer that wins the compare-and-swap makes the
+corroboration reread the entry and try again, at most three times. Without `same_as`,
+`remember_knowledge` behaves exactly as before; `reason` without `same_as` is an
+invalid argument.
 
 `KnowledgeGovernanceMode` is the application configuration for how generated
 knowledge may advance. The default `reviewed` mode never invokes an automatic

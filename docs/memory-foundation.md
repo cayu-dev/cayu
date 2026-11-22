@@ -644,6 +644,14 @@ The historical revision-42-to-43 transition preserved exact empty-evidence
 receipt replay. Revision 60 supersedes that upgrade posture: a populated
 pre-60 knowledge schema is deliberately not migrated or interpreted.
 
+Corroboration uses the `supporting` role. When `remember_knowledge(same_as=ENTRY_ID)`
+records another session as a source of an existing entry, the entry's successor
+revision keeps its text and status, carries its evidence forward, and adds one
+`supporting` evidence record for that session, with a `cayu:corroboration` metadata
+summary whose `source_count` review queues sort by. The tool contract is in
+[runtime contracts](runtime-contracts.md); `cayu.knowledge.corroboration` holds the
+helpers that read it.
+
 `read_evidence(...)` applies the same current-plus-historical authorization rule
 as entry and chunk reads and returns a record/byte-bounded result. Evidence IDs
 are global storage identities. An authorized collision raises

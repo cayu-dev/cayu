@@ -9,7 +9,7 @@ from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from cayu._exception_groups import exception_group_children
 from cayu._validation import (
@@ -31,6 +31,9 @@ from cayu.knowledge._publication import (
 )
 from cayu.knowledge.access import KNOWLEDGE_NOT_ADMITTED_MESSAGE, knowledge_not_admitted
 from cayu.knowledge.activation_contracts import (
+    MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+    MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+    MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
     KnowledgeActivationAuthority,
     KnowledgeActivationDisposition,
     KnowledgeActivationReceipt,
@@ -42,6 +45,15 @@ from cayu.knowledge.activation_contracts import (
     prepare_knowledge_activation_request,
 )
 from cayu.knowledge.base import KnowledgeStore
+from cayu.knowledge.corroboration import (
+    MAX_KNOWLEDGE_CORROBORATION_REASON_CHARS,
+    MAX_KNOWLEDGE_CORROBORATIONS,
+    KnowledgeCorroboration,
+    corroborated_knowledge_revision,
+    knowledge_corroborations,
+    knowledge_entry_has_source_session,
+    knowledge_source_count,
+)
 from cayu.knowledge.governance import (
     REVIEWED_ROUTING_POLICY_IDENTITY,
     REVIEWED_ROUTING_POLICY_VERSION,
@@ -49,6 +61,7 @@ from cayu.knowledge.governance import (
     KnowledgeActivationPolicyError,
     decide_knowledge_activation,
 )
+from cayu.knowledge.maintenance_contracts import KnowledgeMaintenanceConflict
 from cayu.knowledge.publication_contracts import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
@@ -65,9 +78,11 @@ from cayu.knowledge.records import (
     KnowledgeChunk,
     KnowledgeChunkConflict,
     KnowledgeEntry,
+    KnowledgeEvidenceResult,
     KnowledgeRevisionConflict,
     KnowledgeStatus,
     KnowledgeVisibility,
+    _knowledge_entry_id,
     _knowledge_publication_operation_id,
     _next_knowledge_revision,
     copy_knowledge_chunk,
@@ -266,6 +281,10 @@ class RememberKnowledgePolicy(BaseModel):
     #: label the session doesn't carry is left off. Notes that differ only in these labels
     #: are separate entries.
     copy_session_labels: tuple[str, ...] = ()
+    #: Whether ``same_as`` may name a kept (active) entry. A pending entry can always be
+    #: corroborated; a kept one only when this is set, since recording a source appends a
+    #: revision to kept knowledge (with the same text and status).
+    corroborate_kept: StrictBool = False
 
     @field_validator("default_namespace", "default_kind")
     @classmethod
@@ -389,6 +408,7 @@ def _copy_remember_knowledge_policy(
             # contract instead of leaking a helper-level ValueError.
             require_labels=policy.require_labels,
             copy_session_labels=policy.copy_session_labels,
+            corroborate_kept=policy.corroborate_kept,
         )
     if type(policy) is not dict:
         raise TypeError("policy must be a RememberKnowledgePolicy or dictionary.")
@@ -732,7 +752,9 @@ class RememberKnowledgeTool(Tool):
             "archived, deleted, or expired knowledge already owns the logical id, it appends "
             "a reviewed successor revision. "
             "Remembering identical live text with the same kind returns the existing entry "
-            "instead of writing a duplicate."
+            "instead of writing a duplicate. When an entry found by a knowledge lookup "
+            "already states the fact, pass its id as `same_as`: this session is then "
+            "recorded as another source of that entry and no new entry is written."
         ),
         input_schema={
             "type": "object",
@@ -768,6 +790,27 @@ class RememberKnowledgeTool(Tool):
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
                     "description": "Optional controlled aspects for retrieval routing.",
+                },
+                "same_as": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S",
+                    "description": (
+                        "Optional id of an existing pending (or, when allowed, kept) entry "
+                        "that already states this fact. This session is recorded as another "
+                        "source of that entry instead of proposing a new one; `text` is not "
+                        "stored or merged into it."
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_KNOWLEDGE_CORROBORATION_REASON_CHARS,
+                    "pattern": "\\S",
+                    "description": (
+                        "Optional short reason this session corroborates the `same_as` "
+                        "entry, such as what it checked. Only with `same_as`."
+                    ),
                 },
             },
             "required": ["text"],
@@ -890,10 +933,15 @@ class RememberKnowledgeTool(Tool):
         )
         if store is None:
             return _missing_knowledge_store_result()
-        if await knowledge_not_admitted("create"):
+        # Corroboration appends a revision to an existing entry instead of creating one.
+        if await knowledge_not_admitted("modify" if args.get("same_as") is not None else "create"):
             return _knowledge_not_admitted_result()
         with tool_argument_validation():
             policy = _copy_remember_knowledge_policy(self._policy)
+            same_as = _optional_entry_id(args, "same_as")
+            reason = _optional_arg_string(args, "reason")
+            if reason is not None and same_as is None:
+                raise ValueError("Tool argument `reason` requires `same_as`.")
             text = _require_arg_string(args, "text")
             if len(text.encode("utf-8")) > self._max_text_bytes:
                 raise ValueError(f"`text` must be at most {self._max_text_bytes} bytes.")
@@ -903,6 +951,25 @@ class RememberKnowledgeTool(Tool):
             title = _optional_arg_string(args, "title")
             metadata = _remember_metadata(ctx)
             labels, copied_labels = policy.labels_for(ctx.session_labels)
+            corroboration = (
+                None
+                if same_as is None
+                else KnowledgeCorroboration(
+                    session_id=ctx.session_id,
+                    recorded_at=datetime.now(UTC),
+                    reason=reason,
+                )
+            )
+        if same_as is not None:
+            assert corroboration is not None
+            return await self._corroborate(
+                store,
+                ctx,
+                target_id=same_as,
+                corroboration=corroboration,
+                policy=policy,
+                labels=labels,
+            )
         source_hash = knowledge_source_hash(text)
         with tool_argument_validation():
             operation_id = _knowledge_publication_operation_id(
@@ -1154,25 +1221,42 @@ class RememberKnowledgeTool(Tool):
         scope: KnowledgePublicationScope | None,
         reads: _InvocationOperationRegistry,
     ) -> ToolResult:
+        return await self._run_owned(
+            operation_id,
+            intent_sha256,
+            lambda: _remember_publish_owned(
+                store,
+                result=result,
+                operation_id=operation_id,
+                source_hash=source_hash,
+                namespace=namespace,
+                kind=kind,
+                visibility=visibility,
+                required_labels=required_labels,
+                governance=governance,
+                activation_policy=activation_policy,
+                access_scope=access_scope,
+                model_identity=model_identity,
+                operation_registry=reads,
+            ),
+            scope=scope,
+        )
+
+    async def _run_owned(
+        self,
+        operation_id: str,
+        intent_sha256: str,
+        operation_factory: Any,
+        *,
+        scope: KnowledgePublicationScope | None,
+    ) -> ToolResult:
+        """Run or join one retained publication and report owner failures."""
+
         try:
             publication = await self._publication_owner.run(
                 operation_id,
                 intent_sha256,
-                lambda: _remember_publish_owned(
-                    store,
-                    result=result,
-                    operation_id=operation_id,
-                    source_hash=source_hash,
-                    namespace=namespace,
-                    kind=kind,
-                    visibility=visibility,
-                    required_labels=required_labels,
-                    governance=governance,
-                    activation_policy=activation_policy,
-                    access_scope=access_scope,
-                    model_identity=model_identity,
-                    operation_registry=reads,
-                ),
+                operation_factory,
                 scope=scope,
             )
         except KnowledgePublicationOperationConflict:
@@ -1191,6 +1275,70 @@ class RememberKnowledgeTool(Tool):
                 outcome="publication_owner_closed",
             )
         return publication.value
+
+    async def _corroborate(
+        self,
+        store: Any,
+        ctx: ToolContext,
+        *,
+        target_id: str,
+        corroboration: KnowledgeCorroboration,
+        policy: RememberKnowledgePolicy,
+        labels: dict[str, str],
+    ) -> ToolResult:
+        """Record the calling session as another source of ``target_id``."""
+
+        # One retained publication per session and target, whatever the call's idempotency
+        # key, so concurrent deliveries of the same corroboration join one another.
+        operation_id = _corroboration_operation_id(
+            namespace=policy.default_namespace,
+            entry_id=target_id,
+            session_id=corroboration.session_id,
+        )
+        intent_sha256 = sha256(
+            canonical_durable_json_bytes(
+                {
+                    "contract": "cayu.remember_knowledge.corroboration_intent.v1",
+                    "entry_id": target_id,
+                    "session_id": corroboration.session_id,
+                    "reason": corroboration.reason,
+                    "namespace": policy.default_namespace,
+                    "labels": labels,
+                    "corroborate_kept": policy.corroborate_kept,
+                },
+                "remember knowledge corroboration intent",
+            )
+        ).hexdigest()
+        scope = ctx._runtime_knowledge_publication_scope
+        reads: _InvocationOperationRegistry = (
+            self._read_operations
+            if scope is None
+            else _ScopedReadOperations(self._read_operations, scope)
+        )
+        if scope is not None and scope.sealed:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="publication_owner_closed",
+            )
+        if not _remember_store_supports_owned_publication(store):
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="owned_publication_unsupported",
+            )
+        return await self._run_owned(
+            operation_id,
+            intent_sha256,
+            lambda: _corroborate_owned(
+                store,
+                target_id=target_id,
+                corroboration=corroboration,
+                namespace=policy.default_namespace,
+                labels=labels,
+                corroborate_kept=policy.corroborate_kept,
+                operation_registry=reads,
+            ),
+            scope=scope,
+        )
 
     async def aclose(self, *, timeout_s: float = 10.0) -> bool:
         """Seal and drain publications retained beyond their invoking callers."""
@@ -2136,6 +2284,373 @@ def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResul
     )
 
 
+# A corroboration that keeps losing its compare-and-swap to concurrent writers gives up
+# after this many attempts and says the entry is busy.
+_CORROBORATION_ATTEMPTS = 3
+_CORROBORATION_REFUSALS = {
+    "target_not_found": "no entry with that id is in your scope",
+    "target_out_of_scope": (
+        "the entry is outside the namespace and labels this tool writes knowledge to"
+    ),
+    "target_not_pending": "only a pending proposal can be corroborated",
+    "target_not_live": "the entry is archived, deleted or expired",
+    "source_limit_reached": "the entry already records the most sources it can",
+    "target_unreadable": "the entry's chunks, evidence or sources could not be read whole",
+    "target_busy": "the entry kept changing while this session was being recorded",
+    "target_locked": "the entry is the replacement in a pending maintenance review",
+}
+
+
+def _corroboration_operation_id(
+    *,
+    namespace: str,
+    entry_id: str,
+    session_id: str,
+    revision: int | None = None,
+) -> str:
+    """The session's corroboration of one entry, or of one exact revision of it.
+
+    Without ``revision`` it keys the tool's retained publication, so concurrent calls for
+    the same session and entry join one another. With it, it is the store operation that
+    appends the successor of that revision, so a retry after a lost acknowledgement finds
+    its receipt.
+    """
+
+    material = canonical_durable_json_bytes(
+        {
+            "contract": "cayu.remember_knowledge.corroboration_operation.v1",
+            "namespace": namespace,
+            "entry_id": entry_id,
+            "session_id": session_id,
+            "revision": revision,
+        },
+        "remember knowledge corroboration operation",
+    )
+    return f"corroborate_{sha256(material).hexdigest()}"
+
+
+async def _corroboration_read(
+    operation_factory: Any,
+    *,
+    operation_registry: _InvocationOperationRegistry,
+) -> Any:
+    """Run one read-only store call in an owned task; store failures propagate."""
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=operation_registry,
+    )
+    outcome = await pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    if outcome.cancellation is not None:
+        raise outcome.cancellation from None
+    if isinstance(outcome.error, asyncio.CancelledError | BaseExceptionGroup):
+        raise RuntimeError("Knowledge read failed.") from None
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
+
+
+async def _corroborate_owned(
+    store: Any,
+    *,
+    target_id: str,
+    corroboration: KnowledgeCorroboration,
+    namespace: str,
+    labels: dict[str, str],
+    corroborate_kept: bool,
+    operation_registry: _InvocationOperationRegistry,
+) -> ToolResult:
+    """Append the corroborated revision of ``target_id`` unless it already names the session.
+
+    The entry's own sources are the record of who corroborated it: every attempt rereads
+    the entry, and one that already names the session reports it instead of writing.
+    """
+
+    async def load_entry() -> KnowledgeEntry | None:
+        entry = await store.get_entry(target_id)
+        return None if entry is None else copy_knowledge_entry(entry)
+
+    for _attempt in range(_CORROBORATION_ATTEMPTS):
+        try:
+            entry = await _corroboration_read(load_entry, operation_registry=operation_registry)
+        except asyncio.CancelledError:
+            raise
+        except KnowledgeAccessDenied:
+            return _corroboration_refused_result(target_id, "target_not_found")
+        except Exception:
+            return _knowledge_write_failed_result(entry_id=None, outcome="entry_read_failed")
+        refusal = _corroboration_target_refusal(
+            entry,
+            target_id=target_id,
+            namespace=namespace,
+            labels=labels,
+            corroborate_kept=corroborate_kept,
+        )
+        if refusal is not None:
+            return _corroboration_refused_result(target_id, refusal)
+        assert entry is not None
+        if knowledge_entry_has_source_session(entry, corroboration.session_id):
+            return _corroboration_recorded_result(entry, already_recorded=True)
+        if len(knowledge_corroborations(entry)) >= MAX_KNOWLEDGE_CORROBORATIONS:
+            return _corroboration_refused_result(target_id, "source_limit_reached")
+        try:
+            material = await _corroboration_material(
+                store,
+                entry,
+                operation_registry=operation_registry,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _knowledge_write_failed_result(entry_id=None, outcome="entry_read_failed")
+        if material is None:
+            return _corroboration_refused_result(target_id, "target_unreadable")
+        chunks, evidence = material
+        operation_id = _corroboration_operation_id(
+            namespace=namespace,
+            entry_id=target_id,
+            session_id=corroboration.session_id,
+            revision=entry.revision,
+        )
+        try:
+            successor, successor_chunks, successor_evidence = corroborated_knowledge_revision(
+                entry,
+                chunks,
+                evidence,
+                corroboration=corroboration,
+            )
+            _, store_entry, store_chunks, store_evidence, request_sha256 = (
+                prepare_knowledge_publication(
+                    successor,
+                    successor_chunks,
+                    evidence=successor_evidence,
+                    operation_id=operation_id,
+                    expected_revision=entry.revision,
+                )
+            )
+        except ValueError:
+            # The session and the source limit were checked above for this same entry, so
+            # this is a summary Cayu did not write (`KnowledgeCorroborationRefused`) or
+            # material the store would not accept.
+            return _corroboration_refused_result(target_id, "target_unreadable")
+
+        async def publish(
+            publication_entry: KnowledgeEntry = store_entry,
+            publication_chunks: list[KnowledgeChunk] = store_chunks,
+            publication_evidence: list[Any] = store_evidence,
+            publication_operation_id: str = operation_id,
+            expected_revision: int = entry.revision,
+        ) -> KnowledgePublicationReceipt:
+            return copy_knowledge_publication_receipt(
+                await store.publish_entry_revision(
+                    publication_entry,
+                    publication_chunks,
+                    evidence=publication_evidence,
+                    operation_id=publication_operation_id,
+                    expected_revision=expected_revision,
+                )
+            )
+
+        # Cancellation reaching this retained owner is lifecycle shutdown; pass it on.
+        outcome = await await_invocation_operation(publish, request_child_cancellation=True)
+        uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+        if uncontainable_failure is not None:
+            raise uncontainable_failure
+        if outcome.cancellation is not None:
+            raise outcome.cancellation from _remember_cancellation_cause(
+                outcome.error, settled=False
+            )
+        receipt = outcome.result if outcome.error is None else None
+        if isinstance(receipt, KnowledgePublicationReceipt) and _corroboration_receipt_matches(
+            receipt, successor=successor, request_sha256=request_sha256
+        ):
+            return _corroboration_recorded_result(successor, already_recorded=False)
+        # The store failed, or returned something that is not this publication's receipt:
+        # its durable receipt says whether the revision committed.
+        try:
+            durable = await _remember_load_publication_receipt(
+                store,
+                operation_id,
+                operation_registry=operation_registry,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            durable = None
+        if durable is not None:
+            if _corroboration_receipt_matches(
+                durable, successor=successor, request_sha256=request_sha256
+            ):
+                return _corroboration_recorded_result(
+                    successor,
+                    already_recorded=False,
+                    post_write_error="publication_acknowledgement_lost",
+                )
+            # Another delivery of this session's corroboration committed first; the
+            # reread entry names the session.
+            continue
+        failure = outcome.error
+        if type(failure) is KnowledgeRevisionConflict:
+            continue
+        if type(failure) is KnowledgeAccessDenied:
+            return _corroboration_refused_result(target_id, "target_not_found")
+        if type(failure) is KnowledgeMaintenanceConflict:
+            return _corroboration_refused_result(target_id, "target_locked")
+        conflict, _reason = _remember_publication_conflict(failure)
+        return _knowledge_write_failed_result(
+            entry_id=target_id,
+            outcome="publication_conflict" if conflict else "ambiguous_publication",
+        )
+    return _corroboration_refused_result(target_id, "target_busy")
+
+
+def _corroboration_target_refusal(
+    entry: KnowledgeEntry | None,
+    *,
+    target_id: str,
+    namespace: str,
+    labels: dict[str, str],
+    corroborate_kept: bool,
+) -> str | None:
+    if entry is None or entry.id != target_id:
+        return "target_not_found"
+    if entry.namespace != namespace or any(
+        entry.labels.get(key) != value for key, value in labels.items()
+    ):
+        return "target_out_of_scope"
+    if not _remember_existing_entry_is_live(entry):
+        return "target_not_live"
+    if entry.status is KnowledgeStatus.ACTIVE and not corroborate_kept:
+        return "target_not_pending"
+    return None
+
+
+async def _corroboration_material(
+    store: Any,
+    entry: KnowledgeEntry,
+    *,
+    operation_registry: _InvocationOperationRegistry,
+) -> tuple[list[KnowledgeChunk], list[Any]] | None:
+    """The complete chunks and evidence of ``entry``'s revision, or ``None`` if cut short."""
+
+    async def chunks_factory() -> list[KnowledgeChunk]:
+        chunks = await store.read_chunks(
+            entry.id,
+            revision=entry.revision,
+            max_chunks=MAX_KNOWLEDGE_ACTIVATION_CHUNKS,
+            max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+        )
+        return [copy_knowledge_chunk(chunk) for chunk in chunks]
+
+    async def evidence_factory() -> Any:
+        return await store.read_evidence(
+            entry.id,
+            revision=entry.revision,
+            max_records=MAX_KNOWLEDGE_ACTIVATION_EVIDENCE_RECORDS,
+            max_bytes=MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES,
+        )
+
+    chunks = await _corroboration_read(chunks_factory, operation_registry=operation_registry)
+    evidence_result = await _corroboration_read(
+        evidence_factory, operation_registry=operation_registry
+    )
+    if not isinstance(evidence_result, KnowledgeEvidenceResult):
+        return None
+    # A bounded read stops at its record or byte limit without saying so, and cuts the
+    # last chunk it can't fit. Copying a cut list forward would silently drop the rest, so
+    # refuse a read that reached either limit: below them nothing was cut.
+    chunk_bytes = sum(len(chunk.text.encode("utf-8")) for chunk in chunks)
+    if (
+        len(chunks) >= MAX_KNOWLEDGE_ACTIVATION_CHUNKS
+        or chunk_bytes > MAX_KNOWLEDGE_ACTIVATION_REQUEST_BYTES - 8
+        or [chunk.chunk_index for chunk in chunks] != list(range(len(chunks)))
+        or any(
+            chunk.entry_id != entry.id or chunk.entry_revision != entry.revision for chunk in chunks
+        )
+    ):
+        return None
+    if (
+        evidence_result.truncated
+        or evidence_result.entry_id != entry.id
+        or evidence_result.entry_revision != entry.revision
+        or evidence_result.total_evidence_known != len(evidence_result.evidence)
+    ):
+        return None
+    return chunks, list(evidence_result.evidence)
+
+
+def _corroboration_receipt_matches(
+    receipt: KnowledgePublicationReceipt,
+    *,
+    successor: KnowledgeEntry,
+    request_sha256: str,
+) -> bool:
+    return (
+        receipt.entry_id == successor.id
+        and receipt.entry_revision == successor.revision
+        and receipt.request_sha256 == request_sha256
+    )
+
+
+def _corroboration_recorded_result(
+    entry: KnowledgeEntry,
+    *,
+    already_recorded: bool,
+    post_write_error: str | None = None,
+) -> ToolResult:
+    count = knowledge_source_count(entry)
+    if already_recorded:
+        content = (
+            f"This session is already a source of {entry.id} ({entry.status.value}, "
+            f"{count} sources). No new entry was written."
+        )
+    else:
+        content = (
+            f"Recorded this session as another source of {entry.id} ({entry.status.value}); "
+            f"it now has {count} sources. No new entry was written."
+        )
+    structured: dict[str, Any] = {
+        "entry": _remembered_entry_payload(entry),
+        "same_as": entry.id,
+        "corroborated": True,
+        "already_recorded": already_recorded,
+        "source_count": count,
+        "written": not already_recorded,
+        "status": entry.status.value,
+    }
+    if post_write_error is not None:
+        structured["post_write_error"] = post_write_error
+    return ToolResult(content=content, structured=structured)
+
+
+def _corroboration_refused_result(target_id: str, code: str) -> ToolResult:
+    return ToolResult(
+        content=(
+            f"Not recorded as a source of {target_id}: {_CORROBORATION_REFUSALS[code]}. "
+            "Nothing was written."
+        ),
+        structured={
+            "error": "corroboration_refused",
+            "reason": code,
+            "same_as": target_id,
+            "written": False,
+        },
+        is_error=True,
+    )
+
+
+def _optional_entry_id(args: dict, key: str) -> str | None:
+    value = _optional_arg_string(args, key)
+    if value is None:
+        return None
+    return _knowledge_entry_id(value, key)
+
+
 class ListKnowledgeTool(Tool):
     spec = ToolSpec(
         display=ToolDisplay(verb="Listed knowledge"),
@@ -2620,6 +3135,15 @@ class _ScopedKnowledgeStoreHandle:
             **kwargs,
         )
 
+    async def read_evidence(self, entry_id, **kwargs):
+        if self._scope_is_store_bound:
+            return await self._store.read_evidence(entry_id, **kwargs)
+        return await self._store.read_evidence(
+            entry_id,
+            access_scope=self._access_scope,
+            **kwargs,
+        )
+
     async def publish_entry_revision(
         self,
         entry,
@@ -2628,7 +3152,10 @@ class _ScopedKnowledgeStoreHandle:
         operation_id,
         expected_revision=None,
         activation_authority=None,
+        evidence=None,
     ):
+        # Only a corroboration passes evidence; other writes keep the call they always made.
+        extra = {} if evidence is None else {"evidence": evidence}
         if self._scope_is_store_bound:
             return await self._store.publish_entry_revision(
                 entry,
@@ -2636,6 +3163,7 @@ class _ScopedKnowledgeStoreHandle:
                 operation_id=operation_id,
                 expected_revision=expected_revision,
                 activation_authority=activation_authority,
+                **extra,
             )
         return await self._store.publish_entry_revision(
             entry,
@@ -2644,6 +3172,7 @@ class _ScopedKnowledgeStoreHandle:
             operation_id=operation_id,
             expected_revision=expected_revision,
             activation_authority=activation_authority,
+            **extra,
         )
 
     async def load_entry_publication_receipt(self, operation_id):
