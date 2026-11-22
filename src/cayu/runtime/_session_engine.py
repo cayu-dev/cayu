@@ -6862,6 +6862,9 @@ class SessionEngine(BeforeStopPolicies):
             recovered_structured_events = model_boundary.structured_output_events
             governed_closed_tool_round = (
                 invocation_context.work_attempt is not None
+                and model_boundary.completion_event is not None
+                and model_boundary.completion_event.interaction_id
+                == invocation_context.binding.interaction_id
                 and model_boundary.pointer is not None
                 and model_boundary.pointer.tool_round_id is not None
                 and model_boundary.pending_tool_round is None

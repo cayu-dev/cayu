@@ -1129,6 +1129,7 @@ class ModelCompletionRecovery:
         if (
             invocation_context is not None
             and invocation_context.work_attempt is not None
+            and completion_event.interaction_id == invocation_context.binding.interaction_id
             and pending_round is None
             and pointer.tool_round_id is not None
             and transcript_window.cursor > pointer.transcript_end_cursor
