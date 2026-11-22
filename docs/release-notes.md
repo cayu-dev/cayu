@@ -1,5 +1,143 @@
 # Release notes
 
+## v0.22.0
+
+Upgrade: No database migration is needed. Storage revision stays 159 and the
+compatibility floor stays 146, so `cayu storage migrate` has nothing to apply
+from v0.21.1. Server contract advances from 91 to 92 and app manifest schema
+from 18 to 19; upgrade independently deployed clients and dashboards to the
+matching contract, and record persisted manifests again before an older Cayu
+reads them. The bundled dashboard and parts package already match. Upgrade
+workers before or together with code that creates labelled tasks outside a
+session. Scripts that read `cayu cloud connections bound` need `--json`, and
+scripts that run `cayu cloud connections add` or `authorize` for a sign-in
+connector without a person at the browser need `--no-wait`.
+
+### Breaking changes
+
+- App manifests are schema 19, which adds `connection_slots`. Schema 18
+  manifests still parse, but a release before this one can't read a schema 19
+  manifest, and the generator plan schema is 19.
+- Server contract 92 adds `POST /api/knowledge`. Regenerate OpenAPI clients and
+  rebuild independently deployed dashboards and applications against the
+  matching contract. Older contract-bound dashboards must not be used with the
+  new server.
+- `cayu cloud connections bound` prints a table of the bound slots and the
+  declared slots nobody bound. `--json` prints the previous output.
+- `cayu cloud connections add` and `authorize` for a connector that signs in,
+  such as Slack, now wait (up to `--wait-seconds`, 600 by default) while the
+  person approves in the browser, and finish the sign-in themselves. `--no-wait`
+  keeps the previous behavior of printing the approval link.
+- A child session of a labelled parent carries the parent's labels unless it
+  sets its own, and a child run naming another value for a key the app's
+  knowledge scope pins (`session_label_keys`) is refused with
+  `ResourceAccessDenied`. A durable subagent refused this way returns a
+  `submission_failed` tool result and no child is created. This closes a gap in
+  organization isolation: a durable subagent or a child resumed later by a
+  worker read knowledge without its parent's pins.
+- Tasks created outside a session's member binding keep the labels they run
+  as: those of their parent task, then of the running session, then
+  `TaskCreate.labels`, and conflicting labels are refused. The worker runs
+  them pinned to those labels, and a session they start carries them. An older
+  worker refuses such a task, so upgrade workers first. An unbound event task
+  created inside a labelled session gets a different event key than before.
+  This is a fix for the same organization isolation gap.
+
+### Deprecations
+
+- `ModelPolicyController`, `CayuApp(model_policy=...)` and
+  `CAYU_MODEL_POLICY_CONFIG` are still deprecated and may be removed in the next
+  minor release. Bind model slots in Cayu Cloud instead.
+
+### Changes
+
+- Connector toolkits declare the connection slots their tools call, with the
+  connectors and scopes they need, and `CayuApp.require_connection(slot, ...)`
+  declares any other slot, so Cayu Cloud offers them when someone binds the
+  Agent's connections. An application without toolkits or declarations
+  registers as before.
+- `cayu.connections.tools("<toolset>")` gives an Agent the tools of any Cayu
+  Cloud connector package, read from Cayu Cloud's `cayu.connector-tools/v1`
+  API, so a new connector or a fix to its tools needs no Cayu release. Write
+  tools are offered only with `writes=True` and need approval through the new
+  `Tool.approval_reason`. `cayu cloud connectors tools TOOLSET` lists and saves
+  a toolset, and `cayu cloud connections run-tool` runs one tool on an Agent's
+  slot. `CAYU_CONNECTOR_TOOLS=snapshot` pins tests to a saved catalog. These
+  are provisional.
+- Host filesystem isolation accepts Cayu Cloud's `own_kernel` guarantee
+  (guarantees version 3), so a trusted coding agent, such as the one
+  `cayu new --preset coding` generates, runs in a gVisor sandbox. Untrusted
+  code still needs a virtual machine, and version 2 records behave as before.
+- `cayu cloud sandboxes logs [SANDBOX_ID] --application APP` reads the sandbox
+  broker's own lines (egress refusals, failed preflights, sandboxes that became
+  ready, failed or were destroyed) for one sandbox or an Agent, with filters,
+  cursors, `--follow` and `--json`.
+- `cayu cloud connections add` and `authorize` also finish sign-ins that Cayu
+  Cloud completes by polling: the command opens the approval link and asks
+  Cayu Cloud until the connection is connected. `--no-wait` refuses such a
+  connector. A Cayu Cloud that doesn't offer this keeps the loopback sign-in.
+- `cayu cloud connections activity NAME` lists the recent calls Agents made
+  through a connection, with paging. `cayu cloud connections repositories NAME`
+  lists the repositories a GitHub App connection reaches, and
+  `connections bind` shows Cayu Cloud's repository refusals.
+- `cayu cloud connections add` and `rotate` take any field Cayu Cloud describes
+  as not secret as a plain `--credential FIELD=VALUE`, and name the connector's
+  fields when one isn't recognised. Secret and multi-line fields still come
+  from files.
+- `cayu knowledge add` (and `POST /api/knowledge`) adds a knowledge entry
+  through the running server's knowledge scope, active by default or for
+  someone else's review with `--pending`.
+- `cayu cloud eval run --max-run-cost AMOUNT` caps an isolated run's model
+  spend in USD, held at Cayu Cloud's Gateway. It needs a Cayu Cloud that
+  supports the cap.
+- `cayu storage migrate --backup-managed` accepts
+  `pitr:<provider>:<RFC 3339 UTC timestamp>`, so a platform such as Cloud SQL or
+  Azure Database for PostgreSQL can cite its point-in-time recovery in the
+  migration receipt.
+- The package ships a Cayu Cloud skill for Claude Code and Codex. `cayu guide
+  cloud` prints it, and `cayu guide --plugin-dir` prints the plugin marketplace
+  directory to install it from.
+- A `cayu cloud login` to production also writes an unselected context file,
+  reported as `context_file`, so `--context PATH` can name production.
+- Add `KubernetesSandboxEgressAdapter`, the `KubernetesSandboxAllocator`
+  protocol and `PodNetworkProxyExposure` for virtual egress in Kubernetes
+  sandbox pods. `TransparentEgressProxyServer.restrict_peer` treats
+  IPv4-mapped peers as IPv4.
+- The Kubernetes-mode command sidecar no longer needs `nsenter` or `env` in the
+  agent image, and commands get a working directory on alpine images. A
+  command killed by a signal reports that signal.
+- Security: the bundled and editable dashboard and the web app `cayu new`
+  writes use Vite+ 1.6.0 instead of the 1.0.0-rc.1 release candidate, which
+  fixes published advisories against the development and test server. An
+  existing generated web app can take `web/package.json` and
+  `web/package-lock.json` from a freshly generated project.
+- Security: OpenTelemetry API and SDK require 1.45.2. Earlier versions parse a
+  `traceparent` header in quadratic time.
+- Refresh bundled model catalog and price provenance.
+
+### Fixes
+
+- A pending approval whose execution profile was adopted during a runtime
+  upgrade no longer gets stranded when a storage failure hits before dispatch.
+- Approval continuations rebase adopted run-budget limits instead of
+  interrupting before the approved tool runs.
+- When a limit closes an approval round during recovery, results that were
+  already staged are published instead of being reported as skipped.
+- A non-external tool that cancels itself in a deferred parallel round gets a
+  tool error instead of failing the whole round.
+- Resume checks native structured-output support for every failover
+  candidate, as a first run does.
+- Automatic-recall anchors survive the finishing step before a run limit.
+- The dispatch worker keeps running when reading the next schedule wake time
+  fails, such as on a locked SQLite database.
+- Concurrent reclaimers no longer deadlock on retry-key locks.
+- A running orchestrator without a workspace binding can own the shared
+  allocation scope of its subagents, and the allocation is recorded for
+  recovery.
+- Durable local workspace branches with the same name in two sessions no
+  longer collide; a failed binding claim release leaves later releases
+  retryable; and a rollback racing a private write reports a journal conflict.
+
 ## v0.21.1
 
 Upgrade: v0.21.0 was tagged but never published to PyPI, so upgrade from
