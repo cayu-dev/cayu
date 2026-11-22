@@ -3286,7 +3286,7 @@ home = "/close"
 
 [sign_in]
 mode = "cloud"
-public_paths = ["/vendor/", "/webhooks/"]
+public_paths = ["/vendor/", "/health"]
 ```
 
 - `home` is optional and sits at the top level, before any table. It is a path on the
@@ -3295,8 +3295,10 @@ public_paths = ["/vendor/", "/webhooks/"]
   before they reach the Agent's pages. `mode = "own"` leaves sign-in to the Agent's own
   login. An Agent without a `[sign_in]` table keeps its own sign-in, exactly as before.
 - `public_paths` is optional and allowed only with `mode = "cloud"`. Each entry is a path
-  prefix that anyone can open without signing in, such as static assets or webhooks. It
-  holds at most 50 different prefixes.
+  prefix that anyone can open without signing in, such as static assets or a health check.
+  It holds at most 50 different prefixes. Paths that outside senders post to belong in
+  [`[webhooks] paths`](#webhooks-to-a-sleeping-agent) instead: a webhook path listed only
+  here loses every request that arrives while the Agent sleeps.
 
 `home` and each `public_paths` entry start with `/` and are at most 1024 printable ASCII
 characters. They may not contain a scheme or host (including a leading `//`), a query
