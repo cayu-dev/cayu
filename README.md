@@ -267,7 +267,9 @@ organization.
 The long-running preset is a small working example of
 approval before a side effect, a waited-for reply, reminder and deadline timers,
 a per-session spend cap, and restart tests; `cayu guide long-running` explains
-each part on one page.
+each part on one page. `--with remembered-approvals` (agent, long-running and b2b)
+lets a person who approves a paused call have the same kind of call run without
+asking again (`cayu guide long-running#remembered-approvals`).
 
 Discover or review the Rails-style generation plan before writing:
 

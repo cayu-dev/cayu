@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 
 import pytest
 from tests._session_provenance import fixture_session_invocation
@@ -15,6 +16,7 @@ from cayu.tools import (
     DenyPatternRule,
     EveryCallRule,
     ParameterConstrainedToolPolicy,
+    ParameterRule,
     RequiredAllowlistRule,
     RequiredFieldRule,
     TaintAwareToolPolicy,
@@ -273,6 +275,32 @@ def test_every_call_rule_applies_the_decision_to_every_call(decision) -> None:
     assert unrelated.decision == ToolPolicyDecision.ALLOW
     # The rule carries execution-profile material, so durable resume can rebuild it.
     assert policy._execution_profile_material() is not None
+
+
+def test_parameter_constrained_policy_names_its_approval_gate() -> None:
+    rules: dict[str, Iterable[ParameterRule]] = {
+        "send_notice": (EveryCallRule(),),
+        "ask_user": (RequiredFieldRule("question"),),
+    }
+    gated = ParameterConstrainedToolPolicy(
+        rules, decision=ToolPolicyDecision.REQUIRE_APPROVAL, approval_gate="notices"
+    )
+
+    paused = asyncio.run(gated.authorize(_request(tool_name="send_notice")))
+    assert paused.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+    assert paused.metadata["cayu:approval_gate"] == "notices"
+    # A validity denial is not an approval, so it names no gate.
+    invalid = asyncio.run(gated.authorize(_request(tool_name="ask_user")))
+    assert invalid.decision == ToolPolicyDecision.DENY
+    assert "cayu:approval_gate" not in invalid.metadata
+    # Only a set gate enters the profile, so existing profiles keep their fingerprints.
+    ungated = ParameterConstrainedToolPolicy(rules, decision=ToolPolicyDecision.REQUIRE_APPROVAL)
+    assert gated._execution_profile_material() == {
+        **(ungated._execution_profile_material() or {}),
+        "approval_gate": "notices",
+    }
+    with pytest.raises(ValueError, match="approval_gate"):
+        ParameterConstrainedToolPolicy(rules, approval_gate=" ")
 
 
 def test_parameter_constrained_policy_copies_execution_profile_identity() -> None:

@@ -35,6 +35,8 @@ WEB_APP = "web-app"
 # Organizations on top of the web app, whose people become their members
 # (`scaffold_organizations.py`).
 ORGANIZATIONS = "organizations"
+# Tool authorization grants for the approvals (`scaffold_remembered_approvals.py`).
+REMEMBERED_APPROVALS = "remembered-approvals"
 
 
 class ScaffoldPlanError(ValueError):
@@ -494,6 +496,27 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         ),
     ),
     CapabilitySpec(
+        name=REMEMBERED_APPROVALS,
+        summary=(
+            "Remembered approvals: a person approving a paused call can have the same kind "
+            "of call in that session run without asking again. Tool authorization grants in "
+            "the application's database, served by `cayu serve`; only full-access roles and "
+            "the subjects in CAYU_GRANT_OWNERS may grant."
+        ),
+        status="selectable",
+        # Not service: `cayu serve` doesn't serve grants beside a maintained service_factory.
+        supported_presets=("agent", "long-running", "b2b"),
+        implied=("approvals",),
+        environment=("CAYU_GRANT_OWNERS",),
+        files=("policies/grants.py", "policies/tools.py", "configuration/storage.py", "app.py"),
+        verification=("uv run --no-sync pytest -q tests/test_remembered_approvals.py",),
+        owned_files=(
+            "policies/grants.py",
+            "policies/REMEMBERED_APPROVALS.md",
+            "tests/test_remembered_approvals.py",
+        ),
+    ),
+    CapabilitySpec(
         name="remote-git-delivery",
         summary="Approved host-side commit and push of an exact patch-ready result.",
         status="selectable",
@@ -743,6 +766,14 @@ def normalize_application_plan(
             "which a browser page can't send, and its server isn't assembled from "
             "[tool.cayu.serve]. Choose preset agent, coding or long-running for an Agent with "
             "a web app for its team",
+        )
+
+    if preset == "service" and REMEMBERED_APPROVALS in requested:
+        raise ScaffoldPlanError(
+            "unsupported_capability",
+            "preset 'service' can't remember approvals: its API is a maintained "
+            "service_factory, and `cayu serve` refuses to start one whose application hosts "
+            "tool authorization grants. Choose preset agent, long-running or b2b",
         )
 
     capabilities = set(selected_preset.default_capabilities)

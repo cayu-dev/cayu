@@ -513,3 +513,29 @@ def test_policy_offers_fail_closed_and_carry_the_configured_gate(tmp_path) -> No
         )
 
     asyncio.run(scenario())
+
+
+def test_manifest_coverage_sees_through_the_grant_policy() -> None:
+    from cayu.runtime.manifest import _tool_policy_coverage
+    from cayu.tools.policy import StaticToolPolicy
+
+    gated = AlwaysRequireApprovalToolPolicy(tools=["exec_command"], approval_gate="commands")
+
+    def coverage(then, tool_name="exec_command", controls=()) -> str:
+        policy = ToolAuthorizationGrantPolicy(
+            policy_id="p",
+            store=InMemoryToolAuthorizationGrantStore(),
+            grantable={"exec_command": "process_command"},
+            then=then,
+            mandatory_controls=controls,
+        )
+        return _tool_policy_coverage(policy, tool_name, {})
+
+    # A grant can stand in for the person, so a grantable tool is conditional.
+    assert coverage(gated) == "conditional"
+    assert coverage(gated, "send_email") == "allowed"
+    assert coverage(StaticToolPolicy(deny=["exec_command"])) == "denied"
+    # A mandatory control on the whole tool always asks.
+    control = ToolAuthorizationGrantControl(tool_name="exec_command")
+    assert coverage(gated, controls=[control]) == "approval_required"
+    assert coverage(StaticToolPolicy(), controls=[control]) == "approval_required"

@@ -110,6 +110,75 @@ Otherwise pass `CayuApp(event_watcher_store=SQLiteEventWatcherStore(path))` or
 memory, so a restart delivers every old matching event again; the example keeps
 it only because its test app is too.
 
+## Remembered approvals
+
+A person approving a paused call can have it remembered as a tool authorization
+grant, so the same kind of call in that session runs without asking again.
+`cayu new NAME --with remembered-approvals` (presets agent, long-running and
+b2b) generates the wiring:
+
+- `configuration/storage.py` keeps the grants beside the sessions, in the same
+  SQLite file or PostgreSQL database (`open_application_stores(...,
+  tool_authorization_grants=True)`). A test that injects its own session store
+  gets them in memory.
+- `policies/tools.py` names the approval gate `external-effect` and wraps the
+  policy in `ToolAuthorizationGrantPolicy` once an agent has an external tool
+  other than knowledge proposals.
+  A grant covers any call to its tool under that gate (`--pin PATH` keeps an
+  argument fixed). Questions and knowledge proposals are never granted.
+- `policies/grants.py` holds the policy id, `GrantOwners` (who may grant), and
+  reads mandatory controls and the default sampled-review rate from
+  `cayu-objectives.toml`, or its own constants when the project has none.
+- `app.py` calls `host_remembered_approvals(...)`: `cayu serve` serves
+  `{api}/tool-authorization-grants`, and `cayu serve` and `cayu worker` settle
+  grants a stopped process left staged.
+- `tests/test_remembered_approvals.py` approves and remembers a paused call (from
+  a second app, as after a restart, when the project has recovery), runs the
+  same call again without a pause, and shows that a member can't grant and a
+  mandatory control is never granted.
+
+The grant policy is part of the execution profile of each agent it wraps, so
+adding it or changing its controls is a change a waiting session meets like any
+change to its tool policy.
+
+Only a caller the grant routes authenticated may create, revoke or read grants:
+through `cayu serve`'s auth, or locally as the CLI's `--reviewer`. It needs a
+full-access role (admin or developer on Cayu Cloud, never member) or a subject
+listed in `CAYU_GRANT_OWNERS`, comma-separated exact subjects, empty by default.
+Approving one call at a time is unchanged. Locally, list yourself and approve as
+that subject:
+
+```console
+$ export CAYU_GRANT_OWNERS=local:me
+$ uv run --no-sync cayu inbox approve ITEM_ID --remember --reviewer local:me
+$ uv run --no-sync cayu grants list --status active
+$ uv run --no-sync cayu grants show GRANT_ID
+$ uv run --no-sync cayu grants uses GRANT_ID
+$ uv run --no-sync cayu grants revoke GRANT_ID --reason "No longer routine."
+```
+
+`--remember` can't be combined with `--as`, `--claim-task` or `--adopt-profile`.
+[From the command line](https://github.com/cayu-dev/cayu/blob/main/docs/tool-authorization-grants.md#from-the-command-line)
+has every option, and `--application NAME` for a Cayu Cloud Agent. A grant
+applies in its session; `--scope workspace` needs a workspace the application
+named with `workspace_id=`.
+
+Each grant sends a share of its calls to a person anyway: `sampled_review_rate_bps`
+in `cayu-objectives.toml` (500 is 5%), or `--sample-rate-bps` for one grant. The
+draw depends only on the call's identity, and `cayu grants uses` shows each call
+a grant allowed or sent for review. A mandatory control names a tool, or one
+gate on it, that a person always approves; existing grants never apply to it and
+it can't be remembered:
+
+```toml
+[[mandatory_controls]]
+tool_name = "pay_invoice"
+```
+
+`cayu grants revoke` ends a grant at once, and the next call asks again. A grant
+also ends when it expires (`--expires-in-seconds`); deleting its session does not
+revoke it.
+
 ## Waiting for an outside reply
 
 ```python

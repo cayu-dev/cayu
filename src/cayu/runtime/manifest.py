@@ -1322,6 +1322,24 @@ def _tool_policy_coverage(
         if coverage == "allowed" and tool_name in policy.tools:
             return "approval_required"
         return coverage
+    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    from cayu.approvals.authorization_grants import is_mandatory_control
+
+    if type(policy) is ToolAuthorizationGrantPolicy:
+        coverage = (
+            "approval_required"
+            if policy.then is None
+            else _tool_policy_coverage(policy.then, tool_name, schema, _seen=seen)
+        )
+        if coverage not in {"denied", "unknown"} and is_mandatory_control(
+            policy.mandatory_controls, tool_name=tool_name, approval_gate=None
+        ):
+            # A mandatory control on the whole tool always asks a person, grant or not.
+            return "approval_required"
+        if coverage == "approval_required" and tool_name in policy.grantable:
+            # An active grant can stand in for the person's approval.
+            return "conditional"
+        return coverage
     if type(policy) is AllowAllToolPolicy:
         return "allowed"
     if type(policy) is AlwaysRequireApprovalToolPolicy:
@@ -1416,6 +1434,8 @@ def _decisive_policy(policy: ToolPolicy, tool_name: str) -> tuple[ToolPolicy, bo
     from the decisive policy still needs approval.
     """
 
+    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    from cayu.approvals.authorization_grants import is_mandatory_control
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     floored = False
@@ -1431,6 +1451,12 @@ def _decisive_policy(policy: ToolPolicy, tool_name: str) -> tuple[ToolPolicy, bo
             policy = policy.inner
         elif type(policy) is StructuredCommandToolPolicy and policy._base_policy is not None:
             policy = policy._base_policy
+        elif type(policy) is ToolAuthorizationGrantPolicy and policy.then is not None:
+            # A mandatory control on the whole tool is a floor too.
+            floored = floored or is_mandatory_control(
+                policy.mandatory_controls, tool_name=tool_name, approval_gate=None
+            )
+            policy = policy.then
         else:
             break
     return policy, floored

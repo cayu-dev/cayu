@@ -21,6 +21,7 @@ from cayu.storage.targets import (
 )
 
 if TYPE_CHECKING:
+    from cayu.approvals.authorization_grants import ToolAuthorizationGrantStore
     from cayu.budgets.base import BudgetLedger
     from cayu.knowledge.base import KnowledgeStore
     from cayu.knowledge.scopes import KnowledgeAccessScope
@@ -64,6 +65,7 @@ class ApplicationStores:
         "_session_store",
         "_task_admission_listener",
         "_task_store",
+        "_tool_authorization_grant_store",
     )
 
     def __init__(
@@ -76,6 +78,7 @@ class ApplicationStores:
         product_store: ProductOperationStore | None = None,
         model_policy_store: ModelPolicyStore | None = None,
         agent_snapshot_store: AgentSnapshotStore | None = None,
+        tool_authorization_grant_store: ToolAuthorizationGrantStore | None = None,
         budget_ledger: BudgetLedger | None = None,
         event_watcher_store: EventWatcherStore | None = None,
         pool: Any | None = None,
@@ -99,6 +102,7 @@ class ApplicationStores:
         self._product_store = product_store
         self._model_policy_store = model_policy_store
         self._agent_snapshot_store = agent_snapshot_store
+        self._tool_authorization_grant_store = tool_authorization_grant_store
         self._budget_ledger = budget_ledger
         self._event_watcher_store = event_watcher_store
         self._pool = pool
@@ -117,6 +121,7 @@ class ApplicationStores:
             f"knowledge={self._knowledge_store is not None!r}, "
             f"product_operations={self._product_store is not None!r}, "
             f"agent_snapshots={self._agent_snapshot_store is not None!r}, "
+            f"tool_authorization_grants={self._tool_authorization_grant_store is not None!r}, "
             f"budget_ledger={self._budget_ledger is not None!r}, "
             f"event_watchers={self._event_watcher_store is not None!r}, "
             f"pool_max_size={self._pool_max_size!r})"
@@ -153,6 +158,12 @@ class ApplicationStores:
         """The agent snapshot manifest store, when requested."""
 
         return self._agent_snapshot_store
+
+    @property
+    def tool_authorization_grant_store(self) -> ToolAuthorizationGrantStore | None:
+        """The tool authorization grant store, when requested."""
+
+        return self._tool_authorization_grant_store
 
     @property
     def budget_ledger(self) -> BudgetLedger | None:
@@ -208,6 +219,7 @@ class ApplicationStores:
             self._product_store,
             self._model_policy_store,
             self._agent_snapshot_store,
+            self._tool_authorization_grant_store,
             self._budget_ledger,
             self._event_watcher_store,
             self._knowledge_store,
@@ -246,6 +258,7 @@ def open_application_stores(
     product_operations: bool = False,
     model_policy: bool = False,
     agent_snapshots: bool = False,
+    tool_authorization_grants: bool = False,
     budget_ledger: bool = True,
     event_watchers: bool = True,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
@@ -276,6 +289,9 @@ def open_application_stores(
     ``AgentSnapshotStore`` for snapshot manifests, bindings and pins: SQLite in the
     same file, or PostgreSQL on the shared pool. Snapshot provider objects stay in
     the ``AgentSnapshotObjectStore`` the application composes with it.
+    ``tool_authorization_grants=True`` adds a ``ToolAuthorizationGrantStore`` for
+    remembered approvals: SQLite in the same file, or PostgreSQL on the shared
+    pool.
 
     ``budget_ledger=True`` (the default) adds a durable budget ledger: a
     ``SQLiteBudgetLedger`` in the same SQLite file, or a ``PostgresBudgetLedger``
@@ -304,6 +320,8 @@ def open_application_stores(
         raise TypeError("product_operations must be a bool.")
     if type(agent_snapshots) is not bool:
         raise TypeError("agent_snapshots must be a bool.")
+    if type(tool_authorization_grants) is not bool:
+        raise TypeError("tool_authorization_grants must be a bool.")
     if type(budget_ledger) is not bool:
         raise TypeError("budget_ledger must be a bool.")
     if type(event_watchers) is not bool:
@@ -318,6 +336,7 @@ def open_application_stores(
             product_operations=product_operations,
             model_policy=model_policy,
             agent_snapshots=agent_snapshots,
+            tool_authorization_grants=tool_authorization_grants,
             budget_ledger=budget_ledger,
             event_watchers=event_watchers,
             public_authority_alias_codec=public_authority_alias_codec,
@@ -346,6 +365,7 @@ def open_application_stores(
         product_operations=product_operations,
         model_policy=model_policy,
         agent_snapshots=agent_snapshots,
+        tool_authorization_grants=tool_authorization_grants,
         budget_ledger=budget_ledger,
         event_watchers=event_watchers,
         public_authority_alias_codec=public_authority_alias_codec,
@@ -360,6 +380,7 @@ def _open_sqlite_stores(
     product_operations: bool,
     model_policy: bool,
     agent_snapshots: bool,
+    tool_authorization_grants: bool,
     budget_ledger: bool,
     event_watchers: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
@@ -395,6 +416,11 @@ def _open_sqlite_stores(
         from cayu.snapshots.base import SQLiteAgentSnapshotStore
 
         snapshot_store = SQLiteAgentSnapshotStore(path)
+    grant_store = None
+    if tool_authorization_grants:
+        from cayu.storage.authorization_grants_sqlite import SQLiteToolAuthorizationGrantStore
+
+        grant_store = SQLiteToolAuthorizationGrantStore(path)
     ledger = None
     watcher_store = None
     # Diagnostic inspection is read-only: it never reserves budget or claims events.
@@ -415,6 +441,7 @@ def _open_sqlite_stores(
         product_store=product_store,
         model_policy_store=policy_store,
         agent_snapshot_store=snapshot_store,
+        tool_authorization_grant_store=grant_store,
         budget_ledger=ledger,
         event_watcher_store=watcher_store,
     )
@@ -430,6 +457,7 @@ def _open_postgres_stores(
     product_operations: bool,
     model_policy: bool,
     agent_snapshots: bool,
+    tool_authorization_grants: bool,
     budget_ledger: bool,
     event_watchers: bool,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None,
@@ -457,6 +485,11 @@ def _open_postgres_stores(
         from cayu.storage.agent_snapshots_postgres import PostgresAgentSnapshotStore
 
         snapshot_store_type = PostgresAgentSnapshotStore
+    grant_store_type: Any = None
+    if tool_authorization_grants:
+        from cayu.storage.authorization_grants_postgres import PostgresToolAuthorizationGrantStore
+
+        grant_store_type = PostgresToolAuthorizationGrantStore
     if model_policy:
         from cayu.storage.model_policy_postgres import PostgresModelPolicyStore
 
@@ -494,6 +527,9 @@ def _open_postgres_stores(
             ),
             agent_snapshot_store=(
                 snapshot_store_type(dsn, max_size=pool_max_size) if snapshot_store_type else None
+            ),
+            tool_authorization_grant_store=(
+                grant_store_type(dsn, max_size=pool_max_size) if grant_store_type else None
             ),
         )
 
@@ -549,6 +585,11 @@ def _open_postgres_stores(
         agent_snapshot_store=(
             snapshot_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
             if snapshot_store_type
+            else None
+        ),
+        tool_authorization_grant_store=(
+            grant_store_type(pool=pool, schema_mode=SchemaMode.VALIDATE)
+            if grant_store_type
             else None
         ),
         budget_ledger=(

@@ -20,6 +20,7 @@ from cayu.cli._scaffold_test_tools import extra_only_dev_requirements
 from cayu.cli._task_retry_checks import task_retry_policy_diagnostics
 from cayu.cli.scaffold_convention import local_database_path
 from cayu.cli.scaffold_plan import (
+    REMEMBERED_APPROVALS,
     ApplicationPlan,
     ScaffoldPlanError,
     declared_capabilities,
@@ -671,6 +672,18 @@ def _check_selected_plan_source(
             "register_agents" if _source_contains_name(app_path, "register_agents") else None
         )
         drift("preset", "register_agents", observed_factory, "app.py")
+        hosted = _source_contains_name(app_path, "host_remembered_approvals")
+        drift(
+            REMEMBERED_APPROVALS,
+            "present" if REMEMBERED_APPROVALS in plan.capabilities else "absent",
+            "present" if hosted else "absent",
+            "app.py",
+            hint=(
+                "app.py hosts the grants with host_remembered_approvals(...) exactly when "
+                "[tool.cayu.scaffold] selects remembered-approvals. Compare with a "
+                "disposable `cayu new --with remembered-approvals --dry-run` reference."
+            ),
+        )
 
     coding_docker_files = (
         "Dockerfile.coding",

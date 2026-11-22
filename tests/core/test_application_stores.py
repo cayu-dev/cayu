@@ -275,6 +275,42 @@ def test_diagnostic_inspection_reads_sqlite_snapshots_without_changing_files(
     assert (existing.stat().st_mtime_ns, existing.stat().st_size) == before
 
 
+def test_tool_authorization_grant_store_is_opt_in_beside_the_sessions(tmp_path: Path) -> None:
+    from cayu.storage import PostgresToolAuthorizationGrantStore, SQLiteToolAuthorizationGrantStore
+    from cayu.storage.migrations import SchemaMode
+
+    database = tmp_path / "data" / "cayu.db"
+
+    async def scenario() -> None:
+        async with open_application_stores(None, sqlite_path=database) as stores:
+            assert stores.tool_authorization_grant_store is None
+        async with open_application_stores(
+            None, sqlite_path=database, tool_authorization_grants=True
+        ) as stores:
+            assert isinstance(
+                stores.tool_authorization_grant_store, SQLiteToolAuthorizationGrantStore
+            )
+            assert stores.tool_authorization_grant_store.path == database
+            assert "tool_authorization_grants=True" in repr(stores)
+
+    asyncio.run(scenario())
+    with pytest.raises(TypeError, match="tool_authorization_grants"):
+        open_application_stores(
+            None,
+            sqlite_path=database,
+            tool_authorization_grants="yes",  # ty: ignore[invalid-argument-type]
+        )
+
+    url = "postgresql://app@127.0.0.1:1/unreachable"
+    stores = open_application_stores(url, sqlite_path=database, tool_authorization_grants=True)
+    store = stores.tool_authorization_grant_store
+    assert isinstance(store, PostgresToolAuthorizationGrantStore)
+    assert store._pool is stores.session_store._pool  # ty: ignore[unresolved-attribute]
+    assert store._owns_pool is False
+    assert store._schema_mode is SchemaMode.VALIDATE
+    asyncio.run(stores.close())
+
+
 def test_required_postgres_refuses_the_sqlite_agent_snapshot_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -479,13 +515,16 @@ def test_diagnostic_inspection_builds_read_only_store_owned_pools(tmp_path: Path
             sqlite_path=tmp_path / "cayu.db",
             product_operations=True,
             agent_snapshots=True,
+            tool_authorization_grants=True,
         )
-    assert stores.product_store is not None
-    assert stores.product_store._owns_pool is True
-    assert stores.product_store._read_only is True
-    assert stores.agent_snapshot_store is not None
-    assert stores.agent_snapshot_store._owns_pool is True
-    assert stores.agent_snapshot_store._read_only is True
+    for store in (
+        stores.product_store,
+        stores.agent_snapshot_store,
+        stores.tool_authorization_grant_store,
+    ):
+        assert store is not None
+        assert store._owns_pool is True  # ty: ignore[unresolved-attribute]
+        assert store._read_only is True  # ty: ignore[unresolved-attribute]
     asyncio.run(stores.close())
 
 

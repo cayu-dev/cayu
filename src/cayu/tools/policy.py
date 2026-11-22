@@ -694,7 +694,9 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
     validity violation always denies: approval cannot repair missing, empty or
     wrongly typed arguments. Authority violations return ``decision`` with a
     structured metadata payload. Validity checks take precedence over authority
-    violations, even when an authority rule appears first.
+    violations, even when an authority rule appears first. ``approval_gate`` names
+    the class of decision in REQUIRE_APPROVAL metadata (``cayu:approval_gate``), as
+    for ``AlwaysRequireApprovalToolPolicy``.
     """
 
     def __init__(
@@ -703,6 +705,7 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         *,
         decision: ToolPolicyDecision = ToolPolicyDecision.DENY,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        approval_gate: str | None = None,
     ) -> None:
         if type(rules) is not dict:
             raise TypeError("ParameterConstrainedToolPolicy rules must be a dict.")
@@ -716,6 +719,11 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
             self.rules[name] = _copy_parameter_rules(tool_rules, f"rules[{name!r}]")
         self._execution_profile_identity = copy_execution_profile_behavior_identity(
             execution_profile_identity
+        )
+        self.approval_gate = (
+            None
+            if approval_gate is None
+            else require_clean_nonblank(approval_gate, "approval_gate")
         )
 
     @property
@@ -753,6 +761,9 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         }
         if self.decision == ToolPolicyDecision.REQUIRE_APPROVAL and any(self.rules.values()):
             result["validity_denials_version"] = 1
+        # Omitted when unset so existing profiles keep their fingerprints.
+        if self.approval_gate is not None:
+            result["approval_gate"] = self.approval_gate
         return result
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
@@ -777,6 +788,12 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
                     )
                 )
                 invalid = rule.is_validity_violation(request.arguments)
+                if (
+                    not invalid
+                    and self.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+                    and self.approval_gate is not None
+                ):
+                    metadata[APPROVAL_GATE_METADATA_KEY] = self.approval_gate
                 result = ToolPolicyResult(
                     decision=ToolPolicyDecision.DENY if invalid else self.decision,
                     reason=(

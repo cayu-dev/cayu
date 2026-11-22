@@ -67,6 +67,7 @@ from cayu.cli.scaffold_plan import (
     preset_spec,
     removed_capability_files,
 )
+from cayu.cli.scaffold_remembered_approvals import remembered_approvals_files
 from cayu.cli.scaffold_web_app import web_app_project_files
 from cayu.workspaces.local import LocalWorkspace
 
@@ -3309,12 +3310,14 @@ def _rendered_preset_files(
 
         files.update(web_app_project_files(files=files, plan=plan))
         files.update(organizations_project_files(files=files, plan=plan))
+        files.update(remembered_approvals_files(files, plan))
         return files
     if plan.preset == "long-running":
         from cayu.cli.scaffold_long_running import long_running_project_files
 
         files.update(long_running_project_files(files=files, render=render, plan=plan))
         files.update(web_app_project_files(files=files, plan=plan))
+        files.update(remembered_approvals_files(files, plan))
         return files
     files.update(
         {
