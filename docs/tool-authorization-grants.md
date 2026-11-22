@@ -39,7 +39,8 @@ keep doing that. Every part below is usable on its own.
 - **Service**: `ToolAuthorizationGrantService` creates grants from the
   runtime's pending-approval snapshot, settles, lists, and revokes them.
 - **Server routes**: `cayu.server.authorization_grants.ToolAuthorizationGrantServer`
-  exposes the service over authenticated HTTP.
+  exposes the service over authenticated HTTP. `app.host_tool_authorization_grants(...)`
+  has `cayu serve` mount it (see [HTTP](#http)).
 
 ## Matching
 
@@ -213,9 +214,42 @@ arguments.
 
 ## HTTP
 
-Pass a server to `create_server(app, config=ServerConfig.protected(auth),
+A project served with `cayu serve` names its grant service in the application
+factory, and `cayu serve` mounts the routes:
+
+```python
+async def developers_read(principal, grant) -> bool:
+    return principal.subject in DEVELOPERS
+
+
+def build_app() -> CayuApp:
+    app = CayuApp(...)
+    service = ToolAuthorizationGrantService(app, store=grants, authority=authority)
+    app.host_tool_authorization_grants(service, authorize_read=developers_read)
+    return app
+```
+
+`authorize_read` takes the authenticated caller and a grant and returns whether
+that caller may see it; a grant it hides answers 404 and is left out of
+listings. The service's grant authority still decides who may create and revoke.
+The routes sit behind the server's auth target and its inbox access rule, like
+the other approval routes. A grant records its authenticated creator, so the
+open development server (`cayu serve --dev`) serves none of them and says so
+when it starts. A project that declares a `service_factory` is refused at
+startup if its application hosts grants, because a maintained public service
+does not serve these routes. `app.tool_authorization_grant_hosting` reads what
+was set up, or `None`.
+
+Hosting only exposes the service. The application still wraps its agents' tool
+policy in `ToolAuthorizationGrantPolicy`, and still calls
+`service.reconcile_staged()` where it wants a staged grant settled after a
+crash; a staged grant authorizes nothing until then.
+
+An application that builds its own server passes one to
+`create_server(app, config=ServerConfig.protected(auth),
 tool_authorization_grants=ToolAuthorizationGrantServer(service, authorize_read=...))`.
-The routes are mounted only when configured and require authenticated access:
+Either way the routes are mounted only when configured and require authenticated
+access:
 
 | Route | Purpose |
 | --- | --- |

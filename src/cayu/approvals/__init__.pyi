@@ -2,6 +2,9 @@
 
 from cayu.approvals.actors import ResolutionActor as ResolutionActor
 from cayu.approvals.actors import ResolutionActorSource as ResolutionActorSource
+from cayu.approvals.authorization_grant_hosting import (
+    ToolAuthorizationGrantHosting as ToolAuthorizationGrantHosting,
+)
 from cayu.approvals.authorization_grant_policy import (
     ToolAuthorizationGrantPolicy as ToolAuthorizationGrantPolicy,
 )

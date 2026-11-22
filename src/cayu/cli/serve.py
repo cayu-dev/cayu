@@ -347,6 +347,13 @@ def _build_serve_app(
                 "doesn't serve: call app.host_external_waits(...) before "
                 "create_agent_service(...), which then mounts the delivery route."
             )
+        if service.cayu_app._tool_authorization_grant_hosting is not None:
+            raise ServeError(
+                "The service_factory's app hosts tool authorization grants, which a "
+                "maintained public service doesn't serve: drop "
+                "app.host_tool_authorization_grants(...), or serve the project from its "
+                "application factory."
+            )
         server = service.asgi_app
         if identity_proxy is not None:
             server = _with_identity_proxy(server, identity_proxy, args, settings)
@@ -415,10 +422,21 @@ def _build_serve_app(
                 dashboard=dashboard,
             )
         )
+        grant_hosting = app._tool_authorization_grant_hosting
+        grant_server = None
+        # The grant routes record the authenticated caller as a grant's creator, so
+        # the open development server has nobody to record and serves none.
+        if grant_hosting is not None and not args.dev:
+            from cayu.server.authorization_grants import ToolAuthorizationGrantServer
+
+            grant_server = ToolAuthorizationGrantServer(
+                grant_hosting.service, authorize_read=grant_hosting.authorize_read
+            )
         server = server_module.create_server(
             app,
             config=config,
             project_context=project_control_plane,
+            tool_authorization_grants=grant_server,
             inbox_access=_load_inbox_access(settings.inbox_access, app, development=args.dev),
         )
         _include_project_routers(server, app, settings.routers, development=args.dev, auth=auth)
@@ -435,6 +453,13 @@ def _build_serve_app(
         hosting = app._external_wait_hosting
         if hosting is not None and hosting.delivery_path is not None:
             print(f"External-wait delivery: POST {hosting.delivery_path}/{{source}}")
+        if grant_server is not None:
+            print(f"Tool authorization grants: {config.api.path}/tool-authorization-grants")
+        elif grant_hosting is not None:
+            print(
+                "Tool authorization grants: not served with --dev. The routes need an "
+                "authenticated caller; start with an auth target to serve them."
+            )
         print(
             "Cayu Developer dashboard: "
             f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"

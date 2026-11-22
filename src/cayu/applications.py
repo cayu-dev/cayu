@@ -56,6 +56,12 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
+from cayu.approvals.authorization_grant_hosting import (
+    host_tool_authorization_grants as _host_tool_authorization_grants,
+)
+from cayu.approvals.authorization_grant_hosting import (
+    tool_authorization_grant_hosting as _tool_authorization_grant_hosting,
+)
 from cayu.approvals.review import (
     HumanReviewPolicy,
 )
@@ -809,6 +815,7 @@ RegisteredEnvironment = runtime_records.RegisteredEnvironment
 _WorkerStepResult = TypeVar("_WorkerStepResult")
 
 if TYPE_CHECKING:
+    from cayu.approvals.authorization_grant_hosting import ToolAuthorizationGrantHosting
     from cayu.collaboration._contracts import OperationRef
     from cayu.collaboration._producer_cleanup_finalization import ProducerCleanupFinalized
     from cayu.collaboration._producer_contracts import (
@@ -1239,6 +1246,7 @@ class CayuApp(
         # Set when an agent registers a wake tool; task workers then reconcile wakes.
         self._uses_session_wakes = False
         self._external_wait_hosting: ExternalWaitHosting | None = None
+        self._tool_authorization_grant_hosting: ToolAuthorizationGrantHosting | None = None
         self._recovery_task_store = task_store
         self._knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
@@ -5972,6 +5980,8 @@ class CayuApp(
 
     host_external_waits = _host_external_waits
     external_wait_hosting = property(_external_wait_hosting)
+    host_tool_authorization_grants = _host_tool_authorization_grants
+    tool_authorization_grant_hosting = property(_tool_authorization_grant_hosting)
 
     def register_task_type(self, spec: TaskTypeSpec) -> TaskTypeSpec:
         """Declare a public task type without starting or scheduling work."""

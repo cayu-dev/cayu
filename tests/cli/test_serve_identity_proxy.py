@@ -409,7 +409,9 @@ def test_a_maintained_service_serves_behind_the_proxy(
         server.include_router(router)
         _materialize_asgi_middleware_stacks(server, seen=set())
         return SimpleNamespace(
-            cayu_app=SimpleNamespace(_external_wait_hosting=None),
+            cayu_app=SimpleNamespace(
+                _external_wait_hosting=None, _tool_authorization_grant_hosting=None
+            ),
             asgi_app=server,
             deployment_kind=None,
             manifest=SimpleNamespace(product_api_path="/product", control_plane_path="/api"),

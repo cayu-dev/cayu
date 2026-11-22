@@ -122,7 +122,9 @@ service_factory = "unused:build_service"
     )
     service = SimpleNamespace(
         asgi_app=object(),
-        cayu_app=SimpleNamespace(_external_wait_hosting=None),
+        cayu_app=SimpleNamespace(
+            _external_wait_hosting=None, _tool_authorization_grant_hosting=None
+        ),
         manifest=SimpleNamespace(
             product_api_path="/product/v1",
             control_plane_path="/operators",
