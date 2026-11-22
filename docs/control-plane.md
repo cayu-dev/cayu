@@ -1345,6 +1345,44 @@ and `--json` adds its chunks. The CLI applies the filters to what an Agent
 returns too, so an Agent on a Cayu without these filters still answers
 correctly.
 
+#### Grouping duplicate proposals
+
+`GET /api/knowledge/pending/clusters` groups pending proposals that say the same thing,
+using the application's knowledge similarity part (`CayuApp(knowledge_similarity=...)`,
+lexical by default; see [Knowledge similarity](memory-foundation.md#knowledge-similarity)).
+It takes the pending list's `namespace`, repeated `label` and `kind` filters, and
+`max_entries` (200 by default, 1 to 1,000): how many proposals it reads, and how many kept
+entries it compares them with. Every proposal it reads is in exactly one cluster; one like
+no other is a cluster of one. Each cluster has its `members`, the kept entries they
+resemble (`similar_kept`, at most three), and `sources`, the sources its members record
+together. Every row carries its own `sources` (1 unless other sessions corroborated it).
+Clusters come most sources first, so a fact several sessions proposed independently comes
+before one proposed once; within a cluster, members come most sources first, then oldest.
+`truncated` says more proposals exist than were read. Rows are redacted like the pending
+list's, and the inbox access rule leaves out proposals the caller can't see before
+anything is compared. Grouping only orders the queue: nothing is kept or dropped by it.
+Comparing many entries is CPU work, so the route is a heavy read: it takes one of a few
+heavy-read slots after authentication, like the dashboard's aggregate reads, and the
+default lexical part compares in a worker thread, so other requests keep being served.
+
+From the command line, `cayu knowledge list --status pending --group` prints the clusters
+(`--max-proposals N` reads up to N); from a local store it groups with the default lexical
+part. `cayu knowledge drop-duplicates` decides a cluster in one step:
+
+```bash
+cayu knowledge drop-duplicates ENTRY_B ENTRY_C --keep ENTRY_A --reason "Same fact" --operation-id dup-2026-11-22
+cayu knowledge drop-duplicates ENTRY_B ENTRY_C --of KEPT_ENTRY --operation-id dup-2026-11-22-2
+```
+
+With `--keep` it keeps that proposal, then drops the listed ones as its duplicates; with
+`--of` it checks the entry is kept and drops the listed ones as its duplicates. Each entry
+is kept or dropped through the same routes as `keep` and `drop`, so each decision is atomic
+and records its reviewer, and each drop its own reason: `Duplicate of ENTRY_ID.` followed by
+`--reason`. Every decision has its own operation ID derived from `--operation-id`, so
+running the same command again replays the decisions already made and makes the rest; after
+a failure part way through, the error says how many were made. At most 50 entries are dropped
+per command.
+
 ### Inspecting specialists and tools
 
 Specialist cards open their model/provider configuration, system-prompt presence,

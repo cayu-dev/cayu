@@ -9768,6 +9768,7 @@ def create_router(
         app=cayu_app,
         pending_router=router,
         protected=protected,
+        heavy_read=heavy_read(),
         workflow=_knowledge_review_workflow,
         gate=inbox_gate,
         seal=inbox_cursor,

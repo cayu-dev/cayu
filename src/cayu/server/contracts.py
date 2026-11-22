@@ -3933,6 +3933,36 @@ class PendingKnowledgeListResponse(ApiBaseModel):
     total_entries_known: StrictInt = Field(ge=0)
 
 
+class ApiKnowledgeClusterEntry(ApiKnowledgeEntryBase):
+    text_preview: str = Field(
+        description="The start of the entry's text, redacted, as in the pending list."
+    )
+    sources: StrictInt = Field(
+        ge=1, description="How many sessions the entry records as its sources."
+    )
+
+
+class ApiKnowledgeProposalCluster(ApiBaseModel):
+    sources: StrictInt = Field(ge=1, description="The members' sources, together.")
+    members: list[ApiKnowledgeClusterEntry] = Field(
+        description="Similar pending proposals, most sources first."
+    )
+    similar_kept: list[ApiKnowledgeClusterEntry] = Field(
+        description="Kept entries the proposals resemble, most similar first."
+    )
+
+
+class PendingKnowledgeClustersResponse(ApiBaseModel):
+    clusters: list[ApiKnowledgeProposalCluster] = Field(
+        description="Every pending proposal read, in exactly one cluster, most sources first."
+    )
+    pending_compared: StrictInt = Field(ge=0)
+    kept_compared: StrictInt = Field(ge=0)
+    truncated: StrictBool = Field(
+        description="More pending proposals exist than were read; narrow the filters."
+    )
+
+
 class ApiKnowledgeChunk(ApiBaseModel):
     chunk_id: str
     entry_id: str

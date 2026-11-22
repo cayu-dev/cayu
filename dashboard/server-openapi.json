@@ -2878,6 +2878,195 @@
         "title": "ApiKnowledgeChunk",
         "type": "object"
       },
+      "ApiKnowledgeClusterEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "aspects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Aspects",
+            "type": "array"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "created_by_type": {
+            "title": "Created By Type",
+            "type": "string"
+          },
+          "entry_id": {
+            "title": "Entry Id",
+            "type": "string"
+          },
+          "impact_targets": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Impact Targets",
+            "type": "array"
+          },
+          "importance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance"
+          },
+          "importance_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Importance Source"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "revision": {
+            "maximum": 2147483647.0,
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "source_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Type"
+          },
+          "source_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Uri"
+          },
+          "sources": {
+            "description": "How many sessions the entry records as its sources.",
+            "minimum": 1.0,
+            "title": "Sources",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "text_preview": {
+            "description": "The start of the entry's text, redacted, as in the pending list.",
+            "title": "Text Preview",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id",
+          "revision",
+          "namespace",
+          "kind",
+          "visibility",
+          "status",
+          "title",
+          "labels",
+          "aspects",
+          "impact_targets",
+          "source_type",
+          "source_uri",
+          "source_id",
+          "created_by_type",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "importance",
+          "importance_source",
+          "confidence",
+          "text_preview",
+          "sources"
+        ],
+        "title": "ApiKnowledgeClusterEntry",
+        "type": "object"
+      },
       "ApiKnowledgeListItem": {
         "additionalProperties": false,
         "properties": {
@@ -3064,6 +3253,40 @@
           "text_preview"
         ],
         "title": "ApiKnowledgeListItem",
+        "type": "object"
+      },
+      "ApiKnowledgeProposalCluster": {
+        "additionalProperties": false,
+        "properties": {
+          "members": {
+            "description": "Similar pending proposals, most sources first.",
+            "items": {
+              "$ref": "#/components/schemas/ApiKnowledgeClusterEntry"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "similar_kept": {
+            "description": "Kept entries the proposals resemble, most similar first.",
+            "items": {
+              "$ref": "#/components/schemas/ApiKnowledgeClusterEntry"
+            },
+            "title": "Similar Kept",
+            "type": "array"
+          },
+          "sources": {
+            "description": "The members' sources, together.",
+            "minimum": 1.0,
+            "title": "Sources",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sources",
+          "members",
+          "similar_kept"
+        ],
+        "title": "ApiKnowledgeProposalCluster",
         "type": "object"
       },
       "ApiPendingAction": {
@@ -35831,6 +36054,42 @@
         "title": "PendingActionsResponse",
         "type": "object"
       },
+      "PendingKnowledgeClustersResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "clusters": {
+            "description": "Every pending proposal read, in exactly one cluster, most sources first.",
+            "items": {
+              "$ref": "#/components/schemas/ApiKnowledgeProposalCluster"
+            },
+            "title": "Clusters",
+            "type": "array"
+          },
+          "kept_compared": {
+            "minimum": 0.0,
+            "title": "Kept Compared",
+            "type": "integer"
+          },
+          "pending_compared": {
+            "minimum": 0.0,
+            "title": "Pending Compared",
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "More pending proposals exist than were read; narrow the filters.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "clusters",
+          "pending_compared",
+          "kept_compared",
+          "truncated"
+        ],
+        "title": "PendingKnowledgeClustersResponse",
+        "type": "object"
+      },
       "PendingKnowledgeDetailResponse": {
         "additionalProperties": false,
         "properties": {
@@ -42798,7 +43057,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "93",
+            "default": "94",
             "title": "Contract Version",
             "type": "string"
           },
@@ -51830,7 +52089,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "93",
+            "default": "94",
             "title": "Contract Version",
             "type": "string"
           }
@@ -58922,6 +59181,101 @@
           }
         },
         "summary": "List Pending Knowledge"
+      }
+    },
+    "/api/knowledge/pending/clusters": {
+      "get": {
+        "description": "Pending proposals grouped by the app's knowledge similarity part, most\ncorroborated first. Grouping only orders the queue; it decides nothing.",
+        "operationId": "list_pending_knowledge_clusters_api_knowledge_pending_clusters_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_entries",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "title": "Max Entries",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingKnowledgeClustersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Pending Knowledge Clusters"
       }
     },
     "/api/knowledge/pending/{entry_id}": {

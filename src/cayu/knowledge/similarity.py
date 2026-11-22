@@ -7,6 +7,12 @@ overlap of code identifiers (backticked names, ``snake_case``, ``CamelCase`` and
 names) is a second one. An embedding-based part can replace it by implementing
 ``score``; nothing else depends on how a score is computed.
 
+``matches_many`` compares a set of entries with each other and with reference entries in
+one call, as grouping a review queue does. Its default calls ``matches`` per subject;
+the lexical part overrides it to tokenize each entry once, score only the pairs that
+share enough words or identifiers to reach a threshold, and do that work in a worker
+thread, with the same results.
+
 Scope comes first and isn't swappable: ``KnowledgeSimilarity.matches`` compares only
 candidates in the subject's namespace and visibility that carry the same values for
 the part's ``scope_labels`` (``("module", "repository")``, say). Callers hand it entries
@@ -17,10 +23,13 @@ A score suggests and groups. It never keeps, drops or merges knowledge by itself
 
 from __future__ import annotations
 
+import asyncio
+import math
 import re
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from types import MappingProxyType
 
@@ -177,6 +186,33 @@ class KnowledgeSimilarity(ABC):
         found.sort(key=lambda match: (-match.score.score, match.index))
         return found if limit is None else found[:limit]
 
+    async def matches_many(
+        self,
+        subjects: Sequence[KnowledgeComparable],
+        candidates: Sequence[KnowledgeComparable] = (),
+    ) -> list[list[KnowledgeSimilarityMatch]]:
+        """Compare a set of entries with each other and with ``candidates``, in one call.
+
+        Returns, for each subject, what ``matches`` returns for it against the subjects
+        after it followed by every candidate, so each pair of subjects is compared once
+        and candidates are never compared with each other. A match's ``index`` is a
+        position in ``subjects`` + ``candidates``: below ``len(subjects)`` it is another
+        subject, otherwise ``candidates[index - len(subjects)]``.
+
+        This default calls ``matches`` once per subject. A part that can prepare each
+        entry once, or tell which pairs can't match without scoring them, overrides it
+        with the same results; a part whose scoring is CPU-bound runs it off the event
+        loop, as ``LexicalKnowledgeSimilarity`` does.
+        """
+
+        subjects = list(subjects)
+        pool = [*subjects, *candidates]
+        found: list[list[KnowledgeSimilarityMatch]] = []
+        for index, subject in enumerate(subjects):
+            later = await self.matches(subject, pool[index + 1 :])
+            found.append([replace(match, index=index + 1 + match.index) for match in later])
+        return found
+
 
 class LexicalKnowledgeSimilarity(KnowledgeSimilarity):
     """Word and identifier overlap; no model calls.
@@ -214,6 +250,91 @@ class LexicalKnowledgeSimilarity(KnowledgeSimilarity):
             )
             for candidate in candidates
         ]
+
+    async def matches_many(
+        self,
+        subjects: Sequence[KnowledgeComparable],
+        candidates: Sequence[KnowledgeComparable] = (),
+    ) -> list[list[KnowledgeSimilarityMatch]]:
+        """Like ``KnowledgeSimilarity.matches_many``, with each entry tokenized once,
+        only pairs that can reach a threshold scored, and the work done in a worker
+        thread so the event loop keeps serving.
+
+        A pair is scored only when the two entries share a word among the rarest
+        ``n - ceil(word_threshold * n) + 1`` of each one's ``n`` words, or an identifier
+        among the rarest ``n - max(ceil(identifier_threshold * n), min_shared_identifiers)
+        + 1`` of its identifiers, rarest across the entries compared. Any pair that
+        reaches a threshold shares one (prefix filtering, as in set-similarity joins),
+        so the matches are exactly those of scoring every pair. A subclass that
+        overrides ``score`` gets the default, which calls it.
+        """
+
+        if type(self).score is not LexicalKnowledgeSimilarity.score:
+            return await super().matches_many(subjects, candidates)
+        stop = threading.Event()
+        try:
+            return await asyncio.to_thread(
+                self._matches_many, list(subjects), [*subjects, *candidates], stop
+            )
+        except asyncio.CancelledError:
+            # A thread can't be interrupted; this stops it at its next subject.
+            stop.set()
+            raise
+
+    def _matches_many(
+        self,
+        subjects: list[KnowledgeComparable],
+        pool: list[KnowledgeComparable],
+        stop: threading.Event,
+    ) -> list[list[KnowledgeSimilarityMatch]]:
+        sets = [(knowledge_words(item), knowledge_identifiers(item)) for item in pool]
+        word_rarity = _rarity(words for words, _ in sets)
+        identifier_rarity = _rarity(identifiers for _, identifiers in sets)
+        word_index: dict[str, list[int]] = {}
+        identifier_index: dict[str, list[int]] = {}
+        prefixes: list[tuple[list[str], list[str]]] = []
+        for position, (words, identifiers) in enumerate(sets):
+            word_prefix = _prefix(
+                words, word_rarity, _required_overlap(len(words), self.word_threshold, 1)
+            )
+            identifier_prefix = _prefix(
+                identifiers,
+                identifier_rarity,
+                _required_overlap(
+                    len(identifiers), self.identifier_threshold, self.min_shared_identifiers
+                ),
+            )
+            prefixes.append((word_prefix, identifier_prefix))
+            for word in word_prefix:
+                word_index.setdefault(word, []).append(position)
+            for identifier in identifier_prefix:
+                identifier_index.setdefault(identifier, []).append(position)
+
+        found: list[list[KnowledgeSimilarityMatch]] = []
+        for index, subject in enumerate(subjects):
+            if stop.is_set():
+                break
+            word_prefix, identifier_prefix = prefixes[index]
+            nearby: set[int] = set()
+            for word in word_prefix:
+                nearby.update(word_index[word])
+            for identifier in identifier_prefix:
+                nearby.update(identifier_index[identifier])
+            matches: list[KnowledgeSimilarityMatch] = []
+            for position in nearby:
+                if position <= index:
+                    continue
+                candidate = pool[position]
+                if not self.same_scope(subject, candidate):
+                    continue
+                score = self._score_sets(*sets[index], *sets[position])
+                if score.similar:
+                    matches.append(
+                        KnowledgeSimilarityMatch(index=position, candidate=candidate, score=score)
+                    )
+            matches.sort(key=lambda match: (-match.score.score, match.index))
+            found.append(matches)
+        return found
 
     def score_pair(
         self, a: KnowledgeComparable, b: KnowledgeComparable
@@ -281,8 +402,9 @@ def _identifiers(material: str) -> frozenset[str]:
     return frozenset(found)
 
 
-# Grouping a review queue compares every proposal with every other, so a note-sized text
-# is tokenized once rather than once per pair; long documents aren't kept.
+# Repeated `score` and `matches` calls see the same notes, so a note-sized text is
+# tokenized once across calls; long documents aren't kept. `matches_many` tokenizes each
+# entry once per call whatever its length.
 _CACHED_MATERIAL_CHARS = 8_192
 _cached_words = lru_cache(maxsize=2048)(_words)
 _cached_identifiers = lru_cache(maxsize=2048)(_identifiers)
@@ -293,8 +415,37 @@ def _material(item: KnowledgeComparable) -> str:
 
 
 def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    union = a | b
-    return len(a & b) / len(union) if union else 0.0
+    shared = len(a & b)
+    union = len(a) + len(b) - shared
+    return shared / union if union else 0.0
+
+
+def _rarity(sets: Iterable[frozenset[str]]) -> dict[str, int]:
+    """How many of the sets hold each token: the order prefix filtering sorts by."""
+
+    counts: dict[str, int] = {}
+    for tokens in sets:
+        for token in tokens:
+            counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def _required_overlap(size: int, threshold: float, minimum: int) -> int:
+    """The fewest shared tokens a set of ``size`` needs to reach ``threshold`` Jaccard
+    with any other set, and at least ``minimum``. Rounded down a little, so a float
+    error can only widen the prefix."""
+
+    return max(math.ceil(threshold * size - 1e-9), minimum)
+
+
+def _prefix(tokens: frozenset[str], rarity: Mapping[str, int], overlap: int) -> list[str]:
+    """The rarest ``len(tokens) - overlap + 1`` tokens: two sets that share at least
+    ``overlap`` tokens share one of these (none when the set is too small)."""
+
+    length = len(tokens) - overlap + 1
+    if length <= 0:
+        return []
+    return sorted(tokens, key=lambda token: (rarity[token], token))[:length]
 
 
 def _unit_threshold(value: float, name: str) -> float:

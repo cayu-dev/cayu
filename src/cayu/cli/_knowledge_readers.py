@@ -69,6 +69,11 @@ class KnowledgeReader(Protocol):
         """The entry with its text and chunks, whatever its status, or ``None``."""
         ...
 
+    async def list_clusters(self, request: KnowledgeListRequest) -> dict[str, Any]:
+        """Pending proposals grouped by similarity, most sources first, in the shape of
+        ``GET /api/knowledge/pending/clusters``; ``request.limit`` proposals at most."""
+        ...
+
     async def close(self) -> None: ...
 
 
@@ -129,6 +134,42 @@ class StoreKnowledgeReader:
             ),
             truncated=more and not listed.entries,
         )
+
+    async def list_clusters(self, request: KnowledgeListRequest) -> dict[str, Any]:
+        from cayu.knowledge._sources import knowledge_source_count
+        from cayu.knowledge.similarity import LexicalKnowledgeSimilarity
+        from cayu.storage.knowledge_review import KnowledgeReviewWorkflow
+
+        workflow = KnowledgeReviewWorkflow(self._store, access_scope=self._scope)
+        # A local store has no application, so it groups with the default part.
+        grouped = await workflow.list_pending_clusters(
+            similarity=LexicalKnowledgeSimilarity(),
+            namespace=request.namespace,
+            labels=dict(request.labels),
+            kinds=list(request.kinds) or None,
+            max_entries=request.limit,
+        )
+
+        def row(entry: KnowledgeEntry) -> dict[str, Any]:
+            return {
+                **entry_projection(entry),
+                "text_preview": _text_preview(entry),
+                "sources": knowledge_source_count(entry),
+            }
+
+        return {
+            "clusters": [
+                {
+                    "sources": cluster.sources,
+                    "members": [row(entry) for entry in cluster.members],
+                    "similar_kept": [row(entry) for entry in cluster.similar_kept],
+                }
+                for cluster in grouped.clusters
+            ],
+            "pending_compared": grouped.pending_compared,
+            "kept_compared": grouped.kept_compared,
+            "truncated": grouped.truncated,
+        }
 
     async def _archived_decision(self, entry: KnowledgeEntry) -> dict[str, Any]:
         """The verified reviewed decision that published an archived entry, as the server's
@@ -221,6 +262,41 @@ class ApiKnowledgeReader:
             and body.get("truncated") is True
             and (unpaged or (cursor is None and not rows)),
         )
+
+    async def list_clusters(self, request: KnowledgeListRequest) -> dict[str, Any]:
+        query: dict[str, str | list[str]] = {"max_entries": str(request.limit)}
+        if request.namespace is not None:
+            query["namespace"] = request.namespace
+        if request.kinds:
+            query["kind"] = list(request.kinds)
+        if request.labels:
+            query["label"] = [f"{key}={value}" for key, value in request.labels.items()]
+        try:
+            body = self._get("/knowledge/pending/clusters", query, "pending knowledge clusters")
+        except CayuApiNotFound:
+            # A Cayu from before grouping reads the path as a pending entry named so.
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} runs a Cayu that doesn't group pending knowledge; "
+                "deploy it with a newer Cayu.",
+            ) from None
+        clusters = body.get("clusters") if isinstance(body, dict) else None
+        if not isinstance(clusters, list) or not all(
+            isinstance(cluster, dict)
+            and isinstance(cluster.get("members"), list)
+            and isinstance(cluster.get("similar_kept"), list)
+            and all(_is_entry(row) for row in cluster["members"] + cluster["similar_kept"])
+            for cluster in clusters
+        ):
+            raise CayuApiError(
+                "not_cayu", f"{self._api.description} returned invalid knowledge clusters."
+            )
+        return {
+            "clusters": clusters,
+            "pending_compared": body.get("pending_compared"),
+            "kept_compared": body.get("kept_compared"),
+            "truncated": body.get("truncated") is True,
+        }
 
     async def load_entry(self, entry_id: str) -> dict[str, Any] | None:
         quoted = quote(entry_id, safe="")

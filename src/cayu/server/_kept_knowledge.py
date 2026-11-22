@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import StringConstraints, ValidationError
 
 from cayu.knowledge._retrieval_results import _truncate_text_to_bytes as truncate_text_to_bytes
+from cayu.knowledge._sources import knowledge_source_count
 from cayu.knowledge.activation_contracts import (
     KnowledgeActivationConflict,
     KnowledgeActivationReceipt,
@@ -38,6 +39,7 @@ from cayu.server.contracts import (
     ArchivedKnowledgeListResponse,
     KeptKnowledgeDetailResponse,
     KeptKnowledgeListResponse,
+    PendingKnowledgeClustersResponse,
     PendingKnowledgeDetailResponse,
     RetireKnowledgeRequest,
     RetireKnowledgeResponse,
@@ -46,6 +48,7 @@ from cayu.sessions.event_queries import EventQueryResultTooLarge
 from cayu.sessions.inspection import SessionInspectionIdentity
 from cayu.sessions.knowledge_usage import retained_knowledge_usage
 from cayu.storage._knowledge_rejection import KnowledgeReviewMaterialTooLarge
+from cayu.storage.knowledge_review import DEFAULT_KNOWLEDGE_CLUSTER_ENTRIES
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -65,6 +68,7 @@ def register_kept_knowledge(
     app: CayuApp,
     pending_router: APIRouter,
     protected: list[Any],
+    heavy_read: list[Any],
     workflow: Callable[[], KnowledgeReviewWorkflow],
     gate: InboxAccessGate,
     seal: InboxCursorSeal,
@@ -334,6 +338,76 @@ def register_kept_knowledge(
         return await knowledge_detail(
             entry_id, max_chunks, max_bytes, auth_context, KnowledgeStatus.ACTIVE
         )
+
+    # Registered before `/knowledge/pending/{entry_id}`, which would read the path as an id.
+    # Comparing many entries is CPU work: the route takes a heavy-read slot (after
+    # authentication), and the lexical part compares in a worker thread.
+    @pending_router.get(
+        "/knowledge/pending/clusters",
+        response_model=PendingKnowledgeClustersResponse,
+        dependencies=heavy_read,
+    )
+    async def list_pending_knowledge_clusters(
+        namespace: str | None = None,
+        label: Annotated[list[str] | None, Query()] = None,
+        kind: Annotated[list[str] | None, Query()] = None,
+        max_entries: int = DEFAULT_KNOWLEDGE_CLUSTER_ENTRIES,
+        auth_context: AuthContext | None = auth_default,
+    ):
+        """Pending proposals grouped by the app's knowledge similarity part, most
+        corroborated first. Grouping only orders the queue; it decides nothing."""
+
+        owner = workflow()
+        limited = gate.applies(auth_context)
+
+        async def admit(entry: KnowledgeEntry) -> bool:
+            return await gate.permits(auth_context, gate.knowledge_scope(entry))
+
+        try:
+            grouped = await owner.list_pending_clusters(
+                similarity=app.knowledge_similarity,
+                namespace=(parse_strings([namespace], "namespace")[0] if namespace else None),
+                labels=parse_labels(label),
+                kinds=parse_strings(kind, "kind") if kind is not None else None,
+                max_entries=max_entries,
+                admit=admit if limited else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        identities: dict[str, SessionInspectionIdentity | None] = {}
+
+        async def row(entry: KnowledgeEntry) -> dict[str, Any]:
+            detail = serialize_detail(entry)
+            serialized = {
+                key: value
+                for key, value in detail.items()
+                if key not in {"text", "metadata", "expires_at"}
+            }
+            if entry.source_type == "tool":
+                # Like the kept list and details: the verified, exposed source session, or
+                # nothing, and never the private session id in its URI.
+                serialized["source_id"] = await tool_source_session(
+                    entry, specialist_of(entry), limited=limited, identities=identities
+                )
+                serialized["source_uri"] = None
+            serialized = app.redact_json(serialized)
+            serialized["text_preview"] = knowledge_preview(entry.text, app.redact_json)
+            serialized["sources"] = knowledge_source_count(entry)
+            return serialized
+
+        return {
+            "clusters": [
+                {
+                    "sources": cluster.sources,
+                    "members": [await row(entry) for entry in cluster.members],
+                    "similar_kept": [await row(entry) for entry in cluster.similar_kept],
+                }
+                for cluster in grouped.clusters
+            ],
+            "pending_compared": grouped.pending_compared,
+            "kept_compared": grouped.kept_compared,
+            "truncated": grouped.truncated,
+        }
 
     @pending_router.get(
         "/knowledge/pending/{entry_id}",

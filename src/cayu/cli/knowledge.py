@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +24,12 @@ from cayu.cli._output import (
 from cayu.cli._read_targets import ReadTarget, add_read_target_options, run_read_command
 from cayu.cli.session import _parse_labels, _redact_sensitive
 from cayu.knowledge.records import KnowledgeStatus
+from cayu.storage.knowledge_review import (
+    DEFAULT_KNOWLEDGE_CLUSTER_ENTRIES as DEFAULT_GROUPED_PROPOSALS,
+)
+from cayu.storage.knowledge_review import (
+    MAX_KNOWLEDGE_CLUSTER_ENTRIES as MAX_GROUPED_PROPOSALS,
+)
 
 CLI_SCHEMA_VERSION = "1"
 _PREVIEW_CHARS = 60
@@ -152,6 +159,30 @@ def add_knowledge_parser(subparsers: Any) -> None:
     )
     add_action_target_options(add_parser, output_format="json")
 
+    duplicates = commands.add_parser(
+        "drop-duplicates",
+        help="Drop pending proposals as duplicates of one entry, in one step.",
+        description=(
+            "Decide a cluster of similar proposals (from `cayu knowledge list --status "
+            "pending --group`): keep one with --keep and drop the rest as its duplicates, "
+            "or drop them all as duplicates of an entry already kept with --of. Each entry "
+            "is kept or dropped on its own, recording the reviewer and its reason "
+            '("Duplicate of ENTRY_ID." and --reason). Run the same command again to '
+            "finish after a failure: decisions already made replay."
+        ),
+    )
+    duplicates.add_argument("entry_ids", nargs="+", metavar="ENTRY_ID", help="Proposals to drop.")
+    target = duplicates.add_mutually_exclusive_group(required=True)
+    target.add_argument("--keep", metavar="ENTRY_ID", help="Keep this proposal first.")
+    target.add_argument("--of", metavar="ENTRY_ID", help="The kept entry they duplicate.")
+    duplicates.add_argument("--reason", help="Why, recorded with every decision.")
+    duplicates.add_argument(
+        "--operation-id",
+        required=True,
+        help="Retain this ID to retry: the same command replays decisions already made.",
+    )
+    add_action_target_options(duplicates)
+
     list_parser = commands.add_parser(
         "list",
         help="List knowledge entries.",
@@ -192,6 +223,24 @@ def add_knowledge_parser(subparsers: Any) -> None:
         help=f"Entries per page, 1-{MAX_KNOWLEDGE_PAGE} (default: 50).",
     )
     list_parser.add_argument("--cursor", help="Continue from a listing's next_cursor.")
+    list_parser.add_argument(
+        "--group",
+        action="store_true",
+        help=(
+            "With --status pending: group similar proposals, each group with the kept "
+            "entries it resembles, the groups with the most sources first. Reads up to "
+            "--max-proposals; grouping only orders them."
+        ),
+    )
+    list_parser.add_argument(
+        "--max-proposals",
+        type=_group_limit,
+        default=DEFAULT_GROUPED_PROPOSALS,
+        help=(
+            f"With --group, how many proposals to read, 1-{MAX_GROUPED_PROPOSALS} "
+            f"(default: {DEFAULT_GROUPED_PROPOSALS})."
+        ),
+    )
     add_read_target_options(list_parser)
     add_output_options(list_parser, formats=("table", "json", "jsonl"), default="table")
 
@@ -239,6 +288,10 @@ def add_knowledge_parser(subparsers: Any) -> None:
 
 
 def run_knowledge(args: argparse.Namespace) -> int:
+    if args.knowledge_command == "drop-duplicates":
+        from cayu.cli._knowledge_duplicates import run_drop_duplicates
+
+        return run_drop_duplicates(args)
     if args.knowledge_command in {"add", "keep", "drop", "archive"}:
         from cayu.cli._control_plane_actions import run_action
 
@@ -290,6 +343,8 @@ def open_knowledge_reader(target: ReadTarget) -> KnowledgeReader:
 
 
 async def _list_entries(args: argparse.Namespace, reader: KnowledgeReader) -> int:
+    if args.group:
+        return await _list_clusters(args, reader)
     namespace = None if args.namespace is None else args.namespace.strip() or None
     kinds = tuple(dict.fromkeys(kind.strip() for kind in args.kind if kind.strip()))
     page = await reader.list_entries(
@@ -333,6 +388,55 @@ async def _list_entries(args: argparse.Namespace, reader: KnowledgeReader) -> in
             print(f"More entries follow; add --cursor {terminal_safe(page.next_cursor)}")
         elif page.truncated:
             print("More entries exist than this page shows; narrow the filters.")
+    return 0
+
+
+async def _list_clusters(args: argparse.Namespace, reader: KnowledgeReader) -> int:
+    if args.status != KnowledgeStatus.PENDING.value:
+        raise ValueError("--group lists pending proposals: add --status pending.")
+    if args.cursor is not None:
+        raise ValueError("--group reads one bounded set of proposals; it takes no --cursor.")
+    namespace = None if args.namespace is None else args.namespace.strip() or None
+    kinds = tuple(dict.fromkeys(kind.strip() for kind in args.kind if kind.strip()))
+    grouped = await reader.list_clusters(
+        KnowledgeListRequest(
+            status=KnowledgeStatus.PENDING,
+            namespace=namespace,
+            kinds=kinds,
+            labels=_parse_labels(args.label),
+            limit=args.max_proposals,
+        )
+    )
+    payload = _redact_sensitive(
+        {"schema_version": CLI_SCHEMA_VERSION, "source": reader.source, **grouped}
+    )
+    if args.output_format == "json":
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.output_format == "jsonl":
+        for cluster in payload["clusters"]:
+            print(json.dumps(cluster, ensure_ascii=False, sort_keys=True))
+        return 0
+    rows = []
+    for number, cluster in enumerate(payload["clusters"], start=1):
+        for role, entries in (("proposal", cluster["members"]), ("kept", cluster["similar_kept"])):
+            rows.extend(
+                {
+                    "group": number,
+                    "role": role,
+                    "sources": entry.get("sources"),
+                    **_table_row(entry),
+                }
+                for entry in entries
+            )
+    if rows:
+        print_table(("group", "role", "sources", "entry_id", "kind", "preview"), rows)
+    else:
+        print("No pending knowledge proposals.")
+    if payload["truncated"]:
+        print(
+            "More proposals exist than were grouped; raise --max-proposals or narrow the filters."
+        )
     return 0
 
 
@@ -464,14 +568,23 @@ def _revision(value: str) -> int:
     return revision
 
 
-def _page_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError("must be an integer") from None
-    if not 1 <= limit <= MAX_KNOWLEDGE_PAGE:
-        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_KNOWLEDGE_PAGE}")
-    return limit
+def _bounded_int(maximum: int) -> Callable[[str], int]:
+    """An argparse type for an integer from 1 to ``maximum``."""
+
+    def parse(value: str) -> int:
+        try:
+            limit = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("must be an integer") from None
+        if not 1 <= limit <= maximum:
+            raise argparse.ArgumentTypeError(f"must be between 1 and {maximum}")
+        return limit
+
+    return parse
+
+
+_page_limit = _bounded_int(MAX_KNOWLEDGE_PAGE)
+_group_limit = _bounded_int(MAX_GROUPED_PROPOSALS)
 
 
 async def _check_lookups(args: argparse.Namespace, target: ReadTarget) -> int:

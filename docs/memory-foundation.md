@@ -1461,6 +1461,17 @@ the labels `remember_knowledge` copies from the session, such as `("module",
 Callers read candidates through their own knowledge access scope, so a comparison never
 crosses tenants either.
 
+`matches_many(subjects, candidates)` compares a set of entries with each other and with
+reference entries in one call: for each subject, its matches among the subjects after it
+and among the candidates, so each pair is compared once. Grouping a review queue uses it.
+The default calls `matches` once per subject. `LexicalKnowledgeSimilarity` overrides it:
+it tokenizes each entry once for the whole call, whatever its length, scores only pairs
+that share one of their rarest words or identifiers (prefix filtering, which leaves out
+only pairs that can't reach a threshold, so the matches are the same as scoring every
+pair), and does that work in a worker thread so the event loop keeps serving. A part
+that overrides `score` gets the default; one whose scoring is CPU-bound should keep it
+off the event loop the same way.
+
 An application picks its part with `CayuApp(knowledge_similarity=...)`; the default is
 `LexicalKnowledgeSimilarity()`. An embedding-based part subclasses `KnowledgeSimilarity`
 and implements `score`; the lexical default doesn't need an embedding model.
@@ -1476,6 +1487,18 @@ An unreviewed proposal's body is never returned; a kept entry's is a `read_knowl
 away. It sees proposals only when that access scope lets it read pending entries
 (`allowed_statuses`). Its effect is `NONE`, so tool policies, approvals and budgets can allow it on its
 own without allowing the write.
+
+The review queue uses the same part. `cluster_knowledge_proposals` in
+`cayu.knowledge.review_clusters` joins the pending proposals a part calls similar into
+clusters, transitively, lists the kept entries each cluster resembles, and orders the
+clusters by corroboration: the sources their proposals record, read with the entry's
+corroboration summary (`metadata["cayu:corroboration"]["source_count"]`, 1 when there is
+none). `KnowledgeReviewWorkflow.list_pending_clusters(similarity=...)` reads a bounded set
+of pending and kept entries in the workflow's scope and clusters them; the server's
+`GET /api/knowledge/pending/clusters` and `cayu knowledge list --status pending --group`
+serve it ([control plane](control-plane.md#grouping-duplicate-proposals)). A reviewer
+then decides a cluster with `cayu knowledge drop-duplicates`, one recorded decision per
+entry. Grouping never keeps or drops anything.
 
 ## Durable opt-in knowledge enrichment
 

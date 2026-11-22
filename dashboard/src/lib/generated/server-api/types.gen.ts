@@ -1488,6 +1488,106 @@ export type ApiKnowledgeChunk = {
 };
 
 /**
+ * ApiKnowledgeClusterEntry
+ */
+export type ApiKnowledgeClusterEntry = {
+    /**
+     * Aspects
+     */
+    aspects: Array<string>;
+    /**
+     * Confidence
+     */
+    confidence: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Created By
+     */
+    created_by: string | null;
+    /**
+     * Created By Type
+     */
+    created_by_type: string;
+    /**
+     * Entry Id
+     */
+    entry_id: string;
+    /**
+     * Impact Targets
+     */
+    impact_targets: Array<string>;
+    /**
+     * Importance
+     */
+    importance: string | null;
+    /**
+     * Importance Source
+     */
+    importance_source: string | null;
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Namespace
+     */
+    namespace: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Source Id
+     */
+    source_id: string | null;
+    /**
+     * Source Type
+     */
+    source_type: string | null;
+    /**
+     * Source Uri
+     */
+    source_uri: string | null;
+    /**
+     * Sources
+     *
+     * How many sessions the entry records as its sources.
+     */
+    sources: number;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Text Preview
+     *
+     * The start of the entry's text, redacted, as in the pending list.
+     */
+    text_preview: string;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Visibility
+     */
+    visibility: string;
+};
+
+/**
  * ApiKnowledgeListItem
  */
 export type ApiKnowledgeListItem = {
@@ -1583,6 +1683,30 @@ export type ApiKnowledgeListItem = {
      * Visibility
      */
     visibility: string;
+};
+
+/**
+ * ApiKnowledgeProposalCluster
+ */
+export type ApiKnowledgeProposalCluster = {
+    /**
+     * Members
+     *
+     * Similar pending proposals, most sources first.
+     */
+    members: Array<ApiKnowledgeClusterEntry>;
+    /**
+     * Similar Kept
+     *
+     * Kept entries the proposals resemble, most similar first.
+     */
+    similar_kept: Array<ApiKnowledgeClusterEntry>;
+    /**
+     * Sources
+     *
+     * The members' sources, together.
+     */
+    sources: number;
 };
 
 /**
@@ -17633,6 +17757,32 @@ export type PendingActionsResponse = {
 };
 
 /**
+ * PendingKnowledgeClustersResponse
+ */
+export type PendingKnowledgeClustersResponse = {
+    /**
+     * Clusters
+     *
+     * Every pending proposal read, in exactly one cluster, most sources first.
+     */
+    clusters: Array<ApiKnowledgeProposalCluster>;
+    /**
+     * Kept Compared
+     */
+    kept_compared: number;
+    /**
+     * Pending Compared
+     */
+    pending_compared: number;
+    /**
+     * Truncated
+     *
+     * More pending proposals exist than were read; narrow the filters.
+     */
+    truncated: boolean;
+};
+
+/**
  * PendingKnowledgeDetailResponse
  */
 export type PendingKnowledgeDetailResponse = {
@@ -30692,6 +30842,48 @@ export type ListPendingKnowledgeApiKnowledgePendingGetResponses = {
 };
 
 export type ListPendingKnowledgeApiKnowledgePendingGetResponse = ListPendingKnowledgeApiKnowledgePendingGetResponses[keyof ListPendingKnowledgeApiKnowledgePendingGetResponses];
+
+export type ListPendingKnowledgeClustersApiKnowledgePendingClustersGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Namespace
+         */
+        namespace?: string | null;
+        /**
+         * Label
+         */
+        label?: Array<string> | null;
+        /**
+         * Kind
+         */
+        kind?: Array<string> | null;
+        /**
+         * Max Entries
+         */
+        max_entries?: number;
+    };
+    url: '/api/knowledge/pending/clusters';
+};
+
+export type ListPendingKnowledgeClustersApiKnowledgePendingClustersGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListPendingKnowledgeClustersApiKnowledgePendingClustersGetError = ListPendingKnowledgeClustersApiKnowledgePendingClustersGetErrors[keyof ListPendingKnowledgeClustersApiKnowledgePendingClustersGetErrors];
+
+export type ListPendingKnowledgeClustersApiKnowledgePendingClustersGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: PendingKnowledgeClustersResponse;
+};
+
+export type ListPendingKnowledgeClustersApiKnowledgePendingClustersGetResponse = ListPendingKnowledgeClustersApiKnowledgePendingClustersGetResponses[keyof ListPendingKnowledgeClustersApiKnowledgePendingClustersGetResponses];
 
 export type GetPendingKnowledgeApiKnowledgePendingEntryIdGetData = {
     body?: never;

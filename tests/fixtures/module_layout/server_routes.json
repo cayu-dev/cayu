@@ -76,6 +76,7 @@
   "GET /api/knowledge/pending name=list_pending_knowledge class=APIRoute GET=list_pending_knowledge_api_knowledge_pending_get",
   "POST /api/knowledge/{entry_id}/approve name=approve_knowledge class=APIRoute POST=approve_knowledge_api_knowledge__entry_id__approve_post",
   "POST /api/knowledge/{entry_id}/reject name=reject_knowledge class=APIRoute POST=reject_knowledge_api_knowledge__entry_id__reject_post",
+  "GET /api/knowledge/pending/clusters name=list_pending_knowledge_clusters class=APIRoute GET=list_pending_knowledge_clusters_api_knowledge_pending_clusters_get",
   "GET /api/knowledge/pending/{entry_id} name=get_pending_knowledge class=APIRoute GET=get_pending_knowledge_api_knowledge_pending__entry_id__get",
   "GET /api/inbox name=list_inbox class=APIRoute GET=list_inbox_api_inbox_get",
   "GET /api/inbox/counts name=inbox_counts class=APIRoute GET=inbox_counts_api_inbox_counts_get",

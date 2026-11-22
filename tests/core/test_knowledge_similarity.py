@@ -224,3 +224,90 @@ def test_source_count_reads_the_corroboration_summary(metadata, count):
     from cayu.knowledge._sources import knowledge_source_count
 
     assert knowledge_source_count(KnowledgeEntry(id="e", text="t", metadata=metadata)) == count
+
+
+def _every_pair(part: KnowledgeSimilarity, subjects, candidates):
+    """What ``matches_many`` must return: the base default, scoring every pair."""
+
+    return asyncio.run(KnowledgeSimilarity.matches_many(part, subjects, candidates))
+
+
+def _summary(found) -> list[list[tuple[int, float, bool]]]:
+    return [[(m.index, m.score.score, m.score.similar) for m in row] for row in found]
+
+
+@pytest.mark.parametrize("scope_labels", [(), ("module",)])
+def test_lexical_matches_many_finds_what_scoring_every_pair_finds(scope_labels):
+    entries, _ = _fixture_entries()
+    items = list(entries.values())
+    similarity = LexicalKnowledgeSimilarity(scope_labels=scope_labels)
+    for subjects, candidates in ((items, []), (items[:40], items[40:]), (items[::3], items[1::3])):
+        found = asyncio.run(similarity.matches_many(subjects, candidates))
+        assert _summary(found) == _summary(_every_pair(similarity, subjects, candidates))
+    # Identifier matches, a threshold met exactly, and entries with nothing to compare.
+    tricky = [
+        KnowledgeComparable(text="`resume_session` then `load_checkpoint` first"),
+        KnowledgeComparable(text="`load_checkpoint` before `resume_session` always"),
+        KnowledgeComparable(text="alpha bravo charlie delta echo"),
+        KnowledgeComparable(text="alpha zulu yankee xray whiskey"),
+        KnowledgeComparable(text="a b c"),
+        KnowledgeComparable(text=""),
+    ]
+    strict = LexicalKnowledgeSimilarity(word_threshold=1 / 9)
+    found = asyncio.run(strict.matches_many(tricky[:3], tricky[3:]))
+    assert _summary(found) == _summary(_every_pair(strict, tricky[:3], tricky[3:]))
+    assert [m.index for m in found[0]] == [1]
+    assert [m.index for m in found[2]] == [3]  # 1 of 9 words shared: exactly the threshold
+
+
+def test_matches_many_tokenizes_each_long_entry_once(monkeypatch):
+    from cayu.knowledge import similarity as similarity_module
+
+    calls: dict[str, int] = {}
+    words, identifiers = similarity_module._words, similarity_module._identifiers
+
+    def counted(function):
+        def spy(material: str) -> frozenset[str]:
+            calls[material] = calls.get(material, 0) + 1
+            return function(material)
+
+        return spy
+
+    monkeypatch.setattr(similarity_module, "_words", counted(words))
+    monkeypatch.setattr(similarity_module, "_identifiers", counted(identifiers))
+    # Longer than the per-text cache keeps, so nothing is remembered between calls.
+    long = [
+        KnowledgeComparable(text=f"note {index} `store_{index}` " + "durable queue " * 1_000)
+        for index in range(8)
+    ]
+    assert all(len(item.text) > similarity_module._CACHED_MATERIAL_CHARS for item in long)
+    found = asyncio.run(LexicalKnowledgeSimilarity().matches_many(long[:5], long[5:]))
+    assert [len(row) for row in found] == [7, 6, 5, 4, 3]
+    # Once for words and once for identifiers, per entry, for the whole comparison.
+    assert sorted(calls.values()) == [2] * 8
+
+
+def test_a_part_that_overrides_score_gets_matches_many_through_it():
+    class _Tuned(LexicalKnowledgeSimilarity):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def score(self, subject, candidates):
+            self.calls += 1
+            return await super().score(subject, candidates)
+
+    part = _Tuned()
+    items = [KnowledgeComparable(text=f"Queued delivery retries {n}") for n in range(3)]
+    found = asyncio.run(part.matches_many(items, [KnowledgeComparable(text="Queued delivery")]))
+    assert part.calls == 3
+    assert [[m.index for m in row] for row in found] == [[1, 2, 3], [2, 3], [3]]
+
+
+def test_lexical_matches_many_stops_when_asked():
+    import threading
+
+    stop = threading.Event()
+    stop.set()
+    items = [KnowledgeComparable(text="Queued delivery retries")] * 3
+    assert LexicalKnowledgeSimilarity()._matches_many(items, items, stop) == []

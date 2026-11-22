@@ -74,6 +74,15 @@ def open_action_api(args: argparse.Namespace) -> CayuApi:
     )
 
 
+def require_operation_id(value: str) -> str:
+    """Refuse an operation ID a server's Idempotency-Key can't carry."""
+
+    require_durable_clean_nonblank(value, "operation ID")
+    if len(value) > 256 or any(ord(c) < 32 or ord(c) > 126 for c in value):
+        raise ValueError("Operation ID must be 1-256 printable ASCII characters.")
+    return value
+
+
 def action_server_url(args: argparse.Namespace) -> str:
     """The running server an action without ``--application`` reaches."""
 
@@ -295,9 +304,7 @@ def run_action(args: argparse.Namespace) -> int:
             try:
                 operation = getattr(args, "operation_id", None)
                 if operation is not None:
-                    require_durable_clean_nonblank(operation, "operation ID")
-                    if len(operation) > 256 or any(ord(c) < 32 or ord(c) > 126 for c in operation):
-                        raise ValueError("Operation ID must be 1-256 printable ASCII characters.")
+                    require_operation_id(operation)
                 if args.command == "task":
                     command = args.task_command
                     if command == "create":

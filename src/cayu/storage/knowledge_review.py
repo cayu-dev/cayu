@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from cayu._validation import (
@@ -44,13 +45,22 @@ from cayu.knowledge.records import (
     KnowledgeStatus,
     KnowledgeVisibility,
 )
+from cayu.knowledge.review_clusters import (
+    KnowledgeProposalCluster,
+    cluster_knowledge_proposals,
+)
 from cayu.knowledge.scopes import (
     KnowledgeAccessDenied,
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
     knowledge_review_scope,
 )
-from cayu.knowledge.search import KnowledgeListQuery, KnowledgeListResult
+from cayu.knowledge.search import (
+    KnowledgeListQuery,
+    KnowledgeListResult,
+    encode_knowledge_list_cursor,
+)
+from cayu.knowledge.similarity import KnowledgeSimilarity
 from cayu.storage._knowledge_rejection import (
     KnowledgeRejectionDecision,
     KnowledgeReviewRejection,
@@ -71,6 +81,14 @@ _KNOWLEDGE_REVIEW_STORE_METHODS = (
     "load_entry_publication_receipt",
     "load_activation_receipt",
 )
+#: How many pending proposals, and as many kept entries, one grouped review reads at most.
+DEFAULT_KNOWLEDGE_CLUSTER_ENTRIES = 200
+MAX_KNOWLEDGE_CLUSTER_ENTRIES = 1_000
+_CLUSTER_PAGE_SIZE = 100
+#: Entries one grouped read lists at most, as a multiple of ``max_entries``, counting
+#: those ``admit`` leaves out.
+_CLUSTER_SCAN_FACTOR = 4
+_CLUSTER_PAGE_MAX_BYTES = 1_048_576
 _CURATOR_FORBIDDEN_REVIEW_IDENTITY_FIELDS = (
     "candidate_generator_identity",
     "evaluator_identity",
@@ -87,6 +105,17 @@ def _review_forbidden_activation_identities(entry: KnowledgeEntry) -> tuple[str,
             if type(value) is str and value.strip() and value not in identities:
                 identities.append(value)
     return tuple(identities)
+
+
+@dataclass(frozen=True)
+class KnowledgeProposalClusters:
+    """A grouped review queue: ``clusters`` most corroborated first, how many pending and
+    kept entries were compared, and whether more pending ones existed than were read."""
+
+    clusters: list[KnowledgeProposalCluster]
+    pending_compared: int
+    kept_compared: int
+    truncated: bool
 
 
 class _KnowledgeReviewStore(Protocol):
@@ -263,6 +292,83 @@ class KnowledgeReviewWorkflow:
             count_total=count_total,
         )
         return await self.store.list_entries(query, access_scope=self.access_scope)
+
+    async def list_pending_clusters(
+        self,
+        *,
+        similarity: KnowledgeSimilarity,
+        namespace: str | None = None,
+        labels: dict[str, str] | None = None,
+        kinds: Iterable[str] | None = None,
+        max_entries: int = DEFAULT_KNOWLEDGE_CLUSTER_ENTRIES,
+        admit: Callable[[KnowledgeEntry], Awaitable[bool]] | None = None,
+    ) -> KnowledgeProposalClusters:
+        """Group pending entries in the workflow scope by similarity, most corroborated
+        first (``cluster_knowledge_proposals``), with the kept entries each group resembles.
+
+        Reads at most ``max_entries`` pending entries and as many kept ones, in list order.
+        ``admit`` leaves out entries the caller may not see before anything is compared;
+        entries it leaves out still count toward a read budget of
+        ``_CLUSTER_SCAN_FACTOR`` times ``max_entries``, after which the result is truncated.
+        """
+
+        max_entries = _positive_int(max_entries, "max_entries")
+        if max_entries > MAX_KNOWLEDGE_CLUSTER_ENTRIES:
+            raise ValueError(f"`max_entries` must be at most {MAX_KNOWLEDGE_CLUSTER_ENTRIES}.")
+        query = KnowledgeListQuery(
+            namespace=self._scoped_namespace(namespace),
+            labels=self._scoped_labels(labels),
+            kinds=_string_list(kinds, "kinds") if kinds is not None else None,
+            statuses=[KnowledgeStatus.PENDING],
+            limit=_CLUSTER_PAGE_SIZE,
+            max_bytes=_CLUSTER_PAGE_MAX_BYTES,
+            count_total=False,
+        )
+        pending, truncated = await self._read_for_clusters(query, max_entries, admit)
+        kept: list[KnowledgeEntry] = []
+        if pending and KnowledgeStatus.ACTIVE in self.access_scope.allowed_statuses:
+            kept, _ = await self._read_for_clusters(
+                query.model_copy(update={"statuses": [KnowledgeStatus.ACTIVE]}),
+                max_entries,
+                admit,
+            )
+        clusters = await cluster_knowledge_proposals(pending, similarity=similarity, kept=kept)
+        return KnowledgeProposalClusters(
+            clusters=clusters,
+            pending_compared=len(pending),
+            kept_compared=len(kept),
+            truncated=truncated,
+        )
+
+    async def _read_for_clusters(
+        self,
+        query: KnowledgeListQuery,
+        max_entries: int,
+        admit: Callable[[KnowledgeEntry], Awaitable[bool]] | None,
+    ) -> tuple[list[KnowledgeEntry], bool]:
+        entries: list[KnowledgeEntry] = []
+        seen: set[str] = set()
+        scanned = 0
+        while True:
+            result = await self.store.list_entries(query, access_scope=self.access_scope)
+            scanned += len(result.entries)
+            for item in result.entries:
+                entry = item.entry
+                if entry.id in seen or entry.status not in query.statuses:
+                    continue
+                seen.add(entry.id)
+                if admit is None or await admit(entry):
+                    entries.append(entry)
+            more = result.truncated and bool(result.entries)
+            if len(entries) >= max_entries:
+                return entries[:max_entries], more or len(entries) > max_entries
+            if not more:
+                return entries, result.truncated
+            if scanned >= max_entries * _CLUSTER_SCAN_FACTOR:
+                return entries, True
+            query = query.model_copy(
+                update={"cursor": encode_knowledge_list_cursor(result.entries[-1].entry)}
+            )
 
     async def get_pending(self, entry_id: str) -> KnowledgeEntry:
         """Load one pending entry after status and scope checks."""
