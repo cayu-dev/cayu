@@ -4344,6 +4344,7 @@ def create_router(
     session_follow_max_streams_per_session: int = 32,
     dashboard_configured: bool = False,
     browser_recordings_configured: bool = False,
+    tool_authorization_grants_configured: bool = False,
     dashboard_pricing_configured: bool = False,
     deployment_name: str | None = None,
     deployment_kind: DeploymentKind | None = None,
@@ -4695,6 +4696,7 @@ def create_router(
         task_creation_supported=task_store is not None
         and task_store.supports_task_creation_operations,
         browser_recordings_configured=browser_recordings_configured,
+        tool_authorization_grants_configured=tool_authorization_grants_configured,
         session_overview_supported=type(session_store).read_usage_accounting
         is not SessionStore.read_usage_accounting,
         dashboard_configured=dashboard_configured,

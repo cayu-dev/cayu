@@ -12235,6 +12235,16 @@
           "tasks": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "tool_authorization_grants": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptionalSurfaceCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "tool_display": {
             "anyOf": [
               {
@@ -42788,7 +42798,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "92",
+            "default": "93",
             "title": "Contract Version",
             "type": "string"
           },
@@ -51820,7 +51830,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "92",
+            "default": "93",
             "title": "Contract Version",
             "type": "string"
           }

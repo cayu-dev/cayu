@@ -36,6 +36,7 @@ from cayu.approvals.authorization_grants import (
     ToolAuthorizationGrantUse,
     ToolAuthorizationGrantUseCursor,
 )
+from cayu.approvals.review import HumanReviewDenied, HumanReviewReference
 from cayu.approvals.tools import ToolApprovalDecision, ToolApprovalRequest
 from cayu.server._inbox_access import InboxAccessGate
 from cayu.server.auth import (
@@ -49,12 +50,18 @@ from cayu.server.inbox import InboxAccess
 
 GrantReadAccess = Callable[[AuthContext, ToolAuthorizationGrant], Awaitable[bool]]
 
+#: The response header in which an accepted approval names the grant it made.
+GRANT_ID_HEADER = "X-Cayu-Tool-Authorization-Grant-Id"
+
 
 class ToolAuthorizationGrantApproveBody(BaseModel):
     """Approve one pending tool call and remember it as a grant.
 
     There is no ``resolved_by`` and no tool, argument, or decision field: the
     actor is the authenticated caller and the call is the pending snapshot.
+    ``review_reference`` is the reference of the protected review the caller was
+    shown, which an application with a human-review policy requires of every
+    approval; it is checked as ``/tool-approvals/resolve`` checks it.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -65,6 +72,7 @@ class ToolAuthorizationGrantApproveBody(BaseModel):
     tool_call_id: str = Field(min_length=1)
     reason: str | None = Field(default=None, min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    review_reference: HumanReviewReference | None = None
     grant: ToolAuthorizationGrantRequest
 
     @field_validator("metadata", mode="before")
@@ -198,8 +206,33 @@ class ToolAuthorizationGrantServer:
 
         @router.post("/approve", responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES)
         async def approve_with_grant(body: ToolAuthorizationGrantApproveBody, principal: Principal):
-            """Remember and approve: idempotent by approval identity; streams the resolution."""
+            """Remember and approve: idempotent by approval identity; streams the resolution.
 
+            The accepted response names the grant in ``GRANT_ID_HEADER``.
+            """
+
+            reference = body.review_reference
+            if reference is not None and (
+                reference.context.recipient != principal.subject
+                or reference.context.tenant != principal.tenant
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Human-review recipient does not match authentication.",
+                )
+            try:
+                # Before the grant is staged, so a caller the human-review policy
+                # doesn't let decide leaves nothing behind.
+                await service.app.require_human_review_resolution_authority(
+                    body.session_id, reference
+                )
+            except HumanReviewDenied:
+                raise HTTPException(
+                    status_code=403, detail="Human-review decision is not authorized."
+                ) from None
+            except ValueError as exc:
+                # A session alias that is malformed or names nothing.
+                raise _http_error(exc) from None
             if inbox_gate.applies(principal):
                 try:
                     session_id = await service.app._resolve_public_session_id(body.session_id)
@@ -220,6 +253,7 @@ class ToolAuthorizationGrantServer:
                     decision=ToolApprovalDecision.APPROVE,
                     reason=body.reason,
                     metadata=body.metadata,
+                    review_reference=reference,
                     resolved_by=_actor(principal),
                 )
                 # Authorize and stage before any approval state is touched, so
@@ -235,7 +269,7 @@ class ToolAuthorizationGrantServer:
                     status_code=409,
                     detail=f"The grant for this approval is {prepared.grant.status.value}.",
                 )
-            return await _accepted_event_stream_response(
+            response = await _accepted_event_stream_response(
                 service.approve_and_grant(approval, body.grant),
                 cayu_app=service.app,
                 session_id=prepared.approval_request.session_id,
@@ -246,6 +280,9 @@ class ToolAuthorizationGrantServer:
                     ToolAuthorizationGrantError,
                 ),
             )
+            # The events needn't name the grant, so the answer does.
+            response.headers[GRANT_ID_HEADER] = prepared.grant.grant_id
+            return response
 
         @router.get("", response_model=ToolAuthorizationGrantListResponse)
         async def list_grants(
@@ -348,6 +385,7 @@ class ToolAuthorizationGrantServer:
 
 
 __all__ = [
+    "GRANT_ID_HEADER",
     "GrantReadAccess",
     "ToolAuthorizationGrantApproveBody",
     "ToolAuthorizationGrantListResponse",

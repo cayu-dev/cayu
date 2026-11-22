@@ -43,6 +43,7 @@ const SURFACE: Partial<Record<keyof ControlPlaneSurfaceCapabilities, string>> = 
   task_index: "Task filters and counts",
   task_value_filters: "Task input and metadata filters",
   tasks: "Tasks",
+  tool_authorization_grants: "Remembered approvals",
   tool_display: "Tool display names",
   tool_inventory: "Tool list",
   tool_usage: "Tool usage",
@@ -73,6 +74,7 @@ const NOT_SET_UP: Partial<Record<keyof ControlPlaneSurfaceCapabilities, string>>
   artifacts: "No artifact store is set up.",
   tasks: "No task store is set up.",
   inbox: "No inbox is set up.",
+  tool_authorization_grants: "The application hosts no grant service.",
 }
 
 const MUTATION: Record<keyof ControlPlaneMutationCapabilities, string> = {

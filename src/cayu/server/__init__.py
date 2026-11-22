@@ -427,6 +427,7 @@ def create_server(
         event_watcher_task: asyncio.Task[None] | None = None
         storage_growth_task: asyncio.Task[None] | None = None
         orphan_reconciliation_task: asyncio.Task[None] | None = None
+        grant_reconciliation_task: asyncio.Task[Any] | None = None
         try:
             # aclose() owns stopping them, within the shutdown deadline.
             await app.start_model_policy()
@@ -446,6 +447,7 @@ def create_server(
             event_watcher_task = _start_registered_event_watchers(app)
             storage_growth_task = _start_storage_growth_report(app)
             orphan_reconciliation_task = _start_orphaned_session_reconciliation(app, lifecycle)
+            grant_reconciliation_task = _start_staged_grant_reconciliation(app)
             yield
         finally:
             try:
@@ -453,6 +455,7 @@ def create_server(
                     # Stop the server's own loops before the app seals, so
                     # neither starts new work against a closing application.
                     await _cancel_background_task(orphan_reconciliation_task)
+                    await _cancel_background_task(grant_reconciliation_task)
                     await _cancel_background_task(event_watcher_task)
                     await _cancel_background_task(storage_growth_task)
                     await _cancel_background_task(incomplete_session_recovery_task)
@@ -561,6 +564,7 @@ def create_server(
             session_follow_max_streams_per_session=lifecycle.session_follow_max_streams_per_session,
             dashboard_configured=resolved_config.dashboard.enabled,
             browser_recordings_configured=browser_recordings is not None,
+            tool_authorization_grants_configured=tool_authorization_grants is not None,
             dashboard_pricing_configured=pricing_metadata is not None,
             deployment_name=resolved_config.deployment_name,
             deployment_kind=resolved_deployment_kind,
@@ -1479,7 +1483,7 @@ def _start_incomplete_session_startup_recovery(
 
 
 async def _cancel_background_task(
-    task: asyncio.Task[None] | None,
+    task: asyncio.Task[Any] | None,
 ) -> None:
     if task is None:
         return
@@ -1547,6 +1551,21 @@ def _start_human_attention_repair(app: CayuApp) -> asyncio.Task[None] | None:
     if handoff is None:
         return None
     return asyncio.create_task(handoff.run(), name="cayu-human-attention-repair")
+
+
+def _start_staged_grant_reconciliation(app: CayuApp) -> asyncio.Task[Any] | None:
+    """Settle the staged grants a stopped process left, when the application hosts grants."""
+
+    if app._tool_authorization_grant_hosting is None:
+        return None
+    from cayu.approvals.authorization_grant_hosting import (
+        reconcile_hosted_tool_authorization_grants,
+    )
+
+    return asyncio.create_task(
+        reconcile_hosted_tool_authorization_grants(app),
+        name="cayu-staged-grant-reconciliation",
+    )
 
 
 def _start_registered_event_watchers(app: CayuApp) -> asyncio.Task[None] | None:

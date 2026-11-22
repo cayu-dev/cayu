@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from tests.runtime.authorization_grant_support import Harness, _command_turn
+from tests.runtime.authorization_grant_support import GatedPolicy, Harness, _command_turn
 from tests.runtime.runtime_provider_support import FakeProvider
 
 from cayu.agents import AgentSpec
@@ -426,3 +426,31 @@ def test_reconcile_uses_the_current_request_digests(tmp_path, backend) -> None:
         assert len(harness.tool.calls) == 1
 
     asyncio.run(scenario())
+
+
+def test_turning_grants_on_or_off_changes_the_execution_profile() -> None:
+    """The grant policy is part of the profile; the grants it reads are data."""
+
+    from cayu.runtime._execution_profile_admission import _policy_component
+
+    gated = GatedPolicy()
+    store = InMemoryToolAuthorizationGrantStore()
+
+    def wrapped(**changes) -> ToolAuthorizationGrantPolicy:
+        options = {
+            "policy_id": "commands",
+            "store": store,
+            "grantable": {"exec_command": "process_command"},
+            "then": gated,
+            **changes,
+        }
+        return ToolAuthorizationGrantPolicy(**options)
+
+    on = _policy_component(wrapped())
+    assert on is not None and on != _policy_component(gated)
+    # Another store holding other grants is the same policy.
+    assert on == _policy_component(wrapped(store=InMemoryToolAuthorizationGrantStore()))
+    assert on != _policy_component(wrapped(grantable={"exec_command": "tool_call"}))
+    assert on != _policy_component(
+        wrapped(mandatory_controls=(ToolAuthorizationGrantControl(tool_name="exec_command"),))
+    )

@@ -407,6 +407,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": True, "unavailable_reason": None},
             "mutate": {"enabled": True, "unavailable_reason": None},
         },
+        "tool_authorization_grants": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
         "tasks": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -558,7 +563,7 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
                 "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
             }
             continue
-        if name in {"evaluation_promotion", "evals"}:
+        if name in {"evaluation_promotion", "evals", "tool_authorization_grants"}:
             assert surface == {
                 "configured": False,
                 "read": {"enabled": False, "unavailable_reason": "not_configured"},

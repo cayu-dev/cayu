@@ -240,10 +240,21 @@ startup if its application hosts grants, because a maintained public service
 does not serve these routes. `app.tool_authorization_grant_hosting` reads what
 was set up, or `None`.
 
-Hosting only exposes the service. The application still wraps its agents' tool
-policy in `ToolAuthorizationGrantPolicy`, and still calls
-`service.reconcile_staged()` where it wants a staged grant settled after a
-crash; a staged grant authorizes nothing until then.
+`GET /api/contract` says whether the routes are served:
+`capabilities.surfaces.tool_authorization_grants.configured` is true only on a
+server that mounts them.
+
+Hosting exposes the service and settles what a crash left: `cayu serve` and
+`cayu worker` call `service.reconcile_staged()` when they start, so a grant
+whose call was approved by a process that stopped before activating it becomes
+`active`, and one whose approval ended another way becomes `abandoned`. A pass
+that fails is logged and left to the next start; a staged grant authorizes
+nothing meanwhile. The application still wraps its agents' tool policy in
+`ToolAuthorizationGrantPolicy`. That wrapper is part of each agent's execution
+profile, with its policy id, grantable tools, mandatory controls and boundary
+labels, so adding it, removing it or changing those is a profile change that a
+waiting session meets like any other change to its tool policy. The grants
+themselves are data and change no profile.
 
 An application that builds its own server passes one to
 `create_server(app, config=ServerConfig.protected(auth),
@@ -253,7 +264,7 @@ access:
 
 | Route | Purpose |
 | --- | --- |
-| `POST /api/tool-authorization-grants/approve` | Remember and approve; streams the resolution like `/api/tool-approvals/resolve` |
+| `POST /api/tool-authorization-grants/approve` | Remember and approve; streams the resolution like `/api/tool-approvals/resolve`, and names the grant in the `X-Cayu-Tool-Authorization-Grant-Id` response header |
 | `GET /api/tool-authorization-grants` | List grants the caller may read |
 | `GET /api/tool-authorization-grants/{grant_id}` | One grant with its expiry-aware status |
 | `GET /api/tool-authorization-grants/{grant_id}/uses` | Use evidence |
@@ -262,7 +273,10 @@ access:
 
 The approve body has no `resolved_by`, tool, argument, or decision field. The
 actor is always the authenticated caller, and the call is always the pending
-snapshot. The router can also be mounted in your own FastAPI application with
+snapshot. In an application with a [human-review policy](human-review.md) the
+body carries `review_reference`, the reference of the protected review the
+caller was shown, as every approval there does: without it, or with another
+caller's, the route answers 403 and stages nothing. The router can also be mounted in your own FastAPI application with
 `server.router(auth=...)`.
 
 ## Minimal consumer example

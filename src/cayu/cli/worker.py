@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from cayu.applications import CayuApp
+from cayu.approvals.authorization_grant_hosting import (
+    STARTUP_RECONCILIATION_SECONDS,
+    reconcile_hosted_tool_authorization_grants,
+)
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli._worker_drain import DrainRequest, drain_notice, watch_cloud_drain
 from cayu.cli.project import (
@@ -594,6 +598,10 @@ async def _invoke_worker(
         # No-ops outside Cayu Cloud; close_project_app stops them.
         await app.start_managed_settings(role="worker")
         await app.start_model_slots()
+        # A grant a stopped process left staged authorizes nothing until it is settled.
+        await reconcile_hosted_tool_authorization_grants(
+            app, timeout_s=STARTUP_RECONCILIATION_SECONDS
+        )
         if orphaned_session_reconcile_interval_seconds is not None:
             reconciliation = asyncio.create_task(
                 run_orphaned_session_reconciliation(

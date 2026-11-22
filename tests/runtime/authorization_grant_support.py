@@ -134,12 +134,17 @@ class Harness:
         default_sampled_review_rate_bps: int = 0,
         grants: InMemoryToolAuthorizationGrantStore | None = None,
         sessions: InMemorySessionStore | None = None,
+        human_review_policy=None,
     ) -> None:
         self.clock = Clock()
         self.sessions = sessions or InMemorySessionStore()
         self.grants = grants or InMemoryToolAuthorizationGrantStore()
         self.tool = tool or CommandTool()
-        self.app = CayuApp(session_store=self.sessions, enable_logging=False)
+        self.app = CayuApp(
+            session_store=self.sessions,
+            enable_logging=False,
+            human_review_policy=human_review_policy,
+        )
         self.app.register_provider(FakeProvider(turns), default=True)
         if workspace_id is not None:
             root = tmp_path / workspace_id

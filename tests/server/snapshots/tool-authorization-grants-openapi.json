@@ -27,6 +27,70 @@
       "title": "HTTPValidationError",
       "type": "object"
     },
+    "HumanReviewContext": {
+      "additionalProperties": false,
+      "description": "Verified recipient supplied by trusted SDK code or server authentication.",
+      "properties": {
+        "purpose": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Purpose",
+          "type": "string"
+        },
+        "recipient": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Recipient",
+          "type": "string"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        }
+      },
+      "required": [
+        "recipient",
+        "purpose"
+      ],
+      "title": "HumanReviewContext",
+      "type": "object"
+    },
+    "HumanReviewReference": {
+      "additionalProperties": false,
+      "description": "Opaque content binding; conveys no authority to execute or resolve.",
+      "properties": {
+        "content_tag": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Tag",
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/components/schemas/HumanReviewContext"
+        },
+        "policy_version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Policy Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "policy_version",
+        "content_tag"
+      ],
+      "title": "HumanReviewReference",
+      "type": "object"
+    },
     "ProcessCommandGrantMatcher": {
       "additionalProperties": false,
       "description": "Authorize one exact process command: argv, cwd, env, and stdin.\n\nThere are no prefixes, globs, substrings, or shell parsing. A request that\nis not an explicit process command never matches. Environment and stdin\noften carry credentials, so the grant keeps only their digest.",
@@ -389,7 +453,7 @@
     },
     "ToolAuthorizationGrantApproveBody": {
       "additionalProperties": false,
-      "description": "Approve one pending tool call and remember it as a grant.\n\nThere is no ``resolved_by`` and no tool, argument, or decision field: the\nactor is the authenticated caller and the call is the pending snapshot.",
+      "description": "Approve one pending tool call and remember it as a grant.\n\nThere is no ``resolved_by`` and no tool, argument, or decision field: the\nactor is the authenticated caller and the call is the pending snapshot.\n``review_reference`` is the reference of the protected review the caller was\nshown, which an application with a human-review policy requires of every\napproval; it is checked as ``/tool-approvals/resolve`` checks it.",
       "properties": {
         "approval_id": {
           "minLength": 1,
@@ -415,6 +479,16 @@
             }
           ],
           "title": "Reason"
+        },
+        "review_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/HumanReviewReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "session_id": {
           "minLength": 1,

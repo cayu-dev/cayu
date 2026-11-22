@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from tests.runtime.authorization_grant_support import Harness, _command_turn
 from tests.server.server_test_support import _sse_frames
 
-from cayu.approvals import ProcessCommandGrantMatcher
+from cayu.approvals import ProcessCommandGrantMatcher, ToolArgumentReview
 from cayu.server import AuthContext, ServerConfig, create_server
 from cayu.server.authorization_grants import ToolAuthorizationGrantServer
 
@@ -132,6 +132,7 @@ def test_grant_lifecycle_over_http(tmp_path) -> None:
         headers=owner,
     ) as response:
         assert response.status_code == 200
+        named = response.headers["x-cayu-tool-authorization-grant-id"]
         types = [frame["data"]["type"] for frame in _sse_frames(response) if "data" in frame]
     assert "tool.call.approved" in types
     assert harness.tool.calls == [{"argv": ["ls"]}]
@@ -142,6 +143,8 @@ def test_grant_lifecycle_over_http(tmp_path) -> None:
     assert listed.status_code == 200
     (view,) = listed.json()["grants"]
     grant_id = view["grant"]["grant_id"]
+    # The accepted approval names the grant it made.
+    assert named == grant_id
     assert view["effective_status"] == "active"
     assert view["grant"]["created_by"] == {
         "subject": "owner",
@@ -327,3 +330,92 @@ def test_grant_uses_page_over_http_by_cursor(tmp_path) -> None:
 
     assert sorted(seen) == [f"round-{index}" for index in range(5)]
     assert len(seen) == len(set(seen))
+
+
+def test_the_contract_says_whether_grants_are_served(tmp_path) -> None:
+    harness = Harness(tmp_path, turns=_command_turn("call_1", ["ls"]))
+    owner = {"x-test-subject": "owner"}
+
+    served = _client(harness).get("/api/contract", headers=owner)
+    assert served.status_code == 200, served.text
+    assert served.json()["capabilities"]["surfaces"]["tool_authorization_grants"] == {
+        "configured": True,
+        "read": {"enabled": True, "unavailable_reason": None},
+        "mutate": {"enabled": True, "unavailable_reason": None},
+    }
+
+    plain = TestClient(create_server(harness.app, config=ServerConfig.protected(_auth)))
+    assert plain.get("/api/contract", headers=owner).json()["capabilities"]["surfaces"][
+        "tool_authorization_grants"
+    ] == {
+        "configured": False,
+        "read": {"enabled": False, "unavailable_reason": "not_configured"},
+        "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+    }
+
+
+def test_a_grant_approval_needs_the_callers_own_protected_review(tmp_path) -> None:
+    harness = Harness(
+        tmp_path,
+        turns=_command_turn("call_1", ["ls"]) + _command_turn("call_2", ["ls"]),
+        human_review_policy=ToolArgumentReview({"exec_command": ("argv",)}, binding_key=b"k" * 32),
+    )
+    asyncio.run(harness.run("s1"))
+    pending = asyncio.run(harness.pending("s1"))
+    owner = {"x-test-subject": "owner"}
+    with _client(harness) as client:
+        purpose = client.get("/api/app", headers=owner).json()["human_review_purpose"]
+
+        def reference(headers: dict) -> dict:
+            review = client.get(
+                "/api/sessions/s1/human-review", params={"purpose": purpose}, headers=headers
+            )
+            assert review.status_code == 200, review.text
+            return review.json()["reference"]
+
+        # Without a review the policy lets nobody decide, and nothing is staged.
+        unreviewed = client.post(
+            "/api/tool-authorization-grants/approve", json=_approve_body(pending), headers=owner
+        )
+        assert unreviewed.status_code == 403, unreviewed.text
+        # Someone else's review is refused for this caller.
+        stolen = client.post(
+            "/api/tool-authorization-grants/approve",
+            json={
+                **_approve_body(pending),
+                "review_reference": reference({"x-test-subject": "intruder"}),
+            },
+            headers=owner,
+        )
+        assert stolen.status_code == 403, stolen.text
+        assert asyncio.run(harness.service.list_grants()) == ()
+        assert harness.tool.calls == []
+
+        with client.stream(
+            "POST",
+            "/api/tool-authorization-grants/approve",
+            json={**_approve_body(pending), "review_reference": reference(owner)},
+            headers=owner,
+        ) as approved:
+            assert approved.status_code == 200
+            types = [frame["data"]["type"] for frame in _sse_frames(approved) if "data" in frame]
+        assert "tool.call.approved" in types
+
+    (grant,) = asyncio.run(harness.service.list_grants())
+    assert grant.status.value == "active"
+    assert harness.tool.calls == [{"argv": ["ls"]}]
+
+
+def test_a_session_alias_that_names_nothing_is_a_client_error(tmp_path) -> None:
+    harness = Harness(tmp_path, turns=_command_turn("call_1", ["ls"]))
+    asyncio.run(harness.run("s1"))
+    pending = asyncio.run(harness.pending("s1"))
+
+    refused = _client(harness).post(
+        "/api/tool-authorization-grants/approve",
+        json={**_approve_body(pending), "session_id": "cayu_authority_nope"},
+        headers={"x-test-subject": "owner"},
+    )
+
+    assert refused.status_code == 422, refused.text
+    assert asyncio.run(harness.service.list_grants()) == ()

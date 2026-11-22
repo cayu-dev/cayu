@@ -5,7 +5,9 @@ application's :class:`~cayu.approvals.ToolAuthorizationGrantService` in its
 factory. ``cayu serve`` then mounts the grant routes at
 ``{api}/tool-authorization-grants``, behind the same authentication and inbox
 access rule as its other approval routes, so a person can approve a pending
-call and have it remembered, and list, inspect and revoke grants.
+call and have it remembered, and list, inspect and revoke grants. ``cayu serve``
+and ``cayu worker`` also settle the staged grants a stopped process left behind
+when they start.
 
 The application still assembles the parts itself: the grant store, the
 :class:`~cayu.approvals.ToolAuthorizationGrantPolicy` around its agents' tool
@@ -17,6 +19,8 @@ its own. An application that builds its own server passes a
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -25,6 +29,11 @@ if TYPE_CHECKING:
     from cayu.applications import CayuApp
     from cayu.approvals.authorization_grant_service import ToolAuthorizationGrantService
     from cayu.approvals.authorization_grants import ToolAuthorizationGrant
+
+logger = logging.getLogger(__name__)
+
+#: How long ``cayu worker`` waits for staged grants to settle before it starts claiming.
+STARTUP_RECONCILIATION_SECONDS = 30.0
 
 #: Decides whether one authenticated caller (an ``AuthContext``) may see one grant.
 ToolAuthorizationGrantReadAccess = Callable[[Any, "ToolAuthorizationGrant"], Awaitable[bool]]
@@ -87,8 +96,40 @@ def host_tool_authorization_grants(
     return app._tool_authorization_grant_hosting
 
 
+async def reconcile_hosted_tool_authorization_grants(
+    app: CayuApp, *, timeout_s: float | None = None
+) -> int | None:
+    """Settle the staged grants of the application's hosted service, once.
+
+    A process that stopped between approving a call and activating its grant
+    leaves the grant ``staged``, where it authorizes nothing. ``cayu serve`` and
+    ``cayu worker`` call this when they start, so the grant becomes ``active``
+    or ``abandoned`` by what the approval recorded. Returns how many grants were
+    looked at, or ``None`` when the application hosts none or the pass did not
+    finish: a failure or a timeout is logged and left to the next start, never
+    raised, because a staged grant only means people are asked again.
+    """
+
+    hosting = app._tool_authorization_grant_hosting
+    if hosting is None:
+        return None
+    try:
+        settled = await asyncio.wait_for(hosting.service.reconcile_staged(), timeout=timeout_s)
+    except Exception as exc:
+        # A timeout is this pass's own bound or a store's; either way the rest waits.
+        logger.warning(
+            "Staged tool authorization grants were not all settled (%s); the next start "
+            "settles the rest.",
+            type(exc).__name__,
+        )
+        return None
+    return len(settled)
+
+
 __all__ = [
+    "STARTUP_RECONCILIATION_SECONDS",
     "ToolAuthorizationGrantHosting",
     "host_tool_authorization_grants",
+    "reconcile_hosted_tool_authorization_grants",
     "tool_authorization_grant_hosting",
 ]

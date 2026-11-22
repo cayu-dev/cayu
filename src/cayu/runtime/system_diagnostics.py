@@ -272,6 +272,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     supervision: OptionalSurfaceCapability | None = None
     inbox: OptionalSurfaceCapability | None = None
     inbox_queries: OptionalSurfaceCapability | None = None
+    tool_authorization_grants: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability
     kept_knowledge: OptionalSurfaceCapability | None = None

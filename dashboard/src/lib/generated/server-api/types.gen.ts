@@ -5968,6 +5968,7 @@ export type ControlPlaneSurfaceCapabilities = {
     task_index?: OptionalSurfaceCapability | null;
     task_value_filters?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
+    tool_authorization_grants?: OptionalSurfaceCapability | null;
     tool_display?: OptionalSurfaceCapability | null;
     tool_inventory?: OptionalSurfaceCapability | null;
     tool_usage?: OptionalSurfaceCapability | null;

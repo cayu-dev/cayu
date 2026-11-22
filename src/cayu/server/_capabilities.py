@@ -41,6 +41,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_project_identity_configured: bool
     eval_captured_results_supported: bool
     browser_recordings_configured: bool = False
+    tool_authorization_grants_configured: bool = False
     task_index_supported: bool = False
     task_graph_creation_supported: bool = False
     task_creation_supported: bool = False
@@ -187,6 +188,11 @@ class ControlPlaneCapabilitySnapshot:
                     True,
                     mutation_supported=True,
                 ),
+                # Approving a pending call with a grant, and listing and revoking grants.
+                tool_authorization_grants=_optional_surface(
+                    self.tool_authorization_grants_configured,
+                    mutation_supported=True,
+                ),
                 tasks=_optional_surface(
                     self.tasks_configured,
                     mutation_supported=True,
@@ -268,6 +274,7 @@ def inspect_control_plane_capabilities(
     eval_project_identity_configured: bool | None = None,
     eval_captured_results_supported: bool = False,
     browser_recordings_configured: bool = False,
+    tool_authorization_grants_configured: bool = False,
     task_index_supported: bool = False,
     task_graph_creation_supported: bool = False,
     task_creation_supported: bool = False,
@@ -298,6 +305,7 @@ def inspect_control_plane_capabilities(
         ("eval_reports_supported", eval_reports_supported),
         ("eval_session_additions_supported", eval_session_additions_supported),
         ("browser_recordings_configured", browser_recordings_configured),
+        ("tool_authorization_grants_configured", tool_authorization_grants_configured),
         ("dashboard_configured", dashboard_configured),
         ("tasks_configured", tasks_configured),
         ("knowledge_configured", knowledge_configured),
@@ -335,6 +343,7 @@ def inspect_control_plane_capabilities(
         eval_reports_supported=eval_reports_supported,
         eval_session_additions_supported=eval_session_additions_supported,
         browser_recordings_configured=browser_recordings_configured,
+        tool_authorization_grants_configured=tool_authorization_grants_configured,
         task_index_supported=task_index_supported,
         task_creation_supported=task_creation_supported,
         task_graph_creation_supported=task_graph_creation_supported,

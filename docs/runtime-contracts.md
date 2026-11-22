@@ -11009,6 +11009,13 @@ review policy, so settling an approval or a question needs a protected review's
 null when there is no policy or it names none. client.js adds `getAppInfo`,
 `getHumanReview` and `readHumanReviewLongField` over the existing routes.
 
+Server contract version 93 adds `capabilities.surfaces.tool_authorization_grants`.
+It is `configured` when the server serves the
+[tool authorization grant routes](tool-authorization-grants.md#http), so a caller
+can tell an application that hosts no grants from one that is unreachable.
+`POST /api/tool-authorization-grants/approve` takes an optional
+`review_reference`, checked as `POST /api/tool-approvals/resolve` checks it.
+
 Server contract version 52 adds `RunRequest.title`, the optional `title` field on
 `POST /api/run`, and `capabilities.surfaces.session_display_metadata`. The
 `app.run(request)` signature is unchanged. Session titles, summaries and explicit

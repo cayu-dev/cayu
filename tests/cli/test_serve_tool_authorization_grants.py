@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -214,3 +215,116 @@ def test_a_maintained_service_that_would_not_serve_hosted_grants_is_refused(
     assert main(["serve", "--dev"]) == 1
 
     assert "hosts tool authorization grants" in capsys.readouterr().err
+
+
+def _staged_after_an_approval(tmp_path: Path):
+    """A grant whose call was approved by a process that stopped before activating it."""
+
+    from tests.runtime.authorization_grant_support import Harness, _command_turn
+
+    from cayu.approvals import ToolAuthorizationGrantRequest, ToolAuthorizationGrantStatus
+
+    harness = Harness(tmp_path, turns=_command_turn("call_1", ["ls"]))
+
+    async def scenario() -> str:
+        await harness.run("s1")
+        prepared = await harness.service.prepare(
+            await harness.approval("s1"), ToolAuthorizationGrantRequest(scope="session")
+        )
+        _ = [e async for e in harness.app.resolve_tool_approval(prepared.approval_request)]
+        staged = await harness.service.get(prepared.grant.grant_id)
+        assert staged is not None and staged.status is ToolAuthorizationGrantStatus.STAGED
+        return prepared.grant.grant_id
+
+    return harness, asyncio.run(scenario())
+
+
+def test_a_server_settles_the_staged_grants_a_stopped_process_left(tmp_path: Path) -> None:
+    from fastapi import HTTPException, Request
+
+    from cayu.server import AuthContext, ServerConfig, create_server
+
+    harness, grant_id = _staged_after_an_approval(tmp_path)
+    harness.app.host_tool_authorization_grants(harness.service, authorize_read=_anyone_reads)
+
+    def auth(request: Request) -> AuthContext:
+        if not request.headers.get("x-test-subject"):
+            raise HTTPException(status_code=401, detail="unauthenticated")
+        return AuthContext(subject="owner", tenant="acme")
+
+    # Hosting is enough: the server need not serve the routes to settle what was left.
+    with TestClient(create_server(harness.app, config=ServerConfig.protected(auth))) as client:
+        for _ in range(200):
+            if asyncio.run(harness.service.get(grant_id)).status.value != "staged":
+                break
+            client.get("/api/contract", headers={"x-test-subject": "owner"})
+
+    assert asyncio.run(harness.service.get(grant_id)).status.value == "active"
+
+
+def test_a_worker_settles_staged_grants_before_it_claims(tmp_path: Path) -> None:
+    import cayu.cli.worker as worker_cli
+
+    harness, grant_id = _staged_after_an_approval(tmp_path)
+    harness.app.host_tool_authorization_grants(harness.service, authorize_read=_anyone_reads)
+    seen: list[str] = []
+
+    async def entrypoint(app: CayuApp, stop: Any) -> None:
+        seen.append((await harness.service.get(grant_id)).status.value)
+
+    outcome = asyncio.run(
+        worker_cli._invoke_worker(entrypoint, harness.app, name="default", shutdown_grace_seconds=5)
+    )
+
+    assert outcome == 0
+    assert seen == ["active"]
+
+
+def test_a_failed_startup_reconciliation_never_stops_the_process(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from cayu.approvals.authorization_grant_hosting import (
+        reconcile_hosted_tool_authorization_grants,
+    )
+
+    plain = CayuApp(enable_logging=False)
+    assert asyncio.run(reconcile_hosted_tool_authorization_grants(plain)) is None
+
+    class Unreachable(InMemoryToolAuthorizationGrantStore):
+        async def list(self, query: Any = None) -> Any:
+            raise ConnectionError("postgres://user:secret@db/grants is down")
+
+    app = CayuApp(enable_logging=False)
+    service = ToolAuthorizationGrantService(
+        app, store=Unreachable(), authority=AllowedActorsGrantAuthority(creators=["operator"])
+    )
+    app.host_tool_authorization_grants(service, authorize_read=_anyone_reads)
+
+    assert asyncio.run(reconcile_hosted_tool_authorization_grants(app)) is None
+    assert "ConnectionError" in caplog.text
+    # The store's own message may name its address and credentials.
+    assert "secret" not in caplog.text
+
+
+@pytest.mark.parametrize("timeout_s", [None, 30.0])
+def test_a_stores_own_timeout_is_logged_like_any_other_failure(
+    caplog: pytest.LogCaptureFixture, timeout_s: float | None
+) -> None:
+    from cayu.approvals.authorization_grant_hosting import (
+        reconcile_hosted_tool_authorization_grants,
+    )
+
+    class Slow(InMemoryToolAuthorizationGrantStore):
+        async def list(self, query: Any = None) -> Any:
+            raise TimeoutError("statement timeout")
+
+    app = CayuApp(enable_logging=False)
+    service = ToolAuthorizationGrantService(
+        app, store=Slow(), authority=AllowedActorsGrantAuthority(creators=["operator"])
+    )
+    app.host_tool_authorization_grants(service, authorize_read=_anyone_reads)
+
+    assert asyncio.run(reconcile_hosted_tool_authorization_grants(app, timeout_s=timeout_s)) is None
+    [record] = caplog.records
+    # The warning itself formats, whatever bound the pass ran under.
+    assert "TimeoutError" in record.getMessage()
