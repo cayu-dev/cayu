@@ -347,17 +347,25 @@ def test_postgres_list_queries_can_sort_on_an_index(session_store_case):
                     dialect=POSTGRES_DIALECT,
                     access_clause=overview_filter_clause(overview, postgres=True),
                 )
+                expected = (
+                    "idx_cayu_sessions_updated_id"
+                    if index == "idx_cayu_session_summaries_state"
+                    else index
+                )
+                # The table is a few rows on one page, so a filtered list costs the same on
+                # the plain updated-at index (with a filter) as on its own index, and the
+                # planner picks either. Take the plain one away, inside a savepoint, so the
+                # plan shows whether the list's own index can serve it without a sort.
+                await cur.execute("SAVEPOINT plan")
+                if expected != "idx_cayu_sessions_updated_id":
+                    await cur.execute("DROP INDEX idx_cayu_sessions_updated_id")
                 await cur.execute(
                     "EXPLAIN SELECT cayu_sessions.id FROM cayu_sessions "
                     f"{plan.page_where_sql} ORDER BY {plan.order_sql} {plan.pagination_sql}",
                     plan.page_params,
                 )
                 text = "\n".join(row[0] for row in await cur.fetchall())
-                expected = (
-                    "idx_cayu_sessions_updated_id"
-                    if index == "idx_cayu_session_summaries_state"
-                    else index
-                )
+                await cur.execute("ROLLBACK TO SAVEPOINT plan")
                 assert expected in text, (query, text)
                 assert "Sort  (" not in text and "Sort Key" not in text, (query, text)
 
