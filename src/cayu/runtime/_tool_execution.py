@@ -987,7 +987,7 @@ async def _run_tool(
             exc,
             empty_message="tool execution failed",
             nonportable_message="Tool execution failed with a non-portable diagnostic.",
-            redactor=active_redactor,
+            redactor=active_redactor.with_python_repr_forms(),
         )
         result, controls = tool_results.terminal_failure_result(
             terminal_outcome="tool_execution_error",
@@ -1142,7 +1142,7 @@ async def _run_tool(
                 exc,
                 empty_message="tool execution failed",
                 nonportable_message="Tool execution failed with a non-portable diagnostic.",
-                redactor=active_redactor,
+                redactor=active_redactor.with_python_repr_forms(),
             )
             result, controls = tool_results.terminal_failure_result(
                 terminal_outcome="tool_execution_error",
