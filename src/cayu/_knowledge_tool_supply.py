@@ -27,9 +27,15 @@ def is_knowledge_tool(tool: object) -> bool:
         RememberKnowledgeTool,
         SearchKnowledgeTool,
     )
+    from cayu.tools.knowledge_lookup import FindKnowledgeTool
 
     return isinstance(
-        tool, ListKnowledgeTool | ReadKnowledgeTool | RememberKnowledgeTool | SearchKnowledgeTool
+        tool,
+        FindKnowledgeTool
+        | ListKnowledgeTool
+        | ReadKnowledgeTool
+        | RememberKnowledgeTool
+        | SearchKnowledgeTool,
     )
 
 

@@ -338,6 +338,7 @@ from cayu.knowledge.scopes import (
     KnowledgeAccessScope,
     copy_knowledge_access_scope,
 )
+from cayu.knowledge.similarity import KnowledgeSimilarity, LexicalKnowledgeSimilarity
 from cayu.managed_settings import ManagedSetting, ManagedSettings
 from cayu.mcp.tools import (
     McpToolset,
@@ -957,6 +958,7 @@ class CayuApp(
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         knowledge_review_namespace: str | None = None,
         knowledge_review_labels: dict[str, str] | None = None,
+        knowledge_similarity: KnowledgeSimilarity | None = None,
         dispatcher: Dispatcher | None = None,
         budget_policy: BudgetPolicy | None = None,
         budget_store: BudgetStore | None = None,
@@ -1276,6 +1278,14 @@ class CayuApp(
         self.knowledge_review_labels = copy_label_map(
             knowledge_review_labels or {},
             "knowledge_review_labels",
+        )
+        if knowledge_similarity is not None and not isinstance(
+            knowledge_similarity, KnowledgeSimilarity
+        ):
+            raise TypeError("knowledge_similarity must be a KnowledgeSimilarity.")
+        #: Scores how alike knowledge entries are, for proposal lookups and review grouping.
+        self.knowledge_similarity: KnowledgeSimilarity = (
+            LexicalKnowledgeSimilarity() if knowledge_similarity is None else knowledge_similarity
         )
         self.dispatcher = dispatcher if dispatcher is not None else InlineDispatcher()
         self.budget_policy = budget_policy

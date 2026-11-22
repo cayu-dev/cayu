@@ -1430,6 +1430,53 @@ separate decision about what active memory enters model context. See the credent
 [`reviewed_knowledge_curator.py`](../examples/reviewed_knowledge_curator.py) example for a
 completed-session-to-pending-to-approved-to-later-recall path.
 
+## Knowledge similarity
+
+`cayu.knowledge.similarity` scores how alike two knowledge entries are, so that a model
+can find a fact that is already proposed or kept before it remembers it again, and so that
+review can show similar proposals together. A score only suggests and groups: nothing
+keeps, drops or merges an entry because of it.
+
+`KnowledgeSimilarity` is the part. Its `score(subject, candidates)` returns one
+`KnowledgeSimilarityScore` per candidate: a `score` from 0 to 1 for ranking, whether it
+passes the part's threshold (`similar`), and the part's own `signals`. The subject and
+candidates are `KnowledgeComparable` values (text, title, kind, namespace, visibility and
+labels), built from a stored entry with `KnowledgeComparable.from_entry` or from a draft.
+
+The default, `LexicalKnowledgeSimilarity`, makes no model calls. Its main signal is word
+overlap: the Jaccard index of the words of four or more letters in the title and text.
+Its second signal is identifier overlap: backticked names, `snake_case`, `CamelCase` and
+dotted names. Two entries are similar when word overlap reaches `word_threshold` (0.2),
+or when they share at least `min_shared_identifiers` (2) identifiers and identifier
+overlap reaches `identifier_threshold` (0.5). The thresholds were set on pairs of notes
+that reviewers labelled as duplicates or not, kept as a regression fixture in
+`tests/fixtures/knowledge_duplicate_pairs.json`. That's precise enough to suggest
+candidates and group a review queue, not to reject proposals automatically.
+
+`matches(subject, candidates)` applies the scope rule every part shares before it scores:
+only candidates in the subject's namespace and visibility, with the same value (or the
+same absence) for each of the part's `scope_labels`, are compared. Set `scope_labels` to
+the labels `remember_knowledge` copies from the session, such as `("module",
+"repository")`, or to `("repository",)` when notes sometimes carry the wrong module.
+Callers read candidates through their own knowledge access scope, so a comparison never
+crosses tenants either.
+
+An application picks its part with `CayuApp(knowledge_similarity=...)`; the default is
+`LexicalKnowledgeSimilarity()`. An embedding-based part subclasses `KnowledgeSimilarity`
+and implements `score`; the lexical default doesn't need an embedding model.
+
+`FindKnowledgeTool` (`find_knowledge`) is the read-only lookup a model calls before
+`remember_knowledge`. Give it the same `RememberKnowledgePolicy`: it lists kept and
+pending entries in the namespace, visibility and labels that policy would write a note
+with (labels copied from the calling session included), through the tool context's
+knowledge access scope, and ranks them with its `similarity` part, by default
+`LexicalKnowledgeSimilarity` scoped on the policy's copied and required labels. Each match
+has its id, title, status (`kept` or `unreviewed proposal`), kind and number of sources.
+An unreviewed proposal's body is never returned; a kept entry's is a `read_knowledge` call
+away. It sees proposals only when that access scope lets it read pending entries
+(`allowed_statuses`). Its effect is `NONE`, so tool policies, approvals and budgets can allow it on its
+own without allowing the write.
+
 ## Durable opt-in knowledge enrichment
 
 `KnowledgeEnrichmentQueue` is the explicit durable boundary around that same curator. It is

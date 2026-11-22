@@ -1,0 +1,2109 @@
+{
+ "about": "Pairs of knowledge notes about this repository's own code, labelled by reviewers: `duplicates` say the same thing, `distinct` are other pairs of notes about the same module. Kept notes carry the start of their text only. The default similarity thresholds are checked against them.",
+ "entries": [
+  {
+   "id": "n01",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Allocation replacement requires positive disposal and a durable workspace checkpoint",
+   "text": "EnvironmentLifecycle._retire_terminal_allocation(reason='replacement') leaves reconnect authority intact unless the workspace-checkpoint record is phase='durable' and the factory's is_allocation_disposed returns the exact bool True. Before retiring, its checkpoint transform rechecks the same reconnect owner and receipt and refuses pending allocation, disposal, or completion-finalization authority; a reconnect exception alone never authorizes replacement."
+  },
+  {
+   "id": "n02",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Dynamic-secret terminal workspace deltas are intentionally quarantined",
+   "text": "Final workspace evidence for dynamic-secret environments is intentionally content-free: _final_workspace_revision_payload replaces arbitrary revision/branch values and finalization deltas with fixed truncated projections, and _final_workspace_snapshot_payload suppresses snapshots. A raw-versus-aliased identity mismatch in _final_workspace_delta_payload therefore does not change the published dynamic-scope delta; detailed delta comparisons apply to static-secret environments."
+  },
+  {
+   "id": "n03",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Allocation ownership_epoch is not the session run epoch",
+   "text": "EnvironmentFactoryRequest.ownership_epoch is intentionally None for ordinary per-session requests (documented in environments/factory.py). It represents a durable allocation claim generation, not Session.run_epoch; shared-allocation request builders populate it from their record's claim_generation. Do not treat its omission from EnvironmentLifecycle.resolve_factory's per-session request as an unimplemented session-epoch forwarding bug."
+  },
+  {
+   "id": "n04",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Dynamic final workspace evidence is deliberately quarantined",
+   "text": "EnvironmentLifecycle builds final workspace payloads through runtime/_final_workspace_payloads.py. For a non-static secret-resolution scope, final revisions and deltas are intentionally content-free/truncated, snapshots and final Git receipts are omitted, and workspace/extension-observer identities are aliased. An inability to match raw final observation identities to aliased tool-window baselines does not by itself lose an intended dynamic finalization delta."
+  },
+  {
+   "id": "n05",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Terminal workspace evidence intentionally quarantines dynamic secret scopes",
+   "text": "EnvironmentLifecycle's terminal workspace evidence uses src/cayu/runtime/_final_workspace_payloads.py: when registered_environment_secret_resolution_scope is not static, final revision/delta data is deliberately content-free and truncated, final snapshots are omitted, and final Git receipts are omitted. This remains intentional even when an individual factory result exposes no vault, because the registered factory secret-scope declaration controls the boundary."
+  },
+  {
+   "id": "n06",
+   "status": "kept",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Admission collector failures preserve probe settlement authority",
+   "text": "Runner.collect_execution_admission_candidate_for may raise with authenticated probe-settlement tasks. EnvironmentLifecycle._collect_final_admission_decision converts ordinary collection failures into"
+  },
+  {
+   "id": "n07",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Progress reporter reserves the orphan-reconciliation terminal slot",
+   "text": "RuntimeEnvironmentLifecycleProgressReporter.report reserves the last configured progress-event slot for a terminal event (nonterminal emissions stop at max_progress_events - 1). EnvironmentLifecycle.reconcile_orphaned_progress increments the last nonterminal event_index by one, so normal reporter output cannot overflow EnvironmentLifecycleProgress.event_index's MAX_ENVIRONMENT_PROGRESS_EVENTS bound during orphan reconciliation."
+  },
+  {
+   "id": "n08",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Command binding recovery authenticates a strictly older saved binding",
+   "text": "EnvironmentLifecycle._validate_command_binding_recovery requires the saved command-binding source_run_epoch to be strictly less than the current session.run_epoch, verifies the exact durable allocation/profile/binding record, and checks the live incomplete-recovery claim against the store's clock in transform_checkpoint_with_store_time. This entrance reconstructs a recorded binding through _recover_completion_finalization instead of repeating initial bind/copy-in."
+  },
+  {
+   "id": "n09",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Progress reporter reserves its terminal event slot",
+   "text": "RuntimeEnvironmentLifecycleProgressReporter.report coalesces nonterminal observations once event_count reaches policy.max_progress_events - 1, reserving one slot for finish/deadline terminal evidence. Consequently the lifecycle's orphan-progress reconciliation can increment a reporter-produced nonterminal event_index without exceeding MAX_ENVIRONMENT_PROGRESS_EVENTS."
+  },
+  {
+   "id": "n10",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Cancelled completion copy-back is retargeted to interruption",
+   "text": "Completion-critical finalization cancelled while waiting for SyncBinding staging capacity keeps its exact setup owner and pending_completion_finalization marker. A subsequent interruption terminalization goes through _retarget_retained_completion_finalization, rewriting that marker's outcome from completed to interrupted and changing the owner's retry outcome; tests/core/test_completion_copyback_cancellation.py exercises this transition and restart recovery."
+  },
+  {
+   "id": "n11",
+   "status": "kept",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Resume replacement requires positive provider disposal proof",
+   "text": "EnvironmentFactory.is_allocation_disposed defaults to False. EnvironmentLifecycle._retire_terminal_allocation retires reconnect authority for a later invocation only after this hook returns an actual"
+  },
+  {
+   "id": "n12",
+   "status": "kept",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Inject lifecycle cancellation through real event sink delivery",
+   "text": "Lifecycle publication fault tests must distinguish sink delivery from persistence: RuntimeEventWriter._emit_to_sinks catches ordinary Exception from EventSink.emit and records runtime.sink.failed,"
+  },
+  {
+   "id": "n13",
+   "status": "kept",
+   "module": "src/cayu/runtime/_environment_lifecycle.py",
+   "title": "Ordinary factory requests intentionally omit ownership epochs",
+   "text": "EnvironmentFactoryRequest.ownership_epoch is documented as None for ordinary per-session lifecycle requests. Shared allocation requests instead carry their durable record's claim generation;"
+  },
+  {
+   "id": "n14",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Private argument continuity is materialized after both context-build paths",
+   "text": "ModelStepRun applies runtime._argument_continuity.materialize to both the initial context messages and the context-overflow recovery messages after _build_context completes, before build_request. Consequently context policies and compactors see only public arguments, and only exact calls retained by context selection regain eligible private arguments for the final model request; docs/private-argument-continuity.md documents this audience boundary."
+  },
+  {
+   "id": "n15",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Private argument continuity is materialized only after context selection",
+   "text": "In src/cayu/runtime/_model_step_executor.py, both _execute_candidate and context-overflow recovery call _argument_continuity.materialize after context-policy selection and before build_request."
+  },
+  {
+   "id": "n16",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Initial budget renewal errors are normalized before cleanup",
+   "text": "In ModelStepRun._execute_request, the initial reservation renewal handles asyncio.CancelledError and BudgetReservationLeaseLost only, but ordinary ledger heartbeat failures do not bypass it:"
+  },
+  {
+   "id": "n17",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Budget renewal backend errors follow the lease-loss cleanup path",
+   "text": "In RunLimitController.renew_reservations (src/cayu/runtime/_run_limits.py), every ordinary Exception from BudgetLedger.heartbeat is wrapped as BudgetReservationLeaseLost, and a false heartbeat result raises the same type. Therefore ModelStepRun._execute_request's initial renewal handlers for BudgetReservationLeaseLost and asyncio.CancelledError cover ordinary backend renewal failures; a missing catch-all there is not a separate storage-error cleanup gap."
+  },
+  {
+   "id": "n18",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Observe counting reuses the staged model dispatch and defers notification consumption",
+   "text": "In _model_step_executor.run_with_retries, observe-mode counting prepares a durable dispatch first when recalled-memory evidence, child-session notifications, or ModelExecutionSelection is present."
+  },
+  {
+   "id": "n19",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Observe-mode counting fences disclosure without consuming child notifications",
+   "text": "For observe-mode token counting with recalled memory, child notifications, or model failover, ModelStepExecutor.run_with_retries prepares the durable model dispatch before counting but passes consume_child_session_notifications=False. LiveModelAttempt reuses that exact dispatch and consumes the notifications at model-provider entry. A counter-only exposure therefore does not consume fresh child results; tests/core/test_child_session_context.py::test_provider_count_exposure_does_not_consume_terminal_child_notification covers closing after counting and resuming."
+  },
+  {
+   "id": "n20",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Hosted discovery replay integration fixture",
+   "text": "tests/core/test_tool_discovery.py::_HostedReplayDiscoveryProvider emits a canonical OpenAI server tool_search_call/tool_search_output pair plus matching ToolDiscoveryProjectionResult on its first"
+  },
+  {
+   "id": "n21",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Native targeted-tool snapshots survive grant expiration",
+   "text": "ModelStepRun._targeted_tool_projections intentionally retains native OpenAI targeted-tool definitions even after their grants expire, are revoked, or are consumed. openai_targeted_tool_projection"
+  },
+  {
+   "id": "n22",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Model-request attachment fitting preserves the newest result",
+   "text": "build_request applies _fit_tool_result_attachments before resolving attachment bytes. When a request exceeds byte/count limits it removes older tool-result attachment sets using"
+  },
+  {
+   "id": "n23",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Non-routed targeted-grant footprint retains admission baseline",
+   "text": "In ModelStepRun._targeted_tool_projections, execution without ModelExecutionSelection uses the invocation's admitted TargetedToolGrantFootprint rather than recomputing usage counters from the current"
+  },
+  {
+   "id": "n24",
+   "status": "kept",
+   "module": "src/cayu/runtime/_model_step_executor.py",
+   "title": "Model-slot request metadata is attribution only",
+   "text": "ModelRequest.model_slot is an attribution field, not model-selection or admission authority. GatewayProvider._gateway_request forwards it as cayu.model_slot; the other adapters ignore it (see"
+  },
+  {
+   "id": "n25",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Provider resolution replay distinguishes active fallback from failure settlement",
+   "text": "RecoveryCoordinator.resolve_provider_operation treats an exact fallback replay as receipt-only once _provider_operation_disposition_execution_started proves the session is RUNNING with the resolution's interaction, current epoch and execution-profile fingerprint. It deliberately does not take over that running fallback; recover_incomplete_session handles abandoned pre-dispatch work. FAIL dispositions still enter finish_pending_provider_operation_disposition after matching durable failure progress so outstanding terminal publication and hook settlement can finish. tests/core/test_provider_operation_offline_recovery.py covers concurrent exact fallback replay and pre-dispatch cancellation/recovery."
+  },
+  {
+   "id": "n26",
+   "status": "kept",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Interaction terminalization releases retained foreground policies",
+   "text": "RecoveryCoordinator's successful human-gate continuations release their per-action ForegroundGatePolicyOwner entry, but that is not the only cleanup path: SessionFinalization's interaction-transition"
+  },
+  {
+   "id": "n27",
+   "status": "kept",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Receipt validation telemetry follows atomic terminal selection",
+   "text": "In RecoveryCoordinator._settle_tool_effect_reconciliation, a receipt-backed tool terminal and its TOOL_EFFECT_RECEIPT_VALIDATED event are committed together by ToolEffectStateOwner.transition before"
+  },
+  {
+   "id": "n28",
+   "status": "kept",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Pre-dispatch provider fallback remains disposition-owned",
+   "text": "Provider fallback resolution deliberately considers a RUNNING session with its exact active interaction/profile as execution already started, even before replacement provider dispatch."
+  },
+  {
+   "id": "n29",
+   "status": "kept",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Human-gate continuation race barrier",
+   "text": "The public resolve_user_input and resolve_tool_approval streams emit INTERACTION_RESUMED after the durable RUNNING/epoch rebind but before continue_user_input_resolution or"
+  },
+  {
+   "id": "n30",
+   "status": "kept",
+   "module": "src/cayu/runtime/_recovery_coordinator.py",
+   "title": "Human-gate continuations rebuild the admitted failover plan in the engine",
+   "text": "RecoveryCoordinator._continue_closed_tool_round does not need to carry a ModelFailoverProfileResolution on RecoverySessionRunRequest. SessionEngine._run_recovered_session checks"
+  },
+  {
+   "id": "n31",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Recovery profile resolution restores recorded tool-completion policy",
+   "text": "ExecutionProfileContinuation._prepare_plan automatically loads the recorded ToolCompletionPolicy when invocation_semantics_available=True, a recorded active profile exists, and the caller supplies tool_completion=None. It authenticates the recorded finalization material through load_recorded_tool_completion_policy, so an omitted explicit tool_completion argument at a failover continuation call does not by itself drop the policy."
+  },
+  {
+   "id": "n32",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Overridden queued-delivery methods must reattest handoff support",
+   "text": "SessionEngine._deliver_queued_session_messages authenticates atomic successor support using queued_interaction_profile_handoff_version=1 on both the configured store and the class that defines"
+  },
+  {
+   "id": "n33",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Native targeted-tool recovery preserves historical projection, not new-use permission",
+   "text": "SessionEngine._reconstruct_targeted_tool_grants intentionally includes expired or revoked durable grant records when preserve_native_projection_snapshot=True, so native provider replay retains the exact historical additional_tools item. This snapshot is not new-use authority: expiry and revocation are enforced separately by the store's atomic use-binding path."
+  },
+  {
+   "id": "n34",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Queued-delivery overrides must reattest atomic profile handoff",
+   "text": "SessionEngine._deliver_queued_session_messages refuses successor handoff unless both the store and the class actually defining deliver_queued_session_messages explicitly declare queued_interaction_profile_handoff_version = 1. A subclass overriding that method must redeclare the capability; merely inheriting the version is intentionally insufficient. Fault-injection stores testing successor delivery need that attestation to reach the handoff path."
+  },
+  {
+   "id": "n35",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Producer completion replay does not grant fresh execution",
+   "text": "In src/cayu/runtime/_session_engine.py, producer_replay reconstructs an already-committed AssistantStepResult and runs common post-model gates without a provider request. If policies request another"
+  },
+  {
+   "id": "n36",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Recovery reconstructs omitted final-tool policy from authenticated evidence",
+   "text": "An omitted tool_completion argument during session recovery does not by itself drop final-tool semantics: ExecutionProfileContinuation._prepare_plan calls load_recorded_tool_completion_policy when"
+  },
+  {
+   "id": "n37",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Approval recovery callers retain continuation cleanup ownership",
+   "text": "Human-gated engine continuations deliberately leave fence ownership with their recovery caller: _RecoveryCoordinator._continue_closed_tool_round builds"
+  },
+  {
+   "id": "n38",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Resume's late checkpoint reload still requires exact predecessor release",
+   "text": "SessionEngine.resume reloads the checkpoint after any egress cutover and puts that snapshot into AdmitInvocationCommand.expected_checkpoint_sha256 and expected_active_profile. The runtime"
+  },
+  {
+   "id": "n39",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Queued-delivery acknowledgement-loss retry preserves delivery identity",
+   "text": "SessionEngine._deliver_queued_session_messages retries an ordinary delivery-store exception with the same delivery_id and freezes eligible_through after the first returned batch. Native delivery"
+  },
+  {
+   "id": "n40",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Failover continuation restores omitted final-tool policy",
+   "text": "SessionEngine._run_recovered_session omits tool_completion in its failover continuation resolve call, but ExecutionProfileContinuation._build_plan restores an omitted policy from exact durable model-step evidence when invocation_semantics_available=True. The resulting FINALIZATION material is checked against the active profile, so this omission alone does not lose the final-tool policy."
+  },
+  {
+   "id": "n41",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_engine.py",
+   "title": "Omitted final-tool policy is authenticated during continuation reconstruction",
+   "text": "For session-engine continuation paths, an omitted tool_completion argument does not necessarily disable the admitted policy. ExecutionProfileContinuation._prepare_plan calls load_recorded_tool_completion_policy when invocation semantics are available; that helper reuses the durable policy only after matching the active interaction/profile and the complete FINALIZATION component (max_steps, limits, retry policy, and tool-completion policy)."
+  },
+  {
+   "id": "n42",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Abandonment fallback preserves active model-stage recovery",
+   "text": "In src/cayu/runtime/_session_finalization.py, finalize_abandoned_session_run checks load_active_model_completion_stage after complete_abandoned_turn raises and re-raises while a stage remains; it"
+  },
+  {
+   "id": "n43",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Paired terminal decisions permit additive terminal payload evidence",
+   "text": "InteractionTransitionSpec.validate_transition_shape validates a paired terminal event by requiring every InvocationTerminalDecision.terminal_payload key/value to match, not by requiring equal whole payloads. Environment-finalization details or interruption diagnostics may therefore be added to the terminal payload without conflicting with the elected decision, provided the original fields remain unchanged."
+  },
+  {
+   "id": "n44",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Interaction-transition cancellation normalizes task request counts intentionally",
+   "text": "In src/cayu/runtime/_session_finalization.py, cancellation observed while awaiting the owned interaction-transition store task is consumed by await_shielded_task_outcome and redelivered as the"
+  },
+  {
+   "id": "n45",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Background interruption cascades are operator-only",
+   "text": "SessionFinalization's background cascade scheduling is for durable operator interruptions only: BackgroundInterruptionCoordinator.run_cascade immediately returns unless"
+  },
+  {
+   "id": "n46",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Interruption terminal decisions permit later supplemental diagnostics",
+   "text": "In _session_finalization.handle_session_interrupted, provider/transition cleanup diagnostics may be added after an interruption terminal decision was elected. This is compatible with"
+  },
+  {
+   "id": "n47",
+   "status": "kept",
+   "module": "src/cayu/runtime/_session_finalization.py",
+   "title": "Closed-interaction terminal publication regression location",
+   "text": "The closed-interaction terminal publication path in SessionFinalization is exercised by tests/core/test_queued_session_messages.py::test_closed_interaction_terminal_decision_replays_after_status_comm"
+  },
+  {
+   "id": "n48",
+   "status": "kept",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Retained tool rounds preserve paused interactions even on session failure",
+   "text": "For ordinary tool-round error audits, SessionFinalization derives pending_action_kind from the retained checkpoint before selecting a non-completed interaction transition. A pending_tool_round"
+  },
+  {
+   "id": "n49",
+   "status": "kept",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "MCP admission audits registered exposure as well as advertised definitions",
+   "text": "ToolRoundExecutor's MCP manifest audit hashes and compares both the server's full advertised source and the agent's registered MCP adapter exposure. Registering only a subset can intentionally"
+  },
+  {
+   "id": "n50",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Pausing tools still pass argument-schema admission",
+   "text": "ToolRoundExecutor.policy_plan calls ToolInvocationAdmission.authorize before selecting a user-input or wake pause. authorize runs _registered_tool_argument_error and returns DENY for invalid registered schemas before calling the tool policy; _first_pausing_tool_call skips DENY outcomes. For supported pausing tools, the prompt selector's lightweight parsing is therefore not the argument-validation boundary."
+  },
+  {
+   "id": "n51",
+   "status": "kept",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Pause selection already receives schema-validated policy decisions",
+   "text": "ToolRoundExecutor.policy_plan calls ToolInvocationAdmission.authorize before _first_pausing_tool_call. authorize validates each registered tool's arguments against its snapshotted schema and returns"
+  },
+  {
+   "id": "n52",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Resolved vault secrets reach the round observer before the tool",
+   "text": "In dynamic ordinary tool rounds, InvocationVault._resolve_and_publish awaits its on_redactor_change observer before returning a resolved secret. ToolRoundRun supplies DurableToolRound.record_redactor, which merges and persists the cumulative scope through the publication coordinator; cancellation after ctx.vault.resolve returns therefore does not by itself mean the round has lost that resolved secret's redaction scope."
+  },
+  {
+   "id": "n53",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Pause selection follows schema-validating policy admission",
+   "text": "ToolRoundExecutor.policy_plan calls ToolInvocationAdmission.authorize before selecting a pause. authorize validates registered input schemas and returns DENY for invalid arguments; _first_pausing_tool_call requires AUTHORITATIVE policy evidence and skips DENY. Thus malformed built-in ask_user/sleep_until arguments fall through to ordinary rejection, rather than reaching prompt/wake planning as authorized pauses."
+  },
+  {
+   "id": "n54",
+   "status": "kept",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Wake-task creation failures cross a credential-safe task-store boundary",
+   "text": "ToolRoundRun's wake-task warning logs exc_info, but its production callback goes through tasks.session_wakes._publish_session_wake -> CayuApp.create_task ->"
+  },
+  {
+   "id": "n55",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "Executor regression tests enter asyncio through synchronous pytest wrappers",
+   "text": "Focused executor tests under tests/core use synchronous pytest functions that enter an inner async scenario with asyncio.run (see test_tool_round_executor.py). Match that pattern for new executor regressions: an unmarked native async test is not exercised by this repository's current pytest dependency/setup."
+  },
+  {
+   "id": "n56",
+   "status": "proposal",
+   "module": "src/cayu/runtime/_tool_round_executor.py",
+   "title": "MCP admission compares source and registered exposure evidence",
+   "text": "ToolRoundExecutor's MCP admission builds each authoritative manifest hash from both source-tool evidence and registered exposed-tool contracts. _mcp_manifest_status diffs both dimensions, so changes to registered descriptions, schemas, parallel safety or effect classification are audited even when the source manifest is unchanged. McpManifestBaseline validation recomputes that combined hash; baseline-corruption tests must not assume independently valid SHA-256 fields imply valid baseline evidence."
+  },
+  {
+   "id": "n57",
+   "status": "kept",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Postgres owned task mutations force READ COMMITTED",
+   "text": "PostgresTaskStore's _run_owned_mutation and owned claim/reclaim paths enter PostgresMutationMixin._owned_store_connection, which executes SET TRANSACTION ISOLATION LEVEL READ COMMITTED on each"
+  },
+  {
+   "id": "n58",
+   "status": "proposal",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Owned task mutations force READ COMMITTED snapshots",
+   "text": "PostgresTaskStore._owned_store_connection explicitly starts READ COMMITTED transactions, so ordinary queue/continuation claims and reclamation use fresh snapshots for each post-lock statement even when the database role defaults to REPEATABLE READ. Helpers such as heartbeat that directly use the pool are separate from this owned-connection path."
+  },
+  {
+   "id": "n59",
+   "status": "kept",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Group transitions have multi-task write sets",
+   "text": "Task-group quiescence transitions can atomically write several other task rows: when an all-members policy becomes impossible, plan_group_graph_transition cancels unstarted nonterminal siblings"
+  },
+  {
+   "id": "n60",
+   "status": "proposal",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Task-store tests use asyncio.run or the explicit anyio marker",
+   "text": "Core PostgreSQL tests usually wrap an async scenario in a synchronous test with asyncio.run (for example test_postgres_task_store.py). The async graph/group suites instead set pytestmark=pytest.mark.anyio and provide anyio_backend='asyncio'. A new bare async test without that marker is not run by the repository's locked pytest setup."
+  },
+  {
+   "id": "n61",
+   "status": "proposal",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Continuation page invariants require progress evidence for non-exhausted scans",
+   "text": "InterruptedTaskContinuationClaimPage validates zero scanned_candidates as necessarily exhausted with no cursor (tasks/handoff.py). A non-exhausted page must have a cursor, so a continuation scan cannot represent 'retry without progress' by merely returning exhausted=False on an empty locked-row batch; it must retain inspection/cursor evidence or perform another bounded selection."
+  },
+  {
+   "id": "n62",
+   "status": "kept",
+   "module": "src/cayu/storage/tasks_postgres.py",
+   "title": "Graph transitions guard terminal task immutability",
+   "text": "PostgresTaskStore._record_task_transition delegates graph members to _postgres_task_graphs.record_transition, which reconstructs the prior snapshot and calls tasks._graphs.plan_graph_transition. That"
+  },
+  {
+   "id": "n63",
+   "status": "proposal",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Dispatch lease mutations use fixed claim generation",
+   "text": "Dispatch claim authority is identified by claim_generation, not by lease_expires_at: TaskStoreDispatcher stores the generation in _DispatchLeaseAuthority and supplies it on heartbeat, release, terminalization and cancellation mutations. Renewals keep that generation, while a later claim (even with the same worker_id) has a different generation."
+  },
+  {
+   "id": "n64",
+   "status": "kept",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Cancelled dispatch tasks can acknowledge exact session terminal receipts",
+   "text": "For a CANCELLED dispatch queue task, TaskStoreDispatcher._acknowledge_terminal_task preserves the task's public CANCELLED outcome but passes the exact session terminal status"
+  },
+  {
+   "id": "n65",
+   "status": "proposal",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Dispatch async regression tests need explicit AnyIO setup",
+   "text": "The core dispatch tests use synchronous scenario wrappers with asyncio.run, or explicit pytest.mark.anyio plus an anyio_backend fixture returning 'asyncio'. In this checkout, a plain async test without that setup fails before execution ('async def functions are not natively supported'); new async regressions should follow tests/core/test_dispatch_cancel_fence_read_failure.py's AnyIO setup."
+  },
+  {
+   "id": "n66",
+   "status": "kept",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Not-admitted dispatch acknowledgement is an intentional no-op",
+   "text": "The built-in QueuedDispatchCoordinator.acknowledge returns successfully without writing when exact settlement is NOT_ADMITTED. Thus TaskStoreDispatcher.submit can safely call"
+  },
+  {
+   "id": "n67",
+   "status": "kept",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Execution presence protects silent live sessions from dispatch recovery",
+   "text": "Dispatcher-triggered stalled-session recovery always supplies inactive_for_seconds (defaulting to the queue lease length). IncompleteSessionRecoveryCoordinator first skips a session with active work"
+  },
+  {
+   "id": "n68",
+   "status": "kept",
+   "module": "src/cayu/tasks/dispatch.py",
+   "title": "Async dispatch regressions need the existing AnyIO test marker or asyncio.run",
+   "text": "Focused asynchronous tests in tests/core can follow tests/core/test_task_execution_settlement_owner.py: set pytestmark = pytest.mark.anyio and provide anyio_backend returning \"asyncio\". The"
+  },
+  {
+   "id": "n69",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Until-idle continuation flag is intentionally conservative for fresh tasks",
+   "text": "In tasks/worker.py, _may_await_continuation deliberately returns true for ordinary handled tasks unless their handoff is parked, even when _handoff_state returns None for a completed task."
+  },
+  {
+   "id": "n70",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Continuation-capable worker test subclasses must redeclare the capability",
+   "text": "run_task_worker checks supports_interrupted_task_handoffs using the concrete store class's own __dict__, not inherited attribute lookup. A fault-injection subclass of a built-in task store used with"
+  },
+  {
+   "id": "n71",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Controlled continuations bypass backoff, not worker supervision",
+   "text": "Controlled inbox decisions and parked-wait triggers both call tasks/worker.py::_run_recovered_interrupted_task_handler with an exact TaskContinuationExpectation and apply_unproductive_backoff=False."
+  },
+  {
+   "id": "n72",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Worker fault injection requires class-level store overrides",
+   "text": "Generic task-worker capability validation rejects instance-shadowed cancellation/terminalization methods. For latency or fault-injection tests, follow tests/core/test_task_worker.py: define a store"
+  },
+  {
+   "id": "n73",
+   "status": "proposal",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Worker handoff capabilities must be declared by the concrete store class",
+   "text": "run_task_worker checks interrupted-handoff advertisement on the concrete store class's __dict__, not inherited attributes. A custom test subclass that exercises interrupted recovery must explicitly declare supports_interrupted_task_handoffs=True and satisfy the complete mutation capability checks; controlled continuation claims similarly require the concrete supports_bound_interrupted_task_handoffs declaration."
+  },
+  {
+   "id": "n74",
+   "status": "proposal",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Explicit bound continuations bypass automated stall throttling",
+   "text": "The worker helper _run_recovered_interrupted_task_handler serves both generic polling and explicit bound continuations. The Inbox caller in runtime/_inbox_continuation.py and trigger caller in tasks/parked_continuation.py pass apply_unproductive_backoff=False and leave max_unproductive_handoffs=None, so automated stall-history throttling/failure does not apply to these explicit decisions; exact bound claims, session validation, heartbeats and handler settlement still do."
+  },
+  {
+   "id": "n75",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Ordinary worker disposition has a five-minute timeout floor",
+   "text": "Ordinary task-handler disposition in src/cayu/tasks/worker.py is bounded by _dispose_within_deadline using max(float(lease_seconds), _MIN_TASK_DISPOSITION_DEADLINE_S), where the floor is 300 seconds."
+  },
+  {
+   "id": "n76",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Busy task-worker maintenance backs off after failed passes",
+   "text": "The generic task worker's busy-slot reclamation loop uses DurableWorkerCadence.run_if_due. That helper advances its next-run time in a finally block even when the maintenance action raises, so a"
+  },
+  {
+   "id": "n77",
+   "status": "proposal",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Failed busy-slot maintenance still advances its cadence",
+   "text": "The generic worker's reclaim and fenced-task scans use DurableWorkerCadence.run_if_due, which advances next_run_at in a finally block after every attempted action, including failures. Thus maintained_while_busy logging a failed maintenance pass does not immediately retry in a tight loop; the next attempt remains bounded by reclaim_every_s."
+  },
+  {
+   "id": "n78",
+   "status": "proposal",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Until-idle continuation reporting is deliberately conservative",
+   "text": "When run_task_worker_until_idle is given a recovered_interrupted_task_handler, continuations_pending is deliberately conservative: processing an ordinary task can set it even when that task completed and no actual handoff remains. tests/core/test_task_worker_until_idle.py::test_until_idle_continues_handoffs_once_without_waiting_on_people explicitly asserts this behavior for due_task=True with a completing ordinary handler; do not infer a stranded continuation solely from that flag."
+  },
+  {
+   "id": "n79",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Retry owner-shutdown cleanup failures intentionally release the attempt",
+   "text": "tests/core/test_task_retry_series.py::test_task_retry_worker_preserves_owner_cancellation_when_handler_cleanup_groups_it explicitly expects a retry handler that raises during owner-shutdown draining"
+  },
+  {
+   "id": "n80",
+   "status": "kept",
+   "module": "src/cayu/tasks/worker.py",
+   "title": "Retry worker shutdown deliberately drains rather than interrupting the attempt",
+   "text": "For retry-series tasks, cancelling run_task_worker deliberately retains and naturally drains the handler: a returned TaskRetryAttemptReport is settled before the caller's cancellation is re-raised,"
+  },
+  {
+   "id": "n81",
+   "status": "proposal",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Durable local branches require two explicit durable boundaries",
+   "text": "LocalWorkspace defaults branch_store and branch_authority_resolver to None (src/cayu/workspaces/local.py:102-103). Durable branch admission requires both a store declaring DURABLE and an authority provider declaring DURABLE claim scope (src/cayu/workspaces/_local_branch.py:2057-2073); the built-in WorkspaceBranchBindingAuthorityRegistry declares PROCESS_LOCAL (src/cayu/workspaces/branches.py:853-855), so it cannot by itself enable durable local branches."
+  },
+  {
+   "id": "n82",
+   "status": "kept",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Publication checks all captured directory semantics",
+   "text": "LocalWorkspaceBranch._publication_conflicts intentionally revalidates lookup semantics for every captured source directory, not just ancestors of changed files; docs/runtime-contracts.md explicitly"
+  },
+  {
+   "id": "n83",
+   "status": "kept",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Local durable-branch admission requires an external durable claim provider",
+   "text": "LocalWorkspace durable branch creation/recovery requires both a DURABLE branch store and a provider declaring DURABLE claim_scope (_local_branch.py:2057-2073; local.py:250-280). The built-in"
+  },
+  {
+   "id": "n84",
+   "status": "proposal",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Durable local branching requires two explicit durable boundaries",
+   "text": "LocalWorkspace defaults branch_store and branch_authority_resolver to None (src/cayu/workspaces/local.py:102-103); durable admission requires both a durable store and a provider declaring claim_scope='durable' (_local_branch.py:2057-2072). The built-in WorkspaceBranchBindingAuthorityRegistry declares process_local (branches.py:853-855), so a file-backed session store plus that registry alone cannot activate durable branches. Existing admission coverage: tests/workspaces/test_durable_local_workspace_branches.py:2279-2325."
+  },
+  {
+   "id": "n85",
+   "status": "kept",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Durable local branch operations coordinate through record transitions, not one shared asyncio lock",
+   "text": "LocalWorkspaceBranch's asyncio coordinator lock is per durable attachment and is used for private mutations only. Different attachments, publication, rollback, and recovery coordinate through guarded"
+  },
+  {
+   "id": "n86",
+   "status": "kept",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Workspace branch tests wrap async scenarios in asyncio.run",
+   "text": "The workspace branch pytest tests use synchronous test functions that run their async scenario with asyncio.run(). Use this pattern for new tests in tests/workspaces; the target-test environment does"
+  },
+  {
+   "id": "n87",
+   "status": "kept",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Local branch capture validates more than the file-only revision inventory",
+   "text": "A complete observe_deterministic_workspace(LocalWorkspace(...)) observation inventories regular files, not empty directories. Local branch baseline capture independently walks and validates every"
+  },
+  {
+   "id": "n88",
+   "status": "proposal",
+   "module": "src/cayu/workspaces/_local_branch.py",
+   "title": "Local durable branch admission requires an external durable claim provider",
+   "text": "Durable LocalWorkspace branches require both a durable branch store and a provider declaring claim_scope='durable' (src/cayu/workspaces/_local_branch.py:2052-2073). The bundled WorkspaceBranchBindingAuthorityRegistry declares PROCESS_LOCAL (src/cayu/workspaces/branches.py:853-855), so it cannot enable durable local branches by itself; docs/runtime-contracts.md:2211 documents the external-provider opt-in."
+  }
+ ],
+ "duplicates": [
+  [
+   "n01",
+   "n11"
+  ],
+  [
+   "n02",
+   "n04"
+  ],
+  [
+   "n03",
+   "n13"
+  ],
+  [
+   "n04",
+   "n05"
+  ],
+  [
+   "n07",
+   "n09"
+  ],
+  [
+   "n14",
+   "n15"
+  ],
+  [
+   "n16",
+   "n17"
+  ],
+  [
+   "n18",
+   "n19"
+  ],
+  [
+   "n21",
+   "n33"
+  ],
+  [
+   "n25",
+   "n28"
+  ],
+  [
+   "n31",
+   "n36"
+  ],
+  [
+   "n32",
+   "n34"
+  ],
+  [
+   "n36",
+   "n40"
+  ],
+  [
+   "n36",
+   "n41"
+  ],
+  [
+   "n43",
+   "n46"
+  ],
+  [
+   "n49",
+   "n56"
+  ],
+  [
+   "n50",
+   "n51"
+  ],
+  [
+   "n51",
+   "n53"
+  ],
+  [
+   "n57",
+   "n58"
+  ],
+  [
+   "n65",
+   "n68"
+  ],
+  [
+   "n69",
+   "n78"
+  ],
+  [
+   "n70",
+   "n73"
+  ],
+  [
+   "n71",
+   "n74"
+  ],
+  [
+   "n76",
+   "n77"
+  ],
+  [
+   "n81",
+   "n83"
+  ],
+  [
+   "n83",
+   "n84"
+  ],
+  [
+   "n83",
+   "n88"
+  ]
+ ],
+ "distinct": [
+  [
+   "n01",
+   "n02"
+  ],
+  [
+   "n01",
+   "n03"
+  ],
+  [
+   "n01",
+   "n04"
+  ],
+  [
+   "n01",
+   "n05"
+  ],
+  [
+   "n01",
+   "n06"
+  ],
+  [
+   "n01",
+   "n07"
+  ],
+  [
+   "n01",
+   "n08"
+  ],
+  [
+   "n01",
+   "n09"
+  ],
+  [
+   "n01",
+   "n10"
+  ],
+  [
+   "n01",
+   "n12"
+  ],
+  [
+   "n01",
+   "n13"
+  ],
+  [
+   "n02",
+   "n03"
+  ],
+  [
+   "n02",
+   "n06"
+  ],
+  [
+   "n02",
+   "n07"
+  ],
+  [
+   "n02",
+   "n08"
+  ],
+  [
+   "n02",
+   "n09"
+  ],
+  [
+   "n02",
+   "n10"
+  ],
+  [
+   "n02",
+   "n11"
+  ],
+  [
+   "n02",
+   "n12"
+  ],
+  [
+   "n02",
+   "n13"
+  ],
+  [
+   "n03",
+   "n04"
+  ],
+  [
+   "n03",
+   "n05"
+  ],
+  [
+   "n03",
+   "n06"
+  ],
+  [
+   "n03",
+   "n07"
+  ],
+  [
+   "n03",
+   "n08"
+  ],
+  [
+   "n03",
+   "n09"
+  ],
+  [
+   "n03",
+   "n10"
+  ],
+  [
+   "n03",
+   "n11"
+  ],
+  [
+   "n03",
+   "n12"
+  ],
+  [
+   "n04",
+   "n06"
+  ],
+  [
+   "n04",
+   "n07"
+  ],
+  [
+   "n04",
+   "n08"
+  ],
+  [
+   "n04",
+   "n09"
+  ],
+  [
+   "n04",
+   "n10"
+  ],
+  [
+   "n04",
+   "n11"
+  ],
+  [
+   "n04",
+   "n12"
+  ],
+  [
+   "n04",
+   "n13"
+  ],
+  [
+   "n05",
+   "n06"
+  ],
+  [
+   "n05",
+   "n07"
+  ],
+  [
+   "n05",
+   "n08"
+  ],
+  [
+   "n05",
+   "n09"
+  ],
+  [
+   "n05",
+   "n10"
+  ],
+  [
+   "n05",
+   "n11"
+  ],
+  [
+   "n05",
+   "n12"
+  ],
+  [
+   "n05",
+   "n13"
+  ],
+  [
+   "n06",
+   "n07"
+  ],
+  [
+   "n06",
+   "n08"
+  ],
+  [
+   "n06",
+   "n09"
+  ],
+  [
+   "n06",
+   "n10"
+  ],
+  [
+   "n06",
+   "n11"
+  ],
+  [
+   "n06",
+   "n12"
+  ],
+  [
+   "n06",
+   "n13"
+  ],
+  [
+   "n07",
+   "n08"
+  ],
+  [
+   "n07",
+   "n10"
+  ],
+  [
+   "n07",
+   "n11"
+  ],
+  [
+   "n07",
+   "n12"
+  ],
+  [
+   "n07",
+   "n13"
+  ],
+  [
+   "n08",
+   "n09"
+  ],
+  [
+   "n08",
+   "n10"
+  ],
+  [
+   "n08",
+   "n11"
+  ],
+  [
+   "n08",
+   "n12"
+  ],
+  [
+   "n08",
+   "n13"
+  ],
+  [
+   "n09",
+   "n10"
+  ],
+  [
+   "n09",
+   "n11"
+  ],
+  [
+   "n09",
+   "n12"
+  ],
+  [
+   "n09",
+   "n13"
+  ],
+  [
+   "n10",
+   "n11"
+  ],
+  [
+   "n10",
+   "n12"
+  ],
+  [
+   "n10",
+   "n13"
+  ],
+  [
+   "n11",
+   "n12"
+  ],
+  [
+   "n11",
+   "n13"
+  ],
+  [
+   "n12",
+   "n13"
+  ],
+  [
+   "n14",
+   "n16"
+  ],
+  [
+   "n14",
+   "n17"
+  ],
+  [
+   "n14",
+   "n18"
+  ],
+  [
+   "n14",
+   "n19"
+  ],
+  [
+   "n14",
+   "n20"
+  ],
+  [
+   "n14",
+   "n21"
+  ],
+  [
+   "n14",
+   "n22"
+  ],
+  [
+   "n14",
+   "n23"
+  ],
+  [
+   "n14",
+   "n24"
+  ],
+  [
+   "n15",
+   "n16"
+  ],
+  [
+   "n15",
+   "n17"
+  ],
+  [
+   "n15",
+   "n18"
+  ],
+  [
+   "n15",
+   "n19"
+  ],
+  [
+   "n15",
+   "n20"
+  ],
+  [
+   "n15",
+   "n21"
+  ],
+  [
+   "n15",
+   "n22"
+  ],
+  [
+   "n15",
+   "n23"
+  ],
+  [
+   "n15",
+   "n24"
+  ],
+  [
+   "n16",
+   "n18"
+  ],
+  [
+   "n16",
+   "n19"
+  ],
+  [
+   "n16",
+   "n20"
+  ],
+  [
+   "n16",
+   "n21"
+  ],
+  [
+   "n16",
+   "n22"
+  ],
+  [
+   "n16",
+   "n23"
+  ],
+  [
+   "n16",
+   "n24"
+  ],
+  [
+   "n17",
+   "n18"
+  ],
+  [
+   "n17",
+   "n19"
+  ],
+  [
+   "n17",
+   "n20"
+  ],
+  [
+   "n17",
+   "n21"
+  ],
+  [
+   "n17",
+   "n22"
+  ],
+  [
+   "n17",
+   "n23"
+  ],
+  [
+   "n17",
+   "n24"
+  ],
+  [
+   "n18",
+   "n20"
+  ],
+  [
+   "n18",
+   "n21"
+  ],
+  [
+   "n18",
+   "n22"
+  ],
+  [
+   "n18",
+   "n23"
+  ],
+  [
+   "n18",
+   "n24"
+  ],
+  [
+   "n19",
+   "n20"
+  ],
+  [
+   "n19",
+   "n21"
+  ],
+  [
+   "n19",
+   "n22"
+  ],
+  [
+   "n19",
+   "n23"
+  ],
+  [
+   "n19",
+   "n24"
+  ],
+  [
+   "n20",
+   "n21"
+  ],
+  [
+   "n20",
+   "n22"
+  ],
+  [
+   "n20",
+   "n23"
+  ],
+  [
+   "n20",
+   "n24"
+  ],
+  [
+   "n21",
+   "n22"
+  ],
+  [
+   "n21",
+   "n23"
+  ],
+  [
+   "n21",
+   "n24"
+  ],
+  [
+   "n22",
+   "n23"
+  ],
+  [
+   "n22",
+   "n24"
+  ],
+  [
+   "n23",
+   "n24"
+  ],
+  [
+   "n25",
+   "n26"
+  ],
+  [
+   "n25",
+   "n27"
+  ],
+  [
+   "n25",
+   "n29"
+  ],
+  [
+   "n25",
+   "n30"
+  ],
+  [
+   "n26",
+   "n27"
+  ],
+  [
+   "n26",
+   "n28"
+  ],
+  [
+   "n26",
+   "n29"
+  ],
+  [
+   "n26",
+   "n30"
+  ],
+  [
+   "n27",
+   "n28"
+  ],
+  [
+   "n27",
+   "n29"
+  ],
+  [
+   "n27",
+   "n30"
+  ],
+  [
+   "n28",
+   "n29"
+  ],
+  [
+   "n28",
+   "n30"
+  ],
+  [
+   "n29",
+   "n30"
+  ],
+  [
+   "n31",
+   "n32"
+  ],
+  [
+   "n31",
+   "n33"
+  ],
+  [
+   "n31",
+   "n34"
+  ],
+  [
+   "n31",
+   "n35"
+  ],
+  [
+   "n31",
+   "n37"
+  ],
+  [
+   "n31",
+   "n38"
+  ],
+  [
+   "n31",
+   "n39"
+  ],
+  [
+   "n32",
+   "n33"
+  ],
+  [
+   "n32",
+   "n35"
+  ],
+  [
+   "n32",
+   "n36"
+  ],
+  [
+   "n32",
+   "n37"
+  ],
+  [
+   "n32",
+   "n38"
+  ],
+  [
+   "n32",
+   "n39"
+  ],
+  [
+   "n32",
+   "n40"
+  ],
+  [
+   "n32",
+   "n41"
+  ],
+  [
+   "n33",
+   "n34"
+  ],
+  [
+   "n33",
+   "n35"
+  ],
+  [
+   "n33",
+   "n36"
+  ],
+  [
+   "n33",
+   "n37"
+  ],
+  [
+   "n33",
+   "n38"
+  ],
+  [
+   "n33",
+   "n39"
+  ],
+  [
+   "n33",
+   "n40"
+  ],
+  [
+   "n33",
+   "n41"
+  ],
+  [
+   "n34",
+   "n35"
+  ],
+  [
+   "n34",
+   "n36"
+  ],
+  [
+   "n34",
+   "n37"
+  ],
+  [
+   "n34",
+   "n38"
+  ],
+  [
+   "n34",
+   "n39"
+  ],
+  [
+   "n34",
+   "n40"
+  ],
+  [
+   "n34",
+   "n41"
+  ],
+  [
+   "n35",
+   "n36"
+  ],
+  [
+   "n35",
+   "n37"
+  ],
+  [
+   "n35",
+   "n38"
+  ],
+  [
+   "n35",
+   "n39"
+  ],
+  [
+   "n35",
+   "n40"
+  ],
+  [
+   "n35",
+   "n41"
+  ],
+  [
+   "n36",
+   "n37"
+  ],
+  [
+   "n36",
+   "n38"
+  ],
+  [
+   "n36",
+   "n39"
+  ],
+  [
+   "n37",
+   "n38"
+  ],
+  [
+   "n37",
+   "n39"
+  ],
+  [
+   "n37",
+   "n40"
+  ],
+  [
+   "n37",
+   "n41"
+  ],
+  [
+   "n38",
+   "n39"
+  ],
+  [
+   "n38",
+   "n40"
+  ],
+  [
+   "n38",
+   "n41"
+  ],
+  [
+   "n39",
+   "n40"
+  ],
+  [
+   "n39",
+   "n41"
+  ],
+  [
+   "n42",
+   "n43"
+  ],
+  [
+   "n42",
+   "n44"
+  ],
+  [
+   "n42",
+   "n45"
+  ],
+  [
+   "n42",
+   "n46"
+  ],
+  [
+   "n42",
+   "n47"
+  ],
+  [
+   "n43",
+   "n44"
+  ],
+  [
+   "n43",
+   "n45"
+  ],
+  [
+   "n43",
+   "n47"
+  ],
+  [
+   "n44",
+   "n45"
+  ],
+  [
+   "n44",
+   "n46"
+  ],
+  [
+   "n44",
+   "n47"
+  ],
+  [
+   "n45",
+   "n46"
+  ],
+  [
+   "n45",
+   "n47"
+  ],
+  [
+   "n46",
+   "n47"
+  ],
+  [
+   "n48",
+   "n49"
+  ],
+  [
+   "n48",
+   "n50"
+  ],
+  [
+   "n48",
+   "n51"
+  ],
+  [
+   "n48",
+   "n52"
+  ],
+  [
+   "n48",
+   "n53"
+  ],
+  [
+   "n48",
+   "n54"
+  ],
+  [
+   "n48",
+   "n55"
+  ],
+  [
+   "n48",
+   "n56"
+  ],
+  [
+   "n49",
+   "n50"
+  ],
+  [
+   "n49",
+   "n51"
+  ],
+  [
+   "n49",
+   "n52"
+  ],
+  [
+   "n49",
+   "n53"
+  ],
+  [
+   "n49",
+   "n54"
+  ],
+  [
+   "n49",
+   "n55"
+  ],
+  [
+   "n50",
+   "n52"
+  ],
+  [
+   "n50",
+   "n54"
+  ],
+  [
+   "n50",
+   "n55"
+  ],
+  [
+   "n50",
+   "n56"
+  ],
+  [
+   "n51",
+   "n52"
+  ],
+  [
+   "n51",
+   "n54"
+  ],
+  [
+   "n51",
+   "n55"
+  ],
+  [
+   "n51",
+   "n56"
+  ],
+  [
+   "n52",
+   "n53"
+  ],
+  [
+   "n52",
+   "n54"
+  ],
+  [
+   "n52",
+   "n55"
+  ],
+  [
+   "n52",
+   "n56"
+  ],
+  [
+   "n53",
+   "n54"
+  ],
+  [
+   "n53",
+   "n55"
+  ],
+  [
+   "n53",
+   "n56"
+  ],
+  [
+   "n54",
+   "n55"
+  ],
+  [
+   "n54",
+   "n56"
+  ],
+  [
+   "n55",
+   "n56"
+  ],
+  [
+   "n57",
+   "n59"
+  ],
+  [
+   "n57",
+   "n60"
+  ],
+  [
+   "n57",
+   "n61"
+  ],
+  [
+   "n57",
+   "n62"
+  ],
+  [
+   "n58",
+   "n59"
+  ],
+  [
+   "n58",
+   "n60"
+  ],
+  [
+   "n58",
+   "n61"
+  ],
+  [
+   "n58",
+   "n62"
+  ],
+  [
+   "n59",
+   "n60"
+  ],
+  [
+   "n59",
+   "n61"
+  ],
+  [
+   "n59",
+   "n62"
+  ],
+  [
+   "n60",
+   "n61"
+  ],
+  [
+   "n60",
+   "n62"
+  ],
+  [
+   "n61",
+   "n62"
+  ],
+  [
+   "n63",
+   "n64"
+  ],
+  [
+   "n63",
+   "n65"
+  ],
+  [
+   "n63",
+   "n66"
+  ],
+  [
+   "n63",
+   "n67"
+  ],
+  [
+   "n63",
+   "n68"
+  ],
+  [
+   "n64",
+   "n65"
+  ],
+  [
+   "n64",
+   "n66"
+  ],
+  [
+   "n64",
+   "n67"
+  ],
+  [
+   "n64",
+   "n68"
+  ],
+  [
+   "n65",
+   "n66"
+  ],
+  [
+   "n65",
+   "n67"
+  ],
+  [
+   "n66",
+   "n67"
+  ],
+  [
+   "n66",
+   "n68"
+  ],
+  [
+   "n67",
+   "n68"
+  ],
+  [
+   "n69",
+   "n70"
+  ],
+  [
+   "n69",
+   "n71"
+  ],
+  [
+   "n69",
+   "n72"
+  ],
+  [
+   "n69",
+   "n73"
+  ],
+  [
+   "n69",
+   "n74"
+  ],
+  [
+   "n69",
+   "n75"
+  ],
+  [
+   "n69",
+   "n76"
+  ],
+  [
+   "n69",
+   "n77"
+  ],
+  [
+   "n69",
+   "n79"
+  ],
+  [
+   "n69",
+   "n80"
+  ],
+  [
+   "n70",
+   "n71"
+  ],
+  [
+   "n70",
+   "n72"
+  ],
+  [
+   "n70",
+   "n74"
+  ],
+  [
+   "n70",
+   "n75"
+  ],
+  [
+   "n70",
+   "n76"
+  ],
+  [
+   "n70",
+   "n77"
+  ],
+  [
+   "n70",
+   "n78"
+  ],
+  [
+   "n70",
+   "n79"
+  ],
+  [
+   "n70",
+   "n80"
+  ],
+  [
+   "n71",
+   "n72"
+  ],
+  [
+   "n71",
+   "n73"
+  ],
+  [
+   "n71",
+   "n75"
+  ],
+  [
+   "n71",
+   "n76"
+  ],
+  [
+   "n71",
+   "n77"
+  ],
+  [
+   "n71",
+   "n78"
+  ],
+  [
+   "n71",
+   "n79"
+  ],
+  [
+   "n71",
+   "n80"
+  ],
+  [
+   "n72",
+   "n73"
+  ],
+  [
+   "n72",
+   "n74"
+  ],
+  [
+   "n72",
+   "n75"
+  ],
+  [
+   "n72",
+   "n76"
+  ],
+  [
+   "n72",
+   "n77"
+  ],
+  [
+   "n72",
+   "n78"
+  ],
+  [
+   "n72",
+   "n79"
+  ],
+  [
+   "n72",
+   "n80"
+  ],
+  [
+   "n73",
+   "n74"
+  ],
+  [
+   "n73",
+   "n75"
+  ],
+  [
+   "n73",
+   "n76"
+  ],
+  [
+   "n73",
+   "n77"
+  ],
+  [
+   "n73",
+   "n78"
+  ],
+  [
+   "n73",
+   "n79"
+  ],
+  [
+   "n73",
+   "n80"
+  ],
+  [
+   "n74",
+   "n75"
+  ],
+  [
+   "n74",
+   "n76"
+  ],
+  [
+   "n74",
+   "n77"
+  ],
+  [
+   "n74",
+   "n78"
+  ],
+  [
+   "n74",
+   "n79"
+  ],
+  [
+   "n74",
+   "n80"
+  ],
+  [
+   "n75",
+   "n76"
+  ],
+  [
+   "n75",
+   "n77"
+  ],
+  [
+   "n75",
+   "n78"
+  ],
+  [
+   "n75",
+   "n79"
+  ],
+  [
+   "n75",
+   "n80"
+  ],
+  [
+   "n76",
+   "n78"
+  ],
+  [
+   "n76",
+   "n79"
+  ],
+  [
+   "n76",
+   "n80"
+  ],
+  [
+   "n77",
+   "n78"
+  ],
+  [
+   "n77",
+   "n79"
+  ],
+  [
+   "n77",
+   "n80"
+  ],
+  [
+   "n78",
+   "n79"
+  ],
+  [
+   "n78",
+   "n80"
+  ],
+  [
+   "n79",
+   "n80"
+  ],
+  [
+   "n81",
+   "n82"
+  ],
+  [
+   "n81",
+   "n85"
+  ],
+  [
+   "n81",
+   "n86"
+  ],
+  [
+   "n81",
+   "n87"
+  ],
+  [
+   "n82",
+   "n83"
+  ],
+  [
+   "n82",
+   "n84"
+  ],
+  [
+   "n82",
+   "n85"
+  ],
+  [
+   "n82",
+   "n86"
+  ],
+  [
+   "n82",
+   "n87"
+  ],
+  [
+   "n82",
+   "n88"
+  ],
+  [
+   "n83",
+   "n85"
+  ],
+  [
+   "n83",
+   "n86"
+  ],
+  [
+   "n83",
+   "n87"
+  ],
+  [
+   "n84",
+   "n85"
+  ],
+  [
+   "n84",
+   "n86"
+  ],
+  [
+   "n84",
+   "n87"
+  ],
+  [
+   "n85",
+   "n86"
+  ],
+  [
+   "n85",
+   "n87"
+  ],
+  [
+   "n85",
+   "n88"
+  ],
+  [
+   "n86",
+   "n87"
+  ],
+  [
+   "n86",
+   "n88"
+  ],
+  [
+   "n87",
+   "n88"
+  ]
+ ]
+}

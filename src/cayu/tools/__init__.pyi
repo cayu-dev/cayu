@@ -189,6 +189,7 @@ from cayu.tools.knowledge import ReadKnowledgeTool as ReadKnowledgeTool
 from cayu.tools.knowledge import RememberKnowledgePolicy as RememberKnowledgePolicy
 from cayu.tools.knowledge import RememberKnowledgeTool as RememberKnowledgeTool
 from cayu.tools.knowledge import SearchKnowledgeTool as SearchKnowledgeTool
+from cayu.tools.knowledge_lookup import FindKnowledgeTool as FindKnowledgeTool
 from cayu.tools.named_checks import ExactNamedCheckCommandPolicy as ExactNamedCheckCommandPolicy
 from cayu.tools.named_checks import NamedCheck as NamedCheck
 from cayu.tools.named_checks import RunCheckTool as RunCheckTool

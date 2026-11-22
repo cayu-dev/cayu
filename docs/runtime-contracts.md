@@ -13938,6 +13938,7 @@ The first built-in tools are:
 - `search_knowledge`: search the active knowledge store with bounded previews and optional filters
 - `read_knowledge`: expand bounded chunks from a returned knowledge entry
 - `remember_knowledge`: propose a new knowledge entry through the active knowledge store, subject to application write policy
+- `find_knowledge`: before remembering, find kept entries and pending proposals like a draft in the scope `remember_knowledge` would write to; returns ids, titles, statuses, kinds and source counts, never a proposal's body
 
 A path-addressed `read_file` whose workspace target is missing returns a recoverable
 tool error for both text and native attachment reads: `is_error=true`, model-facing
@@ -13979,6 +13980,7 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - `search_knowledge`: 10 hits by default, 25 maximum per call; 320 bytes of preview text per hit by default, 4 KB maximum per hit, and 20 KB total preview text by default, 128 KB maximum per call
 - `read_knowledge`: 5 chunks by default, 50 maximum per call; 20 KB chunk text by default, 128 KB maximum per call
 - `remember_knowledge`: 64 KB app-configured accepted text by default, 512 KB maximum for a registered tool instance; internal indexing defaults to 4 KB target chunks and 100 chunks maximum for the built-in tool instance; writes that would exceed the configured text or chunk capacity are rejected before persistence
+- `find_knowledge`: 5 matches by default, 10 maximum per call; 64 KB of draft text; compares at most 500 kept and pending entries by default (`FindKnowledgeTool(max_candidates=...)`, up to 5,000) and says when there were more
 
 ### Built-in terminal payload bounds
 

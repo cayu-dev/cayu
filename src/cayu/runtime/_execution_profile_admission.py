@@ -1180,6 +1180,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         RememberKnowledgeTool,
         SearchKnowledgeTool,
     )
+    from cayu.tools.knowledge_lookup import FindKnowledgeTool
     from cayu.tools.named_checks import RunCheckTool
     from cayu.tools.patches import ApplyPatchTool
     from cayu.tools.search import SearchTextTool
@@ -1201,6 +1202,7 @@ def _cayu_tool_material_extractors() -> dict[type[object], _ExecutionProfileMate
         ReadFileTool,
         WriteFileTool,
         GitChangesTool,
+        FindKnowledgeTool,
         ListKnowledgeTool,
         ReadKnowledgeTool,
         RememberKnowledgeTool,
