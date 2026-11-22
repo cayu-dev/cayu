@@ -423,6 +423,12 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
 
 _SQLITE_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
+# Statuses whose unadmitted schedule the expiry sweep settles; the wakeup
+# observation must report exactly these.
+_UNADMITTED_SCHEDULE_STATUS_SQL = (
+    "status IN ('pending', 'paused', 'blocked', 'needs_attention', "
+    "'waiting_dependencies', 'waiting_group')"
+)
 
 
 @model_store_surface("tasks")
@@ -4123,8 +4129,7 @@ class SQLiteTaskStore(TaskStore):
                     "OR (json_extract(schedule_json, '$.policy.misfire_policy') = 'skip' AND "
                     "(julianday(?) - julianday(available_at)) * 86400 > "
                     "json_extract(schedule_json, '$.policy.misfire_grace_seconds')) THEN 1 ELSE 0 END), 0) "
-                    f"FROM cayu_tasks WHERE {scope} "
-                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention') "
+                    f"FROM cayu_tasks WHERE {scope} AND {_UNADMITTED_SCHEDULE_STATUS_SQL} "
                     "AND schedule_json IS NOT NULL AND json_extract(schedule_json, '$.admitted_at') IS NULL",
                     [stamp, stamp, stamp, *params],
                 ).fetchone()
@@ -7140,7 +7145,7 @@ class SQLiteTaskStore(TaskStore):
         stamp = sqlite_records.format_datetime(as_of)
         rows = self._connection.execute(
             f"SELECT id FROM cayu_tasks WHERE {scope} "
-            "AND status IN ('pending', 'paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group') "
+            f"AND {_UNADMITTED_SCHEDULE_STATUS_SQL} "
             "AND (status != 'pending' OR (concurrency_key IS NOT NULL AND EXISTS ("
             "SELECT 1 FROM cayu_tasks AS busy WHERE busy.concurrency_key = cayu_tasks.concurrency_key "
             "AND " + _busy_concurrency_key_sql("busy.") + "))) "

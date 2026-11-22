@@ -387,6 +387,19 @@ from cayu.tasks.work_receipts import (
     WorkAttemptPreparationHoldReceipt,
 )
 
+# Statuses whose unadmitted schedule the expiry sweep settles; the wakeup
+# observation must report exactly these.
+_UNADMITTED_SCHEDULE_STATUSES = frozenset(
+    {
+        TaskStatus.PENDING,
+        TaskStatus.WAITING_DEPENDENCIES,
+        TaskStatus.WAITING_GROUP,
+        TaskStatus.PAUSED,
+        TaskStatus.BLOCKED,
+        TaskStatus.NEEDS_ATTENTION,
+    }
+)
+
 
 class _PreparedMemoryTaskWrite(NamedTuple):
     task: Task
@@ -2539,13 +2552,7 @@ class InMemoryTaskStore(TaskStore):
             for task in self._tasks.values():
                 if (
                     task.session_id is not None
-                    or task.status
-                    not in {
-                        TaskStatus.PENDING,
-                        TaskStatus.PAUSED,
-                        TaskStatus.BLOCKED,
-                        TaskStatus.NEEDS_ATTENTION,
-                    }
+                    or task.status not in _UNADMITTED_SCHEDULE_STATUSES
                     or not _task_matches_claim_filter(task, query)
                     or self._task_has_unsettled_local_execution_attempt(task.id)
                 ):
@@ -4470,15 +4477,7 @@ class InMemoryTaskStore(TaskStore):
                 if (
                     waiting.schedule is None
                     or waiting.schedule.admitted_at is not None
-                    or waiting.status
-                    not in {
-                        TaskStatus.PENDING,
-                        TaskStatus.WAITING_DEPENDENCIES,
-                        TaskStatus.WAITING_GROUP,
-                        TaskStatus.PAUSED,
-                        TaskStatus.BLOCKED,
-                        TaskStatus.NEEDS_ATTENTION,
-                    }
+                    or waiting.status not in _UNADMITTED_SCHEDULE_STATUSES
                     or waiting.session_id is not None
                     or not _task_matches_claim_filter(waiting, query)
                     or self._task_has_unsettled_local_execution_attempt(waiting.id)

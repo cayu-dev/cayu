@@ -300,6 +300,12 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
 
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
+# Statuses whose unadmitted schedule the expiry sweep settles; the wakeup
+# observation must report exactly these.
+_UNADMITTED_SCHEDULE_STATUS_SQL = (
+    "status IN ('pending', 'paused', 'blocked', 'needs_attention', "
+    "'waiting_dependencies', 'waiting_group')"
+)
 _TASK_ADMISSION_NOTIFY_CHANNEL = "cayu_task_admission_v1"
 _TASK_ADMISSION_LISTENER_INITIAL_RECONNECT_DELAY_S = 0.1
 _TASK_ADMISSION_LISTENER_MAX_RECONNECT_DELAY_S = 5.0
@@ -1656,9 +1662,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     "OR (schedule->'policy'->>'misfire_policy' = 'skip' AND "
                     "EXTRACT(EPOCH FROM (%s::timestamptz - available_at)) > "
                     "(schedule->'policy'->>'misfire_grace_seconds')::bigint)), FALSE) "
-                    f"FROM cayu_tasks WHERE {scope} "
-                    "AND status IN ('pending', 'paused', 'blocked', 'needs_attention', "
-                    "'waiting_dependencies', 'waiting_group') "
+                    f"FROM cayu_tasks WHERE {scope} AND {_UNADMITTED_SCHEDULE_STATUS_SQL} "
                     "AND schedule IS NOT NULL AND schedule->>'admitted_at' IS NULL",
                 ),
                 [now, now, now, *params],
@@ -4760,7 +4764,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         clauses, params = self._task_filter_clauses(query.model_copy(update={"status": None}))
         scope = " AND ".join(
             [
-                "status IN ('pending', 'paused', 'blocked', 'needs_attention', 'waiting_dependencies', 'waiting_group')",
+                _UNADMITTED_SCHEDULE_STATUS_SQL,
                 "session_id IS NULL",
                 "worker_id IS NULL",
                 "(status != 'pending' OR (concurrency_key IS NOT NULL AND EXISTS ("
