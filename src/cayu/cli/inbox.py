@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from cayu.approvals.authorization_grants import TOOL_AUTHORIZATION_GRANT_MAX_LIFETIME_SECONDS
 from cayu.cli._inbox_client import (
     _KINDS,
     DECISION_OUTCOMES,
@@ -158,6 +159,8 @@ def add_inbox_parser(subparsers: Any) -> None:
             ),
         )
         _add_continuation_options(command)
+        if decision == "approve":
+            _add_grant_options(command)
         _add_review_options(command)
         _add_target_options(command)
 
@@ -315,6 +318,93 @@ def _add_continuation_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_GRANT_OPTIONS = ("scope", "expires_in_seconds", "sample_rate_bps", "justification", "pin")
+
+
+def _add_grant_options(parser: argparse.ArgumentParser) -> None:
+    remember = parser.add_argument_group(
+        "remembering the approval",
+        "A tool authorization grant: later calls of the same kind run without asking. The "
+        "application must host its grants, its policy must offer this call, and its grant "
+        "authority must let you. See `cayu grants`.",
+    )
+    remember.add_argument(
+        "--remember",
+        action="store_true",
+        help="Approve the call and remember the approval as a grant.",
+    )
+    remember.add_argument(
+        "--scope",
+        choices=("session", "workspace"),
+        help=(
+            "Where the grant applies: this session (default), or every session in the "
+            "same workspace, when the application named that workspace."
+        ),
+    )
+    remember.add_argument(
+        "--expires-in-seconds",
+        type=_whole_number(1, TOOL_AUTHORIZATION_GRANT_MAX_LIFETIME_SECONDS),
+        metavar="SECONDS",
+        help="How long the grant lasts (default: until it is revoked).",
+    )
+    remember.add_argument(
+        "--sample-rate-bps",
+        type=_whole_number(0, 10_000),
+        metavar="BPS",
+        help=(
+            "How many of every 10000 granted calls still go to a person, chosen by the "
+            "call's identity (default: the application's rate)."
+        ),
+    )
+    remember.add_argument(
+        "--justification",
+        help="Why the approval is remembered, recorded on the grant.",
+    )
+    remember.add_argument(
+        "--pin",
+        action="append",
+        metavar="PATH",
+        help=(
+            "For a grant that covers any call to the tool: an argument path that must keep "
+            "the value it has on this call. Repeat it for several."
+        ),
+    )
+
+
+def _grant_request(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The grant `cayu inbox approve --remember` asks for, or None without --remember."""
+
+    given = [
+        "--" + name.replace("_", "-")
+        for name in _GRANT_OPTIONS
+        if getattr(args, name, None) is not None
+    ]
+    if not getattr(args, "remember", False):
+        if given:
+            raise ValueError(f"{', '.join(given)} applies with --remember.")
+        return None
+    if args.as_subject is not None:
+        raise ValueError(
+            "--remember can't be combined with --as: a person's own inbox serves no grants. "
+            "Name who you are with --reviewer instead."
+        )
+    if args.claim_task or args.adopt_profile:
+        raise ValueError(
+            "--remember can't be combined with --claim-task or --adopt-profile: a grant is "
+            "made from an approval of the session's own, under its current profile."
+        )
+    grant: dict[str, Any] = {"scope": args.scope or "session"}
+    if args.expires_in_seconds is not None:
+        grant["expires_in_seconds"] = args.expires_in_seconds
+    if args.sample_rate_bps is not None:
+        grant["sampled_review_rate_bps"] = args.sample_rate_bps
+    if args.justification is not None:
+        grant["justification"] = args.justification
+    if args.pin:
+        grant["pinned_argument_paths"] = list(args.pin)
+    return grant
+
+
 def _add_review_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--purpose",
@@ -406,6 +496,9 @@ async def _run(args: argparse.Namespace) -> int:
             raise ValueError("Name the item with ITEM_ID or its session with --session.")
         if getattr(args, "adopt_profile", False) and reason is None:
             raise ValueError("--adopt-profile needs --reason, recorded with the adoption.")
+        if args.inbox_command == "approve":
+            # Before the application is opened: a wrong combination changes nothing.
+            _grant_request(args)
         async with _inbox(args) as inbox:
             if args.inbox_command == "list":
                 return await _list(args, inbox)
@@ -430,7 +523,9 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 @asynccontextmanager
-async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
+async def _inbox(
+    args: argparse.Namespace, *, command: str = "cayu inbox"
+) -> AsyncIterator[InboxClient]:
     if args.application is not None:
         from cayu.cli.cloud import cloud_client, resolve_application_id
 
@@ -438,7 +533,7 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
         application_id = await asyncio.to_thread(resolve_application_id, client, args.application)
         yield CloudInbox(client, application_id)
         return
-    project = resolve_project(args.target, command="cayu inbox")
+    project = resolve_project(args.target, command=command)
     with project_context(project.root):
         # A project's public service gives the sessions it started their continuation
         # policies, so its sessions are continued as `cayu serve` continues them.
@@ -452,7 +547,7 @@ async def _inbox(args: argparse.Namespace) -> AsyncIterator[InboxClient]:
             if service is None
             else service.cayu_app
         )
-        deciding = args.inbox_command in _CONTINUING
+        deciding = getattr(args, "inbox_command", None) in _CONTINUING
         local: LocalInbox | None = None
         try:
             as_subject = args.as_subject
@@ -756,7 +851,12 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
         reference = await _decision_reference(args, inbox, item, decision)
         if reference is not None:
             body["review_reference"] = reference
-    answer = await inbox.settle(args.item_id, body)
+    grant = _grant_request(args) if decision == "approve" else None
+    answer = (
+        await inbox.settle(args.item_id, body)
+        if grant is None
+        else await inbox.settle_with_grant(args.item_id, item, body, grant)
+    )
     settled: dict[str, Any] = answer["item"] if isinstance(answer.get("item"), dict) else {}
     recorded = settled.get("settlement")
     if settled.get("status") != "settled" or not isinstance(recorded, dict):
@@ -785,6 +885,7 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
                 "replayed": answer.get("replayed") is True,
                 "item": settled,
                 "session_status": session_status,
+                **({} if grant is None else {"grant": answer.get("grant")}),
             }
         )
         return 0
@@ -795,6 +896,8 @@ async def _decide(args: argparse.Namespace, inbox: InboxClient) -> int:
     ]
     again = " (already recorded)" if answer.get("replayed") is True else ""
     print(f"{done} {args.item_id}{again}" + (f" as {_plain(who)}." if who else "."))
+    if grant is not None:
+        print(_remembered(answer.get("grant")))
     if session_status is not None:
         print(f"Session {_plain(item.get('session_id'))} is {session_status}.")
     return 0
@@ -1098,6 +1201,44 @@ def _render_error(
         )
 
 
+def _remembered(view: Any) -> str:
+    """What `cayu inbox approve --remember` says about the grant it made."""
+
+    grant = view.get("grant") if isinstance(view, dict) else None
+    if not isinstance(grant, dict):
+        return (
+            "The approval was recorded, but its grant couldn't be read back. "
+            "List the application's grants with `cayu grants list`."
+        )
+    scope = grant.get("scope")
+    where = (
+        f"{_plain(scope.get('kind'))} {_plain(scope.get('id'))}"
+        if isinstance(scope, dict)
+        else "an unknown scope"
+    )
+    expires = grant.get("expires_at")
+    return (
+        f"Remembered as grant {_plain(grant.get('grant_id'))} "
+        f"({_plain(view.get('effective_status'))}): {_plain(grant.get('tool_name'))} in {where}, "
+        + (f"until {_plain(expires)}." if expires else "until it is revoked.")
+    )
+
+
+def _whole_number(minimum: int, maximum: int, *, noun: str = "value") -> Callable[[str], int]:
+    """An option's whole number from ``minimum`` to ``maximum``."""
+
+    def number(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"the {noun} must be a whole number.") from None
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(f"the {noun} must be {minimum} to {maximum}.")
+        return parsed
+
+    return number
+
+
 def _positive_seconds(value: str) -> float:
     try:
         seconds = float(value)
@@ -1119,16 +1260,7 @@ def _record_time(value: str) -> datetime:
 def _limit(maximum: int) -> Callable[[str], int]:
     """An option's limit: a whole number from 1 to ``maximum``."""
 
-    def limit(value: str) -> int:
-        try:
-            number = int(value)
-        except ValueError:
-            raise argparse.ArgumentTypeError("the limit must be a whole number.") from None
-        if not 1 <= number <= maximum:
-            raise argparse.ArgumentTypeError(f"the limit must be 1 to {maximum}.")
-        return number
-
-    return limit
+    return _whole_number(1, maximum, noun="limit")
 
 
 def _wait_seconds(value: str) -> float:

@@ -279,6 +279,37 @@ caller was shown, as every approval there does: without it, or with another
 caller's, the route answers 403 and stages nothing. The router can also be mounted in your own FastAPI application with
 `server.router(auth=...)`.
 
+## From the command line
+
+`cayu inbox approve --remember` approves a pending call and remembers it, and
+`cayu grants` reads and revokes what was remembered:
+
+```console
+$ cayu inbox approve inbox_... --remember --justification "Approved unchanged all month."
+$ cayu inbox approve inbox_... --remember --scope workspace --expires-in-seconds 604800
+$ cayu grants list --status active
+$ cayu grants show tag_...
+$ cayu grants uses tag_...
+$ cayu grants revoke tag_... --reason "Sampled reviews were corrected."
+```
+
+`--remember` takes `--scope session` (the default) or `workspace`,
+`--expires-in-seconds`, `--sample-rate-bps`, `--justification` and, for a grant
+that covers any call to the tool, `--pin PATH` for each argument that must keep
+its value. It goes through the same review as a plain approval: where the
+application has a human-review policy, the decision carries the review you were
+shown. It can't be combined with `--claim-task` or `--adopt-profile`.
+
+Without `--application` the commands open the project's application in this
+process, as `cayu inbox` does, and act as `--reviewer SUBJECT` (your local user
+by default); the application's grant authority decides whether that subject may
+create or revoke a grant. With `--application NAME` they ask that Cayu Cloud
+Agent with your `cayu cloud login`, and the Agent records you. An application
+that hosts no grants answers `grants_not_served`. `list` prints one page and,
+when more are left, the `--after-created-at` and `--after-grant-id` to go on
+with; `uses` prints the next `--cursor`. `--json` prints the routes' own
+documents.
+
 ## Minimal consumer example
 
 ```python

@@ -176,12 +176,18 @@ cayu inbox show ITEM_ID --application support-bot --context PATH
 cayu inbox approve ITEM_ID --application support-bot --context PATH --reason "..."
 cayu inbox deny ITEM_ID --application support-bot --context PATH --reason "..."
 cayu inbox answer ITEM_ID "TEXT" --application support-bot --context PATH
+cayu inbox approve ITEM_ID --remember --application support-bot --context PATH
+cayu grants list --application support-bot --context PATH
+cayu grants revoke GRANT_ID --application support-bot --context PATH --reason "..."
 ```
 
 The inbox holds what the Agent waits on a person for: tool approvals, questions, recovery
 items and knowledge proposals. Approving runs the tool call the Agent proposed, so approve,
 deny, answer or dismiss only what the person has decided; run `inbox show` first, since a
-decision is bound to the review it issues.
+decision is bound to the review it issues. `approve --remember` also makes a grant: later
+calls of the same kind run without asking, until `cayu grants revoke`. Remember an approval
+only when the person asked for exactly that, and say what the grant covers
+(`cayu grants show`). An Agent whose Release hosts no grants answers `grants_not_served`.
 
 ## 4. Before and after a change
 

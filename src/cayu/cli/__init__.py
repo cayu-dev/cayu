@@ -41,6 +41,7 @@ def _command_specs() -> tuple[
         run_execution_profile,
     )
     from cayu.cli.generate import add_generate_parser, run_generate
+    from cayu.cli.grants import add_grants_parser, run_grants
     from cayu.cli.guide import add_guide_parser, run_guide
     from cayu.cli.inbox import add_inbox_parser, run_inbox
     from cayu.cli.inspect import add_inspect_parser, run_inspect
@@ -75,6 +76,7 @@ def _command_specs() -> tuple[
         ("eval", add_eval_parser, run_eval_command),
         ("execution-profile", add_execution_profile_parser, run_execution_profile),
         ("generate", add_generate_parser, run_generate),
+        ("grants", add_grants_parser, run_grants),
         ("guide", add_guide_parser, run_guide),
         ("inbox", add_inbox_parser, run_inbox),
         ("inspect", add_inspect_parser, run_inspect),

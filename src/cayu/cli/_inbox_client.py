@@ -14,11 +14,18 @@ The commands use one ``InboxClient`` and never build requests themselves. There 
 Both return the Runtime's own documents: inbox items, item states, and the
 ``HumanReviewView`` the application's human-review policy builds for the caller. The
 review is the only place arguments appear, and only the ones that policy shows.
+
+Both also carry tool authorization grants (``docs/tool-authorization-grants.md``):
+approving a pending call and remembering it, and listing, reading and revoking the
+grants of an application that hosts them. ``LocalInbox`` serves the grant routes
+``cayu serve`` mounts, in this process; ``CloudInbox`` asks Cayu Cloud, which carries
+each request to the Agent as the signed-in person.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -171,6 +178,32 @@ class InboxClient(Protocol):
         """Wait for work the decision continues in this process; the session's status then."""
         ...
 
+    async def settle_with_grant(
+        self, item_id: str, item: dict[str, Any], body: dict[str, Any], grant: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Approve the pending call and remember it: ``{"replayed", "item", "grant"}``.
+
+        ``grant`` is the request (scope, lifetime, sampled-review rate); the answer's
+        ``grant`` is the grant's view, or ``None`` when it couldn't be read back.
+        """
+        ...
+
+    async def grants(self, query: dict[str, Any]) -> dict[str, Any]:
+        """One page of grants the caller may read: ``{"grants", "next"}``."""
+        ...
+
+    async def grant(self, grant_id: str) -> dict[str, Any]:
+        """One grant's view, with its status as of now."""
+        ...
+
+    async def grant_uses(self, grant_id: str, *, limit: int, cursor: str | None) -> dict[str, Any]:
+        """One page of the calls a grant decided: ``{"uses", "next_cursor"}``."""
+        ...
+
+    async def revoke_grant(self, grant_id: str, *, reason: str | None) -> dict[str, Any]:
+        """Revoke a grant; its view afterwards."""
+        ...
+
 
 def _refusal(status_code: int, body: Any) -> InboxClientError:
     """The Runtime's or Cloud's refusal, with its code, message and the item's state."""
@@ -194,6 +227,28 @@ def _refusal(status_code: int, body: Any) -> InboxClientError:
         status_code, f"http_{status_code}"
     )
     return InboxClientError(code, message, status_code=status_code)
+
+
+_GRANTS = "/tool-authorization-grants"
+
+
+def grants_not_served(where: str) -> InboxClientError:
+    what = "This Agent's Release" if where == "cloud" else "This application"
+    return InboxClientError(
+        "grants_not_served",
+        f"{what} doesn't serve tool authorization grants, so an approval can't be "
+        "remembered and there are none to list. An application serves them once its "
+        "factory calls app.host_tool_authorization_grants(...).",
+    )
+
+
+def _grant_refusal(exc: InboxClientError) -> InboxClientError:
+    """A grant route's refusal under its own code, with the route's own words."""
+
+    code = {"item_not_found": "grant_not_found", "forbidden": "grant_forbidden"}.get(
+        exc.code, "grant_refused" if exc.code == "http_409" else exc.code
+    )
+    return InboxClientError(code, str(exc), status_code=exc.status_code, item=exc.item)
 
 
 class LocalInbox:
@@ -271,6 +326,18 @@ class LocalInbox:
                     openapi_url=None,
                     continuation_loop_policy_provider=continuation_loop_policies,
                 )
+            )
+        hosting = app._tool_authorization_grant_hosting
+        #: Whether this application hosts its grants; `--as` reads a person's own inbox only.
+        self.grants_served = hosting is not None and not scoped
+        if hosting is not None and not scoped:
+            from cayu.server.authorization_grants import ToolAuthorizationGrantServer
+
+            api.include_router(
+                ToolAuthorizationGrantServer(
+                    hosting.service, authorize_read=hosting.authorize_read
+                ).router(auth=lambda _request: identity),
+                prefix="/api",
             )
         self._http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api), base_url="http://cayu.local"
@@ -374,6 +441,102 @@ class LocalInbox:
                 return status if isinstance(status, str) else None
             await asyncio.sleep(_CONTINUATION_POLL_SECONDS)
 
+    def _require_grants(self) -> None:
+        if not self.grants_served:
+            raise grants_not_served(self.where)
+
+    async def settle_with_grant(
+        self, item_id: str, item: dict[str, Any], body: dict[str, Any], grant: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Approve through the grant route. Its stream ends when the session pauses or
+        ends, which is the work the decision continues here, so the wait is bounded."""
+
+        self._require_grants()
+        session_id = str(item.get("session_id"))
+        pending = await self._json(
+            "GET", "/pending-actions", params={"session_id": session_id, "limit": 200}
+        )
+        action = next(
+            (
+                row
+                for row in pending.get("actions", [])
+                if isinstance(row, dict)
+                and row.get("kind") == "tool_approval"
+                and row.get("attention_id") == item.get("attention_id")
+                and all(
+                    isinstance(row.get(key), str)
+                    for key in ("approval_id", "round_id", "tool_call_id")
+                )
+            ),
+            None,
+        )
+        if action is None:
+            raise InboxClientError(
+                "not_pending",
+                "This approval is no longer waiting, so there is nothing to remember.",
+            )
+        payload = {
+            "session_id": session_id,
+            "approval_id": action["approval_id"],
+            "tool_round_id": action["round_id"],
+            "tool_call_id": action["tool_call_id"],
+            "grant": grant,
+            **{key: body[key] for key in ("reason", "review_reference") if key in body},
+        }
+        if self._wait_seconds is not None and self._wait_deadline is None:
+            self._wait_deadline = self._monotonic() + self._wait_seconds
+        grant_id: str | None = None
+        try:
+            response = await asyncio.wait_for(
+                self._http.post("/api" + _GRANTS + "/approve", json=payload),
+                timeout=self.remaining_wait_seconds(),
+            )
+        except TimeoutError:
+            # The approval was accepted or refused before the wait ran out only if the
+            # item says so; the session is stopped when the application closes.
+            response = None
+        if response is not None:
+            if not 200 <= response.status_code < 300:
+                try:
+                    refused = response.json()
+                except ValueError:
+                    refused = None
+                raise _grant_refusal(_refusal(response.status_code, refused))
+            from cayu.server.authorization_grants import GRANT_ID_HEADER
+
+            grant_id = response.headers.get(GRANT_ID_HEADER)
+        view = None
+        if grant_id is not None:
+            with contextlib.suppress(InboxClientError):
+                view = await self.grant(grant_id)
+        return {"replayed": False, "item": await self.item(item_id), "grant": view}
+
+    async def _grant_json(self, method: str, path: str, **options: Any) -> dict[str, Any]:
+        self._require_grants()
+        try:
+            return await self._json(method, _GRANTS + path, **options)
+        except InboxClientError as exc:
+            raise _grant_refusal(exc) from None
+
+    async def grants(self, query: dict[str, Any]) -> dict[str, Any]:
+        return await self._grant_json("GET", "", params=query)
+
+    async def grant(self, grant_id: str) -> dict[str, Any]:
+        return await self._grant_json("GET", f"/{quote(grant_id, safe='')}")
+
+    async def grant_uses(self, grant_id: str, *, limit: int, cursor: str | None) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        return await self._grant_json("GET", f"/{quote(grant_id, safe='')}/uses", params=params)
+
+    async def revoke_grant(self, grant_id: str, *, reason: str | None) -> dict[str, Any]:
+        return await self._grant_json(
+            "POST",
+            f"/{quote(grant_id, safe='')}/revoke",
+            payload={} if reason is None else {"reason": reason},
+        )
+
     def remaining_wait_seconds(self) -> float | None:
         """What is left of ``wait_seconds`` since the first wait began; ``None`` without one."""
 
@@ -403,6 +566,7 @@ class CloudInbox:
         self._client = client
         self._application_id = application_id
         self._base = f"/v1/applications/{quote(application_id, safe='')}/inbox"
+        self._grants = f"/v1/applications/{quote(application_id, safe='')}{_GRANTS}"
         self._idempotency_key = idempotency_key
 
     def _request(self, method: str, path: str, **options: Any) -> dict[str, Any]:
@@ -670,6 +834,68 @@ class CloudInbox:
         # The Agent continues on its own service.
         return None
 
+    async def settle_with_grant(
+        self, item_id: str, item: dict[str, Any], body: dict[str, Any], grant: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Cloud finds the pending call and sends the Agent's grant route the decision."""
+
+        try:
+            answer = await asyncio.to_thread(
+                self._request,
+                "POST",
+                f"/{quote(item_id, safe='')}/settle",
+                payload={**body, "grant": grant},
+                idempotency_key=self._idempotency_key(),
+            )
+        except InboxClientError as exc:
+            if exc.code == "review_reference_unsupported":
+                raise _review_unsupported() from None
+            raise
+        view = answer.get("grant")
+        return {
+            "replayed": answer.get("replayed") is True,
+            "item": answer.get("item"),
+            "grant": view if isinstance(view, dict) else None,
+        }
+
+    def _grant_request(self, method: str, path: str, **options: Any) -> dict[str, Any]:
+        try:
+            return self._cloud(method, self._grants + path, **options)
+        except InboxClientError as exc:
+            if exc.code == "http_404" and not path:
+                # The listing always answers on a Cloud that has these routes.
+                raise _grants_unsupported() from None
+            raise
+
+    async def grants(self, query: dict[str, Any]) -> dict[str, Any]:
+        sent = {
+            key: [str(item) for item in value] if isinstance(value, list) else str(value)
+            for key, value in query.items()
+        }
+        answer = await asyncio.to_thread(self._grant_request, "GET", "", query=sent)
+        if answer.get("served") is False:
+            raise grants_not_served(self.where)
+        return answer
+
+    async def grant(self, grant_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._grant_request, "GET", f"/{quote(grant_id, safe='')}")
+
+    async def grant_uses(self, grant_id: str, *, limit: int, cursor: str | None) -> dict[str, Any]:
+        query = {"limit": str(limit)}
+        if cursor is not None:
+            query["cursor"] = cursor
+        return await asyncio.to_thread(
+            self._grant_request, "GET", f"/{quote(grant_id, safe='')}/uses", query=query
+        )
+
+    async def revoke_grant(self, grant_id: str, *, reason: str | None) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._grant_request,
+            "POST",
+            f"/{quote(grant_id, safe='')}/revoke",
+            payload={} if reason is None else {"reason": reason},
+        )
+
 
 def _cloud_refusal(exc: CloudApiError) -> InboxClientError:
     body = exc.body or {}
@@ -682,6 +908,8 @@ def _cloud_refusal(exc: CloudApiError) -> InboxClientError:
         path == "body.profile_adoption" for path, _ in exc.rejected_fields
     ):
         code = "profile_adoption_unsupported"
+    elif exc.status_code == 422 and any(path == "body.grant" for path, _ in exc.rejected_fields):
+        return _grants_unsupported()
     elif exc.code is not None:
         code = exc.code
     elif exc.status_code is not None:
@@ -693,6 +921,13 @@ def _cloud_refusal(exc: CloudApiError) -> InboxClientError:
         str(exc),
         status_code=exc.status_code,
         item=item if isinstance(item, dict) else None,
+    )
+
+
+def _grants_unsupported() -> InboxClientError:
+    return InboxClientError(
+        "grants_unsupported",
+        "This Cayu Cloud can't remember an approval or read an Agent's grants yet.",
     )
 
 

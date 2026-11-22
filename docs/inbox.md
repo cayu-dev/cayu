@@ -582,6 +582,7 @@ $ cayu inbox approve --session invoice-7 --reason "Checked."
 $ cayu inbox answer inbox_... "Week of 17 November"
 $ cayu inbox answer --session auditor-visit --option 1
 $ cayu inbox list --as alice
+$ cayu inbox approve inbox_... --remember
 ```
 
 `dismiss` takes recovery items, approvals and questions, as described above.
@@ -592,6 +593,9 @@ continues the session in this process like an approval does. A question asked un
 the demonstration provider (`cayu session start --scripted-tool-call ask_user=...`)
 continues with its canned replies, since the local inbox registers it as
 `cayu serve --dev` does.
+`approve --remember` also remembers the approval as a
+[tool authorization grant](tool-authorization-grants.md#from-the-command-line), so
+later calls of the same kind run without asking; `cayu grants` lists and revokes them.
 Locally, `--as SUBJECT` reads and decides through
 `app.access(SUBJECT).inbox`, so a developer sees exactly what alice sees and her
 decisions are recorded as hers; the application needs a resource access policy.
