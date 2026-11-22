@@ -1079,10 +1079,15 @@ So agents should take their `ExecutionRequirements` from
 `options` are keyed by backend name: `DockerCodingBackendOptions` (image
 identity, architecture, restrictions, transfer limits, `cancel_timeout_s`) and
 `BrokeredCodingBackendOptions` (image, lease, transfer limits; built from the
-`CAYU_CLOUD_*` variables when omitted). Brokered sandboxes always run with
-`egress="none"`, since the toolchain profile prohibits the network; the
-backend refuses `CAYU_CLOUD_SANDBOX_EGRESS` set to anything else and
-`CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`.
+`CAYU_CLOUD_*` variables when omitted). The broker client a
+`BrokeredCodingBackendOptions(broker=...)` passes in stays open for its owner
+to close. Without one the backend makes a client, shares it between the
+workspaces it serves, and closes it once all their factories have closed their
+idle resources, which `app.aclose()` does for the factories registered with the
+app; a factory dropped without closing doesn't keep it open. Brokered
+sandboxes always run with `egress="none"`, since the toolchain profile
+prohibits the network; the backend refuses `CAYU_CLOUD_SANDBOX_EGRESS` set to
+anything else and `CAYU_CLOUD_SANDBOX_EGRESS_HOSTS`.
 
 `register_coding_environment` can be called once per workspace, for example
 for each clone a parallel worker edits; `RunRequest.environment_name` then

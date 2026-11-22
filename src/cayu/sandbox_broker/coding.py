@@ -834,6 +834,8 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
         self.reuse_pool = reuse_pool
         self._pool = BrokeredSandboxPool() if reuse_pool is None else reuse_pool
         self._reuse_closed = False
+        # Set only by the Cayu Cloud coding backend, for a broker client it made.
+        self._backend_broker: _BackendBroker | None = None
         owned_sandbox_exclusions = tuple(sandbox_excluded_directory_names)
         names = {
             name.casefold(): name
@@ -1209,10 +1211,17 @@ class BrokeredSandboxCodingEnvironmentFactory(EnvironmentFactory):
                 await self._destroy_idle(entry)
 
     async def close_idle_resources(self) -> None:
-        """Destroy the sandboxes waiting for reuse, and keep none from now on."""
+        """Destroy the sandboxes waiting for reuse, and keep none from now on.
+
+        The ``broker`` passed in stays open for its owner. A broker client the
+        Cayu Cloud coding backend made is closed here once every factory
+        built on it has closed.
+        """
 
         self._reuse_closed = True
         await self.release_idle_resources()
+        if self._backend_broker is not None:
+            await self._backend_broker.factory_closed(self)
 
     def _reuse_key(self, request: EnvironmentFactoryRequest) -> tuple[str, str, str] | None:
         """Which idle sandboxes ``request``'s session may take and leave, or ``None`` for none."""
@@ -1769,8 +1778,10 @@ class BrokeredCodingBackendOptions:
     the network, so an allowlist isn't offered here. ``image`` names the
     catalog entry, or the image a broker builds for the application (for
     example ``"release"``). ``broker`` reuses
-    an existing client; otherwise one is made from the ``CAYU_CLOUD_*``
-    variables and shared by every workspace the backend serves.
+    an existing client, which stays open for its owner to close; otherwise one
+    is made from the ``CAYU_CLOUD_*`` variables, shared by every workspace the
+    backend serves, and closed once each of their factories has closed, as an
+    app's ``aclose()`` closes the factories registered with it.
     """
 
     image: str = DEFAULT_IMAGE
@@ -1837,6 +1848,34 @@ class BrokeredCodingBackendOptions:
         )
 
 
+class _BackendBroker:
+    """A broker client the Cayu Cloud coding backend made, and the factories built on it.
+
+    The client closes once every factory still alive has closed its idle
+    resources, which an app's ``aclose()`` does for the factories registered
+    with it. Factories are held weakly, so one dropped without closing (an
+    unregistered environment) doesn't keep the client open. Copies made by
+    ``with_source_workspace`` aren't tracked: they share the client while their
+    original lives.
+    """
+
+    def __init__(self, client: SandboxBrokerClient) -> None:
+        self.client = client
+        self._open: weakref.WeakSet[BrokeredSandboxCodingEnvironmentFactory] = weakref.WeakSet()
+
+    def track(self, factory: BrokeredSandboxCodingEnvironmentFactory) -> None:
+        factory._backend_broker = self
+        self._open.add(factory)
+
+    async def factory_closed(self, factory: BrokeredSandboxCodingEnvironmentFactory) -> None:
+        if factory not in self._open:
+            return  # Closed already.
+        if len(self._open) == 1:
+            # Forgotten only once closed, so a close that failed is retried.
+            await self.client.aclose()
+        self._open.discard(factory)
+
+
 def brokered_coding_backend(context: Any) -> Any:
     """Build the ``cayu-cloud`` coding backend from a ``CodingBackendContext``."""
 
@@ -1859,7 +1898,12 @@ def brokered_coding_backend(context: Any) -> Any:
         profile, egress="none", setup_commands=(), workspace_setup_commands=()
     )
     # One client for every workspace of this process: it holds the broker's connections.
-    broker = options.broker or SandboxBrokerClient.from_env(context.environ)
+    # A client passed in stays with its owner; one made here closes with its factories.
+    broker = options.broker
+    owned = None
+    if broker is None:
+        broker = SandboxBrokerClient.from_env(context.environ)
+        owned = _BackendBroker(broker)
 
     def build_factory(
         source_workspace: LocalWorkspace,
@@ -1870,7 +1914,7 @@ def brokered_coding_backend(context: Any) -> Any:
     ) -> BrokeredSandboxCodingEnvironmentFactory:
         # The artifact store is registered with the app; sandboxes never hold it.
         del artifact_store
-        return BrokeredSandboxCodingEnvironmentFactory(
+        factory = BrokeredSandboxCodingEnvironmentFactory(
             broker=broker,
             source_workspace=source_workspace,
             egress="none",
@@ -1887,6 +1931,9 @@ def brokered_coding_backend(context: Any) -> Any:
             knowledge_store=knowledge_store,
             knowledge_access_scope=knowledge_access_scope,
         )
+        if owned is not None:
+            owned.track(factory)
+        return factory
 
     return CodingBackend(
         name=CLOUD_CODING_BACKEND,

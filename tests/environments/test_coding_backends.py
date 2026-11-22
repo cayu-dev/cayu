@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import logging
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from cayu.sandbox_broker.client import (
     BROKER_API_URL_ENV,
     BROKER_APPLICATION_ID_ENV,
     BROKER_TOKEN_ENV,
+    SandboxBrokerClient,
 )
 from cayu.storage import (
     InMemoryKnowledgeStore,
@@ -424,6 +426,163 @@ def test_a_session_started_on_one_backend_is_not_resumed_on_another(tmp_path: Pa
     assert len(broker.sandboxes) == 1
     # The factories' identities differ, so the execution profile no longer matches.
     assert "execution_environment" in str(refused)
+
+
+class _CloseSpy:
+    """Counts a broker client's closes, which still close it."""
+
+    def __init__(self, client: SandboxBrokerClient) -> None:
+        self.client = client
+        self.closes = 0
+        self._close = client.aclose
+
+    async def __call__(self) -> None:
+        self.closes += 1
+        await self._close()
+
+    @property
+    def connected(self) -> bool:
+        return self.client._client is not None
+
+
+def _cloud_app_with_two_workspaces(
+    tmp_path: Path, backend: CodingBackend
+) -> tuple[CayuApp, list[BrokeredSandboxCodingEnvironmentFactory]]:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        ),
+        default=True,
+    )
+    factories = []
+    for index in range(2):
+        root = tmp_path / f"slot-{index}"
+        root.mkdir()
+        (root / "README.md").write_text("project\n", encoding="utf-8")
+        factory = register_coding_environment(
+            app,
+            name=f"slot-{index}",
+            backend=backend,
+            source_workspace=LocalWorkspace(root, workspace_id=f"slot-{index}"),
+            default=index == 0,
+            execution_profile_identity=_IDENTITY,
+        )
+        assert isinstance(factory, BrokeredSandboxCodingEnvironmentFactory)
+        factories.append(factory)
+    app.register_agent(
+        AgentSpec(name="coder", model="scripted-model"),
+        tools=[],
+        execution_requirements=backend.execution_requirements(),
+    )
+    return app, factories
+
+
+async def _run_one_session(app: CayuApp) -> None:
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                session_id="coding", agent_name="coder", messages=[Message.text("user", "go")]
+            )
+        )
+    ]
+    assert events[-1].type is EventType.SESSION_COMPLETED, events[-1].payload
+
+
+def test_app_shutdown_closes_the_broker_client_the_cloud_backend_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBroker(tmp_path / "cloud")
+    made: list[_CloseSpy] = []
+
+    def from_env(environ: object = None) -> SandboxBrokerClient:
+        client = fake.client()
+        spy = _CloseSpy(client)
+        monkeypatch.setattr(client, "aclose", spy)
+        made.append(spy)
+        return client
+
+    monkeypatch.setattr(SandboxBrokerClient, "from_env", from_env)
+    backend = select_coding_backend(
+        toolchain_profile=CodingToolchainProfile(profile_id="close", revision="1"),
+        options={CLOUD_CODING_BACKEND: BrokeredCodingBackendOptions(git_baseline=False)},
+        environ=_CLOUD,
+    )
+    (spy,) = made
+    app, factories = _cloud_app_with_two_workspaces(tmp_path, backend)
+
+    async def scenario() -> None:
+        await _run_one_session(app)
+        assert spy.connected
+        # One workspace closing leaves the client to the other.
+        await factories[1].close_idle_resources()
+        assert (spy.closes, spy.connected) == (0, True)
+        outcome = await app.aclose()
+        assert outcome.settled, outcome.summary()
+        assert (spy.closes, spy.connected) == (1, False)
+        # Closing again is safe and leaves it closed.
+        assert (await app.aclose()).settled
+        await factories[0].close_idle_resources()
+        assert (spy.closes, spy.connected) == (1, False)
+
+    asyncio.run(scenario())
+    assert fake.live() == []
+
+
+def test_a_dropped_factory_does_not_keep_the_backends_client_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBroker(tmp_path / "cloud")
+    client = fake.client()
+    spy = _CloseSpy(client)
+    monkeypatch.setattr(client, "aclose", spy)
+    monkeypatch.setattr(SandboxBrokerClient, "from_env", lambda environ=None: client)
+    backend = select_coding_backend(
+        toolchain_profile=CodingToolchainProfile(profile_id="close", revision="1"),
+        environ=_CLOUD,
+    )
+    kept = backend.factory_for(_workspace(tmp_path, "kept"))
+    dropped = backend.factory_for(_workspace(tmp_path, "dropped"))
+    client._http()
+    # An environment unregistered without closing its factory.
+    del dropped
+    gc.collect()
+
+    asyncio.run(kept.close_idle_resources())
+    assert (spy.closes, spy.connected) == (1, False)
+
+
+def test_app_shutdown_leaves_an_injected_broker_client_open(tmp_path: Path) -> None:
+    fake = FakeBroker(tmp_path / "cloud")
+    client = fake.client()
+    spy = _CloseSpy(client)
+    client.aclose = spy  # type: ignore[method-assign]
+    backend = select_coding_backend(
+        toolchain_profile=CodingToolchainProfile(profile_id="close", revision="1"),
+        options={
+            CLOUD_CODING_BACKEND: BrokeredCodingBackendOptions(broker=client, git_baseline=False)
+        },
+        environ=_CLOUD,
+    )
+    app, factories = _cloud_app_with_two_workspaces(tmp_path, backend)
+
+    async def scenario() -> None:
+        await _run_one_session(app)
+        assert (await app.aclose()).settled
+        await factories[0].close_idle_resources()
+        assert (spy.closes, spy.connected) == (0, True)
+        # Its owner closes it.
+        await client.aclose()
+        assert not spy.connected
+
+    asyncio.run(scenario())
+    assert fake.live() == []
 
 
 def _workspace(tmp_path: Path, name: str) -> LocalWorkspace:
