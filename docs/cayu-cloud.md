@@ -29,7 +29,8 @@ top-level commands are:
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `platform` for [which Cayu Cloud revision runs and when it rolled out](#cloud-rollouts);
-- `init` and `deploy` for local project setup and publication;
+- `init` and `deploy` for local project setup and publication, and for
+  [deploying from a repository](#deploying-from-a-repository);
 - `deployment list|logs|status|timeline|wait|source|promote|discard|retry` and `rollback`
   for immutable releases, including [candidate releases](#candidate-releases) and
   [downloading a release's source](#downloading-a-releases-source);
@@ -680,6 +681,62 @@ be at the root of the upload, and Git must not ignore an untracked `uv.lock`.
 Files listed in `[tool.cayu.improvement] evaluator_only_paths` are uploaded for
 evaluation but kept out of the image the Agent runs.
 
+### Deploying from a repository
+
+`cayu cloud deploy OWNER/NAME` (or `https://github.com/OWNER/NAME`) has Cayu Cloud build the
+Agent from a GitHub repository instead of an upload. Cloud reads the repository through one
+of the Organization's GitHub App connections (see [Connections](#connections)), so nothing
+of it is read on this machine and a private repository needs no local GitHub login:
+
+```console
+cayu cloud deploy acme/support-desk
+cayu cloud deploy acme/support-desk --ref release-2026-11
+cayu cloud deploy acme/support-desk --revision 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
+cayu cloud deploy acme/agents --manifest-path desk/cayu-cloud.toml --connection acme-builds
+```
+
+- Cloud first reads the manifest at `--ref` (a branch, tag or commit; the repository's
+  default branch without one) or at the exact `--revision`, and the command prints the commit
+  it read. The deploy then builds exactly that commit, so a push in between changes nothing.
+  The Release records the commit with the `--ref` asked for as its label (none for a
+  `--revision` or the default branch), the connection and the manifest path (`source` in the
+  output).
+- On a Cayu Cloud with repository builds, the Agent is the one the manifest's `application`
+  names: the command creates it with the manifest's `name` when it doesn't exist.
+  `--application SLUG` doesn't choose another Agent there; it must match the manifest, or
+  nothing is deployed (`application_mismatch`).
+- Without `--application`, Cloud reads the repository only through a connection available to
+  every Agent. With it, an existing Agent's own connections count too, as they do for its
+  deploys.
+- `--manifest-path` selects a `cayu-cloud.toml` in a subdirectory; Cloud builds that
+  subdirectory. `--connection NAME` is needed only when more than one ready connection fits.
+- The command then follows the build and the rollout as `cayu cloud deploy .` does, with the
+  same acknowledgement, session and wait flags and the same output; `source` names the
+  repository instead of the uploaded bundle. `--no-promote` takes a local directory only.
+- Deploying a commit the Agent already has a Release of follows that Release, as a local
+  deploy of unchanged source does, adding any `--acknowledge-breaking` or session choice given
+  now. To build a new Release, push a new commit or change `version` in the manifest.
+
+A refusal is a `repository_deploy_refused` error with Cloud's `code` and the next step:
+
+| `code` | What to do |
+|---|---|
+| `connection_required` | Add a GitHub App connection installed on the repository (`cayu cloud connections add github-app ...`). When GitHub App connections exist but can't be used (listed in `connections`: not ready, or available only to some Agents), pass `--application AGENT` or make one available to every Agent. |
+| `connection_ambiguous` | Pass `--connection` with one of the names listed in `connections`. |
+| `application_mismatch` | Deploy to the Agent the manifest names (`application`), or change the manifest. |
+| `repository_not_installed` | Install the connection's GitHub App on the repository. |
+| `scope_not_allowed` | Give the GitHub App the Contents: read permission, then `cayu cloud connections check NAME`. |
+| `source_not_found` | Check the repository, `--ref` or `--revision`, and `--manifest-path`. |
+| `source_too_large` | Deploy a smaller subdirectory, or a checkout with `cayu cloud deploy .`. |
+| `source_fetch_timeout` | Run the same command again. |
+| `too_many_calls`, `too_many_previews` | Run the same command again after the wait Cloud gives (`Retry-After`), which the message names. |
+
+A Cayu Cloud without repository builds deploys an exact `--revision` as earlier releases of
+the CLI did: it reads the manifest with your own GitHub login (`gh`), deploys to the Agent the
+manifest names or the one `--application` selects instead, as `cayu cloud deploy .` does,
+and takes `--no-promote`. It refuses a ref or a named connection with
+`repository_build_unsupported` before anything is created.
+
 ### The release smoke test
 
 Before a Release can serve, Cloud starts each distinct process command (the
@@ -974,8 +1031,9 @@ on disk. Include the file in the selected source rather than bypassing preflight
 The CLI does not generate locks or change ignore rules during deployment.
 
 A successful wheel build does not prove the lockfile was uploaded or that the frozen
-Linux dependency installation will succeed. Remote Git sources are validated by Cloud
-after resolving the immutable revision; local preflight does not inspect remote content.
+Linux dependency installation will succeed. A repository source is read and validated by
+Cloud at the commit it resolves (see [Deploying from a repository](#deploying-from-a-repository));
+local preflight does not inspect remote content.
 
 Deploy verifies that the local evidence directory is writable before authentication or
 Cloud mutation. Deploy output and stored evidence replace every runtime `environment`

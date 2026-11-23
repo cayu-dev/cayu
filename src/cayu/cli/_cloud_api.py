@@ -253,6 +253,19 @@ _REPORTED_API_REFUSALS = frozenset(
         (503, "release_source_unavailable"),
         (503, "source_bundles_unavailable"),
         (504, "compass_outcome_unknown"),
+        # `cayu cloud deploy OWNER/NAME`: why Cloud couldn't build the Agent from the repository;
+        # the command adds the next step to each.
+        (409, "application_mismatch"),
+        (409, "release_exists"),
+        (413, "source_too_large"),
+        (422, "connection_ambiguous"),
+        (422, "connection_not_available"),
+        (422, "connection_required"),
+        (422, "connector_not_buildable"),
+        (422, "repository_not_installed"),
+        (422, "source_not_found"),
+        (429, "too_many_previews"),
+        (504, "source_fetch_timeout"),
     }
 )
 
@@ -300,6 +313,8 @@ class CloudApiError(RuntimeError):
         body: dict[str, Any] | None = None,
         transport_error: str | None = None,
         request: str | None = None,
+        retry_after: int | None = None,
+        validation_messages: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -320,6 +335,11 @@ class CloudApiError(RuntimeError):
         # Neither carries a credential or the exception's own text.
         self.transport_error = transport_error
         self.request = request
+        # For an HTTP 429: the seconds Cloud's `Retry-After` says to wait, when it gives them.
+        self.retry_after = retry_after
+        # For an HTTP 422 validation rejection: each error's message that passes the safe-text
+        # filter, such as "Value error, Give ref or revision, not both.". Callers opt in.
+        self.validation_messages = validation_messages
 
 
 # Most specific first: httpx's timeouts are transport errors too.
@@ -646,7 +666,19 @@ def _rejection(response: httpx.Response) -> CloudApiError:
         code=code,
         rejected_fields=_rejected_fields(response),
         body=None if code is None or structured is None else structured[1],
+        retry_after=_retry_after(response),
+        validation_messages=_validation_messages(response),
     )
+
+
+def _retry_after(response: httpx.Response) -> int | None:
+    """The whole seconds an HTTP 429's `Retry-After` asks to wait, within a day."""
+
+    value = response.headers.get("Retry-After", "") if response.status_code == 429 else ""
+    return int(value) if value.isdigit() and 0 < int(value) <= _MAX_RETRY_AFTER_SECONDS else None
+
+
+_MAX_RETRY_AFTER_SECONDS = 86_400
 
 
 def _bounded_error_response(response: httpx.Response) -> httpx.Response:
@@ -788,6 +820,21 @@ _REJECTED_FIELD_PART = re.compile(r"[A-Za-z0-9_]{1,64}")
 _REJECTED_FIELD_TYPE = re.compile(r"[a-z][a-z_]{0,63}")
 
 
+def _validation_errors(response: httpx.Response) -> list[dict[str, Any]]:
+    """The first errors of an HTTP 422 validation rejection (FastAPI's `detail` list)."""
+
+    if response.status_code != 422:
+        return []
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    errors = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(errors, list):
+        return []
+    return [error for error in errors[:_REJECTED_FIELD_LIMIT] if isinstance(error, dict)]
+
+
 def _rejected_fields(response: httpx.Response) -> tuple[tuple[str, str], ...]:
     """The request fields an HTTP 422 validation rejection names, with each error's type.
 
@@ -795,19 +842,9 @@ def _rejected_fields(response: httpx.Response) -> tuple[tuple[str, str], ...]:
     when every part of the location is a plain field name or index.
     """
 
-    if response.status_code != 422:
-        return ()
-    try:
-        payload = response.json()
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return ()
-    errors = payload.get("detail") if isinstance(payload, dict) else None
-    if not isinstance(errors, list):
-        return ()
+    errors = _validation_errors(response)
     fields: list[tuple[str, str]] = []
-    for error in errors[:_REJECTED_FIELD_LIMIT]:
-        if not isinstance(error, dict):
-            continue
+    for error in errors:
         location, kind = error.get("loc"), error.get("type")
         if (
             not isinstance(location, list)
@@ -822,6 +859,17 @@ def _rejected_fields(response: httpx.Response) -> tuple[tuple[str, str], ...]:
         ):
             fields.append((".".join(parts), kind))
     return tuple(fields)
+
+
+def _validation_messages(response: httpx.Response) -> tuple[str, ...]:
+    """The messages of an HTTP 422 validation rejection's errors, each bounded and filtered."""
+
+    errors = _validation_errors(response)
+    messages = (safe_text(error.get("msg"), _VALIDATION_MESSAGE_LIMIT) for error in errors)
+    return tuple(message for message in messages if message is not None)
+
+
+_VALIDATION_MESSAGE_LIMIT = 256
 
 
 def _plain_api_error_detail(response: httpx.Response) -> str | None:

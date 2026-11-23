@@ -185,14 +185,13 @@ def test_a_first_deploy_skips_the_check_and_a_candidate_lists_them_for_its_promo
 
     monkeypatch.setattr(deploy_tasks, "read_running_tasks", read)
     monkeypatch.setattr(cloud_cli, "_requested_candidate", lambda arguments: None)
-    project = SimpleNamespace(manifest=SimpleNamespace(runtime_payload=lambda: {"web": {}}))
     arguments = SimpleNamespace()
 
     first = cloud_cli._running_tasks_before_deploy(
         arguments,
         client=None,  # type: ignore[arg-type]
         application={"id": "scanner-agent", "current_deployment_id": None},
-        project=project,  # type: ignore[arg-type]
+        has_processes=True,
     )
     assert first is None and reads == []
 
@@ -201,7 +200,7 @@ def test_a_first_deploy_skips_the_check_and_a_candidate_lists_them_for_its_promo
         arguments,
         client=None,  # type: ignore[arg-type]
         application={"id": "scanner-agent", "current_deployment_id": "dep_1"},
-        project=project,  # type: ignore[arg-type]
+        has_processes=True,
     )
     assert candidate == {**report, "candidate": True}
     assert "Promoting this candidate later publishes it" in capsys.readouterr().err

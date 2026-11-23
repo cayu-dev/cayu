@@ -1629,6 +1629,116 @@ def resolve_project(
     )
 
 
+@dataclass(frozen=True)
+class RepositoryDeploySource:
+    """A GitHub repository Cayu Cloud builds the Agent from, through one of the Organization's
+    connections: Cloud resolves the ref, reads the manifest and keeps the source, so nothing of
+    the repository is read on this machine."""
+
+    # The canonical https://github.com/OWNER/NAME URL.
+    repository: str
+    # A branch, tag or commit Cloud resolves once (its default branch when neither this nor
+    # `revision` is given), or an exact 40-character commit.
+    ref: str | None
+    revision: str | None
+    connection: str | None
+    manifest_path: str
+
+    @property
+    def full_name(self) -> str:
+        return self.repository.removeprefix("https://github.com/")
+
+    def request_payload(self) -> dict[str, object]:
+        """What Cloud reads: the repository, the ref or commit, the manifest and connection."""
+
+        return {
+            "repository": self.full_name,
+            "manifest_path": self.manifest_path,
+            **({} if self.connection is None else {"connection": self.connection}),
+            **({} if self.ref is None else {"ref": self.ref}),
+            **({} if self.revision is None else {"revision": self.revision}),
+        }
+
+
+@dataclass(frozen=True)
+class RepositoryPreview:
+    """The manifest Cloud read from the repository before the deploy (`POST
+    /v1/repositories/manifest`): the Agent it deploys and the commit the deploy pins, so the
+    Release is built from exactly what was read."""
+
+    source: RepositoryDeploySource
+    application: str
+    name: str
+    version: str
+    # The commit the ref named, and the branch or tag read (null for a pinned commit).
+    revision: str
+    ref: str | None
+    connection: str
+
+    def deploy_payload(self) -> dict[str, object]:
+        """The `deployments/repository` request for the commit and connection read, with the
+        ref asked for, which Cloud records as the commit's label."""
+
+        return {
+            "repository": self.source.full_name,
+            "manifest_path": self.source.manifest_path,
+            "connection": self.connection,
+            "revision": self.revision,
+            **({} if self.source.ref is None else {"ref": self.source.ref}),
+        }
+
+
+def repository_deploy_source(
+    source: str,
+    *,
+    ref: str | None,
+    revision: str | None,
+    connection: str | None,
+    manifest_path: Path | None,
+) -> RepositoryDeploySource | None:
+    """The repository `cayu cloud deploy SOURCE` builds from, or None for a local directory or
+    a source that names no GitHub repository (which `resolve_project` refuses)."""
+
+    if Path(source).expanduser().exists():
+        if ref is not None or connection is not None:
+            raise CloudApiError(
+                "source_invalid",
+                "--ref and --connection are only valid for a repository source.",
+            )
+        return None
+    shorthand = source.split("/")
+    if (
+        len(shorthand) == 2
+        and _GITHUB_OWNER.fullmatch(shorthand[0]) is not None
+        and _GITHUB_REPOSITORY.fullmatch(shorthand[1]) is not None
+    ):
+        source = f"https://github.com/{source}"
+    elif not source.startswith(("https://github.com/", "git@github.com:")):
+        return None
+    repository = _canonical_github_repository(source)
+    if ref is not None and revision is not None:
+        raise CloudApiError("source_invalid", "Give --ref or --revision, not both.")
+    if revision is not None and _COMMIT.fullmatch(revision) is None:
+        raise CloudApiError(
+            "source_revision_invalid",
+            "--revision is an exact 40-character commit; give a branch or tag with --ref.",
+        )
+    selected = manifest_path or _ROOT_MANIFEST
+    if selected.is_absolute() or any(part in {".", ".."} for part in selected.parts):
+        raise CloudApiError(
+            "manifest_invalid",
+            "--manifest-path is a relative path inside the repository, such as "
+            "agents/desk/cayu-cloud.toml.",
+        )
+    return RepositoryDeploySource(
+        repository=repository,
+        ref=ref,
+        revision=revision,
+        connection=connection,
+        manifest_path=selected.as_posix(),
+    )
+
+
 def check_project_manifest(path: Path) -> ResolvedCloudProject:
     """Read ``path``'s cayu-cloud.toml exactly as `cayu cloud deploy` reads a local source.
 

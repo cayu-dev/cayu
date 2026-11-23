@@ -1303,6 +1303,15 @@ def test_cloud_deploy_is_implemented_by_the_core_package(
             self.wfile.write(payload)
 
         def do_POST(self) -> None:
+            if self.path == "/v1/repositories/manifest":
+                # A Cayu Cloud without repository builds.
+                missing = b'{"detail":"Not Found"}'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(missing)))
+                self.end_headers()
+                self.wfile.write(missing)
+                return
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length)) if length else None
             requests.append(("POST", self.path, body))
@@ -1825,6 +1834,15 @@ def test_cloud_deploy_starts_the_complete_application_after_promotion(
                 )
 
         def do_POST(self) -> None:
+            if self.path == "/v1/repositories/manifest":
+                # A Cayu Cloud without repository builds.
+                missing = b'{"detail":"Not Found"}'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(missing)))
+                self.end_headers()
+                self.wfile.write(missing)
+                return
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length)) if length else None
             requests.append(("POST", self.path, body))
@@ -3567,6 +3585,11 @@ def test_cloud_deploy_reports_redacted_source_authentication_failure(
             del params
             anonymous_requests.append((url, headers))
             return SimpleNamespace(status_code=404, content=b"")
+
+        def request(self, method: str, url: str, **_kwargs: object) -> httpx.Response:
+            # A Cayu Cloud without repository builds answers its preview with a bare 404.
+            assert (method, httpx.URL(url).path) == ("POST", "/v1/repositories/manifest")
+            return httpx.Response(404, json={"detail": "Not Found"})
 
     def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
         raise subprocess.CalledProcessError(1, command, stderr=f"credential={secret}")

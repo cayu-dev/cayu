@@ -78,10 +78,13 @@ from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
     CloudSourceInputsError,
+    RepositoryDeploySource,
+    RepositoryPreview,
     ResolvedCloudProject,
     check_project_manifest,
     initialize_project,
     is_application_slug,
+    repository_deploy_source,
     resolve_project,
     schedule_input_json,
     schedule_option,
@@ -920,6 +923,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
         exc,
         (
             _CloudDeployCheckError,
+            _CloudRepositoryRefusalError,
             AgentOrganizationError,
             CompassWriteError,
             CloudSettingsError,
@@ -1193,19 +1197,55 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "deploy",
         help="Publish an immutable Agent release.",
         description=(
-            "Publish and activate an immutable Agent release from a local directory or "
-            "repository, or stage it as a candidate release with --no-promote."
+            "Publish and activate an immutable Agent release from a local directory, or "
+            "stage it as a candidate release with --no-promote. A GitHub repository "
+            "(OWNER/NAME or its URL) is built by Cayu Cloud through one of the "
+            "Organization's GitHub App connections."
         ),
     )
-    deploy.add_argument("source", nargs="?", default=".")
-    deploy.add_argument("--manifest", type=Path)
-    deploy.add_argument("--revision")
+    deploy.add_argument(
+        "source",
+        nargs="?",
+        default=".",
+        help="A local directory (default .), or a GitHub repository as OWNER/NAME or its URL.",
+    )
+    deploy.add_argument(
+        "--manifest",
+        "--manifest-path",
+        dest="manifest",
+        type=Path,
+        help=(
+            "The cayu-cloud.toml to deploy, relative to the source (default cayu-cloud.toml); "
+            "in a repository, a path such as agents/desk/cayu-cloud.toml."
+        ),
+    )
+    deploy.add_argument(
+        "--ref",
+        help=(
+            "A repository's branch, tag or commit, which Cloud resolves once (default: the "
+            "repository's default branch)."
+        ),
+    )
+    deploy.add_argument(
+        "--revision",
+        help="A repository's exact 40-character commit, instead of --ref.",
+    )
+    deploy.add_argument(
+        "--connection",
+        metavar="NAME",
+        help=(
+            "The GitHub App connection Cloud reads the repository through; needed only when "
+            "more than one is available to the Agent."
+        ),
+    )
     deploy.add_argument(
         "--application",
         type=_application_slug,
         help=(
             "Create or update this application slug; defaults to the application "
-            "declared in cayu-cloud.toml."
+            "declared in cayu-cloud.toml. For a repository that a Cayu Cloud with repository "
+            "builds builds, the manifest's Agent is used and this must match it; an older "
+            "Cloud takes it as for a local directory."
         ),
     )
     deploy.add_argument(
@@ -2461,18 +2501,26 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
                 "result": recorder.show(arguments.evidence_id),
             }
         return {"operation": "evidence.verify", "result": recorder.verify()}
-    project: ResolvedCloudProject | None = None
+    project: ResolvedCloudProject | RepositoryDeploySource | RepositoryPreview | None = None
     deploy_check: dict[str, Any] | None = None
     if arguments.command == "deploy":
         recorder.preflight()
         if not arguments.no_wait:
             _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
-        project = resolve_project(
+        project = repository_deploy_source(
             arguments.source,
-            manifest_path=arguments.manifest,
+            ref=arguments.ref,
             revision=arguments.revision,
+            connection=arguments.connection,
+            manifest_path=arguments.manifest,
         )
-        deploy_check = _deploy_check(project, skip=arguments.skip_deploy_check)
+        if project is None:
+            project = resolve_project(
+                arguments.source,
+                manifest_path=arguments.manifest,
+                revision=arguments.revision,
+            )
+            deploy_check = _deploy_check(project, skip=arguments.skip_deploy_check)
     if arguments.command == "doctor":
         context_path = _selected_context_path(arguments.context)
         context = _read_context(context_path) if context_path is not None else {}
@@ -2518,6 +2566,9 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         context_path=selected_context,
         organization=arguments._cloud_organization,
     )
+    if isinstance(project, RepositoryDeploySource):
+        # Before any Agent is created or resolved: the Agent is the one the manifest names.
+        project = _repository_deploy_project(arguments, client=client, source=project)
     if arguments._cloud_change is None and arguments._cloud_organization is None:
         return _client_command(
             arguments, client=client, recorder=recorder, project=project, deploy_check=deploy_check
@@ -2537,7 +2588,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.command == "deploy" and agent is not None:
         assert project is not None
         note = remember_agent_home(
-            _agent_homes_directory(), agent, acting, name=project.manifest.name
+            _agent_homes_directory(), agent, acting, name=_deploy_target(arguments, project)[1]
         )
         if note is not None:
             response["warnings"] = [*response.get("warnings", []), note]
@@ -2558,7 +2609,7 @@ def _require_acting_organization(
 
 def _changed_agent(
     arguments: argparse.Namespace,
-    project: ResolvedCloudProject | None,
+    project: ResolvedCloudProject | RepositoryPreview | None,
     *,
     client: CloudApiClient,
     acting: Organization,
@@ -2575,7 +2626,7 @@ def _changed_agent(
         return None
     if arguments.command == "deploy":
         assert project is not None
-        reference = str(arguments.application or project.manifest.application)
+        reference = _deploy_target(arguments, project)[0]
     elif getattr(arguments, "application", None) is None:
         # A release named only by its id, which belongs to one Organization.
         return None
@@ -2631,7 +2682,7 @@ def _client_command(
     *,
     client: CloudApiClient,
     recorder: EvidenceRecorder,
-    project: ResolvedCloudProject | None,
+    project: ResolvedCloudProject | RepositoryPreview | None,
     deploy_check: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if arguments.command == "organizations":
@@ -3247,45 +3298,417 @@ def _deploy_check(project: ResolvedCloudProject, *, skip: bool) -> dict[str, Any
     return check.public_dict()
 
 
+def _deploy_target(
+    arguments: argparse.Namespace, project: ResolvedCloudProject | RepositoryPreview
+) -> tuple[str, str]:
+    """The slug of the Agent `deploy` creates or updates, and the name it creates it with: the
+    manifest's, which a repository's preview read in Cloud."""
+
+    if isinstance(project, RepositoryPreview):
+        return project.application, project.name
+    return str(arguments.application or project.manifest.application), project.manifest.name
+
+
+_PREVIEW = "/v1/repositories/manifest"
+_REPOSITORY_MANIFEST = "cayu-cloud.toml"
+
+
+def _repository_deploy_project(
+    arguments: argparse.Namespace, *, client: CloudApiClient, source: RepositoryDeploySource
+) -> ResolvedCloudProject | RepositoryPreview:
+    """What a repository deploy builds, asked of Cloud before any Agent is created or resolved.
+
+    Cloud reads the manifest at the ref (`POST /v1/repositories/manifest`), which names the
+    Agent and the commit the deploy then pins. A Cayu Cloud without repository builds answers
+    that route with a bare 404: it deploys an exact commit as it always has, from the manifest
+    read here with the person's own GitHub login.
+    """
+
+    # An Agent named with --application is read through as that Agent's deploy would be, so
+    # its connections count; one that doesn't exist yet can only be the manifest's.
+    named = arguments.application
+    existing = named is not None and any(
+        isinstance(item, dict) and item.get("id") == named
+        for item in client.request("GET", "/v1/applications").get("items", [])
+    )
+    try:
+        answer = client.request(
+            "POST",
+            _PREVIEW,
+            payload={**source.request_payload(), **({"application": named} if existing else {})},
+        )
+    except CloudApiError as exc:
+        # The framework's own answer for a route it doesn't have: exactly {"detail": "Not Found"}.
+        if exc.status_code == 404 and exc.code is None and exc.detail == "Not Found":
+            return _repository_project_on_older_cloud(source)
+        if (
+            Path(source.manifest_path).name != _REPOSITORY_MANIFEST
+            and exc.status_code == 422
+            and exc.code is None
+        ):
+            raise CloudCommandError(
+                "manifest_invalid",
+                "Cayu Cloud builds from a manifest named cayu-cloud.toml: give --manifest-path "
+                "as a relative path to one, such as agents/desk/cayu-cloud.toml.",
+            ) from exc
+        _raise_repository_refusal(exc, source=source, agent=named if existing else None)
+        raise
+    preview = _checked_preview(answer, source=source)
+    if _requested_candidate(arguments) is not None:
+        raise CloudCommandError(
+            "invalid_input",
+            "--no-promote stages a candidate from a local directory; Cayu Cloud publishes a "
+            "Release it builds from a repository. Deploy a checkout of the commit instead: "
+            "`cayu cloud deploy . --no-promote ...`.",
+        )
+    if named is not None and preview.application != named:
+        raise _CloudRepositoryRefusalError(
+            _application_mismatch(preview.application, named, source=source),
+            code="application_mismatch",
+            details={"application": preview.application},
+        )
+    ref = "" if preview.ref is None else f" ({preview.ref})"
+    print(
+        terminal_safe(
+            f"cayu cloud: Cayu Cloud read {source.manifest_path} in {source.full_name} at "
+            f"{preview.revision}{ref} through the {preview.connection} connection; it deploys "
+            f"{preview.application}."
+        ),
+        file=sys.stderr,
+    )
+    return preview
+
+
+def _checked_preview(
+    answer: dict[str, Any], *, source: RepositoryDeploySource
+) -> RepositoryPreview:
+    fields = {
+        key: answer.get(key)
+        for key in ("application", "name", "version", "revision", "ref", "connection")
+    }
+    if not (
+        all(
+            isinstance(value, str) or (key == "ref" and value is None)
+            for key, value in fields.items()
+        )
+        and is_application_slug(str(fields["application"]))
+        and re.fullmatch(r"[0-9a-f]{40}", str(fields["revision"])) is not None
+    ):
+        raise CloudApiError(
+            "api_response_invalid", "Cayu Cloud returned an invalid repository manifest."
+        )
+    return RepositoryPreview(
+        source=source,
+        application=str(fields["application"]),
+        name=str(fields["name"]),
+        version=str(fields["version"]),
+        revision=str(fields["revision"]),
+        ref=None if fields["ref"] is None else str(fields["ref"]),
+        connection=str(fields["connection"]),
+    )
+
+
+def _application_mismatch(
+    manifest_agent: str, named: str, *, source: RepositoryDeploySource
+) -> str:
+    return (
+        f"{source.manifest_path} in {source.full_name} deploys {manifest_agent}, not {named}, "
+        f"so nothing was deployed. Deploy it with --application {manifest_agent} or without "
+        "--application, or change the manifest's application."
+    )
+
+
+def _repository_project_on_older_cloud(source: RepositoryDeploySource) -> ResolvedCloudProject:
+    """The exact commit a Cayu Cloud without repository builds deploys, read here as before
+    with the person's own GitHub login; a ref or a named connection it can't take."""
+
+    if source.revision is None or source.connection is not None:
+        raise CloudCommandError(
+            "repository_build_unsupported",
+            "This Cayu Cloud can't build from a repository, so nothing was deployed. Deploy an "
+            "exact commit with --revision SHA and no --connection (its cayu-cloud.toml is read "
+            "with your GitHub login), or a checkout with `cayu cloud deploy .`.",
+        )
+    print(
+        "cayu cloud: This Cayu Cloud can't build from a repository; reading the manifest at "
+        "the commit with your GitHub login instead.",
+        file=sys.stderr,
+    )
+    return resolve_project(
+        source.repository, manifest_path=Path(source.manifest_path), revision=source.revision
+    )
+
+
+def _repository_idempotency_key(
+    *,
+    application_id: str,
+    preview: RepositoryPreview,
+    acknowledge_breaking: Sequence[int],
+    session_choice: dict[str, Any] | None,
+) -> str:
+    """The key of a repository build: the same commit, manifest and choices replay their
+    Release, as a local deploy of unchanged source does."""
+
+    identity = json.dumps(
+        [
+            application_id,
+            preview.source.full_name.lower(),
+            preview.connection,
+            preview.revision,
+            # The ref sent as the commit's label: another ref, or none, is another request.
+            preview.source.ref,
+            preview.source.manifest_path,
+            sorted(set(acknowledge_breaking)),
+            session_choice,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return "deploy-repository:" + hashlib.sha256(identity).hexdigest()
+
+
+def _submit_repository_build(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    preview: RepositoryPreview,
+    payload: dict[str, Any] | None,
+    idempotency_key: str,
+) -> tuple[dict[str, Any], bool]:
+    """Ask Cloud to build the Agent's Release from the previewed commit, and whether the
+    Release is one Cloud built from it before, taken up as a local deploy takes up its earlier
+    Release of the same source: `release_exists`, or a key an earlier request of that commit
+    used (an HTTP 409 with no code, or `idempotency_conflict`)."""
+
+    try:
+        release = client.request(
+            "POST",
+            f"/v1/applications/{application_id}/deployments/repository",
+            payload={**preview.deploy_payload(), **(payload or {})},
+            idempotency_key=idempotency_key,
+        )
+    except CloudApiError as exc:
+        key_reused = exc.status_code == 409 and exc.code in {None, "idempotency_conflict"}
+        if exc.code != "release_exists" and not key_reused:
+            _raise_repository_refusal(exc, source=preview.source, agent=application_id)
+            raise
+        version = (exc.body or {}).get("version")
+        existing = _deployment_matching(
+            client,
+            application_id=application_id,
+            matches=lambda item: item.get("version") == (version or preview.version),
+        )
+        if existing is None:
+            raise
+        return existing, True
+    return release, False
+
+
+def _repository_source_result(
+    release: dict[str, Any], *, preview: RepositoryPreview
+) -> dict[str, Any]:
+    """Where Cloud read a Release it built from a repository, as `deploy` reports it."""
+
+    # The Release's own record, which for a Release followed again (`release_exists`, or a
+    # replay) can differ from the preview: another connection or ref built that commit.
+    recorded = release.get("repository_source")
+    if recorded is None:
+        return _legacy_repository_source(release)
+    fields = (
+        {
+            key: recorded.get(key)
+            for key in ("archive_digest", "commit_sha", "connection", "manifest_path", "ref")
+        }
+        if isinstance(recorded, dict)
+        else {}
+    )
+    if not (
+        fields
+        and all(
+            isinstance(value, str) or (key == "ref" and value is None)
+            for key, value in fields.items()
+        )
+    ):
+        raise CloudApiError(
+            "api_response_invalid", "Cayu Cloud returned a repository Release without its source."
+        )
+    return {
+        "connection": fields["connection"],
+        "content_digest": fields["archive_digest"],
+        "kind": "repository_build",
+        "manifest": fields["manifest_path"],
+        # The ref Cloud recorded as the commit's label; null for a commit deployed by itself.
+        "ref": fields["ref"],
+        "repository": preview.source.repository,
+        "revision": fields["commit_sha"],
+    }
+
+
+def _legacy_repository_source(release: dict[str, Any]) -> dict[str, Any]:
+    """The source of a Release an earlier CLI deployed from the same commit, which records
+    only the manifest's repository and revision: read through no connection, with no ref."""
+
+    manifest = release.get("manifest")
+    source = manifest.get("source") if isinstance(manifest, dict) else None
+    repository = source.get("repository") if isinstance(source, dict) else None
+    revision = source.get("revision") if isinstance(source, dict) else None
+    if not isinstance(repository, str) or not isinstance(revision, str):
+        raise CloudApiError(
+            "api_response_invalid", "Cayu Cloud returned a repository Release without its source."
+        )
+    return {
+        "connection": None,
+        "content_digest": None,
+        "kind": "repository",
+        "manifest": None,
+        "ref": None,
+        "repository": repository,
+        "revision": revision,
+    }
+
+
+def _release_has_processes(release: dict[str, Any]) -> bool:
+    """Whether a Release Cloud built declares processes for its service to run."""
+
+    manifest = release.get("manifest")
+    runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
+    return isinstance(runtime, dict) and any(
+        runtime.get(key) for key in ("web", "worker", "schedules")
+    )
+
+
+class _CloudRepositoryRefusalError(CloudCommandError):
+    """Cloud refused to build the Agent from the repository, with what to do next."""
+
+    def __init__(self, message: str, *, code: str, details: dict[str, object]) -> None:
+        super().__init__("repository_deploy_refused", message)
+        self.details = {"code": code, **details}
+
+
+def _raise_repository_refusal(
+    exc: CloudApiError, *, source: RepositoryDeploySource, agent: str | None
+) -> None:
+    """Explain Cloud's refusal to read or build the repository, with the next step for each
+    code; ``agent`` is the Agent it was read for, None for any Agent."""
+
+    code = exc.code
+    if code is None:
+        _raise_invalid_repository_request(exc)
+        return
+    body = exc.body or {}
+    reason = safe_text(body.get("message"), 512) or str(exc)
+    listed = body.get("connections")
+    names = (
+        [name for name in listed if isinstance(name, str) and safe_text(name, 63) == name]
+        if isinstance(listed, list)
+        else []
+    )
+    details: dict[str, object] = {} if not isinstance(listed, list) else {"connections": names}
+    if code == "connection_required" and agent is None and names:
+        next_step = (
+            "These GitHub App connections exist but can't be used here (not ready, or "
+            f"available only to some Agents): {', '.join(names)}; pass --application AGENT or "
+            "make one available to every Agent."
+        )
+    elif code == "connection_required":
+        next_step = (
+            "Add a GitHub App connection installed on the repository: `cayu cloud connections "
+            "add github-app --name NAME --credential app_id=APP_ID --credential "
+            f"private_key=@KEY_FILE{'' if agent is None else f' --agent {agent}'}`, then deploy "
+            "again."
+        )
+    elif code == "connection_ambiguous":
+        next_step = (
+            f"Pass --connection with one of: {', '.join(names)}."
+            if names
+            else "Pass --connection NAME to choose one."
+        )
+    elif code in {"too_many_calls", "too_many_previews"}:
+        wait = exc.retry_after
+        next_step = (
+            "Run the same command again in a minute."
+            if wait is None
+            else f"Run the same command again in {wait} seconds."
+        )
+    elif code == "application_mismatch":
+        manifest_agent = safe_text(body.get("application"), 63)
+        if manifest_agent is None or agent is None:
+            return
+        raise _CloudRepositoryRefusalError(
+            _application_mismatch(manifest_agent, agent, source=source),
+            code=code,
+            details={"application": manifest_agent},
+        ) from exc
+    else:
+        next_step = _REPOSITORY_NEXT_STEPS.get(code, "").format(
+            connection=source.connection or "NAME",
+            repository=source.full_name,
+            agent=agent or "AGENT",
+        )
+        if not next_step:
+            return
+    raise _CloudRepositoryRefusalError(
+        f"{reason.rstrip('.')}. {next_step}", code=code, details=details
+    ) from exc
+
+
+def _raise_invalid_repository_request(exc: CloudApiError) -> None:
+    """Show why Cloud's validation refused a repository request (an HTTP 422 with no code):
+    its plain-text detail, or its errors' messages, bounded."""
+
+    if exc.status_code != 422:
+        return
+    reason = exc.detail or "; ".join(exc.validation_messages)
+    if len(reason) > _INVALID_REQUEST_LIMIT:
+        reason = reason[: _INVALID_REQUEST_LIMIT - 3].rstrip() + "..."
+    if reason:
+        raise CloudCommandError(
+            "repository_request_invalid", f"Cayu Cloud refused the request: {reason}"
+        ) from exc
+
+
+_INVALID_REQUEST_LIMIT = 512
+
+
+_REPOSITORY_NEXT_STEPS = {
+    "connection_not_available": (
+        "An admin makes it available: `cayu cloud connections agents {connection} --agent {agent}`."
+    ),
+    "connection_not_found": "`cayu cloud connections list` lists the Organization's connections.",
+    "connection_not_ready": "`cayu cloud connections check {connection}` checks it again.",
+    "connector_not_buildable": "Pass --connection with a github-app connection.",
+    "manifest_invalid": "Fix the manifest in the repository, push, and deploy again.",
+    "repository_not_installed": (
+        "Install the connection's GitHub App on {repository}, then deploy again."
+    ),
+    "scope_not_allowed": (
+        "Give the GitHub App the Contents: read permission, then run `cayu cloud connections "
+        "check {connection}`."
+    ),
+    "source_fetch_timeout": "Run the same command again.",
+    "source_not_found": "Check the repository, --ref or --revision, and --manifest-path.",
+    "source_too_large": (
+        "Deploy a smaller subdirectory with --manifest-path, or a checkout with "
+        "`cayu cloud deploy .`."
+    ),
+}
+
+
 def _deploy(
     arguments: argparse.Namespace,
     *,
     client: CloudApiClient,
     recorder: EvidenceRecorder,
-    project: ResolvedCloudProject,
+    project: ResolvedCloudProject | RepositoryPreview,
     deploy_check: dict[str, Any] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    application = _resolve_application(
-        client,
-        reference=arguments.application or project.manifest.application,
-        name=project.manifest.name,
-    )
+    reference, name = _deploy_target(arguments, project)
+    application = _resolve_application(client, reference=reference, name=name)
     # The release the Agent served before this command; a promote below changes `application`.
     selected_before = application.get("current_deployment_id")
-    running_tasks = _running_tasks_before_deploy(
-        arguments, client=client, application=application, project=project
-    )
-    repository = project.repository
-    revision = project.revision
-    if project.bundle is not None:
-        if project.content_digest is None:
-            raise CloudCommandError("source_invalid", "Local source bundle digest is missing.")
-        upload = client.request(
-            "POST",
-            "/v1/source-bundles/uploads",
-            payload={
-                "content_digest": project.content_digest,
-                "size_bytes": len(project.bundle),
-            },
-        )
-        repository, revision, upload_url = _validated_source_upload(
-            upload,
-            content_digest=project.content_digest,
-            size_bytes=len(project.bundle),
-        )
-        client.upload_bytes(upload_url, project.bundle)
     correlation_id = _correlation_id("deploy")
     acknowledged = _acknowledged_revisions(arguments)
     acknowledgement = _acknowledgement_payload(acknowledged)
@@ -3296,59 +3719,109 @@ def _deploy(
     candidate = _requested_candidate(arguments)
     # `--no-promote` stages a candidate, which nothing this command does publishes.
     staging = candidate is not None
-    create_payload = {
-        **(acknowledgement or {}),
-        **(session_payload or {}),
-        **({} if candidate is None else {"candidate": candidate}),
-    }
     retry_payload = {**(acknowledgement or {}), **(session_payload or {})} or None
-    unacknowledged_payload = project.manifest.deployment_payload(
-        repository=repository,
-        revision=revision,
-    )
-    source_key = _deployment_idempotency_key(
-        application_id=str(application["id"]),
-        version=project.manifest.version,
-        revision=revision,
-        acknowledge_breaking=acknowledged,
-        session_choice=session_choice,
-        candidate=candidate,
-    )
     retry: dict[str, Any] | None = None
     acknowledge_existing = False
-    try:
-        deployment = client.request(
-            "POST",
-            f"/v1/applications/{application['id']}/deployments",
-            payload={**unacknowledged_payload, **create_payload},
-            idempotency_key=source_key,
+    if isinstance(project, RepositoryPreview):
+        source_key = _repository_idempotency_key(
+            application_id=str(application["id"]),
+            preview=project,
+            acknowledge_breaking=acknowledged,
+            session_choice=session_choice,
         )
-    except CloudApiError as exc:
-        _raise_unsupported_database(exc)
-        _raise_unsupported_schedule_timezone(exc)
-        if staging:
-            _raise_candidate_refusal(exc)
-            if exc.status_code == 422:
-                _raise_rejected_candidate(exc)
-        if (
-            exc.status_code != 409
-            or (retry_payload is None and not staging)
-            or exc.code in _CONFLICTS_WITHOUT_RELEASE
-        ):
-            raise
-        # The earlier submission may have acknowledged a different set of revisions or
-        # made another session choice. Its current acknowledgement and choice can also
-        # have changed through publication retries, so they cannot reconstruct the
-        # original submission key. Match immutable inputs.
-        existing = _existing_source_deployment(
+        deployment, acknowledge_existing = _submit_repository_build(
             client,
             application_id=str(application["id"]),
-            payload=unacknowledged_payload,
+            preview=project,
+            payload=retry_payload,
+            idempotency_key=source_key,
         )
-        if existing is None:
-            raise
-        deployment = existing
-        acknowledge_existing = True
+        has_processes = _release_has_processes(deployment)
+        running_tasks = _running_tasks_before_deploy(
+            arguments, client=client, application=application, has_processes=has_processes
+        )
+        source = _repository_source_result(deployment, preview=project)
+    else:
+        has_processes = project.manifest.runtime_payload() is not None
+        running_tasks = _running_tasks_before_deploy(
+            arguments, client=client, application=application, has_processes=has_processes
+        )
+        repository = project.repository
+        revision = project.revision
+        if project.bundle is not None:
+            if project.content_digest is None:
+                raise CloudCommandError("source_invalid", "Local source bundle digest is missing.")
+            upload = client.request(
+                "POST",
+                "/v1/source-bundles/uploads",
+                payload={
+                    "content_digest": project.content_digest,
+                    "size_bytes": len(project.bundle),
+                },
+            )
+            repository, revision, upload_url = _validated_source_upload(
+                upload,
+                content_digest=project.content_digest,
+                size_bytes=len(project.bundle),
+            )
+            client.upload_bytes(upload_url, project.bundle)
+        source = {
+            "content_digest": project.content_digest,
+            "kind": "local_bundle" if project.bundle is not None else "repository",
+            "manifest": str(project.manifest_path),
+            "repository": repository,
+            "revision": revision,
+        }
+        create_payload = {
+            **(acknowledgement or {}),
+            **(session_payload or {}),
+            **({} if candidate is None else {"candidate": candidate}),
+        }
+        unacknowledged_payload = project.manifest.deployment_payload(
+            repository=repository,
+            revision=revision,
+        )
+        source_key = _deployment_idempotency_key(
+            application_id=str(application["id"]),
+            version=project.manifest.version,
+            revision=revision,
+            acknowledge_breaking=acknowledged,
+            session_choice=session_choice,
+            candidate=candidate,
+        )
+        try:
+            deployment = client.request(
+                "POST",
+                f"/v1/applications/{application['id']}/deployments",
+                payload={**unacknowledged_payload, **create_payload},
+                idempotency_key=source_key,
+            )
+        except CloudApiError as exc:
+            _raise_unsupported_database(exc)
+            _raise_unsupported_schedule_timezone(exc)
+            if staging:
+                _raise_candidate_refusal(exc)
+                if exc.status_code == 422:
+                    _raise_rejected_candidate(exc)
+            if (
+                exc.status_code != 409
+                or (retry_payload is None and not staging)
+                or exc.code in _CONFLICTS_WITHOUT_RELEASE
+            ):
+                raise
+            # The earlier submission may have acknowledged a different set of revisions or
+            # made another session choice. Its current acknowledgement and choice can also
+            # have changed through publication retries, so they cannot reconstruct the
+            # original submission key. Match immutable inputs.
+            existing = _existing_source_deployment(
+                client,
+                application_id=str(application["id"]),
+                payload=unacknowledged_payload,
+            )
+            if existing is None:
+                raise
+            deployment = existing
+            acknowledge_existing = True
     # Only a release of this submission is taken up; any other is reported as the conflict.
     _require_candidate_statement(
         deployment, requested=candidate, application_id=str(application["id"])
@@ -3561,11 +4034,7 @@ def _deploy(
     allow_sleeping = False
     # A candidate's service is published by its promotion, never by this command; its
     # release is reported as it stands.
-    if (
-        not staging
-        and project.manifest.runtime_payload() is not None
-        and deployment.get("status") == "promoted"
-    ):
+    if not staging and has_processes and deployment.get("status") == "promoted":
         # Unchanged source replays a Release Cloud promoted earlier. The Agent may have
         # selected another Release since, and its service may have been destroyed;
         # either way no finalizer is going to publish this Release now.
@@ -3624,17 +4093,11 @@ def _deploy(
         "service_publication_requested": service_publication_requested,
         "service_publication_pending": (
             not staging
-            and project.manifest.runtime_payload() is not None
+            and has_processes
             and deployment.get("status") == "promoted"
             and (service is None or service.get("deployment_id") != deployment.get("id"))
         ),
-        "source": {
-            "content_digest": project.content_digest,
-            "kind": "local_bundle" if project.bundle is not None else "repository",
-            "manifest": str(project.manifest_path),
-            "repository": repository,
-            "revision": revision,
-        },
+        "source": source,
     }
     if (
         allow_sleeping
@@ -3648,7 +4111,7 @@ def _deploy(
     if unchanged_source is not None:
         result["unchanged_source"] = unchanged_source
     # Without processes there's no publication for the choice to govern.
-    check_preflight = promoted_with_choice and project.manifest.runtime_payload() is not None
+    check_preflight = promoted_with_choice and has_processes
     if check_preflight and wait_live:
         # What Cloud recorded once the service ran this Release.
         deployment = client.request(
@@ -3800,15 +4263,16 @@ def _running_tasks_before_deploy(
     *,
     client: CloudApiClient,
     application: dict[str, Any],
-    project: ResolvedCloudProject,
+    has_processes: bool,
 ) -> dict[str, Any] | None:
-    """Read and report the tasks a published release would interrupt, before uploading.
+    """Read and report the tasks a published release would interrupt, before it is uploaded
+    or, for one Cloud builds from a repository, followed.
 
     None for a release without processes, or an Agent with no selected release yet (nothing
     of it runs). A candidate (`--no-promote`) is listed for its later promotion.
     """
 
-    if project.manifest.runtime_payload() is None or (
+    if not has_processes or (
         "current_deployment_id" in application and not application["current_deployment_id"]
     ):
         return None
@@ -3855,6 +4319,25 @@ def _existing_source_deployment(
     digest = hashlib.sha256(
         json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
+    return _deployment_matching(
+        client,
+        application_id=application_id,
+        matches=lambda item: (
+            item.get("version") == payload["version"]
+            and item.get("manifest_digest") == digest
+            and item.get("policy_version") == payload["policy_version"]
+        ),
+    )
+
+
+def _deployment_matching(
+    client: CloudApiClient,
+    *,
+    application_id: str,
+    matches: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any] | None:
+    """The Agent's first Release, newest first, that ``matches``; None when none does."""
+
     cursor = None
     seen = set()
     for _page in range(100):
@@ -3868,12 +4351,7 @@ def _existing_source_deployment(
                 "api_response_invalid", "Cayu Cloud returned an invalid deployment list."
             )
         for item in items:
-            if (
-                isinstance(item, dict)
-                and item.get("version") == payload["version"]
-                and item.get("manifest_digest") == digest
-                and item.get("policy_version") == payload["policy_version"]
-            ):
+            if isinstance(item, dict) and matches(item):
                 return item
         cursor = page.get("next_cursor")
         if cursor is None:

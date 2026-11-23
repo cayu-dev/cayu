@@ -774,6 +774,7 @@
   "cayu.cli.cloud:_requested_candidate": [
     "_deploy",
     "_preflight_deploy_wait",
+    "_repository_deploy_project",
     "_running_tasks_before_deploy"
   ],
   "cayu.cli.cloud:_write_private_json": [
