@@ -3,8 +3,9 @@
 `cayu cloud deploy` records an Agent's home the first time it deploys from this machine, and
 every command that changes an Agent compares the Cloud and Organization it acts in with that
 record before it changes anything. A command for the Agent from another Organization or Cloud
-is refused, unless it names that Organization with ``--organization``, so a deploy can't go
-somewhere else just because another login or context happens to be selected.
+is refused, unless it names the Organization it acts in with ``--organization`` (not only
+``CAYU_CLOUD_ORGANIZATION``, which is set for a whole shell), so a deploy can't go somewhere
+else just because another login, context or Organization happens to be selected.
 
 The records are local: one private JSON file per Agent slug under ``agents/`` in the Cayu Cloud
 config directory. Nothing here talks to Cloud except :func:`acting_organization`.
@@ -29,7 +30,7 @@ _SCHEMA_VERSION = 1
 _SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 # What an Organization id may be (WorkOS's `org_...`), so one is safe to print and to put in a
 # command; Cloud's other answers are refused.
-_ORGANIZATION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+ORGANIZATION_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def _printable_name(value: object) -> str | None:
@@ -84,7 +85,7 @@ def acting_organization(client: CloudApiClient, *, api_url: str) -> Organization
 
     identity = client.request("GET", "/v1/me")
     organization_id = identity.get("organization_id")
-    if not isinstance(organization_id, str) or _ORGANIZATION_ID.fullmatch(organization_id) is None:
+    if not isinstance(organization_id, str) or ORGANIZATION_ID.fullmatch(organization_id) is None:
         raise CloudApiError(
             "api_response_invalid", "Cayu Cloud didn't say which Organization this acts in."
         )
@@ -103,15 +104,21 @@ def acting_organization(client: CloudApiClient, *, api_url: str) -> Organization
 
 
 def require_intended_organization(intended: str | None, acting: Organization) -> None:
-    """Refuse when ``--organization`` names another Organization than the one acted in."""
+    """Refuse when the command names another Organization (``--organization`` or
+    ``CAYU_CLOUD_ORGANIZATION``) than the one Cloud says it acts in.
+
+    A login acts in the named one, so this refuses an Organization API key, which acts only in
+    its own, and a token Cloud placed anywhere else.
+    """
 
     if intended is None or intended == acting.id:
         return
     raise AgentOrganizationError(
         "organization_mismatch",
-        f"This command would act in {acting.describe()}, not in Organization {intended}. "
-        f"Switch with `cayu cloud organizations use {intended}` (or "
-        f"`cayu cloud login --organization {intended}`), then run it again.",
+        f"This command would act in {acting.describe()}, not in Organization {intended}: an "
+        "Organization API key, or a context that signs in with one, acts only in its own "
+        "Organization. Use that Organization's key, or a login (`cayu cloud login`), which acts "
+        "in any Organization it is a member of.",
         details={"acting_organization": acting.public(), "intended_organization_id": intended},
     )
 
@@ -151,9 +158,9 @@ def require_agent_home(
     """Refuse to change Agent ``application`` (its slug, which is its id) outside the Cloud and
     Organization it deploys to. A record that can't be read refuses too.
 
-    ``intended`` is the command's ``--organization``: naming the Organization acted in (which
-    :func:`require_intended_organization` has checked) is how a person says they mean to act
-    on the Agent there anyway. ``login_command(api_url)`` is the command that signs in to an
+    ``intended`` is the command's ``--organization`` flag (not CAYU_CLOUD_ORGANIZATION): naming
+    the Organization acted in (which :func:`require_intended_organization` has checked) on the
+    command is how a person says they mean to act on the Agent there anyway. ``login_command(api_url)`` is the command that signs in to an
     install. The record, or None when there is none, is returned.
     """
 
@@ -166,10 +173,7 @@ def require_agent_home(
         return home
     recorded = home.organization
     if recorded.api_url == acting.api_url:
-        switch = (
-            f"Switch with `cayu cloud organizations use {recorded.id}` (or "
-            f"`cayu cloud login --organization {recorded.id}`)"
-        )
+        switch = f"Act there with `--organization {recorded.id}`"
     else:
         switch = (
             f"Sign in there with `{login_command(recorded.api_url)} --organization {recorded.id}`"
@@ -270,7 +274,7 @@ def _read_agent_home(path: Path) -> AgentHome | None:
         or not api_url.isprintable()
         or " " in api_url
         or not isinstance(organization_id, str)
-        or _ORGANIZATION_ID.fullmatch(organization_id) is None
+        or ORGANIZATION_ID.fullmatch(organization_id) is None
         or not (name is None or _printable_name(name) == name)
         or not isinstance(recorded_at, str)
     ):

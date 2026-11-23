@@ -48,9 +48,11 @@ the saved login are shared state that another session, `cayu cloud context use` 
 
 1. Run `cayu cloud whoami` (and `cayu cloud context show` when a context is in use) and check
    with the person that this is the Cloud and Organization they mean.
-2. On every `cayu cloud` command that changes something, pass `--organization ORG_ID`. Those
-   commands all take it, and with it they refuse to act in any other Organization
-   (`organization_mismatch`). Read commands don't take it.
+2. On every `cayu cloud` command that changes something, pass `--organization ORG_ID`. With a
+   login it acts in that Organization for that one command, without changing the login's own
+   (so never switch with `cayu cloud organizations use` to act elsewhere: that changes it for
+   every session on the machine). An Organization API key acts only in its own, and naming
+   another is refused (`organization_mismatch`). Reads take it too, right after `cayu cloud`.
 3. Pass `--context PATH` too whenever the Cloud you mean has a context file. It goes right
    after `cayu cloud`, before the command; on `cayu inbox`, `cayu session` and `cayu task` it
    goes after the command, with `--application`.
@@ -68,7 +70,7 @@ cayu cloud --context PATH deploy . --organization ORG_ID
   yourself.
 - Each Agent remembers where it was first deployed from this machine. A change to it from
   another Organization or Cloud is refused with `agent_organization_mismatch`, and the error
-  says how to switch. Don't work around it; ask which one is meant.
+  names the Organization to pass. Don't work around it; ask which one is meant.
 
 Changing commands say on standard error which Organization and Cloud they act in. Reads say
 nothing. `docs/cayu-cloud.md` lists which commands change something.

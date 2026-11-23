@@ -22,6 +22,7 @@ from urllib.parse import quote, urlsplit
 
 from cayu.cli._cloud_activity import activity_command, add_activity_parser
 from cayu.cli._cloud_agent_homes import (
+    ORGANIZATION_ID,
     AgentOrganizationError,
     Organization,
     acting_organization,
@@ -44,6 +45,8 @@ from cayu.cli._cloud_auth import (
     CloudAuthStore,
     WorkOSDeviceAuthClient,
     _canonical_http_url,
+    cloud_credentials_in_organization,
+    forget_organization_credentials,
     fresh_cloud_credentials,
     switch_cloud_organization,
 )
@@ -184,9 +187,13 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("connections", "run-tool"): "agent",
 }
 _ORGANIZATION_HELP = (
-    "The Organization (its id) this command must act in; it's refused in any other. Naming it "
-    "also lets a command act on an Agent that deploys to another Organization or Cayu Cloud."
+    "Act in this Organization (its id, one of `cayu cloud organizations`) for this command "
+    "only; the login's own Organization stays as `organizations use` set it. Defaults to "
+    "CAYU_CLOUD_ORGANIZATION. An Organization API key acts only in its own. Naming it also lets "
+    "a command act on an Agent that deploys to another Organization or Cayu Cloud."
 )
+# `cayu cloud`'s Organization for every command, when `--organization` names none.
+_ORGANIZATION_VARIABLE = "CAYU_CLOUD_ORGANIZATION"
 # A service or archive wait tolerates this many consecutive throttled, unavailable or 5xx reads.
 _SERVICE_POLL_TRANSIENT_LIMIT = 5
 _TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
@@ -2318,24 +2325,58 @@ def _requested_storage_acknowledgement(publication_error: dict[str, Any]) -> tup
     return tuple(sorted(revisions))
 
 
+# Commands that don't act in one Organization of Cayu Cloud: `--organization` is refused there,
+# and CAYU_CLOUD_ORGANIZATION ignored.
+_COMMANDS_OUTSIDE_AN_ORGANIZATION = frozenset(
+    {"context", "evidence", "init", "login", "logout", "organizations"}
+)
+
+
+def _chosen_organization(arguments: argparse.Namespace) -> str | None:
+    """The Organization this command acts in when it names one: `--organization`, else
+    CAYU_CLOUD_ORGANIZATION; None to act where the login or context does."""
+
+    flag = arguments.intended_organization
+    named, source = (
+        (flag, "--organization")
+        if flag is not None
+        else (os.environ.get(_ORGANIZATION_VARIABLE), _ORGANIZATION_VARIABLE)
+    )
+    if named is None:
+        return None
+    if ORGANIZATION_ID.fullmatch(named) is None:
+        # An empty or mistyped value in a script must never fall back to another Organization.
+        raise CloudCommandError(
+            "invalid_input",
+            f"{source} must be an Organization id such as org_01...; "
+            + (
+                "unset it to act in the login's own Organization."
+                if source == _ORGANIZATION_VARIABLE
+                else "`cayu cloud organizations` lists yours."
+            ),
+        )
+    return named
+
+
 def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     preflight: Callable[[argparse.Namespace], None] | None = arguments._cloud_preflight
     if preflight is not None:
         preflight(arguments)
-    if arguments.intended_organization is not None and arguments.command in {
-        "context",
-        "evidence",
-        "init",
-        "login",
-        "logout",
-        "organizations",
-    }:
+    if (
+        arguments.intended_organization is not None
+        and arguments.command in _COMMANDS_OUTSIDE_AN_ORGANIZATION
+    ):
         raise CloudCommandError(
             "invalid_input",
             f"`--organization` names where a command acts in Cayu Cloud; `cayu cloud "
             f"{arguments.command}` doesn't. Sign in to an Organization with `cayu cloud login "
             "--organization ORG_ID` or switch with `cayu cloud organizations use ORG_ID`.",
         )
+    arguments._cloud_organization = (
+        None
+        if arguments.command in _COMMANDS_OUTSIDE_AN_ORGANIZATION
+        else _chosen_organization(arguments)
+    )
     if arguments.command == "init" and arguments.check:
         return _check_manifest(arguments)
     if arguments.command == "init":
@@ -2435,10 +2476,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
     if arguments.command == "doctor":
         context_path = _selected_context_path(arguments.context)
         context = _read_context(context_path) if context_path is not None else {}
-        client = _cloud_client(arguments, context=context, context_path=context_path)
+        client = _cloud_client(
+            arguments,
+            context=context,
+            context_path=context_path,
+            organization=arguments._cloud_organization,
+        )
         acting = (
             None
-            if arguments.intended_organization is None
+            if arguments._cloud_organization is None
             else _require_acting_organization(arguments, client)
         )
         applications = client.request("GET", "/v1/applications").get("items")
@@ -2466,8 +2512,13 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         }
     selected_context = _selected_context_path(arguments.context)
     context = _read_context(selected_context) if selected_context is not None else {}
-    client = _cloud_client(arguments, context=context, context_path=selected_context)
-    if arguments._cloud_change is None and arguments.intended_organization is None:
+    client = _cloud_client(
+        arguments,
+        context=context,
+        context_path=selected_context,
+        organization=arguments._cloud_organization,
+    )
+    if arguments._cloud_change is None and arguments._cloud_organization is None:
         return _client_command(
             arguments, client=client, recorder=recorder, project=project, deploy_check=deploy_check
         )
@@ -2496,12 +2547,12 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
 def _require_acting_organization(
     arguments: argparse.Namespace, client: CloudApiClient
 ) -> Organization:
-    """Say which Organization ``client`` acts in, and refuse when `--organization` names
-    another."""
+    """Say which Organization ``client`` acts in, and refuse when the command named another:
+    an Organization API key acts only in its own, and a login's token is checked too."""
 
     acting = _acting_organization(client)
     print(f"cayu cloud: acting in {terminal_safe(acting.describe())}", file=sys.stderr)
-    require_intended_organization(arguments.intended_organization, acting)
+    require_intended_organization(arguments._cloud_organization, acting)
     return acting
 
 
@@ -3094,12 +3145,15 @@ def _logout(arguments: argparse.Namespace) -> dict[str, Any]:
                 "login_api_mismatch",
                 "The context's login file holds a login for another Cayu Cloud; it was kept.",
             )
+    signed_out = store.delete()
+    # The other Organizations' access tokens `--organization` kept go with the login.
+    forget_organization_credentials(store)
     result: dict[str, Any] = {
         "operation": "logout",
         "result": {
             "api_url": api_url,
             "login": str(store.path),
-            "signed_out": store.delete(),
+            "signed_out": signed_out,
             "status": "signed_out",
         },
     }
@@ -6386,7 +6440,11 @@ def _cloud_client(
     *,
     context: dict[str, Any] | None = None,
     context_path: Path | None = None,
+    organization: str | None = None,
 ) -> CloudApiClient:
+    """The client a command acts with. ``organization`` makes a login act in that one of the
+    person's Organizations for this command; an API key can't, and acts in its own."""
+
     context = context or {}
     context_is_selected = context_path is not None
     configured_api_url = _configured_cloud_api_url(
@@ -6415,7 +6473,9 @@ def _cloud_client(
         assert context_path is not None
         install_login = _context_login(context_path, context)
         if install_login is not None:
-            return _login_client(arguments, install_login, api_url=context_api_url)
+            return _login_client(
+                arguments, install_login, api_url=context_api_url, organization=organization
+            )
     if key_file_value is not None or context_is_selected:
         api_url = configured_api_url or _PRODUCTION_API_URL
         selected_key_file = key_file_value or context.get("api_key_file")
@@ -6439,7 +6499,9 @@ def _cloud_client(
 
     auth_store = CloudAuthStore()
     if auth_store.load() is not None:
-        return _login_client(arguments, auth_store, api_url=_PRODUCTION_API_URL)
+        return _login_client(
+            arguments, auth_store, api_url=_PRODUCTION_API_URL, organization=organization
+        )
 
     raise CloudAuthError(
         "login_required",
@@ -6464,16 +6526,49 @@ def member_client(*, timeout_seconds: float) -> CloudApiClient | None:
 
 
 def _login_client(
-    arguments: argparse.Namespace, auth_store: CloudAuthStore, *, api_url: str
+    arguments: argparse.Namespace,
+    auth_store: CloudAuthStore,
+    *,
+    api_url: str,
+    organization: str | None = None,
 ) -> CloudApiClient:
     """A client signed in with ``auth_store``'s login, which must be made for ``api_url``.
 
+    With ``organization``, it acts in that one of the person's Organizations, with a token of
+    its own (`cloud_credentials_in_organization`); the saved login keeps acting in its own.
     Its WorkOS authority (Cloud, WorkOS client, Organization and user) is fixed for the whole
     command: a refreshed login made for anything else is refused before it is sent.
     """
 
-    credentials = _require_login_for(auth_store.load(), api_url=api_url)
-    authority_fingerprint = _cloud_login_authority_fingerprint(credentials)
+    saved = _require_login_for(auth_store.load(), api_url=api_url)
+    if organization is not None and organization != saved.organization_id:
+        _require_membership(arguments, auth_store, api_url=api_url, organization=organization)
+
+    def credentials_now(rejected: str | None = None) -> CloudAuthCredentials:
+        if organization is None:
+            current = fresh_cloud_credentials(
+                auth_store,
+                timeout_seconds=arguments.timeout_seconds,
+                rejected_access_token=rejected,
+            )
+        else:
+            current = cloud_credentials_in_organization(
+                auth_store,
+                organization,
+                timeout_seconds=arguments.timeout_seconds,
+                rejected_access_token=rejected,
+            )
+        if current is None:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Could not read the local Cayu Cloud login.",
+            )
+        return current
+
+    credentials = credentials_now()
+    authority_fingerprint = _cloud_login_authority_fingerprint(
+        saved if organization is None else credentials
+    )
 
     def require_same_login_authority(current: CloudAuthCredentials) -> None:
         if _cloud_login_authority_fingerprint(current) != authority_fingerprint:
@@ -6483,28 +6578,10 @@ def _login_client(
             )
 
     def current_access_token(rejected: str | None = None) -> str:
-        current = fresh_cloud_credentials(
-            auth_store,
-            timeout_seconds=arguments.timeout_seconds,
-            rejected_access_token=rejected,
-        )
-        if current is None:
-            raise CloudAuthError(
-                "cloud_auth_unavailable",
-                "Could not read the local Cayu Cloud login.",
-            )
+        current = credentials_now(rejected)
         require_same_login_authority(current)
         return current.access_token
 
-    credentials = fresh_cloud_credentials(
-        auth_store,
-        timeout_seconds=arguments.timeout_seconds,
-    )
-    if credentials is None:
-        raise CloudAuthError(
-            "cloud_auth_unavailable",
-            "Could not read the local Cayu Cloud login.",
-        )
     require_same_login_authority(credentials)
     return CloudApiClient(
         api_url=api_url,
@@ -6514,6 +6591,66 @@ def _login_client(
         # A long deploy wait can outlive a token Cloud rejects before the local
         # clock says it expires; refresh it once instead of failing the wait.
         rejected_api_key_provider=current_access_token,
+    )
+
+
+def _require_membership(
+    arguments: argparse.Namespace,
+    auth_store: CloudAuthStore,
+    *,
+    api_url: str,
+    organization: str,
+) -> None:
+    """Refuse, before a refresh token is spent, an Organization the login isn't a member of,
+    naming the ones it can act in. When Cloud can't list them, WorkOS's refusal of the
+    exchange (`organization_unavailable`) still stops the command."""
+
+    current = fresh_cloud_credentials(auth_store, timeout_seconds=arguments.timeout_seconds)
+    if current is None:
+        raise CloudAuthError("cloud_auth_unavailable", "Could not read the local Cayu Cloud login.")
+    try:
+        listing = CloudApiClient(
+            api_url=api_url,
+            api_key=current.access_token,
+            timeout_seconds=arguments.timeout_seconds,
+        ).request("GET", "/v1/me/organizations")
+    except CloudApiError:
+        return
+    items = listing.get("items")
+    if not isinstance(items, list):
+        return
+    members = [item for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)]
+    if any(item["id"] == organization for item in members):
+        return
+    named = [
+        Organization(
+            api_url=api_url,
+            id=terminal_safe(item["id"]),
+            name=(
+                item["name"]
+                if isinstance(item.get("name"), str)
+                and item["name"].strip()
+                and item["name"].isprintable()
+                else None
+            ),
+        )
+        for item in members
+    ]
+    can = ", ".join(
+        organization_.id
+        if organization_.name is None
+        else f"{organization_.name} ({organization_.id})"
+        for organization_ in named
+    )
+    raise AgentOrganizationError(
+        "organization_unavailable",
+        f"This login isn't a member of Organization {terminal_safe(organization)} on {api_url}, "
+        "so it can't act there. "
+        + (f"It can act in: {can}." if can else "It isn't a member of any Organization there."),
+        details={
+            "intended_organization_id": organization,
+            "member_organizations": [organization_.public() for organization_ in named],
+        },
     )
 
 
@@ -6531,8 +6668,13 @@ def _cloud_recovery_arguments(arguments: argparse.Namespace) -> tuple[str, ...]:
     for flag, value in (
         ("--context", getattr(arguments, "context", None)),
         ("--api-key-file", getattr(arguments, "api_key_file", None)),
-        # A command that had to name its Organization prints follow-ups that name it too.
-        ("--organization", getattr(arguments, "intended_organization", None)),
+        # A command that named its Organization (by flag or CAYU_CLOUD_ORGANIZATION) prints
+        # follow-ups that name it too, so a copied one acts where this one did.
+        (
+            "--organization",
+            getattr(arguments, "_cloud_organization", None)
+            or getattr(arguments, "intended_organization", None),
+        ),
     ):
         if value is not None:
             result.extend((flag, str(value)))

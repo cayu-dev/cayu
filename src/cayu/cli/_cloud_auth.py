@@ -16,7 +16,7 @@ import time
 from collections.abc import Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from cayu._filesystem_lock import cooperative_path_lock
+from cayu.cli._cloud_agent_homes import ORGANIZATION_ID
 from cayu.cli._cloud_private_state import (
     PreparedPrivateJsonWrite,
     prepare_private_json,
@@ -443,10 +444,14 @@ class WorkOSDeviceAuthClient:
         form = {
             "client_id": credentials.workos_client_id,
             "grant_type": "refresh_token",
+            # Always named: the refresh token may come from a refresh into another
+            # Organization (`cloud_credentials_in_organization`), and a refresh that named none
+            # could carry on there instead of in the login's own.
+            "organization_id": (
+                credentials.organization_id if organization_id is None else organization_id
+            ),
             "refresh_token": credentials.refresh_token,
         }
-        if organization_id is not None:
-            form["organization_id"] = organization_id
         response: httpx.Response | None = None
         retry_started_monotonic = time.monotonic()
         retry_started_wall = time.time()
@@ -681,6 +686,168 @@ def switch_cloud_organization(
                 "Another command changed the login while switching; retry this command.",
             )
         return published
+
+
+def cloud_credentials_in_organization(
+    store: CloudAuthStore,
+    organization_id: str,
+    *,
+    timeout_seconds: float,
+    rejected_access_token: str | None = None,
+) -> CloudAuthCredentials:
+    """The saved login, acting in ``organization_id`` for one command; the saved login keeps
+    acting in its own Organization.
+
+    WorkOS issues a token for another of the person's Organizations from the refresh token,
+    which that spends. Under the lock a refresh takes, the refresh token is exchanged for one in
+    ``organization_id`` and the saved login is saved back unchanged but for the rotated refresh
+    token: its Organization, access token and expiry stay. The other Organization's access
+    token (never its refresh token) is kept beside the login until it is about to expire, so the
+    next command there needs no exchange. The returned credentials carry no usable refresh
+    token. ``rejected_access_token`` is one Cayu Cloud just refused, which is not reused.
+
+    Another command may refresh the login, or make the same exchange, at the same time. As
+    `fresh_cloud_credentials` does, this then carries on with what that command saved: the token
+    it kept for ``organization_id``, or an exchange with the login it rotated.
+    """
+
+    for _attempt in range(_ORGANIZATION_EXCHANGE_ATTEMPTS):
+        credentials = store.load()
+        if credentials is None:
+            raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+        if credentials.organization_id == organization_id:
+            fresh = fresh_cloud_credentials(
+                store,
+                timeout_seconds=timeout_seconds,
+                rejected_access_token=rejected_access_token,
+            )
+            if fresh is None:
+                raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+            return fresh
+        cached = _cached_organization_credentials(store, credentials, organization_id)
+        if cached is not None and (
+            rejected_access_token is None
+            or not hmac.compare_digest(
+                cached.access_token.encode("utf-8"), rejected_access_token.encode("utf-8")
+            )
+        ):
+            return cached
+        with store.prepare_refresh(credentials) as publication:
+            current = publication.current
+            if current is None:
+                raise CloudAuthError("login_required", "Sign in first with `cayu cloud login`.")
+            if not _same_cloud_auth_credentials(current, credentials):
+                # Another command rotated the login meanwhile; carry on with what it saved.
+                continue
+            try:
+                switched = WorkOSDeviceAuthClient(
+                    api_url=current.api_url, timeout_seconds=timeout_seconds
+                ).refresh(current, organization_id=organization_id)
+            except CloudAuthError:
+                reconciled = store.load()
+                if reconciled is not None and not _same_cloud_auth_credentials(reconciled, current):
+                    # Another command spent the refresh token first; carry on with its login.
+                    continue
+                raise
+            if switched is current:
+                # WorkOS couldn't be reached and the refresh token wasn't spent.
+                raise CloudAuthError(
+                    "login_refresh_unavailable",
+                    f"Couldn't get a token for Organization {organization_id} right now; "
+                    "retry this command.",
+                )
+            # Only the rotated refresh token changes. If another command saved the login
+            # meanwhile, its login stays; the token for ``organization_id`` is valid either way.
+            publication.publish(replace(current, refresh_token=switched.refresh_token))
+        _cache_organization_credentials(store, switched)
+        return _without_refresh_token(switched)
+    raise CloudAuthError(
+        "cloud_auth_unavailable",
+        "Other commands kept changing the login meanwhile; retry this command.",
+    )
+
+
+def forget_organization_credentials(store: CloudAuthStore) -> None:
+    """Delete the other Organizations' access tokens kept beside ``store``'s login."""
+
+    directory = _organization_credentials_directory(store)
+    try:
+        paths = list(directory.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise CloudAuthError(
+            "cloud_auth_unavailable", "Could not remove the local Cayu Cloud login."
+        ) from exc
+    try:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        directory.rmdir()
+    except OSError as exc:
+        raise CloudAuthError(
+            "cloud_auth_unavailable", "Could not remove the local Cayu Cloud login."
+        ) from exc
+
+
+# How often a command starts over when other commands change the login while it exchanges it.
+_ORGANIZATION_EXCHANGE_ATTEMPTS = 3
+# What stands for the refresh token in a kept or returned Organization token: it is never one.
+_NO_REFRESH_TOKEN = "not-a-refresh-token"
+
+
+def _organization_credentials_directory(store: CloudAuthStore) -> Path:
+    return store.path.with_name(f"{store.path.stem}-organizations")
+
+
+def _organization_credentials_path(store: CloudAuthStore, organization_id: str) -> Path | None:
+    if ORGANIZATION_ID.fullmatch(organization_id) is None:
+        return None
+    return _organization_credentials_directory(store) / f"{organization_id}.json"
+
+
+def _without_refresh_token(credentials: CloudAuthCredentials) -> CloudAuthCredentials:
+    return replace(credentials, refresh_token=_NO_REFRESH_TOKEN)
+
+
+def _cache_organization_credentials(
+    store: CloudAuthStore, credentials: CloudAuthCredentials
+) -> None:
+    """Keep ``credentials``' access token for later commands; a failure only costs an exchange."""
+
+    path = _organization_credentials_path(store, credentials.organization_id)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private_json(path, _credentials_payload(_without_refresh_token(credentials)))
+    except OSError:
+        return
+
+
+def _cached_organization_credentials(
+    store: CloudAuthStore, login: CloudAuthCredentials, organization_id: str
+) -> CloudAuthCredentials | None:
+    """A kept access token in ``organization_id`` for the same person, Cloud and WorkOS client
+    as ``login``, while it has more than the refresh margin left; None otherwise."""
+
+    path = _organization_credentials_path(store, organization_id)
+    if path is None:
+        return None
+    try:
+        cached = CloudAuthStore(path).load()
+    except CloudAuthError:
+        return None
+    if (
+        cached is None
+        or cached.organization_id != organization_id
+        or cached.user_id != login.user_id
+        or cached.api_url != login.api_url
+        or cached.workos_api_hostname != login.workos_api_hostname
+        or cached.workos_client_id != login.workos_client_id
+        or cached.expires_at <= time.time() + _REFRESH_SKEW_SECONDS
+    ):
+        return None
+    return cached
 
 
 def _transient_refresh_status(status_code: int) -> bool:

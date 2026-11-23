@@ -1102,6 +1102,29 @@ Organization API key belongs to one Organization, so these commands need `cayu c
 With an install's context selected (`login --api-url`), they switch that install's login, and
 its context stays selected.
 
+`organizations use` changes the login for every command and session that shares it. To act in
+another of your Organizations for one command, name it instead:
+
+```console
+cayu cloud --organization org_01... service status --application my-agent
+CAYU_CLOUD_ORGANIZATION=org_01... cayu cloud env list --application my-agent
+```
+
+`--organization ORG_ID` (right after `cayu cloud`; a changing command takes it after itself too) or the
+`CAYU_CLOUD_ORGANIZATION` variable makes a login act in ORG_ID for that command; the flag wins
+when both are set. The login's own Organization stays as `organizations use` set it. The
+command first checks that you are a member of ORG_ID (`GET /v1/me/organizations`); if not, it is
+refused with `organization_unavailable`, naming the Organizations the login can act in, and
+nothing changes. Otherwise the refresh token is exchanged for a token in ORG_ID, and the saved
+login is saved back as it was but for its rotated refresh token. ORG_ID's access token (never a
+refresh token) is kept beside the login until it is about to expire, so the next commands there
+need no exchange; `logout` deletes it. An empty or malformed `CAYU_CLOUD_ORGANIZATION` is
+refused (`invalid_input`) rather than ignored. Commands about the login itself (`login`,
+`logout`, `organizations`, `context`) ignore the variable and refuse the flag. An Organization
+API key can't act in another Organization: naming another one is refused with
+`organization_mismatch`. The variable applies to `cayu cloud` only; `cayu inbox`, `cayu session`
+and `cayu task` act where the login or context does.
+
 ### Where an Agent deploys
 
 A command that changes something first says, on standard error, which Organization it acts in
@@ -1127,15 +1150,16 @@ when the login or context in use acts in another Organization or on another Clou
 anything is changed. The command resolves its Agent reference (a slug, a name, or the slug of a
 name) as it always does, and the Agent it resolves to is the one checked and then changed; an Agent that isn't
 found where the command acts is explained by its record when this machine has one. The error
-names both Organizations, and how to switch: `cayu cloud organizations use ORG_ID` (or `cayu
-cloud login --organization ORG_ID`) for another Organization of the same Cloud, or `cayu cloud
-login --api-url URL --organization ORG_ID` for another install. This keeps a deploy meant for
+names both Organizations, and how to act where the Agent deploys: `--organization ORG_ID` for
+another Organization of the same Cloud, or `cayu cloud login --api-url URL --organization
+ORG_ID` for another install. This keeps a deploy meant for
 staging from going to production only because no `--context` was given.
 
-To act on the Agent where you are anyway, name that Organization with `--organization ORG_ID`,
-either right after `cayu cloud` or after the command. It must be the Organization the command
-acts in: any other is refused with `organization_mismatch`, so `--organization` also works on its
-own as a check that a command, a read or `doctor` included, runs where you mean it to. A `deploy` with it
+To act on the Agent in another Organization anyway, name that Organization with `--organization
+ORG_ID`, either right after `cayu cloud` or after the command: the command acts there and the
+record check accepts it. Only the flag on the command does this; `CAYU_CLOUD_ORGANIZATION`, which
+a whole shell shares, chooses the Organization but leaves the check in place. With
+`--organization`, a command, a read or `doctor` included, also says where it acts. A `deploy` with it
 moves the record to the new Organization and says so in `warnings`; the other commands act once
 and leave the record as it was. The follow-up commands a command prints (`deployment status`,
 `rollback`, `eval baseline` and so on) carry its `--organization`, like `--context`. A record

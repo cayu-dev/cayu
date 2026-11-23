@@ -786,8 +786,8 @@
     "cayu.cli.inbox:_inbox"
   ],
   "cayu.cli.cloud:fresh_cloud_credentials": [
-    "_login_client",
-    "_login_client.<locals>.current_access_token"
+    "_login_client.<locals>.credentials_now",
+    "_require_membership"
   ],
   "cayu.cli.cloud:member_client": [
     "cayu.connections._tool_catalog:_Member.signed_in"

@@ -188,9 +188,8 @@ def test_a_deploy_from_another_organization_is_refused_before_anything_changes(
         "message": (
             "Agent support-agent deploys to Organization Cayu (org_cayu) on "
             "https://cloud.cayu.dev, but this command would act in Organization Cayu Demo "
-            "(org_demo) on https://cloud.cayu.dev. Switch with `cayu cloud organizations use "
-            "org_cayu` (or `cayu cloud login --organization org_cayu`), or pass `--organization "
-            "org_demo` to act on support-agent in Cayu Demo anyway."
+            "(org_demo) on https://cloud.cayu.dev. Act there with `--organization org_cayu`, "
+            "or pass `--organization org_demo` to act on support-agent in Cayu Demo anyway."
         ),
         "acting_organization": {"api_url": _PRODUCTION, "id": "org_demo", "name": "Cayu Demo"},
         "agent_organization": {"api_url": _PRODUCTION, "id": "org_cayu", "name": "Cayu"},
@@ -272,13 +271,41 @@ def test_organization_names_where_the_command_must_act(
     assert code == 2
     assert deploys == []
     assert output["error"]["category"] == "organization_mismatch"
+    # The fake Cloud acts where its credential does, as an Organization API key would.
     assert output["error"]["message"] == (
         "This command would act in Organization Cayu Demo (org_demo) on https://cloud.cayu.dev, "
-        "not in Organization org_cayu. Switch with `cayu cloud organizations use org_cayu` (or "
-        "`cayu cloud login --organization org_cayu`), then run it again."
+        "not in Organization org_cayu: an Organization API key, or a context that signs in with "
+        "one, acts only in its own Organization. Use that Organization's key, or a login "
+        "(`cayu cloud login`), which acts in any Organization it is a member of."
     )
     # A refused deploy records nothing.
     assert not (tmp_path / "cayu-cloud" / "agents").exists()
+
+
+def test_the_organization_variable_alone_never_moves_an_agent(
+    config: Path,
+    deploys: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CAYU_CLOUD_ORGANIZATION chooses where a command acts, but an Agent recorded elsewhere
+    still needs `--organization` on the command itself."""
+
+    _record(config, _PRODUCTION, "org_cayu", "Cayu")
+    _use(monkeypatch, _Cloud("org_demo"))
+    monkeypatch.setenv("CAYU_CLOUD_ORGANIZATION", "org_demo")
+
+    code, output, _err = _cloud(capsys, tmp_path, "deploy", "--no-wait")
+    assert code == 2
+    assert output["error"]["category"] == "agent_organization_mismatch"
+    assert deploys == []
+
+    code, _output, _err = _cloud(
+        capsys, tmp_path, "deploy", "--no-wait", "--organization", "org_demo"
+    )
+    assert code == 0
+    assert deploys == ["org_demo"]
 
 
 @pytest.mark.parametrize(
@@ -712,3 +739,12 @@ def test_the_command_changes_the_agent_that_was_checked(
 
     assert code == 0
     assert cloud.changes() == [("DELETE", "/v1/applications/helper/environment/SECRET")]
+
+
+def test_follow_ups_name_an_organization_the_variable_chose() -> None:
+    arguments = cloud_cli._build_parser().parse_args(
+        ["service", "redeploy", "--application", _AGENT]
+    )
+    arguments._cloud_organization = "org_demo"
+
+    assert cloud_cli._cloud_recovery_arguments(arguments) == ("--organization", "org_demo")

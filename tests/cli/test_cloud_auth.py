@@ -31,6 +31,9 @@ from cayu.cli._cloud_auth import (
     WorkOSDeviceAuthClient,
 )
 
+# The real Organization lookup, before `tests/cli/conftest.py` answers it for every test.
+_ACTING_ORGANIZATION = cloud_cli._acting_organization
+
 
 def _jwt(*, expires_at: float, marker: str) -> str:
     def encode(value: dict[str, object]) -> str:
@@ -607,6 +610,8 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
         {
             "client_id": ["client_test"],
             "grant_type": ["refresh_token"],
+            # Every refresh names the login's own Organization.
+            "organization_id": ["org_test"],
             "refresh_token": [refresh_one],
         },
     ]
@@ -772,6 +777,7 @@ def test_workos_transient_refresh_failure_preserves_running_deployment_recovery(
                 {
                     "client_id": credentials.workos_client_id,
                     "grant_type": "refresh_token",
+                    "organization_id": credentials.organization_id,
                     "refresh_token": credentials.refresh_token,
                 },
             )
@@ -2690,3 +2696,238 @@ def test_login_into_another_organization_saves_only_that_login(
     saved = store.load()
     assert saved is not None
     assert (saved.organization_id, saved.refresh_token) == ("org_demo", "refresh-org_demo")
+
+
+_MEMBER_ORGANIZATIONS = [
+    {"id": "org_demo", "name": "Cayu Demo", "role": "admin"},
+    {"id": "org_test", "name": "Cayu", "role": "developer"},
+]
+
+
+def _whoami(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, dict, str]:
+    code = main(["cloud", *arguments, "whoami"])
+    streams = capsys.readouterr()
+    return code, json.loads(streams.out), streams.err
+
+
+@pytest.fixture
+def per_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A saved login in org_test, a member of org_demo too, with Cloud asked where it acts."""
+
+    monkeypatch.setattr(cloud_cli, "_acting_organization", _ACTING_ORGANIZATION)
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    forms = _fake_workos_and_cloud(
+        monkeypatch, organizations=_MEMBER_ORGANIZATIONS, refused="org_stranger"
+    )
+    return store, credentials, forms
+
+
+def test_organization_acts_there_for_one_command_and_keeps_the_saved_login(
+    per_command, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, credentials, forms = per_command
+
+    code, output, err = _whoami(capsys, "--organization", "org_demo")
+
+    assert code == 0
+    assert output["result"]["organization_id"] == "org_demo"
+    assert output["organization"]["id"] == "org_demo"
+    assert err == "cayu cloud: acting in Organization Cayu Demo (org_demo) on http://127.0.0.1:9\n"
+    # WorkOS issued a token for org_demo from the refresh token...
+    assert forms == [
+        {
+            "client_id": "client_test",
+            "grant_type": "refresh_token",
+            "organization_id": "org_demo",
+            "refresh_token": "refresh-token-current",
+        }
+    ]
+    # ...and the saved login still acts in its own Organization, with its own access token;
+    # only the spent refresh token was replaced.
+    assert store.load() == replace(credentials, refresh_token="refresh-org_demo")
+
+    # The default is untouched afterwards.
+    code, output, err = _whoami(capsys)
+    assert (code, output["result"]["organization_id"]) == (0, "org_test")
+    assert "acting in" not in err
+
+    # The next command in org_demo reuses its token, spending nothing.
+    code, output, _err = _whoami(capsys, "--organization", "org_demo")
+    assert (code, output["result"]["organization_id"]) == (0, "org_demo")
+    assert len(forms) == 1
+    # Naming the login's own Organization needs no exchange at all.
+    code, output, _err = _whoami(capsys, "--organization", "org_test")
+    assert (code, output["result"]["organization_id"]) == (0, "org_test")
+    assert len(forms) == 1
+
+
+def test_the_saved_login_refreshes_in_its_own_organization_after_acting_in_another(
+    per_command, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, _credentials, forms = per_command
+    assert _whoami(capsys, "--organization", "org_demo")[0] == 0
+    saved = store.load()
+    assert saved is not None
+    # The saved access token expires; its refresh token came from the exchange into org_demo.
+    store.save(replace(saved, expires_at=time.time() - 10))
+
+    code, output, _err = _whoami(capsys)
+
+    assert (code, output["result"]["organization_id"]) == (0, "org_test")
+    assert forms[-1]["organization_id"] == "org_test"
+    refreshed = store.load()
+    assert refreshed is not None
+    assert refreshed.organization_id == "org_test"
+
+
+def test_the_organization_variable_chooses_and_the_flag_wins(
+    per_command, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, credentials, forms = per_command
+    monkeypatch.setenv("CAYU_CLOUD_ORGANIZATION", "org_demo")
+
+    code, output, err = _whoami(capsys)
+    assert (code, output["result"]["organization_id"]) == (0, "org_demo")
+    assert err.startswith("cayu cloud: acting in Organization Cayu Demo (org_demo)")
+
+    code, output, err = _whoami(capsys, "--organization", "org_test")
+    assert (code, output["result"]["organization_id"]) == (0, "org_test")
+    assert err.startswith("cayu cloud: acting in Organization Cayu (org_test)")
+
+    # Commands about the login itself ignore the variable.
+    assert main(["cloud", "organizations"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["current_organization_id"] == "org_test"
+    assert len(forms) == 1
+    assert store.load() == replace(credentials, refresh_token="refresh-org_demo")
+
+
+@pytest.mark.parametrize("value", ["", "  ", "org demo"])
+def test_an_organization_variable_that_names_none_is_refused(
+    per_command, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    _store, _credentials, forms = per_command
+    monkeypatch.setenv("CAYU_CLOUD_ORGANIZATION", value)
+
+    code, output, _err = _whoami(capsys)
+
+    assert code == 2
+    assert output["error"]["category"] == "invalid_input"
+    assert "CAYU_CLOUD_ORGANIZATION" in output["error"]["message"]
+    assert forms == []
+
+
+def test_an_organization_the_login_isnt_in_is_refused_naming_its_own(
+    per_command, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, credentials, forms = per_command
+
+    code, output, _err = _whoami(capsys, "--organization", "org_stranger")
+
+    assert code == 2
+    error = output["error"]
+    assert error["category"] == "organization_unavailable"
+    assert error["message"] == (
+        "This login isn't a member of Organization org_stranger on http://127.0.0.1:9, so it "
+        "can't act there. It can act in: Cayu Demo (org_demo), Cayu (org_test)."
+    )
+    assert [item["id"] for item in error["member_organizations"]] == ["org_demo", "org_test"]
+    # Refused before the refresh token was spent; the login is as it was.
+    assert forms == []
+    assert store.load() == credentials
+
+
+def test_logout_forgets_the_tokens_kept_for_other_organizations(
+    per_command, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, _credentials, _forms = per_command
+    assert _whoami(capsys, "--organization", "org_demo")[0] == 0
+    kept = store.path.with_name(f"{store.path.stem}-organizations")
+    assert [path.name for path in kept.iterdir()] == ["org_demo.json"]
+    assert stat.S_IMODE((kept / "org_demo.json").stat().st_mode) == 0o600
+    # A kept token is never a refresh token.
+    assert "refresh-org_demo" not in (kept / "org_demo.json").read_text()
+
+    assert main(["cloud", "logout"]) == 0
+    capsys.readouterr()
+
+    assert not store.path.exists()
+    assert not kept.exists()
+
+
+def test_commands_exchanging_for_the_same_organization_at_once_all_get_a_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two commands in org_demo with no kept token: neither fails because the other saved the
+    login first, and the saved login still acts in its own Organization."""
+
+    store, credentials = _configure_saved_workos_login(
+        monkeypatch, tmp_path, api_url="http://127.0.0.1:9", expires_at=time.time() + 3600
+    )
+    exchanges: list[str] = []
+    both_started = threading.Barrier(2, timeout=5)
+
+    def refresh(_client, current, *, organization_id=None):
+        exchanges.append(current.refresh_token)
+        both_started.wait()
+        number = len(exchanges)
+        return replace(
+            current,
+            access_token=_jwt(expires_at=time.time() + 3600, marker=f"demo-{number}"),
+            refresh_token=f"refresh-demo-{number}",
+            expires_at=time.time() + 3600,
+            organization_id=organization_id or current.organization_id,
+        )
+
+    monkeypatch.setattr(WorkOSDeviceAuthClient, "refresh", refresh)
+    results: dict[int, object] = {}
+
+    def run(index: int) -> None:
+        try:
+            results[index] = cloud_auth.cloud_credentials_in_organization(
+                store, "org_demo", timeout_seconds=5
+            )
+        except CloudAuthError as exc:
+            results[index] = exc
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(isinstance(result, CloudAuthCredentials) for result in results.values()), results
+    assert {result.organization_id for result in results.values()} == {"org_demo"}
+    saved = store.load()
+    assert saved is not None
+    assert (saved.organization_id, saved.access_token) == ("org_test", credentials.access_token)
+    assert saved.refresh_token in {"refresh-demo-1", "refresh-demo-2"}
+
+
+def test_a_command_carries_on_with_the_token_another_command_kept_meanwhile(
+    per_command, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When another command saves the login while this one reserves it, this one starts over
+    and finds that command's token for the Organization instead of failing."""
+
+    store, credentials, forms = per_command
+    real_prepare = CloudAuthStore.prepare_refresh
+    raced: list[bool] = []
+
+    @contextmanager
+    def another_command_first(self, expected):
+        if not raced:
+            raced.append(True)
+            cloud_auth.cloud_credentials_in_organization(self, "org_demo", timeout_seconds=5)
+        with real_prepare(self, expected) as publication:
+            yield publication
+
+    monkeypatch.setattr(CloudAuthStore, "prepare_refresh", another_command_first)
+
+    got = cloud_auth.cloud_credentials_in_organization(store, "org_demo", timeout_seconds=5)
+
+    assert got.organization_id == "org_demo"
+    # One exchange in all: the other command's, whose kept token this one reused.
+    assert len(forms) == 1
+    assert store.load() == replace(credentials, refresh_token="refresh-org_demo")

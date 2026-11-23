@@ -39,5 +39,7 @@ def _cloud_changes_kept_local(
         return Organization(api_url=api_url, id="org_test", name="Test Organization")
 
     homes = tmp_path_factory.mktemp("cayu-cloud-agent-homes")
+    # A shell's own Organization for `cayu cloud` would otherwise move every test there.
+    monkeypatch.delenv("CAYU_CLOUD_ORGANIZATION", raising=False)
     monkeypatch.setattr(cloud, "_acting_organization", acting)
     monkeypatch.setattr(cloud, "_agent_homes_directory", lambda: homes)
