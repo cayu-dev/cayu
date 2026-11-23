@@ -48,6 +48,7 @@ from cayu.cli._cloud_auth import (
     switch_cloud_organization,
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
+from cayu.cli._cloud_compass_grants import WRITES as COMPASS_GRANT_WRITES
 from cayu.cli._cloud_connections import (
     AGENT_ACTIONS,
     add_connections_parsers,
@@ -168,6 +169,7 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("compass", "pass"): "agent_slug",
     ("compass", "findings", "accept"): "agent_slug",
     ("compass", "findings", "dismiss"): "agent_slug",
+    **{("compass", "grants", action): "agent_slug" for action in COMPASS_GRANT_WRITES},
     ("eval", "run"): "agent",
     ("eval", "runs", "cancel"): "agent",
     ("eval", "baseline"): "agent",

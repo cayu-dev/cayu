@@ -42,7 +42,7 @@ top-level commands are:
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
 - `sandboxes list|show|archives|logs` to [read an Agent's brokered sandboxes](#reading-an-agents-sandboxes);
 - `activity status` to [read how Cloud reads an Agent's activity](#clouds-activity-reader);
-- `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings` for
+- `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings|grants` for
   [Compass](#compass);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
   read its eval runs;
@@ -1112,7 +1112,8 @@ Organization API key). It asks Cloud (`GET /v1/me`) before it changes anything. 
 are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollback`,
 `service destroy|pause|redeploy|restart|resume|sleep|wake`, `env set|unset`,
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
-`compass findings accept|dismiss`, `eval run|baseline`, `eval runs cancel`,
+`compass findings accept|dismiss`, `compass grants propose|approve|reject|revoked|keep`,
+`eval run|baseline`, `eval runs cancel`,
 `api-keys create|revoke` and `connections add|authorize|agents|rotate|remove|bind|unbind`. Commands that
 only read say nothing.
 
@@ -3165,6 +3166,9 @@ cayu cloud compass findings accept my-agent FINDING --note "Worth trying"
 cayu cloud compass findings dismiss my-agent FINDING --note "Expected behavior"
 cayu cloud compass findings dismiss my-agent --rule repeated_tool --note "Paging, not repeats"
 cayu cloud compass findings sessions my-agent FINDING
+cayu cloud compass grants propose my-agent FINDING
+cayu cloud compass grants list my-agent --status proposed
+cayu cloud compass grants approve my-agent PROPOSAL
 cayu cloud compass passes list my-agent --all
 cayu cloud compass missions my-agent
 cayu cloud compass disable my-agent
@@ -3200,8 +3204,8 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   idempotency key, and with several it fails saying that Cloud watches one agent
   per Agent. Once an Agent watches several agents, Cloud refuses a single
   `agent` with `agents_required`.
-- **Idempotency.** `enroll`, `verify`, `pass`, `findings accept` and
-  `findings dismiss` take `--idempotency-key`. Without one the command chooses a
+- **Idempotency.** `enroll`, `verify`, `pass`, `findings accept`,
+  `findings dismiss` and the `grants` decisions take `--idempotency-key`. Without one the command chooses a
   key and prints it as `idempotency_key`, on an error too, so a write whose
   answer was lost (`compass_outcome_unknown`) can be repeated with it.
 - **Jobs.** `verify` and `pass` print the first job Compass queued, with one per
@@ -3258,6 +3262,25 @@ member is refused with `code` `developer_required`. They mirror Cloud's operator
   `--idempotency-key` dismisses the rest. `findings list` and `findings
   dismiss` print text; pass `--json` for the JSON envelope with
   `idempotency_key`.
+- **Grant proposals.** An accepted `autonomy_grant` finding says people approve
+  every call of one gated tool as proposed. `grants propose AGENT FINDING` asks
+  Compass to turn it into a grant proposal; `--sample-rate-bps`, `--scope
+  workspace|session`, `--expires-in-seconds` (or `--no-expiry`) and
+  `--revoke-threshold` set its terms, and each one left out takes Compass's
+  default. `grants approve` or `grants reject --note TEXT` decides a proposed
+  one. Compass gives no grant itself: an approved proposal carries
+  `grant_request`, the terms the Agent's owner approves the tool's next pending
+  call with (`cayu inbox approve --remember`). Compass's next pass then marks
+  the proposal `live`, and each later pass checks the grant's sampled reviews.
+  When too many are corrected the proposal turns `revoke_recommended`, and
+  `grants revoked` (after `cayu grants revoke` on the Agent) or `grants keep
+  --note TEXT` records what the owner did. `grants list` lists the Agent's
+  proposals, newest first, narrowed by `--status` (repeatable) and `--agent`;
+  `grants show AGENT PROPOSAL` or `grants show AGENT --finding FINDING` reads
+  one. A decision on a proposal that is no longer in the status it needs is
+  refused with `proposal_changed` and the proposal's `status` as it is now. A
+  Compass from before grant proposals answers `compass_revision_unsupported`,
+  and a Cloud release from before them `compass_grants_unavailable`.
 - **Missions.** `missions` lists the Compound missions Compass made ready and
   why Cloud starts none now, if it doesn't. Cloud starts them on its own, and
   each waits for a person to approve its plan before it spends anything.

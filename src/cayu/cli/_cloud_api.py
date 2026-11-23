@@ -131,6 +131,14 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "idempotency_key_reused"),
         (409, "no_schedule"),
         (409, "no_selected_release"),
+        # `cayu cloud compass grants`: why Compass proposes no grant, or a decision found the
+        # proposal in another status (its `proposal` is the proposal as it is now).
+        (409, "compass_revision_unsupported"),
+        (409, "finding_not_accepted"),
+        (409, "mandatory_control"),
+        (409, "no_objectives"),
+        (409, "not_a_grant"),
+        (409, "proposal_changed"),
         (409, "release_source_unreadable"),
         (409, "service_busy"),
         # `cayu cloud eval run`: an evaluation service without isolated corpus runs, or an eval

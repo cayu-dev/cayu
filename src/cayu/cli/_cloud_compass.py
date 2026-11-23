@@ -3,7 +3,8 @@
 The commands mirror Cayu Cloud's operator `compass` commands and call the same
 customer API routes (`/v1/compass/agents/...`, and the paged `/v1/compass/findings` and
 `/v1/compass/passes`) with the `cayu cloud login` (or a selected context's API key). Compass routes need a developer or an organization
-administrator. Writes take `--idempotency-key`; without one a fresh key is chosen
+administrator. `grants` (`_cloud_compass_grants`) reads and decides the grants Compass
+proposes. Writes take `--idempotency-key`; without one a fresh key is chosen
 and printed, on an error too, so a write whose answer was lost can be repeated
 with it.
 """
@@ -18,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 from cayu.cli import _cloud_compass_findings as findings_cli
+from cayu.cli import _cloud_compass_grants as grants_cli
 from cayu.cli import _cloud_compass_passes as passes_cli
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 
@@ -66,6 +68,7 @@ class CompassWriteError(CloudApiError):
             detail=error.detail,
             code=error.code,
             rejected_fields=error.rejected_fields,
+            body=error.body,
             transport_error=error.transport_error,
             request=error.request,
         )
@@ -205,6 +208,8 @@ def add_compass_parser(
     pass_listing.add_argument("application", type=application)
     passes_cli.add_passes_arguments(pass_listing)
 
+    grants_cli.add_grants_parser(actions, application=application)
+
     findings = actions.add_parser("findings", description="What Compass found, and its review.")
     finding_actions = findings.add_subparsers(dest="findings_command", required=True)
     listing = finding_actions.add_parser(
@@ -303,6 +308,8 @@ def compass_command(
         return _answer(action, client.request("GET", _job_path(path, arguments.job_id)))
     if action == "passes":
         return passes_cli.list_passes(client, arguments.application, arguments)
+    if action == "grants":
+        return _grants(client, arguments, path)
     if action == "missions":
         query = _query(status=arguments.status)
         return _answer(action, client.request("GET", f"{path}/missions", query=query))
@@ -396,6 +403,24 @@ def compass_command(
     else:
         review = {"note": arguments.note}
     return _write(client, operation, arguments, "POST", f"{finding}/{finding_action}", review)
+
+
+def _grants(client: CloudApiClient, arguments: argparse.Namespace, path: str) -> dict[str, Any]:
+    def write(operation: str, target: str, payload: dict[str, object]) -> dict[str, Any]:
+        try:
+            return _write(client, operation, arguments, "POST", target, payload)
+        except CompassWriteError as exc:
+            missing = grants_cli.unavailable(exc)
+            now = grants_cli.changed_proposal(exc)
+            if missing is None and now is None:
+                raise
+            raise CompassWriteError(
+                missing or exc,
+                idempotency_key=exc.idempotency_key,
+                details=None if now is None else {"proposal": now},
+            ) from None
+
+    return grants_cli.grants_command(client, arguments, path, answer=_answer, write=write)
 
 
 def _dismiss_by_rule(

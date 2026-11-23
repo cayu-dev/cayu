@@ -1395,3 +1395,243 @@ def test_a_page_that_repeats_a_cursor_is_refused_even_at_the_limit(
     # The cursor a listing resumes from counts too.
     code, output = _run(["findings", "list", "acme-scout", "--cursor", "c-1", "--json"], capsys)
     assert (code, output["error"]["category"]) == (2, "api_response_invalid")
+
+
+_PROPOSALS = f"{_AGENT}/grant-proposals"
+
+
+def test_grants_reads_call_the_proposal_routes(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = cloud(
+        {
+            ("GET", f"{_PROPOSALS}?status=proposed&status=live&agent=filer"): [
+                httpx.Response(200, json={"items": [], "total": 0})
+            ],
+            ("GET", f"{_PROPOSALS}/grant%2F1"): [
+                httpx.Response(200, json={"proposal_id": "grant/1"})
+            ],
+            ("GET", f"{_AGENT}/findings/fnd_1/grant-proposal"): [
+                httpx.Response(200, json={"finding_id": "fnd_1", "proposal": None})
+            ],
+        }
+    )
+
+    operations = []
+    for arguments in (
+        ["list", "acme-scout", "--status", "proposed", "--status", "live", "--agent", "filer"],
+        ["show", "acme-scout", "grant/1"],
+        ["show", "acme-scout", "--finding", "fnd_1"],
+    ):
+        code, output = _run(["grants", *arguments], capsys)
+        assert code == 0
+        assert "idempotency_key" not in output
+        operations.append(output["operation"])
+
+    assert operations == ["compass.grants.list", "compass.grants.show", "compass.grants.show"]
+    assert all("Idempotency-Key" not in request.headers for request in fake.requests)
+
+
+@pytest.mark.parametrize("arguments", [[], ["grant-1", "--finding", "fnd_1"]])
+def test_grants_show_takes_a_proposal_or_a_finding(
+    arguments: list[str], cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({})
+
+    code, output = _run(["grants", "show", "acme-scout", *arguments], capsys)
+
+    assert code == 2
+    assert "PROPOSAL_ID or --finding" in output["error"]["message"]
+    assert fake.requests == []
+
+
+def test_grants_propose_sends_only_the_given_options_and_prints_the_key(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud(
+        {
+            ("POST", f"{_AGENT}/findings/fnd_1/propose-grant"): [
+                httpx.Response(200, json={"proposal_id": "grant-1", "status": "proposed"})
+            ]
+        }
+    )
+
+    plain_code, plain = _run(["grants", "propose", "acme-scout", "fnd_1"], capsys)
+    code, output = _run(
+        [
+            "grants",
+            "propose",
+            "acme-scout",
+            "fnd_1",
+            "--sample-rate-bps",
+            "500",
+            "--scope",
+            "session",
+            "--no-expiry",
+            "--revoke-threshold",
+            "0.1",
+            "--idempotency-key",
+            "propose-1",
+        ],
+        capsys,
+    )
+    timed_code, _timed = _run(
+        ["grants", "propose", "acme-scout", "fnd_1", "--expires-in-seconds", "3600"], capsys
+    )
+
+    assert (plain_code, code, timed_code) == (0, 0, 0)
+    assert plain["operation"] == "compass.grants.propose"
+    assert plain["idempotency_key"].startswith("compass-grants.propose-")
+    assert output["idempotency_key"] == "propose-1"
+    assert fake.requests[1].headers["Idempotency-Key"] == "propose-1"
+    assert fake.bodies() == [
+        {},
+        {
+            "expires_in_seconds": None,
+            "revoke_threshold": "0.1",
+            "sampled_review_rate_bps": 500,
+            "scope": "session",
+        },
+        {"expires_in_seconds": 3600},
+    ]
+
+
+def test_grants_decisions_send_the_note(cloud, capsys: pytest.CaptureFixture[str]) -> None:
+    fake = cloud(
+        {
+            ("POST", f"{_PROPOSALS}/grant-1/{decision}"): [
+                httpx.Response(200, json={"proposal_id": "grant-1"})
+            ]
+            for decision in ("approve", "reject", "revoked", "keep")
+        }
+    )
+
+    operations = []
+    for arguments in (
+        ["approve", "acme-scout", "grant-1"],
+        ["reject", "acme-scout", "grant-1", "--note", "Too wide"],
+        ["revoked", "acme-scout", "grant-1", "--note", "Revoked on the Agent"],
+        ["keep", "acme-scout", "grant-1", "--note", "The corrections were a test"],
+    ):
+        code, output = _run(["grants", *arguments], capsys)
+        assert code == 0
+        assert output["idempotency_key"].startswith(f"compass-grants.{arguments[0]}-")
+        operations.append(output["operation"])
+
+    assert operations == [
+        "compass.grants.approve",
+        "compass.grants.reject",
+        "compass.grants.revoked",
+        "compass.grants.keep",
+    ]
+    assert fake.bodies() == [
+        {},
+        {"note": "Too wide"},
+        {"note": "Revoked on the Agent"},
+        {"note": "The corrections were a test"},
+    ]
+
+
+@pytest.mark.parametrize("decision", ["reject", "keep"])
+def test_rejecting_or_keeping_a_grant_needs_a_reason(
+    decision: str, cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({})
+
+    code, output = _run(["grants", decision, "acme-scout", "grant-1"], capsys)
+
+    assert code == 2
+    assert "--note" in output["error"]["message"]
+    assert fake.requests == []
+
+
+def test_a_decision_on_a_changed_proposal_says_what_it_is_now(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    message = "The proposal is approved, not proposed."
+    cloud(
+        {
+            ("POST", f"{_PROPOSALS}/grant-1/reject"): [
+                httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "code": "proposal_changed",
+                            "message": message,
+                            "proposal": {
+                                "proposal_id": "grant-1",
+                                "status": "approved",
+                                "tool": "send_email",
+                            },
+                        }
+                    },
+                )
+            ]
+        }
+    )
+
+    code, output = _run(
+        ["grants", "reject", "acme-scout", "grant-1", "--note", "No", "--idempotency-key", "r-1"],
+        capsys,
+    )
+
+    assert code == 2
+    assert output["error"] == {
+        "category": "api_request_rejected",
+        "code": "proposal_changed",
+        "idempotency_key": "r-1",
+        "message": f"Cayu Cloud API returned HTTP 409: {message}",
+        "proposal": {"status": "approved"},
+    }
+
+
+@pytest.mark.parametrize(
+    "code", ["compass_revision_unsupported", "finding_not_accepted", "mandatory_control"]
+)
+def test_a_refused_proposal_reports_clouds_code_and_message(
+    code: str, cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("POST", f"{_AGENT}/findings/fnd_1/propose-grant"): [
+                httpx.Response(409, json={"detail": {"code": code, "message": "Why it is not."}})
+            ]
+        }
+    )
+
+    exit_code, output = _run(
+        ["grants", "propose", "acme-scout", "fnd_1", "--idempotency-key", "p-1"], capsys
+    )
+
+    assert exit_code == 2
+    assert output["error"] == {
+        "category": "api_request_rejected",
+        "code": code,
+        "idempotency_key": "p-1",
+        "message": "Cayu Cloud API returned HTTP 409: Why it is not.",
+    }
+
+
+def test_an_older_cloud_says_it_has_no_grant_proposals(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = [httpx.Response(404, json={"detail": "Not Found"})]
+    cloud(
+        {
+            ("GET", _PROPOSALS): missing,
+            ("POST", f"{_PROPOSALS}/grant-1/approve"): missing,
+            ("GET", f"{_PROPOSALS}/grant-2"): [
+                httpx.Response(404, json={"detail": {"code": "not_enrolled", "message": "x"}})
+            ],
+        }
+    )
+
+    read_code, read = _run(["grants", "list", "acme-scout"], capsys)
+    write_code, written = _run(
+        ["grants", "approve", "acme-scout", "grant-1", "--idempotency-key", "a-1"], capsys
+    )
+    kept_code, kept = _run(["grants", "show", "acme-scout", "grant-2"], capsys)
+
+    assert (read_code, write_code, kept_code) == (2, 2, 2)
+    assert read["error"]["category"] == "compass_grants_unavailable"
+    assert written["error"]["category"] == "compass_grants_unavailable"
+    assert written["error"]["idempotency_key"] == "a-1"
+    assert kept["error"]["code"] == "not_enrolled"
