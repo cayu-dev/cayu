@@ -588,6 +588,11 @@ or Alembic dependency: the generated project does.
 - Add a table: define its model, run
   `uv run alembic revision --autogenerate -m "describe the change"`, review the file
   in `migrations/versions/`, then migrate.
+- Move data, such as records from an older store into new tables, with a data move
+  (`cayu.data_moves`): a paged source and one idempotent step per item, run with
+  `uv run cayu data-move run MODULE:NAME [--dry-run]`. It reports each item's outcome,
+  including conflicts with rows the application changed since, and where to resume.
+  See [data moves](https://github.com/cayu-dev/cayu/blob/main/docs/data-moves.md).
 - Set up a new local database with
   `uv run cayu storage migrate && uv run alembic upgrade head` (either order works);
   after that, `uv run alembic upgrade head` applies the application's migrations.

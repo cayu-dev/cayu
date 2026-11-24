@@ -78,6 +78,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Session inspection](session-inspection.md)
 - [Session-message lifecycle](session-message-lifecycle.md)
 - [Session-store targets](session-store-targets.md)
+- [Data moves](data-moves.md)
 - [Storage retention](storage-retention.md)
 - [Durable one-shot task scheduling](task-scheduling.md)
 - [Durable external-event waits](external-event-waits.md)
