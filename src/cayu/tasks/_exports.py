@@ -296,6 +296,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "copy_dispatch_request": ("cayu.tasks.dispatch", "copy_dispatch_request"),
     "fail_managed_task": ("cayu.tasks.worker", "fail_managed_task"),
     "is_fenced_after_worker_loss": ("cayu.tasks.abandoned", "is_fenced_after_worker_loss"),
+    "cancelled_at_restart_limit": ("cayu.tasks.abandoned", "cancelled_at_restart_limit"),
     "interrupted_task_handoff_request": ("cayu.tasks.handoff", "interrupted_task_handoff_request"),
     "new_interrupted_task_continuation_handoff_id": (
         "cayu.tasks.handoff",
@@ -598,6 +599,7 @@ PUBLIC_NAMES = [
     "TaskCancellationRequested",
     "TaskCancellationSignal",
     "current_task_cancellation",
+    "cancelled_at_restart_limit",
     "completion_gap_fingerprint",
     "completion_result_sha256",
     "copy_dispatch_handle",

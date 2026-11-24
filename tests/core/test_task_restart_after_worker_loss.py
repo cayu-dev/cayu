@@ -18,6 +18,7 @@ from cayu.tasks import (
     AbandonedTaskSettlement,
     TaskRestartLimitReached,
     TaskRestartReason,
+    cancelled_at_restart_limit,
     complete_managed_task,
     reconcile_abandoned_tasks,
     restart_abandoned_task,
@@ -607,5 +608,101 @@ def test_a_settled_cancellation_still_says_whether_worker_loss_or_a_request_fenc
         assert summary is not None
         assert summary["fenced_by"] == ("request" if requested else "worker_loss")
         await _close(store)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_the_application_hears_of_a_task_cancelled_at_its_restart_cap(
+    backend: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.ERROR, logger="cayu.tasks.abandoned")
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = _store(backend, tmp_path, clock)
+        heard: list[Task] = []
+
+        async def on_limit(task: Task) -> None:
+            heard.append(task)
+
+        await store.create_task(
+            TaskCreate(
+                task_id="reset-1",
+                type="scan",
+                restartable=True,
+                max_restarts=1,
+                labels={"owner": "team-a"},
+            )
+        )
+        await store.create_task(TaskCreate(task_id="plain", type="scan"))
+        await _lose_worker(store, clock, "reset-1", "worker-a")
+        [restarted] = await reconcile_abandoned_tasks(
+            store, **SETTLE, on_restart_limit_reached=on_limit
+        )
+        assert restarted.status is TaskStatus.PENDING and heard == []
+        assert not cancelled_at_restart_limit(restarted)
+
+        await _lose_worker(store, clock, "reset-1", "worker-b")
+        [cancelled] = await reconcile_abandoned_tasks(
+            store, **SETTLE, on_restart_limit_reached=on_limit
+        )
+        assert cancelled.status is TaskStatus.CANCELLED
+        assert [(t.id, t.type, t.invocation.access_labels) for t in heard] == [
+            ("reset-1", "scan", {"owner": "team-a"})
+        ]
+        assert cancelled_at_restart_limit(cancelled)
+        # It reads the stored task, so a later listing finds the same answer.
+        listed = await store.list_tasks(TaskQuery(status=TaskStatus.CANCELLED, type="scan"))
+        assert [t.id for t in listed if cancelled_at_restart_limit(t)] == ["reset-1"]
+
+        # A task cancelled for another reason isn't reported, and a failing
+        # handler is logged without undoing the cancellation.
+        def failing(task: Task) -> None:
+            raise RuntimeError("boom")
+
+        await _lose_worker(store, clock, "plain", "worker-c")
+        [plain] = await reconcile_abandoned_tasks(store, **SETTLE, on_restart_limit_reached=failing)
+        assert plain.status is TaskStatus.CANCELLED and not cancelled_at_restart_limit(plain)
+
+        await store.create_task(
+            TaskCreate(task_id="capped", type="scan", restartable=True, max_restarts=0)
+        )
+        await _lose_worker(store, clock, "capped", "worker-d")
+        [capped] = await reconcile_abandoned_tasks(
+            store, **SETTLE, on_restart_limit_reached=failing
+        )
+        assert capped.status is TaskStatus.CANCELLED and cancelled_at_restart_limit(capped)
+        stored = await store.load_task("capped")
+        assert stored is not None and stored.status is TaskStatus.CANCELLED
+        await _close(store)
+
+    asyncio.run(scenario())
+    [message] = [
+        r.getMessage() for r in caplog.records if "on_restart_limit_reached" in r.getMessage()
+    ]
+    assert "task capped (type scan), which stays cancelled" in message
+
+
+def test_the_single_worker_monitor_reports_a_task_cancelled_at_its_cap() -> None:
+    async def scenario() -> None:
+        clock = _Clock()
+        store = InMemoryTaskStore(ownership_clock=clock)
+        await store.create_task(
+            TaskCreate(task_id="capped", type="scan", restartable=True, max_restarts=0)
+        )
+        await _lose_worker(store, clock, "capped", "worker-old")
+        heard: list[str] = []
+        monitor = FencedTaskMonitor(
+            store,
+            worker_id="worker-new",
+            query=TaskQuery(type="scan"),
+            reconcile_abandoned_after_s=0,
+            settlement=AbandonedTaskSettlement.RESTART,
+            on_restart_limit_reached=lambda task: heard.append(task.id),
+        )
+        [settled] = await monitor.scan()
+        assert settled.status is TaskStatus.CANCELLED
+        assert heard == ["capped"]
 
     asyncio.run(scenario())

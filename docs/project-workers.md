@@ -238,6 +238,37 @@ still cancelled. The flags set `CAYU_WORKER_RESTART_ABANDONED` and
 `CAYU_WORKER_MAX_ABANDONED_RESTARTS`, which `run_task_worker` reads when the
 entrypoint doesn't pass `restart_abandoned` and `max_abandoned_restarts` itself.
 
+A task cancelled at its cap may leave the application's own work half done, such
+as a record it locked while the task ran. To hear about it, pass
+`on_restart_limit_reached` to `run_task_worker` or `reconcile_abandoned_tasks`. It
+is called (and awaited, when it returns an awaitable) with the cancelled task, so
+its id, type, input and `invocation.access_labels`, once the cancellation is
+stored. An error it raises is logged and the task stays cancelled. A process
+that stops between the two never calls it for that task, so also check on
+startup: `cancelled_at_restart_limit(task)` from `cayu.tasks` says whether a
+cancelled task ended this way, for example over
+`TaskQuery(status="cancelled", type="reset")`. `cayu task show` reports the same
+as `evidence_kind` `restart_limit_reached` in its `Worker loss` section.
+
+```python
+from cayu.tasks import Task, cancelled_at_restart_limit, run_task_worker
+
+
+async def unlock_workspace(task: Task) -> None:
+    await workspaces.unlock(task.input["workspace_id"], reason="reset gave up")
+
+
+await run_task_worker(
+    app,
+    task_store,
+    handler,
+    worker_id="worker-1",
+    reconcile_abandoned_after_s=120,
+    restart_abandoned=True,
+    on_restart_limit_reached=unlock_workspace,
+)
+```
+
 ### Sessions a lost worker left running
 
 A worker that is stopped or killed while a handler runs sessions leaves those

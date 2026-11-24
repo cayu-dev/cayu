@@ -4427,6 +4427,7 @@
         ],
         "cayu.tasks.abandoned": [
           "AbandonedTaskSettlement",
+          "cancelled_at_restart_limit",
           "is_fenced_after_worker_loss",
           "reconcile_abandoned_tasks"
         ],

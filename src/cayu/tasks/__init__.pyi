@@ -11,6 +11,7 @@ from cayu.tasks._terminalization import (
 )
 from cayu.tasks._terminalization import terminalize_task_with_retry as terminalize_task_with_retry
 from cayu.tasks.abandoned import AbandonedTaskSettlement as AbandonedTaskSettlement
+from cayu.tasks.abandoned import cancelled_at_restart_limit as cancelled_at_restart_limit
 from cayu.tasks.abandoned import is_fenced_after_worker_loss as is_fenced_after_worker_loss
 from cayu.tasks.abandoned import reconcile_abandoned_tasks as reconcile_abandoned_tasks
 from cayu.tasks.admission import (

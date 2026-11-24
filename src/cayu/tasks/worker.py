@@ -146,6 +146,7 @@ from cayu.tasks._terminalization import (
 from cayu.tasks.abandoned import (
     AbandonedTaskSettlement,
     FencedTaskMonitor,
+    RestartLimitHandler,
     _declaring_worker_actor,
     reconcile_abandoned_after_from_environment,
     restart_abandoned_from_environment,
@@ -590,6 +591,7 @@ async def run_task_worker(
     reconcile_abandoned_after_s: float | None = None,
     restart_abandoned: bool | None = None,
     max_abandoned_restarts: int | None = None,
+    on_restart_limit_reached: RestartLimitHandler | None = None,
     recover_interrupted_handoffs: bool = True,
     interrupted_handoff_recovery_every_s: float = (_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS),
     recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
@@ -662,6 +664,9 @@ async def run_task_worker(
       is cancelled as before, with evidence that says so. ``None`` for either
       reads ``cayu worker --restart-abandoned`` and
       ``--max-abandoned-restarts`` through their environment variables.
+    - ``on_restart_limit_reached`` is called with each task that declared single
+      worker cancels at its restart cap, once the cancellation is stored; see
+      :func:`cayu.tasks.reconcile_abandoned_tasks`.
     - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
       task workers. Elect one such scanner for each shared task store.
     - ``interrupted_handoff_recovery_every_s`` controls the scanner's exhausted
@@ -868,6 +873,7 @@ async def run_task_worker(
             reconcile_abandoned_after_s=reconcile_abandoned_after_s,
             settlement=abandoned_settlement,
             max_restarts=max_abandoned_restarts,
+            on_restart_limit_reached=on_restart_limit_reached,
             # A run that exits once idle scans once, so it reads every fenced task.
             whole_pass=until_idle is not None,
         )

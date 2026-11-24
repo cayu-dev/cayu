@@ -31,9 +31,10 @@ Each part works on its own:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -83,6 +84,45 @@ _SCAN_MAX = 1_000
 _WHOLE_PASS_SCAN_MAX = 100_000
 
 logger = logging.getLogger(__name__)
+
+#: The evidence id prefix of a task cancelled because it had used its restarts.
+_RESTART_LIMIT_EVIDENCE_PREFIX = "restart-limit-reached:"
+
+#: Called with each task cancelled because it had used its restarts after worker loss.
+RestartLimitHandler = Callable[[Task], Awaitable[None] | None]
+
+
+def cancelled_at_restart_limit(task: Task) -> bool:
+    """Whether ``task`` was cancelled because it had used its restarts after worker loss.
+
+    True for a restartable task that :func:`reconcile_abandoned_tasks` (or a task worker
+    declared the only one) cancelled at its ``max_restarts``. It reads the settled
+    cancellation stored on the task, so it answers the same at any later time, for
+    example for tasks listed with ``TaskQuery(status="cancelled", type=...)``.
+    """
+
+    if task.status is not TaskStatus.CANCELLED or type(task.status_payload) is not dict:
+        return False
+    reconciliation = task.status_payload.get("cancellation_reconciliation")
+    evidence = reconciliation.get("evidence") if type(reconciliation) is dict else None
+    evidence_id = evidence.get("evidence_id") if type(evidence) is dict else None
+    return type(evidence_id) is str and evidence_id.startswith(_RESTART_LIMIT_EVIDENCE_PREFIX)
+
+
+async def _notify_restart_limit(handler: RestartLimitHandler | None, task: Task) -> None:
+    # The task is already settled; a failing handler must not undo or block that.
+    if handler is None:
+        return
+    try:
+        result = handler(task)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception(
+            "on_restart_limit_reached failed for task %s (type %s), which stays cancelled.",
+            task.id,
+            task.type,
+        )
 
 
 class AbandonedTaskSettlement(StrEnum):
@@ -335,6 +375,7 @@ async def reconcile_abandoned_tasks(
     reconciled_by: ResolutionActor | None = None,
     settlement: AbandonedTaskSettlement | str = AbandonedTaskSettlement.CANCEL,
     max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
+    on_restart_limit_reached: RestartLimitHandler | None = None,
 ) -> list[Task]:
     """Settle fenced tasks held by workers the caller knows are gone; return the settled tasks.
 
@@ -361,6 +402,13 @@ async def reconcile_abandoned_tasks(
     ``restart-limit-reached:<cap>:lease-expired-at:...`` recording why. Other
     tasks, and a restartable task whose cancellation someone asked for before
     its worker was lost, are cancelled as with ``"cancel"``.
+
+    ``on_restart_limit_reached`` is called (and awaited, if it returns an awaitable)
+    with each task cancelled at its cap, after the cancellation is stored, so the
+    application can recover what the task was doing or report it. An error it raises
+    is logged and the task stays cancelled. A process that stops between the two
+    never calls it for that task; :func:`cancelled_at_restart_limit` finds such tasks
+    among the cancelled ones later.
     """
 
     if isinstance(live_worker_ids, str):
@@ -383,6 +431,7 @@ async def reconcile_abandoned_tasks(
         reconciled_by=reconciled_by,
         settlement=settlement,
         max_restarts=max_restarts,
+        on_restart_limit_reached=on_restart_limit_reached,
     )
 
 
@@ -406,6 +455,7 @@ async def _settle_abandoned(
     reconciled_by: ResolutionActor | None,
     settlement: AbandonedTaskSettlement,
     max_restarts: int,
+    on_restart_limit_reached: RestartLimitHandler | None = None,
 ) -> list[Task]:
     from cayu.tasks.worker import _reconcile_observed_abandoned_task_cancellation
 
@@ -413,6 +463,7 @@ async def _settle_abandoned(
     for task in tasks:
         assert task.lease_expires_at is not None
         evidence_id = f"lease-expired-at:{task.lease_expires_at.isoformat()}"
+        at_limit = False
         try:
             if (
                 settlement is AbandonedTaskSettlement.RESTART
@@ -439,7 +490,10 @@ async def _settle_abandoned(
                         task.type,
                         exc.restarts,
                     )
-                    evidence_id = f"restart-limit-reached:{exc.max_restarts}:{evidence_id}"
+                    evidence_id = (
+                        f"{_RESTART_LIMIT_EVIDENCE_PREFIX}{exc.max_restarts}:{evidence_id}"
+                    )
+                    at_limit = True
             # Bound to the claim that was listed, so a claim that changed since
             # (for example a replacement worker) is skipped, never cancelled.
             result = await _reconcile_observed_abandoned_task_cancellation(
@@ -454,6 +508,8 @@ async def _settle_abandoned(
             logger.info("Fenced task %s was not reconciled: %s", task.id, exc)
             continue
         settled.append(result)
+        if at_limit:
+            await _notify_restart_limit(on_restart_limit_reached, result)
     return settled
 
 
@@ -491,8 +547,10 @@ class FencedTaskMonitor:
         settlement: AbandonedTaskSettlement = AbandonedTaskSettlement.CANCEL,
         max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
         whole_pass: bool = False,
+        on_restart_limit_reached: RestartLimitHandler | None = None,
     ) -> None:
         self._task_store = task_store
+        self._on_restart_limit_reached = on_restart_limit_reached
         self._whole_pass = whole_pass
         self._worker_id = worker_id
         self._query = fenced_task_scan_query(query)
@@ -558,6 +616,7 @@ class FencedTaskMonitor:
                 reconciled_by=_declaring_worker_actor(self._worker_id),
                 settlement=self._settlement,
                 max_restarts=self._max_restarts,
+                on_restart_limit_reached=self._on_restart_limit_reached,
             )
             # Settled tasks left the list, so continue that many earlier.
             self._next_offset = max(self._next_offset - len(settled), 0)
@@ -730,6 +789,7 @@ __all__ = [
     "SINGLE_WORKER_VALIDATOR_VERSION",
     "AbandonedTaskSettlement",
     "abandoned_task_settlement",
+    "cancelled_at_restart_limit",
     "has_cancellation_fence",
     "held_after_worker_loss",
     "is_fenced_after_worker_loss",
