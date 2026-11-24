@@ -62,12 +62,21 @@ INVOICES = DataMove("invoices", read, key=lambda row: row["id"], apply=apply, ve
 
 ## Running it
 
-```sh
-uv run cayu data-move run moves.invoices:INVOICES --dry-run
-uv run cayu data-move run moves.invoices:INVOICES --json
+Declare the project's moves by name in `pyproject.toml`:
+
+```toml
+[tool.cayu.data_moves]
+invoices = "moves.invoices:INVOICES"
 ```
 
-The target is a `DataMove`, or a function without arguments that returns one. The report
+```sh
+uv run cayu data-move run invoices --dry-run
+uv run cayu data-move run invoices --json
+uv run cayu data-move run moves.other:OTHER   # a module:name works too
+```
+
+The target is a declared name, or the `module:name` of a `DataMove` or of a function
+without arguments that returns one. Nothing is imported until a move is used. The report
 counts each outcome and lists the conflicts, failures and skips. It exits 0 when every page
 was read with no conflict, failure or verify problem, and 3 otherwise. A failing item is
 reported and the run goes on; `--stop-on-failure` stops at the first one instead. The report
@@ -110,3 +119,49 @@ command runs on a laptop, against a scratch database in CI, or as part of the de
 that migrates the application's tables. Python code can call
 `run_data_move(move, dry_run=..., page_size=..., after=..., max_items=...)` directly and
 read the `DataMoveReport` it returns.
+
+## On a deployed Agent
+
+A Cayu Cloud Agent runs its declared moves itself, with its own database and secrets:
+
+```sh
+cayu cloud data-move run invoices --application acme-orders --dry-run
+cayu cloud data-move runs --application acme-orders
+cayu cloud data-move runs --run-id RUN --application acme-orders
+cayu cloud data-move resume invoices --application acme-orders
+```
+
+`cayu serve` mounts the routes for `[tool.cayu.data_moves]` under its API path
+(`/api/data-moves`, `cayu.server.data_moves`), behind the server's own authentication; a
+server without authentication (`--dev`) refuses them. The CLI reaches them with the Agent's
+Developer dashboard login, as `cayu cloud data` does. `run` and `resume` start the run in the
+Agent's web process, then read its record every two seconds until it stops (`--no-wait`
+returns at once; `--wait-seconds` bounds the wait, and the run goes on after it). The
+command exits 3, as `cayu data-move run` does, when the run stopped, wasn't clean or was
+still running when the wait ended, and 0 when it was clean; `--no-wait` exits 0 once the run has
+started. `run` and `resume` change the Agent, so like other changing `cayu cloud` commands
+they check that the Agent belongs to the organization they act in (`--organization`). One run of a move goes at a time.
+
+The run lives in the web process. When the process stops (a deploy, a restart, an Agent that
+sleeps when idle), the run's record in the Agent's data volume keeps the cursor of its last
+page, and `resume` goes on from it. Such a run reads as `stopped` once no process runs it,
+so the routes assume the Agent has one web process. Keep the Agent awake for a long move, or resume it after.
+An Agent whose release was built with a Cayu without these routes answers `unsupported`.
+A maintained public service (`service_factory`) owns its routes, so it opts in itself: pass
+the declared moves to `create_agent_service`, and they are served at
+`{control_plane_path}/api/data-moves` behind the service's `operator_access`:
+
+```python
+from cayu.server import create_agent_service
+from cayu.server.data_moves import declared_data_move_sources
+
+service = create_agent_service(
+    app,
+    ...,  # the service's other arguments
+    data_moves=declared_data_move_sources(),
+)
+```
+
+Without it, `cayu serve` says the declared moves aren't served and how to serve them.
+`data_move_router` can also be included in any other FastAPI app; mount it under that app's
+Cayu API path so `cayu cloud data-move` finds `/data-moves` there.

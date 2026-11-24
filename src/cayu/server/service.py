@@ -2690,12 +2690,19 @@ def create_agent_service(
     evals: EvalsConfig | None = None,
     project_context: ProjectControlPlaneContext | None = None,
     deployment_kind: DeploymentKind | None = None,
+    data_moves: Mapping[str, Any] | None = None,
 ) -> CayuService:
     """Assemble the maintained product API and separately protected control plane.
 
     ``execution_timeout_s`` bounds each new operation's runtime execution; ``None``
     leaves it unbounded. Durable session deadlines remain in force across recovery.
     Queue wait before execution is not charged against this duration.
+
+    ``data_moves``, off by default, serves those data moves (name to a ``DataMove``, its
+    ``module:name`` or a function returning one; ``cayu.server.data_moves.
+    declared_data_move_sources()`` gives the project's ``[tool.cayu.data_moves]``) at
+    ``{control_plane_path}/api/data-moves``, behind ``operator_access``, for
+    ``cayu cloud data-move``.
     """
 
     if not isinstance(app, CayuApp):
@@ -2953,6 +2960,21 @@ def create_agent_service(
         operator_mount_access = AuthenticatedAccess(dependency=_placeholder_operator_auth)
     else:
         operator_mount_access = operator_access
+    if data_moves:
+        from cayu.server.auth import server_auth_dependency
+        from cayu.server.config import auth_dependency_for
+        from cayu.server.data_moves import data_move_router
+
+        operator_auth = auth_dependency_for(operator_mount_access)
+        # Before the control plane mounts its dashboard at `control_plane_path`, which would
+        # otherwise answer these paths first.
+        server.include_router(
+            data_move_router(
+                data_moves,
+                auth=None if operator_auth is None else server_auth_dependency(operator_auth),
+            ),
+            prefix=f"{control_plane_path}/api",
+        )
     mount_cayu(
         server,
         app,

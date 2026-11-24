@@ -16,7 +16,6 @@ from pathlib import Path
 from shlex import quote
 from typing import Any
 
-from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.data_move_runs import (
     DataMoveRun,
     DataMoveRunStore,
@@ -28,6 +27,10 @@ from cayu.data_move_runs import (
 )
 from cayu.data_moves import DataMove, DataMoveReport, StepOutcome, run_data_move
 
+_TARGET_HELP = (
+    "A name declared in [tool.cayu.data_moves], or the module:name of a DataMove or of a "
+    "function returning one."
+)
 #: Exit status of a run that read every page with no conflict, failure or verify problem.
 EXIT_CLEAN = 0
 #: Exit status of a run with conflicts, failures or verify problems, or that stopped early.
@@ -54,7 +57,7 @@ def add_data_move_parser(subparsers: Any) -> None:
             "rerun with --after RESUME_AFTER to go on from where a run stopped."
         ),
     )
-    run.add_argument("target", help="module:name of the DataMove, or of a function returning one.")
+    run.add_argument("target", help=_TARGET_HELP)
     run.add_argument(
         "--dry-run",
         action="store_true",
@@ -92,9 +95,7 @@ def add_data_move_parser(subparsers: Any) -> None:
             "moves that page again; its steps are idempotent."
         ),
     )
-    resume.add_argument(
-        "target", help="module:name of the DataMove, or of a function returning one."
-    )
+    resume.add_argument("target", help=_TARGET_HELP)
     resume.add_argument("--run-id", help="The run to go on with (default: the newest open one).")
     _add_store(resume)
     resume.add_argument("--json", action="store_true", help="Print the run record as JSON.")
@@ -155,22 +156,28 @@ def run_data_move_command(args: argparse.Namespace) -> int:
 
 
 def _load_move(target_name: str) -> DataMove[Any] | None:
-    project = str(Path.cwd())
-    if project not in sys.path:
-        sys.path.insert(0, project)
+    from cayu._data_move_declarations import (
+        DataMoveDeclarationError,
+        declared_data_move_project,
+        load_data_move,
+        load_declared_data_move,
+    )
+
     try:
-        target = load_target(target_name, label="Data move", normalize_errors=True)
-    except TargetResolutionError as exc:
+        if ":" not in target_name:
+            root, declared = declared_data_move_project()
+            if target_name not in declared:
+                print(
+                    f"error: no data move {target_name!r} is declared in "
+                    "[tool.cayu.data_moves]; name one, or give its module:name.",
+                    file=sys.stderr,
+                )
+                return None
+            return load_declared_data_move(target_name, declared[target_name], project=root)
+        return load_data_move(target_name)
+    except DataMoveDeclarationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return None
-    move = target if isinstance(target, DataMove) else target() if callable(target) else None
-    if not isinstance(move, DataMove):
-        print(
-            f"error: {target_name} is not a DataMove or a function that returns one.",
-            file=sys.stderr,
-        )
-        return None
-    return move
 
 
 def _finish(args: argparse.Namespace, report: DataMoveReport, run: DataMoveRun | None) -> int:

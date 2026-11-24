@@ -364,6 +364,7 @@ def _build_serve_app(
                 "application factory."
             )
         server = service.asgi_app
+        _data_moves_service_notice(project.root, service.asgi_app)
         if identity_proxy is not None:
             server = _with_identity_proxy(server, identity_proxy, args, settings)
         print(
@@ -459,6 +460,7 @@ def _build_serve_app(
             inbox_access=_load_inbox_access(settings.inbox_access, app, development=args.dev),
         )
         _include_project_routers(server, app, settings.routers, development=args.dev, auth=auth)
+        _include_data_moves(server, project.root, config.api.path, auth=None if args.dev else auth)
         if settings.ui is not None:
             # Last, so every route above answers first.
             from cayu.server import WebAppError, serve_web_app
@@ -561,6 +563,58 @@ def serve_uvicorn_options(uvicorn: Any, *, covered: bool) -> dict[str, Any]:
         "propagate": False,
     }
     return {"log_config": log_config, "access_log": not covered}
+
+
+def _include_data_moves(server: Any, root: Path, api_path: str, *, auth: Any) -> None:
+    """Serve `[tool.cayu.data_moves]` under the API, behind the server's own auth.
+
+    Without auth (`--dev`) the routes are mounted but refuse every request, so a move that
+    writes the application's data never runs on an open server.
+    """
+
+    from cayu._data_move_declarations import DataMoveDeclarationError
+    from cayu.server.data_moves import declared_data_move_sources
+
+    try:
+        moves = declared_data_move_sources(root)
+    except DataMoveDeclarationError as exc:
+        raise ServeError(str(exc)) from exc
+    if not moves:
+        return
+    from cayu.server.auth import server_auth_dependency
+    from cayu.server.data_moves import DATA_MOVES_PATH, data_move_router
+
+    dependency = None if auth is None else server_auth_dependency(auth)
+    server.include_router(data_move_router(moves, auth=dependency), prefix=api_path)
+    print(f"Data moves: {api_path}{DATA_MOVES_PATH} ({', '.join(sorted(moves))})")
+
+
+def _data_moves_service_notice(root: Path, server: Any) -> None:
+    """Say where a maintained service serves its data moves, or how it opts in."""
+
+    from cayu._data_move_declarations import DataMoveDeclarationError, declared_data_moves
+    from cayu.server.data_moves import DATA_MOVES_PATH
+
+    try:
+        declared = declared_data_moves(root)
+    except DataMoveDeclarationError as exc:
+        raise ServeError(str(exc)) from exc
+    if not declared:
+        return
+    served = [
+        path
+        for path in (getattr(route, "path", "") for route in getattr(server, "routes", ()))
+        if path.endswith(DATA_MOVES_PATH)
+    ]
+    if served:
+        print(f"Data moves: {served[0]} ({', '.join(sorted(declared))})")
+        return
+    print(
+        "Data moves: not served. Pass data_moves=declared_data_move_sources() (from "
+        "cayu.server.data_moves) to create_agent_service in the service_factory to serve "
+        "[tool.cayu.data_moves] behind its operator access.",
+        file=sys.stderr,
+    )
 
 
 def _include_project_routers(

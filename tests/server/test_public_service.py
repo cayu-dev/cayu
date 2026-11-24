@@ -401,6 +401,7 @@ def _build_service(
     execution_profile_policy=None,
     project_context=None,
     execution_timeout_s=None,
+    data_moves=None,
 ):
     provider = provider or ScriptedModelProvider(
         [
@@ -450,6 +451,7 @@ def _build_service(
         control_plane_path=control_plane_path,
         project_context=project_context,
         execution_timeout_s=execution_timeout_s,
+        data_moves=data_moves,
     )
     return service, product_store, provider
 
@@ -3665,3 +3667,48 @@ def test_product_service_retains_public_step_default_for_task_runs(monkeypatch):
             await service.cayu_app.aclose()
 
     asyncio.run(scenario())
+
+
+def _letters_move():
+    from cayu.data_moves import DataMove, SourcePage, StepOutcome, StepResult
+
+    return DataMove(
+        "letters",
+        lambda cursor, limit: SourcePage(["a", "b"]),
+        str,
+        lambda item, *, dry_run: StepResult(StepOutcome.CREATED),
+    )
+
+
+def test_a_service_serves_no_data_moves_unless_it_opts_in() -> None:
+    service, _, _ = _build_service()
+
+    with TestClient(service.asgi_app) as client:
+        answer = client.get("/cayu/api/data-moves", auth=("operator", "operator-secret"))
+
+    assert answer.status_code == 404
+
+
+def test_a_service_that_opts_in_serves_its_data_moves_behind_operator_access(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CAYU_DATA_VOLUME", str(tmp_path))
+    service, _, _ = _build_service(data_moves={"letters": _letters_move()})
+    operator = ("operator", "operator-secret")
+
+    with TestClient(service.asgi_app) as client:
+        anonymous = client.get("/cayu/api/data-moves")
+        listing = client.get("/cayu/api/data-moves", auth=operator)
+        started = client.post("/cayu/api/data-moves/letters/runs", json={}, auth=operator)
+        run_id = started.json()["run_id"]
+        for _ in range(100):
+            run = client.get(f"/cayu/api/data-moves/runs/{run_id}", auth=operator).json()
+            if run["status"] != "running":
+                break
+            threading.Event().wait(0.05)
+
+    assert anonymous.status_code == 401
+    assert listing.json()["moves"] == [{"name": "letters", "running": False}]
+    assert started.status_code == 202
+    assert run["status"] == "finished" and run["report"]["counts"]["created"] == 2
+    assert (tmp_path / "data-moves" / f"{run_id}.json").is_file()

@@ -315,6 +315,8 @@ def test_the_organization_variable_alone_never_moves_an_agent(
         ["env", "unset", "LOG_LEVEL", "--application", _AGENT],
         ["rollback", "dep_earlier", "--application", _AGENT],
         ["schedule", "run", "nightly", "--application", _AGENT],
+        ["data-move", "run", "invoices", "--application", _AGENT, "--json"],
+        ["data-move", "resume", "invoices", "--application", _AGENT, "--json"],
         ["service", "restart", "--application", _AGENT],
         ["applications", "archive", _AGENT, "--expected-revision", "3"],
         # By the name it was deployed with, too.

@@ -61,6 +61,7 @@ from cayu.cli._cloud_connections import (
     models_command,
 )
 from cayu.cli._cloud_data import add_data_parser, data_command
+from cayu.cli._cloud_data_moves import add_data_move_parser, data_move_command
 from cayu.cli._cloud_data_transfers import (
     COMMANDS as DATA_TRANSFER_COMMANDS,
 )
@@ -171,6 +172,8 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("settings", "set"): "agent",
     ("settings", "unset"): "agent",
     ("schedule", "run"): "agent",
+    ("data-move", "run"): "agent",
+    ("data-move", "resume"): "agent",
     ("compass", "enroll"): "agent_slug",
     ("compass", "disable"): "agent_slug",
     ("compass", "verify"): "agent_slug",
@@ -881,15 +884,18 @@ def _run_cloud(arguments: argparse.Namespace) -> int:
         return _cloud_failure(
             exc, render=None if render is None else arguments._cloud_render_failure
         )
+    # A command that succeeded but whose outcome a script should branch on (a data move
+    # that wasn't clean) says which status to exit with; it isn't printed.
+    exit_status = result.pop("_exit_status", 0)
     # A renderer answers None for a result it has no text for, which prints the JSON envelope.
     text = None if render is None else render(result)
     if text is not None:
         # A command that printed its output as it went (`service logs --follow`) renders "".
         if text:
             print(text)
-        return 0
+        return exit_status
     print(json.dumps({"ok": True, **result}, sort_keys=True))
-    return 0
+    return exit_status
 
 
 def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | None = None) -> int:
@@ -1595,6 +1601,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_activity_parser(commands)
 
     add_data_parser(commands)
+    add_data_move_parser(commands)
 
     add_api_keys_parser(commands)
     add_gateway_parser(commands)
@@ -2736,6 +2743,12 @@ def _client_command(
         return _schedule(arguments, client=client)
     if arguments.command == "data":
         return data_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+        )
+    if arguments.command == "data-move":
+        return data_move_command(
             arguments,
             client=client,
             application_id=_application_id(client, arguments.application),

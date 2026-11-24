@@ -206,6 +206,33 @@ def run_recorded(
 ) -> DataMoveRun:
     """Run `move` as `run_data_move` does, saving its record before and after every page."""
 
+    run = open_run(move, store, dry_run=dry_run, after=after, options=options, run_id=run_id)
+    return continue_run(move, store, run)
+
+
+def resume_recorded(
+    move: DataMove[ItemT], store: DataMoveRunStore, *, run_id: str | None = None
+) -> DataMoveRun:
+    """Go on with run `run_id`, or the newest resumable run of `move`, from its record."""
+
+    return continue_run(move, store, reopen_run(move, store, run_id=run_id))
+
+
+def open_run(
+    move: DataMove[ItemT],
+    store: DataMoveRunStore,
+    *,
+    dry_run: bool = False,
+    after: str | None = None,
+    options: RunOptions | None = None,
+    run_id: str | None = None,
+) -> DataMoveRun:
+    """Save and return a new `running` record of `move`; `continue_run` then runs it.
+
+    The two steps let a caller answer with the record before the work starts, such as a
+    server that runs the move in the background.
+    """
+
     _move_name(move.name)
     now = _now()
     run = DataMoveRun(
@@ -220,13 +247,13 @@ def run_recorded(
         ),
     )
     store.save(run)
-    return _drive(move, store, run, after=after, continuing=None)
+    return run
 
 
-def resume_recorded(
+def reopen_run(
     move: DataMove[ItemT], store: DataMoveRunStore, *, run_id: str | None = None
 ) -> DataMoveRun:
-    """Go on with run `run_id`, or the newest resumable run of `move`, from its record."""
+    """Mark run `run_id`, or the newest resumable run of `move`, `running` again and return it."""
 
     if run_id is None:
         run = next((run for run in store.list_runs(move.name, limit=1000) if run.resumable), None)
@@ -240,6 +267,14 @@ def resume_recorded(
             raise ValueError(f"run {run_id!r} finished; start a new run instead")
     run = replace(run, status="running", resumes=run.resumes + 1, error=None, updated_at=_now())
     store.save(run)
+    return run
+
+
+def continue_run(move: DataMove[ItemT], store: DataMoveRunStore, run: DataMoveRun) -> DataMoveRun:
+    """Run an opened or reopened record from where it says, saving it after every page."""
+
+    if run.report.pages == 0:
+        return _drive(move, store, run, after=run.report.started_after, continuing=None)
     return _drive(move, store, run, after=None, continuing=run.report)
 
 

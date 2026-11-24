@@ -1974,6 +1974,14 @@ process, isn't. It also needs a release built with a Cayu that serves these read
 Cloud that sets `CAYU_DATA_VOLUME`; an older one fails with `unsupported`, or with a message
 saying to deploy the Agent again.
 
+## Running an Agent's data moves
+
+`cayu cloud data-move run|resume|runs --application AGENT` runs the [data moves](data-moves.md)
+the Agent's project declares in `[tool.cayu.data_moves]` on the Agent, through the Agent's own
+Cayu server and with its Developer dashboard login, as `cayu cloud data` does, and reads their
+run records, which the Agent keeps in `/data/data-moves`. See
+[On a deployed Agent](data-moves.md#on-a-deployed-agent).
+
 ## Running an Agent's evals
 
 `cayu cloud eval` runs a suite of a portable [eval corpus](evals.md#portable-corpus-documents)
