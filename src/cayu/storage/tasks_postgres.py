@@ -16,12 +16,21 @@ from cayu._resource_store_surface import model_store_surface
 from cayu.storage import _postgres_base as postgres_base
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage._phase_timing import PostgresTimingScope
-from cayu.storage._task_index_schema import TASK_INDEX_REVISION
+from cayu.storage._task_series_schema import TASK_SERIES_REVISION
+from cayu.tasks._series_store import (
+    advance_series_async,
+    advances_after,
+    finished_occurrence,
+    needs_occurrence,
+    paused_series_state,
+    saved_series_state,
+)
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
     prepare_continuation_expectation,
     require_expected_continuation,
 )
+from cayu.tasks.series import TaskSeries, TaskSeriesState
 
 if TYPE_CHECKING:
     from cayu.tasks.groups import (
@@ -298,7 +307,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = TASK_SERIES_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 # Statuses whose unadmitted schedule the expiry sweep settles; the wakeup
 # observation must report exactly these.
@@ -459,6 +468,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_series: ClassVar[bool] = True
     supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
@@ -1446,6 +1456,117 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                     )
         await record_transition(self, cur, prior, current, settled_execution=settled_execution)
         await self._record_schedule_transition(cur, prior, current, operation_id=operation_id)
+        finished = finished_occurrence(prior, current)
+        if finished is not None:
+            state = await self._load_task_series_row(cur, finished[0], lock=True)
+            if state is not None:
+                next_task = (
+                    None
+                    if state.next_task_id is None
+                    else await self._load_task(cur, state.next_task_id)
+                )
+                if advances_after(state, current, next_task):
+                    await self._advance_task_series(cur, state, after=finished[1])
+
+    async def _load_task_series_row(
+        self, cur: Any, series_id: str, *, lock: bool = False
+    ) -> TaskSeriesState | None:
+        if lock:
+            await self._lock_verified_work_identity(cur, "task-series", series_id)
+        await cur.execute(
+            "SELECT state_json FROM cayu_task_series WHERE series_id = %s", (series_id,)
+        )
+        row = await cur.fetchone()
+        return None if row is None else TaskSeriesState.model_validate_json(row[0])
+
+    async def _save_task_series_row(self, cur: Any, state: TaskSeriesState) -> None:
+        await cur.execute(
+            "INSERT INTO cayu_task_series (series_id, state_json) VALUES (%s, %s) "
+            "ON CONFLICT (series_id) DO UPDATE SET state_json = EXCLUDED.state_json",
+            (state.series.series_id, state.model_dump_json()),
+        )
+
+    async def _advance_task_series(
+        self, cur: Any, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        state, created = await advance_series_async(
+            state,
+            after=after,
+            now=await self._verified_evidence_now(cur),
+            load=lambda task_id: self._load_task(cur, task_id),
+        )
+        if created is not None:
+            # A caller publishing the same occurrence at once may insert it first.
+            await cur.execute(
+                f"""
+                INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                ON CONFLICT (id) DO NOTHING
+                """,
+                pg_support.task_insert_values(created),
+            )
+            if cur.rowcount == 1:
+                await self._record_task_transition(cur, None, created)
+        await self._save_task_series_row(cur, state)
+        return state
+
+    async def _settle_task_series(
+        self, cur: Any, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        next_task = (
+            None if state.next_task_id is None else await self._load_task(cur, state.next_task_id)
+        )
+        if needs_occurrence(state, next_task):
+            return await self._advance_task_series(cur, state, after=after)
+        await self._save_task_series_row(cur, state)
+        return state
+
+    async def save_task_series(self, series: TaskSeries) -> TaskSeriesState:
+        await self._ensure_ready()
+
+        async def operation(_conn: Any, cur: Any) -> TaskSeriesState:
+            existing = await self._load_task_series_row(cur, series.series_id, lock=True)
+            now = await self._verified_evidence_now(cur)
+            state = saved_series_state(existing, series, now=now)
+            return await self._settle_task_series(
+                cur, state, after=None if existing is None else now
+            )
+
+        return await self._run_owned_mutation(operation)
+
+    async def load_task_series(self, series_id: str) -> TaskSeriesState | None:
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            return await self._load_task_series_row(cur, series_id)
+
+    async def set_task_series_paused(self, series_id: str, paused: bool) -> TaskSeriesState:
+        await self._ensure_ready()
+
+        async def operation(_conn: Any, cur: Any) -> TaskSeriesState:
+            existing = await self._load_task_series_row(cur, series_id, lock=True)
+            if existing is None:
+                raise KeyError(f"No task series {series_id!r}.")
+            now = await self._verified_evidence_now(cur)
+            state = paused_series_state(existing, paused=paused, now=now)
+            return await self._settle_task_series(cur, state, after=now)
+
+        return await self._run_owned_mutation(operation)
+
+    async def delete_task_series(self, series_id: str) -> bool:
+        await self._ensure_ready()
+
+        async def operation(_conn: Any, cur: Any) -> bool:
+            await self._lock_verified_work_identity(cur, "task-series", series_id)
+            await cur.execute("DELETE FROM cayu_task_series WHERE series_id = %s", (series_id,))
+            return cur.rowcount == 1
+
+        return await self._run_owned_mutation(operation)
 
     async def _record_schedule_transition(
         self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None

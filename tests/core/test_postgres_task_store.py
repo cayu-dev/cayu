@@ -177,6 +177,7 @@ from cayu.tasks.worker import run_task_worker
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_task_series",
     "cayu_task_retry_keys",
     "cayu_task_session_closure_claims",
     "cayu_session_closure_progress",

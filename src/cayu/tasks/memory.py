@@ -13,11 +13,20 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, cast
 from uuid import uuid4
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.tasks._series_store import (
+    advance_series,
+    advances_after,
+    finished_occurrence,
+    needs_occurrence,
+    paused_series_state,
+    saved_series_state,
+)
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
     prepare_continuation_expectation,
     require_expected_continuation,
 )
+from cayu.tasks.series import TaskSeries, TaskSeriesState
 
 if TYPE_CHECKING:
     from cayu.tasks.graphs import (
@@ -525,6 +534,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_series: ClassVar[bool] = True
     supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
@@ -551,6 +561,7 @@ class InMemoryTaskStore(TaskStore):
         self._ownership_clock = utc_clock(ownership_clock)
         self._creation_operation_receipts: dict[str, str] = {}
         self._task_retry_keys: dict[str, TaskRetryKeyState] = {}
+        self._task_series: dict[str, TaskSeriesState] = {}
         self._tasks: dict[str, Task] = {}
         self._retired_task_sessions: set[str] = set()
         self._task_groups: dict[str, TaskGroupSnapshot] = {}
@@ -5497,6 +5508,64 @@ class InMemoryTaskStore(TaskStore):
         return _PreparedMemoryTaskWrite(task, prior, tuple(events))
 
     def _publish_prepared_task_write(
+        self, prepared: _PreparedMemoryTaskWrite, *, event_now: datetime | None = None
+    ) -> None:
+        """Publish prevalidated state, then queue a series' next occurrence it ended."""
+        self._publish_prepared_task_write_once(prepared, event_now=event_now)
+        task, prior, _ = prepared
+        finished = finished_occurrence(prior, task)
+        state = None if finished is None else self._task_series.get(finished[0])
+        if finished is None or state is None:
+            return
+        next_task = None if state.next_task_id is None else self._tasks.get(state.next_task_id)
+        if advances_after(state, task, next_task):
+            self._advance_task_series(state, after=finished[1])
+
+    def _advance_task_series(
+        self, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        now = self._clock()
+        state, created = advance_series(state, after=after, now=now, load=self._tasks.get)
+        if created is not None:
+            self._publish_prepared_task_write(self._prepare_task_write(created), event_now=now)
+        self._task_series[state.series.series_id] = state
+        return state
+
+    def _settle_task_series(
+        self, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        self._task_series[state.series.series_id] = state
+        next_task = None if state.next_task_id is None else self._tasks.get(state.next_task_id)
+        if needs_occurrence(state, next_task):
+            state = self._advance_task_series(state, after=after)
+        return state.model_copy(deep=True)
+
+    async def save_task_series(self, series: TaskSeries) -> TaskSeriesState:
+        async with self._lock:
+            existing = self._task_series.get(series.series_id)
+            state = saved_series_state(existing, series, now=self._clock())
+            return self._settle_task_series(
+                state, after=None if existing is None else self._clock()
+            )
+
+    async def load_task_series(self, series_id: str) -> TaskSeriesState | None:
+        async with self._lock:
+            state = self._task_series.get(series_id)
+            return None if state is None else state.model_copy(deep=True)
+
+    async def set_task_series_paused(self, series_id: str, paused: bool) -> TaskSeriesState:
+        async with self._lock:
+            existing = self._task_series.get(series_id)
+            if existing is None:
+                raise KeyError(f"No task series {series_id!r}.")
+            state = paused_series_state(existing, paused=paused, now=self._clock())
+            return self._settle_task_series(state, after=self._clock())
+
+    async def delete_task_series(self, series_id: str) -> bool:
+        async with self._lock:
+            return self._task_series.pop(series_id, None) is not None
+
+    def _publish_prepared_task_write_once(
         self, prepared: _PreparedMemoryTaskWrite, *, event_now: datetime | None = None
     ) -> None:
         """Publish prevalidated state while retaining the preparation lock."""

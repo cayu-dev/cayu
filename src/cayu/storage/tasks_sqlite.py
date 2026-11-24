@@ -12,11 +12,20 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 from uuid import uuid4
 
 from cayu._resource_store_surface import model_store_surface
+from cayu.tasks._series_store import (
+    advance_series,
+    advances_after,
+    finished_occurrence,
+    needs_occurrence,
+    paused_series_state,
+    saved_series_state,
+)
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
     prepare_continuation_expectation,
     require_expected_continuation,
 )
+from cayu.tasks.series import TaskSeries, TaskSeriesState
 
 if TYPE_CHECKING:
     from cayu.tasks.groups import (
@@ -85,7 +94,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage._phase_timing import TimedStoreLock
 from cayu.storage._sqlite_connection import _run_off_thread_with_connection_ownership
-from cayu.storage._task_index_schema import TASK_INDEX_REVISION
+from cayu.storage._task_series_schema import TASK_SERIES_REVISION
 from cayu.storage.targets import require_sqlite_store_allowed
 from cayu.tasks import _verified_work_policy as verified_work_support
 from cayu.tasks._cancellation import (
@@ -421,7 +430,7 @@ def _busy_concurrency_key_sql(prefix: Literal["", "busy."] = "") -> str:
     )
 
 
-_SQLITE_TASK_MIN_REQUIRED_REVISION = TASK_INDEX_REVISION
+_SQLITE_TASK_MIN_REQUIRED_REVISION = TASK_SERIES_REVISION
 _CONTINUATION_CANDIDATE_SAVEPOINT = "cayu_continuation_candidate"
 # Statuses whose unadmitted schedule the expiry sweep settles; the wakeup
 # observation must report exactly these.
@@ -577,6 +586,7 @@ class SQLiteTaskStore(TaskStore):
     supports_task_cancellation_reconciliation: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_task_retry_keys: ClassVar[bool] = True
+    supports_task_series: ClassVar[bool] = True
     supports_task_event_execution: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_completion_verifier_dispatches: ClassVar[bool] = True
@@ -3929,6 +3939,80 @@ class SQLiteTaskStore(TaskStore):
                     )
         record_transition(self, prior, current, settled_execution=settled_execution)
         self._record_schedule_transition_unlocked(prior, current, operation_id=operation_id)
+        finished = finished_occurrence(prior, current)
+        state = None if finished is None else self._load_task_series_unlocked(finished[0])
+        if finished is not None and state is not None:
+            next_task = (
+                None if state.next_task_id is None else self._load_task_unlocked(state.next_task_id)
+            )
+            if advances_after(state, current, next_task):
+                self._advance_task_series_unlocked(state, after=finished[1])
+
+    def _load_task_series_unlocked(self, series_id: str) -> TaskSeriesState | None:
+        row = self._connection.execute(
+            "SELECT state_json FROM cayu_task_series WHERE series_id = ?", (series_id,)
+        ).fetchone()
+        return None if row is None else TaskSeriesState.model_validate_json(row[0])
+
+    def _save_task_series_unlocked(self, state: TaskSeriesState) -> None:
+        self._connection.execute(
+            "INSERT INTO cayu_task_series (series_id, state_json) VALUES (?, ?) "
+            "ON CONFLICT (series_id) DO UPDATE SET state_json = excluded.state_json",
+            (state.series.series_id, state.model_dump_json()),
+        )
+
+    def _advance_task_series_unlocked(
+        self, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        state, created = advance_series(
+            state, after=after, now=self._clock(), load=self._load_task_unlocked
+        )
+        if created is not None:
+            self._insert_task_unlocked(created)
+            self._record_task_transition_unlocked(None, created)
+        self._save_task_series_unlocked(state)
+        return state
+
+    async def save_task_series(self, series: TaskSeries) -> TaskSeriesState:
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_task_series_unlocked(series.series_id)
+                state = saved_series_state(existing, series, now=self._clock())
+                return self._settle_task_series_unlocked(
+                    state, after=None if existing is None else self._clock()
+                )
+
+    def _settle_task_series_unlocked(
+        self, state: TaskSeriesState, *, after: datetime | None
+    ) -> TaskSeriesState:
+        next_task = (
+            None if state.next_task_id is None else self._load_task_unlocked(state.next_task_id)
+        )
+        if needs_occurrence(state, next_task):
+            return self._advance_task_series_unlocked(state, after=after)
+        self._save_task_series_unlocked(state)
+        return state
+
+    async def load_task_series(self, series_id: str) -> TaskSeriesState | None:
+        async with self._lock:
+            return self._load_task_series_unlocked(series_id)
+
+    async def set_task_series_paused(self, series_id: str, paused: bool) -> TaskSeriesState:
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_task_series_unlocked(series_id)
+                if existing is None:
+                    raise KeyError(f"No task series {series_id!r}.")
+                state = paused_series_state(existing, paused=paused, now=self._clock())
+                return self._settle_task_series_unlocked(state, after=self._clock())
+
+    async def delete_task_series(self, series_id: str) -> bool:
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                cursor = self._connection.execute(
+                    "DELETE FROM cayu_task_series WHERE series_id = ?", (series_id,)
+                )
+                return cursor.rowcount == 1
 
     def _record_schedule_transition_unlocked(
         self, prior: Task | None, current: Task, *, operation_id: str | None = None

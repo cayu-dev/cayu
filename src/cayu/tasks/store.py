@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     )
     from cayu.tasks.operations import TaskCreationOperation
     from cayu.tasks.restart import AbandonedTaskRestartRequest
+    from cayu.tasks.series import TaskSeries, TaskSeriesState
 from cayu._clock import normalize_utc_datetime
 from cayu.runtime._durable_worker_loop import (
     DurableWorkerDemandPolicy,
@@ -331,6 +332,9 @@ class TaskStore(ABC):
     # True only when create_task admits ``TaskCreate.retry_key`` atomically with
     # the insert and load_task_retry_key reads the result.
     supports_task_retry_keys: ClassVar[bool] = False
+    # True when save_task_series and the methods after it keep series durably and
+    # every transition that ends an occurrence queues the next one atomically.
+    supports_task_series: ClassVar[bool] = False
     # Requires automatic event association before invocation fingerprinting,
     # atomic admission of roots and native successors, terminal transition
     # accounting, and the store-clock maintenance/remaining-time methods below.
@@ -1457,6 +1461,41 @@ class TaskStore(ABC):
         """
 
         raise NotImplementedError("This TaskStore does not support task retry keys.")
+
+    async def save_task_series(self, series: TaskSeries) -> TaskSeriesState:
+        """Store ``series`` (replacing its definition if it exists) and queue its next occurrence.
+
+        A new series queues its first occurrence from ``start_at``; an existing one
+        keeps its paused state and the occurrence already queued. In the same
+        transaction, an active series with nothing queued gets its next occurrence. From
+        then on, every transition that ends the series' queued occurrence (completed,
+        failed or cancelled) queues the next one in its own transaction, until the series
+        is paused or deleted. Occurrences are ordinary managed scheduled tasks, as
+        :func:`cayu.tasks.publish_next_occurrence` makes them.
+        """
+
+        raise NotImplementedError("This TaskStore does not support task series.")
+
+    async def load_task_series(self, series_id: str) -> TaskSeriesState | None:
+        """The stored series, or ``None``."""
+
+        raise NotImplementedError("This TaskStore does not support task series.")
+
+    async def set_task_series_paused(self, series_id: str, paused: bool) -> TaskSeriesState:
+        """Pause or resume a stored series; raise ``KeyError`` if there is none.
+
+        A paused series queues nothing more when an occurrence ends; the occurrence
+        already queued stays queued, and ``series_task_handler`` completes it without
+        running the handler. Resuming queues the next occurrence after now if nothing
+        is queued, stepping over future occurrences that were cancelled.
+        """
+
+        raise NotImplementedError("This TaskStore does not support task series.")
+
+    async def delete_task_series(self, series_id: str) -> bool:
+        """Delete a stored series; its tasks stay. Return whether it existed."""
+
+        raise NotImplementedError("This TaskStore does not support task series.")
 
     async def reconcile_task_retry_cancellation(
         self,

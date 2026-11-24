@@ -69,6 +69,7 @@ from cayu.storage._task_group_schema import (
 from cayu.storage._task_index_schema import POSTGRES_TASK_INDEX_DDL, TASK_INDEX_REVISION
 from cayu.storage._task_progress_schema import POSTGRES_TASK_PROGRESS_DDL, TASK_PROGRESS_REVISION
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
+from cayu.storage._task_series_schema import POSTGRES_TASK_SERIES_DDL, TASK_SERIES_REVISION
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
 from cayu.storage._trace_event_schema import POSTGRES_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
@@ -1068,6 +1069,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     ENVIRONMENT_ACTIVITY_INDEX_REVISION: (),
     # Task progress counters, in a table of their own.
     TASK_PROGRESS_REVISION: POSTGRES_TASK_PROGRESS_DDL,
+    # Recurring task series, one row each.
+    TASK_SERIES_REVISION: POSTGRES_TASK_SERIES_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

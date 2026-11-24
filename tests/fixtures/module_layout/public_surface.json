@@ -4661,6 +4661,7 @@
         "cayu.tasks.series": [
           "TaskRecurrence",
           "TaskSeries",
+          "TaskSeriesState",
           "last_occurrence",
           "next_occurrence",
           "occurrence_task_id",

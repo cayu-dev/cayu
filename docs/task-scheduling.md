@@ -293,6 +293,43 @@ settings, and Cayu keeps its occurrences:
   without a store.
 - `cayu task list --type review` and `cayu task show <id>` read the occurrences.
 
+#### Series kept by the task store
+
+The built-in stores (memory, SQLite and PostgreSQL, `supports_task_series`) can also
+keep the series themselves, with its paused state, so the application doesn't:
+
+```python
+state = await task_store.save_task_series(series)  # queues the first occurrence
+await task_store.set_task_series_paused(series.series_id, True)
+await task_store.set_task_series_paused(series.series_id, False)
+await task_store.load_task_series(series.series_id)  # a TaskSeriesState, or None
+await task_store.delete_task_series(series.series_id)
+
+await run_task_worker(
+    app, task_store, series_task_handler(task_store, review_handler), worker_id="worker-1"
+)
+```
+
+- `save_task_series` stores the definition and, in the same transaction, queues the
+  first occurrence from `start_at` (by the misfire rule). Saving an existing series
+  replaces its definition and keeps its paused state and the occurrence already
+  queued. `TaskSeriesState.next_task_id` names the occurrence queued last and
+  `revision` goes up with every change.
+- When that occurrence ends (completed, failed or cancelled, also after a lost
+  worker), the transaction that ends it also queues the next occurrence. Nothing
+  needs to run between the two, so a crash can't leave the series without its next
+  occurrence. An older occurrence that ends later doesn't queue anything.
+- Without `series_for`, `series_task_handler` reads the stored series: an occurrence
+  of a paused or deleted series completes as `series_paused`, and the wrapper
+  publishes nothing itself.
+- A paused series queues nothing when an occurrence ends. Resuming queues the next
+  occurrence after now if nothing is queued, stepping over future occurrences that
+  were cancelled. Deleting a series leaves its tasks.
+- Storage revision 161 adds the `cayu_task_series` table. It is breaking: an older
+  worker could end an occurrence without queueing the next one, so stop older
+  workers and run `cayu storage migrate --acknowledge-breaking 161` before starting
+  this version.
+
 ## Let an agent sleep and continue later
 
 Three kinds of waiting look alike but differ in what survives a crash:

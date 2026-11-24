@@ -24,7 +24,15 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import require_clean_nonblank
@@ -253,6 +261,29 @@ class TaskSeries(BaseModel):
             raise ValueError(f"metadata[{SERIES_METADATA_KEY!r}] is set by the series.")
         return template
 
+    @model_validator(mode="after")
+    def validate_occurrences(self) -> TaskSeries:
+        # Every occurrence is the template plus a schedule; refuse a template that
+        # can't take one (for example one a managed schedule doesn't allow) up front.
+        copy_task_create(occurrence_request(self, self.recurrence.start_at))
+        return self
+
+
+class TaskSeriesState(BaseModel):
+    """A series as a task store keeps it (``TaskStore.save_task_series``): its definition, whether it is paused, its next task.
+
+    ``next_task_id`` is the occurrence the store queued last, or ``None`` when the
+    series has no further occurrence. ``revision`` goes up with every change.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    series: TaskSeries
+    paused: StrictBool = False
+    revision: StrictInt = Field(ge=1)
+    next_task_id: str | None = None
+    updated_at: datetime
+
 
 def occurrence_task_id(series_id: str, occurrence_at: datetime) -> str:
     """The task id of ``series_id``'s occurrence at ``occurrence_at``."""
@@ -271,6 +302,49 @@ def task_occurrence(task: Task) -> tuple[str, datetime] | None:
     if type(series_id) is not str or type(at) is not str:
         return None
     return series_id, datetime.fromisoformat(at)
+
+
+def planned_occurrence(
+    series: TaskSeries, *, after: datetime | None, now: datetime
+) -> datetime | None:
+    """The occurrence to queue after ``after`` (``None``: from ``start_at``), by the misfire rule."""
+
+    recurrence = series.recurrence
+    at = next_occurrence(
+        recurrence, recurrence.start_at - timedelta(microseconds=1) if after is None else after
+    )
+    if at is not None and (now - at).total_seconds() > series.misfire_grace_seconds:
+        at = (
+            next_occurrence(recurrence, now)
+            if series.misfire_policy is TaskMisfirePolicy.SKIP
+            else last_occurrence(recurrence, now)
+        )
+    return at
+
+
+def occurrence_request(series: TaskSeries, at: datetime) -> TaskCreate:
+    """The task creation request of ``series``' occurrence at ``at``."""
+
+    return series.task.model_copy(
+        update={
+            "task_id": occurrence_task_id(series.series_id, at),
+            "available_at": at,
+            # The store always admits it, however late: series_task_handler applies
+            # the series' misfire policy, so a skipped occurrence still publishes
+            # the next one.
+            "schedule_policy": TaskSchedulePolicy(
+                misfire_policy=TaskMisfirePolicy.FIRE_ONCE,
+                misfire_grace_seconds=series.misfire_grace_seconds,
+            ),
+            "metadata": {
+                **series.task.metadata,
+                SERIES_METADATA_KEY: {
+                    "series_id": series.series_id,
+                    "occurrence_at": at.isoformat(),
+                },
+            },
+        }
+    )
 
 
 async def publish_next_occurrence(
@@ -294,15 +368,7 @@ async def publish_next_occurrence(
     series = TaskSeries.model_validate(series.model_dump())
     current = datetime.now(UTC) if now is None else normalize_utc_datetime(now, "now")
     recurrence = series.recurrence
-    at = next_occurrence(
-        recurrence, recurrence.start_at - timedelta(microseconds=1) if after is None else after
-    )
-    if at is not None and (current - at).total_seconds() > series.misfire_grace_seconds:
-        at = (
-            next_occurrence(recurrence, current)
-            if series.misfire_policy is TaskMisfirePolicy.SKIP
-            else last_occurrence(recurrence, current)
-        )
+    at = planned_occurrence(series, after=after, now=current)
     for _ in range(_CANCELLED_SKIP_MAX):
         if at is None:
             return None
@@ -320,26 +386,7 @@ async def publish_next_occurrence(
 
 async def _publish_occurrence(task_store: TaskStore, series: TaskSeries, at: datetime) -> Task:
     task_id = occurrence_task_id(series.series_id, at)
-    request = series.task.model_copy(
-        update={
-            "task_id": task_id,
-            "available_at": at,
-            # The store always admits it, however late: series_task_handler applies
-            # the series' misfire policy, so a skipped occurrence still publishes
-            # the next one.
-            "schedule_policy": TaskSchedulePolicy(
-                misfire_policy=TaskMisfirePolicy.FIRE_ONCE,
-                misfire_grace_seconds=series.misfire_grace_seconds,
-            ),
-            "metadata": {
-                **series.task.metadata,
-                SERIES_METADATA_KEY: {
-                    "series_id": series.series_id,
-                    "occurrence_at": at.isoformat(),
-                },
-            },
-        }
-    )
+    request = occurrence_request(series, at)
     existing = await task_store.load_task(task_id)
     if existing is not None:
         return existing
@@ -358,18 +405,20 @@ SeriesLookup = Callable[[Task], TaskSeries | None | Awaitable[TaskSeries | None]
 
 
 def series_task_handler(
-    task_store: TaskStore, handler: TaskHandler, *, series_for: SeriesLookup
+    task_store: TaskStore, handler: TaskHandler, *, series_for: SeriesLookup | None = None
 ) -> TaskHandler:
-    """Wrap ``handler`` so each series occurrence publishes the next one before it runs.
+    """Wrap ``handler`` so it runs only the occurrences of active series, on time.
 
-    ``series_for(task)`` returns the task's series as the application keeps it now
-    (sync or async), or ``None`` when the series is paused or deleted: then nothing
-    more is published, and the occurrence is completed with ``{"series_paused":
-    true}`` without running ``handler``. Tasks that aren't series occurrences go to
-    ``handler`` unchanged. Publishing first means a failure, a lost worker or a
-    restart of this occurrence never stops the series. An occurrence that starts more
-    than ``misfire_grace_seconds`` late in a ``SKIP`` series is completed with
-    ``{"series_skipped": true}`` without running ``handler``.
+    Without ``series_for``, the series are the ones stored with
+    ``TaskStore.save_task_series``, and the store queues each next occurrence when the
+    current one ends. With ``series_for(task)``, which returns the task's series as the
+    application keeps it now (sync or async), the wrapper publishes the next
+    occurrence before it runs the current one, so a failure, a lost worker or a restart
+    never stops the series. Either way, an occurrence of a paused or deleted series
+    (``series_for`` returns ``None``) is completed with ``{"series_paused": true}``
+    without running ``handler``, and one that starts more than
+    ``misfire_grace_seconds`` late in a ``SKIP`` series with ``{"series_skipped":
+    true}``. Tasks that aren't series occurrences go to ``handler`` unchanged.
     """
 
     from cayu.tasks.worker import complete_managed_task
@@ -378,9 +427,13 @@ def series_task_handler(
         occurrence = task_occurrence(task)
         if occurrence is None:
             return await handler(app, task, worker_id)
-        found = series_for(task)
-        if inspect.isawaitable(found):
-            found = await found
+        if series_for is None:
+            state = await task_store.load_task_series(occurrence[0])
+            found = None if state is None or state.paused else state.series
+        else:
+            found = series_for(task)
+            if inspect.isawaitable(found):
+                found = await found
         if found is None:
             await complete_managed_task(task_store, task, worker_id, {"series_paused": True})
             return None
@@ -388,7 +441,8 @@ def series_task_handler(
             raise TypeError("series_for must return a TaskSeries or None.")
         series = found
         now = datetime.now(UTC)
-        await publish_next_occurrence(task_store, series, after=occurrence[1], now=now)
+        if series_for is not None:
+            await publish_next_occurrence(task_store, series, after=occurrence[1], now=now)
         late = (now - occurrence[1]).total_seconds() > series.misfire_grace_seconds
         # Only an occurrence's first run is skipped: a restart of it began on time.
         if late and series.misfire_policy is TaskMisfirePolicy.SKIP and task.restart_count == 0:
@@ -403,6 +457,7 @@ __all__ = [
     "SERIES_METADATA_KEY",
     "TaskRecurrence",
     "TaskSeries",
+    "TaskSeriesState",
     "last_occurrence",
     "next_occurrence",
     "occurrence_task_id",

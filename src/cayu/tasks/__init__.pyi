@@ -286,6 +286,7 @@ from cayu.tasks.scheduling import TaskScheduleState as TaskScheduleState
 from cayu.tasks.scheduling import TaskScheduleWakeup as TaskScheduleWakeup
 from cayu.tasks.series import TaskRecurrence as TaskRecurrence
 from cayu.tasks.series import TaskSeries as TaskSeries
+from cayu.tasks.series import TaskSeriesState as TaskSeriesState
 from cayu.tasks.series import last_occurrence as last_occurrence
 from cayu.tasks.series import next_occurrence as next_occurrence
 from cayu.tasks.series import occurrence_task_id as occurrence_task_id

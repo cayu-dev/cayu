@@ -36,6 +36,7 @@ from cayu.storage._session_list_index_schema import (
 from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage._task_progress_schema import TASK_PROGRESS_REVISION
+from cayu.storage._task_series_schema import TASK_SERIES_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage._usage_projection_schema import USAGE_PROJECTION_REVISION
 
@@ -713,6 +714,14 @@ REVISIONS: tuple[Revision, ...] = (
     # Task progress counters are a new table that older binaries never read or
     # write. Only the optional task progress stores require it.
     Revision(revision=TASK_PROGRESS_REVISION, kind=RevisionKind.ADDITIVE, compatible_from=146),
+    # Recurring task series: one row per series with its definition, paused state
+    # and the occurrence queued last. Breaking: every writer that ends an occurrence
+    # must queue the next one in the same transaction, which older binaries don't.
+    Revision(
+        revision=TASK_SERIES_REVISION,
+        kind=RevisionKind.BREAKING,
+        compatible_from=TASK_SERIES_REVISION,
+    ),
 )
 
 #: The revision an empty database is initialized to.
