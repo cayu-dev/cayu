@@ -237,32 +237,13 @@ class CodingBackendRegistry:
         only.
         """
 
-        env = os.environ if environ is None else environ
-        configured = (env.get(CODING_BACKEND_ENV) or "").strip() or None
-        if required is not None and configured is not None and required != configured:
-            raise ValueError(
-                f"{CODING_BACKEND_ENV}={configured} conflicts with the required coding backend "
-                f"{required!r}."
-            )
-        name = required or configured
-        if name is not None:
-            source = CODING_BACKEND_ENV if required is None else "This application"
-            registration = self._registrations.get(name)
-            if registration is None:
-                raise ValueError(
-                    f"{source} requires the {name!r} coding backend, which isn't registered "
-                    f"(registered: {', '.join(self.names()) or 'none'})."
-                )
-            reason = None if registration.available is None else registration.available(env)
-            if reason is not None:
-                raise ValueError(f"{source} requires the {name!r} coding backend, but {reason}.")
-            return name
-        reason = cloud_sandbox_unavailable_reason(env)
-        if reason is None:
-            return CLOUD_CODING_BACKEND
-        if (env.get(_CLOUD_SANDBOX_TOKEN_VARIABLE) or "").strip():
-            raise ValueError(f"Cayu Cloud's sandbox variables are incomplete: {reason}.")
-        return DOCKER_CODING_BACKEND
+        return _select_backend_name(
+            {name: r.available for name, r in self._registrations.items()},
+            environ,
+            required=required,
+            env_variable=CODING_BACKEND_ENV,
+            kind="coding",
+        )
 
     def build(
         self,
@@ -292,6 +273,49 @@ class CodingBackendRegistry:
         if backend.toolchain_profile != owned_profile:
             raise ValueError(f"The {name!r} backend changed the toolchain profile it was given.")
         return backend
+
+
+def _select_backend_name(
+    available: Mapping[str, CodingBackendAvailability | None],
+    environ: Mapping[str, str] | None,
+    *,
+    required: str | None,
+    env_variable: str,
+    kind: str,
+) -> str:
+    """Pick a backend name by the rule :meth:`CodingBackendRegistry.selected_name` documents.
+
+    ``available`` maps each registered name to its availability check (or
+    ``None``), ``env_variable`` names the variable that requires one backend,
+    and ``kind`` says what the backends are in error messages. Other
+    registries use it to select their backends the same way.
+    """
+
+    env = os.environ if environ is None else environ
+    configured = (env.get(env_variable) or "").strip() or None
+    if required is not None and configured is not None and required != configured:
+        raise ValueError(
+            f"{env_variable}={configured} conflicts with the required {kind} backend {required!r}."
+        )
+    name = required or configured
+    if name is not None:
+        source = env_variable if required is None else "This application"
+        if name not in available:
+            raise ValueError(
+                f"{source} requires the {name!r} {kind} backend, which isn't registered "
+                f"(registered: {', '.join(sorted(available)) or 'none'})."
+            )
+        check = available[name]
+        reason = None if check is None else check(env)
+        if reason is not None:
+            raise ValueError(f"{source} requires the {name!r} {kind} backend, but {reason}.")
+        return name
+    reason = cloud_sandbox_unavailable_reason(env)
+    if reason is None:
+        return CLOUD_CODING_BACKEND
+    if (env.get(_CLOUD_SANDBOX_TOKEN_VARIABLE) or "").strip():
+        raise ValueError(f"Cayu Cloud's sandbox variables are incomplete: {reason}.")
+    return DOCKER_CODING_BACKEND
 
 
 def cloud_sandbox_unavailable_reason(environ: Mapping[str, str]) -> str | None:

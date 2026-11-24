@@ -3226,6 +3226,22 @@
           "E2BWorkspaceCapability",
           "E2BWorkspaceEntry"
         ],
+        "cayu.runners.isolated": [
+          "IsolatedLimits",
+          "IsolatedRun",
+          "isolated_run_key",
+          "run_isolated"
+        ],
+        "cayu.runners.isolated_backends": [
+          "CloudIsolatedOptions",
+          "DockerIsolatedOptions",
+          "IsolatedBackendRegistry",
+          "IsolatedRunnerContext",
+          "default_isolated_backends",
+          "open_cloud_isolated_runner",
+          "open_docker_isolated_runner",
+          "open_isolated_runner"
+        ],
         "cayu.runners.launched": [
           "LaunchedRunner"
         ],
@@ -3252,6 +3268,8 @@
         "E2BCloseAction",
         "E2BGuestHandoffPhase",
         "E2B_SANDBOX_ID_MAX_BYTES",
+        "ISOLATED_BACKEND_ENV",
+        "ISOLATED_OUTPUT_LIMIT_BYTES",
         "LambdaMicroVMCloseAction",
         "PINNED_BROWSER_FETCH_IMAGE",
         "PINNED_BROWSER_FETCH_WORKLOAD",

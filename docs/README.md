@@ -71,6 +71,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Project workers](project-workers.md)
 - [Approved remote Git delivery](remote-git-delivery.md)
 - [Process-isolated host tools](process-isolated-tools.md)
+- [Isolated commands on files](isolated-commands.md)
 - [Server configuration](server-configuration.md)
 - [Registered session exports](session-exports.md)
 - [Authenticated peer-content delivery](peer-content.md)
