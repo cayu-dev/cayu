@@ -555,6 +555,47 @@ after stopping and fully joining the handler themselves. Keep the lease renewed
 until that point and pass its current snapshot. This standalone helper neither
 cancels work nor treats an expired lease as proof of quiescence.
 
+### Queue a task with the application's own rows
+
+`create_task` commits on the task store's own connection, so it can't join the
+application's transaction. When the application writes a row and queues a task
+for it, a crash between the two commits loses the task, or leaves a task for a
+row that rolled back. Queue the task through an outbox table instead, in the same
+transaction as the row, and let a drain create it:
+
+```python
+from sqlalchemy import text
+from cayu.tasks.outbox import PostgresTaskOutbox, run_task_outbox, task_outbox_row
+
+# The application's migration creates the table:
+#   task_outbox_ddl("app.task_outbox", dialect="postgresql")
+with session.begin():
+    session.add(Invoice(id="inv-1"))
+    session.execute(
+        text("INSERT INTO app.task_outbox (id, request_json) VALUES (:id, :request_json)"),
+        task_outbox_row(TaskCreate(type="review", input={"invoice": "inv-1"})),
+    )
+
+# In the worker process, beside the task worker:
+await run_task_outbox(app.task_store, PostgresTaskOutbox(dsn, table="app.task_outbox"))
+```
+
+`task_outbox_row` gives the request a task id when it has none, and the row's id is
+that task id, so the task exists exactly when the application's commit does.
+`drain_task_outbox(task_store, outbox)` creates the queued tasks in the order they
+were written (a parent queued before its child in one transaction comes first) and
+removes each row once its task exists; a drain that stops in between leaves the
+row, and the next one finds the task and only removes the row. A row whose request
+the store refuses (a missing parent, a spent retry key, JSON that doesn't parse) is
+logged, listed in the drain's `refused` and removed, so it can't hold up later rows.
+A request carrying runtime invocation provenance can't be queued this way. `run_task_outbox`
+drains every `interval_s` seconds (1 by default) until its `stop` event is set.
+`SQLiteTaskOutbox(path, table=...)` reads the same table in a SQLite file, and
+`TaskOutbox` is the contract for another backend. The table is the application's
+(columns `id`, `request_json`, `created_at`, and on PostgreSQL a `position`
+sequence that orders the drain); Cayu reads and deletes its rows and never migrates
+it.
+
 ### Saved step results
 
 A restarted handler starts again from the top. To skip steps that already
