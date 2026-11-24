@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from cayu.tasks.creation import TaskCreate
@@ -39,7 +40,11 @@ class TaskOnce:
 
 
 async def create_task_once(
-    task_store: TaskStore, request: TaskCreate, *, attempts: int = 1
+    task_store: TaskStore,
+    request: TaskCreate,
+    *,
+    attempts: int = 1,
+    task_id_for: Callable[[str, int], str] | None = None,
 ) -> TaskOnce:
     """Queue ``request`` unless its ``retry_key`` already has a task; return the task.
 
@@ -55,7 +60,12 @@ async def create_task_once(
 
     The task IDs come from the key and the attempt number, so two callers queueing the
     same attempt collide on the ID and only one task is made. The request can't name
-    its own ``task_id`` for that reason.
+    its own ``task_id`` for that reason. To choose the IDs, pass ``task_id_for``: it is
+    called with the key and the attempt number (1 for the first task) and must return
+    the same ID for the same pair and a different ID for each attempt, such as
+    ``lambda key, attempt: f"{key}:{attempt}"``. The guarantee stays the same, because
+    callers that queue the same attempt still collide on its ID. An ID some other task
+    already uses, one not queued for this key, is refused with ``ValueError``.
     """
 
     key = request.retry_key
@@ -78,7 +88,11 @@ async def create_task_once(
         if not _admits_another(state, holder):
             return TaskOnce(task=holder, created=False, key=state)
     attempt = 1 if state is None else state.attempts + 1
-    task_id = _attempt_task_id(key, attempt)
+    task_id = (
+        _attempt_task_id(key, attempt)
+        if task_id_for is None
+        else _chosen_task_id(task_id_for, key, attempt, state)
+    )
     try:
         task = await task_store.create_task(
             request.model_copy(update={"task_id": task_id, "retry_budget": budget})
@@ -106,6 +120,23 @@ def _admits_another(state: TaskRetryKeyState, holder: Task | None) -> bool:
         return False
     remaining = state.attempts_remaining
     return holder.status in _ENDED_WITHOUT_COMPLETING and (remaining is None or remaining > 0)
+
+
+def _chosen_task_id(
+    task_id_for: Callable[[str, int], str],
+    key: str,
+    attempt: int,
+    state: TaskRetryKeyState | None,
+) -> str:
+    task_id = task_id_for(key, attempt)
+    if type(task_id) is not str:
+        raise TypeError("task_id_for must return the task ID as a string.")
+    if state is not None and task_id == state.latest_task_id:
+        raise ValueError(
+            f"task_id_for returned {task_id!r} for attempt {attempt}, the ID of the key's "
+            "previous task; return a different ID for each attempt."
+        )
+    return task_id
 
 
 def _attempt_task_id(key: str, attempt: int) -> str:

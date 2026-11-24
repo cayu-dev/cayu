@@ -243,7 +243,13 @@ cancelled or was skipped, the next call queues another, up to N tasks for the ke
 Otherwise queue again under a new key, for example the slot with a suffix. The first use of
 the key fixes its budget, and later calls keep it. The task IDs come from the key
 and the attempt number, so two callers queueing the same attempt make one task; the
-request can't set its own `task_id`.
+request can't set its own `task_id`. To keep IDs of your own, such as ones a queue you
+are moving from already uses, pass `task_id_for`, a function of the key and the
+attempt number (1 for the first task) that returns the same ID for the same pair and
+a different one for each attempt, for example
+`task_id_for=lambda key, attempt: f"{key}:{attempt}"`. Callers queueing the same
+attempt still collide on its ID, so the key still holds one task at a time. An ID
+another task already uses is refused with `ValueError`.
 
 ```python
 from cayu.tasks import TaskCreate, create_task_once
