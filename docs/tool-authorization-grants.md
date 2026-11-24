@@ -157,7 +157,13 @@ tool that would otherwise need approval as `conditional`.
 `ToolCallPreauthorizationStore` is the seam for a durable store: `issue` is
 idempotent for equal terms and raises `ToolAuthorizationGrantConflict` for
 different ones, `use` must be atomic, and a used record can't be revoked.
-`InMemoryToolCallPreauthorizationStore` is the process-local implementation.
+`InMemoryToolCallPreauthorizationStore` is the process-local implementation;
+`cayu.storage.SQLiteToolCallPreauthorizationStore` and
+`cayu.storage.PostgresToolCallPreauthorizationStore` keep records durably and
+share one set of transition rules with it. Each `use` runs in one transaction
+(SQLite `BEGIN IMMEDIATE`, PostgreSQL a transaction lock on the task), so two
+workers never use one record. The table joins storage revision 162; run
+`cayu storage migrate` on an existing database.
 The digest is of the whole call's arguments, as the model sent them. A built-in
 tool that checks each target of a batched call separately, such as `read_file`
 with `files`, passes its policy one argument set per target; the runtime also

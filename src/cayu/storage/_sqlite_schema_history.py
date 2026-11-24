@@ -67,6 +67,10 @@ from cayu.storage._task_progress_schema import SQLITE_TASK_PROGRESS_DDL, TASK_PR
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_series_schema import SQLITE_TASK_SERIES_DDL, TASK_SERIES_REVISION
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
+from cayu.storage._tool_call_preauthorization_schema import (
+    SQLITE_TOOL_CALL_PREAUTHORIZATION_DDL,
+    TOOL_CALL_PREAUTHORIZATION_REVISION,
+)
 from cayu.storage._trace_event_schema import SQLITE_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import SQLITE_USAGE_EVENTS_DDL
 from cayu.storage._usage_projection_schema import (
@@ -851,6 +855,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     TASK_PROGRESS_REVISION: SQLITE_TASK_PROGRESS_DDL,
     # Recurring task series, one row each.
     TASK_SERIES_REVISION: SQLITE_TASK_SERIES_DDL,
+    # Preauthorizations of one exact tool call, issued before a task's sessions run.
+    TOOL_CALL_PREAUTHORIZATION_REVISION: SQLITE_TOOL_CALL_PREAUTHORIZATION_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

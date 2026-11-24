@@ -71,6 +71,10 @@ from cayu.storage._task_progress_schema import POSTGRES_TASK_PROGRESS_DDL, TASK_
 from cayu.storage._task_scheduling_schema import POSTGRES_SCHEDULING_DDL
 from cayu.storage._task_series_schema import POSTGRES_TASK_SERIES_DDL, TASK_SERIES_REVISION
 from cayu.storage._task_step_schema import POSTGRES_TASK_STEP_DDL
+from cayu.storage._tool_call_preauthorization_schema import (
+    POSTGRES_TOOL_CALL_PREAUTHORIZATION_DDL,
+    TOOL_CALL_PREAUTHORIZATION_REVISION,
+)
 from cayu.storage._trace_event_schema import POSTGRES_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
 from cayu.storage._usage_event_schema import POSTGRES_USAGE_EVENTS_DDL
 from cayu.storage._usage_projection_schema import (
@@ -1071,6 +1075,8 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     TASK_PROGRESS_REVISION: POSTGRES_TASK_PROGRESS_DDL,
     # Recurring task series, one row each.
     TASK_SERIES_REVISION: POSTGRES_TASK_SERIES_DDL,
+    # Preauthorizations of one exact tool call, issued before a task's sessions run.
+    TOOL_CALL_PREAUTHORIZATION_REVISION: POSTGRES_TOOL_CALL_PREAUTHORIZATION_DDL,
     128: (
         """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE "C" PRIMARY KEY,

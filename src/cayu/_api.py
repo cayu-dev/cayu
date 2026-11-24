@@ -24,6 +24,7 @@ OPTIONAL_EXTRA_MODULES = frozenset(
         "cayu.storage.postgres",
         "cayu.storage.product_operations_postgres",
         "cayu.storage.product_operations_sqlite",
+        "cayu.storage.tool_call_preauthorizations_postgres",
     }
 )
 

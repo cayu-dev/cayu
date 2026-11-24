@@ -279,6 +279,92 @@ class ToolCallPreauthorizationStore(ABC):
         """Revoke an unused record; revoking a used one raises a conflict."""
 
 
+# Transition rules every store applies inside its own atomic section, so the
+# in-memory, SQLite and PostgreSQL stores decide identically.
+
+
+def issued_transition(
+    existing: ToolCallPreauthorization | None, record: ToolCallPreauthorization
+) -> tuple[ToolCallPreauthorization, bool]:
+    """The record to keep for ``issue`` and whether it must be written."""
+
+    if type(record) is not ToolCallPreauthorization:
+        raise TypeError("preauthorization must be a ToolCallPreauthorization.")
+    if record.use is not None or record.revoked_at is not None:
+        raise ValueError("Issue a preauthorization unused and unrevoked.")
+    if existing is None:
+        return record, True
+    if existing.terms() != record.terms():
+        raise ToolAuthorizationGrantConflict("A preauthorization with this id has different terms.")
+    return existing, False
+
+
+def used_transition(
+    records: Iterable[ToolCallPreauthorization],
+    *,
+    task_id: str,
+    tool_name: str,
+    arguments_digest: str,
+    agent_name: str,
+    use: ToolCallPreauthorizationUse,
+) -> tuple[ToolCallPreauthorization | None, bool]:
+    """The record ``use`` decides from the task's records, and whether it changed."""
+
+    candidates = sorted(
+        (
+            record
+            for record in records
+            if record.matches(
+                task_id=task_id,
+                tool_name=tool_name,
+                arguments_digest=arguments_digest,
+                agent_name=agent_name,
+            )
+        ),
+        key=lambda record: (record.created_at, record.preauthorization_id),
+    )
+    for record in candidates:
+        if record.use is not None and record.use.same_call(use):
+            return record, False
+    for record in candidates:
+        if record.available(use.used_at):
+            return record.model_copy(update={"use": use}), True
+    return None, False
+
+
+def revoked_transition(
+    existing: ToolCallPreauthorization | None,
+    *,
+    preauthorization_id: str,
+    revoked_by: ToolAuthorizationGrantActor | None,
+    now: datetime,
+) -> tuple[ToolCallPreauthorization, bool]:
+    """The record ``revoke`` leaves and whether it must be written."""
+
+    if existing is None:
+        raise ToolAuthorizationGrantNotFound(preauthorization_id)
+    if existing.use is not None:
+        raise ToolAuthorizationGrantConflict("A used preauthorization cannot be revoked.")
+    if existing.revoked_at is not None:
+        return existing, False
+    revoked = ToolCallPreauthorization.model_validate(
+        {
+            **existing.model_dump(),
+            "revoked_at": normalize_grant_timestamp(now, "now"),
+            "revoked_by": revoked_by,
+        }
+    )
+    return revoked, True
+
+
+def preauthorization_record_json(record: ToolCallPreauthorization) -> str:
+    return record.model_dump_json()
+
+
+def preauthorization_from_record_json(value: str | bytes) -> ToolCallPreauthorization:
+    return ToolCallPreauthorization.model_validate_json(value)
+
+
 class InMemoryToolCallPreauthorizationStore(ToolCallPreauthorizationStore):
     """Process-local store for tests and single-process applications."""
 
@@ -287,20 +373,14 @@ class InMemoryToolCallPreauthorizationStore(ToolCallPreauthorizationStore):
         self._lock = asyncio.Lock()
 
     async def issue(self, preauthorization: ToolCallPreauthorization) -> ToolCallPreauthorization:
-        if type(preauthorization) is not ToolCallPreauthorization:
-            raise TypeError("preauthorization must be a ToolCallPreauthorization.")
-        if preauthorization.use is not None or preauthorization.revoked_at is not None:
-            raise ValueError("Issue a preauthorization unused and unrevoked.")
         async with self._lock:
-            stored = self._records.get(preauthorization.preauthorization_id)
-            if stored is None:
-                self._records[preauthorization.preauthorization_id] = preauthorization
-                return preauthorization
-            if stored.terms() != preauthorization.terms():
-                raise ToolAuthorizationGrantConflict(
-                    "A preauthorization with this id has different terms."
-                )
-            return stored
+            record, changed = issued_transition(
+                self._records.get(getattr(preauthorization, "preauthorization_id", "")),
+                preauthorization,
+            )
+            if changed:
+                self._records[record.preauthorization_id] = record
+            return record
 
     async def get(self, preauthorization_id: str) -> ToolCallPreauthorization:
         record = self._records.get(preauthorization_id)
@@ -326,25 +406,17 @@ class InMemoryToolCallPreauthorizationStore(ToolCallPreauthorizationStore):
         use: ToolCallPreauthorizationUse,
     ) -> ToolCallPreauthorization | None:
         async with self._lock:
-            candidates = [
-                record
-                for record in await self.list_for_task(task_id)
-                if record.matches(
-                    task_id=task_id,
-                    tool_name=tool_name,
-                    arguments_digest=arguments_digest,
-                    agent_name=agent_name,
-                )
-            ]
-            for record in candidates:
-                if record.use is not None and record.use.same_call(use):
-                    return record
-            for record in candidates:
-                if record.available(use.used_at):
-                    used = record.model_copy(update={"use": use})
-                    self._records[record.preauthorization_id] = used
-                    return used
-            return None
+            record, changed = used_transition(
+                self._records.values(),
+                task_id=task_id,
+                tool_name=tool_name,
+                arguments_digest=arguments_digest,
+                agent_name=agent_name,
+                use=use,
+            )
+            if record is not None and changed:
+                self._records[record.preauthorization_id] = record
+            return record
 
     async def revoke(
         self,
@@ -354,20 +426,15 @@ class InMemoryToolCallPreauthorizationStore(ToolCallPreauthorizationStore):
         now: datetime,
     ) -> ToolCallPreauthorization:
         async with self._lock:
-            record = await self.get(preauthorization_id)
-            if record.use is not None:
-                raise ToolAuthorizationGrantConflict("A used preauthorization cannot be revoked.")
-            if record.revoked_at is not None:
-                return record
-            revoked = ToolCallPreauthorization.model_validate(
-                {
-                    **record.model_dump(),
-                    "revoked_at": normalize_grant_timestamp(now, "now"),
-                    "revoked_by": revoked_by,
-                }
+            record, changed = revoked_transition(
+                self._records.get(preauthorization_id),
+                preauthorization_id=preauthorization_id,
+                revoked_by=revoked_by,
+                now=now,
             )
-            self._records[preauthorization_id] = revoked
-            return revoked
+            if changed:
+                self._records[preauthorization_id] = record
+            return record
 
 
 def _mandatory(metadata: Mapping[str, Any]) -> bool:

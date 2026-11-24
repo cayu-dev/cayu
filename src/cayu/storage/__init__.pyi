@@ -347,6 +347,12 @@ from cayu.storage.task_steps_postgres import PostgresTaskStepStore as PostgresTa
 from cayu.storage.task_steps_sqlite import SQLiteTaskStepStore as SQLiteTaskStepStore
 from cayu.storage.tasks_postgres import PostgresTaskStore as PostgresTaskStore
 from cayu.storage.tasks_sqlite import SQLiteTaskStore as SQLiteTaskStore
+from cayu.storage.tool_call_preauthorizations_postgres import (
+    PostgresToolCallPreauthorizationStore as PostgresToolCallPreauthorizationStore,
+)
+from cayu.storage.tool_call_preauthorizations_sqlite import (
+    SQLiteToolCallPreauthorizationStore as SQLiteToolCallPreauthorizationStore,
+)
 from cayu.storage.work_context_postgres import (
     PostgresAgentWorkContextStore as PostgresAgentWorkContextStore,
 )
@@ -520,6 +526,7 @@ __all__ = [
     "SQLiteTaskStepStore",
     "SQLiteTaskStore",
     "SQLiteToolAuthorizationGrantStore",
+    "SQLiteToolCallPreauthorizationStore",
     "SessionCompactionLevel",
     "SessionRetentionPolicy",
     "SessionRetentionTarget",

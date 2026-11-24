@@ -20,10 +20,9 @@ def test_pending_returns_revisions_after_current():
 
 
 def test_validate_migration_input_returns_exact_ordered_path() -> None:
-    state = m.SchemaState(
-        revision=m.LATEST_REVISION - 2,
-        compatible_from=m.revision(m.LATEST_REVISION - 2).compatible_from,
-    )
+    # Revisions need not be consecutive; start two registered revisions back.
+    start = m.REVISIONS[-3]
+    state = m.SchemaState(revision=start.revision, compatible_from=start.compatible_from)
 
     assert m.validate_migration_input(state) == m.REVISIONS[-2:]
 

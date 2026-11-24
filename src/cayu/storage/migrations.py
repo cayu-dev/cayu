@@ -37,6 +37,7 @@ from cayu.storage._session_summary_schema import SESSION_SUMMARY_REVISION
 from cayu.storage._task_index_schema import TASK_INDEX_REVISION
 from cayu.storage._task_progress_schema import TASK_PROGRESS_REVISION
 from cayu.storage._task_series_schema import TASK_SERIES_REVISION
+from cayu.storage._tool_call_preauthorization_schema import TOOL_CALL_PREAUTHORIZATION_REVISION
 from cayu.storage._trace_event_schema import TRACE_EVENTS_REVISION
 from cayu.storage._usage_projection_schema import USAGE_PROJECTION_REVISION
 
@@ -720,6 +721,15 @@ REVISIONS: tuple[Revision, ...] = (
     Revision(
         revision=TASK_SERIES_REVISION,
         kind=RevisionKind.BREAKING,
+        compatible_from=TASK_SERIES_REVISION,
+    ),
+    # cayu_tool_call_preauthorizations holds the exact tool calls a person
+    # authorized for a task before its sessions ran. Older binaries never read
+    # or write it. Preauthorization stores require it. The floor stays at
+    # revision 161's.
+    Revision(
+        revision=TOOL_CALL_PREAUTHORIZATION_REVISION,
+        kind=RevisionKind.ADDITIVE,
         compatible_from=TASK_SERIES_REVISION,
     ),
 )
