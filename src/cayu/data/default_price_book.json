@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-11-22",
-  "price_book_version": "2026-11-22",
+  "generated_at": "2026-11-24",
+  "price_book_version": "2026-11-24",
   "prices": [
     {
       "aliases": [],
@@ -468,7 +468,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-27",
+            "as_of": "2026-11-24",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }
@@ -509,7 +509,7 @@
             ]
           },
           "provenance": {
-            "as_of": "2026-10-29",
+            "as_of": "2026-11-24",
             "source": "official",
             "url": "https://prices.azure.com/api/retail/prices"
           }

@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-11-22",
-  "generated_at": "2026-11-22",
+  "catalog_version": "2026-11-24",
+  "generated_at": "2026-11-24",
   "models": [
     {
       "aliases": [],
@@ -350,7 +350,7 @@
       "model": "gpt-5.4-mini",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-27",
+        "as_of": "2026-11-24",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
@@ -383,7 +383,7 @@
       "model": "gpt-5.4-nano",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-10-29",
+        "as_of": "2026-11-24",
         "source": "official",
         "url": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure"
       },
