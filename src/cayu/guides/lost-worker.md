@@ -100,8 +100,12 @@ evidence for that task alone.
 On Cayu Cloud the platform's record is already there: Cloud records each worker
 instance and how it stopped, and the Agent reads it at `CAYU_WORKER_EXITS_URL`.
 `cayu.tasks.cloud_worker_exits` uses it. Give each worker an id that names its
-Cloud run, then settle the tasks of runs Cloud recorded as stopped, at startup
-and on a timer:
+Cloud run with `cloud_worker_id`, and `run_task_worker` does the rest there: on
+its fenced-task cadence (`reclaim_every_s`) it reads the record and settles the
+fenced tasks of runs Cloud recorded as stopped, restarting restartable ones.
+`run_task_worker(settle_cloud_worker_exits=False)` or `cayu worker
+--no-cloud-exit-settlement` turns that off. The parts also work on their own,
+for example in a worker of your own:
 
 ```python
 from cayu.tasks.cloud_worker_exits import (

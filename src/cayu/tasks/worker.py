@@ -148,6 +148,7 @@ from cayu.tasks.abandoned import (
     FencedTaskMonitor,
     RestartLimitHandler,
     _declaring_worker_actor,
+    cloud_exit_settlement_enabled,
     reconcile_abandoned_after_from_environment,
     restart_abandoned_from_environment,
 )
@@ -592,6 +593,7 @@ async def run_task_worker(
     restart_abandoned: bool | None = None,
     max_abandoned_restarts: int | None = None,
     on_restart_limit_reached: RestartLimitHandler | None = None,
+    settle_cloud_worker_exits: bool | None = None,
     recover_interrupted_handoffs: bool = True,
     interrupted_handoff_recovery_every_s: float = (_INTERRUPTED_HANDOFF_RECOVERY_RESCAN_SECONDS),
     recovered_interrupted_task_handler: RecoveredInterruptedTaskHandler | None = None,
@@ -667,6 +669,13 @@ async def run_task_worker(
     - ``on_restart_limit_reached`` is called with each task that declared single
       worker cancels at its restart cap, once the cancellation is stored; see
       :func:`cayu.tasks.reconcile_abandoned_tasks`.
+    - ``settle_cloud_worker_exits``: on Cayu Cloud (``CAYU_WORKER_EXITS_URL`` bound) the
+      worker also reads Cloud's worker exit record on the fenced-task cadence and
+      settles fenced tasks whose worker run Cloud recorded as stopped, restarting
+      restartable ones (``cayu.tasks.cloud_worker_exits``). Only tasks held under a
+      ``cloud_worker_id`` match. ``None`` (the default) turns it on there unless
+      ``cayu worker --no-cloud-exit-settlement`` turned it off; ``False`` turns it off.
+      It needs ``reclaim`` or ``reconcile_abandoned_after_s``, which run that cadence.
     - ``recover_interrupted_handoffs`` owns bounded recovery of expired attached
       task workers. Elect one such scanner for each shared task store.
     - ``interrupted_handoff_recovery_every_s`` controls the scanner's exhausted
@@ -766,10 +775,12 @@ async def run_task_worker(
     reconcile_abandoned_after_s = reconcile_abandoned_after_from_environment(
         reconcile_abandoned_after_s
     )
+    settles_cloud_exits = cloud_exit_settlement_enabled(settle_cloud_worker_exits)
     abandoned_settlement, max_abandoned_restarts = restart_abandoned_from_environment(
         restart_abandoned,
         max_abandoned_restarts,
         reconcile_abandoned_after_s=reconcile_abandoned_after_s,
+        cloud_exit_settlement=settles_cloud_exits,
     )
     if reconcile_abandoned_after_s is not None:
         require_single_process_worker("reconcile_abandoned_after_s")
@@ -882,6 +893,19 @@ async def run_task_worker(
     )
     if until_idle is not None:
         until_idle.fenced = fenced_monitor
+    from cayu.tasks.cloud_worker_exits import cloud_worker_exit_settler
+
+    cloud_exits = (
+        cloud_worker_exit_settler(
+            task_store,
+            enabled=settles_cloud_exits,
+            query=query,
+            max_restarts=max_abandoned_restarts,
+            on_restart_limit_reached=on_restart_limit_reached,
+        )
+        if fenced_monitor is not None
+        else None
+    )
     infrastructure_stop = asyncio.Event()
     slot_stop = infrastructure_stop if concurrency > 1 else stop
 
@@ -923,10 +947,21 @@ async def run_task_worker(
 
         async def scan_fenced_tasks() -> bool:
             assert fenced_monitor is not None
+            settled_on_exit: list[Task] = []
+            # A failed Cloud read or settlement is a maintenance failure, so an until-idle
+            # run asks to be run again rather than reporting a clean pass.
+            cloud_failed = False
+            if cloud_exits is not None:
+                try:
+                    settled_on_exit = await cloud_exits.run()
+                    cloud_failed = cloud_exits.last_run_failed
+                except Exception:
+                    cloud_failed = True
+                    logger.exception("Settling tasks from Cloud's worker exits failed.")
             try:
-                settled = await fenced_monitor.scan()
+                settled = [*settled_on_exit, *await fenced_monitor.scan()]
                 if until_idle is not None:
-                    until_idle.fenced_scan_failed = False
+                    until_idle.fenced_scan_failed = cloud_failed
                 return bool(settled)
             except Exception:
                 logger.exception(

@@ -44,9 +44,11 @@ from cayu.runtime.orphaned_sessions import (
     run_orphaned_session_reconciliation,
 )
 from cayu.tasks.abandoned import (
+    CLOUD_EXIT_SETTLEMENT_ENV,
     MAX_ABANDONED_RESTARTS_ENV,
     RECONCILE_ABANDONED_AFTER_ENV,
     RESTART_ABANDONED_ENV,
+    cloud_exit_settlement_enabled,
 )
 from cayu.tasks.records import TASK_MAX_RESTARTS_LIMIT
 from cayu.tasks.until_idle import TaskWorkerIdleResult, _worker_until_idle_requested
@@ -203,6 +205,14 @@ def add_worker_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--no-cloud-exit-settlement",
+        action="store_true",
+        help=(
+            "On Cayu Cloud, don't settle fenced tasks whose worker run Cloud recorded as "
+            "stopped. On by default where Cloud binds CAYU_WORKER_EXITS_URL."
+        ),
+    )
+    parser.add_argument(
         "--orphaned-session-reconcile-interval-seconds",
         type=_reconcile_interval,
         default=DEFAULT_ORPHANED_SESSION_RECONCILE_INTERVAL_SECONDS,
@@ -261,6 +271,8 @@ def _run_worker(args: argparse.Namespace) -> int:
             os.environ[RESTART_ABANDONED_ENV] = "1"
         if max_restarts is not None:
             os.environ[MAX_ABANDONED_RESTARTS_ENV] = str(max_restarts)
+        if getattr(args, "no_cloud_exit_settlement", False):
+            os.environ[CLOUD_EXIT_SETTLEMENT_ENV] = "0"
         reconcile_interval = getattr(
             args,
             "orphaned_session_reconcile_interval_seconds",
@@ -385,8 +397,18 @@ def worker_process_plan(
             "--restart-abandoned needs --reconcile-abandoned-after-seconds: only a "
             "declared single worker settles fenced tasks itself."
         )
-    if getattr(args, "max_abandoned_restarts", None) is not None and not restart_abandoned:
-        raise WorkerError("--max-abandoned-restarts needs --restart-abandoned.")
+    cloud_exits = not getattr(args, "no_cloud_exit_settlement", False) and (
+        cloud_exit_settlement_enabled(None)
+    )
+    if (
+        getattr(args, "max_abandoned_restarts", None) is not None
+        and not restart_abandoned
+        and not cloud_exits
+    ):
+        raise WorkerError(
+            "--max-abandoned-restarts needs --restart-abandoned, or Cayu Cloud worker-exit "
+            "settlement (CAYU_WORKER_EXITS_URL bound)."
+        )
     return WorkerProcessPlan(requested=requested, reconciles=reconciles, until_idle=until_idle)
 
 

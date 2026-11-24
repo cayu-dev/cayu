@@ -25,6 +25,7 @@ matched, so those tasks are left for the other settlement paths.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import secrets
 from collections.abc import Iterator, Mapping
@@ -39,15 +40,18 @@ from cayu._validation import require_clean_nonblank
 from cayu.approvals.tools import ResolutionActor
 from cayu.human_attention_handoff import TOKEN_ENVIRONMENT
 from cayu.tasks.abandoned import (
+    CLOUD_EXIT_SETTLEMENT_ENV,
     AbandonedTaskSettlement,
+    RestartLimitHandler,
     _list_fenced,
     _settle_abandoned,
     _settleable,
     abandoned_task_settlement_choice,
+    cloud_exit_settlement_enabled,
     validate_max_restarts,
 )
 from cayu.tasks.queries import TaskQuery, copy_task_query
-from cayu.tasks.records import Task
+from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.restart import DEFAULT_MAX_ABANDONED_RESTARTS
 from cayu.tasks.store import TaskStore
 
@@ -69,6 +73,7 @@ _ECS_METADATA_ENVIRONMENT = "ECS_CONTAINER_METADATA_URI_V4"
 _KUBERNETES_ENVIRONMENT = "KUBERNETES_SERVICE_HOST"
 _WORKER_ID_MARK = "@cloud-run:"
 _DIGEST_CHARS = 24
+logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT_SECONDS = 10.0
 _MAX_EXITS = 1_000
 
@@ -250,6 +255,7 @@ async def reconcile_tasks_of_exited_workers(
     settlement: AbandonedTaskSettlement | str = AbandonedTaskSettlement.CANCEL,
     max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
     reconciled_by: ResolutionActor | None = None,
+    on_restart_limit_reached: RestartLimitHandler | None = None,
 ) -> list[Task]:
     """Settle fenced tasks whose worker's run the record shows exited; return them.
 
@@ -258,7 +264,8 @@ async def reconcile_tasks_of_exited_workers(
     settled like :func:`~cayu.tasks.reconcile_abandoned_tasks` settles it: cancelled,
     or with ``settlement="restart"`` a restartable task is requeued. The validator is
     ``cayu.cloud.worker-exit`` and the evidence id names the exit. Session-attached and
-    retry-series tasks are left alone, as there.
+    retry-series tasks are left alone, as there. ``max_restarts`` and
+    ``on_restart_limit_reached`` work as they do there.
     """
 
     settlement = abandoned_task_settlement_choice(settlement)
@@ -285,7 +292,107 @@ async def reconcile_tasks_of_exited_workers(
         reconciled_by=reconciled_by,
         settlement=settlement,
         max_restarts=max_restarts,
+        on_restart_limit_reached=on_restart_limit_reached,
         evidence_for=lambda task: exited[_worker_digest(task.worker_id) or ""],
+    )
+
+
+class CloudWorkerExitSettler:
+    """What a task worker runs on its fenced-task cadence: read Cloud's record, settle.
+
+    Built by :func:`cloud_worker_exit_settler`. A Cloud that doesn't serve the record
+    (or a process outside Cayu Cloud) turns it off after one log line; a failed read is
+    logged and retried at the next run.
+    """
+
+    def __init__(
+        self,
+        task_store: TaskStore,
+        *,
+        query: TaskQuery | None = None,
+        settlement: AbandonedTaskSettlement | str = AbandonedTaskSettlement.CANCEL,
+        max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
+        on_restart_limit_reached: RestartLimitHandler | None = None,
+        environ: Mapping[str, str] = os.environ,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._task_store = task_store
+        self._on_restart_limit_reached = on_restart_limit_reached
+        #: Whether the latest run couldn't read the record; it is retried next run.
+        self.last_run_failed = False
+        self._query = query
+        self._settlement = abandoned_task_settlement_choice(settlement)
+        self._max_restarts = validate_max_restarts(max_restarts, "max_restarts")
+        self._environ = environ
+        self._transport = transport
+        self._off = False
+
+    @property
+    def active(self) -> bool:
+        return not self._off
+
+    async def run(self) -> list[Task]:
+        self.last_run_failed = False
+        if self._off:
+            return []
+        try:
+            record = await read_cloud_worker_exits(self._environ, transport=self._transport)
+        except WorkerExitsUnsupported as exc:
+            self._off = True
+            logger.info("Not settling fenced tasks from Cloud's worker exits: %s", exc)
+            return []
+        except WorkerExitsUnavailable as exc:
+            self.last_run_failed = True
+            logger.warning("Reading Cloud's worker exits failed; retrying later: %s", exc)
+            return []
+        settled = await reconcile_tasks_of_exited_workers(
+            self._task_store,
+            record,
+            query=self._query,
+            settlement=self._settlement,
+            max_restarts=self._max_restarts,
+            on_restart_limit_reached=self._on_restart_limit_reached,
+        )
+        for task in settled:
+            logger.warning(
+                "%s task %s (type %s): Cayu Cloud recorded that the worker run holding it stopped.",
+                "Restarted" if task.status is TaskStatus.PENDING else "Settled as cancelled",
+                task.id,
+                task.type,
+            )
+        return settled
+
+
+def cloud_worker_exit_settler(
+    task_store: TaskStore,
+    *,
+    enabled: bool | None = None,
+    query: TaskQuery | None = None,
+    max_restarts: int = DEFAULT_MAX_ABANDONED_RESTARTS,
+    on_restart_limit_reached: RestartLimitHandler | None = None,
+    environ: Mapping[str, str] = os.environ,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> CloudWorkerExitSettler | None:
+    """The settler a task worker runs, or ``None``.
+
+    ``enabled=None`` turns it on when Cayu Cloud bound ``CAYU_WORKER_EXITS_URL``, unless
+    ``CAYU_WORKER_CLOUD_EXIT_SETTLEMENT`` is ``0``; ``False`` turns it off. It restarts
+    tasks created with ``restartable=True`` when the store can, and cancels the rest.
+    ``run_task_worker`` passes its own ``max_abandoned_restarts`` and
+    ``on_restart_limit_reached``, so the cap and the callback are the same on either path.
+    """
+
+    if not cloud_exit_settlement_enabled(enabled, environ):
+        return None
+    restarts = type(task_store).restart_abandoned_task is not TaskStore.restart_abandoned_task
+    return CloudWorkerExitSettler(
+        task_store,
+        query=query,
+        settlement=AbandonedTaskSettlement.RESTART if restarts else AbandonedTaskSettlement.CANCEL,
+        max_restarts=max_restarts,
+        on_restart_limit_reached=on_restart_limit_reached,
+        environ=environ,
+        transport=transport,
     )
 
 
@@ -400,14 +507,17 @@ def _instant(value: object) -> datetime | None:
 
 
 __all__ = [
+    "CLOUD_EXIT_SETTLEMENT_ENV",
     "CLOUD_WORKER_EXIT_VALIDATOR_ID",
     "CLOUD_WORKER_EXIT_VALIDATOR_VERSION",
     "RUN_MARKER_PREFIX",
     "WORKER_EXITS_URL_ENVIRONMENT",
+    "CloudWorkerExitSettler",
     "WorkerExit",
     "WorkerExitRecord",
     "WorkerExitsUnavailable",
     "WorkerExitsUnsupported",
+    "cloud_worker_exit_settler",
     "cloud_worker_id",
     "exited_run_references",
     "read_cloud_worker_exits",

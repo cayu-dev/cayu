@@ -17,6 +17,7 @@ from cayu.tasks.cloud_worker_exits import (
     WorkerExitRecord,
     WorkerExitsUnavailable,
     WorkerExitsUnsupported,
+    cloud_worker_exit_settler,
     cloud_worker_id,
     exited_run_references,
     read_cloud_worker_exits,
@@ -222,3 +223,142 @@ def test_read_cloud_worker_exits() -> None:
     with pytest.raises(WorkerExitsUnavailable) as raised:
         asyncio.run(read_cloud_worker_exits(environ, transport=refused))
     assert "agent-token" not in str(raised.value)
+
+
+def test_settler_is_on_only_where_cloud_binds_the_record(tmp_path: Path) -> None:
+    store = SQLiteTaskStore(tmp_path / "tasks.db")
+    bound = {"CAYU_WORKER_EXITS_URL": EXITS_URL}
+    assert cloud_worker_exit_settler(store, environ={}) is None
+    assert cloud_worker_exit_settler(store, environ=bound) is not None
+    opted_out = {**bound, "CAYU_WORKER_CLOUD_EXIT_SETTLEMENT": "0"}
+    assert cloud_worker_exit_settler(store, environ=opted_out) is None
+    assert cloud_worker_exit_settler(store, enabled=False, environ=bound) is None
+    # Asked for outside Cloud: it turns itself off after one look.
+    settler = cloud_worker_exit_settler(store, enabled=True, environ={})
+    assert settler is not None
+    assert asyncio.run(settler.run()) == []
+    assert not settler.active
+    asyncio.run(store.close())
+
+
+def test_task_worker_settles_from_cloud_exits_on_its_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cayu.applications import CayuApp
+    from cayu.tasks.worker import run_task_worker
+
+    async def scenario() -> None:
+        clock = _Clock()
+        store = SQLiteTaskStore(tmp_path / "tasks.db", ownership_clock=clock)
+        old = await _started_claim(store, "lost", worker_id_for_run("jobs", ARN_OLD))
+        assert old.lease_expires_at is not None
+        clock.value = old.lease_expires_at + timedelta(seconds=1)
+        record = _record(WorkerExit(ARN_OLD, "stopped", stopped_at=STOPPED_AT))
+
+        async def read(environ=None, *, transport=None):
+            return record
+
+        monkeypatch.setenv("CAYU_WORKER_EXITS_URL", EXITS_URL)
+        monkeypatch.delenv("CAYU_WORKER_CLOUD_EXIT_SETTLEMENT", raising=False)
+        monkeypatch.setattr(exits_module, "read_cloud_worker_exits", read)
+        app = CayuApp(task_store=store, enable_logging=False)
+        stop = asyncio.Event()
+
+        async def handler(_app, task, _worker_id) -> None:
+            raise AssertionError(f"{task.id} should not be claimed")
+
+        async def watch() -> None:
+            while True:
+                task = await store.load_task("lost")
+                if task is not None and task.status is TaskStatus.CANCELLED:
+                    stop.set()
+                    return
+                await asyncio.sleep(0.02)
+
+        watcher = asyncio.create_task(watch())
+        await asyncio.wait_for(
+            run_task_worker(
+                app,
+                store,
+                handler,
+                worker_id=worker_id_for_run("jobs", ARN_LIVE),
+                query=TaskQuery(type="scan"),
+                poll_interval_s=0.02,
+                reclaim_every_s=0.02,
+                recover_interrupted_handoffs=False,
+                # A cap is accepted for Cloud settlement without single-worker recovery.
+                max_abandoned_restarts=5,
+                stop=stop,
+            ),
+            timeout=10,
+        )
+        await watcher
+        await app.aclose()
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_settler_uses_the_worker_restart_cap_and_limit_callback(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        clock = _Clock()
+        store = SQLiteTaskStore(tmp_path / "tasks.db", ownership_clock=clock)
+        lost = await _started_claim(
+            store, "lost", worker_id_for_run("jobs", ARN_OLD), restartable=True
+        )
+        assert lost.lease_expires_at is not None
+        clock.value = lost.lease_expires_at + timedelta(seconds=1)
+        await store.reclaim_expired(query=TaskQuery(type="scan"))
+        record = _record(WorkerExit(ARN_OLD, "stopped", stopped_at=STOPPED_AT))
+        reached: list[str] = []
+
+        async def read(environ=None, *, transport=None):
+            return record
+
+        settler = cloud_worker_exit_settler(
+            store,
+            enabled=True,
+            environ={"CAYU_WORKER_EXITS_URL": EXITS_URL},
+            max_restarts=0,
+            on_restart_limit_reached=lambda task: reached.append(task.id),
+        )
+        assert settler is not None
+        original = exits_module.read_cloud_worker_exits
+        exits_module.read_cloud_worker_exits = read  # ty: ignore[invalid-assignment]
+        try:
+            [settled] = await settler.run()
+        finally:
+            exits_module.read_cloud_worker_exits = original
+        # A cap of 0 cancels at once instead of restarting, and the callback hears of it.
+        assert settled.status is TaskStatus.CANCELLED
+        assert reached == ["lost"]
+        assert not settler.last_run_failed
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_settler_reports_a_failed_read(tmp_path: Path) -> None:
+    store = SQLiteTaskStore(tmp_path / "tasks.db")
+    failing = httpx.MockTransport(lambda request: httpx.Response(503, json={}))
+    settler = cloud_worker_exit_settler(
+        store,
+        enabled=True,
+        environ={"CAYU_WORKER_EXITS_URL": EXITS_URL, "CAYU_ATTENTION_HANDOFF_TOKEN": "t"},
+        transport=failing,
+    )
+    assert settler is not None
+    assert asyncio.run(settler.run()) == []
+    assert settler.last_run_failed and settler.active
+    asyncio.run(store.close())
+
+
+def test_a_restart_cap_needs_restart_or_cloud_settlement() -> None:
+    from cayu.tasks.abandoned import restart_abandoned_from_environment
+
+    with pytest.raises(ValueError, match="Cayu Cloud"):
+        restart_abandoned_from_environment(False, 5, reconcile_abandoned_after_s=None)
+    _, cap = restart_abandoned_from_environment(
+        False, 5, reconcile_abandoned_after_s=None, cloud_exit_settlement=True
+    )
+    assert cap == 5

@@ -34,7 +34,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from collections.abc import Awaitable, Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -71,6 +71,9 @@ RECONCILE_ABANDONED_AFTER_ENV = "CAYU_WORKER_RECONCILE_ABANDONED_AFTER_S"
 RESTART_ABANDONED_ENV = "CAYU_WORKER_RESTART_ABANDONED"
 #: Set by ``cayu worker --max-abandoned-restarts`` for the worker process.
 MAX_ABANDONED_RESTARTS_ENV = "CAYU_WORKER_MAX_ABANDONED_RESTARTS"
+#: Set to ``0`` by ``cayu worker --no-cloud-exit-settlement``: task workers don't settle
+#: from Cayu Cloud's worker exit record (``cayu.tasks.cloud_worker_exits``).
+CLOUD_EXIT_SETTLEMENT_ENV = "CAYU_WORKER_CLOUD_EXIT_SETTLEMENT"
 
 _FENCE_REASONS = frozenset(
     {_TASK_CANCELLATION_REQUESTED_REASON, _TASK_RETRY_CANCELLATION_REQUESTED_REASON}
@@ -281,13 +284,38 @@ def validate_max_restarts(value: int, name: str) -> int:
     return value
 
 
+def cloud_exit_settlement_enabled(
+    enabled: bool | None, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Whether a task worker settles from Cayu Cloud's worker exit record.
+
+    ``None`` means yes where Cloud bound ``CAYU_WORKER_EXITS_URL``, unless
+    ``CAYU_WORKER_CLOUD_EXIT_SETTLEMENT`` is ``0``.
+    """
+
+    if enabled is None:
+        environ = os.environ if environ is None else environ
+        return bool(environ.get("CAYU_WORKER_EXITS_URL", "").strip()) and (
+            environ.get(CLOUD_EXIT_SETTLEMENT_ENV, "").strip() != "0"
+        )
+    if type(enabled) is not bool:
+        raise TypeError("settle_cloud_worker_exits must be a bool or None.")
+    return enabled
+
+
 def restart_abandoned_from_environment(
     restart_abandoned: bool | None,
     max_restarts: int | None,
     *,
     reconcile_abandoned_after_s: float | None,
+    cloud_exit_settlement: bool = False,
 ) -> tuple[AbandonedTaskSettlement, int]:
-    """The worker's settlement and restart cap, falling back to the ``cayu worker`` variables."""
+    """The worker's settlement and restart cap, falling back to the ``cayu worker`` variables.
+
+    A cap applies with ``restart_abandoned=True``, or to Cloud exit settlement
+    (``cloud_exit_settlement``), which restarts restartable tasks without declaring a
+    single worker.
+    """
 
     if restart_abandoned is None:
         raw = os.environ.get(RESTART_ABANDONED_ENV, "").strip().lower()
@@ -309,8 +337,11 @@ def restart_abandoned_from_environment(
             max_restarts = validate_max_restarts(parsed, MAX_ABANDONED_RESTARTS_ENV)
     else:
         max_restarts = validate_max_restarts(max_restarts, "max_abandoned_restarts")
-    if max_restarts is not None and not restart_abandoned:
-        raise ValueError("max_abandoned_restarts only applies with restart_abandoned=True.")
+    if max_restarts is not None and not (restart_abandoned or cloud_exit_settlement):
+        raise ValueError(
+            "max_abandoned_restarts only applies with restart_abandoned=True or Cayu Cloud "
+            "worker-exit settlement."
+        )
     if restart_abandoned and reconcile_abandoned_after_s is None:
         raise ValueError(
             "restart_abandoned=True needs reconcile_abandoned_after_s: only a declared "
