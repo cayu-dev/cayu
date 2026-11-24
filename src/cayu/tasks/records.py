@@ -451,7 +451,6 @@ class Task(BaseModel):
             for value in (
                 self.graph_id,
                 self.parent_task_id,
-                self.schedule,
                 self.retry_series,
                 self.work_contract,
                 self.invocation.root_session_id,

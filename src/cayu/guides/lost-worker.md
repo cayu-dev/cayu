@@ -36,6 +36,17 @@ await app.create_task(
 )
 ```
 
+It may also be scheduled: with `available_at` and a `schedule_policy`, a restart
+puts it back in the occurrence it was admitted to, so its misfire and expiry rules
+aren't applied again and it runs once more even if its expiry has passed. To retry
+a task without a managed schedule after it fails, queue it with
+`create_task_once(task_store, TaskCreate(..., retry_key=KEY, restartable=True),
+attempts=N)` instead of a `retry_policy`: a restart reruns the same attempt, and a
+failure lets the next call queue the next attempt. `create_task_once` doesn't take
+a managed schedule (it needs an explicit `task_id`), so retry a failed scheduled
+task by creating a new one with its own ID. A retry series (`retry_policy`), a graph, a parent, a work contract or a
+session still can't be restartable.
+
 A restartable task is already requeued when the worker shuts down cleanly and
 the handler stops within the shutdown grace. A crash, an OOM kill or a handler
 that runs past the grace leaves the task fenced instead. To requeue it, tell the

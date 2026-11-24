@@ -8531,7 +8531,10 @@ increments `restart_count`, appends a `TaskRestartRecord` to
 with evidence already in `restart_history` returns the task unchanged for the
 same claim and is refused for a different one. Graceful requeues
 through `requeue_restartable_task` increment `restart_count` but add no history
-record and don't count toward the cap. `max_restarts` and `restart_history` are
+record and don't count toward the cap. A restartable task may carry a managed
+schedule: a requeue keeps `available_at`, the policy and `schedule.admitted_at`, so
+expiry and misfire rules aren't applied again. It may not carry a retry series,
+graph, parent, work contract or root session. `max_restarts` and `restart_history` are
 stored in revision 135 columns and omitted from serialized tasks while unset. Revision 135 is breaking (`--acknowledge-breaking 135`): terminalization receipts embed task snapshots that can carry the new fields, which older binaries can't read.
 
 `reconcile_task_cancellation(...)` is the durable operator/application boundary

@@ -167,10 +167,14 @@ class TaskCreate(BaseModel):
                 self.parent_task_id,
                 self.retry_policy,
                 self.work_contract,
-                self.schedule_policy,
             )
         ):
-            raise ValueError("Restartable tasks must be ordinary unattached root queue jobs.")
+            # A schedule policy is allowed: a restart keeps the occurrence it admitted.
+            raise ValueError(
+                "Restartable tasks must be ordinary unattached root queue jobs without a retry "
+                "series; to retry one, queue it with create_task_once(attempts=N) or create the "
+                "retry yourself."
+            )
         if self.max_restarts is not None and not self.restartable:
             raise ValueError("max_restarts requires restartable=True.")
         return self
