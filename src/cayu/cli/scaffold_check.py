@@ -292,14 +292,20 @@ def check_scaffold_capabilities(
         return ()
     try:
         plan = _normalized_declared_plan(contract)
+        runtime_only = _runtime_only_capabilities(contract, plan)
     except ScaffoldPlanError as exc:
         return (_invalid_scaffold_contract(exc),)
     selected = frozenset(plan.capabilities)
     diagnostics: list[ProjectDiagnostic] = []
 
-    def compare(capability: str, surface: str, observed: bool) -> None:
+    def compare(
+        capability: str, surface: str, observed: bool, *, model_facing: bool = False
+    ) -> None:
         expected = capability in selected
         if observed == expected:
+            return
+        # A runtime-only capability may leave its model-facing part out, or keep it.
+        if model_facing and capability in runtime_only:
             return
         diagnostics.append(
             _diagnostic(
@@ -331,6 +337,7 @@ def check_scaffold_capabilities(
         "memory",
         "agents.context_policy",
         any(agent.context_policy == "AutomaticRecallContextPolicy" for agent in manifest.agents),
+        model_facing=True,
     )
     compare("observability", "runtime.event_sinks", bool(manifest.runtime.event_sinks))
     # Approval coverage can belong to an independently generated external-tool
@@ -349,7 +356,9 @@ def check_scaffold_capabilities(
         # An opaque policy's unknown coverage is already reported by `cayu check`
         # (EXTERNAL_TOOL_COVERAGE_UNKNOWN); it says nothing about drift.
         opaque = proposal is not None and observed_coverage == "unknown"
-        if observed_coverage != expected_coverage and not opaque:
+        # A runtime-only knowledge capability may register no proposal tool.
+        absent = proposal is None and "knowledge" in runtime_only
+        if observed_coverage != expected_coverage and not opaque and not absent:
             diagnostics.append(
                 _diagnostic(
                     code="SCAFFOLD_CAPABILITY_DRIFT",
@@ -380,8 +389,44 @@ def check_scaffold_capabilities(
             if capability in selected
             else any(names & inventory for inventory in inventories)
         )
-        compare(capability, "agents.tools." + capability, observed)
+        compare(capability, "agents.tools." + capability, observed, model_facing=True)
     return tuple(diagnostics)
+
+
+# Capabilities with a part only the model uses: their tools, or automatic recall.
+_RUNTIME_ONLY_CAPABILITIES = frozenset(
+    {"artifacts", "delegation", "human-input", "knowledge", "memory"}
+)
+
+
+def _runtime_only_capabilities(
+    contract: Mapping[str, object], plan: ApplicationPlan
+) -> frozenset[str]:
+    """Selected capabilities the project uses without their model-facing part.
+
+    ``[tool.cayu.scaffold].runtime_only`` names them, sorted and unique. Each must
+    be selected (a capability or an extension) and have a model-facing part.
+    """
+
+    declared = contract.get("runtime_only", [])
+    if not isinstance(declared, list) or any(type(item) is not str for item in declared):
+        raise ScaffoldPlanError("invalid_runtime_only", "runtime_only must be a list of strings")
+    for name in declared:
+        if name not in _RUNTIME_ONLY_CAPABILITIES:
+            raise ScaffoldPlanError(
+                "unsupported_runtime_only",
+                f"capability {name!r} has no model-facing part to leave out",
+            )
+        if name not in plan.capabilities:
+            raise ScaffoldPlanError(
+                "runtime_only_not_selected",
+                "runtime_only must name selected capabilities or extensions",
+            )
+    if declared != sorted(set(declared)):
+        raise ScaffoldPlanError(
+            "runtime_only_not_normalized", "runtime_only must be sorted and unique"
+        )
+    return frozenset(cast("list[str]", declared))
 
 
 def _starter_agent_name(root: Path) -> str | None:

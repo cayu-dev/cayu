@@ -652,6 +652,27 @@ a tool family is incomplete. Source ownership, import safety, and maintained
 service/authentication checks still run. Metadata neither changes runtime objects
 nor grants model exposure, execution authority, or provider access.
 
+A project can use a capability's runtime parts without its model-facing part:
+the knowledge or artifact store without the knowledge or artifact tools, the
+pause-for-input machinery without `ask_user`, child sessions without the
+subagent tools, or a memory capability without automatic recall in an agent's
+context. Name those capabilities in `runtime_only`:
+
+```toml
+[tool.cayu.scaffold]
+# ...
+runtime_only = ["human-input", "knowledge", "memory"]
+```
+
+For a capability listed there, the checker still compares its stores but
+accepts agents that register none of its tools (or only some), and, for
+`memory`, no `AutomaticRecallContextPolicy`; registering them stays fine too.
+Only `artifacts`, `delegation`, `human-input`, `knowledge` and `memory` have
+such a part. Each entry must be a selected capability or extension, and the list
+must be sorted and unique; anything else is `SCAFFOLD_CONTRACT_INVALID`. So an
+agent that should never see those tools has no reason to register and hide
+them.
+
 For `cayu cloud deploy`, run `uv lock` in the selected project root and include both
 `pyproject.toml` and `uv.lock` in the uploaded source. Preflight checks the actual bundle,
 including Git ignore rules; a local wheel build alone does not establish Cloud build

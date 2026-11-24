@@ -726,3 +726,69 @@ def test_reduced_generated_project_tests_pass(tmp_path, execution, excluded):
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _without_model_facing_parts(project: Path) -> None:
+    tools = project / "tools/registration.py"
+    tools.write_text(tools.read_text().replace("    return tuple(tools)\n", "    return ()\n", 1))
+    context = project / "memory/context.py"
+    source = context.read_text()
+    marker = '    """Recall active scoped knowledge; pending and out-of-scope entries stay excluded."""\n'
+    assert marker in source
+    context.write_text(source.replace(marker, marker + "    return None\n", 1))
+
+
+@pytest.mark.parametrize("declared", (False, True))
+def test_runtime_only_capabilities_need_no_model_facing_parts(
+    tmp_path, capsys, monkeypatch, declared
+):
+    assert main(["new", "profile", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "profile"
+    _without_model_facing_parts(project)
+    if declared:
+        pyproject = project / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text().replace(
+                "extensions = []\n",
+                'extensions = []\nruntime_only = ["artifacts", "human-input", "knowledge", "memory"]\n',
+                1,
+            )
+        )
+    monkeypatch.chdir(project)
+    assert main(["check", "--fail-on", "warning", "--json"]) == (0 if declared else 1)
+    drift = {
+        item["parameters"]["capability"]
+        for item in json.loads(capsys.readouterr().out)["diagnostics"]
+        if item["code"] == "SCAFFOLD_CAPABILITY_DRIFT"
+    }
+    assert drift == (
+        set() if declared else {"approvals", "artifacts", "human-input", "knowledge", "memory"}
+    )
+
+
+@pytest.mark.parametrize(
+    "value,reason",
+    (
+        ('"knowledge"', "invalid_runtime_only"),
+        ('["tasks"]', "unsupported_runtime_only"),
+        ('["delegation"]', "runtime_only_not_selected"),
+        ('["knowledge", "artifacts"]', "runtime_only_not_normalized"),
+    ),
+)
+def test_invalid_runtime_only_declarations(tmp_path, capsys, monkeypatch, value, reason):
+    assert main(["new", "profile", "--dir", str(tmp_path)]) == 0
+    capsys.readouterr()
+    project = tmp_path / "profile"
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace(
+            "extensions = []\n", "extensions = []\nruntime_only = " + value + "\n", 1
+        )
+    )
+    monkeypatch.chdir(project)
+    assert main(["check", "--json"]) == 1
+    assert any(
+        item["code"] == "SCAFFOLD_CONTRACT_INVALID" and item["parameters"]["reason"] == reason
+        for item in json.loads(capsys.readouterr().out)["diagnostics"]
+    )
