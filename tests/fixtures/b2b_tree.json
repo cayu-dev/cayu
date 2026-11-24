@@ -180,7 +180,7 @@
     "tests/test_organizations.py": "fdcb07e0a8d3dc5ac881838fc3219427c8a9b4b0729f8b4a6771a537ec76f39a",
     "migrations/versions/0003_membership_roles.py": "31e36c05906d8c672f04abeac516ef89988c9c157319f89eff17c031fae64451",
     "integrations/sign_in.py": "24c09137c8d81fbe90ab542cf5de3a762877646803bd6d8c00e457904dd461a1",
-    "integrations/http/__init__.py": "b6513d597dfcc2cf775501af8dd7a617d9e5a09c3e6486fb6adb89a6d813320a",
+    "integrations/http/__init__.py": "cc2bb17ca5879bff6d29abe74c1961d630693da1b74b4360ff37de845880a092",
     "integrations/http/fixed_settings.py": "bf0aa72f9896de69495087332a8d75a21cddef749b7ba003dc3f8715cefb3ec7",
     "integrations/http/overview_metrics.py": "0048275320ad3746b8958484a99bb738668ccf4ae1f449c1f5a5e9330a2024de",
     "tests/test_http_api.py": "e1933d4f6d3510c9a6460293832005d8563450aaf89c9965a50a3b2a3000461b",

@@ -6607,6 +6607,19 @@
         "OPERATOR_INPUT_SUBPROTOCOL"
       ]
     },
+    "cayu.server.app_errors": {
+      "defined_in": {
+        "cayu.server.app_errors": [
+          "AppErrorRoute",
+          "ErrorStatus",
+          "NotFound"
+        ]
+      },
+      "identities": {},
+      "present": [
+        "DEFAULT_APP_ERRORS"
+      ]
+    },
     "cayu.server.browser_recording": {
       "defined_in": {
         "cayu.server.browser_recording": [

@@ -36,6 +36,7 @@ from cayu.memberships import (
     UnknownOrganization,
     conversation_labels,
 )
+from cayu.server.app_errors import AppErrorRoute
 from cayu.server.resource_access import create_resource_router
 from database.memberships import memberships
 from domain.organizations import app_role
@@ -74,7 +75,9 @@ class MemberRequest(BaseModel):
 
 def build_router(app: CayuApp, *, development: bool) -> APIRouter:
     authenticate = build_authenticate(development=development)
-    router = APIRouter(prefix="/app")
+    # Raising cayu.server.app_errors.NotFound, Forbidden, Conflict or Invalid answers 404,
+    # 403, 409 or 422 with its message; see `cayu guide app-ui`.
+    router = APIRouter(prefix="/app", route_class=AppErrorRoute)
     router.include_router(create_resource_router(app, authenticate=authenticate))
 
     async def signed_in(request: Request) -> str:

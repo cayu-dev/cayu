@@ -595,6 +595,49 @@ def build_router(app, *, development, auth=None):  # [tool.cayu.serve] routers
   rule. An app whose people are its customers signs them in with
   `ProxyIdentityAuth.product_dependency()` instead (`cayu guide b2b`).
 
+## Answer exceptions as API errors
+
+Build your `/app` router with `AppErrorRoute` and its handlers (and their dependencies)
+answer exceptions the way Cayu's own routes do, with `{"detail": "..."}` and a status,
+instead of a 500 or a `try` in every handler:
+
+```python
+from fastapi import APIRouter
+
+from cayu.server.app_errors import AppErrorRoute, NotFound
+
+router = APIRouter(prefix="/app", route_class=AppErrorRoute)
+
+
+@router.get("/invoices/{invoice_id}")
+async def invoice(invoice_id: str) -> dict:
+    raise NotFound("Invoice not found.")  # 404 {"detail": "Invoice not found."}
+```
+
+Raise `NotFound` (404), `Forbidden` (403), `Conflict` (409) or `Invalid` (422) when the
+message is written for the caller; it goes out as the detail. Other exceptions answer with
+a fixed text, since a built-in exception's message may name a server path or a stored
+value: Cayu's access refusals 404 `Resource unavailable.` (so a refusal doesn't say the
+resource exists), any other `PermissionError` 403, Cayu's conflicts (`CAYU_CONFLICTS`: a
+stale knowledge revision, a reused task or request id, a session in the wrong state) 409,
+artifact storage being down 503, `LookupError` and `FileNotFoundError` 404, and any other
+`ValueError` 422. `HTTPException` and request validation pass through, and an exception no
+rule names is still a 500.
+
+Add your own exceptions with `extend`; its rules are checked first and, without a
+`detail`, send the exception's message:
+
+```python
+from cayu.server.app_errors import DEFAULT_APP_ERRORS, ErrorStatus
+
+errors = DEFAULT_APP_ERRORS.extend(ErrorStatus((InvoiceLocked,), 409))
+router = APIRouter(prefix="/app", route_class=errors.route_class())
+```
+
+`ErrorStatus(..., detail=...)` sets a fixed detail or a function of the exception, and
+`errors.http_error(exc)` gives the mapping on its own. The routers `cayu new` generates
+under `/app` use `AppErrorRoute`.
+
 ## Keep GET handlers read-only
 
 A GET handler in your app must not reconcile decisions, migrate data, backfill

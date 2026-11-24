@@ -55,6 +55,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 
 from cayu import CayuApp
+from cayu.server.app_errors import AppErrorRoute
 from cayu.server.operator_sign_in import operator_person_dependency, operator_roles
 from configuration.settings import configured_cloud_application
 from integrations.http.fixed_settings import fixed_settings
@@ -82,7 +83,9 @@ def build_router(app: CayuApp, *, development: bool, auth: Any = None) -> APIRou
         auth, person=Person, decide=() if app.human_review_purpose is not None else None
     )
     person = operator_person_dependency(auth, development=development, rule=rule)
-    router = APIRouter(prefix="/app")
+    # Raising cayu.server.app_errors.NotFound, Forbidden, Conflict or Invalid answers 404,
+    # 403, 409 or 422 with its message; see `cayu guide app-ui`.
+    router = APIRouter(prefix="/app", route_class=AppErrorRoute)
     router.include_router(
         build_generated_router(
             app,
