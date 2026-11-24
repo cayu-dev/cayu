@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 
 #: The task metadata key that records which series and occurrence a task is.
 SERIES_METADATA_KEY = "cayu_series"
+#: The top-level metadata key every occurrence carries, with its series id as the value,
+#: so ``cayu task list --metadata cayu_series_id=ID`` (and ``GET /api/tasks?metadata=``)
+#: finds a series' occurrences. Metadata, not a label: a task's labels are the labels it
+#: runs as, which decide what it may read and who may see it.
+SERIES_ID_METADATA_KEY = "cayu_series_id"
 # How far a cron search looks before deciding an expression never matches again.
 _CRON_SEARCH_DAYS = 366 * 8
 # How many cancelled future occurrences publication steps over before giving up.
@@ -342,6 +347,7 @@ def occurrence_request(series: TaskSeries, at: datetime) -> TaskCreate:
                     "series_id": series.series_id,
                     "occurrence_at": at.isoformat(),
                 },
+                SERIES_ID_METADATA_KEY: series.series_id,
             },
         }
     )
@@ -454,6 +460,7 @@ def series_task_handler(
 
 
 __all__ = [
+    "SERIES_ID_METADATA_KEY",
     "SERIES_METADATA_KEY",
     "TaskRecurrence",
     "TaskSeries",

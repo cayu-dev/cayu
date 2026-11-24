@@ -1497,6 +1497,11 @@ class TaskStore(ABC):
 
         raise NotImplementedError("This TaskStore does not support task series.")
 
+    async def list_task_series(self, *, limit: int = 100, offset: int = 0) -> list[TaskSeriesState]:
+        """Stored series in ``series_id`` order, ``limit`` (1 to 1000) from ``offset``."""
+
+        raise NotImplementedError("This TaskStore does not support task series.")
+
     async def reconcile_task_retry_cancellation(
         self,
         request: TaskRetryCancellationReconciliationRequest,

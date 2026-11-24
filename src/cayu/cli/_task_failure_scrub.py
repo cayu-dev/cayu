@@ -199,29 +199,11 @@ def open_scrubber(target: ReadTarget) -> _Scrubber:
 def _open_store_scrubber(target: ReadTarget) -> _Scrubber:
     """The task store in ``target``'s database, opened for writing (never migrated)."""
 
-    from cayu.cli.store_targets import SessionStoreBackend
-    from cayu.storage import migrations as schema
+    from cayu.cli._task_readers import open_writable_task_store
 
-    store_target = target.store
-    assert store_target is not None
-    if store_target.backend is SessionStoreBackend.SQLITE:
-        path = store_target.sqlite_path
-        assert path is not None
-        if not path.is_file():
-            raise ValueError(f"No SQLite database exists at {path}.")
-        from cayu.storage import SQLiteTaskStore
-
-        return _StoreScrubber(
-            SQLiteTaskStore(path, schema_mode=schema.SchemaMode.VALIDATE),
-            source={"kind": "sqlite", "path": str(path)},
-        )
-    assert store_target.postgres_dsn is not None
-    from cayu.storage import PostgresTaskStore
-
-    return _StoreScrubber(
-        PostgresTaskStore(store_target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE),
-        source={"kind": "postgres"},
-    )
+    assert target.store is not None
+    store, source = open_writable_task_store(target.store)
+    return _StoreScrubber(store, source=source)
 
 
 async def run_scrub(args: argparse.Namespace, target: ReadTarget) -> int:

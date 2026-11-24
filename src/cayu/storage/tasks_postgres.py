@@ -24,6 +24,7 @@ from cayu.tasks._series_store import (
     needs_occurrence,
     paused_series_state,
     saved_series_state,
+    series_page,
 )
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
@@ -1567,6 +1568,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
             return cur.rowcount == 1
 
         return await self._run_owned_mutation(operation)
+
+    async def list_task_series(self, *, limit: int = 100, offset: int = 0) -> list[TaskSeriesState]:
+        limit, offset = series_page(limit, offset)
+        await self._ensure_ready()
+        async with PostgresTimingScope(self._pool.connection()) as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT state_json FROM cayu_task_series ORDER BY series_id LIMIT %s OFFSET %s",
+                (limit, offset),
+            )
+            return [TaskSeriesState.model_validate_json(row[0]) for row in await cur.fetchall()]
 
     async def _record_schedule_transition(
         self, cur: Any, prior: Task | None, current: Task, *, operation_id: str | None = None

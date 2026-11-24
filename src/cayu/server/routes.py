@@ -263,6 +263,7 @@ from cayu.server._task_index import (
     read_tasks_by_ids,
 )
 from cayu.server._task_latest_routes import register_task_latest_route
+from cayu.server._task_series_routes import register_task_series_routes
 from cayu.server._transcript_parts import (
     MIN_PART_BYTES,
     register_transcript_message,
@@ -4903,6 +4904,9 @@ def create_router(
         cayu_app=cayu_app,
         protected=protected,
         optional_auth_context=optional_auth_context,
+    )
+    register_task_series_routes(
+        bounded_control_plane_router, cayu_app=cayu_app, protected=protected
     )
 
     async def _require_settle_access(

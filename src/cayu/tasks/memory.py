@@ -20,6 +20,7 @@ from cayu.tasks._series_store import (
     needs_occurrence,
     paused_series_state,
     saved_series_state,
+    series_page,
 )
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
@@ -5582,6 +5583,12 @@ class InMemoryTaskStore(TaskStore):
     async def delete_task_series(self, series_id: str) -> bool:
         async with self._lock:
             return self._task_series.pop(series_id, None) is not None
+
+    async def list_task_series(self, *, limit: int = 100, offset: int = 0) -> list[TaskSeriesState]:
+        limit, offset = series_page(limit, offset)
+        async with self._lock:
+            ids = sorted(self._task_series)[offset : offset + limit]
+            return [self._task_series[series_id].model_copy(deep=True) for series_id in ids]
 
     def _publish_prepared_task_write_once(
         self, prepared: _PreparedMemoryTaskWrite, *, event_now: datetime | None = None

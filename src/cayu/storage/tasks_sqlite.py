@@ -19,6 +19,7 @@ from cayu.tasks._series_store import (
     needs_occurrence,
     paused_series_state,
     saved_series_state,
+    series_page,
 )
 from cayu.tasks.continuation_claims import (
     TaskContinuationExpectation,
@@ -4013,6 +4014,15 @@ class SQLiteTaskStore(TaskStore):
                     "DELETE FROM cayu_task_series WHERE series_id = ?", (series_id,)
                 )
                 return cursor.rowcount == 1
+
+    async def list_task_series(self, *, limit: int = 100, offset: int = 0) -> list[TaskSeriesState]:
+        limit, offset = series_page(limit, offset)
+        async with self._lock:
+            rows = self._connection.execute(
+                "SELECT state_json FROM cayu_task_series ORDER BY series_id LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [TaskSeriesState.model_validate_json(row[0]) for row in rows]
 
     def _record_schedule_transition_unlocked(
         self, prior: Task | None, current: Task, *, operation_id: str | None = None

@@ -167,6 +167,8 @@ _READ_AND_DECIDE_ROUTES: Final = frozenset(
             "/knowledge/pending/{entry_id}",
             "/knowledge/kept/{entry_id}",
             "/pending-actions",
+            "/task-series",
+            "/task-series/{series_id:path}",
             "/sessions",
             "/sessions/overview/counts",
             "/sessions/display",

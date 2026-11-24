@@ -260,6 +260,10 @@ def add_task_parser(subparsers: Any) -> None:
     add_read_target_options(scrub)
     add_output_options(scrub, formats=("table", "json"), default="table")
 
+    from cayu.cli._task_series import add_series_parser
+
+    add_series_parser(commands)
+
     list_parser = commands.add_parser(
         "list",
         help="List tasks, most recently updated first.",
@@ -555,6 +559,10 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
         from cayu.cli._task_failure_scrub import run_scrub
 
         return await run_scrub(args, target)
+    if args.task_command == "series":
+        from cayu.cli._task_series import run_series
+
+        return await run_series(args, target)
     reader = open_task_reader(target)
     try:
         if args.task_command == "list":

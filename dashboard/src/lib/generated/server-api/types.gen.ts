@@ -3734,6 +3734,66 @@ export type ApiTaskScheduleState = {
 };
 
 /**
+ * ApiTaskSeries
+ *
+ * One stored series. `state` is the whole `TaskSeriesState` as JSON.
+ */
+export type ApiTaskSeries = {
+    /**
+     * Next Task Id
+     */
+    next_task_id: string | null;
+    /**
+     * Paused
+     */
+    paused: boolean;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Series Id
+     */
+    series_id: string;
+    /**
+     * State
+     */
+    state: {
+        [key: string]: unknown;
+    };
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * ApiTaskSeriesDeleted
+ */
+export type ApiTaskSeriesDeleted = {
+    /**
+     * Deleted
+     */
+    deleted: boolean;
+    /**
+     * Series Id
+     */
+    series_id: string;
+};
+
+/**
+ * ApiTaskSeriesPage
+ *
+ * Stored series in `series_id` order.
+ */
+export type ApiTaskSeriesPage = {
+    /**
+     * Series
+     */
+    series: Array<ApiTaskSeries>;
+};
+
+/**
  * ApiTaskTopologyChildBranch
  */
 export type ApiTaskTopologyChildBranch = {
@@ -33859,6 +33919,160 @@ export type CreateGraphApiTaskGraphsPostResponses = {
 };
 
 export type CreateGraphApiTaskGraphsPostResponse = CreateGraphApiTaskGraphsPostResponses[keyof CreateGraphApiTaskGraphsPostResponses];
+
+export type ListTaskSeriesApiTaskSeriesGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Offset
+         */
+        offset?: number;
+    };
+    url: '/api/task-series';
+};
+
+export type ListTaskSeriesApiTaskSeriesGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListTaskSeriesApiTaskSeriesGetError = ListTaskSeriesApiTaskSeriesGetErrors[keyof ListTaskSeriesApiTaskSeriesGetErrors];
+
+export type ListTaskSeriesApiTaskSeriesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskSeriesPage;
+};
+
+export type ListTaskSeriesApiTaskSeriesGetResponse = ListTaskSeriesApiTaskSeriesGetResponses[keyof ListTaskSeriesApiTaskSeriesGetResponses];
+
+export type ShowTaskSeriesApiTaskSeriesSeriesIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Series Id
+         */
+        series_id: string;
+    };
+    query?: never;
+    url: '/api/task-series/{series_id}';
+};
+
+export type ShowTaskSeriesApiTaskSeriesSeriesIdGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ShowTaskSeriesApiTaskSeriesSeriesIdGetError = ShowTaskSeriesApiTaskSeriesSeriesIdGetErrors[keyof ShowTaskSeriesApiTaskSeriesSeriesIdGetErrors];
+
+export type ShowTaskSeriesApiTaskSeriesSeriesIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskSeries;
+};
+
+export type ShowTaskSeriesApiTaskSeriesSeriesIdGetResponse = ShowTaskSeriesApiTaskSeriesSeriesIdGetResponses[keyof ShowTaskSeriesApiTaskSeriesSeriesIdGetResponses];
+
+export type DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostData = {
+    body?: never;
+    path: {
+        /**
+         * Series Id
+         */
+        series_id: string;
+    };
+    query?: never;
+    url: '/api/task-series/{series_id}/delete';
+};
+
+export type DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostError = DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostErrors[keyof DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostErrors];
+
+export type DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskSeriesDeleted;
+};
+
+export type DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostResponse = DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostResponses[keyof DeleteTaskSeriesApiTaskSeriesSeriesIdDeletePostResponses];
+
+export type PauseTaskSeriesApiTaskSeriesSeriesIdPausePostData = {
+    body?: never;
+    path: {
+        /**
+         * Series Id
+         */
+        series_id: string;
+    };
+    query?: never;
+    url: '/api/task-series/{series_id}/pause';
+};
+
+export type PauseTaskSeriesApiTaskSeriesSeriesIdPausePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PauseTaskSeriesApiTaskSeriesSeriesIdPausePostError = PauseTaskSeriesApiTaskSeriesSeriesIdPausePostErrors[keyof PauseTaskSeriesApiTaskSeriesSeriesIdPausePostErrors];
+
+export type PauseTaskSeriesApiTaskSeriesSeriesIdPausePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskSeries;
+};
+
+export type PauseTaskSeriesApiTaskSeriesSeriesIdPausePostResponse = PauseTaskSeriesApiTaskSeriesSeriesIdPausePostResponses[keyof PauseTaskSeriesApiTaskSeriesSeriesIdPausePostResponses];
+
+export type ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostData = {
+    body?: never;
+    path: {
+        /**
+         * Series Id
+         */
+        series_id: string;
+    };
+    query?: never;
+    url: '/api/task-series/{series_id}/resume';
+};
+
+export type ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostError = ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostErrors[keyof ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostErrors];
+
+export type ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiTaskSeries;
+};
+
+export type ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostResponse = ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostResponses[keyof ResumeTaskSeriesApiTaskSeriesSeriesIdResumePostResponses];
 
 export type TaskTypesApiTaskTypesGetData = {
     body?: never;

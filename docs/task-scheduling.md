@@ -291,7 +291,12 @@ settings, and Cayu keeps its occurrences:
 - A local time that a daylight-saving change skips doesn't occur that day, and one
   it repeats occurs once. `next_occurrence` and `last_occurrence` compute times
   without a store.
-- `cayu task list --type review` and `cayu task show <id>` read the occurrences.
+- Every occurrence's metadata has `cayu_series_id` set to its series id (replacing
+  any value the template gives it), so `cayu task list --metadata cayu_series_id=ID`
+  lists one series' occurrences, also from a Cloud Agent (`--application`);
+  `cayu task show <id>` reads one. It is metadata rather than a label because a
+  task's labels are the labels it runs as, which decide what it may read and who
+  may see it.
 
 #### Series kept by the task store
 
@@ -325,6 +330,16 @@ await run_task_worker(
 - A paused series queues nothing when an occurrence ends. Resuming queues the next
   occurrence after now if nothing is queued, stepping over future occurrences that
   were cancelled. Deleting a series leaves its tasks.
+- `list_task_series(limit=..., offset=...)` lists stored series by id. From the
+  command line, `cayu task series list`, `show ID`, `pause ID`, `resume ID` and
+  `delete ID` do the same on a local store (`--sqlite`, `--postgres` or the
+  project's), a running server (`--server-url`) or a Cloud Agent (`--application`),
+  with `--json` for scripts. The server serves them at `GET /api/task-series`,
+  `GET /api/task-series/{series_id}` and `POST /api/task-series/{series_id}/pause`,
+  `/resume` and `/delete`; changing a series needs full access, and a caller whose
+  task reads are scoped to labels is refused, since a series spans every task it
+  queues. An Agent whose Cayu predates these routes answers with an error that points
+  to `cayu task list --metadata cayu_series_id=ID`.
 - Storage revision 161 adds the `cayu_task_series` table. It is breaking: an older
   worker could end an occurrence without queueing the next one, so stop older
   workers and run `cayu storage migrate --acknowledge-breaking 161` before starting

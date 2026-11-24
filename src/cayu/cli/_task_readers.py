@@ -697,3 +697,30 @@ def _is_task_row(value: object) -> bool:
         return False
     row = cast("dict[str, Any]", value)
     return all(isinstance(row.get(key), str) for key in ("id", "status", "type"))
+
+
+def open_writable_task_store(target: SessionStoreTarget) -> tuple[Any, dict[str, Any]]:
+    """The task store in ``target``'s database, opened for writing (never migrated), and its
+    source as command output names it."""
+
+    from cayu.cli.store_targets import SessionStoreBackend
+    from cayu.storage import migrations as schema
+
+    if target.backend is SessionStoreBackend.SQLITE:
+        path = target.sqlite_path
+        assert path is not None
+        if not path.is_file():
+            raise ValueError(f"No SQLite database exists at {path}.")
+        from cayu.storage import SQLiteTaskStore
+
+        return (
+            SQLiteTaskStore(path, schema_mode=schema.SchemaMode.VALIDATE),
+            {"kind": "sqlite", "path": str(path)},
+        )
+    assert target.postgres_dsn is not None
+    from cayu.storage import PostgresTaskStore
+
+    return (
+        PostgresTaskStore(target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE),
+        {"kind": "postgres"},
+    )

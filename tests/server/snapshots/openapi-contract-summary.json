@@ -7289,6 +7289,92 @@
       "title": "ApiTaskScheduleState",
       "type": "object"
     },
+    "ApiTaskSeries": {
+      "additionalProperties": false,
+      "description": "One stored series. `state` is the whole `TaskSeriesState` as JSON.",
+      "properties": {
+        "next_task_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Task Id"
+        },
+        "paused": {
+          "title": "Paused",
+          "type": "boolean"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "series_id": {
+          "title": "Series Id",
+          "type": "string"
+        },
+        "state": {
+          "additionalProperties": true,
+          "title": "State",
+          "type": "object"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "series_id",
+        "paused",
+        "revision",
+        "next_task_id",
+        "updated_at",
+        "state"
+      ],
+      "title": "ApiTaskSeries",
+      "type": "object"
+    },
+    "ApiTaskSeriesDeleted": {
+      "additionalProperties": false,
+      "properties": {
+        "deleted": {
+          "title": "Deleted",
+          "type": "boolean"
+        },
+        "series_id": {
+          "title": "Series Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "series_id",
+        "deleted"
+      ],
+      "title": "ApiTaskSeriesDeleted",
+      "type": "object"
+    },
+    "ApiTaskSeriesPage": {
+      "additionalProperties": false,
+      "description": "Stored series in `series_id` order.",
+      "properties": {
+        "series": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskSeries"
+          },
+          "title": "Series",
+          "type": "array"
+        }
+      },
+      "required": [
+        "series"
+      ],
+      "title": "ApiTaskSeriesPage",
+      "type": "object"
+    },
     "ApiTaskTopologyChildBranch": {
       "additionalProperties": false,
       "properties": {
@@ -45006,6 +45092,203 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/TaskGraphCreationResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-series": {
+      "get": {
+        "operation_id": "list_task_series_api_task_series_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskSeriesPage"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-series/{series_id}": {
+      "get": {
+        "operation_id": "show_task_series_api_task_series__series_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Series Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskSeries"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-series/{series_id}/delete": {
+      "post": {
+        "operation_id": "delete_task_series_api_task_series__series_id__delete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Series Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskSeriesDeleted"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-series/{series_id}/pause": {
+      "post": {
+        "operation_id": "pause_task_series_api_task_series__series_id__pause_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Series Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskSeries"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/task-series/{series_id}/resume": {
+      "post": {
+        "operation_id": "resume_task_series_api_task_series__series_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "title": "Series Id",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": {
+          "content": {}
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiTaskSeries"
               }
             }
           },

@@ -138,3 +138,13 @@ async def advance_series_async(
             return _advanced(state, at, existing, now)
         at = planned_occurrence(state.series, after=at, now=now)
     raise _too_many_cancelled(state)
+
+
+def series_page(limit: int, offset: int) -> tuple[int, int]:
+    """A checked ``list_task_series`` page."""
+
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("limit must be a whole number from 1 to 1000.")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset must be a whole number of at least 0.")
+    return limit, offset
