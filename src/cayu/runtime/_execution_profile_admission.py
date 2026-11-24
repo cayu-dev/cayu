@@ -1329,8 +1329,9 @@ def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
             return None
         return {"then": downstream, "guards": guards}
     from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    from cayu.approvals.tool_call_preauthorizations import PreauthorizedToolCallPolicy
 
-    if type(policy) is ToolAuthorizationGrantPolicy:
+    if type(policy) is ToolAuthorizationGrantPolicy or type(policy) is PreauthorizedToolCallPolicy:
         # Grant records are durable data, so only the policy's own configuration
         # and its downstream decision participate in the profile.
         material: dict[str, Any] = policy._execution_profile_material()

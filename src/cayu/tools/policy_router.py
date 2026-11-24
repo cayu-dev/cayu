@@ -67,6 +67,7 @@ def _policies_behind(policy: ToolPolicy, *, structured_commands: bool) -> list[T
     """
 
     from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    from cayu.approvals.tool_call_preauthorizations import PreauthorizedToolCallPolicy
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     reached: list[ToolPolicy] = []
@@ -80,7 +81,11 @@ def _policies_behind(policy: ToolPolicy, *, structured_commands: bool) -> list[T
         reached.append(current)
         if type(current) is ToolPolicyRouter:
             pending.extend((*current.routes.values(), current.default))
-        elif type(current) is GuardedToolPolicy or type(current) is ToolAuthorizationGrantPolicy:
+        elif (
+            type(current) is GuardedToolPolicy
+            or type(current) is ToolAuthorizationGrantPolicy
+            or type(current) is PreauthorizedToolCallPolicy
+        ):
             if current.then is not None:
                 pending.append(current.then)
         elif type(current) is ApprovalFloorToolPolicy:

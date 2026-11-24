@@ -46,6 +46,30 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.approvals.authorization_grants",
         "InMemoryToolAuthorizationGrantStore",
     ),
+    "InMemoryToolCallPreauthorizationStore": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "InMemoryToolCallPreauthorizationStore",
+    ),
+    "PreauthorizedToolCallPolicy": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "PreauthorizedToolCallPolicy",
+    ),
+    "TOOL_CALL_PREAUTHORIZATION_METADATA_KEY": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "TOOL_CALL_PREAUTHORIZATION_METADATA_KEY",
+    ),
+    "ToolCallPreauthorization": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "ToolCallPreauthorization",
+    ),
+    "ToolCallPreauthorizationStore": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "ToolCallPreauthorizationStore",
+    ),
+    "ToolCallPreauthorizationUse": (
+        "cayu.approvals.tool_call_preauthorizations",
+        "ToolCallPreauthorizationUse",
+    ),
     "PendingToolApproval": ("cayu.approvals.tools", "PendingToolApproval"),
     "PendingToolApprovalEventView": ("cayu.approvals.tools", "PendingToolApprovalEventView"),
     "PendingToolCallApproval": ("cayu.approvals.tools", "PendingToolCallApproval"),
@@ -254,6 +278,12 @@ PUBLIC_NAMES = [
     "HumanReviewView",
     "InMemoryToolAuthorizationGrantStore",
     "PendingToolApproval",
+    "InMemoryToolCallPreauthorizationStore",
+    "PreauthorizedToolCallPolicy",
+    "TOOL_CALL_PREAUTHORIZATION_METADATA_KEY",
+    "ToolCallPreauthorization",
+    "ToolCallPreauthorizationStore",
+    "ToolCallPreauthorizationUse",
     "PendingToolApprovalEventView",
     "PendingToolCallApproval",
     "PendingToolCallApprovalEventView",

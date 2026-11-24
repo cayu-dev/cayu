@@ -351,6 +351,7 @@ def _execution_profile_components() -> list[str]:
     # Policies whose material is built by hand in _cayu_policy_material.
     for path in (
         "cayu.approvals.authorization_grant_policy:ToolAuthorizationGrantPolicy",
+        "cayu.approvals.tool_call_preauthorizations:PreauthorizedToolCallPolicy",
         "cayu.tools.policy:GuardedToolPolicy",
         "cayu.tools.policy:RequiredArguments",
     ):

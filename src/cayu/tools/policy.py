@@ -68,6 +68,11 @@ class ToolPolicyRequest(BaseModel):
     tool_round_id: str | None = None
     tool_effect: ToolEffect = ToolEffect.EXTERNAL
     arguments: dict[str, Any] = Field(default_factory=dict)
+    #: The whole call's arguments, set by the runtime only when ``arguments`` is a
+    #: projection a tool made for its policy (one target of a batched call, say).
+    call_arguments: dict[str, Any] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     environment_name: str | None = None
     workspace_id: str | None = None
     #: Whether the application named the workspace (see ``Workspace.workspace_id_explicit``).
@@ -94,6 +99,11 @@ class ToolPolicyRequest(BaseModel):
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
         return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("call_arguments", mode="before")
+    @classmethod
+    def copy_call_arguments(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return None if value is None else copy_durable_json_value(value, "call_arguments")
 
 
 class ToolPolicyResult(BaseModel):

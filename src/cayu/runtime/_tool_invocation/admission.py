@@ -1225,6 +1225,9 @@ class ToolInvocationAdmission:
         )
         if not argument_sets or len(argument_sets) > 64:
             raise ValueError("Tool policy argument sets must contain between 1 and 64 entries.")
+        if len(argument_sets) > 1 or argument_sets[0] is not request.arguments:
+            # Policies that authorize the whole call (a preauthorization) need it too.
+            request.call_arguments = copy_durable_json_value(request.arguments, "call arguments")
         if len(argument_sets) == 1:
             if argument_sets[0] is not request.arguments:
                 request.arguments = copy_durable_json_value(argument_sets[0], "policy arguments")

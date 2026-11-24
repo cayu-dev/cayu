@@ -96,6 +96,77 @@ There are two matchers, and the policy author chooses one per tool in
 When several grants apply, session grants are checked before workspace grants,
 each ordered by `(created_at, grant_id)`, and the first is used.
 
+## Preauthorizing one exact call
+
+A grant comes from a person's answer to a paused call. When the person who
+starts a piece of work already knows the one call it may make, for example "it
+may send this email to this recipient", they can authorize that call before any
+session runs, with no first approval:
+
+```python
+from cayu.approvals import (
+    InMemoryToolCallPreauthorizationStore,
+    PreauthorizedToolCallPolicy,
+    ToolAuthorizationGrantActor,
+    ToolCallPreauthorization,
+)
+from cayu.tools import AlwaysRequireApprovalToolPolicy
+
+store = InMemoryToolCallPreauthorizationStore()
+policy = PreauthorizedToolCallPolicy(
+    store=store,
+    tools=["send_email"],
+    then=AlwaysRequireApprovalToolPolicy(tools=["send_email"]),
+)
+
+await store.issue(
+    ToolCallPreauthorization.for_call(
+        preauthorization_id="review-42-send",
+        task_id=task.task_id,
+        tool_name="send_email",
+        arguments={"email_id": "e-1", "to": ["ap@example.com"]},
+        authorized_by=ToolAuthorizationGrantActor(subject="operator@example.com"),
+        created_at=now,
+        lifetime_seconds=86_400,
+    )
+)
+```
+
+A `ToolCallPreauthorization` binds a task id, a tool, the digest of the exact
+arguments (`tool_arguments_digest`, the canonical JSON SHA-256 that grant use
+records carry), and optionally an agent name. It records the person who
+authorized it, an optional justification and expiry, and the one call that used
+it. The policy only considers a REQUIRE_APPROVAL decision from `then` for a tool
+in `tools`, in a session that runs under that task: the task mark is set by the
+runtime when a task's handler creates the session, and clients can't set it.
+Sessions such a session starts carry the same mark. When tool, arguments, task
+and agent all match an unused, unrevoked, unexpired record, the store marks it
+used by this call (session, incarnation, round and call id) before ALLOW is
+returned, with the record's id, task and person under
+`cayu:tool_call_preauthorization`. A retry of that same execution is allowed
+again; any other call, even with identical arguments, asks a person.
+
+It never stands in for more than an approval: DENY and ALLOW from `then` pass
+through, a mandatory approval (`cayu:mandatory_approval`, or a mandatory
+control of a `ToolAuthorizationGrantPolicy` in `then`) still asks a person,
+re-checking arguments a person changed asks again, and a store that fails asks a
+person. A dry run (`preview_tool_call`) reports ALLOW without using the record.
+`then` results can't forge the evidence key. `cayu check` reads a preauthorized
+tool that would otherwise need approval as `conditional`.
+
+`ToolCallPreauthorizationStore` is the seam for a durable store: `issue` is
+idempotent for equal terms and raises `ToolAuthorizationGrantConflict` for
+different ones, `use` must be atomic, and a used record can't be revoked.
+`InMemoryToolCallPreauthorizationStore` is the process-local implementation.
+The digest is of the whole call's arguments, as the model sent them. A built-in
+tool that checks each target of a batched call separately, such as `read_file`
+with `files`, passes its policy one argument set per target; the runtime also
+gives the policy the whole call as `ToolPolicyRequest.call_arguments`, so a
+preauthorization of the batch matches every target and is used once, by that
+call.
+Authenticating the person you record in `authorized_by` is the application's
+job.
+
 ## Sampled review
 
 A grant carries `sampled_review_rate_bps` (0 to 10000 basis points). For each

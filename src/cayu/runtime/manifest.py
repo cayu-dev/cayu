@@ -1025,6 +1025,33 @@ def _describe_tool(
     return manifest
 
 
+def _mandatory_control_behind(policy: ToolPolicy | None, tool_name: str) -> bool:
+    """Whether a grant policy behind ``policy`` makes approval of the tool mandatory."""
+
+    from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
+    from cayu.approvals.authorization_grants import is_mandatory_control
+    from cayu.approvals.tool_call_preauthorizations import PreauthorizedToolCallPolicy
+
+    seen: set[int] = set()
+    while policy is not None and id(policy) not in seen:
+        seen.add(id(policy))
+        if type(policy) is ToolAuthorizationGrantPolicy:
+            if is_mandatory_control(
+                policy.mandatory_controls, tool_name=tool_name, approval_gate=None
+            ):
+                return True
+            policy = policy.then
+        elif type(policy) is ToolPolicyRouter:
+            policy = policy.policy_for(tool_name)
+        elif type(policy) is GuardedToolPolicy or type(policy) is PreauthorizedToolCallPolicy:
+            policy = policy.then
+        elif type(policy) is ApprovalFloorToolPolicy:
+            policy = policy.inner
+        else:
+            return False
+    return False
+
+
 def _application_owned_tools(policy: ToolPolicy) -> frozenset[str]:
     """The tool names an opaque policy declares it decides by the application's rules.
 
@@ -1369,6 +1396,22 @@ def _tool_policy_coverage(
             # An active grant can stand in for the person's approval.
             return "conditional"
         return coverage
+    from cayu.approvals.tool_call_preauthorizations import PreauthorizedToolCallPolicy
+
+    if type(policy) is PreauthorizedToolCallPolicy:
+        coverage = (
+            "approval_required"
+            if policy.then is None
+            else _tool_policy_coverage(policy.then, tool_name, schema, _seen=seen)
+        )
+        if (
+            coverage == "approval_required"
+            and tool_name in policy.tools
+            and not _mandatory_control_behind(policy.then, tool_name)
+        ):
+            # A person's preauthorization of the exact call can stand in for approval.
+            return "conditional"
+        return coverage
     if type(policy) is AllowAllToolPolicy:
         return "allowed"
     if type(policy) is AlwaysRequireApprovalToolPolicy:
@@ -1465,6 +1508,7 @@ def _decisive_policy(policy: ToolPolicy, tool_name: str) -> tuple[ToolPolicy, bo
 
     from cayu.approvals.authorization_grant_policy import ToolAuthorizationGrantPolicy
     from cayu.approvals.authorization_grants import is_mandatory_control
+    from cayu.approvals.tool_call_preauthorizations import PreauthorizedToolCallPolicy
     from cayu.tools.structured_commands import StructuredCommandToolPolicy
 
     floored = False
@@ -1480,6 +1524,8 @@ def _decisive_policy(policy: ToolPolicy, tool_name: str) -> tuple[ToolPolicy, bo
             policy = policy.inner
         elif type(policy) is StructuredCommandToolPolicy and policy._base_policy is not None:
             policy = policy._base_policy
+        elif type(policy) is PreauthorizedToolCallPolicy and policy.then is not None:
+            policy = policy.then
         elif type(policy) is ToolAuthorizationGrantPolicy and policy.then is not None:
             # A mandatory control on the whole tool is a floor too.
             floored = floored or is_mandatory_control(
