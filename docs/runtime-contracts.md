@@ -20732,8 +20732,29 @@ only; no destructive or pseudonymizing budget disposition is available.
 `CayuApp.delete_session()` composes validation, parked-egress discard and
 erasure, and is what `DELETE /api/sessions/{id}` calls. By default it refuses
 any session that is not `completed` or `failed`; `finished_only=False` admits
-every status the closure itself admits. SQLite and Postgres keep every closure
-receipt, so an erased session id stays retired and an exact erase replays its
+every status the closure itself admits. A session with child sessions is refused unless
+`child_policy=SessionClosureChildPolicy.RECURSIVE` (or `DETACH`) says what the closure does
+with them; `RECURSIVE` deletes them first under the closure's own bounds and checks.
+`cayu.sessions.bulk_deletion.delete_sessions(app, SessionQuery(labels={"person": "ana"}),
+close_reason="Reset")` deletes every session a query matches by composing these parts. A
+call examines matches oldest first, at most `max_sessions` (1,000 by default); when
+`has_more` is set, call again with `after=next_after` for the matches after them, so
+refused sessions are examined once and don't hold up the rest. A match below another match is left to
+that one's closure. Each other match that hasn't finished is closed once with `close_reason`,
+as `close_session` closes one, which closes its open child sessions too; without a reason, or
+when the close is refused, it is listed in `refused` and nothing below it is touched. The
+sessions below it, as the closure enumerates them (`CayuApp.session_descendant_ids`, bounded
+like the closure, `None` when it can't prove the set), need the same: without a reason, an
+unfinished one refuses the match before anything is touched; with one, each still open after
+the match's close is closed, deepest first, and a refused close refuses the match. Then it
+is deleted with `delete_session(..., finished_only=False, child_policy=RECURSIVE)`. Every
+refusal is one of those calls' own checks. `POST /api/sessions/deletions` takes `labels`,
+`agent_name`, `task_id` or `status` (at least one), `close_reason`, `max_sessions` and
+`after`, returns session ids as the rest of the API shows them, and seals `next_after` to
+the request's filters. `cayu session delete --label person=ana --close-reason Reset` sends
+it to a Cloud Agent with `--application NAME` in batches of 50, following `next_after`
+until no more match, or runs it in the project's application, and prints the totals. SQLite and Postgres keep every
+closure receipt, so an erased session id stays retired and an exact erase replays its
 report. `InMemorySessionStore` drops the closure's progress record and the
 session's public aliases with the session, and keeps only the newest
 `closure_receipt_limit` receipts (10,000 by default). Eviction frees only the

@@ -44,6 +44,7 @@ SealedPurpose = Literal[
     "pending-knowledge",
     "archived-knowledge",
     "member-inbox",
+    "session-deletions",
 ]
 
 _LIFETIME_SECONDS = 900
@@ -67,6 +68,8 @@ _PURPOSES: dict[SealedPurpose, tuple[str, Callable[[str], object]]] = {
     # A session-store position among one person's waiting sessions (``ScopedInboxAccess``),
     # in whatever form the store gives it, since it names a private session id.
     "member-inbox": ("cayu.inbox.member.v1", str),
+    # The last session one bulk deletion examined, which names a private session id.
+    "session-deletions": ("cayu.sessions.deletions.v1", decode_session_cursor),
 }
 
 

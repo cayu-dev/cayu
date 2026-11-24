@@ -61,6 +61,7 @@
   "GET /api/sessions/{session_id} name=get_session class=APIRoute GET=get_session_api_sessions__session_id__get",
   "DELETE /api/sessions/{session_id} name=delete_session class=APIRoute DELETE=delete_session_api_sessions__session_id__delete",
   "POST /api/sessions/{session_id}/close name=close_session class=APIRoute POST=close_session_api_sessions__session_id__close_post",
+  "POST /api/sessions/deletions name=delete_matching_sessions class=APIRoute POST=delete_matching_sessions_api_sessions_deletions_post",
   "PATCH /api/sessions/{session_id}/labels name=update_session_labels class=APIRoute PATCH=update_session_labels_api_sessions__session_id__labels_patch",
   "PATCH /api/sessions/{session_id}/metadata name=update_session_metadata class=APIRoute PATCH=update_session_metadata_api_sessions__session_id__metadata_patch",
   "GET /api/tasks name=list_tasks class=APIRoute GET=list_tasks_api_tasks_get",

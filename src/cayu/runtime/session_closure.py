@@ -1648,6 +1648,19 @@ class SessionClosureCoordinator:
             except NotImplementedError as exc:
                 raise ValueError("Session store cannot release closure progress.") from exc
 
+    async def descendant_ids(
+        self, session_id: str, *, policy: SessionClosurePolicy | None = None
+    ) -> tuple[str, ...] | None:
+        """The session's descendants as the closure enumerates them, parents before
+        children, within ``policy``'s bounds; ``None`` when it can't prove the whole set."""
+
+        policy = SessionClosurePolicy() if policy is None else policy
+        try:
+            descendants = await self._load_descendants(session_id, policy=policy)
+        except _DescendantBoundExceeded:
+            return None
+        return None if descendants is None else tuple(child for child, _parent in descendants)
+
     async def validate(self, session_id: str, *, policy: SessionClosurePolicy | None = None):
         """Run closure admission checks without mutating any owned resource."""
         policy = SessionClosurePolicy() if policy is None else policy

@@ -956,3 +956,30 @@ def test_finished_parent_is_found_through_an_interrupted_child_with_pending_chil
             await app.aclose()
 
     asyncio.run(scenario())
+
+
+def test_deleting_a_parent_waiting_on_a_subagent_closes_both_once() -> None:
+    import asyncio
+
+    from cayu.sessions.bulk_deletion import delete_sessions
+    from cayu.sessions.queries import SessionQuery
+
+    async def scenario() -> None:
+        app, child = await _parent_waiting_on_subagent()
+        try:
+            outcome = await delete_sessions(
+                app, SessionQuery(agent_name="parent"), close_reason="Nobody will approve it."
+            )
+            # The one close closes the subagent it waits on too. Deleting the tree is
+            # then the closure's call: here it refuses, since the spawn call the parent
+            # made has no settled effect, and both sessions stay closed.
+            assert outcome.closed == ("parent",), outcome
+            [refusal] = outcome.refused
+            assert refusal.session_id == "parent" and "tool effects" in refusal.reason
+            for session_id in ("parent", child.id):
+                stored = await app.session_store.load(session_id)
+                assert stored is not None and stored.status is SessionStatus.FAILED
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())

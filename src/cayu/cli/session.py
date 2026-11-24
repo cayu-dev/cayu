@@ -530,6 +530,55 @@ def add_session_parser(subparsers: Any) -> None:
     )
     add_output_options(close_parser, formats=("json", "table"))
 
+    delete_parser = commands.add_parser(
+        "delete",
+        help="Delete every session the filters match, such as one person's sessions.",
+        description=(
+            "Delete every session the filters match, through the same dependent-first "
+            "closure as deleting one: its child sessions, events and records go too. An "
+            "unfinished session is closed first with --close-reason (as `cayu session close` "
+            "closes one); without it, it stays and is listed as refused. At least one filter "
+            "is required, and at most 1,000 sessions go per run (has_more says to run it "
+            "again). With --application NAME it deletes a Cayu Cloud Agent's sessions "
+            "through the Agent's API; without it, it opens the project's application in "
+            "this process, as `cayu session close` does."
+        ),
+    )
+    delete_parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Only sessions with this exact label; repeat for several.",
+    )
+    delete_parser.add_argument(
+        "--task", metavar="TASK_ID", help="Only sessions run under this task."
+    )
+    delete_parser.add_argument("--agent", help="Only sessions of this agent.")
+    delete_parser.add_argument(
+        "--close-reason",
+        help="Close each unfinished session with this reason first, recorded with it.",
+    )
+    delete_target = delete_parser.add_mutually_exclusive_group()
+    delete_target.add_argument(
+        "--application",
+        metavar="NAME",
+        help="A Cayu Cloud Agent's id, name or slug, signed in like `cayu cloud` commands.",
+    )
+    delete_target.add_argument(
+        "--target",
+        metavar="MODULE:FACTORY",
+        help="Override project discovery with a module:factory target (local only).",
+    )
+    delete_parser.add_argument(
+        "--context",
+        type=Path,
+        metavar="PATH",
+        help="Private Cayu Cloud context JSON for --application; defaults to `cayu cloud`'s.",
+    )
+    add_wake_options(delete_parser)
+    add_output_options(delete_parser, formats=("json", "table"))
+
     resolution_parser = commands.add_parser(
         "resolve-provider-operation",
         help="Explicitly retry or fail unavailable provider work.",
@@ -604,6 +653,12 @@ def _run_session(args: argparse.Namespace) -> int:
         except (ValueError, OSError, RuntimeError) as exc:
             _render_session_error(str(exc), args.output_format, code="SESSION_CLOSE_FAILED")
             return 1
+    if args.session_command == "delete":
+        try:
+            return _delete_sessions(args)
+        except (ValueError, OSError, RuntimeError) as exc:
+            _render_session_error(str(exc), args.output_format, code="SESSION_DELETE_FAILED")
+            return 1
     if args.session_command == "resolve-provider-operation":
         try:
             return _resolve_provider_operation(args)
@@ -674,6 +729,162 @@ def _close_session(args: argparse.Namespace) -> int:
             f"it is {terminal_safe(str(payload['status']))}."
         )
     return 0
+
+
+#: Sessions one `cayu session delete` request to an Agent deletes.
+_DELETE_BATCH = 50
+
+
+def _delete_sessions(args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        key: value
+        for key, value in {"task_id": args.task, "agent_name": args.agent}.items()
+        if value is not None
+    }
+    labels = _parse_labels(args.label)
+    if labels:
+        body["labels"] = labels
+    if not body:
+        raise ValueError("Give at least one of --label, --task or --agent.")
+    if args.close_reason is not None:
+        if not args.close_reason.strip():
+            raise ValueError("--close-reason must not be blank.")
+        if len(args.close_reason) > _CLOSE_REASON_MAX_CHARS:
+            raise ValueError(f"--close-reason is longer than {_CLOSE_REASON_MAX_CHARS} characters.")
+        body["close_reason"] = args.close_reason
+    if args.application is not None:
+        answer = _delete_cloud_sessions(args, body)
+    else:
+        if args.context is not None:
+            raise ValueError("--context selects the Cayu Cloud for --application NAME.")
+        answer = asyncio.run(_delete_local_sessions(args, body))
+    deleted: list[Any] = answer["deleted"]
+    closed: list[Any] = answer["closed"]
+    refused: list[dict[str, Any]] = answer["refused"]
+    has_more = answer.get("has_more") is True
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "where": "cloud" if args.application is not None else "local",
+        "deleted": deleted,
+        "closed": closed,
+        "refused": refused,
+        "has_more": has_more,
+    }
+    if args.output_format == "json":
+        _render_detail("json", payload)
+    else:
+        print(
+            f"Deleted {len(deleted)} sessions, closing {len(closed)} first; refused {len(refused)}."
+        )
+        for refusal in refused:
+            print(
+                f"  {terminal_safe(str(refusal.get('session_id')))}: "
+                f"{terminal_safe(str(refusal.get('reason')))}"
+            )
+        if has_more:
+            print("More sessions match; run it again for the rest.")
+    return 0 if not refused and not has_more else 1
+
+
+def _delete_cloud_sessions(args: argparse.Namespace, body: dict[str, Any]) -> dict[str, Any]:
+    from cayu.cli._cloud_agent_api import CayuApiError, open_cloud_agent_api
+
+    try:
+        api = open_cloud_agent_api(
+            args.application,
+            context=args.context,
+            timeout_seconds=120.0,
+            wake_timeout_seconds=args.wake_timeout_seconds,
+            offers_wake_option=True,
+        )
+    except CayuApiError as exc:
+        raise RuntimeError(str(exc)) from None
+    # Small batches keep each request well inside the client's timeout; each next one
+    # examines the matches after the last, refused ones included, until none are left.
+    answer: dict[str, Any] = {"deleted": [], "closed": [], "refused": [], "has_more": False}
+    after: str | None = None
+    try:
+        while True:
+            batch = api.mutate(
+                "/sessions/deletions",
+                {
+                    **body,
+                    "max_sessions": _DELETE_BATCH,
+                    **({} if after is None else {"after": after}),
+                },
+                resource="session deletion",
+            )
+            if not isinstance(batch, dict) or not all(
+                isinstance(batch.get(key), list) for key in ("deleted", "closed", "refused")
+            ):
+                raise RuntimeError("The Agent answered the deletion without its result.")
+            for key in ("deleted", "closed", "refused"):
+                answer[key].extend(batch[key])
+            after = batch.get("next_after")
+            if batch.get("has_more") is not True or not isinstance(after, str):
+                break
+    except CayuApiError as exc:
+        if exc.category == "request_rejected" and exc.detail:
+            raise ValueError(exc.detail) from None
+        if exc.category == "outcome_unknown":
+            raise RuntimeError(f"{exc} Repeating the same deletion is safe.") from None
+        raise RuntimeError(str(exc)) from None
+    finally:
+        api.close()
+    return answer
+
+
+async def _delete_local_sessions(args: argparse.Namespace, body: dict[str, Any]) -> dict[str, Any]:
+    import getpass
+
+    from cayu.approvals.actors import ResolutionActor, ResolutionActorSource
+    from cayu.cli.project import (
+        ProjectError,
+        build_project_app,
+        close_project_app,
+        project_context,
+        resolve_project,
+    )
+    from cayu.sessions.bulk_deletion import delete_sessions
+
+    try:
+        actor = ResolutionActor(
+            subject=f"local:{getpass.getuser()}", source=ResolutionActorSource.REQUEST
+        )
+    except (KeyError, OSError):
+        actor = None
+    try:
+        project = resolve_project(args.target, command="cayu session delete")
+    except ProjectError as exc:
+        raise ValueError(str(exc)) from None
+    query = SessionQuery.model_validate(
+        {key: body[key] for key in ("labels", "task_id", "agent_name") if key in body}
+    )
+    with project_context(project.root):
+        try:
+            app = build_project_app(project.target, command="Session delete")
+        except ProjectError as exc:
+            raise ValueError(str(exc)) from None
+        answer: dict[str, Any] = {"deleted": [], "closed": [], "refused": [], "has_more": False}
+        after: str | None = None
+        try:
+            while True:
+                result = await delete_sessions(
+                    app,
+                    query,
+                    close_reason=body.get("close_reason"),
+                    closed_by=actor,
+                    after=after,
+                )
+                page = result.model_dump(mode="json")
+                for key in ("deleted", "closed", "refused"):
+                    answer[key].extend(page[key])
+                after = result.next_after
+                if not result.has_more or after is None:
+                    break
+        finally:
+            await close_project_app(app)
+    return answer
 
 
 def _close_cloud_session(args: argparse.Namespace) -> dict[str, Any]:

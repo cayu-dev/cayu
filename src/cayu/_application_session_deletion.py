@@ -11,6 +11,7 @@ from cayu.runtime._session_closure_projection import (
     project_closure_report,
 )
 from cayu.runtime.session_closure import (
+    SessionClosureChildPolicy,
     SessionClosureExport,
     SessionClosureExportIncomplete,
     SessionClosurePolicy,
@@ -25,7 +26,11 @@ _DELETABLE_FINISHED_SESSION_STATUSES = frozenset({SessionStatus.COMPLETED, Sessi
 
 
 async def delete_app_session(
-    self: CayuApp, session_id: str, *, finished_only: bool
+    self: CayuApp,
+    session_id: str,
+    *,
+    finished_only: bool,
+    child_policy: SessionClosureChildPolicy = SessionClosureChildPolicy.REJECT,
 ) -> SessionClosureReport | None:
     session_id = require_durable_clean_nonblank(session_id, "session_id")
     session = await self.session_store.load(session_id)
@@ -41,7 +46,15 @@ async def delete_app_session(
         and getattr(self.session_store, "supports_session_closure_finished_only", False) is not True
     ):
         raise ValueError("Session store cannot enforce finished-only closure admission.")
-    inspection = await self.validate_session_closure(session_id)
+    if type(child_policy) is not SessionClosureChildPolicy:
+        raise TypeError("child_policy must be a SessionClosureChildPolicy.")
+    # The default policy is today's: a session with child sessions is refused.
+    policy = (
+        None
+        if child_policy is SessionClosureChildPolicy.REJECT
+        else SessionClosurePolicy(child_policy=child_policy)
+    )
+    inspection = await self.validate_session_closure(session_id, policy=policy)
     if not inspection.complete:
         raise ValueError(
             "Session closure inventory is incomplete; no destructive work was started."
@@ -50,7 +63,7 @@ async def delete_app_session(
         raise ValueError("Session has a parked egress allocation whose cleanup remains in flight.")
     report = project_closure_report(
         await self._environment_registry.session_closure.erase(
-            session_id, finished_only=finished_only
+            session_id, policy=policy, finished_only=finished_only
         ),
         redactor=self._secret_redactor,
         project_session_id=self.project_session_id_for_exposure,

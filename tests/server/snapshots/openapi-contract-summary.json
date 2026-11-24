@@ -11320,6 +11320,90 @@
       "title": "DelegatedActionReference",
       "type": "object"
     },
+    "DeleteSessionsBody": {
+      "additionalProperties": false,
+      "description": "Which sessions to delete (as `GET /sessions` filters them), and how.",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "maxLength": 8192,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A previous answer's `next_after`: examine the matches after it.",
+          "title": "After"
+        },
+        "agent_name": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Agent Name"
+        },
+        "close_reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Close each unfinished session with this reason first; without it they stay.",
+          "title": "Close Reason"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "max_sessions": {
+          "default": 1000,
+          "maximum": 1000.0,
+          "minimum": 1.0,
+          "title": "Max Sessions",
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/SessionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Id"
+        }
+      },
+      "title": "DeleteSessionsBody",
+      "type": "object"
+    },
     "EgressAuthorityBindingIdentity": {
       "additionalProperties": false,
       "description": "One destination/credential class bound to a named policy.",
@@ -27740,6 +27824,54 @@
       "title": "SessionAggregateFilter",
       "type": "object"
     },
+    "SessionBulkDeletion": {
+      "additionalProperties": false,
+      "description": "What ``delete_sessions`` did to the sessions its query matched.",
+      "properties": {
+        "closed": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Closed",
+          "type": "array"
+        },
+        "deleted": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Deleted",
+          "type": "array"
+        },
+        "has_more": {
+          "default": false,
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_after": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next After"
+        },
+        "refused": {
+          "default": [],
+          "items": {
+            "$ref": "#/components/schemas/SessionDeletionRefusal"
+          },
+          "title": "Refused",
+          "type": "array"
+        }
+      },
+      "title": "SessionBulkDeletion",
+      "type": "object"
+    },
     "SessionCostBody": {
       "properties": {
         "currency": {
@@ -27885,6 +28017,26 @@
       ],
       "title": "SessionDebugState",
       "type": "string"
+    },
+    "SessionDeletionRefusal": {
+      "additionalProperties": false,
+      "description": "A matching session that was not deleted, and why.",
+      "properties": {
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "reason"
+      ],
+      "title": "SessionDeletionRefusal",
+      "type": "object"
     },
     "SessionDisplay": {
       "additionalProperties": false,
@@ -41024,6 +41176,36 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ListSessionsResponse"
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/deletions": {
+      "post": {
+        "operation_id": "delete_matching_sessions_api_sessions_deletions_post",
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "$ref": "#/components/schemas/DeleteSessionsBody"
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/SessionBulkDeletion"
               }
             }
           },

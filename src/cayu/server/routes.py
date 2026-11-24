@@ -395,6 +395,11 @@ from cayu.sessions._model_failover import ModelFailoverPolicy, ModelTarget
 from cayu.sessions._rollup import SessionRollupQuery
 from cayu.sessions._run_identity import RUN_LINEAGE_METADATA_KEY
 from cayu.sessions._supervision_projection import supervision_page_with_anchors
+from cayu.sessions.bulk_deletion import (
+    MAX_BULK_SESSION_DELETIONS,
+    SessionBulkDeletion,
+    delete_sessions,
+)
 from cayu.sessions.checkpoints import CheckpointCompatibilityError
 from cayu.sessions.event_delivery import PersistedEventSideEffectPage, PersistedEventSideEffectQuery
 from cayu.sessions.event_delivery import Status as EventSideEffectStatus
@@ -2249,6 +2254,30 @@ class CloseSessionBody(BaseModel):
     waiting_on: NonBlankString | None = Field(
         default=None,
         description="An approval or input ID the session must still wait on to be closed.",
+    )
+
+
+class DeleteSessionsBody(BaseModel):
+    """Which sessions to delete (as `GET /sessions` filters them), and how."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    labels: dict[str, str] = Field(default_factory=dict)
+    agent_name: NonBlankString | None = None
+    task_id: NonBlankString | None = None
+    status: SessionStatus | None = None
+    close_reason: NonBlankString | None = Field(
+        default=None,
+        max_length=4096,
+        description="Close each unfinished session with this reason first; without it they stay.",
+    )
+    max_sessions: int = Field(
+        default=MAX_BULK_SESSION_DELETIONS, ge=1, le=MAX_BULK_SESSION_DELETIONS
+    )
+    after: NonBlankString | None = Field(
+        default=None,
+        max_length=8192,
+        description="A previous answer's `next_after`: examine the matches after it.",
     )
 
 
@@ -9174,6 +9203,66 @@ def create_router(
             "actions": [action.value for action in result.actions],
             "message": result.message,
         }
+
+    @router.post(
+        "/sessions/deletions",
+        response_model=SessionBulkDeletion,
+        dependencies=protected,
+        summary="Delete every session the filters match, as DELETE /sessions/{session_id} does one",
+    )
+    async def delete_matching_sessions(
+        body: DeleteSessionsBody,
+        auth_context: AuthContext | None = optional_auth_context,
+    ):
+        """At least one filter is required. Matches are examined oldest first, at most
+        ``max_sessions`` per request; ``has_more`` says more match, so send the request
+        again with ``after`` set to ``next_after``. Refused sessions aren't examined
+        again on the next page."""
+
+        filters = body.model_dump(
+            include={"labels", "agent_name", "task_id", "status"}, exclude_defaults=True
+        )
+        if not filters:
+            raise HTTPException(422, "Give at least one filter; deleting every session is refused.")
+        try:
+            query = SessionQuery.model_validate(filters)
+        except ValidationError as exc:
+            raise HTTPException(422, exc.errors(include_context=False)) from exc
+        # A position names a private session id, so it leaves sealed to these filters.
+        binding = [
+            filters,
+            None if auth_context is None else [auth_context.subject, auth_context.tenant],
+        ]
+        after = (
+            None
+            if body.after is None
+            else inbox_cursor.open("session-deletions", body.after, binding)
+        )
+        result = await delete_sessions(
+            cayu_app,
+            query,
+            close_reason=body.close_reason,
+            closed_by=_request_actor(auth_context, None, field_name="resolved_by"),
+            max_sessions=body.max_sessions,
+            after=after,
+        )
+        # Session ids leave the API only as their public projection.
+        expose = cayu_app.project_session_id_for_exposure
+        return result.model_copy(
+            update={
+                "deleted": tuple(expose(item) for item in result.deleted),
+                "closed": tuple(expose(item) for item in result.closed),
+                "refused": tuple(
+                    item.model_copy(update={"session_id": expose(item.session_id)})
+                    for item in result.refused
+                ),
+                "next_after": (
+                    None
+                    if result.next_after is None
+                    else inbox_cursor.seal("session-deletions", result.next_after, binding)
+                ),
+            }
+        )
 
     @router.patch(
         "/sessions/{session_id}/labels",

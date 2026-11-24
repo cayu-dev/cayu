@@ -583,6 +583,7 @@ from cayu.runtime.public_authority import (
 )
 from cayu.runtime.session_closure import (
     BudgetSessionClosureStore,
+    SessionClosureChildPolicy,
     SessionClosureExport,
     SessionClosurePolicy,
     SessionClosureReport,
@@ -4715,11 +4716,15 @@ class CayuApp(
         session_id: str,
         *,
         finished_only: bool = True,
+        child_policy: SessionClosureChildPolicy = SessionClosureChildPolicy.REJECT,
     ) -> SessionClosureReport | None:
         """Delete a session through dependent-first closure.
 
         By default only completed or failed sessions qualify. Running sessions or
         incomplete cleanup raise ValueError. Missing sessions return None.
+        A session with child sessions is refused unless ``child_policy`` says what
+        the closure does with them (``RECURSIVE`` deletes them first, under the
+        closure's own bounds and checks).
         Deleting a session asleep in ``sleep_until`` cancels its wake task; one
         whose owning task still runs is refused until that task is cancelled, as is
         one that waits on an external event inside a running task.
@@ -4728,10 +4733,27 @@ class CayuApp(
         await _session_wakes._require_deletable(self, session_id)
         await _external_wait_tasks.require_deletable(self, session_id)
         wake_id = await _session_wakes._open_wake_id(self, session_id)
-        report = await delete_app_session(self, session_id, finished_only=finished_only)
+        report = await delete_app_session(
+            self, session_id, finished_only=finished_only, child_policy=child_policy
+        )
         if wake_id is not None and await self.session_store.load(session_id) is None:
             await _session_wakes._cancel_session_wake_attempts(self, wake_id)
         return report
+
+    @_tracked_entrance
+    async def session_descendant_ids(self, session_id: str) -> tuple[str, ...] | None:
+        """The sessions below ``session_id``, parents before children, as the closure of
+        ``delete_session(..., child_policy=RECURSIVE)`` would take them.
+
+        The enumeration is bounded by the closure's default limits. ``None`` means the
+        closure can't prove the whole set (a store without lineage, or past its bounds);
+        never read that as an empty tree.
+        """
+
+        return await self._environment_registry.session_closure.descendant_ids(
+            session_id,
+            policy=SessionClosurePolicy(child_policy=SessionClosureChildPolicy.RECURSIVE),
+        )
 
     @_tracked_entrance
     async def validate_session_closure(

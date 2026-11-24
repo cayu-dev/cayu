@@ -309,6 +309,7 @@ _FULL_ACCESS_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
             ("POST", "/resume"),
             ("POST", "/run"),
             ("POST", "/sessions/{session_id}/close"),
+            ("POST", "/sessions/deletions"),
             ("POST", "/sessions/{session_id}/compact"),
             ("POST", "/sessions/{session_id}/interrupt"),
             ("POST", "/sessions/{session_id}/messages"),

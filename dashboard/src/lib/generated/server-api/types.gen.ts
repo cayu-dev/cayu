@@ -7130,6 +7130,45 @@ export type DelegatedActionReference = {
 };
 
 /**
+ * DeleteSessionsBody
+ *
+ * Which sessions to delete (as `GET /sessions` filters them), and how.
+ */
+export type DeleteSessionsBody = {
+    /**
+     * After
+     *
+     * A previous answer's `next_after`: examine the matches after it.
+     */
+    after?: string | null;
+    /**
+     * Agent Name
+     */
+    agent_name?: string | null;
+    /**
+     * Close Reason
+     *
+     * Close each unfinished session with this reason first; without it they stay.
+     */
+    close_reason?: string | null;
+    /**
+     * Labels
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    /**
+     * Max Sessions
+     */
+    max_sessions?: number;
+    status?: SessionStatus | null;
+    /**
+     * Task Id
+     */
+    task_id?: string | null;
+};
+
+/**
  * DurableOperationOwnership
  *
  * Bounded fencing authority embedded in one feature-owned record.
@@ -21504,6 +21543,34 @@ export type SessionAggregateFilter = {
 };
 
 /**
+ * SessionBulkDeletion
+ *
+ * What ``delete_sessions`` did to the sessions its query matched.
+ */
+export type SessionBulkDeletion = {
+    /**
+     * Closed
+     */
+    closed?: Array<string>;
+    /**
+     * Deleted
+     */
+    deleted?: Array<string>;
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Next After
+     */
+    next_after?: string | null;
+    /**
+     * Refused
+     */
+    refused?: Array<SessionDeletionRefusal>;
+};
+
+/**
  * SessionCostBody
  */
 export type SessionCostBody = {
@@ -21602,6 +21669,22 @@ export type SessionCostSummary = {
  * SessionDebugState
  */
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
+
+/**
+ * SessionDeletionRefusal
+ *
+ * A matching session that was not deleted, and why.
+ */
+export type SessionDeletionRefusal = {
+    /**
+     * Reason
+     */
+    reason: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
 
 /**
  * SessionDisplay
@@ -31670,6 +31753,31 @@ export type ListSessionsApiSessionsGetResponses = {
 };
 
 export type ListSessionsApiSessionsGetResponse = ListSessionsApiSessionsGetResponses[keyof ListSessionsApiSessionsGetResponses];
+
+export type DeleteMatchingSessionsApiSessionsDeletionsPostData = {
+    body: DeleteSessionsBody;
+    path?: never;
+    query?: never;
+    url: '/api/sessions/deletions';
+};
+
+export type DeleteMatchingSessionsApiSessionsDeletionsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DeleteMatchingSessionsApiSessionsDeletionsPostError = DeleteMatchingSessionsApiSessionsDeletionsPostErrors[keyof DeleteMatchingSessionsApiSessionsDeletionsPostErrors];
+
+export type DeleteMatchingSessionsApiSessionsDeletionsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: SessionBulkDeletion;
+};
+
+export type DeleteMatchingSessionsApiSessionsDeletionsPostResponse = DeleteMatchingSessionsApiSessionsDeletionsPostResponses[keyof DeleteMatchingSessionsApiSessionsDeletionsPostResponses];
 
 export type SessionDisplaysApiSessionsDisplayGetData = {
     body?: never;
