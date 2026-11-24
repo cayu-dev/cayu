@@ -263,6 +263,7 @@ def create_server(
     project_context: ProjectControlPlaneContext | None = None,
     browser_recordings: Any | None = None,
     tool_authorization_grants: Any | None = None,
+    tool_call_preauthorizations: Any | None = None,
     inbox_access: InboxAccess | None = None,
     inbox_cursor_key: bytes | None = None,
     fastapi_options: Mapping[str, Any] | None = None,
@@ -285,6 +286,9 @@ def create_server(
         tool_authorization_grants: Optional ``ToolAuthorizationGrantServer``
             from ``cayu.server.authorization_grants``. Its authenticated grant
             routes are mounted under the API path; requires authenticated access.
+        tool_call_preauthorizations: Optional ``ToolCallPreauthorizationServer``
+            from ``cayu.server.tool_call_preauthorizations``, mounted under the API
+            path like the grant routes; requires authenticated access.
         inbox_access: Optional ``cayu.server.inbox.InboxAccess`` rule deciding which
             authenticated callers may see and settle each approval, question, recovery
             item and knowledge proposal, on every route that lists or settles them,
@@ -341,6 +345,17 @@ def create_server(
             )
         if tool_authorization_grants.service.app is not app:
             raise ValueError("Tool authorization grant routes must use this server's CayuApp.")
+    if tool_call_preauthorizations is not None:
+        from cayu.server.tool_call_preauthorizations import ToolCallPreauthorizationServer
+
+        if (
+            type(tool_call_preauthorizations) is not ToolCallPreauthorizationServer
+            or api_auth is None
+        ):
+            raise ValueError(
+                "Tool-call preauthorization routes require a ToolCallPreauthorizationServer "
+                "and authenticated access."
+            )
     # A disabled API serves no fork-controller or Cayu Cloud reader routes either.
     fork_controller_router = (
         _environment_fork_controller_router(app, resolved_config.api.path)
@@ -599,6 +614,10 @@ def create_server(
             server.include_router(
                 tool_authorization_grants.router(auth=api_auth, inbox_access=inbox_access),
                 prefix=control_plane_path,
+            )
+        if tool_call_preauthorizations is not None:
+            server.include_router(
+                tool_call_preauthorizations.router(auth=api_auth), prefix=control_plane_path
             )
     if fork_controller_router is not None:
         server.include_router(fork_controller_router)

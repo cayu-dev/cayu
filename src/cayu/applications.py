@@ -65,6 +65,12 @@ from cayu.approvals.authorization_grant_hosting import (
 from cayu.approvals.review import (
     HumanReviewPolicy,
 )
+from cayu.approvals.tool_call_preauthorization_hosting import (
+    host_tool_call_preauthorizations as _host_tool_call_preauthorizations,
+)
+from cayu.approvals.tool_call_preauthorization_hosting import (
+    tool_call_preauthorization_hosting as _tool_call_preauthorization_hosting,
+)
 from cayu.approvals.tools import (
     PendingToolApproval,
     ToolApprovalDecision,
@@ -817,6 +823,9 @@ _WorkerStepResult = TypeVar("_WorkerStepResult")
 
 if TYPE_CHECKING:
     from cayu.approvals.authorization_grant_hosting import ToolAuthorizationGrantHosting
+    from cayu.approvals.tool_call_preauthorization_hosting import (
+        ToolCallPreauthorizationHosting,
+    )
     from cayu.collaboration._contracts import OperationRef
     from cayu.collaboration._producer_cleanup_finalization import ProducerCleanupFinalized
     from cayu.collaboration._producer_contracts import (
@@ -1249,6 +1258,7 @@ class CayuApp(
         self._uses_session_wakes = False
         self._external_wait_hosting: ExternalWaitHosting | None = None
         self._tool_authorization_grant_hosting: ToolAuthorizationGrantHosting | None = None
+        self._tool_call_preauthorization_hosting: ToolCallPreauthorizationHosting | None = None
         self._recovery_task_store = task_store
         self._knowledge_store = knowledge_store
         owned_store_ids = list(closure_stores)
@@ -5993,6 +6003,8 @@ class CayuApp(
     external_wait_hosting = property(_external_wait_hosting)
     host_tool_authorization_grants = _host_tool_authorization_grants
     tool_authorization_grant_hosting = property(_tool_authorization_grant_hosting)
+    host_tool_call_preauthorizations = _host_tool_call_preauthorizations
+    tool_call_preauthorization_hosting = property(_tool_call_preauthorization_hosting)
 
     def register_task_type(self, spec: TaskTypeSpec) -> TaskTypeSpec:
         """Declare a public task type without starting or scheduling work."""

@@ -347,6 +347,15 @@ def _build_serve_app(
                 "doesn't serve: call app.host_external_waits(...) before "
                 "create_agent_service(...), which then mounts the delivery route."
             )
+        # A service's app is a CayuApp, which always has the attribute; reading it with a
+        # default keeps serve working for a service built around anything else.
+        if getattr(service.cayu_app, "_tool_call_preauthorization_hosting", None) is not None:
+            raise ServeError(
+                "The service_factory's app hosts tool-call preauthorizations, which a "
+                "maintained public service doesn't serve: drop "
+                "app.host_tool_call_preauthorizations(...), or serve the project from its "
+                "application factory."
+            )
         if service.cayu_app._tool_authorization_grant_hosting is not None:
             raise ServeError(
                 "The service_factory's app hosts tool authorization grants, which a "
@@ -432,11 +441,21 @@ def _build_serve_app(
             grant_server = ToolAuthorizationGrantServer(
                 grant_hosting.service, authorize_read=grant_hosting.authorize_read
             )
+        preauthorization_hosting = app._tool_call_preauthorization_hosting
+        preauthorization_server = None
+        # Like the grant routes, these name the authenticated caller, so --dev serves none.
+        if preauthorization_hosting is not None and not args.dev:
+            from cayu.server.tool_call_preauthorizations import ToolCallPreauthorizationServer
+
+            preauthorization_server = ToolCallPreauthorizationServer(
+                preauthorization_hosting.store, authorize=preauthorization_hosting.authorize
+            )
         server = server_module.create_server(
             app,
             config=config,
             project_context=project_control_plane,
             tool_authorization_grants=grant_server,
+            tool_call_preauthorizations=preauthorization_server,
             inbox_access=_load_inbox_access(settings.inbox_access, app, development=args.dev),
         )
         _include_project_routers(server, app, settings.routers, development=args.dev, auth=auth)

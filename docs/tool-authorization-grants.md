@@ -164,6 +164,59 @@ share one set of transition rules with it. Each `use` runs in one transaction
 (SQLite `BEGIN IMMEDIATE`, PostgreSQL a transaction lock on the task), so two
 workers never use one record. The table joins storage revision 162; run
 `cayu storage migrate` on an existing database.
+
+To let people issue them over HTTP and from the command line, host the store in
+the application factory:
+
+```python
+async def preauthorizations(principal, action, record) -> bool:
+    # action is "issue", "read" or "revoke"; record names the caller when issuing.
+    if action == "read":
+        return principal.subject in OPERATORS
+    return principal.subject in SENDERS
+
+
+app.host_tool_call_preauthorizations(store, authorize=preauthorizations)
+```
+
+`cayu serve` then mounts these routes behind its authentication (not under
+`--dev`, since a record names its authenticated author; a project whose
+`service_factory` app hosts them is refused at startup, as for grants):
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/tool-call-preauthorizations` | Issue: `task_id`, `tool_name`, `arguments`, and optionally `agent_name`, `preauthorization_id`, `lifetime_seconds`, `justification` |
+| `GET /api/tool-call-preauthorizations?task_id=...` | A task's records the caller may read, oldest first |
+| `GET /api/tool-call-preauthorizations/{id}` | One record and its `status` (`available`, `used`, `revoked`, `expired`) |
+| `POST /api/tool-call-preauthorizations/{id}/revoke` | Revoke an unused record |
+
+The body has no `authorized_by`: the record names the authenticated caller, and
+revoking records the caller as `revoked_by`. The arguments are hashed and not
+stored. An issue with a `preauthorization_id` that already exists with the
+same terms returns it; other terms answer 409. `authorize` refusing a read
+answers 404, and refusing an issue or revoke answers 403. An application with
+its own server passes
+`create_server(..., tool_call_preauthorizations=ToolCallPreauthorizationServer(store, authorize=...))`.
+
+The same routes from the command line, against the project's application in
+this process, recorded as `--reviewer SUBJECT` (your local user by default):
+
+```console
+$ cayu preauthorizations issue --task task_... --tool send_email \
+    --arguments '{"email_id": "e-1", "to": ["ap@example.com"]}' --expires-in-seconds 86400
+$ cayu preauthorizations list --task task_...
+$ cayu preauthorizations show tcp_...
+$ cayu preauthorizations revoke tcp_...
+```
+
+`--arguments-file PATH` reads the arguments from a file, `--agent NAME` binds
+the agent, and `--id ID` makes a retry return the same record. `--format json`
+prints the routes' documents. With `--application NAME` the commands ask that Cayu Cloud
+Agent through Cayu Cloud, which forwards them as the person signed in with
+`cayu cloud login`, so the Agent's `authorize` sees and the record names that
+person. The Agent needs Cloud sign-in on, as for grants. A Cayu Cloud that
+doesn't forward these yet answers `preauthorizations_unsupported`; an Agent
+that hosts none answers `preauthorizations_not_served`.
 The digest is of the whole call's arguments, as the model sent them. A built-in
 tool that checks each target of a batched call separately, such as `read_file`
 with `files`, passes its policy one argument set per target; the runtime also

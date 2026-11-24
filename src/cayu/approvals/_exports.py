@@ -148,6 +148,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.approvals.authorization_grants",
         "ToolAuthorizationGrantError",
     ),
+    "ToolCallPreauthorizationHosting": (
+        "cayu.approvals.tool_call_preauthorization_hosting",
+        "ToolCallPreauthorizationHosting",
+    ),
     "ToolAuthorizationGrantHosting": (
         "cayu.approvals.authorization_grant_hosting",
         "ToolAuthorizationGrantHosting",
@@ -314,6 +318,7 @@ PUBLIC_NAMES = [
     "ToolAuthorizationGrantDenied",
     "ToolAuthorizationGrantError",
     "ToolAuthorizationGrantHosting",
+    "ToolCallPreauthorizationHosting",
     "ToolAuthorizationGrantMatcherKind",
     "ToolAuthorizationGrantNotFound",
     "ToolAuthorizationGrantOffer",
