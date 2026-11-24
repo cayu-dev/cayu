@@ -665,6 +665,36 @@ def _validate_tool_round_publication(
             )
 
 
+def _structured_output_calls_skipped_at_limit(
+    request: RuntimePublicationRequest,
+    structured_calls: list[dict[str, Any]],
+) -> bool:
+    """A run limit closed the round before its output was validated.
+
+    The result parts are bound to their terminal events, so a skipped result
+    here is the runtime's own run-limit terminal.
+    """
+
+    results = {
+        part.tool_call_id: part
+        for message in request.transcript_messages
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    }
+    for call in structured_calls:
+        part = results.get(call.get("tool_call_id"))  # ty: ignore[invalid-argument-type]
+        structured = None if part is None else part.structured
+        if (
+            part is None
+            or not part.is_error
+            or type(structured) is not dict
+            or structured.get("skipped") is not True
+            or structured.get("reason") != "limit_reached"
+        ):
+            return False
+    return True
+
+
 def _validate_structured_output_tool_round_marker(
     request: RuntimePublicationRequest,
     *,
@@ -680,7 +710,9 @@ def _validate_structured_output_tool_round_marker(
         call for call in raw_calls if call.get("tool_name") == STRUCTURED_OUTPUT_TOOL_NAME
     ]
     if auxiliary is None:
-        if structured_calls:
+        if structured_calls and not _structured_output_calls_skipped_at_limit(
+            request, structured_calls
+        ):
             raise SessionRuntimePublicationConflict(
                 "A pending structured-output tool round requires validated "
                 "intent.auxiliary evidence."

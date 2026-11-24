@@ -9716,6 +9716,13 @@ boundary. Without a terminal event its status remains `INTERRUPTED`.
   dedicated approval/input/recovery/delegation action; `None` means ordinary
   resumability was not established. These hints confer no authority and do not
   bypass current access, checkpoint or execution-profile checks.
+- `limit_reached` names the run or budget limit that stopped the run
+  (`"output_tokens"`, `"estimated_cost"` and so on): the interruption's `limit`
+  when the run ended `INTERRUPTED` at a limit, else `None`. A limit reached
+  while the model's structured-output submission is waiting is the same kind of
+  stop: the submission is skipped with `reason: "limit_reached"`, nothing is
+  validated, `structured_output` stays `None`, and the run ends `INTERRUPTED`
+  instead of failing.
 
 ### Bounded summaries
 

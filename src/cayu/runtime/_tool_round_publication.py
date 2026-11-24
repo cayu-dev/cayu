@@ -475,6 +475,24 @@ async def publish_tool_round_with_exact_replay(
         return None
 
 
+def _structured_output_skipped_at_limit(evidence: ToolRoundPublicationEvidence) -> bool:
+    """A run limit closed the round before its output was validated.
+
+    Nothing was validated, so there are no validation events to publish and the
+    round closes like an ordinary one; the session then stops at the limit.
+    """
+
+    terminals = [
+        event
+        for event in evidence.terminal_events
+        if event.tool_name == STRUCTURED_OUTPUT_TOOL_NAME
+    ]
+    return bool(terminals) and all(
+        event.type == EventType.TOOL_CALL_FAILED and event.payload.get("reason") == "limit_reached"
+        for event in terminals
+    )
+
+
 def _build_tool_round_publication_request(
     *,
     session_id: str,
@@ -488,8 +506,6 @@ def _build_tool_round_publication_request(
     is_structured_output_round = any(
         call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in copied_pending_round.tool_calls
     )
-    if is_structured_output_round and extension is None:
-        raise ValueError("Structured-output tool rounds require an explicit publication extension.")
     if not is_structured_output_round and extension is not None:
         raise ValueError(
             "Tool-round publication extensions are reserved for structured-output rounds."
@@ -515,6 +531,9 @@ def _build_tool_round_publication_request(
         pending_round=copied_pending_round,
         durable_events=durable_events,
     )
+    skipped_at_limit = is_structured_output_round and _structured_output_skipped_at_limit(evidence)
+    if is_structured_output_round and extension is None and not skipped_at_limit:
+        raise ValueError("Structured-output tool rounds require an explicit publication extension.")
     from cayu.sessions._foreground_child_checkpoint import (
         FOREGROUND_CHILD_POST_ACTION_CONTINUATION_KEY,
         FOREGROUND_CHILD_TERMINAL_KEY,
@@ -617,7 +636,7 @@ def _build_tool_round_publication_request(
         raise AssertionError("Tool-round transcript construction must return one message.")
     spec = copied_pending_round.structured_output
     validation = copied_pending_round.structured_output_validation
-    if spec is not None and validation is not None and validation.valid:
+    if spec is not None and validation is not None and validation.valid and not skipped_at_limit:
         result_message = tool_result_messages[0]
         tool_result_messages[0] = Message(
             role=result_message.role,

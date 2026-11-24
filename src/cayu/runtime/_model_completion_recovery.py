@@ -1369,6 +1369,38 @@ class ModelCompletionRecovery:
         ):
             raise RuntimeError("Closed structured output lost its exact interaction receipt.")
         auxiliary = receipt.intent.get("auxiliary")
+        if auxiliary is None and not receipt.appended_event_ids:
+            # A run limit skipped the submission before validation, so the
+            # round closed with no validation events to recover. Read the
+            # terminals the receipt itself bound.
+            structured_ids = {
+                call.tool_call_id
+                for call in pending.tool_calls
+                if call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME
+            }
+            terminals: list[Event] = []
+            for reference in receipt.referenced_events:
+                rows = await self._session_store.query_events(
+                    EventQuery(session_id=session.id, event_id=reference.event_id, limit=2)
+                )
+                if len(rows) != 1:
+                    raise RuntimeError("Closed structured output event is missing or ambiguous.")
+                event = rows[0].event
+                if (
+                    event.type != EventType.TOOL_CALL_STARTED
+                    and event.payload.get("tool_call_id") in structured_ids
+                ):
+                    terminals.append(event)
+            if (
+                len(terminals) == len(structured_ids)
+                and terminals
+                and all(
+                    event.type == EventType.TOOL_CALL_FAILED
+                    and event.payload.get("reason") == "limit_reached"
+                    for event in terminals
+                )
+            ):
+                return ()
         if (
             type(auxiliary) is not dict
             or any(

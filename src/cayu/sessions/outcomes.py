@@ -225,6 +225,22 @@ class RunOutcome:
         return len(self.tool_calls)
 
     @property
+    def limit_reached(self) -> str | None:
+        """The run or budget limit that stopped this run, or ``None``.
+
+        It is the interruption's ``limit`` (``"output_tokens"``,
+        ``"estimated_cost"`` and so on) when the run ended ``INTERRUPTED`` at a
+        limit, including one reached while waiting for structured output.
+        """
+        if (
+            self.status is not SessionStatus.INTERRUPTED
+            or self.interruption is None
+            or self.interruption.kind != "limit"
+        ):
+            return None
+        return self.interruption.limit
+
+    @property
     def resumable(self) -> bool | None:
         if self.status is not SessionStatus.INTERRUPTED or self.interruption is None:
             return None
