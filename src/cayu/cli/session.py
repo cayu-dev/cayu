@@ -375,10 +375,24 @@ def add_session_parser(subparsers: Any) -> None:
         help="Page durable session events.",
         description=(
             "Page durable session events with optional filters. "
+            "Give a session, or --task or --label for the events of every session they "
+            "select (on a local store). "
             "Use `--include-payload` only for bounded payload previews."
         ),
     )
-    events_parser.add_argument("session_id")
+    events_parser.add_argument("session_id", nargs="?")
+    events_parser.add_argument(
+        "--task",
+        metavar="TASK_ID",
+        help="Only events of the sessions run under this task (`cayu session list --task`).",
+    )
+    events_parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Only events of sessions with this label. Repeat for several; every one must match.",
+    )
     _add_target_options(events_parser)
     events_parser.add_argument(
         "--type",
@@ -2150,10 +2164,16 @@ def _runner_commands_cell(call: dict[str, Any]) -> str | None:
 
 
 async def _session_events(args: argparse.Namespace, reader: SessionReader) -> int:
-    await reader.require_session(args.session_id)
+    labels = _parse_labels(args.label)
+    if args.session_id is None and args.task is None and not labels:
+        raise ValueError("Give a session id, --task or --label.")
+    if args.session_id is not None:
+        await reader.require_session(args.session_id)
     records = await reader.query_events(
         EventQuery(
             session_id=args.session_id,
+            task_id=args.task,
+            labels=labels,
             interaction_id=args.interaction_id,
             event_types=tuple(args.event_types),
             tool_name=args.tool,
@@ -2161,7 +2181,13 @@ async def _session_events(args: argparse.Namespace, reader: SessionReader) -> in
             environment_name=args.environment,
             since=args.since,
             until=args.until,
-            after_sequence=args.after_sequence,
+            # A sequence bound makes a cross-session read stop below a sequence another
+            # session's writer hasn't committed yet, so a later page can't skip it.
+            after_sequence=(
+                0
+                if args.after_sequence is None and args.session_id is None
+                else args.after_sequence
+            ),
             before_sequence=args.before_sequence,
             limit=args.limit + 1,
             order_by=EventOrder.SEQUENCE_ASC,
@@ -2170,10 +2196,18 @@ async def _session_events(args: argparse.Namespace, reader: SessionReader) -> in
     has_more = len(records) > args.limit
     page = records[: args.limit]
     rows = [_event_row(record, payload_limit=args.include_payload) for record in page]
+    if args.session_id is None:
+        # Events of several sessions: say whose each one is.
+        rows = [
+            {"session_id": record.event.session_id, **row}
+            for record, row in zip(page, rows, strict=True)
+        ]
     next_sequence = page[-1].sequence if has_more and page else None
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
         "session_id": args.session_id,
+        **({} if args.task is None else {"task_id": args.task}),
+        **({"labels": labels} if labels else {}),
         "interaction_id": args.interaction_id,
         "events": rows,
         "order": "sequence_asc",
@@ -2182,6 +2216,7 @@ async def _session_events(args: argparse.Namespace, reader: SessionReader) -> in
     }
     headers = (
         "sequence",
+        *(("session_id",) if args.session_id is None else ()),
         "timestamp",
         "type",
         "interaction_id",

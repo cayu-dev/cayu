@@ -16,10 +16,13 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER
+from cayu._validation import MAX_DURABLE_JSON_INTEGER, copy_label_map
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.events import Event, EventType
 from cayu.sessions.records import EventRecord
+
+# The most session labels one event query may require.
+MAX_EVENT_QUERY_LABELS = 20
 
 
 class EventOrder(StrEnum):
@@ -49,6 +52,14 @@ class EventQuery(BaseModel):
     workflow_step_id: str | None = None
     workflow_attempt_fenced: StrictBool = False
     tool_name: str | None = None
+    # Events of the sessions run under this task, as ``SessionQuery.task_id`` selects them.
+    task_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Events of the sessions carrying every one of these labels (``SessionQuery.labels``).
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=MAX_EVENT_QUERY_LABELS,
+        exclude_if=lambda value: not value,
+    )
     since: datetime | None = None
     until: datetime | None = None
     after_sequence: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
@@ -71,6 +82,7 @@ class EventQuery(BaseModel):
         "workflow_attempt_id",
         "workflow_step_id",
         "tool_name",
+        "task_id",
     )
     @classmethod
     def validate_optional_nonblank_fields(
@@ -97,6 +109,11 @@ class EventQuery(BaseModel):
                 raise ValueError("`session_ids` must not contain duplicates.")
             copied.append(clean_item)
         return tuple(copied)
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_query_labels(cls, value) -> dict[str, str]:
+        return copy_label_map(value, "labels")
 
     @field_validator("event_type")
     @classmethod

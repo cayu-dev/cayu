@@ -390,6 +390,9 @@ class AgentSessionReader:
     async def query_events(self, query: EventQuery) -> list[EventRecord]:
         if query.session_id is None:
             raise ValueError("Cloud Agent event reads name one session.")
+        if query.task_id is not None or query.labels:
+            # The session events route takes neither, so it would return every event.
+            raise ValueError("--task and --label event filters read a local session store.")
         types: tuple[str | None, ...] = tuple(str(item) for item in query.event_types) or (
             (str(query.event_type),) if query.event_type is not None else (None,)
         )

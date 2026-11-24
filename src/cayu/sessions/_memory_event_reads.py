@@ -19,6 +19,7 @@ from cayu.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.messages import Message
 from cayu.runtime._cost_accounting import CostAccountingSnapshot
 from cayu.runtime._usage_accounting import UsageAccountingSnapshot
+from cayu.session_metadata import TASK_METADATA_KEY
 from cayu.sessions import _runtime_publication as publication_contracts
 from cayu.sessions import _tool_round_publication_rules as tool_publication_rules
 from cayu.sessions import event_queries as event_query_rules
@@ -901,6 +902,15 @@ def _session_matcher(
                     }
                 if owner.id in forked_session_ids:
                     return False
+        if query.task_id is not None and (
+            owner is None or owner.metadata.get(TASK_METADATA_KEY) != query.task_id
+        ):
+            return False
+        if query.labels and (
+            owner is None
+            or any(owner.labels.get(key) != value for key, value in query.labels.items())
+        ):
+            return False
         if query.causal_budget_id is None:
             return True
         return owner is not None and owner.causal_budget_id == query.causal_budget_id

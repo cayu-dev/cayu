@@ -208,6 +208,16 @@ def build_event_query_sql(
     if query.causal_budget_id is not None:
         clauses.append(f"cayu_sessions.causal_budget_id = {dialect.placeholder}")
         params.append(query.causal_budget_id)
+    # Every caller joins the event's session as ``cayu_sessions``.
+    if query.task_id is not None:
+        metadata = _row_metadata(dialect)
+        clauses.append(
+            f"{_json_text(dialect, metadata, TASK_METADATA_KEY)} = {dialect.placeholder}"
+        )
+        params.append(query.task_id)
+    for key, value in query.labels.items():
+        clauses.append(_label_exact_clause(dialect))
+        params.extend([key, value])
     if query.since is not None:
         clauses.append(f"cayu_events.timestamp >= {dialect.placeholder}")
         params.append(dialect.datetime_param(query.since))

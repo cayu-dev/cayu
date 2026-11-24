@@ -6316,6 +6316,7 @@ Session stores expose two read surfaces:
 
 - `load_events(session_id)` returns the full event list for one session.
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
+- `EventQuery(task_id=...)` reads the events of the sessions run under that task, the same sessions `SessionQuery(task_id=...)` lists, and `EventQuery(labels={...})` the events of the sessions carrying every one of those labels. Both combine with the other filters, so an activity feed for one job needs no table of its session ids. `POST /resources/events/query` takes them in its body, and `cayu session events --task TASK_ID` or `--label KEY=VALUE` (without a session id) pages them from a local store; each row then names its session.
 - `inspect_summary(session_id)` returns a content-free `SessionInspectionSummary`
   with identity, serialized transcript/event sizes, usage, pending/queued/operation
   state, terminal failure state, and explicit budget availability. Budget
