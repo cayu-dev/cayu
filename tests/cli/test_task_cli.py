@@ -1038,13 +1038,20 @@ def test_a_project_command_reads_a_deployed_agents_tasks_through_the_public_read
 def test_the_public_readers_fail_with_a_category_when_the_agent_cant_be_read(
     cloud: FakeCloud,
 ) -> None:
-    from cayu.storage import AgentReadError, open_cloud_agent_readers
+    from cayu.storage import AgentReadError, TaskListRequest, open_cloud_agent_readers
 
     cloud.service.update(status="stopped")
 
+    async def read() -> None:
+        async with open_cloud_agent_readers("bug-hunter") as agent:
+            await agent.tasks.list_tasks(TaskListRequest())
+
     with pytest.raises(AgentReadError) as raised:
-        open_cloud_agent_readers("bug-hunter")
+        asyncio.run(read())
     assert raised.value.category == "not_serving"
+    with pytest.raises(AgentReadError) as raised:
+        open_cloud_agent_readers("no-such-agent")
+    assert raised.value.category == "application_not_found"
 
 
 def test_the_public_readers_read_a_local_store_the_same_way(database: Path) -> None:

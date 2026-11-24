@@ -36,6 +36,19 @@ if TYPE_CHECKING:
 
 # FastAPI's answer for a path no route serves, as opposed to a route's own "not found".
 _ROUTE_NOT_FOUND = "Not Found"
+# Cayu Cloud's refusal codes for a read it forwards to an Agent (`agent-read`), by the category
+# they are reported as. Only a plain route-not-found 404 means Cloud has no such route.
+_FORWARDED_READ_CODES = {
+    "agent_read_not_served": "not_served",
+    "agent_read_path_not_allowed": "unsupported",
+    "credentials_rejected": "credentials_rejected",
+    "identity_refused": "credentials_rejected",
+    "agent_start_failed": "not_serving",
+    "agent_not_serving": "no_address",
+    "too_large": "too_large",
+    "agent_answer_invalid": "not_cayu",
+    "agent_answer_refused": "unsafe_response",
+}
 # The most bytes one answer may carry; a full page of session events with payloads fits.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_DETAIL_CHARS = 512
@@ -116,8 +129,13 @@ class CayuApi:
         monotonic: Callable[[], float] = time.monotonic,
         notice: Callable[[str], None] | None = None,
         offers_wake_option: bool = False,
+        root_fallback: bool = True,
+        authorization_provider: Callable[[], str] | None = None,
+        rejected_authorization: Callable[[str], str] | None = None,
     ) -> None:
         parts = urlsplit(url)
+        if authorization_provider is not None:
+            authorization = authorization_provider()
         if parts.scheme not in {"http", "https"} or not parts.netloc:
             raise CayuApiError("invalid_url", f"{description}'s Cayu URL is not an HTTP(S) URL.")
         if parts.scheme == "http" and authorization is not None and not _is_loopback(parts):
@@ -125,12 +143,19 @@ class CayuApi:
                 "invalid_url", f"{description}'s Cayu URL must use HTTPS to send credentials."
             )
         self._origin = f"{parts.scheme}://{parts.netloc}"
-        self._candidates = tuple(dict.fromkeys((parts.path.rstrip("/") + "/api", "/api")))
+        mounted = parts.path.rstrip("/") + "/api"
+        # Without ``root_fallback`` only the mount is read: a route that forwards to the
+        # server (Cayu Cloud's ``agent-read``) has nothing at its origin's ``/api/``.
+        self._candidates = tuple(dict.fromkeys((mounted, "/api") if root_fallback else (mounted,)))
         self._base: str | None = None
         self._headers = {"Accept": "application/json"}
         if authorization is not None:
             self._headers["Authorization"] = authorization
         self._credential_parts = _authorization_secrets(authorization)
+        # A login that expires (a `cayu cloud login` token) is asked for before each request,
+        # and replaced once when the server rejects it.
+        self._authorization_provider = authorization_provider
+        self._rejected_authorization = rejected_authorization
         self.description = description
         self._http = http
         self._owns_http = http is None
@@ -199,6 +224,7 @@ class CayuApi:
         if self._base is None:
             self.get("/app", resource="agent")
         assert self._base is not None
+        self._refresh_authorization()
         headers = dict(self._headers)
         if operation_id is not None:
             headers["Idempotency-Key"] = operation_id
@@ -288,7 +314,10 @@ class CayuApi:
         resource: str,
     ) -> Any:
         deadline = self._monotonic() + self._wake_timeout_seconds
+        replaced = False
         while True:
+            if not replaced:
+                self._refresh_authorization()
             try:
                 response = self._bounded_request(
                     method, self._origin + base + path, query, body, resource
@@ -301,8 +330,10 @@ class CayuApi:
                 raise CayuApiError(
                     "unreachable", f"Could not connect to {self.description.lower()}."
                 ) from exc
-            if response.status_code == 503 and "retry-after" in response.headers:
-                # Cayu Cloud's router is waking a sleeping Agent; this request did the waking.
+            if response.status_code == 503 and (
+                "retry-after" in response.headers or _starting(response)
+            ):
+                # Cayu Cloud is waking a sleeping Agent; this request did the waking.
                 if self._monotonic() >= deadline:
                     raise CayuApiError("starting", self._starting_message(), status_code=503)
                 if not self._told_waking:
@@ -311,9 +342,39 @@ class CayuApi:
                         f"{self.description} is waking up; waiting up to "
                         f"{_duration(self._wake_timeout_seconds)}."
                     )
-                self._sleep(_retry_after_seconds(response.headers["retry-after"]))
+                self._sleep(_retry_after_seconds(response.headers.get("retry-after", "1")))
+                continue
+            if response.status_code == 401 and not replaced and self._replace_authorization():
+                replaced = True
                 continue
             return self._body(response, resource)
+
+    def _set_authorization(self, authorization: str) -> None:
+        self._headers["Authorization"] = authorization
+        # Earlier values stay screened: an answer must never repeat any of them.
+        self._credential_parts = tuple(
+            dict.fromkeys((*self._credential_parts, *_authorization_secrets(authorization)))
+        )
+
+    def _refresh_authorization(self) -> None:
+        if self._authorization_provider is not None:
+            self._set_authorization(self._authorization_provider())
+
+    def _replace_authorization(self) -> bool:
+        """Ask for a replacement of the rejected login; whether there is a new one."""
+
+        current = self._headers.get("Authorization")
+        if self._rejected_authorization is None or current is None:
+            return False
+        try:
+            replacement = self._rejected_authorization(current)
+        except Exception:
+            # No replacement could be had; the 401 is reported as it is.
+            return False
+        if replacement == current:
+            return False
+        self._set_authorization(replacement)
+        return True
 
     def _starting_message(self) -> str:
         if self._wake_timeout_seconds <= 0:
@@ -419,6 +480,19 @@ class CayuApi:
                 detail=detail,
                 code=code,
             )
+        code = _code(body) if status not in _SUCCESS_STATUSES else None
+        category = _FORWARDED_READ_CODES.get(code) if code is not None else None
+        if category is not None:
+            # Cayu Cloud's own answer for a read it forwards (`agent-read`), not the Agent's.
+            raise CayuApiError(
+                category,
+                f"{self.description} couldn't be read for {resource}"
+                + (f": {detail}" if detail else ".")
+                + f" ({code})",
+                status_code=status,
+                detail=detail,
+                code=code,
+            )
         if status == 404:
             if detail is None or detail == _ROUTE_NOT_FOUND:
                 if not established:
@@ -442,25 +516,85 @@ class CayuApi:
                 + ("" if detail else " Its Cayu may be older than this CLI."),
                 status_code=status,
             )
-        if status in {400, 409, 413, 422}:
+        if status in {400, 409, 413, 414, 422}:
             raise CayuApiError(
                 "request_rejected",
                 f"{self.description} rejected the {resource} request"
                 + (f": {detail}" if detail else f" (HTTP {status})."),
                 status_code=status,
                 detail=detail,
+                code=code,
             )
         if status not in _SUCCESS_STATUSES:
             raise CayuApiError(
                 "server_error",
                 f"{self.description} answered HTTP {status} for {resource}.",
                 status_code=status,
+                code=code,
             )
         if not valid_json:
             if not established:
                 raise _RouteMissing
             raise CayuApiError("not_cayu", f"{self.description} did not answer {resource} as Cayu.")
         return body
+
+
+class DeferredCayuApi(CayuApi):
+    """A `CayuApi` opened by ``open_api`` on its first request, so readers that are never
+    used never sign in. ``description`` names the server in messages until then."""
+
+    def __init__(self, open_api: Callable[[], CayuApi], *, description: str) -> None:
+        # Deliberately not `CayuApi.__init__`: every request goes to the opened API.
+        self.description = description
+        self._open_api = open_api
+        self._opened: CayuApi | None = None
+
+    def _api(self) -> CayuApi:
+        if self._opened is None:
+            self._opened = self._open_api()
+            self.description = self._opened.description
+        return self._opened
+
+    @property
+    def origin(self) -> str:
+        return self._api().origin
+
+    def get(
+        self,
+        path: str,
+        *,
+        query: Mapping[str, str | Sequence[str]] | None = None,
+        resource: str,
+    ) -> Any:
+        return self._api().get(path, query=query, resource=resource)
+
+    def post(
+        self,
+        path: str,
+        body: Mapping[str, Any],
+        *,
+        query: Mapping[str, str | Sequence[str]] | None = None,
+        resource: str,
+    ) -> Any:
+        return self._api().post(path, body, query=query, resource=resource)
+
+    def mutate(
+        self,
+        path: str,
+        body: Mapping[str, Any],
+        *,
+        resource: str,
+        operation_id: str | None = None,
+    ) -> Any:
+        return self._api().mutate(path, body, resource=resource, operation_id=operation_id)
+
+    def ensure_safe_output(self, value: Any) -> None:
+        if self._opened is not None:
+            self._opened.ensure_safe_output(value)
+
+    def close(self) -> None:
+        if self._opened is not None:
+            self._opened.close()
 
 
 class _RouteMissing(Exception):
@@ -585,6 +719,56 @@ def cloud_agent_api(
         wake_timeout_seconds=wake_timeout_seconds,
         offers_wake_option=offers_wake_option,
     )
+
+
+def cloud_agent_read_api(
+    client: CloudApiClient,
+    application_id: str,
+    *,
+    timeout_seconds: float = 30.0,
+    wake_timeout_seconds: float = DEFAULT_WAKE_TIMEOUT_SECONDS,
+    offers_wake_option: bool = False,
+    http: httpx.Client | None = None,
+) -> CayuApi:
+    """The Agent's task reads through Cayu Cloud's ``agent-read`` route, with the caller's
+    own Cloud login or API key (a ``read`` scope is enough).
+
+    Cloud forwards only ``GET`` of ``api/tasks``, ``api/tasks/latest`` and
+    ``api/tasks/{id}``, with the Agent's operator login added on Cloud's side, and answers
+    with the Agent's status and body. A Cloud without the route answers its first read with
+    a plain route-not-found 404, which raises ``CayuApiError("not_served")``.
+    """
+
+    def authorization() -> str:
+        provider = client.api_key_provider
+        return f"Bearer {client.api_key if provider is None else provider()}"
+
+    def rejected(authorization: str) -> str:
+        replace = client.rejected_api_key_provider
+        if replace is None:
+            return authorization
+        return f"Bearer {replace(authorization.removeprefix('Bearer '))}"
+
+    return CayuApi(
+        f"{client.api_url.rstrip('/')}/v1/applications/{quote(application_id, safe='')}/agent-read",
+        authorization_provider=authorization,
+        rejected_authorization=rejected,
+        description=f"The Agent {application_id}",
+        http=http,
+        timeout_seconds=timeout_seconds,
+        wake_timeout_seconds=wake_timeout_seconds,
+        offers_wake_option=offers_wake_option,
+        root_fallback=False,
+    )
+
+
+def _starting(response: httpx.Response) -> bool:
+    """Whether a 503 is Cayu Cloud's ``starting``: the Agent it woke is not serving yet."""
+
+    try:
+        return _code(response.json()) == "starting"
+    except ValueError:
+        return False
 
 
 def _code(body: Any) -> str | None:

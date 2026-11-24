@@ -222,8 +222,12 @@ from cayu.knowledge.search import KnowledgeListResult as KnowledgeListResult
 from cayu.knowledge.search import KnowledgeQuery as KnowledgeQuery
 from cayu.knowledge.search import KnowledgeSearchMode as KnowledgeSearchMode
 from cayu.knowledge.search import KnowledgeSearchResult as KnowledgeSearchResult
+from cayu.storage.agent_health_summary import AgentHealth as AgentHealth
+from cayu.storage.agent_health_summary import TaskTypeHealth as TaskTypeHealth
+from cayu.storage.agent_health_summary import agent_health as agent_health
 from cayu.storage.agent_readers import AgentReadError as AgentReadError
 from cayu.storage.agent_readers import AgentReaders as AgentReaders
+from cayu.storage.agent_readers import AgentStatusReader as AgentStatusReader
 from cayu.storage.agent_readers import TaskListRequest as TaskListRequest
 from cayu.storage.agent_readers import open_cloud_agent_readers as open_cloud_agent_readers
 from cayu.storage.agent_readers import open_store_agent_readers as open_store_agent_readers
@@ -398,8 +402,10 @@ __all__ = [
     "RETENTION_ARTIFACT_SCOPES",
     "RETENTION_TERMINAL_EVAL_RUN_STATUSES",
     "RETENTION_TERMINAL_SESSION_STATUSES",
+    "AgentHealth",
     "AgentReadError",
     "AgentReaders",
+    "AgentStatusReader",
     "ApplicationStores",
     "ArtifactRetentionPolicy",
     "BrowserRecordingStore",
@@ -521,7 +527,9 @@ __all__ = [
     "StorageRetentionReport",
     "StorageRetentionTarget",
     "TaskListRequest",
+    "TaskTypeHealth",
     "WorkspaceRetentionPolicy",
+    "agent_health",
     "assess_knowledge_revision_transition",
     "configured_database_url",
     "copy_knowledge_revision_refs",

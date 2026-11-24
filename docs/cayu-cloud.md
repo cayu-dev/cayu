@@ -35,9 +35,10 @@ top-level commands are:
   for immutable releases, including [candidate releases](#candidate-releases) and
   [downloading a release's source](#downloading-a-releases-source);
 - `runtimes list|status` for retained runtime artifacts;
-- `service check|credentials|destroy|logs|pause|redeploy|restart|resume|sleep|status|wake` for
-  Agent infrastructure, [publishing its Release again](#redeploying-an-agents-service) and
-  [its own post-deploy check](#operator-check), and `schedule run` to run a schedule now;
+- `service check|credentials|destroy|health|logs|pause|redeploy|restart|resume|sleep|status|wake`
+  for Agent infrastructure, [publishing its Release again](#redeploying-an-agents-service),
+  [its own post-deploy check](#operator-check) and [its health](#an-agents-health), and
+  `schedule run` to run a schedule now;
 - `env list|set|unset` for Agent-owned configuration, and `settings list|set|unset`
   for the Agent's [managed settings](#agent-settings);
 - `data ls|cat|get|stat` to [read the files in an Agent's `/data`](#reading-an-agents-data-files);
@@ -1701,11 +1702,11 @@ A path the task doesn't have fails and names the first part that is missing.
 
 ### Reading a deployed Agent from the project's own commands
 
-A project's own commands can read the deployed Agent through the same sign-in, with no
+A project's own commands can read a deployed Agent through the same sign-in, with no
 routes or client of their own. `cayu.storage.open_cloud_agent_readers(APPLICATION)` returns
 read-only task and session readers for the Cloud Agent, and
 `cayu.storage.open_store_agent_readers(target)` the same readers for a local store, so one
-command reads either:
+command reads either. An Agent can read other Agents of its Organization this way too:
 
 ```python
 from cayu.storage import TaskListRequest, open_cloud_agent_readers
@@ -1725,8 +1726,70 @@ of top-level values, such as `metadata={"run": RUN}` for one run's tasks), and `
 --application` does, for example `query_events(EventQuery(...))` and
 `query_transcript(TranscriptQuery(...))`. The open function takes `context=` for
 `--context`, `timeout_seconds=` and `wake_timeout_seconds=`; a read that can't be answered
-raises `cayu.storage.AgentReadError`, whose `category` is one of those above. The readers
+raises `cayu.storage.AgentReadError`, whose `category` is one of those above. The open
+function only signs in and finds the Agent; a stopped Agent fails its first read. The readers
 only read.
+
+Tasks are read through Cloud's `agent-read` route (`GET
+/v1/applications/{id}/agent-read/api/tasks`, `api/tasks/latest` and `api/tasks/{id}`), which
+forwards the read to the Agent with its Developer dashboard login on Cloud's side and never
+hands that login out. So an [Organization API key](#organization-api-keys) with only the `read`
+scope can read another Agent's tasks. A Cloud that predates the route answers its plain
+route-not-found 404, and the readers then read with the Developer dashboard login, as the CLI
+does. Any other refusal from the route is reported, not retried with the login: an Agent whose
+Cayu doesn't serve tasks is `not_served` (code `agent_read_not_served`), an Agent that refuses
+Cloud's login `credentials_rejected` (HTTP 502), one that failed to start `not_serving`, and an
+answer Cloud won't forward `too_large` or `not_cayu`; a 401 always means the caller's own login
+or key. Session reads, and task reads filtered by `input` or `metadata`, always use the
+Developer dashboard login, which is fetched on the first read that needs it.
+
+The readers also say what waits on a person and how the Agent runs:
+`await agent.inbox_counts()` is the waiting items by kind (`approval`, `question`,
+`recovery`, `knowledge`), `await agent.oldest_inbox_item_at()` when the oldest of them was
+asked (read only when one page of the inbox holds them all, otherwise `None`), and `await
+agent.service()` Cloud's service record: `status`, `deployment_id`, `paused`,
+`last_request_at`, and `cayu_version` when Cloud reports it. Cloud answers the inbox counts and
+the service record for a `read` key. For a local store, `inbox_counts()` counts the store's
+pending approvals, questions and recovery items when it keeps a native count, and `service()`
+is `None`. `AgentReaders(status=...)` takes any `cayu.storage.AgentStatusReader` for other
+sources.
+
+### An Agent's health
+
+`cayu.storage.agent_health(readers, since=...)` sums up an Agent's health from any
+`AgentReaders`, local or on Cloud:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from cayu.storage import agent_health, open_cloud_agent_readers
+
+async with open_cloud_agent_readers("acme-support") as agent:
+    health = await agent_health(agent, since=datetime.now(UTC) - timedelta(hours=24))
+for task_type, task in health.tasks.items():
+    if task.failure_streak >= 3:
+        print(task_type, task.last_failed_at, task.last_failure_reason)
+```
+
+For each task type of the tasks updated since `since` (or each of `task_types=` when given), it
+reports `last_completed_at`, `last_failed_at`, `failure_streak` (the tasks that failed since the
+last completion, counted up to 50) and `last_failure_reason`, the last failure's summary on one
+line, at most 200 characters, with anything that looks like a credential masked. A type's last
+completion and failure are its latest, however long ago. `inbox`, `oldest_inbox_item_at` and
+`service` are what the readers above answer. A part that can't be read doesn't fail the call:
+it is left empty and listed in `unavailable` as `{"part", "category", "message"}`, for example
+`{"part": "inbox", "category": "access_limited", ...}`; a part the source doesn't have, such as
+a local store's service, is empty without being listed. `AgentHealth` is a frozen dataclass, and
+`health.to_dict()` gives it as JSON-ready values.
+
+`cayu cloud service health --application AGENT` prints the same summary, with `--since SPAN`
+(`30m`, `24h`, `7d`; 24 hours by default) and `--json` for the JSON envelope the other `cayu
+cloud` commands print. It needs only a `read` key where Cloud offers `agent-read`, and changes
+nothing:
+
+```console
+$ cayu cloud service health --application acme-support --since 7d
+```
 
 ## Reading an Agent's logs
 

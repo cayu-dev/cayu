@@ -87,6 +87,19 @@ def test_application_store_selection_is_public_from_storage() -> None:
         assert name in storage.__all__
 
 
+def test_agent_readers_and_health_are_public_from_storage() -> None:
+    from cayu import storage
+    from cayu.storage import agent_health_summary, agent_readers
+
+    for name in ("AgentReaders", "AgentStatusReader", "AgentReadError", "open_cloud_agent_readers"):
+        assert getattr(storage, name) is getattr(agent_readers, name)
+        assert name in storage.__all__
+    for name in ("AgentHealth", "TaskTypeHealth", "agent_health"):
+        assert getattr(storage, name) is getattr(agent_health_summary, name)
+        assert name in storage.__all__
+    assert callable(storage.agent_health)
+
+
 def test_verified_task_worker_exports_share_the_canonical_owner() -> None:
     from cayu import verification
     from cayu.verification import verified_task_worker

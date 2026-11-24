@@ -114,6 +114,7 @@ from cayu.cli._cloud_service_check import (
     add_service_check_arguments,
     service_check,
 )
+from cayu.cli._cloud_service_health import add_service_health_arguments, service_health
 from cayu.cli._cloud_service_logs import add_service_logs_arguments, service_logs
 from cayu.cli._cloud_service_switch import ServiceStillSwitchingError, send_when_not_switching
 from cayu.cli._cloud_settings import CloudSettingsError, add_settings_parser, settings_command
@@ -1448,6 +1449,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "output is a credential: keep it out of logs and shared terminals."
         ),
         "destroy": "Remove the Agent services and schedules but retain its releases.",
+        "health": (
+            "Show the Agent's health: for each task type run since --since, when a task last "
+            "completed and last failed and how many failed in a row since, what waits in its "
+            "inbox, and its service status. An Organization API key with the read scope is "
+            "enough where Cayu Cloud forwards task reads. It changes nothing."
+        ),
         "logs": (
             "Read the output of the Agent's web process, worker and schedules, each line "
             "with its time, process and release."
@@ -1480,6 +1487,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             add_service_logs_arguments(operation)
         if action == "database":
             add_service_database_arguments(operation)
+        if action == "health":
+            add_service_health_arguments(operation)
         if action == "check":
             add_service_check_arguments(operation)
         if action in _SWITCH_REFUSED_SERVICE_ACTIONS:
@@ -5419,6 +5428,8 @@ def _service(
         result = _operator_credentials(client, application_id=application_id)
     elif action == "database":
         return service_database(arguments, client=client, application_id=application_id)
+    elif action == "health":
+        return service_health(arguments, client=client, application_id=application_id)
     else:
         result = change("DELETE", path)
         result_status = None if not result else _service_status(result)
