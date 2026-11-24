@@ -107,6 +107,10 @@ def test_stop_on_failure_resumes_at_the_failing_page() -> None:
 
     assert not stopped.complete and stopped.resume_after == "3"
     assert stopped.verify_problems == []  # verify waits for the last page
+    # The failing page isn't counted: it is moved again on resume.
+    assert stopped.counts[StepOutcome.FAILED] == 0 and stopped.items == []
+    assert stopped.stopped_by is not None and stopped.stopped_by.key == "r04"
+    assert not stopped.clean
     assert resumed.clean
     assert resumed.counts[StepOutcome.UNCHANGED] == 1  # r03, moved before the stop
     assert len(store.target) == 10
@@ -163,6 +167,7 @@ NOT_A_MOVE = 3
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (tmp_path / "letters_move.py").write_text(_MODULE, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CAYU_DATA_VOLUME", raising=False)
     monkeypatch.setattr(sys, "path", list(sys.path))
     yield tmp_path
     sys.modules.pop("letters_move", None)
@@ -173,8 +178,10 @@ def test_the_command_prints_the_report_and_exits_by_whether_it_was_clean(
 ) -> None:
     code = main(["data-move", "run", "letters_move:build", "--page-size", "2", "--json"])
 
-    report = json.loads(capsys.readouterr().out)
+    run = json.loads(capsys.readouterr().out)
+    report = run["report"]
     assert code == 3
+    assert run["status"] == "finished"
     assert report["counts"]["created"] == 2
     assert report["items"] == [{"key": "c", "outcome": "conflict", "detail": "edited"}]
     assert report["complete"] is True and report["clean"] is False
@@ -199,7 +206,18 @@ def test_the_command_says_when_it_stopped_and_where_to_go_on(
     out = capsys.readouterr().out
     assert code == 3
     assert "dry run: nothing written" in out
-    assert "--after=1" in out
+    assert "cayu data-move resume TARGET --run-id" in out
+
+
+def test_without_a_record_the_command_prints_the_bare_report(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(["data-move", "run", "letters_move:build", "--no-record", "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert code == 3
+    assert report["counts"]["created"] == 2
+    assert not (project / "data" / "data-moves").exists()
 
 
 def test_the_command_refuses_a_target_that_is_not_a_move(

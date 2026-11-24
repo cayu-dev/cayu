@@ -70,9 +70,40 @@ uv run cayu data-move run moves.invoices:INVOICES --json
 The target is a `DataMove`, or a function without arguments that returns one. The report
 counts each outcome and lists the conflicts, failures and skips. It exits 0 when every page
 was read with no conflict, failure or verify problem, and 3 otherwise. A failing item is
-reported and the run goes on; `--stop-on-failure` stops at the first one instead.
+reported and the run goes on; `--stop-on-failure` stops at the first one instead. The report
+then names it as `stopped_by` and leaves its page uncounted, since going on moves that page
+again.
 `--max-items` stops at a page boundary. A run that stops reports `resume_after`; pass it as
 `--after` to go on. Because every step is idempotent, a rerun from the start is also safe.
+
+## Run records
+
+Each `cayu data-move run` is recorded as it goes: once before the first page, after every page
+and at the end. The record holds the run's options, its report so far and the cursor to go
+on from. When the process stops mid-run (a deploy, a crash, a host that went to sleep), or
+when `--max-items` or `--stop-on-failure` stopped the run, the record says where it got to:
+
+```sh
+uv run cayu data-move runs                       # newest first
+uv run cayu data-move runs --run-id RUN --json   # one whole record
+uv run cayu data-move resume moves.invoices:INVOICES            # the newest open run
+uv run cayu data-move resume moves.invoices:INVOICES --run-id RUN
+```
+
+`resume` goes on from the record with the options the run started with, adding to the same
+counts. A page that was being moved when the process stopped is moved again. Its steps are
+idempotent, so they answer `UNCHANGED`, and the counts include that page twice. Run one move
+at a time: the record doesn't stop two processes from running the same move at once.
+`--no-record` runs without one.
+
+Records are one JSON file per run in `CAYU_DATA_VOLUME/data-moves` when the host has a data
+volume, so `cayu cloud data ls data-moves` and `cayu cloud data cat data-moves/RUN.json`
+read them on a Cayu Cloud Agent. Without a data volume they go in the project's
+`data/data-moves`; `--runs-dir` picks another directory. Code that keeps records elsewhere
+passes its own `DataMoveRunStore` (`save`, `get` and `list_runs`) to
+`cayu.data_move_runs.run_recorded` and `resume_recorded`.
+
+## Where it runs
 
 The move connects wherever its own code does, usually `CAYU_DATABASE_URL`. So the same
 command runs on a laptop, against a scratch database in CI, or as part of the deploy step

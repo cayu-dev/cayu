@@ -95,6 +95,9 @@ class DataMoveReport:
     verify_problems: list[str] = field(default_factory=list)
     complete: bool = False
     resume_after: str | None = None
+    # The failure that stopped a `stop_on_failure` run. Its page isn't counted, since a
+    # resume moves that page again.
+    stopped_by: ItemReport | None = None
 
     @property
     def clean(self) -> bool:
@@ -121,8 +124,43 @@ class DataMoveReport:
             "verify_problems": list(self.verify_problems),
             "complete": self.complete,
             "resume_after": self.resume_after,
+            "stopped_by": None
+            if self.stopped_by is None
+            else {
+                "key": self.stopped_by.key,
+                "outcome": self.stopped_by.outcome.value,
+                "detail": self.stopped_by.detail,
+            },
             "clean": self.clean,
         }
+
+    @classmethod
+    def from_json(cls, value: dict[str, Any]) -> DataMoveReport:
+        """The report `to_json` wrote, such as one read back from a run record."""
+
+        counts = dict.fromkeys(StepOutcome, 0)
+        counts.update({StepOutcome(name): int(n) for name, n in value.get("counts", {}).items()})
+        return cls(
+            name=str(value["name"]),
+            dry_run=bool(value["dry_run"]),
+            started_after=value.get("started_after"),
+            pages=int(value.get("pages", 0)),
+            counts=counts,
+            items=[
+                ItemReport(str(item["key"]), StepOutcome(item["outcome"]), item.get("detail"))
+                for item in value.get("items", [])
+            ],
+            verify_problems=[str(problem) for problem in value.get("verify_problems", [])],
+            complete=bool(value.get("complete", False)),
+            resume_after=value.get("resume_after"),
+            stopped_by=None
+            if not value.get("stopped_by")
+            else ItemReport(
+                str(value["stopped_by"]["key"]),
+                StepOutcome(value["stopped_by"]["outcome"]),
+                value["stopped_by"].get("detail"),
+            ),
+        )
 
 
 def run_data_move(
@@ -134,6 +172,8 @@ def run_data_move(
     max_items: int | None = None,
     stop_on_failure: bool = False,
     max_reported_items: int = 1000,
+    continuing: DataMoveReport | None = None,
+    on_page: Callable[[DataMoveReport], None] | None = None,
 ) -> DataMoveReport:
     """Run `move` page by page from `after` and report what each item's step did.
 
@@ -141,19 +181,32 @@ def run_data_move(
     always a cursor `read` gave. Conflicts, failures and skips are listed in `items`, at most
     `max_reported_items` of them; the counts are always complete. `verify` runs only when
     every page was read.
+
+    `continuing` goes on with an earlier, incomplete report from its `resume_after`, adding
+    to its counts; `dry_run` and `after` are then taken from it. `on_page` is called with the
+    report after each page, with `resume_after` naming the next page, so a record kept there
+    always says where to go on (`cayu.data_move_runs`).
     """
 
     if page_size < 1:
         raise ValueError("page_size must be at least 1")
     if max_items is not None and max_items < 1:
         raise ValueError("max_items must be at least 1")
-    report = DataMoveReport(name=move.name, dry_run=dry_run, started_after=after)
-    cursor = after
+    if continuing is None:
+        report = DataMoveReport(name=move.name, dry_run=dry_run, started_after=after)
+        cursor = after
+    else:
+        if continuing.complete or continuing.name != move.name:
+            raise ValueError("only an incomplete report of the same move can be continued")
+        report, dry_run, cursor = continuing, continuing.dry_run, continuing.resume_after
+        report.stopped_by = None
     seen = 0
     while True:
         limit = page_size if max_items is None else min(page_size, max_items - seen)
         page = move.read(cursor, limit)
         report.pages += 1
+        # What the report held before this page, for a stop that leaves it to be moved again.
+        counts_before, items_before = dict(report.counts), len(report.items)
         for item in page.items:
             seen += 1
             key = move.key(item)
@@ -168,13 +221,23 @@ def run_data_move(
                 report.items.append(ItemReport(key, result.outcome, detail))
             if result.outcome is StepOutcome.FAILED and stop_on_failure:
                 # Resume at this page: earlier items are idempotent and answer UNCHANGED.
+                # The page isn't counted, so a resume that moves it cleanly ends clean.
+                report.counts = counts_before
+                del report.items[items_before:]
+                report.pages -= 1
+                detail = None if result.detail is None else result.detail[:_MAX_DETAIL]
+                report.stopped_by = ItemReport(key, result.outcome, detail)
                 report.resume_after = cursor
                 return report
         cursor = page.next_cursor
+        report.resume_after = cursor
         if cursor is None:
+            # No checkpoint here: until verify has run, the last one names this page's
+            # start, so a resume repeats only this page and the check.
             break
+        if on_page is not None:
+            on_page(report)
         if max_items is not None and seen >= max_items:
-            report.resume_after = cursor
             return report
     report.complete = True
     if move.verify is not None:
