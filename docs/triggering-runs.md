@@ -585,4 +585,48 @@ the contract for another backend. Nothing in the worker requires a step store,
 and the store does not check task ownership. A saved result does not make a
 step's external effect happen only once: the worker can be lost after the
 effect and before the save, so a step that writes to another system still needs
-an idempotency key there.
+an idempotency key there, or a claim.
+
+### Claiming a step before its effect
+
+When the other system takes no idempotency key (sending a mail, for example),
+claim the step before the effect and reconcile the claim if a run is lost
+between the effect and the save:
+
+```python
+from cayu.tasks import TASK_STEP_NOT_DONE
+
+
+async def send(claim):
+    return {"id": await mail.send(message, client_ref=claim.token)}
+
+
+async def find_sent(claim):
+    sent = await mail.find_by_client_ref(claim.token)
+    return TASK_STEP_NOT_DONE if sent is None else {"id": sent.id}
+
+
+receipt = await steps.act_once("send:invoice-42", send, reconcile=find_sent)
+```
+
+`steps.act_once(name, act, reconcile=probe, data=...)` returns the saved result
+when the step finished. Otherwise it saves a claim (a unique `token` and the
+optional JSON `data`), calls `act(claim)` and saves its result. When a later
+run finds the claim without a result, it never calls `act` again on its own: it
+calls `probe(claim)`. A JSON value from the probe means the effect happened and
+becomes the step's result; `TASK_STEP_NOT_DONE` means it provably did not, so
+the claim is released and the step acts again. Without a probe, or when the
+probe raises, the claim stays and `act_once` raises `TaskStepUnresolved`
+carrying the claim. An exception from `act` also keeps the claim, because the
+effect may have happened.
+
+The parts work on their own too: `steps.begin(name, data)` claims and returns a
+`TaskStepClaim` whose `acquired` is true only for the call that made it,
+`steps.claim(name)` reads it, `steps.reconcile(name, probe)` settles it and
+`steps.release(name)` deletes it once you know the effect never happened.
+`steps.forget(name)` deletes the result and the claim. A claim is saved as a
+step named `cayu:claim:<name>` in the same store, so every `TaskStepStore`
+supports it; `steps.saved()` leaves claims out, step names with that prefix
+are reserved, and a claimed step's name is at most 501 bytes. The store does not lease claims: the task's own lease keeps one
+worker on a task at a time, so return `TASK_STEP_NOT_DONE` only when no earlier
+run of the task can still be acting.

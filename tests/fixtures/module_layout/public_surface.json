@@ -4664,8 +4664,10 @@
         ],
         "cayu.tasks.steps": [
           "InMemoryTaskStepStore",
+          "TaskStepClaim",
           "TaskStepRecord",
           "TaskStepStore",
+          "TaskStepUnresolved",
           "TaskSteps",
           "task_steps"
         ],

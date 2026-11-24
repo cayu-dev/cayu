@@ -13,12 +13,15 @@ from cayu.storage import SQLiteTaskStepStore, SQLiteTaskStore
 from cayu.storage import migrations as schema
 from cayu.storage._task_step_schema import TASK_STEPS_REVISION
 from cayu.tasks import (
+    TASK_STEP_NOT_DONE,
     TASK_STEP_RESULT_MAX_BYTES,
     InMemoryTaskStepStore,
     TaskCreate,
+    TaskStepClaim,
     TaskStepRecord,
     TaskSteps,
     TaskStepStore,
+    TaskStepUnresolved,
     complete_managed_task,
     requeue_restartable_task,
     task_steps,
@@ -303,3 +306,125 @@ def test_step_revision_is_additive_and_only_step_stores_require_it(tmp_path) -> 
             await store.close()
 
     assert asyncio.run(migrate_and_use()) == {"ok": True}
+
+
+async def test_act_once_claims_then_saves_and_never_acts_twice(open_store) -> None:
+    sent: list[str] = []
+
+    def send(claim: TaskStepClaim) -> dict:
+        assert claim.acquired and claim.data == {"to": "a@example.com"}
+        sent.append(claim.token)
+        return {"sent": claim.token}
+
+    steps = task_steps(open_store(), "task-mail")
+    first = await steps.act_once("send", send, data={"to": "a@example.com"})
+    again = await task_steps(open_store(), "task-mail").act_once("send", send)
+
+    assert first == again == {"sent": sent[0]}
+    assert len(sent) == 1
+    claim = await steps.claim("send")
+    assert claim is not None and claim.token == sent[0] and not claim.acquired
+    # Claims are bookkeeping, not saved steps.
+    assert [r.step for r in await steps.saved()] == ["send"]
+
+
+async def test_lost_run_leaves_a_claim_that_the_next_run_reconciles(open_store) -> None:
+    store = open_store()
+    lost = task_steps(store, "task-lost")
+    claim = await lost.begin("send", {"draft": "d1"})
+    assert claim.acquired
+    # The first run dies here: maybe after the effect, certainly before the save.
+
+    def act(_claim: TaskStepClaim) -> str:
+        raise AssertionError("a claimed step must not act again")
+
+    rerun = task_steps(open_store(), "task-lost")
+    with pytest.raises(TaskStepUnresolved) as raised:
+        await rerun.act_once("send", act)
+    assert raised.value.claim.token == claim.token
+
+    async def found(probe_claim: TaskStepClaim) -> dict:
+        assert probe_claim.token == claim.token and probe_claim.data == {"draft": "d1"}
+        return {"message": "m1"}
+
+    assert await rerun.act_once("send", act, reconcile=found) == {"message": "m1"}
+    assert await rerun.act_once("send", act) == {"message": "m1"}
+
+
+async def test_probe_that_proves_no_effect_lets_the_step_act_again(open_store) -> None:
+    steps = task_steps(open_store(), "task-retry")
+    old = await steps.begin("send")
+    tokens: list[str] = []
+
+    def act(claim: TaskStepClaim) -> str:
+        tokens.append(claim.token)
+        return "sent"
+
+    result = await steps.act_once("send", act, reconcile=lambda _claim: TASK_STEP_NOT_DONE)
+    assert result == "sent"
+    assert len(tokens) == 1 and tokens[0] != old.token
+
+
+async def test_reconcile_release_and_failures_keep_the_claim(open_store) -> None:
+    steps = task_steps(open_store(), "task-parts")
+    with pytest.raises(LookupError):
+        await steps.reconcile("send", lambda _claim: "x")
+
+    first = await steps.begin("send")
+    second = await steps.begin("send", {"ignored": True})
+    assert first.acquired and not second.acquired and second.token == first.token
+
+    def unknown(_claim: TaskStepClaim) -> str:
+        raise RuntimeError("provider down")
+
+    with pytest.raises(RuntimeError, match="provider down"):
+        await steps.reconcile("send", unknown)
+    assert await steps.claim("send") is not None
+    assert await steps.reconcile("send", lambda _claim: TASK_STEP_NOT_DONE) is TASK_STEP_NOT_DONE
+    assert await steps.claim("send") is None
+    assert await steps.release("send") is False
+
+    def fails(_claim: TaskStepClaim) -> str:
+        raise RuntimeError("timed out")
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        await steps.act_once("send", fails)
+    # The effect may have happened, so the claim stays and nothing acts again.
+    with pytest.raises(TaskStepUnresolved):
+        await steps.act_once("send", fails)
+
+    assert await steps.forget("send") is False
+    assert await steps.claim("send") is None
+    with pytest.raises(ValueError, match="reserved"):
+        await steps.run("cayu:claim:send", lambda: 1)
+
+
+async def test_saved_pages_past_claims(open_store) -> None:
+    steps = task_steps(open_store(), "task-pages")
+    for name in ("a", "b", "c"):
+        await steps.begin(name)
+    await steps.save("d", 1)
+    await steps.save("e", 2)
+    assert [r.step for r in await steps.saved(limit=1)] == ["d"]
+    assert [r.step for r in await steps.saved(after="d", limit=2)] == ["e"]
+    assert await steps.clear() == 5
+
+
+async def test_probe_failure_is_unresolved_and_long_names_stay_usable(open_store) -> None:
+    steps = task_steps(open_store(), "task-edges")
+    claim = await steps.begin("send")
+
+    def down(_claim: TaskStepClaim) -> str:
+        raise TimeoutError("provider down")
+
+    with pytest.raises(TaskStepUnresolved) as raised:
+        await steps.act_once("send", lambda _claim: "x", reconcile=down)
+    assert raised.value.claim.token == claim.token
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert await steps.claim("send") is not None
+
+    long_name = "x" * 505  # a valid step name whose claim name would be too long
+    await steps.save(long_name, 1)
+    assert await steps.forget(long_name) is True
+    with pytest.raises(ValueError, match="claimed step name"):
+        await steps.begin(long_name)

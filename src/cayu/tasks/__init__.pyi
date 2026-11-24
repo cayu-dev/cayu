@@ -293,11 +293,14 @@ from cayu.tasks.session_wakes import deliver_session_wake as deliver_session_wak
 from cayu.tasks.session_wakes import reconcile_parked_handoffs as reconcile_parked_handoffs
 from cayu.tasks.session_wakes import reconcile_session_wakes as reconcile_session_wakes
 from cayu.tasks.session_wakes import session_wake_attempts as session_wake_attempts
+from cayu.tasks.steps import TASK_STEP_NOT_DONE as TASK_STEP_NOT_DONE
 from cayu.tasks.steps import TASK_STEP_RESULT_MAX_BYTES as TASK_STEP_RESULT_MAX_BYTES
 from cayu.tasks.steps import InMemoryTaskStepStore as InMemoryTaskStepStore
+from cayu.tasks.steps import TaskStepClaim as TaskStepClaim
 from cayu.tasks.steps import TaskStepRecord as TaskStepRecord
 from cayu.tasks.steps import TaskSteps as TaskSteps
 from cayu.tasks.steps import TaskStepStore as TaskStepStore
+from cayu.tasks.steps import TaskStepUnresolved as TaskStepUnresolved
 from cayu.tasks.steps import task_steps as task_steps
 from cayu.tasks.store import TaskStore as TaskStore
 from cayu.tasks.terminalization import TaskTerminalizationConflict as TaskTerminalizationConflict

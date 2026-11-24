@@ -18,9 +18,13 @@ single result. Results are JSON values of at most
 artifact id, a path, a commit sha) for anything larger.
 
 A saved result says the step finished; it does not undo or repeat the step's
-external effects. A step that changes another system should still use a stable
-idempotency key there, because the worker can be lost after the effect and
-before the save.
+external effects. A step that changes another system should use a stable
+idempotency key there when it has one, because the worker can be lost after the
+effect and before the save. When the other system has no idempotency key,
+:meth:`TaskSteps.act_once` claims the step before the effect, and a later run
+that finds the claim without a result reconciles it with a probe instead of
+acting again. The claim is an ordinary saved step under a reserved name, so
+every :class:`TaskStepStore` supports it unchanged.
 """
 
 from __future__ import annotations
@@ -30,7 +34,8 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
@@ -46,6 +51,19 @@ TASK_STEP_RESULT_MAX_BYTES = 256 * 1024
 TASK_STEP_KEY_MAX_BYTES = 512
 #: Largest page :meth:`TaskStepStore.list_steps` returns.
 TASK_STEP_LIST_MAX = 1000
+#: Prefix of the reserved step names that hold :meth:`TaskSteps.begin` claims.
+TASK_STEP_CLAIM_PREFIX: Final = "cayu:claim:"
+
+
+class _NotDone:
+    """Type of :data:`TASK_STEP_NOT_DONE`; compare with ``is``."""
+
+    def __repr__(self) -> str:
+        return "TASK_STEP_NOT_DONE"
+
+
+#: What a reconcile probe returns when the claimed effect provably never happened.
+TASK_STEP_NOT_DONE: Final = _NotDone()
 
 
 class TaskStepRecord(BaseModel):
@@ -114,6 +132,37 @@ def task_step_record(task_id: str, step: str, result_json: str, saved_at_ms: int
         result=json.loads(result_json),
         saved_at=datetime.fromtimestamp(saved_at_ms / 1000, tz=UTC),
     )
+
+
+class TaskStepClaim(BaseModel):
+    """A claim on one step, saved before its external effect.
+
+    ``token`` is unique to the claim; pass it to the other system when it can
+    carry a client reference, so a probe can find the effect later. ``data`` is
+    any JSON the caller saved with the claim. ``acquired`` is true only for the
+    :meth:`TaskSteps.begin` call that made the claim.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    task_id: str
+    step: str
+    token: str
+    data: Any = None
+    claimed_at: datetime
+    acquired: bool = False
+
+
+class TaskStepUnresolved(RuntimeError):
+    """A step is claimed and has no result, and nothing settled whether its effect happened."""
+
+    def __init__(self, claim: TaskStepClaim) -> None:
+        super().__init__(
+            f"Step {claim.step!r} of task {claim.task_id!r} was claimed and has no result; "
+            "reconcile it with a probe, or release the claim once you know the effect "
+            "never happened."
+        )
+        self.claim = claim
 
 
 class TaskStepStore(ABC):
@@ -212,6 +261,7 @@ class TaskSteps:
         return self._task_id
 
     async def run(self, step: str, fn: Callable[[], Awaitable[Any] | Any]) -> Any:
+        step = _user_step(step)
         saved = await self._store.load_step(self._task_id, step)
         if saved is not None:
             return saved.result
@@ -221,27 +271,169 @@ class TaskSteps:
         return (await self._store.save_step(self._task_id, step, value)).result
 
     async def load(self, step: str) -> TaskStepRecord | None:
-        return await self._store.load_step(self._task_id, step)
+        return await self._store.load_step(self._task_id, _user_step(step))
 
     async def save(self, step: str, result: Any) -> TaskStepRecord:
-        return await self._store.save_step(self._task_id, step, result)
+        return await self._store.save_step(self._task_id, _user_step(step), result)
 
     async def saved(self, *, after: str | None = None, limit: int = 100) -> list[TaskStepRecord]:
-        """Return this task's saved steps ordered by step name."""
+        """Return this task's saved steps ordered by step name, leaving out claims."""
 
-        return await self._store.list_steps(self._task_id, after=after, limit=limit)
+        limit = task_step_list_limit(limit)
+        found: list[TaskStepRecord] = []
+        while len(found) < limit:
+            page = await self._store.list_steps(self._task_id, after=after, limit=limit)
+            found.extend(r for r in page if not r.step.startswith(TASK_STEP_CLAIM_PREFIX))
+            if len(page) < limit:
+                break
+            after = page[-1].step
+        return found[:limit]
 
     async def forget(self, step: str) -> bool:
-        """Delete one saved step so the next :meth:`run` calls it again."""
+        """Delete one saved step and its claim so the next :meth:`run` calls it again."""
 
         # Validate here: the store reads step=None as "every step of the task".
-        step = task_step_key(step, "step")
+        step = _user_step(step)
+        if _claimable(step):  # a longer name can never have had a claim
+            await self._store.delete_steps(self._task_id, step=_claim_step(step))
         return await self._store.delete_steps(self._task_id, step=step) == 1
+
+    async def begin(self, step: str, data: Any = None) -> TaskStepClaim:
+        """Claim ``step`` before its effect, or return the claim that already exists.
+
+        The first claim wins, as with results: the returned claim has
+        ``acquired=True`` only when this call made it. A caller that did not
+        acquire the claim must not act; an earlier run may already have.
+        """
+
+        step = _user_step(step)
+        token = uuid4().hex
+        record = await self._store.save_step(
+            self._task_id, _claim_step(step), {"token": token, "data": data}
+        )
+        return _claim(record, step, token)
+
+    async def claim(self, step: str) -> TaskStepClaim | None:
+        """Return the saved claim on ``step``, or ``None`` when it has none."""
+
+        step = _user_step(step)
+        record = await self._store.load_step(self._task_id, _claim_step(step))
+        return None if record is None else _claim(record, step)
+
+    async def release(self, step: str) -> bool:
+        """Delete the claim on ``step``; do this only when its effect never happened."""
+
+        step = _user_step(step)
+        return await self._store.delete_steps(self._task_id, step=_claim_step(step)) == 1
+
+    async def reconcile(
+        self, step: str, probe: Callable[[TaskStepClaim], Awaitable[Any] | Any]
+    ) -> Any:
+        """Settle a claimed step that has no result, by asking ``probe`` what happened.
+
+        Returns the saved result when the step already has one. Otherwise calls
+        ``probe(claim)`` (sync or async). A JSON value means the effect
+        happened: it is saved as the step's result and returned.
+        :data:`TASK_STEP_NOT_DONE` means it provably never happened: the claim
+        is released and :data:`TASK_STEP_NOT_DONE` is returned, so the caller
+        may claim and act again. An exception from the probe leaves the claim
+        in place. Raises :class:`LookupError` when the step has no claim.
+        """
+
+        step = _user_step(step)
+        saved = await self._store.load_step(self._task_id, step)
+        if saved is not None:
+            return saved.result
+        claim = await self.claim(step)
+        if claim is None:
+            raise LookupError(f"Step {step!r} of task {self._task_id!r} has no claim.")
+        outcome = probe(claim)
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        if outcome is TASK_STEP_NOT_DONE:
+            await self.release(step)
+            return TASK_STEP_NOT_DONE
+        return (await self._store.save_step(self._task_id, step, outcome)).result
+
+    async def act_once(
+        self,
+        step: str,
+        act: Callable[[TaskStepClaim], Awaitable[Any] | Any],
+        *,
+        reconcile: Callable[[TaskStepClaim], Awaitable[Any] | Any] | None = None,
+        data: Any = None,
+    ) -> Any:
+        """Claim, act, save; or reconcile when an earlier run claimed without a result.
+
+        Returns the saved result when the step finished. Otherwise claims the
+        step, calls ``act(claim)`` and saves what it returns. When a claim
+        already exists, ``reconcile(claim)`` decides as in :meth:`reconcile`,
+        and the step is claimed and acted on again only after it returns
+        :data:`TASK_STEP_NOT_DONE`. Without ``reconcile``, or when another run
+        claims first, or when ``reconcile`` raises, raises
+        :class:`TaskStepUnresolved` (with the probe's exception as its cause).
+        An exception from ``act`` keeps the claim, since the effect may have
+        happened.
+        """
+
+        step = _user_step(step)
+        saved = await self._store.load_step(self._task_id, step)
+        if saved is not None:
+            return saved.result
+        claim = await self.begin(step, data)
+        if not claim.acquired:
+            if reconcile is None:
+                raise TaskStepUnresolved(claim)
+            try:
+                outcome = await self.reconcile(step, reconcile)
+            except Exception as error:
+                raise TaskStepUnresolved(claim) from error
+            if outcome is not TASK_STEP_NOT_DONE:
+                return outcome
+            claim = await self.begin(step, data)
+            if not claim.acquired:
+                raise TaskStepUnresolved(claim)
+        value = act(claim)
+        if inspect.isawaitable(value):
+            value = await value
+        return (await self._store.save_step(self._task_id, step, value)).result
 
     async def clear(self) -> int:
         """Delete every saved step of this task, for example after it completes."""
 
         return await self._store.delete_steps(self._task_id)
+
+
+def _user_step(step: object) -> str:
+    step = task_step_key(step, "step")
+    if step.startswith(TASK_STEP_CLAIM_PREFIX):
+        raise ValueError(f"step names starting with {TASK_STEP_CLAIM_PREFIX!r} are reserved.")
+    return step
+
+
+def _claimable(step: str) -> bool:
+    return len((TASK_STEP_CLAIM_PREFIX + step).encode("utf-8")) <= TASK_STEP_KEY_MAX_BYTES
+
+
+def _claim_step(step: str) -> str:
+    if not _claimable(step):
+        limit = TASK_STEP_KEY_MAX_BYTES - len(TASK_STEP_CLAIM_PREFIX)
+        raise ValueError(f"A claimed step name must not exceed {limit} UTF-8 bytes.")
+    return TASK_STEP_CLAIM_PREFIX + step
+
+
+def _claim(record: TaskStepRecord, step: str, token: str | None = None) -> TaskStepClaim:
+    stored = record.result
+    if type(stored) is not dict or type(stored.get("token")) is not str:
+        raise ValueError(f"The claim on step {step!r} is not a claim record.")
+    return TaskStepClaim(
+        task_id=record.task_id,
+        step=step,
+        token=stored["token"],
+        data=stored.get("data"),
+        claimed_at=record.saved_at,
+        acquired=stored["token"] == token,
+    )
 
 
 def task_steps(store: TaskStepStore, task: Any) -> TaskSteps:
@@ -254,12 +446,16 @@ def task_steps(store: TaskStepStore, task: Any) -> TaskSteps:
 
 
 __all__ = [
+    "TASK_STEP_CLAIM_PREFIX",
     "TASK_STEP_KEY_MAX_BYTES",
     "TASK_STEP_LIST_MAX",
+    "TASK_STEP_NOT_DONE",
     "TASK_STEP_RESULT_MAX_BYTES",
     "InMemoryTaskStepStore",
+    "TaskStepClaim",
     "TaskStepRecord",
     "TaskStepStore",
+    "TaskStepUnresolved",
     "TaskSteps",
     "encode_task_step_result",
     "optional_task_step_key",
