@@ -2,6 +2,7 @@
 
 from cayu._browser_recording_store import BrowserRecordingStore as BrowserRecordingStore
 from cayu._browser_recording_store import BrowserRecordingUnavailable as BrowserRecordingUnavailable
+from cayu._validation import canonical_durable_json_bytes as canonical_durable_json_bytes
 from cayu.knowledge.activation_contracts import (
     MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES as MAX_KNOWLEDGE_ACTIVATION_ANNOTATION_BYTES,
 )
@@ -531,6 +532,7 @@ __all__ = [
     "WorkspaceRetentionPolicy",
     "agent_health",
     "assess_knowledge_revision_transition",
+    "canonical_durable_json_bytes",
     "configured_database_url",
     "copy_knowledge_revision_refs",
     "knowledge_access_scope_sha256",

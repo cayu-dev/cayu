@@ -257,6 +257,13 @@ if queued.created:
     ...
 ```
 
+To build a key or a digest from JSON, such as a hash of a task's input, encode it
+with `canonical_durable_json_bytes(value, "input")` from `cayu.storage` rather
+than `json.dumps`. A PostgreSQL store may give a number back in another
+spelling or type (`1e18` comes back as an `int`), so a hash of `json.dumps`
+output can change after a round trip. The canonical encoding sorts keys and
+writes each number by value, so the bytes match before and after.
+
 `concurrency` defaults to one. `max_tasks`, when set, is a total for the whole
 call, not a per-slot quota; recovered continuations and contracted-task parking
 also count. One handler failing does not cancel its peers. Each active handler

@@ -3174,6 +3174,7 @@
   "cayu.business_approval_audit": "cayu.approvals.business_approval_audit",
   "cayu.business_approval_routing": "cayu.approvals.business_approval_routing",
   "cayu.business_approval_routing_metadata": "cayu.approvals.business_approval_routing_metadata",
+  "cayu.canonical_durable_json_bytes": "cayu.storage.canonical_durable_json_bytes",
   "cayu.canonical_tool_id": "cayu.tools.canonical_tool_id",
   "cayu.capture_eval_scenario_from_session": "cayu.evals.capture_eval_scenario_from_session",
   "cayu.capture_incremental_workflow_eval_attempt": "cayu.evals.capture_incremental_workflow_eval_attempt",

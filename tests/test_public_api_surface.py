@@ -87,6 +87,17 @@ def test_application_store_selection_is_public_from_storage() -> None:
         assert name in storage.__all__
 
 
+def test_durable_json_encoding_is_public_from_storage() -> None:
+    from cayu import memory, storage
+
+    assert "canonical_durable_json_bytes" in storage.__all__
+    assert storage.canonical_durable_json_bytes is memory.canonical_durable_json_bytes
+    # A number that JSONB stores under another spelling encodes the same way.
+    assert storage.canonical_durable_json_bytes(
+        {"b": 1e18, "a": [1.0, "x"]}, "value"
+    ) == storage.canonical_durable_json_bytes({"a": [1, "x"], "b": 10**18}, "value")
+
+
 def test_agent_readers_and_health_are_public_from_storage() -> None:
     from cayu import storage
     from cayu.storage import agent_health_summary, agent_readers
