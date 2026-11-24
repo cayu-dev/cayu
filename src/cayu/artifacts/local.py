@@ -86,6 +86,10 @@ _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 4
+# renameat2 errors that mean the filesystem (or kernel) refuses RENAME_NOREPLACE.
+_NOREPLACE_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
 _ARTIFACT_LOCK_DIRECTORY_NAME = "cayu-artifact-locks"
 _ARTIFACT_LOCK_SHARD_COUNT = 256
 _ARTIFACT_ROOT_LOCK_DIRECTORY_NAME = "cayu-artifact-root-locks"
@@ -1294,20 +1298,68 @@ def _rename_directory_no_replace(
         target_fd = _AT_FDCWD if parent_fd is None else parent_fd
         source_path = source if parent_fd is None else Path(source.name)
         target_path = target if parent_fd is None else Path(target.name)
-        _call_native_rename(
-            "renameat2",
-            (
-                source_fd,
-                os.fsencode(source_path),
-                target_fd,
-                os.fsencode(target_path),
-                _RENAME_NOREPLACE,
-            ),
-        )
+        try:
+            _call_native_rename(
+                "renameat2",
+                (
+                    source_fd,
+                    os.fsencode(source_path),
+                    target_fd,
+                    os.fsencode(target_path),
+                    _RENAME_NOREPLACE,
+                ),
+            )
+        except OSError as exc:
+            if exc.errno not in _NOREPLACE_UNSUPPORTED_ERRNOS:
+                raise
+            _publish_without_native_noreplace(source, target, parent_fd=parent_fd)
         return
     raise ArtifactStoreUnavailableError(
         "Local artifact publication requires atomic no-replace rename support."
     )
+
+
+def _publish_without_native_noreplace(
+    source: Path,
+    target: Path,
+    *,
+    parent_fd: int | None,
+) -> None:
+    """Publish without replacing a target where the filesystem refuses RENAME_NOREPLACE.
+
+    Some network and FUSE filesystems reject the flag with EINVAL or ENOTSUP. A
+    regular file is then published with ``link`` and ``unlink``: ``link`` fails
+    when the target name exists. A directory is published with a plain ``rename``
+    after checking that the target is absent. ``rename`` fails for an existing
+    non-directory or non-empty directory, so a published artifact, which always
+    holds files, is never replaced.
+    """
+
+    source_name: str | Path = source if parent_fd is None else source.name
+    target_name: str | Path = target if parent_fd is None else target.name
+    source_stat = _stat_directory_entry(source, parent_fd=parent_fd)
+    if stat.S_ISREG(source_stat.st_mode):
+        os.link(
+            source_name,
+            target_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(source_name, dir_fd=parent_fd)
+        return
+    if not stat.S_ISDIR(source_stat.st_mode):
+        raise ArtifactStoreUnavailableError(
+            "Local artifact publication without native no-replace rename supports only "
+            "regular files and directories."
+        )
+    try:
+        _stat_directory_entry(target, parent_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(target))
+    os.rename(source_name, target_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 
 def _call_native_rename(function_name: str, arguments: tuple[object, ...]) -> None:

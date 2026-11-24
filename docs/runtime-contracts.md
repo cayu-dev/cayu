@@ -16597,7 +16597,13 @@ It stores each artifact as content plus JSON metadata under one root. Writes
 prepare both files in a private staging directory, flush and synchronize both
 regular files and the staging directory, atomically rename the complete
 directory into place with no-replace semantics, and synchronize the store root
-before acknowledging success. Newly created store-root ancestry is published
+before acknowledging success. On Linux, some network and FUSE filesystems (such
+as a mounted persistent volume) refuse `renameat2` with `RENAME_NOREPLACE`. The
+store then keeps the no-replace guarantee another way: a staged regular file is
+published with `link` and `unlink`, which fails if the name exists, and a staged
+directory is renamed only after checking that the target is absent, since
+`rename` never replaces a non-empty directory or a file. Other rename errors
+still fail the write. Newly created store-root ancestry is published
 one directory at a time, with each directory and its parent synchronized before
 creation proceeds. Final-root creation is protected by a cooperative lock and a
 deterministic pending sidecar in the parent: every initialization attempt
