@@ -456,6 +456,7 @@ async def _settle_abandoned(
     settlement: AbandonedTaskSettlement,
     max_restarts: int,
     on_restart_limit_reached: RestartLimitHandler | None = None,
+    evidence_for: Callable[[Task], str] | None = None,
 ) -> list[Task]:
     from cayu.tasks.worker import _reconcile_observed_abandoned_task_cancellation
 
@@ -463,6 +464,8 @@ async def _settle_abandoned(
     for task in tasks:
         assert task.lease_expires_at is not None
         evidence_id = f"lease-expired-at:{task.lease_expires_at.isoformat()}"
+        if evidence_for is not None:
+            evidence_id = f"{evidence_for(task)}:{evidence_id}"
         at_limit = False
         try:
             if (

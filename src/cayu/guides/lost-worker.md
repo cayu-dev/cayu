@@ -97,6 +97,44 @@ worker outside `live_worker_ids` and cancels the others as before.
 validator_version=..., evidence_id=...)` restarts one task when you have
 evidence for that task alone.
 
+On Cayu Cloud the platform's record is already there: Cloud records each worker
+instance and how it stopped, and the Agent reads it at `CAYU_WORKER_EXITS_URL`.
+`cayu.tasks.cloud_worker_exits` uses it. Give each worker an id that names its
+Cloud run, then settle the tasks of runs Cloud recorded as stopped, at startup
+and on a timer:
+
+```python
+from cayu.tasks.cloud_worker_exits import (
+    WorkerExitsUnsupported,
+    cloud_worker_id,
+    read_cloud_worker_exits,
+    reconcile_tasks_of_exited_workers,
+)
+
+worker_id = await cloud_worker_id("jobs")  # "jobs" outside Cayu Cloud
+
+try:
+    record = await read_cloud_worker_exits()
+except WorkerExitsUnsupported:
+    record = None  # not on Cayu Cloud, or a Cloud that doesn't record exits
+if record is not None:
+    await reconcile_tasks_of_exited_workers(app.task_store, record, settlement="restart")
+```
+
+`cloud_worker_id` appends a digest of the run: the ECS task ARN read from the
+task metadata endpoint, or on Kubernetes a random marker in
+`/dev/termination-log`, which the kubelet hands to Cloud only after the
+container exited. The first process of a container run writes the marker and the
+others reuse it, so every process of that run is matched. Outside Cayu Cloud
+(no `CAYU_WORKER_EXITS_URL`) it reads and writes nothing. The Kubernetes marker needs a Cayu Cloud that records worker
+run markers; on one that doesn't, no Kubernetes task matches and nothing is
+settled. Only tasks whose `worker_id` names a run the record shows `stopped`
+are settled, with validator `cayu.cloud.worker-exit` and evidence naming the
+stop. `gone` entries count only with `accept_gone=True`, because an instance
+that left the platform's view proves nothing about how it ended. Tasks held by
+an id without a run digest are left alone. This works with any number of
+workers, since each task is matched to its own worker's run.
+
 A restarted task goes back to `pending` with the same id and input,
 `restart_count` one higher, a `TaskRestartRecord` (reason `WORKER_LOST`)
 appended to `task.restart_history`, and `status_payload["restart"]` naming the
