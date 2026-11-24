@@ -88,6 +88,8 @@ def summarize_outcome(
     put(result, "usage", outcome.usage.model_dump(mode="json"), "usage")
     put(result, "final_text", text(outcome.final_text, "final_text", 4096), "final_text")
     put(result, "error", None if outcome.error is None else text(outcome.error, "error"), "error")
+    if outcome.failure_code is not None:
+        put(result, "failure_code", outcome.failure_code, "failure_code")
     if outcome.tool_completion is not None:
         completion = outcome.tool_completion
         item = {
@@ -115,7 +117,7 @@ def summarize_outcome(
         }
         if not append(result["tool_calls"], item, "tool_calls"):
             break
-        for key in ("reason", "blocked_by"):
+        for key in ("reason", "failure_code", "blocked_by"):
             value = getattr(call, key)
             if value is not None:
                 put(item, key, text(value, "tool_calls.details"), "tool_calls.details")

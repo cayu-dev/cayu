@@ -139,6 +139,7 @@ class InvocationProjection:
             terminal_event_id=event.id,
             terminal_index=index,
             reason=_text(payload.get("reason")),
+            failure_code=_tool_failure_code(payload),
             blocked_by=_text(payload.get("denied_by")) or _text(payload.get("blocked_by")),
         )
         # A terminal may explicitly withhold arguments that an earlier event
@@ -169,6 +170,19 @@ class InvocationProjection:
             "interaction_id": self.interaction_id,
             "interruption": self.interruption,
         }
+
+
+_TOOL_OUTPUT_SIZE_CODES = frozenset({"json_value_too_large", "too_many_json_nodes"})
+
+
+def _tool_failure_code(payload: dict[str, Any]) -> str | None:
+    # Read the runtime's own terminal controls, never the tool's result.
+    if (
+        payload.get("terminal_outcome") == "invalid_tool_output"
+        and payload.get("durable_value_error_code") in _TOOL_OUTPUT_SIZE_CODES
+    ):
+        return "tool_output_too_large"
+    return None
 
 
 def _interruption(payload: dict[str, Any]) -> dict[str, Any]:

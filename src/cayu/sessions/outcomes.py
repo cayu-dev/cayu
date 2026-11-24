@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -48,6 +49,56 @@ class StructuredOutputResult:
     name: str | None
     attempt: int
     max_retries: int
+
+
+class RunFailureCode(StrEnum):
+    """Stable codes for failures a caller may want to handle without parsing text.
+
+    ``RunOutcome.failure_code`` and the ``failure_code`` field of a
+    ``session.failed`` event carry a session-level code.
+    ``ToolCallSummary.failure_code`` carries a tool-call code. Both are plain
+    strings, so a code added in a later release still reads; compare against
+    these members.
+    """
+
+    PROVIDER_STREAM_CAPACITY_EXHAUSTED = "provider_stream_capacity_exhausted"
+    """A model call found ``ProviderStreamDeadlines.max_concurrent_streams``
+    streams already open in the process and failed before reaching the provider."""
+
+    TOOL_OUTPUT_TOO_LARGE = "tool_output_too_large"
+    """A tool returned a result over its ``ToolSpec.max_terminal_payload_bytes``
+    bound or the durable record limit, and the call failed with a bounded result."""
+
+
+def failure_code_of(error: BaseException) -> RunFailureCode | None:
+    """The stable code of a runtime-classified failure in ``error``, if any.
+
+    Looks through exception groups and explicit ``raise ... from`` causes. Only
+    the runtime's own exception types carry a code; a subclass does not.
+    """
+
+    from cayu._exception_groups import exception_cause, iter_exception_tree
+    from cayu.providers.deadlines import ProviderStreamCapacityExhausted
+
+    codes: dict[type[BaseException], RunFailureCode] = {
+        ProviderStreamCapacityExhausted: RunFailureCode.PROVIDER_STREAM_CAPACITY_EXHAUSTED,
+    }
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 64:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for node in iter_exception_tree(current):
+            code = codes.get(type(node))
+            if code is not None:
+                return code
+            seen.add(id(node))
+            cause = exception_cause(node)
+            if cause is not None and id(cause) not in seen:
+                pending.append(cause)
+    return None
 
 
 class RunInterruption(BaseModel):
@@ -89,6 +140,9 @@ class RunOutcome:
     - ``error`` is the failure message when ``status`` is ``SessionStatus.FAILED``, else ``None``.
       When the run raised instead of ending in ``session.failed``, it also names
       an exception group's leaf errors and the cause chain.
+    - ``failure_code`` is a stable :class:`RunFailureCode` value for a failure the
+      runtime classifies, or ``None``. It is read from the ``session.failed``
+      event, or from the exception when the run raised.
     - ``error_detail`` is the structured, redacted form of that raised exception
       (type, message, causes and group leaves), or ``None`` when the failure came
       from a ``session.failed`` event or the run did not fail.
@@ -118,6 +172,7 @@ class RunOutcome:
     usage: AggregateUsageMetrics = field(default_factory=build_aggregate_usage_metrics)
     tool_calls: tuple[ToolCallSummary, ...] = ()
     interruption: RunInterruption | None = None
+    failure_code: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "events", tuple(copy_event(event) for event in self.events))
@@ -272,6 +327,8 @@ async def _run_to_completion(
             max_bytes=MAX_EXCEPTION_SUMMARY_UTF8_BYTES,
         )
         collector.status = SessionStatus.FAILED
+        code = failure_code_of(exc)
+        collector.failure_code = None if code is None else code.value
     return collector.finish()
 
 
@@ -288,6 +345,7 @@ class _OutcomeCollector:
         self.status = SessionStatus.INTERRUPTED
         self.error: str | None = None
         self.error_detail: ExceptionDetail | None = None
+        self.failure_code: str | None = None
         self.tool_completion: ToolCompletionResult | None = None
         self.structured_output: StructuredOutputResult | None = None
         self.projection = InvocationProjection()
@@ -300,7 +358,7 @@ class _OutcomeCollector:
         payload = event.payload
         if event.type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}:
             self.status = SessionStatus.INTERRUPTED
-            self.error = self.error_detail = None
+            self.error = self.error_detail = self.failure_code = None
             self.tool_completion = self.structured_output = None
             self.current_turn_text = []
             self.final_text = ""
@@ -322,7 +380,7 @@ class _OutcomeCollector:
             )
         elif event.type == EventType.SESSION_COMPLETED:
             self.status = SessionStatus.COMPLETED
-            self.error = None
+            self.error = self.failure_code = None
             value = payload.get("tool_completion")
             self.tool_completion = (
                 None if value is None else ToolCompletionResult.model_validate(value)
@@ -331,9 +389,11 @@ class _OutcomeCollector:
             self.status = SessionStatus.FAILED
             failure = payload.get("error")
             self.error = failure if isinstance(failure, str) else None
+            code = payload.get("failure_code")
+            self.failure_code = code if isinstance(code, str) else None
         elif event.type == EventType.SESSION_INTERRUPTED:
             self.status = SessionStatus.INTERRUPTED
-            self.error = None
+            self.error = self.failure_code = None
 
     def finish(self) -> RunOutcome:
         projection = self.projection.result()
@@ -347,6 +407,7 @@ class _OutcomeCollector:
             structured_output=self.structured_output,
             tool_completion=self.tool_completion,
             error_detail=self.error_detail,
+            failure_code=self.failure_code,
             interruption=None if interruption is None else RunInterruption(**interruption),
             **projection,
         )

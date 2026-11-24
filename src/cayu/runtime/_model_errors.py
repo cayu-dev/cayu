@@ -41,6 +41,7 @@ from cayu.providers.base import (
 from cayu.providers.deadlines import (
     ProviderDeadlineKind,
     ProviderProgressKind,
+    ProviderStreamCapacityExhausted,
     ProviderStreamDeadlineEvidence,
 )
 from cayu.tools._operation_boundary import (
@@ -761,6 +762,7 @@ _DETACHABLE_BUILTIN_PROVIDER_ERRORS = frozenset(
         ConnectionAbortedError,
         ConnectionRefusedError,
         ConnectionResetError,
+        ProviderStreamCapacityExhausted,
     }
 )
 

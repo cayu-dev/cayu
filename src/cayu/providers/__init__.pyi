@@ -84,6 +84,9 @@ from cayu.providers.deadlines import (
 from cayu.providers.deadlines import ProviderDeadlineKind as ProviderDeadlineKind
 from cayu.providers.deadlines import ProviderProgressKind as ProviderProgressKind
 from cayu.providers.deadlines import (
+    ProviderStreamCapacityExhausted as ProviderStreamCapacityExhausted,
+)
+from cayu.providers.deadlines import (
     ProviderStreamDeadlineEvidence as ProviderStreamDeadlineEvidence,
 )
 from cayu.providers.deadlines import ProviderStreamDeadlines as ProviderStreamDeadlines

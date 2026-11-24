@@ -143,6 +143,10 @@ EXPORTS: dict[str, tuple[str, str]] = {
         "cayu.providers.deadlines",
         "ProviderStreamDeadlineEvidence",
     ),
+    "ProviderStreamCapacityExhausted": (
+        "cayu.providers.deadlines",
+        "ProviderStreamCapacityExhausted",
+    ),
     "ProviderStreamDeadlines": ("cayu.providers.deadlines", "ProviderStreamDeadlines"),
     "RequestCacheProjection": ("cayu.providers.cache", "RequestCacheProjection"),
     "RetryDecision": ("cayu.providers._retry_decision", "RetryDecision"),
@@ -290,6 +294,7 @@ PUBLIC_NAMES = [
     "ProviderOperationState",
     "ProviderOperationStatus",
     "ProviderProgressKind",
+    "ProviderStreamCapacityExhausted",
     "ProviderStreamDeadlineEvidence",
     "ProviderStreamDeadlines",
     "RequestCacheProjection",

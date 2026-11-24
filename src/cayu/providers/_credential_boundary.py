@@ -32,6 +32,7 @@ from cayu.providers._cleanup_diagnostics import (
 from cayu.providers.base import ModelProviderError, ModelStreamDeadlineError
 from cayu.providers.deadlines import (
     DEFAULT_MAX_CONCURRENT_PROVIDER_STREAMS,
+    ProviderStreamCapacityExhausted,
     ProviderStreamDeadlineExceeded,
 )
 
@@ -180,7 +181,7 @@ def reserve_provider_stream_cleanup(
     with _PROVIDER_STREAM_CLEANUP_REGISTRIES_LOCK:
         owners = _PROVIDER_STREAM_CLEANUP_REGISTRIES.setdefault(loop, set())
         if len(owners) >= max_concurrent_streams:
-            raise RuntimeError(
+            raise ProviderStreamCapacityExhausted(
                 "Provider stream cleanup capacity is exhausted: "
                 f"{max_concurrent_streams} provider streams are already open in this "
                 "process. Raise ProviderStreamDeadlines(max_concurrent_streams=...) on "

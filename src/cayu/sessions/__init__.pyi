@@ -378,6 +378,7 @@ from cayu.sessions.messaging import SessionMessageDeliveryMode as SessionMessage
 from cayu.sessions.messaging import SessionMessageQueueStatus as SessionMessageQueueStatus
 from cayu.sessions.messaging import SessionQueuedMessage as SessionQueuedMessage
 from cayu.sessions.messaging import SessionQueuedMessagesPending as SessionQueuedMessagesPending
+from cayu.sessions.outcomes import RunFailureCode as RunFailureCode
 from cayu.sessions.outcomes import RunInterruption as RunInterruption
 from cayu.sessions.outcomes import RunOutcome as RunOutcome
 from cayu.sessions.outcomes import StructuredOutputResult as StructuredOutputResult
@@ -791,6 +792,7 @@ __all__ = [
     "RejectInvocationCommand",
     "ReleaseInvocationCommand",
     "ResumeRequest",
+    "RunFailureCode",
     "RunInterruption",
     "RunOnceMismatch",
     "RunOnceRefused",

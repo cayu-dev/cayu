@@ -292,6 +292,7 @@ from cayu.sessions._terminal_evidence import (
 from cayu.sessions.authority import SessionRunFenced
 from cayu.sessions.event_queries import EventOrder, EventQuery
 from cayu.sessions.messaging import SessionMessageDeliveryBatch
+from cayu.sessions.outcomes import failure_code_of
 from cayu.sessions.records import CheckpointTransform, Session, SessionStatus, session_user_metadata
 from cayu.sessions.recovery import _incomplete_recovery_claim_from_checkpoint
 from cayu.sessions.store import SessionStore
@@ -8526,6 +8527,9 @@ def exception_failure_payload(
         diagnostic.payload_fields(),
         redactor=resolved_redactor,
     )
+    failure_code = failure_code_of(error)
+    if failure_code is not None:
+        fallback["failure_code"] = failure_code.value
 
     safe_payload = binding_finalize_safe_payload(error)
     if safe_payload is None and isinstance(error, BaseExceptionGroup):

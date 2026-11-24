@@ -561,6 +561,7 @@ def test_cayu_app_rejects_provider_dispatch_when_live_cleanup_capacity_is_exhaus
 
         assert provider.requests == []
         assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["failure_code"] == "provider_stream_capacity_exhausted"
 
     asyncio.run(run())
 

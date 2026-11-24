@@ -3843,7 +3843,11 @@ envelope. A call whose size Cayu cannot know at admission reserves that
 ceiling instead of a declaration: a tool that declares no bound, a declaration
 larger than the ceiling, and a call whose hooks may modify published arguments.
 A declaration below 64 KiB reserves and enforces 64 KiB, so the runtime's own
-bounded failure result always fits. Rounds share one process-local byte domain,
+bounded failure result always fits. A result over the bound fails the call with
+`terminal_outcome: "invalid_tool_output"` and
+`durable_value_error_code: "json_value_too_large"`, the same code a result over
+the durable record limit gets, and the call's `ToolCallSummary.failure_code` is
+`"tool_output_too_large"`. Rounds share one process-local byte domain,
 `CayuConfig(tool_execution=ToolExecutionConfig(tool_terminal_staged_capacity_bytes=...))`
 (default 512 MiB); a round or family whose complete reservation exceeds that
 domain receives an exclusive oversize lease. The lease remains owned until every
@@ -9497,6 +9501,20 @@ from an exception group appends the same leaf and cause text to its `error`.
 `exception_detail(error, redactor=...)` builds an `ExceptionDetail` for any
 exception, so applications can apply the same summary in their own handlers.
 
+`RunOutcome.failure_code` is a stable code for a failure the runtime classifies,
+read from the `failure_code` field of `session.failed` (or from the exception
+when the run raised), and `None` otherwise. `ToolCallSummary.failure_code` does
+the same for one tool call. Compare them with `cayu.sessions.RunFailureCode`
+instead of matching error text:
+
+| Code | Where | Meaning |
+| --- | --- | --- |
+| `provider_stream_capacity_exhausted` | `RunOutcome`, `session.failed` | A model call found `ProviderStreamDeadlines.max_concurrent_streams` streams already open in the process and failed before reaching the provider. |
+| `tool_output_too_large` | `ToolCallSummary` | The tool's result was over its `max_terminal_payload_bytes` bound or the durable record limit, and the call failed with a bounded result. |
+
+The codes are plain strings, so a code added later still reads on an older
+caller.
+
 The returned event tuple and structured-output result are detached snapshots,
 including nested event payloads and structured JSON values. Callers may retain
 them as evidence without subsequent mutation of their source objects changing
@@ -12898,8 +12916,11 @@ operation.
 
 Provider stream configuration also declares `max_concurrent_streams`, defaulting
 to 1,000 so the normal N9 evaluation capacity does not encounter a lower hidden
-ceiling. A dispatch over the limit fails before provider entry with an error
-that names the limit; it does not wait for a slot. Runtime reserves both deadline-read and live cleanup ownership before
+ceiling. A dispatch over the limit fails before provider entry with
+`ProviderStreamCapacityExhausted`, whose message names the limit; it does not
+wait for a slot. The session's `session.failed` event then carries
+`failure_code: "provider_stream_capacity_exhausted"`, and so does
+`RunOutcome.failure_code`. Runtime reserves both deadline-read and live cleanup ownership before
 provider entry against that process-wide limit. Operators choosing a larger
 evaluation capacity must set the provider capacity from measured downstream and
 cleanup capacity; the value is validated as a positive integer and is included

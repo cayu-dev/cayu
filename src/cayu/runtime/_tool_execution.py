@@ -32,6 +32,7 @@ from cayu.runners.base import (
 )
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._auxiliary_invocation import AuxiliaryInferenceScope
+from cayu.runtime._diagnostics import ExceptionDiagnostic
 from cayu.runtime._durable_subagents import (
     durable_subagent_committed_cancellation_outcome,
     durable_subagent_unsettled_cancellation_outcome,
@@ -467,14 +468,25 @@ def terminal_payload_limit_failure(
         raise ValueError("maximum_bytes must be a positive integer.")
     if type(observed_bytes) is not int or observed_bytes <= maximum_bytes:
         raise ValueError("observed_bytes must exceed maximum_bytes.")
+    message = (
+        "Tool output violated its registered durable terminal payload limit "
+        f"({observed_bytes} bytes observed; {maximum_bytes} bytes allowed)."
+    )
     result, controls = tool_results.terminal_failure_result(
         terminal_outcome="invalid_tool_output",
         effect=effect,
-        message=(
-            "Tool output violated its registered durable terminal payload limit "
-            f"({observed_bytes} bytes observed; {maximum_bytes} bytes allowed)."
-        ),
+        message=message,
         redactor=redactor,
+        # The same size code a result over the durable record limit carries,
+        # so callers read one stable code for "the tool returned too much".
+        diagnostic=ExceptionDiagnostic(
+            message=message,
+            error_type="DurableValueError",
+            durable_value_error_code="json_value_too_large",
+            durable_value_error_path="$",
+            durable_value_error_limit=maximum_bytes,
+            durable_value_error_observed_lower_bound=observed_bytes,
+        ),
     )
     return _execution_outcome(result, controls)
 

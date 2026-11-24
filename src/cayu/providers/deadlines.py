@@ -208,6 +208,15 @@ class ProviderStreamDeadlineExceeded(TimeoutError):
         )
 
 
+class ProviderStreamCapacityExhausted(RuntimeError):
+    """A model call found the process's provider stream capacity already in use.
+
+    Raised by both the deadline-read and the live-cleanup reservation that
+    ``max_concurrent_streams`` bounds, before the provider is entered, so nothing reached it. The session
+    fails with ``failure_code="provider_stream_capacity_exhausted"``.
+    """
+
+
 _T = TypeVar("_T")
 _DEADLINE_PRECEDENCE = (
     ProviderDeadlineKind.ABSOLUTE,
@@ -278,7 +287,7 @@ def _reserve_provider_deadline_await_ownership(
 
     with _PROVIDER_DEADLINE_AWAIT_OWNERS_LOCK:
         if len(_PROVIDER_DEADLINE_AWAIT_OWNERS) >= max_concurrent_streams:
-            raise RuntimeError(
+            raise ProviderStreamCapacityExhausted(
                 "Provider stream deadline-read capacity is exhausted: "
                 f"{max_concurrent_streams} provider streams are already open in this "
                 "process. Raise ProviderStreamDeadlines(max_concurrent_streams=...) on "

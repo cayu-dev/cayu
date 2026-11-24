@@ -730,6 +730,7 @@ EXPORTS: dict[str, tuple[str, str]] = {
     "TurnRequest": ("cayu.sessions.turns", "TurnRequest"),
     "send_turn": ("cayu.sessions.turns", "send_turn"),
     "RunInterruption": ("cayu.sessions.outcomes", "RunInterruption"),
+    "RunFailureCode": ("cayu.sessions.outcomes", "RunFailureCode"),
 }
 
 PUBLIC_NAMES = [
@@ -1066,4 +1067,5 @@ PUBLIC_NAMES = [
     "TurnRequest",
     "send_turn",
     "RunInterruption",
+    "RunFailureCode",
 ]

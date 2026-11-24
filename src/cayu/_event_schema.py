@@ -2646,7 +2646,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_FAILED] = _observed_policy(
         "approval_id binding_cleanup durable_value_error_code durable_value_error_path "
-        "compaction_failure error error_type interaction_transition_failures interruption_type "
+        "compaction_failure error error_type failure_code interaction_transition_failures "
+        "interruption_type "
         "manual_recovery_required model_attempt_id model_step_id tool_call_id "
         f"tool_name tool_round_id {terminal_finalization_keys}",
         owned_nested_paths=terminal_finalization_owned_paths | failure_evidence_owned_paths,
@@ -2662,7 +2663,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
         "abandoned actual action_id action_kind child_session_id status approval approval_close_intent approval_id "
         "approval_metadata_truncated cost_summary durable_value_error_code "
-        "durable_value_error_path error error_type execution_profile_fingerprint input_id interruption_origin "
+        "durable_value_error_path error error_type execution_profile_fingerprint failure_code "
+        "input_id interruption_origin "
         "interruption_request_id "
         "interaction_transition_failures interruption_type limit manual_recovery_persisted "
         "manual_recovery_persistence_unknown manual_recovery_required "
@@ -3262,7 +3264,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     factory_policy = _observed_policy(
         "allocation_id causal_budget_id durable_value_error_code durable_value_error_path "
         "environment_factory_release environment_name environment_rebuild error error_type "
-        "execution_profile_fingerprint factory_type labels "
+        "execution_profile_fingerprint factory_type failure_code labels "
         "parent_session_id phase_timings reconnect_metadata requested_environment_name "
         "result_metadata",
         owned_nested_paths={

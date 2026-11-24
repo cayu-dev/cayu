@@ -28,6 +28,8 @@ class ToolCallSummary(BaseModel):
     event can appear without a start when resuming or recovering a prior call.
     A restarted call reports its latest attempt. Malformed optional arguments
     or results are unavailable; the original events remain in RunOutcome.events.
+    ``failure_code`` is a stable ``RunFailureCode`` value for a failure the
+    runtime classifies (``"tool_output_too_large"``), else ``None``.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
@@ -45,6 +47,7 @@ class ToolCallSummary(BaseModel):
     arguments_exact: bool | None = None
     result: ToolResult | None = None
     reason: str | None = None
+    failure_code: str | None = None
     blocked_by: str | None = None
     start_event_id: str | None = None
     terminal_event_id: str | None = None
