@@ -49,16 +49,33 @@ _SESSION = '''"""The application's database connection, opened on first use, nev
 
 Cayu Cloud smoke-tests a release without database credentials, so nothing here may connect
 while the application starts. Migrations run as a deploy step, never from the app.
+
+These sessions are synchronous, and routes, tools and task handlers are async. A query blocks
+the thread that runs it, and a session keeps its connection from its first query until it
+commits, rolls back or closes. From async code:
+
+- `await run_in_thread(work)` runs `work(db)` in a worker thread, in one transaction, and
+  closes the session before it returns. Waiting for a connection then never blocks the event
+  loop.
+- Never hold a session across an `await` of slow work (a model call, a file read or upload).
+  Copy the plain values you need, end the transaction, then await. With the pool's five
+  connections held across awaits, the next query blocks the event loop while it waits for a
+  connection, so none of the five can resume to give theirs back, and every request hangs.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from functools import cache
+from typing import TypeVar
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
 from configuration.settings import configured_app_database_url
+
+T = TypeVar("T")
 
 
 def database_url(*, direct: bool = False) -> str:
@@ -93,6 +110,79 @@ def session() -> Session:
     """A new session: use it as a context manager and commit what it changes."""
 
     return Session(engine(), expire_on_commit=False)
+
+
+async def run_in_thread(work: Callable[[Session], T]) -> T:
+    """Run `work(db)` in a worker thread with a new session, committing when it returns.
+
+    The session is closed before this returns: return plain values or loaded rows, never
+    the session itself. `work` is synchronous, so it can't await while it holds a connection.
+    A thread can't be stopped, so when the caller is cancelled this still waits for the
+    transaction to end before the cancellation goes on: no database work outlives its caller.
+    """
+
+    def unit() -> T:
+        with session() as db, db.begin():
+            return work(db)
+
+    worker = asyncio.ensure_future(asyncio.to_thread(unit))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                pass
+        if not worker.cancelled():
+            worker.exception()  # Retrieved, so asyncio doesn't log it as unhandled.
+        raise
+'''
+
+_LOCKS = '''"""Transaction-scoped locks, for application code that must not race with itself.
+
+Two requests that create the same row, such as one with an id derived from its input, can
+both find it missing and both insert it. Claim, then recheck: take the lock on the key the
+row is created under, then read again before writing.
+
+    with session() as db, db.begin():
+        lock(db, f"invoice:{invoice_id}")
+        if db.get(Invoice, invoice_id) is None:
+            db.add(Invoice(id=invoice_id, ...))
+
+A second caller waits at `lock` until the first commits or rolls back, then sees its row.
+The lock is released when the transaction ends; there is no unlock. Take several locks in
+one order everywhere (sorted keys, say), or two callers can each wait for the other's.
+Keys are hashed into PostgreSQL's advisory-lock space under an `app:` prefix, so they
+never meet the locks Cayu takes in the same database.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+
+def _key(key: str) -> dict[str, str]:
+    if not key:
+        raise ValueError("a lock key must not be empty")
+    return {"key": f"app:{key}"}
+
+
+def lock(db: Session, key: str) -> None:
+    """Wait for, then hold, the lock on `key` until `db`'s transaction ends."""
+
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), _key(key))
+
+
+def try_lock(db: Session, key: str) -> bool:
+    """Take the lock on `key` if no other transaction holds it; never waits."""
+
+    return bool(
+        db.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"), _key(key)
+        ).scalar()
+    )
 '''
 
 _ALEMBIC_INI = """# Migrations for the application's own tables, in the `app` schema.
@@ -248,7 +338,10 @@ creates its own and drops it afterwards. Without it the PostgreSQL checks are sk
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import time
 from uuid import uuid4
 
 import pytest
@@ -258,6 +351,7 @@ from sqlalchemy.engine import URL
 
 from cayu.cli import main as cayu
 from database import session
+from database.locks import lock, try_lock
 from database.models import SCHEMA, Base, Note
 
 ALEMBIC = Config("alembic.ini")
@@ -271,6 +365,37 @@ requires_postgres = pytest.mark.skipif(not SERVER and not REQUIRED, reason=SKIPP
 def test_every_table_lives_in_the_app_schema() -> None:
     assert Base.metadata.tables
     assert {table.schema for table in Base.metadata.tables.values()} == {SCHEMA}
+
+
+def test_a_cancelled_caller_waits_for_its_transaction_to_end(monkeypatch) -> None:
+    events = []
+
+    class Recorded:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            events.append("closed")
+
+        def begin(self):
+            return contextlib.nullcontext()
+
+    monkeypatch.setattr(session, "session", Recorded)
+
+    def work(db) -> None:
+        time.sleep(0.2)
+        events.append("committed")
+
+    async def caller() -> None:
+        task = asyncio.create_task(session.run_in_thread(work))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        events.append("caller stopped")
+
+    asyncio.run(caller())
+    assert events == ["committed", "closed", "caller stopped"]
 
 
 def test_nothing_connects_until_a_session_needs_the_database(monkeypatch) -> None:
@@ -362,6 +487,36 @@ def test_cayu_and_application_migrations_share_one_database_in_either_order(
 
 
 @requires_postgres
+def test_more_async_callers_than_connections_all_finish(database) -> None:
+    _app_migrate()
+    callers = 3 * session.engine().pool.size()
+
+    async def handler(n: int) -> int:
+        await session.run_in_thread(lambda db: db.add(Note(body=f"note {n}")))
+        # Slow async work, such as a model call, with no session open.
+        await asyncio.sleep(0.05)
+        return await session.run_in_thread(lambda db: db.query(Note).count())
+
+    async def all_handlers() -> list[int]:
+        return await asyncio.wait_for(
+            asyncio.gather(*(handler(n) for n in range(callers))), timeout=20
+        )
+
+    assert max(asyncio.run(all_handlers())) == callers
+
+
+@requires_postgres
+def test_a_lock_holds_until_its_transaction_ends(database) -> None:
+    with session.session() as first, first.begin():
+        lock(first, "note:1")
+        with session.session() as second, second.begin():
+            assert not try_lock(second, "note:1")
+            assert try_lock(second, "note:2")
+    with session.session() as third, third.begin():
+        assert try_lock(third, "note:1")
+
+
+@requires_postgres
 def test_autogenerate_sees_no_changes_and_never_touches_cayu_tables(database) -> None:
     _cayu_migrate()
     _app_migrate()
@@ -382,6 +537,13 @@ APP_DATABASE_TABLES = """- Application-owned records, such as orders, cases, mem
   database also needs `uv run cayu storage migrate` first. The application
   connects on first use and never migrates itself. Details:
   `cayu guide applications#application-tables`.
+- `database/session.py` is synchronous. From async code, `await run_in_thread(work)`
+  runs the database work in a worker thread in one transaction; never hold a session
+  across an `await` of slow work. Copy plain values and end the transaction first, or
+  five held connections hang every request.
+- Code that creates rows under a deterministic key claims, then rechecks: inside the
+  transaction, `lock(db, key)` from `database/locks.py`, then read again before
+  writing. The lock ends with the transaction.
 - The tests that read and write these tables need a PostgreSQL server where they
   may create databases (`CAYU_TEST_POSTGRES_DSN`), and are skipped without one. Run
   `eval "$(uv run --no-sync cayu dev postgres up --export)"` before `uv run --no-sync
@@ -418,6 +580,7 @@ def app_database_files(settings: str) -> dict[str, str]:
         "database/__init__.py": _PACKAGE_INIT,
         "database/models.py": _MODELS,
         "database/session.py": _SESSION,
+        "database/locks.py": _LOCKS,
         "migrations/env.py": _ENV,
         "migrations/script.py.mako": _SCRIPT_MAKO,
         "migrations/versions/0001_app_tables.py": _FIRST_REVISION,

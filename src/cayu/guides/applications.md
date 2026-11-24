@@ -565,6 +565,21 @@ or Alembic dependency: the generated project does.
   Nothing connects or migrates while the application starts, because Cayu Cloud
   smoke-tests a release without database credentials. There is no SQLite fallback
   for application tables.
+- Those sessions are synchronous, while routes, tools and task handlers are async. A
+  session keeps its connection from its first query until it commits, rolls back or
+  closes, and the pool has five. Holding sessions across an `await` of slow work (a model
+  call, a file read or upload) can use all five; the next query then blocks the event
+  loop while it waits for one, so no holder can resume to give its connection back and
+  every request hangs until the pool times out. From async code, call
+  `await run_in_thread(work)` from `database/session.py`: it runs `work(db)` in a worker
+  thread in one transaction and closes the session before it returns. Otherwise copy the
+  plain values you need and end the transaction before you await.
+- `database/locks.py` has transaction-scoped locks for code that creates rows under a
+  deterministic key. Claim, then recheck: inside the transaction call `lock(db, key)`,
+  then read again before writing, so a second caller waits and then sees the first
+  one's row. `try_lock(db, key)` returns `False` instead of waiting. A lock ends with
+  its transaction; take several in one order everywhere. Keys are hashed under an
+  `app:` prefix, apart from the locks Cayu takes in the same database.
 - `alembic.ini` and `migrations/` migrate the `app` schema only. The environment
   prefers `CAYU_DATABASE_DIRECT_URL`, as `cayu storage migrate` does, creates the
   schema when it's missing, keeps `alembic_version` in it, serialises concurrent runs

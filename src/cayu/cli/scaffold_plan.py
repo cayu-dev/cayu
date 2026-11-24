@@ -433,6 +433,7 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
             "database/__init__.py",
             "database/models.py",
             "database/session.py",
+            "database/locks.py",
             "migrations/env.py",
             "migrations/script.py.mako",
             "migrations/versions/0001_app_tables.py",

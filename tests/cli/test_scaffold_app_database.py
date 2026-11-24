@@ -21,6 +21,7 @@ APP_DATABASE_FILES = (
     "database/__init__.py",
     "database/models.py",
     "database/session.py",
+    "database/locks.py",
     "database/CAPABILITY.md",
     "migrations/env.py",
     "migrations/script.py.mako",
@@ -129,6 +130,41 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
     online = generated_suite({"CAYU_TEST_POSTGRES_DSN": _postgres_server_dsn})
     assert online.returncode == 0, online.stdout + online.stderr
     assert "SKIPPED" not in online.stdout
+    assert "test_more_async_callers_than_connections_all_finish PASSED" in online.stdout
+    assert "test_a_lock_holds_until_its_transaction_ends PASSED" in online.stdout
+
+
+def test_async_code_that_runs_its_queries_in_a_thread_passes_cayu_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _generated_project(tmp_path, capsys)
+    (project / "operations" / "notes.py").write_text(
+        '"""Read notes from async code."""\n\n'
+        "from __future__ import annotations\n\n"
+        "from database.locks import lock\n"
+        "from database.models import Note\n"
+        "from database.session import run_in_thread\n\n\n"
+        "async def note_body(note_id: int) -> str | None:\n"
+        "    note = await run_in_thread(lambda db: db.get(Note, note_id))\n"
+        "    return None if note is None else note.body\n\n\n"
+        "def add_note(db, note_id: int, body: str) -> None:\n"
+        '    lock(db, f"note:{note_id}")\n'
+        "    if db.get(Note, note_id) is None:\n"
+        "        db.add(Note(id=note_id, body=body))\n",
+        encoding="utf-8",
+    )
+    registration = project / "tools" / "registration.py"
+    registration.write_text(
+        registration.read_text(encoding="utf-8").replace(
+            '"""\n\n', '"""\n\nfrom operations.notes import note_body  # noqa: F401\n', 1
+        ),
+        encoding="utf-8",
+    )
+    assert "from operations.notes import note_body" in registration.read_text(encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
 
 
 def _generated_project(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Path:
