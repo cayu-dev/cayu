@@ -266,6 +266,24 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "source_not_found"),
         (429, "too_many_previews"),
         (504, "source_fetch_timeout"),
+        # `cayu cloud gateway`: the Gateway's management refusals, in its own `error` envelope;
+        # each message says what to do (`_cloud_gateway`).
+        (400, "unsupported_request"),
+        (401, "invalid_key"),
+        (401, "unauthenticated"),
+        (403, "forbidden"),
+        (403, "model_not_allowed"),
+        (403, "personal_keys_unavailable"),
+        (409, "alert_conflict"),
+        (409, "delegation_conflict"),
+        (409, "key_conflict"),
+        (409, "key_publication_unknown"),
+        (409, "no_models"),
+        (409, "outcome_unknown"),
+        (422, "invalid_input"),
+        (503, "gateway_unavailable"),
+        (503, "not_enrolled"),
+        (503, "unavailable"),
     }
 )
 
@@ -713,6 +731,8 @@ def _object_store_error(content: bytes) -> str | None:
 
 
 def _structured_api_error(response: httpx.Response) -> tuple[str, dict[str, Any]] | None:
+    """Cloud's structured refusal: FastAPI's `detail` object, or the Gateway's `error` one."""
+
     try:
         payload = response.json()
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -720,6 +740,8 @@ def _structured_api_error(response: httpx.Response) -> tuple[str, dict[str, Any]
     if not isinstance(payload, dict):
         return None
     detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        detail = payload.get("error")
     if not isinstance(detail, dict):
         return None
     code = detail.get("code")

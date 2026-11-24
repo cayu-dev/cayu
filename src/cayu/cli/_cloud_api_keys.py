@@ -159,13 +159,24 @@ def _read_key_file(path: Path) -> str:
 
 
 def _write_new_private_file(path: Path, value: str) -> None:
+    write_private_file(new_private_file(path), path, value)
+
+
+def new_private_file(path: Path) -> int:
+    """Create ``path`` as a new file only its owner can read, and open it for writing."""
+
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags, 0o600)
+        return os.open(path, flags, 0o600)
     except FileExistsError:
         raise ApiKeyFileError(f"The key file {path} already exists; choose a new path.") from None
     except OSError as exc:
         raise ApiKeyFileError(f"Could not create the key file {path}: {exc.strerror}.") from None
+
+
+def write_private_file(descriptor: int, path: Path, value: str) -> None:
+    """Write ``value`` to the file `new_private_file` opened, removing it if that fails."""
+
     try:
         with os.fdopen(descriptor, "w") as destination:
             destination.write(value + "\n")

@@ -50,6 +50,8 @@ top-level commands are:
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
+- `gateway keys|models|limits|usage` for the Organization's
+  [Gateway keys, model policy, limits and usage](#gateway-keys-models-limits-and-usage);
 - `connectors` and `connections list|show|add|authorize|check|activity|repositories|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
@@ -1196,7 +1198,9 @@ are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollb
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
 `compass findings accept|dismiss`, `compass grants propose|approve|reject|revoked|keep`,
 `eval run|baseline`, `eval runs cancel`,
-`api-keys create|revoke` and `connections add|authorize|agents|rotate|remove|bind|unbind`. Commands that
+`api-keys create|revoke`, `gateway keys create|rotate|restrict|revoke`,
+`gateway models set`, `gateway limits set|alerts` and
+`connections add|authorize|agents|rotate|remove|bind|unbind`. Commands that
 only read say nothing.
 
 Each Agent also remembers where it deploys. The first successful `cayu cloud deploy` of an Agent
@@ -2576,6 +2580,150 @@ Cloud kept (or keeps it now), or check with `cayu cloud api-keys list`.
 To rotate a key, create its replacement, move its holder to the new key file, then revoke the
 old key. A revoked key stops working at once and stays listed as inactive. The results report
 each key's `id`, `name`, `scopes`, `active` and `created_at`, never the key.
+
+## Gateway keys, models, limits and usage
+
+Agents and people call models through the install's Gateway with Gateway keys. `cayu cloud
+gateway` manages them, the models they may use, spending limits and usage, through the Gateway
+management API that a Cayu Cloud serves when its operator turns it on (where the Gateway runs
+and people sign in through WorkOS or OIDC). Every command needs a signed-in person
+(`cayu cloud login`); an Organization API key can't manage the Gateway.
+
+| | Admin | Developer | Member |
+|---|---|---|---|
+| Keys for the Organization and its Agents: create, list, show, audit, rotate, restrict, revoke | yes | no | no |
+| Organization, Agent and key models and limits; alert budgets | yes | no | no |
+| Catalog, usage, requests, Runtime model status | yes | no | no |
+| Personal keys, within an admin's allowance, where the install offers them | yes | yes | no |
+
+Personal keys aren't offered yet: no install turns them on until the Gateway can check a
+person's membership when it serves their requests, and OIDC installs never offer them. Until
+then `keys create --personal`, `keys list --mine` and `keys allowance` are refused with
+`personal_keys_unavailable`, and an admin creates a key for an Agent or a service key instead.
+
+### Keys
+
+```console
+cayu cloud gateway keys create --name ci-evals --model claude-sonnet --model claude-haiku \
+  --expires 30d --application my-agent --key-file ~/.config/cayu/ci-evals-key
+cayu cloud gateway keys list --application my-agent
+cayu cloud gateway keys show KEY_ID
+cayu cloud gateway keys audit KEY_ID
+cayu cloud gateway keys restrict KEY_ID --model claude-haiku --expires 7d
+cayu cloud gateway keys rotate KEY_ID --key-file ~/.config/cayu/ci-evals-key-2
+cayu cloud gateway keys revoke KEY_ID
+cayu cloud gateway keys allowance
+```
+
+`create` makes a service key for the Organization, or for one Agent with `--application`;
+`--personal` makes your own key instead, where the install offers personal keys, which must
+fit the allowance an admin gave you (`keys allowance` shows it). `--model` (repeat it) names the models the key may call and
+`--expires` when it stops working, as a duration (`30d`, `12h`) or a time with its offset.
+`--scope inference|receipts` (repeat it) says what it may do; the default is `inference`.
+
+A key's token is shown once: `create` and `rotate` print it in the result as `token`, or, with
+`--key-file` (as for `api-keys create`), write it to a new file only you can read and report its
+path as `key_file` instead. The file is created before Cloud is asked, so an existing or unwritable path is refused
+before any key exists, and it is removed when Cloud refuses. No command takes a token as an
+argument or prints one again. If the answer to `create` or `rotate` is lost, Cloud may have
+made the key without the token reaching you; the error says so, and `keys list` or `keys audit`
+finds the key to revoke. If Cloud answers `key_publication_unknown`, it couldn't confirm whether
+the key was published: the error names the key to check with `keys audit` and revoke before
+making a replacement, and after a rotation the old token may already have stopped working.
+
+`--cap PERIOD=USD` on `create` (repeat it per period) also caps the new key's spend. Cloud sets
+caps once the key exists, so `--cap` needs `--key-file`: if the caps are refused, the key and
+its token file stay, and the error names the `limits set --key` command to finish or the key to
+revoke. `restrict` only narrows a key (fewer models or scopes, an earlier expiry); what it isn't
+given is kept. A model or scope the key doesn't have, or a later expiry, is refused before
+asking Cloud with `gateway_key_widening`: create a new key instead. `rotate` issues a new key
+with the same models, scopes, expiry and limits, and the old token stops working. `revoke` stops
+a key at once; requests it already started run to settlement. Revoking a revoked key succeeds
+with `already_revoked`, and `restrict` or `rotate` of one is refused with `gateway_key_revoked`.
+Each change reads the key first and sends its current revision, so a key changed in between is
+refused with `key_conflict`: run the command again.
+
+Cloud keeps some keys for itself (an Agent's own Gateway key, an evaluation's, Console's). They
+are listed and can be revoked, but not made, rotated or restricted here.
+
+### Models
+
+```console
+cayu cloud gateway models catalog
+cayu cloud gateway models show
+cayu cloud gateway models show --application my-agent
+cayu cloud gateway models set --model claude-sonnet --model claude-haiku --default claude-sonnet
+cayu cloud gateway models set --application my-agent --default claude-haiku
+cayu cloud gateway models status --application my-agent
+```
+
+`catalog` lists the models the Gateway serves, with their prices. `show` reads the model policy
+at Organization scope, or for an Agent (`--application`) or key (`--key KEY_ID`) beside the
+Organization's: each policy's models and default, the models the scope may use (those every
+policy allows), its default and whether the Organization locks every Agent to its default.
+`set` changes the Organization's policy, or an Agent's with `--application`: `--model` (repeat
+it) replaces the models it allows, `--default MODEL` or `--no-default` its default, and
+`--lock`/`--unlock` the Organization's lock. What isn't given is kept. A scope with no policy
+gets one; an Agent's new policy allows the Organization's models unless `--model` names fewer.
+When a scope has several policies, `--policy POLICY_ID` names the one to change. A key's models
+are its own (`keys restrict`). `status` shows which model each of the Agent's Runtime replicas
+installed and why it refused a policy, if it did.
+
+### Limits
+
+```console
+cayu cloud gateway limits show
+cayu cloud gateway limits set --cap monthly=500 --cap daily=50
+cayu cloud gateway limits set --application my-agent --cap weekly=100 --remove-cap daily
+cayu cloud gateway limits set --key KEY_ID --cap monthly=25
+cayu cloud gateway limits alerts --budget monthly=400 --thresholds 50,80,100
+```
+
+Caps (`--cap PERIOD=USD`, daily, weekly or monthly) refuse requests past them; zero forbids
+spend, and `--remove-cap PERIOD` removes one. Other periods' caps are kept. Organization caps
+apply to everything in the Organization, an Agent's to the Agent and a key's to the key.
+`limits alerts` sets alert budgets (`--budget PERIOD=USD`, `--remove-budget PERIOD`): admins
+are alerted as spend crosses each `--thresholds` percentage, which defaults to 50, 80 and 100
+for a new budget. `limits show` lists the scope's caps beside the Organization's, and its alert
+budgets. A `lifetime` cap is the Gateway's own (an evaluation's spend limit) and can't be
+changed here.
+
+Each change reads the policy first and names what it read, so Cloud refuses it if the policy
+changed in between; run the command again. If Cloud can't say whether a change was applied,
+the error names its operation and says to read the policy back before changing it again.
+
+### Usage
+
+```console
+cayu cloud gateway usage agent --application my-agent
+cayu cloud gateway usage agent --application my-agent --since 2026-11-01T00:00:00Z
+cayu cloud gateway usage request REQUEST_ID
+```
+
+`usage agent` lists the Agent's settled requests with their cost, and totals by model, model
+level and model slot, a page at a time (`--limit`, `--cursor`). `--all` reads every page (up to
+100) and totals them; `--since` and `--until` read every page and keep the requests made in that
+time. A page can be empty and still have more after it, so while a cursor remains the totals are
+only so far: `complete` is false, the text says "Total so far", and `--cursor` goes on. An
+evaluation's requests, made with its own key, count apart as `by_evaluation`; Cloud gives them
+no times, so in a time window they still cover every page read (`evaluations_windowed: false`). `usage request` shows one request (`X-Cayu-Request-Id`) and its
+settlement, or with `--evidence` its retained evidence.
+
+### When Cloud refuses
+
+- A Cayu Cloud that doesn't serve Gateway management, or one part of it, answers with category
+  `gateway_management_off`, and one older than Gateway management with
+  `gateway_management_unavailable`; `gateway_management_unknown` means the check itself failed.
+- `personal_keys_unavailable` (HTTP 403): the install offers no personal keys; an admin creates
+  a key for an Agent or a service key instead.
+- `not_enrolled` (HTTP 503): the Organization or Agent isn't set up in the Gateway yet, which
+  Cloud does within seconds; nothing was changed, so run the command again shortly.
+- `no_models` (HTTP 409): the Organization allows no models, so an Agent can't have keys until
+  an admin chooses them with `gateway models set --model`.
+- `forbidden` (HTTP 403): the message says why: you aren't an admin, the personal key is outside
+  your allowance, or the key is one Cloud keeps. For a key named by id, Cloud refuses a key that
+  doesn't exist and one you may not manage alike, so the message says it wasn't found or isn't
+  yours to manage.
 
 ## Connections
 

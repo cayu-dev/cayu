@@ -75,6 +75,7 @@ from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeployme
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
 from cayu.cli._cloud_evidence import EvidenceRecorder
+from cayu.cli._cloud_gateway import add_gateway_parser, gateway_command
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
     CloudSourceInputsError,
@@ -182,6 +183,12 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("eval", "baseline"): "agent",
     ("api-keys", "create"): "organization",
     ("api-keys", "revoke"): "organization",
+    # An optional --application names the Agent a Gateway change acts on.
+    ("gateway", "keys", "create"): "agent",
+    **{("gateway", "keys", action): "organization" for action in ("rotate", "restrict", "revoke")},
+    ("gateway", "models", "set"): "agent",
+    ("gateway", "limits", "set"): "agent",
+    ("gateway", "limits", "alerts"): "agent",
     **{
         ("connections", action): "organization"
         for action in ("add", "agents", "authorize", "rotate", "remove")
@@ -1590,6 +1597,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_data_parser(commands)
 
     add_api_keys_parser(commands)
+    add_gateway_parser(commands)
 
     add_connections_parsers(commands, seconds=_positive_finite_seconds)
     add_models_parser(commands)
@@ -2734,6 +2742,16 @@ def _client_command(
         )
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
+    if arguments.command == "gateway":
+        return gateway_command(
+            arguments,
+            client=client,
+            application_id=(
+                _application_id(client, arguments.application)
+                if getattr(arguments, "application", None)
+                else None
+            ),
+        )
     if arguments.command == "connectors":
         return connectors_command(arguments, client)
     if arguments.command == "connections":
