@@ -47465,6 +47465,158 @@
         "title": "TaskAggregateFilter",
         "type": "object"
       },
+      "TaskBulkCancelBody": {
+        "additionalProperties": false,
+        "description": "Which tasks to cancel (as `GET /tasks` filters them), why, and how long to wait.",
+        "properties": {
+          "assigned_agent_name": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assigned Agent Name"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "object"
+          },
+          "max_tasks": {
+            "default": 1000,
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Tasks",
+            "type": "integer"
+          },
+          "parent_task_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Task Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          },
+          "types": {
+            "anyOf": [
+              {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Types"
+          },
+          "wait_seconds": {
+            "default": 0.0,
+            "maximum": 60.0,
+            "minimum": 0.0,
+            "title": "Wait Seconds",
+            "type": "number"
+          }
+        },
+        "title": "TaskBulkCancelBody",
+        "type": "object"
+      },
+      "TaskBulkCancellation": {
+        "additionalProperties": false,
+        "description": "What ``cancel_tasks`` did to the tasks its query matched.",
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "refused": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TaskCancellationRefusal"
+            },
+            "title": "Refused",
+            "type": "array"
+          },
+          "settled": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Settled",
+            "type": "array"
+          },
+          "stopping": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Stopping",
+            "type": "array"
+          }
+        },
+        "title": "TaskBulkCancellation",
+        "type": "object"
+      },
       "TaskCancelBody": {
         "additionalProperties": false,
         "description": "Why the task is cancelled; recorded as its error (``task_cancelled``).",
@@ -47484,6 +47636,26 @@
           }
         },
         "title": "TaskCancelBody",
+        "type": "object"
+      },
+      "TaskCancellationRefusal": {
+        "additionalProperties": false,
+        "description": "A matching task the store would not cancel, and why.",
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "reason"
+        ],
+        "title": "TaskCancellationRefusal",
         "type": "object"
       },
       "TaskCountDifference": {
@@ -65692,6 +65864,45 @@
           }
         },
         "summary": "Create Task"
+      }
+    },
+    "/api/tasks/cancellations": {
+      "post": {
+        "description": "Cancel every unfinished task the filters match (at least one filter), as `POST /tasks/{task_id}/cancel` cancels one, and wait up to `wait_seconds` for them to settle. `has_more` says more matched than `max_tasks`; send it again.",
+        "operationId": "cancel_matching_tasks_api_tasks_cancellations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskBulkCancelBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskBulkCancellation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Matching Tasks"
       }
     },
     "/api/tasks/counts/check": {

@@ -1000,7 +1000,15 @@ applies the same lifecycle and full-access checks as the dashboard.
 `--payload-file` accepts a JSON object of hold details. `resume` returns a held,
 blocked or attention-needed task to the queue (`POST /api/tasks/{task_id}/resume`).
 `cancel` uses `POST /api/tasks/{task_id}/cancel`, so a task a worker is running shows
-`cancellation_requested` until its worker stops. `replay` queues a new task of the same
+`cancellation_requested` until its worker stops. Without a task id, `cayu task cancel --label job=close --wait 30`
+cancels every unfinished task the filters (`--label`, `--type`, `--session`, `--parent`) match
+through `POST /api/tasks/cancellations`, and waits up to `--wait` seconds (at most 60) for them
+to settle. It prints the tasks that `settled`, those still `stopping` when the wait ended,
+those the store `refused` (such as a managed schedule) and `has_more` when more than 1,000
+matched; send it again for the rest. The route refuses a request with no filter. In Python,
+`cayu.tasks.bulk_cancellation.cancel_tasks(store, TaskQuery(labels={"job": "close"}),
+wait_seconds=30)` does the same on any task store and returns a `TaskBulkCancellation`.
+`replay` queues a new task of the same
 declared type and input, as the dashboard's replay does: it reads
 `GET /api/tasks/{task_id}/replay` and refuses with its `unavailable_reason` (such as
 `task_type_not_declared`) when the agent can't replay the task. Keep `--operation-id`

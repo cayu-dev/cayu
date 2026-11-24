@@ -323,6 +323,7 @@ _FULL_ACCESS_MUTATIONS: dict[str, frozenset[tuple[str, str]]] = {
             ("POST", "/tasks/scrub-errors"),
             ("POST", "/tasks/{task_id}/block"),
             ("POST", "/tasks/{task_id}/cancel"),
+            ("POST", "/tasks/cancellations"),
             ("POST", "/tasks/{task_id}/needs-attention"),
             ("POST", "/tasks/{task_id}/pause"),
             ("POST", "/tasks/{task_id}/replay"),

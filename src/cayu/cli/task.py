@@ -184,11 +184,34 @@ def add_task_parser(subparsers: Any) -> None:
             "(30 seconds by default) and then cancels it, so its running sessions end "
             "interrupted, unless the worker was started with interrupt_on_cancel=False. "
             "Tasks that depend on it are then skipped. "
-            "Inspect the result with `cayu task show TASK_ID`."
+            "Inspect the result with `cayu task show TASK_ID`. "
+            "Without a task id, cancel every unfinished task the filters match, such as "
+            "`cayu task cancel --label job=close --wait 30`, and wait for them to settle."
         ),
     )
-    cancel.add_argument("task_id")
+    cancel.add_argument("task_id", nargs="?")
     cancel.add_argument("--reason", help="Why, recorded as the task's cancellation message.")
+    cancel.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Without a task id: only tasks created with this label. Repeat for several.",
+    )
+    cancel.add_argument("--type", help="Without a task id: only tasks of this type.")
+    cancel.add_argument(
+        "--session", metavar="SESSION_ID", help="Without a task id: only this session's tasks."
+    )
+    cancel.add_argument(
+        "--parent", metavar="TASK_ID", help="Without a task id: only this task's children."
+    )
+    cancel.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Without a task id: wait up to this long (at most 60) for the tasks to settle.",
+    )
     add_action_target_options(cancel)
     resume = commands.add_parser(
         "resume",

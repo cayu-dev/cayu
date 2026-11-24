@@ -129,6 +129,8 @@ def _mutation_result(args: argparse.Namespace, body: dict[str, Any], result: Any
                 raise invalid
             # These keys are caller-selected node identities, not secret field names.
             return {"graph_id": result["graph_id"], "task_ids": dict(task_ids)}
+        if args.task_command == "cancel" and args.task_id is None:
+            return _bulk_cancellation_result(result)
         if args.task_command == "replay":
             if not _receipt_identity(result.get("task_id")):
                 raise invalid
@@ -207,6 +209,55 @@ def knowledge_addition_body(args: argparse.Namespace) -> dict[str, Any]:
         if value is not None:
             body[name] = require_durable_clean_nonblank(value, f"--{name.replace('_', '-')}")
     return body
+
+
+def bulk_cancellation_body(args: argparse.Namespace) -> dict[str, Any]:
+    """The `POST /tasks/cancellations` body for `cayu task cancel` without a task id."""
+
+    from cayu.cli.session import _parse_labels
+
+    body: dict[str, Any] = {
+        key: value
+        for key, value in {
+            "type": args.type,
+            "session_id": args.session,
+            "parent_task_id": args.parent,
+        }.items()
+        if value is not None
+    }
+    labels = _parse_labels(args.label)
+    if labels:
+        body["labels"] = labels
+    if not body:
+        raise ValueError("Give a task id, or --label, --type, --session or --parent.")
+    if not 0 <= args.wait <= 60:
+        raise ValueError("--wait must be 0 to 60 seconds.")
+    body["wait_seconds"] = args.wait
+    if args.reason is not None:
+        body["reason"] = require_durable_nonblank(args.reason, "--reason")
+    return body
+
+
+def _bulk_cancellation_result(result: dict[str, Any]) -> dict[str, Any]:
+    invalid = CayuApiError("outcome_unknown", "The mutation returned an unusable receipt.")
+    settled, stopping, refused = (result.get(key) for key in ("settled", "stopping", "refused"))
+    if (
+        not isinstance(settled, list)
+        or not isinstance(stopping, list)
+        or not isinstance(refused, list)
+        or not isinstance(result.get("has_more"), bool)
+        or not all(_receipt_identity(task_id) for task_id in [*settled, *stopping])
+        or not all(
+            isinstance(item, dict) and _receipt_identity(item.get("task_id")) for item in refused
+        )
+    ):
+        raise invalid
+    return {
+        "settled": list(settled),
+        "stopping": list(stopping),
+        "refused": [{"task_id": item["task_id"], "reason": item.get("reason")} for item in refused],
+        "has_more": result["has_more"],
+    }
 
 
 def _task_action_settled(command: str, task: dict[str, Any]) -> bool:
@@ -319,6 +370,8 @@ def run_action(args: argparse.Namespace) -> int:
                     elif command == "graph-create":
                         path, body = "/task-graphs", json_object_file(args.file)
                         body["operation_id"] = operation
+                    elif command == "cancel" and args.task_id is None:
+                        path, body = "/tasks/cancellations", bulk_cancellation_body(args)
                     elif command in {"cancel", "resume", "replay"}:
                         path = f"/tasks/{quote(args.task_id, safe='')}/{command}"
                         reason = getattr(args, "reason", None)
@@ -341,6 +394,9 @@ def run_action(args: argparse.Namespace) -> int:
                         body["reason"] = require_durable_nonblank(args.reason, "--reason")
                     if getattr(args, "revision", None) is not None:
                         body["expected_revision"] = args.revision
+                if args.command == "task" and path == "/tasks/cancellations":
+                    # The route answers once its wait ends; leave room past it.
+                    args.timeout_seconds = max(args.timeout_seconds, args.wait + 30)
                 api = open_action_api(args)
                 replay_record: Path | None = None
                 if args.command == "task" and args.task_command == "replay":

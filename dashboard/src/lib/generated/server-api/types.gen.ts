@@ -23808,6 +23808,77 @@ export type TaskAggregateFilter = {
 };
 
 /**
+ * TaskBulkCancelBody
+ *
+ * Which tasks to cancel (as `GET /tasks` filters them), why, and how long to wait.
+ */
+export type TaskBulkCancelBody = {
+    /**
+     * Assigned Agent Name
+     */
+    assigned_agent_name?: string | null;
+    /**
+     * Labels
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    /**
+     * Max Tasks
+     */
+    max_tasks?: number;
+    /**
+     * Parent Task Id
+     */
+    parent_task_id?: string | null;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    status?: TaskStatus | null;
+    /**
+     * Type
+     */
+    type?: string | null;
+    /**
+     * Types
+     */
+    types?: Array<string> | null;
+    /**
+     * Wait Seconds
+     */
+    wait_seconds?: number;
+};
+
+/**
+ * TaskBulkCancellation
+ *
+ * What ``cancel_tasks`` did to the tasks its query matched.
+ */
+export type TaskBulkCancellation = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Refused
+     */
+    refused?: Array<TaskCancellationRefusal>;
+    /**
+     * Settled
+     */
+    settled?: Array<string>;
+    /**
+     * Stopping
+     */
+    stopping?: Array<string>;
+};
+
+/**
  * TaskCancelBody
  *
  * Why the task is cancelled; recorded as its error (``task_cancelled``).
@@ -23817,6 +23888,22 @@ export type TaskCancelBody = {
      * Reason
      */
     reason?: string | null;
+};
+
+/**
+ * TaskCancellationRefusal
+ *
+ * A matching task the store would not cancel, and why.
+ */
+export type TaskCancellationRefusal = {
+    /**
+     * Reason
+     */
+    reason: string;
+    /**
+     * Task Id
+     */
+    task_id: string;
 };
 
 /**
@@ -33664,6 +33751,31 @@ export type CreateTaskApiTasksPostResponses = {
 };
 
 export type CreateTaskApiTasksPostResponse = CreateTaskApiTasksPostResponses[keyof CreateTaskApiTasksPostResponses];
+
+export type CancelMatchingTasksApiTasksCancellationsPostData = {
+    body: TaskBulkCancelBody;
+    path?: never;
+    query?: never;
+    url: '/api/tasks/cancellations';
+};
+
+export type CancelMatchingTasksApiTasksCancellationsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CancelMatchingTasksApiTasksCancellationsPostError = CancelMatchingTasksApiTasksCancellationsPostErrors[keyof CancelMatchingTasksApiTasksCancellationsPostErrors];
+
+export type CancelMatchingTasksApiTasksCancellationsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskBulkCancellation;
+};
+
+export type CancelMatchingTasksApiTasksCancellationsPostResponse = CancelMatchingTasksApiTasksCancellationsPostResponses[keyof CancelMatchingTasksApiTasksCancellationsPostResponses];
 
 export type CheckTaskCountsApiTasksCountsCheckGetData = {
     body?: never;
