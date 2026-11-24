@@ -2225,6 +2225,41 @@ An app with a login of its own needs no change: it never reads the header. The
 header's format and the server's checks are in the
 [runtime contracts](runtime-contracts.md#trusted-proxy-identity).
 
+### The Organization's People
+
+The signed-in person comes from the request. To know who else is in the
+Organization, for example to share a record with a colleague or list who can
+approve, read Cloud's People directory with `cayu.cloud_people`. It uses the
+Agent's own Cloud credential, so the Agent needs no Organization API key:
+
+```python
+from cayu.cloud_people import agent_people, find_person, people_directory
+
+directory = people_directory()  # Cloud's on Cayu Cloud, the local stand-in elsewhere
+everyone = await directory.list_people()  # Person(user_id, role, name, email, on_agent)
+on_this_agent = await agent_people(directory)
+reviewer = await find_person(directory, reviewer_user_id)  # a user_id from list_people()
+```
+
+`role` is the person's Organization role (`admin`, `developer` or `member`), and
+`on_agent` says whether they are one of the Agent's people. Cloud gives `name` and
+`email` only for the Agent's own people; everyone else has `None` there and is known
+by `user_id` and `role`. Each call reads Cloud afresh, so cache the list if the app
+reads it often.
+
+On Cayu Cloud the directory is read at `CAYU_PEOPLE_URL` with
+`CAYU_ATTENTION_HANDOFF_TOKEN`, which Cloud binds on every Agent process. This
+needs a Cayu Cloud that serves the People directory to Agents: on one that
+doesn't, `people_directory()` and `list_people()` raise
+`PeopleDirectoryUnsupported` rather than falling back to the stand-in. A refused
+credential, an unreadable directory or a network failure raise
+`PeopleDirectoryUnavailable`, with Cloud's error code in `code` when it gave one.
+
+Outside Cayu Cloud, such as under `cayu serve --dev`, `people_directory()` returns
+a `StaticPeopleDirectory` of the people in `[tool.cayu.serve.identity_proxy]`, the
+ones `--identity-proxy` signs in as, each marked as working with the Agent. Pass
+`local=StaticPeopleDirectory([...])` to use other people, for example in tests.
+
 ## Runs and human touches
 
 An Agent reports its runs and the decisions people made on them to Cayu Cloud
