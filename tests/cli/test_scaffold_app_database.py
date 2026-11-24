@@ -98,7 +98,7 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
         filter(None, (source_root, environment.get("PYTHONPATH")))
     )
 
-    def generated_suite(extra: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def generated_suite(extra: dict[str, str], *paths: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -107,7 +107,7 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
                 "-v",
                 "-p",
                 "no:cacheprovider",
-                "tests/test_app_database.py",
+                *(paths or ("tests/test_app_database.py",)),
             ],
             cwd=project,
             env={**environment, **extra},
@@ -132,6 +132,25 @@ def test_generated_suite_runs_without_a_database_and_against_postgres(
     assert "SKIPPED" not in online.stdout
     assert "test_more_async_callers_than_connections_all_finish PASSED" in online.stdout
     assert "test_a_lock_holds_until_its_transaction_ends PASSED" in online.stdout
+
+    # Another test module takes the migrated database the way the guidance says.
+    (project / "tests" / "test_notes_elsewhere.py").write_text(
+        "from database import session\n"
+        "from database.models import Note\n"
+        "from test_app_database import migrated_database, requires_postgres  # noqa: F401\n\n\n"
+        "@requires_postgres\n"
+        "def test_a_note_is_stored(migrated_database) -> None:\n"
+        "    with session.session() as db, db.begin():\n"
+        '        db.add(Note(body="elsewhere"))\n'
+        "    with session.session() as db:\n"
+        "        assert db.query(Note).count() == 1\n",
+        encoding="utf-8",
+    )
+    elsewhere = generated_suite(
+        {"CAYU_TEST_POSTGRES_DSN": _postgres_server_dsn}, "tests/test_notes_elsewhere.py"
+    )
+    assert elsewhere.returncode == 0, elsewhere.stdout + elsewhere.stderr
+    assert "test_a_note_is_stored PASSED" in elsewhere.stdout
 
 
 def test_async_code_that_runs_its_queries_in_a_thread_passes_cayu_check(

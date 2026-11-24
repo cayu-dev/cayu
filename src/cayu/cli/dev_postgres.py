@@ -22,14 +22,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+# The variable the generated tests read for a server where they may create databases.
+from cayu.testing.postgres import TEST_SERVER_VARIABLE
+
 # Pinned to a digest, as the generated CI's actions are to commits. The generated CI's
 # PostgreSQL service reads this constant too, so the two never drift apart.
 POSTGRES_IMAGE = (
     "postgres:17-alpine@sha256:d3244e8ce3f165ee3c93d9c4a4b1d0fe48b3a89e2287b717fdcbbde92d405065"
 )
 POSTGRES_PASSWORD = "postgres"
-# The variable the generated tests read for a server where they may create databases.
-TEST_SERVER_VARIABLE = "CAYU_TEST_POSTGRES_DSN"
 PROJECT_LABEL = "dev.cayu.postgres.project"
 _CONTAINER_PORT = "5432/tcp"
 _HOST = "127.0.0.1"

@@ -608,6 +608,19 @@ or Alembic dependency: the generated project does.
   autogenerate finds nothing to change. `eval "$(cayu dev postgres up --export)"`
   starts a throwaway server for the project in Docker, the image the generated CI
   uses, and sets that variable; `cayu dev postgres down` removes it.
+- Tests that read and write the application's tables take the generated
+  `migrated_database` fixture: a scratch database on `CAYU_TEST_POSTGRES_DSN` with
+  Cayu's tables and the application's built by their migrations, not by `create_all`,
+  dropped afterwards; another test module takes it with
+  `from test_app_database import migrated_database`. It comes from
+  `cayu.testing.postgres.scratch_database()`, which
+  other test code can call directly (`cayu_migrations=False` or `app_migrations=False`
+  leaves either set out).
+- `cayu dev postgres scratch -- COMMAND` runs a command, such as
+  `uv run cayu eval run`, with `CAYU_DATABASE_URL` naming a freshly migrated scratch
+  database, drops it afterwards and exits with the command's status. The server is
+  `--server`, else `CAYU_TEST_POSTGRES_DSN`, else the project's `cayu dev postgres up`
+  server.
 
 `cayu check` reports `SCAFFOLD_PLAN_DRIFT` with field `storage` when the storage
 module constructs a fixed SQLite or Postgres store, or when

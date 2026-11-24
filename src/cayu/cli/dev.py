@@ -1,7 +1,8 @@
 """`cayu dev`: local development helpers for a project.
 
 `cayu dev postgres up|url|down` starts, reports and removes a throwaway PostgreSQL server for
-the project's tests (`cayu.cli.dev_postgres`). The server is what the generated CI gives the
+the project's tests (`cayu.cli.dev_postgres`). `cayu dev postgres scratch -- COMMAND` runs a
+command against a migrated scratch database on it (`cayu.testing.postgres`). The server is what the generated CI gives the
 tests, so `eval "$(cayu dev postgres up --export)"` before `pytest` runs locally what CI runs.
 """
 
@@ -9,14 +10,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from cayu.cli import dev_postgres
 from cayu.cli.dev_postgres import TEST_SERVER_VARIABLE, DevPostgres, DevPostgresError
+from cayu.testing.postgres import ScratchDatabaseError, database_environment, scratch_database
 
 _VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -79,6 +83,36 @@ def add_dev_parser(subparsers: Any) -> None:
         ),
     )
     _add_project(down)
+    scratch = actions.add_parser(
+        "scratch",
+        help="Run a command against a migrated scratch database, then drop it.",
+        description=(
+            "Create a scratch database on the server, run `cayu storage migrate` and, when the "
+            "project has an alembic.ini, `alembic upgrade head`, then run COMMAND with "
+            "CAYU_DATABASE_URL naming the scratch database, and drop it afterwards. For evals "
+            "and tests that need the application's tables: "
+            "`cayu dev postgres scratch -- uv run cayu eval run`. Exits with COMMAND's status."
+        ),
+    )
+    scratch.add_argument(
+        "--server",
+        help=(
+            f"A server where databases may be created (default: {TEST_SERVER_VARIABLE}, then "
+            "this project's `cayu dev postgres up` server)."
+        ),
+    )
+    scratch.add_argument(
+        "--no-cayu-migrations",
+        action="store_true",
+        help="Leave out Cayu's own tables (`cayu storage migrate`).",
+    )
+    scratch.add_argument(
+        "--no-app-migrations",
+        action="store_true",
+        help="Leave out the application's Alembic migrations.",
+    )
+    _add_project(scratch)
+    scratch.add_argument("scratch_command", nargs=argparse.REMAINDER, metavar="-- COMMAND")
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -113,8 +147,10 @@ def run_dev(args: argparse.Namespace) -> int:
             return _up(args, project)
         if args.postgres_command == "url":
             return _url(args, project)
+        if args.postgres_command == "scratch":
+            return _scratch(args, project)
         return _down(project)
-    except DevPostgresError as exc:
+    except (DevPostgresError, ScratchDatabaseError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
@@ -162,6 +198,33 @@ def _down(project: Path) -> int:
     else:
         print(f"Removed {removed} and its data.", file=sys.stderr)
     return 0
+
+
+def _scratch(args: argparse.Namespace, project: Path) -> int:
+    command = list(args.scratch_command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        print("error: name the command to run after `--`", file=sys.stderr)
+        return 2
+    server = args.server or os.environ.get(TEST_SERVER_VARIABLE, "").strip()
+    if not server:
+        running = dev_postgres.find(project)
+        if running is None:
+            print(
+                f"error: set {TEST_SERVER_VARIABLE} or pass --server, or start a server with "
+                "`cayu dev postgres up`.",
+                file=sys.stderr,
+            )
+            return 3
+        server = running.url
+    with scratch_database(
+        server,
+        project=project,
+        cayu_migrations=not args.no_cayu_migrations,
+        app_migrations=not args.no_app_migrations,
+    ) as url:
+        return subprocess.run(command, env=database_environment(url)).returncode
 
 
 def _print_server(args: argparse.Namespace, server: DevPostgres, *, started: bool | None) -> None:

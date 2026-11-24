@@ -334,6 +334,9 @@ _TEST = '''"""Application tables: hermetic checks always, PostgreSQL checks with
 Set `CAYU_TEST_POSTGRES_DSN` to a server where you may create databases; each test
 creates its own and drops it afterwards. Without it the PostgreSQL checks are skipped, unless
 `CAYU_REQUIRE_POSTGRES_TESTS=1` (as in the generated CI), which makes them fail instead.
+Tests of the application's own behavior take the `migrated_database` fixture: Cayu's tables
+and the application's, built by their migrations rather than `create_all`; other test modules
+import it from here (`from test_app_database import migrated_database, requires_postgres`).
 """
 
 from __future__ import annotations
@@ -342,14 +345,13 @@ import asyncio
 import contextlib
 import os
 import time
-from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.engine import URL
 
 from cayu.cli import main as cayu
+from cayu.testing.postgres import scratch_database
 from database import session
 from database.locks import lock, try_lock
 from database.models import SCHEMA, Base, Note
@@ -406,44 +408,42 @@ def test_nothing_connects_until_a_session_needs_the_database(monkeypatch) -> Non
         session.engine()
 
 
-@pytest.fixture
-def database(monkeypatch):
-    import psycopg
-    from psycopg import sql
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
+def _scratch(monkeypatch, *, migrated: bool):
     if not SERVER:
         pytest.fail(
             "CAYU_REQUIRE_POSTGRES_TESTS is set, so this test needs PostgreSQL: set "
             "CAYU_TEST_POSTGRES_DSN to a server where it may create databases."
         )
-    name = f"app_test_{uuid4().hex}"
-    with psycopg.connect(SERVER, autocommit=True) as connection:
-        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    parts = conninfo_to_dict(make_conninfo(SERVER, dbname=name))
-    host = parts.pop("host", None)
-    socket = host is not None and host.startswith("/")
-    url = URL.create(
-        "postgresql",
-        username=parts.pop("user", None),
-        password=parts.pop("password", None),
-        host=None if socket else host,
-        port=int(parts.pop("port")) if "port" in parts else None,
-        database=parts.pop("dbname"),
-        query={**parts, **({"host": host} if socket else {})},
-    ).render_as_string(hide_password=False)
-    monkeypatch.setenv("CAYU_DATABASE_URL", url)
-    monkeypatch.delenv("CAYU_DATABASE_DIRECT_URL", raising=False)
-    session.engine.cache_clear()
-    try:
-        yield url
-    finally:
-        session.engine().dispose()
+    with scratch_database(
+        SERVER, cayu_migrations=migrated, app_migrations=migrated, prefix="app_test"
+    ) as url:
+        monkeypatch.setenv("CAYU_DATABASE_URL", url)
+        monkeypatch.delenv("CAYU_DATABASE_DIRECT_URL", raising=False)
         session.engine.cache_clear()
-        with psycopg.connect(SERVER, autocommit=True) as connection:
-            connection.execute(
-                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name))
-            )
+        try:
+            yield url
+        finally:
+            session.engine().dispose()
+            session.engine.cache_clear()
+
+
+@pytest.fixture
+def database(monkeypatch):
+    """An empty scratch database, for the tests of the migrations themselves."""
+
+    yield from _scratch(monkeypatch, migrated=False)
+
+
+@pytest.fixture
+def migrated_database(monkeypatch):
+    """A scratch database migrated as a deploy migrates one: Cayu's tables, then the app's.
+
+    Use it for tests that read and write the application's tables, so they run on the schema
+    the migrations build, not on `Base.metadata.create_all`. Another test module takes it with
+    `from test_app_database import migrated_database, requires_postgres  # noqa: F401`.
+    """
+
+    yield from _scratch(monkeypatch, migrated=True)
 
 
 def _app_migrate() -> None:
@@ -487,8 +487,7 @@ def test_cayu_and_application_migrations_share_one_database_in_either_order(
 
 
 @requires_postgres
-def test_more_async_callers_than_connections_all_finish(database) -> None:
-    _app_migrate()
+def test_more_async_callers_than_connections_all_finish(migrated_database) -> None:
     callers = 3 * session.engine().pool.size()
 
     async def handler(n: int) -> int:
@@ -506,7 +505,7 @@ def test_more_async_callers_than_connections_all_finish(database) -> None:
 
 
 @requires_postgres
-def test_a_lock_holds_until_its_transaction_ends(database) -> None:
+def test_a_lock_holds_until_its_transaction_ends(migrated_database) -> None:
     with session.session() as first, first.begin():
         lock(first, "note:1")
         with session.session() as second, second.begin():
@@ -544,6 +543,12 @@ APP_DATABASE_TABLES = """- Application-owned records, such as orders, cases, mem
 - Code that creates rows under a deterministic key claims, then rechecks: inside the
   transaction, `lock(db, key)` from `database/locks.py`, then read again before
   writing. The lock ends with the transaction.
+- Tests that read and write these tables take the `migrated_database` fixture in
+  `tests/test_app_database.py` (another test module imports it:
+  `from test_app_database import migrated_database, requires_postgres  # noqa: F401`):
+  a scratch database built by both migrations. Evals run
+  against one with `uv run --no-sync cayu dev postgres scratch -- uv run --no-sync cayu
+  eval run`.
 - The tests that read and write these tables need a PostgreSQL server where they
   may create databases (`CAYU_TEST_POSTGRES_DSN`), and are skipped without one. Run
   `eval "$(uv run --no-sync cayu dev postgres up --export)"` before `uv run --no-sync
