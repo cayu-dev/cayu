@@ -41,6 +41,7 @@ from cayu.budgets.pricing import PriceBook, SessionCostTotals, default_price_boo
 from cayu.evals.store import EvalRunQuery, EvalRunStatus, EvalStore
 from cayu.events import EventType
 from cayu.runtime._cost_accounting import COST_EVENT_TYPES
+from cayu.session_metadata import TASK_METADATA_KEY
 from cayu.sessions._run_identity import (
     RUN_LINEAGE_METADATA_KEY,
     is_eval_trial,
@@ -66,6 +67,7 @@ from cayu.sessions.supervision_events import (
 )
 from cayu.tasks.abandoned import held_after_worker_loss
 from cayu.tasks.queries import TaskQuery
+from cayu.tasks.records import TaskStatus
 
 if TYPE_CHECKING:
     from cayu.applications import CayuApp
@@ -78,6 +80,8 @@ CLOUD_ACTIVITY_DEFAULT_LIMIT = 100
 CLOUD_ACTIVITY_MAX_LIMIT = 200
 #: The most tasks one ``CloudTaskHealth`` count reads.
 CLOUD_TASK_HEALTH_MAX_COUNT = 100
+#: The most running tasks whose progress one activity page carries.
+CLOUD_TASK_PROGRESS_MAX_COUNT = 100
 #: Where the schedule's eval-run counts stop.
 CLOUD_EVAL_RUN_MAX_COUNT = 100
 _EVAL_RUN_WAITING = (EvalRunStatus.QUEUED,)
@@ -154,6 +158,7 @@ class CloudContract(_ContractModel):
         "schedule",
         "external_event_waits",
         "eval_runs",
+        "task_progress",
     )
     store_id: str | None = None
 
@@ -271,6 +276,20 @@ class CloudRun(_ContractModel):
     tool_calls: int
     cost: CloudRunCost
     waiting_for: tuple[CloudWaitingItem, ...]
+    #: The task the run belongs to (it ran under the task's handler); its progress is
+    #: in the page's ``task_progress``.
+    task_id: str | None = None
+
+
+class CloudTaskProgress(_ContractModel):
+    """How far a running task got, as its handler reported it (``cayu.tasks.progress``):
+    ``done`` of ``total`` units and ``counts`` by outcome."""
+
+    task_id: str
+    done: int
+    total: int | None
+    counts: dict[str, int]
+    updated_at: datetime
 
 
 class CloudTouch(_ContractModel):
@@ -386,7 +405,10 @@ class CloudActivityPage(_ContractModel):
     Continue from ``next_cursor``. ``has_more`` says whether more activity was
     already available; when it is false, read again later from the same cursor.
     ``task_health`` is the agent's current task state, not a change since the
-    cursor; it is ``None`` when the agent has no task store.
+    cursor; it is ``None`` when the agent has no task store. ``task_progress`` is
+    likewise current, read with every page: the reported progress of the tasks
+    running now (at most ``CLOUD_TASK_PROGRESS_MAX_COUNT``), so a progress report
+    shows on the next page even when no run changed.
     """
 
     contract: str = _ACTIVITY_CONTRACT
@@ -395,6 +417,7 @@ class CloudActivityPage(_ContractModel):
     next_cursor: str
     has_more: bool
     task_health: CloudTaskHealth | None = None
+    task_progress: tuple[CloudTaskProgress, ...] = ()
 
 
 async def read_cloud_contract(app: CayuApp) -> CloudContract:
@@ -548,6 +571,7 @@ async def read_cloud_activity(
         next_cursor=_cursor(store_id, position, mark if last is None else _event_mark(last)),
         has_more=has_more,
         task_health=await read_cloud_task_health(app),
+        task_progress=await read_cloud_task_progress(app),
     )
 
 
@@ -717,10 +741,50 @@ def _bundled_price_book() -> PriceBook:
     return default_price_book()
 
 
+async def read_cloud_task_progress(app: CayuApp) -> tuple[CloudTaskProgress, ...]:
+    """The reported progress of the agent's running tasks, newest update first."""
+
+    store, tasks = app.task_progress_store, app.task_store
+    if store is None or tasks is None:
+        return ()
+    running = []
+    for status in (TaskStatus.RUNNING, TaskStatus.CLAIMED):
+        try:
+            running.extend(
+                await tasks.list_tasks(
+                    TaskQuery(status=status, limit=CLOUD_TASK_PROGRESS_MAX_COUNT)
+                )
+            )
+        except NotImplementedError:
+            return ()
+    found: list[CloudTaskProgress] = []
+    for task in running[:CLOUD_TASK_PROGRESS_MAX_COUNT]:
+        progress = await store.load_progress(task.id)
+        if progress is not None:
+            found.append(
+                CloudTaskProgress(
+                    task_id=_redacted(app, task.id),
+                    done=progress.done,
+                    total=progress.total,
+                    counts=progress.counts,
+                    updated_at=progress.updated_at,
+                )
+            )
+    return tuple(sorted(found, key=lambda item: item.updated_at, reverse=True))
+
+
+def _run_task_id(facts: SessionOverviewFacts) -> str | None:
+    value = facts.session.metadata.get(TASK_METADATA_KEY)
+    return value if isinstance(value, str) else None
+
+
 def _project_run(
-    app: CayuApp, facts: SessionOverviewFacts, parked: tuple[CloudWaitingItem, ...]
+    app: CayuApp,
+    facts: SessionOverviewFacts,
+    parked: tuple[CloudWaitingItem, ...],
 ) -> CloudRun:
     session, outcome, status = facts.session, facts.outcome, facts.status
+    task_id = _run_task_id(facts)
     steps, cost, release_id = facts.steps, facts.cost, facts.release_id
     origin = session.invocation.origin
     root_run_id, parent_run_id = session_run_lineage(session)
@@ -761,6 +825,7 @@ def _project_run(
             *(_waiting_item(app, action, child) for action, child in facts.waiting),
             *parked,
         ),
+        task_id=None if task_id is None else _redacted(app, task_id),
     )
 
 

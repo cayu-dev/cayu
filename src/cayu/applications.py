@@ -754,6 +754,7 @@ from cayu.tasks.graphs import (
     TaskGraphSnapshot,
 )
 from cayu.tasks.handler_cancellation import refuse_run_after_task_cancellation
+from cayu.tasks.progress import TaskProgressStore
 from cayu.tasks.records import Task
 from cayu.tasks.scheduling import (
     TaskRescheduleRequest,
@@ -963,6 +964,7 @@ class CayuApp(
         session_store: SessionStore | None = None,
         resource_access_policy: ResourceAccessPolicy | None = None,
         task_store: TaskStore | None = None,
+        task_progress_store: TaskProgressStore | None = None,
         knowledge_store: KnowledgeStore | None = None,
         knowledge_access_scope: KnowledgeAccessScope | None = None,
         knowledge_review_namespace: str | None = None,
@@ -1093,6 +1095,10 @@ class CayuApp(
             raise ValueError(
                 "A trusted budget binding receiver is required when common-root binding is enabled."
             )
+        if task_progress_store is not None and not isinstance(
+            task_progress_store, TaskProgressStore
+        ):
+            raise TypeError("task_progress_store must be a TaskProgressStore.")
         if event_watcher_store is not None and not isinstance(
             event_watcher_store,
             EventWatcherStore,
@@ -1254,6 +1260,7 @@ class CayuApp(
             if not isinstance(getattr(closure_store, "store_id", None), str):
                 raise TypeError("session_closure_stores must expose a string store_id.")
         self._task_store = task_store
+        self._task_progress_store = task_progress_store
         # Set when an agent registers a wake tool; task workers then reconcile wakes.
         self._uses_session_wakes = False
         self._external_wait_hosting: ExternalWaitHosting | None = None
@@ -6395,6 +6402,12 @@ class CayuApp(
         """The task store this app was built with, for example for ``run_task_worker``."""
 
         return self._task_store
+
+    @property
+    def task_progress_store(self) -> TaskProgressStore | None:
+        """Where the app's tasks report progress (``cayu.tasks.progress``), or ``None``."""
+
+        return self._task_progress_store
 
     @property
     def knowledge_store(self) -> KnowledgeStore | None:

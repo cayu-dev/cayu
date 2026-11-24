@@ -24,10 +24,14 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, require_durable_clean_nonblank
+
+if TYPE_CHECKING:
+    from cayu.applications import CayuApp
 
 #: The most outcome names one task's ``counts`` holds.
 TASK_PROGRESS_MAX_COUNTS = 32
@@ -220,9 +224,37 @@ class InMemoryTaskProgressStore(TaskProgressStore):
         return self._rows.pop(task_progress_key(task_id, "task_id"), None) is not None
 
 
+async def report_task_progress(
+    app: CayuApp,
+    *,
+    done: int = 0,
+    total: int | None = None,
+    counts: Mapping[str, int] | None = None,
+) -> TaskProgress:
+    """Report progress from inside a task handler, to ``app.task_progress_store``.
+
+    The task is the one whose handler is running (a worker binds it), so code deep in
+    the handler, such as a tool its agent calls, can report without passing the task
+    around. ``done`` and ``counts`` are added; ``total``, when given, is set first.
+    """
+
+    from cayu.runtime._task_lease_authority import current_task_id
+
+    task_id = current_task_id()
+    if task_id is None:
+        raise RuntimeError("report_task_progress runs inside a task handler.")
+    store = app.task_progress_store
+    if store is None:
+        raise RuntimeError("The app has no task_progress_store.")
+    if total is not None:
+        await store.set_progress(task_id, total=total)
+    return await store.add_progress(task_id, done=done, counts=counts)
+
+
 __all__ = [
     "TASK_PROGRESS_MAX_COUNTS",
     "InMemoryTaskProgressStore",
     "TaskProgress",
     "TaskProgressStore",
+    "report_task_progress",
 ]

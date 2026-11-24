@@ -47927,6 +47927,52 @@
         "title": "TaskOrder",
         "type": "string"
       },
+      "TaskProgress": {
+        "additionalProperties": false,
+        "description": "How far one task got: ``done`` of ``total`` units, by outcome.",
+        "properties": {
+          "counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Counts",
+            "type": "object"
+          },
+          "done": {
+            "minimum": 0.0,
+            "title": "Done",
+            "type": "integer"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "done",
+          "updated_at"
+        ],
+        "title": "TaskProgress",
+        "type": "object"
+      },
       "TaskReplayAvailability": {
         "properties": {
           "available": {
@@ -66554,6 +66600,47 @@
           }
         },
         "summary": "Pause Task"
+      }
+    },
+    "/api/tasks/{task_id}/progress": {
+      "get": {
+        "description": "How far the task got, as its handler reported it to the app's task progress store: `done` of `total` units and `counts` by outcome. 404 when it reported nothing or the app keeps no progress store.",
+        "operationId": "task_progress_api_tasks__task_id__progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskProgress"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Progress"
       }
     },
     "/api/tasks/{task_id}/replay": {

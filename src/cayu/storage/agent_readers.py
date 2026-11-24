@@ -250,6 +250,10 @@ class _CloudTaskReader:
     async def load_task(self, task_id: str) -> dict[str, Any] | None:
         return await self._read(lambda reader: reader.load_task(task_id))
 
+    async def task_progress(self, task_id: str) -> dict[str, Any] | None:
+        # The agent-read route doesn't forward the progress route.
+        return await self._login.task_progress(task_id)
+
     async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
         return await self._read(lambda reader: reader.latest_tasks(request))
 

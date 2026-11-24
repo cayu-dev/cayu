@@ -801,12 +801,19 @@ async def _task_payload(reader: TaskReader, task: dict[str, Any]) -> dict[str, A
             "task": task,
             "cancellation": cancellation_summary(task),
             "retry_series": await _retry_series(reader, task),
+            "progress": await _task_progress(reader, task),
             "event_loop_lag": (await reader.event_loop_lag(session_ids) if session_ids else None),
             "timing": await _task_timing(
                 reader, session_ids, listed=linked is not None, truncated=more
             ),
         }
     )
+
+
+async def _task_progress(reader: TaskReader, task: dict[str, Any]) -> dict[str, Any] | None:
+    # A reader written before progress has no ``task_progress``; its tasks show none.
+    read = getattr(reader, "task_progress", None)
+    return None if read is None else await read(task["id"])
 
 
 async def _task_timing(
@@ -1144,6 +1151,17 @@ def _table_row(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def task_progress_text(progress: dict[str, Any]) -> str:
+    """``12 of 40 done (approved 10, failed 2)``, from a ``TaskProgress`` as JSON."""
+
+    total = progress.get("total")
+    text = f"{progress.get('done')} {'' if total is None else f'of {total} '}done"
+    counts = progress.get("counts") or {}
+    if counts:
+        text += " (" + ", ".join(f"{name} {count}" for name, count in counts.items()) + ")"
+    return text
+
+
 def _print_task(payload: dict[str, Any]) -> None:
     task = payload["task"]
     fields = (
@@ -1166,6 +1184,9 @@ def _print_task(payload: dict[str, Any]) -> None:
         ("field", "value"),
         [{"field": name, "value": task.get(name)} for name in fields if task.get(name) is not None],
     )
+    progress = payload.get("progress")
+    if isinstance(progress, dict):
+        print(f"\nProgress: {terminal_safe(task_progress_text(progress))}")
     cancellation = payload["cancellation"]
     if cancellation is not None:
         print("\nCancellation")

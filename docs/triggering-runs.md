@@ -698,6 +698,19 @@ handlers can report on one task; `set_progress` replaces the fields it is given.
 for another backend. Nothing in the worker requires a progress store, and the
 store doesn't check who runs the task.
 
+Give the store to the app to read progress everywhere else:
+`CayuApp(task_store=..., task_progress_store=progress)`. Code running inside a
+task's handler, a tool its agent calls included, can then report without the
+task: `await report_task_progress(app, done=1, counts={"approved": 1})` (from
+`cayu.tasks.progress`; `total=` sets the total first) reports for the task whose
+handler is running, and raises outside one. `GET /api/tasks/{task_id}/progress`
+returns the progress (404 when the task reported none or the app keeps no store),
+`cayu task show` prints it (`progress` in `--json`, read from the database's
+progress table for `--sqlite` and `--postgres`), and in the Cayu Cloud activity
+contract each run names its `task_id` while every page carries `task_progress`, the
+current progress of the tasks running now, so a report shows on the next page even
+when no run changed (the `task_progress` feature).
+
 ### Claiming a step before its effect
 
 When the other system takes no idempotency key (sending a mail, for example),

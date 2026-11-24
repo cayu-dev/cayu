@@ -19,6 +19,7 @@ from cayu.tasks.bulk_cancellation import (
     cancel_tasks,
 )
 from cayu.tasks.index import TaskCountsCheck
+from cayu.tasks.progress import TaskProgress
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import TaskStatus
 from cayu.tasks.scheduling import TaskScheduleConflict
@@ -151,6 +152,27 @@ def register_task_controls_routes(
             wait_seconds=body.wait_seconds,
             max_tasks=body.max_tasks,
         )
+
+    @router.get(
+        "/tasks/{task_id}/progress",
+        response_model=TaskProgress,
+        dependencies=protected,
+        description=(
+            "How far the task got, as its handler reported it to the app's task progress "
+            "store: `done` of `total` units and `counts` by outcome. 404 when it reported "
+            "nothing or the app keeps no progress store."
+        ),
+    )
+    async def task_progress(task_id: NonBlankString):
+        store = cayu_app.task_progress_store
+        if store is None:
+            raise HTTPException(404, "Task progress store is not configured.")
+        if cayu_app.task_store is None or await cayu_app.task_store.load_task(task_id) is None:
+            raise HTTPException(404, "Task was not found.")
+        progress = await store.load_progress(task_id)
+        if progress is None:
+            raise HTTPException(404, "The task reported no progress.")
+        return progress
 
     @router.get(
         "/tasks/counts/check",

@@ -659,7 +659,7 @@ def test_application_wait_reads_through_until_the_task_ends(
     assert err.count("Task scan-1 is running.") == 1
     assert "answered HTTP 502" in err and "Reading task scan-1 again." in err
     assert "Task scan-1 is completed." in err
-    reads = [path for path, _ in cloud.requests if path.startswith("/cayu/api/tasks/scan-1")]
+    reads = [path for path, _ in cloud.requests if path == "/cayu/api/tasks/scan-1"]
     assert len(reads) == 4
 
 

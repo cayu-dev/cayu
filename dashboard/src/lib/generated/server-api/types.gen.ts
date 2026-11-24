@@ -24084,6 +24084,36 @@ export type TaskOperationalSnapshot = {
 export type TaskOrder = 'created_at_asc' | 'created_at_desc' | 'updated_at_asc' | 'updated_at_desc';
 
 /**
+ * TaskProgress
+ *
+ * How far one task got: ``done`` of ``total`` units, by outcome.
+ */
+export type TaskProgress = {
+    /**
+     * Counts
+     */
+    counts?: {
+        [key: string]: number;
+    };
+    /**
+     * Done
+     */
+    done: number;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    /**
+     * Total
+     */
+    total?: number | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
  * TaskReplayAvailability
  */
 export type TaskReplayAvailability = {
@@ -34137,6 +34167,36 @@ export type PauseTaskApiTasksTaskIdPausePostResponses = {
 };
 
 export type PauseTaskApiTasksTaskIdPausePostResponse = PauseTaskApiTasksTaskIdPausePostResponses[keyof PauseTaskApiTasksTaskIdPausePostResponses];
+
+export type TaskProgressApiTasksTaskIdProgressGetData = {
+    body?: never;
+    path: {
+        /**
+         * Task Id
+         */
+        task_id: string;
+    };
+    query?: never;
+    url: '/api/tasks/{task_id}/progress';
+};
+
+export type TaskProgressApiTasksTaskIdProgressGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type TaskProgressApiTasksTaskIdProgressGetError = TaskProgressApiTasksTaskIdProgressGetErrors[keyof TaskProgressApiTasksTaskIdProgressGetErrors];
+
+export type TaskProgressApiTasksTaskIdProgressGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: TaskProgress;
+};
+
+export type TaskProgressApiTasksTaskIdProgressGetResponse = TaskProgressApiTasksTaskIdProgressGetResponses[keyof TaskProgressApiTasksTaskIdProgressGetResponses];
 
 export type ReplayAvailabilityApiTasksTaskIdReplayGetData = {
     body?: never;

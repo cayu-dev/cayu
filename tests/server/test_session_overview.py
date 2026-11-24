@@ -60,6 +60,8 @@ def test_overview_shares_cloud_state_and_preserves_wire():
                 "tool_calls",
                 "cost",
                 "waiting_for",
+                # Added within the contract version; readers ignore fields they don't know.
+                "task_id",
             }
         batch = client.get(
             "/api/sessions", params=[("include", "overview"), ("ids", "done"), ("ids", "done")]

@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
@@ -28,6 +29,7 @@ from cayu.sessions.records import EventRecord
 from cayu.sessions.store import SessionStore
 from cayu.tasks._value_filters import TaskValueFilters
 from cayu.tasks.index import TaskCountsCheck, TaskIndexQuery
+from cayu.tasks.progress import TaskProgress, TaskProgressStore, task_progress_record
 from cayu.tasks.queries import TaskOrder, TaskQuery
 from cayu.tasks.records import Task, TaskStatus, task_error_code, task_error_summary
 from cayu.tasks.store import TaskStore
@@ -128,7 +130,45 @@ class TaskReader(Protocol):
         (``read_sessions_event_loop_lag``), or ``None`` when the source can't say."""
         ...
 
+    async def task_progress(self, task_id: str) -> dict[str, Any] | None:
+        """The task's reported progress (``TaskProgress``), or ``None`` when it reported
+        none or the source keeps no progress."""
+        ...
+
     async def close(self) -> None: ...
+
+
+class SQLiteProgressReader:
+    """Reads task progress from a SQLite file without writing to it, so a read-only
+    snapshot can be inspected; a database without the progress table has none."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    async def load_progress(self, task_id: str) -> TaskProgress | None:
+        import asyncio
+        import sqlite3
+
+        from cayu.storage._task_progress_schema import TASK_PROGRESS_TABLE
+
+        def read() -> tuple[Any, ...] | None:
+            connection = sqlite3.connect(f"{self._path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                return connection.execute(
+                    "SELECT task_id, done, total, counts_json, updated_at_ms "
+                    f"FROM {TASK_PROGRESS_TABLE} WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+            finally:
+                connection.close()
+
+        row = await asyncio.to_thread(read)
+        return None if row is None else task_progress_record(*row)
+
+    async def close(self) -> None:
+        return None
 
 
 class StoreTaskReader:
@@ -136,11 +176,29 @@ class StoreTaskReader:
     given; ``close`` closes both."""
 
     def __init__(
-        self, store: TaskStore, *, source: dict[str, Any], sessions: SessionStore | None = None
+        self,
+        store: TaskStore,
+        *,
+        source: dict[str, Any],
+        sessions: SessionStore | None = None,
+        progress: TaskProgressStore | SQLiteProgressReader | None = None,
     ) -> None:
         self._store = store
         self._sessions = sessions
+        self._progress = progress
         self.source = source
+
+    async def task_progress(self, task_id: str) -> dict[str, Any] | None:
+        if self._progress is None:
+            return None
+        from cayu.storage.migrations import SchemaTooOld
+
+        try:
+            progress = await self._progress.load_progress(task_id)
+        except SchemaTooOld:
+            # A database from before progress was kept has none.
+            return None
+        return None if progress is None else progress.model_dump(mode="json")
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
         query = TaskQuery(
@@ -231,7 +289,7 @@ class StoreTaskReader:
         return await read_sessions_event_loop_lag(self._sessions, session_ids)
 
     async def close(self) -> None:
-        for store in (self._store, self._sessions):
+        for store in (self._store, self._sessions, self._progress):
             close = getattr(store, "close", None)
             if close is not None:
                 await close()
@@ -387,6 +445,24 @@ class ApiTaskReader:
                 return None
             raise
 
+    async def task_progress(self, task_id: str) -> dict[str, Any] | None:
+        try:
+            body = self._api.get(f"/tasks/{quote(task_id, safe='')}/progress", resource="tasks")
+        except CayuApiNotFound:
+            # No progress reported, no progress store, or no such task.
+            return None
+        except CayuApiError as exc:
+            # A server from before progress, a caller its role doesn't let read it, or a
+            # server that didn't answer just now: the task shows without progress.
+            if exc.category in {"unsupported", "forbidden"} or exc.transient:
+                return None
+            raise
+        if not isinstance(body, dict) or type(body.get("done")) is not int:
+            raise CayuApiError(
+                "not_cayu", f"{self._api.description} returned invalid task progress."
+            )
+        return body
+
     async def close(self) -> None:
         self._api.close()
 
@@ -445,7 +521,10 @@ def open_store_task_reader(target: SessionStoreTarget) -> StoreTaskReader:
             path, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
         )
         return StoreTaskReader(
-            store, source={"kind": "sqlite", "path": str(path)}, sessions=_session_store(target)
+            store,
+            source={"kind": "sqlite", "path": str(path)},
+            sessions=_session_store(target),
+            progress=SQLiteProgressReader(path),
         )
     if target.postgres_dsn is None:
         raise AssertionError("Resolved Postgres target has no DSN.")
@@ -454,7 +533,16 @@ def open_store_task_reader(target: SessionStoreTarget) -> StoreTaskReader:
     store = PostgresTaskStore(
         target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE, read_only=True
     )
-    return StoreTaskReader(store, source={"kind": "postgres"}, sessions=_session_store(target))
+    from cayu.storage.task_progress_postgres import PostgresTaskProgressStore
+
+    return StoreTaskReader(
+        store,
+        source={"kind": "postgres"},
+        sessions=_session_store(target),
+        progress=PostgresTaskProgressStore(
+            target.postgres_dsn, schema_mode=schema.SchemaMode.VALIDATE
+        ),
+    )
 
 
 def _session_store(target: SessionStoreTarget) -> SessionStore:
