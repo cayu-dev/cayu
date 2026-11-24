@@ -251,6 +251,106 @@ def test_an_unfinished_descendant_needs_a_close_reason_too() -> None:
     asyncio.run(scenario())
 
 
+async def _pending_parent_finished_child(app: CayuApp) -> None:
+    for session_id, parent in (("p1", None), ("c1", "p1")):
+        await app.session_store.create(
+            RunRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                labels={"job": "pages"},
+                parent_session_id=parent,
+            ),
+            identity=SessionIdentity(provider_name="provider", model="model"),
+        )
+    await app.close_session("c1", reason="Finished with it.")
+
+
+async def _every_page(app: CayuApp, **options) -> tuple[list[str], list[str]]:
+    deleted, refused, after = [], [], None
+    while True:
+        page = await delete_sessions(
+            app, SessionQuery(labels={"job": "pages"}), max_sessions=1, after=after, **options
+        )
+        deleted += list(page.deleted)
+        refused += [item.session_id for item in page.refused]
+        if not page.has_more:
+            return deleted, refused
+        after = page.next_after
+
+
+def test_a_match_below_one_refused_on_an_earlier_page_is_kept() -> None:
+    async def scenario() -> None:
+        app = _app()
+        try:
+            await _pending_parent_finished_child(app)
+            deleted, refused = await _every_page(app)
+            assert deleted == [] and refused == ["p1", "c1"]
+            assert await app.session_store.load("c1") is not None
+            parent = await app.session_store.load("p1")
+            assert parent is not None and parent.status is SessionStatus.PENDING
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_a_match_below_one_deleted_on_an_earlier_page_goes_with_it() -> None:
+    async def scenario() -> None:
+        app = _app()
+        try:
+            await _pending_parent_finished_child(app)
+            deleted, refused = await _every_page(app, close_reason="Reset")
+            assert deleted == ["p1"] and refused == []
+            for session_id in ("p1", "c1"):
+                assert await app.session_store.load(session_id) is None
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("parent_matches", [False, True])
+def test_store_only_filters_decide_an_ancestor_by_the_store(parent_matches: bool) -> None:
+    async def scenario() -> None:
+        app = _app()
+        try:
+            for session_id, parent in (("p1", None), ("c1", "p1")):
+                await app.session_store.create(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "hello")],
+                        labels={"cleanup": "yes"} if parent or parent_matches else {},
+                        parent_session_id=parent,
+                    ),
+                    identity=SessionIdentity(provider_name="provider", model="model"),
+                )
+            await app.close_session("c1", reason="Finished with it.")
+            # inactive_for_seconds is resolved by the store only.
+            query = SessionQuery(labels={"cleanup": "yes"}, inactive_for_seconds=0)
+            after, deleted, refused = None, [], []
+            while True:
+                page = await delete_sessions(app, query, max_sessions=1, after=after)
+                deleted += list(page.deleted)
+                refused += [item.session_id for item in page.refused]
+                if not page.has_more:
+                    break
+                after = page.next_after
+            if parent_matches:
+                # The pending parent is refused (no close reason) and keeps its child.
+                assert deleted == [] and refused == ["p1", "c1"]
+                assert await app.session_store.load("c1") is not None
+            else:
+                # The parent never matched, so the child is a root of its own.
+                assert deleted == ["c1"] and refused == []
+                assert await app.session_store.load("c1") is None
+        finally:
+            await app.aclose()
+
+    asyncio.run(scenario())
+
+
 async def _refused_then_finished(app: CayuApp) -> None:
     """Three unfinished matches, oldest, then two finished ones."""
 

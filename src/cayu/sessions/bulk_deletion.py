@@ -12,12 +12,18 @@ bounds and checks. Every refusal is one of those checks'.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
 from cayu.runtime.session_closure import SessionClosureChildPolicy
-from cayu.sessions.queries import SessionOrder, SessionQuery, encode_session_cursor
+from cayu.sessions.queries import (
+    SessionOrder,
+    SessionQuery,
+    _session_matches,
+    encode_session_cursor,
+)
 from cayu.sessions.records import SessionStatus
 
 if TYPE_CHECKING:
@@ -117,8 +123,11 @@ async def delete_sessions(
     deleted: list[str] = []
     closed: list[str] = []
     refused: list[SessionDeletionRefusal] = []
-    # Each match's nearest matching ancestor, if any: its closure takes the match.
+    # Each match's nearest matching ancestor, if any: its closure takes the match. An
+    # ancestor that matches but was examined on an earlier page (and so is still here,
+    # refused) decides the match too, so it is left as that ancestor left things.
     owner: dict[str, str] = {}
+    covered: set[str] = set()
     for session in sessions:
         parent_id, depth = session.parent_session_id, 0
         while parent_id is not None and depth < _MAX_ANCESTRY:
@@ -126,9 +135,21 @@ async def delete_sessions(
                 owner[session.id] = parent_id
                 break
             parent = await app.session_store.load(parent_id)
-            parent_id, depth = (None if parent is None else parent.parent_session_id), depth + 1
+            if parent is None:
+                break
+            if await _ancestor_matches(app, parent, query):
+                covered.add(session.id)
+                break
+            parent_id, depth = parent.parent_session_id, depth + 1
     gone: set[str] = set()
     for session in sessions:
+        if session.id in covered:
+            refused.append(
+                SessionDeletionRefusal(
+                    session_id=session.id, reason="A matching session above it was not deleted."
+                )
+            )
+            continue
         if session.id in owner:
             continue
         refusal = await _delete_root(app, session.id, close_reason, closed_by, closed)
@@ -162,6 +183,45 @@ async def delete_sessions(
             else None
         ),
     )
+
+
+async def _ancestor_matches(app: CayuApp, session, query: SessionQuery) -> bool:
+    """Whether ``session`` matches ``query``, as the store would list it."""
+
+    try:
+        return _session_matches(session, query)
+    except ValueError:
+        pass
+    # Filters only the store resolves (inactivity, debug state): check the rest here,
+    # then ask the store about the window that holds just this session's creation.
+    store_only = {"debug_state": None, "inactive_for_seconds": None}
+    if not _session_matches(session, query.model_copy(update=store_only)):
+        return False
+    since = session.created_at
+    before = since + timedelta(milliseconds=1)
+    if query.created_before is not None:
+        before = min(before, query.created_before)
+    if since >= before:
+        return False
+    page_query = query.model_copy(
+        update={
+            "created_since": since,
+            "created_before": before,
+            "limit": _PAGE,
+            "offset": 0,
+            "cursor": None,
+            "include_total_count": False,
+        }
+    )
+    for _page in range(_MAX_ANCESTRY):
+        page = await app.session_store.list_sessions(page_query)
+        if any(listed.id == session.id for listed in page.sessions):
+            return True
+        if page.next_cursor is None:
+            return False
+        page_query = page_query.model_copy(update={"cursor": page.next_cursor})
+    # Past the bound: keep the session below rather than delete it out from under it.
+    return True
 
 
 async def _delete_root(

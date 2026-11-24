@@ -20740,7 +20740,8 @@ close_reason="Reset")` deletes every session a query matches by composing these 
 call examines matches oldest first, at most `max_sessions` (1,000 by default); when
 `has_more` is set, call again with `after=next_after` for the matches after them, so
 refused sessions are examined once and don't hold up the rest. A match below another match is left to
-that one's closure. Each other match that hasn't finished is closed once with `close_reason`,
+that one's closure, also when that match was examined on an earlier page: a match whose
+ancestor also matches is kept when the ancestor was refused, and goes with it otherwise. Each other match that hasn't finished is closed once with `close_reason`,
 as `close_session` closes one, which closes its open child sessions too; without a reason, or
 when the close is refused, it is listed in `refused` and nothing below it is touched. The
 sessions below it, as the closure enumerates them (`CayuApp.session_descendant_ids`, bounded
