@@ -6464,11 +6464,22 @@ class SQLiteTaskStore(TaskStore):
                     )
                     self._connection.commit()
                     raise _rejected_task_retry_cancellation_reconciliation(rejection)
+                event_key = task.invocation.event_retry_key
                 receipt = _reconciled_task_retry_cancellation(
                     task,
                     request,
                     request_sha256=request_sha256,
                     committed_at=now,
+                    event_refusal=(
+                        task_event_retry_refusal(
+                            None
+                            if event_key is None
+                            else self._load_task_retry_key_unlocked(event_key),
+                            now=self._clock(),
+                        )
+                        if request.retry_lost_attempt
+                        else None
+                    ),
                 )
                 settled = receipt.task
                 assert settled.retry_series is not None
@@ -6511,6 +6522,10 @@ class SQLiteTaskStore(TaskStore):
                     settled,
                     settled_execution=claimed_execution(task),
                 )
+                successor = receipt.successor
+                if successor is not None:
+                    self._insert_task_unlocked(successor)
+                    self._record_task_transition_unlocked(None, successor)
                 self._connection.execute(
                     "INSERT INTO cayu_task_retry_settlements "
                     "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -6524,6 +6539,8 @@ class SQLiteTaskStore(TaskStore):
                     ),
                 )
                 self._connection.commit()
+                if successor is not None:
+                    self._publish_task_admission_wakeup(successor, now=now)
                 return receipt.model_copy(deep=True)
             except BaseException:
                 self._connection.rollback()

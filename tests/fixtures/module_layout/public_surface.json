@@ -4658,6 +4658,9 @@
           "TaskRetryKeyState",
           "TaskRetryKeyStatus"
         ],
+        "cayu.tasks.retry_loss": [
+          "retry_lost_task_attempt"
+        ],
         "cayu.tasks.series": [
           "TaskRecurrence",
           "TaskSeries",

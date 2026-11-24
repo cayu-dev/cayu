@@ -4162,13 +4162,31 @@ class InMemoryTaskStore(TaskStore):
                 request,
                 request_sha256=request_sha256,
                 committed_at=now,
+                event_refusal=(
+                    task_event_retry_refusal(
+                        self._task_retry_keys.get(task.invocation.event_retry_key or ""),
+                        now=self._clock(),
+                    )
+                    if request.retry_lost_attempt
+                    else None
+                ),
             )
+            successor = receipt.successor
+            if successor is not None and successor.id in self._tasks:
+                raise TaskTerminalizationConflict(
+                    "Task retry successor identity is already occupied."
+                )
             self._store_task(
                 receipt.task,
                 settled_execution=claimed_execution(task),
             )
+            if successor is not None:
+                self._store_task(successor)
             self._retry_settlements[receipt_key] = receipt
-            return receipt.model_copy(deep=True)
+            committed = receipt.model_copy(deep=True)
+        if successor is not None:
+            self._publish_task_admission_wakeup(successor, now=now)
+        return committed
 
     @runtime_task_mutation
     async def scrub_task_failure_text(

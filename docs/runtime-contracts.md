@@ -8723,7 +8723,13 @@ tuple. Reclaiming a task and assigning it to the same worker ID therefore cannot
 let a delayed prior settlement or deadline operation terminalize the successor
 claim.
 
-`reconcile_task_retry_cancellation(...)` is that operator/application boundary.
+`reconcile_task_retry_cancellation(...)` is that operator/application boundary. With
+`retry_lost_attempt=True` (worker-loss fences only, not for `effect_completed`
+evidence or graph members), it settles the attempt as a retryable failure through
+the series' ordinary rules and inserts the successor in the same transaction; the
+receipt's reconciliation says `retried`. `lost_attempt_token_count` and
+`lost_attempt_estimated_cost` charge the lost attempt's usage, and each one left
+unset charges the series' whole remaining budget for it.
 It accepts a `TaskRetryCancellationReconciliationRequest` only for the exact
 `retry_cancellation_requested` task, series, attempt, causal budget, original
 worker, original lease expiry, cancellation-request timestamp, and deterministic

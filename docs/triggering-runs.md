@@ -381,6 +381,24 @@ tasks use `retry_cancellation_requested` and require
 `TaskStore.reconcile_task_retry_cancellation` with retry-specific evidence; the
 helpers below do not settle them.
 
+To retry such an attempt instead of cancelling its series, call
+`retry_lost_task_attempt(task_store, task, validator_id=..., validator_version=...,
+evidence_id=...)` from `cayu.tasks` once you can vouch that its worker is gone. It
+settles the lost attempt as a retryable failure, so the series' own rules decide
+whether the next attempt is queued (`settlement.successor`): the lost attempt uses
+up an attempt, its time counts toward `max_elapsed_seconds`, and its usage counts
+toward the caps. A lost worker never reported what it spent, so pass
+`token_count=` and `estimated_cost=` when you know them (for example from the
+attempt's session usage). Whatever you leave out counts as everything the series
+had left: a series with `max_total_tokens` or `max_estimated_cost` then ends as
+`tokens_exhausted` or `cost_exhausted` instead of spending past its cap, and a
+series without caps retries. The failed attempt's `error` keeps the fence's code
+and adds `usage_known`, true only when both figures were given. An attempt someone
+asked to cancel (also after its worker was lost), or whose effect
+completed, is never retried, and a graph member can't be retried this way. If
+the attempt's event already succeeded through another task with the same event
+key, the lost attempt is cancelled instead.
+
 A fenced task looks like a live claim unless you check its lease, so Cayu gives
 you ways to tell them apart. Each counts a started task as fenced as soon as its
 worker's lease expires, before reclamation has recorded the fence (until then

@@ -4195,6 +4195,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         from cayu.storage._postgres_task_graphs import lock_task_graphs
 
         await self._ensure_ready()
+        notification_sender_pid: int | None = None
         async with PostgresTimingScope(self._pool.connection()) as conn:
             try:
                 async with conn.cursor() as cur:
@@ -4281,11 +4282,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         await conn.commit()
                         raise _rejected_task_retry_cancellation_reconciliation(rejection)
 
+                    event_refusal = None
+                    event_key = task.invocation.event_retry_key
+                    if request.retry_lost_attempt and event_key is not None:
+                        await self._lock_verified_work_identity(cur, "retry-key", event_key)
+                        event_refusal = task_event_retry_refusal(
+                            await self._load_task_retry_key_row(cur, event_key),
+                            now=self._clock() if self._clock_is_injected else now,
+                        )
                     receipt = _reconciled_task_retry_cancellation(
                         task,
                         request,
                         request_sha256=request_sha256,
                         committed_at=now,
+                        event_refusal=event_refusal,
                     )
                     settled = receipt.task
                     assert settled.retry_series is not None
@@ -4331,7 +4341,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         idempotency_key=request.cancellation_idempotency_key,
                         request_sha256=request_sha256,
                         task=durable_task,
-                        successor=None,
+                        successor=receipt.successor,
                         reconciliation=receipt.reconciliation,
                         events=_task_retry_events(durable_task, occurred_at=now),
                         committed_at=now,
@@ -4342,6 +4352,31 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         durable_task,
                         settled_execution=claimed_execution(task),
                     )
+                    if receipt.successor is not None:
+                        await cur.execute(
+                            f"""
+                            INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
+                            VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s
+                            )
+                            """,
+                            pg_support.task_insert_values(receipt.successor),
+                        )
+                        await self._record_task_transition(cur, None, receipt.successor)
+                        if (
+                            receipt.successor.available_at is None
+                            or receipt.successor.available_at <= now
+                        ):
+                            notification_sender_pid = (
+                                self._register_task_admission_notification_sender(conn)
+                            )
+                            await cur.execute(
+                                "SELECT pg_notify(%s, %s)", (_TASK_ADMISSION_NOTIFY_CHANNEL, "")
+                            )
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -4355,10 +4390,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
                         ),
                     )
                 await conn.commit()
-                return receipt.model_copy(deep=True)
+                committed = receipt.model_copy(deep=True)
             except BaseException:
+                if notification_sender_pid is not None:
+                    self._discard_task_admission_notification_sender(notification_sender_pid, conn)
                 await conn.rollback()
                 raise
+        if committed.successor is not None:
+            self._publish_task_admission_wakeup(committed.successor, now=committed.committed_at)
+        return committed
 
     async def enforce_task_retry_deadline(
         self,

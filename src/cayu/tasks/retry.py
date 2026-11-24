@@ -308,9 +308,13 @@ class TaskRetrySettlementResult(BaseModel):
         if self.reconciliation is not None:
             reconciliation = self.reconciliation
             status_payload = self.task.status_payload
+            # A lost attempt settled to retry ends as a failure; otherwise reconciliation
+            # cancels. The successor is checked against the disposition below.
+            settled_as_expected = (
+                series.disposition is TaskRetrySeriesDisposition.CANCELLED
+            ) != reconciliation.retried
             if (
-                series.disposition is not TaskRetrySeriesDisposition.CANCELLED
-                or self.successor is not None
+                not settled_as_expected
                 or reconciliation.request_sha256 != self.request_sha256
                 or reconciliation.task_id != self.task_id
                 or reconciliation.series_id != series.series_id

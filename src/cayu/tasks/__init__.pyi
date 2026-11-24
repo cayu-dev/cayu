@@ -273,6 +273,7 @@ from cayu.tasks.retry_budgets import TaskRetryBudget as TaskRetryBudget
 from cayu.tasks.retry_budgets import TaskRetryBudgetExhausted as TaskRetryBudgetExhausted
 from cayu.tasks.retry_budgets import TaskRetryKeyState as TaskRetryKeyState
 from cayu.tasks.retry_budgets import TaskRetryKeyStatus as TaskRetryKeyStatus
+from cayu.tasks.retry_loss import retry_lost_task_attempt as retry_lost_task_attempt
 from cayu.tasks.scheduling import TaskMisfirePolicy as TaskMisfirePolicy
 from cayu.tasks.scheduling import TaskRescheduleRequest as TaskRescheduleRequest
 from cayu.tasks.scheduling import TaskScheduleCancelRequest as TaskScheduleCancelRequest

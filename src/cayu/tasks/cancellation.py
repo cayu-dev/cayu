@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from cayu._clock import normalize_utc_datetime
 from cayu._validation import canonical_durable_json_bytes, revalidate_model_input
@@ -248,6 +257,17 @@ class TaskRetryCancellationReconciliationRequest(BaseModel):
     evidence: TaskRetryCancellationReconciliationEvidence
     expected_execution_profile_fingerprint: str | None = None
     expected_effect_fingerprint: str | None = None
+    #: Settle the lost attempt as a retryable failure instead of cancelling it, so
+    #: the series queues its next attempt if its policy and budgets allow.
+    retry_lost_attempt: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
+    #: What the lost attempt spent, when the application knows it. Unknown usage
+    #: counts as everything the series had left.
+    lost_attempt_token_count: StrictInt | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    lost_attempt_estimated_cost: Decimal | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
 
     @field_validator(
         "task_id",
@@ -297,6 +317,18 @@ class TaskRetryCancellationReconciliationRequest(BaseModel):
     def validate_evidence_identity(self) -> TaskRetryCancellationReconciliationRequest:
         if self.reconciled_by.source is None:
             raise ValueError("Task retry reconciliation requires an actor provenance source.")
+        if not self.retry_lost_attempt and (
+            self.lost_attempt_token_count is not None
+            or self.lost_attempt_estimated_cost is not None
+        ):
+            raise ValueError("Lost attempt usage requires retry_lost_attempt=True.")
+        if (
+            self.retry_lost_attempt
+            and self.evidence.outcome is TaskRetryCancellationReconciliationOutcome.EFFECT_COMPLETED
+        ):
+            raise ValueError(
+                "The lost attempt's effect completed, so it can't be retried; cancel it instead."
+            )
         if (
             self.expected_execution_profile_fingerprint
             != self.evidence.execution_profile_fingerprint
@@ -339,6 +371,8 @@ class TaskRetryCancellationReconciliation(BaseModel):
         min_length=3,
         max_length=3,
     )
+    #: The lost attempt was settled as a retryable failure instead of cancelled.
+    retried: StrictBool = Field(default=False, exclude_if=lambda value: value is False)
 
     @field_validator("request_sha256")
     @classmethod

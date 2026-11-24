@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 
@@ -39,8 +40,11 @@ from cayu.tasks.records import (
     _validate_task_retry_reconciliation_identity,
 )
 from cayu.tasks.retry import (
+    TaskRetryAttemptDisposition,
+    TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
     _cancelled_task_retry_settlement,
+    _settled_task_retry_attempt,
     _task_retry_cancellation_requested_event,
     _task_retry_events,
     _task_retry_runtime_idempotency_key,
@@ -457,6 +461,34 @@ def _reconciled_task_cancellation(
     )
 
 
+def _explicit_cancellation_kept(
+    task: Task, payload: dict[str, Any], error: dict[str, Any] | None
+) -> Task:
+    """Keep an explicit cancellation that arrives after a worker-loss fence.
+
+    The fence stays, but its error becomes the explicit one, so the attempt can't
+    later be retried as lost (``retry_lost_task_attempt``); it can only be cancelled.
+    """
+
+    from cayu.tasks.restart import WORKER_LOSS_FENCE_CODES
+
+    fenced = payload.get("error")
+    fenced_code = fenced.get("code") if type(fenced) is dict else None
+    requested = (
+        {"code": TaskRetrySeriesDisposition.CANCELLED.value}
+        if error is None
+        else copy_durable_json_object(error, "error")
+    )
+    if fenced_code not in WORKER_LOSS_FENCE_CODES or requested.get("code") in (
+        WORKER_LOSS_FENCE_CODES
+    ):
+        return task.model_copy(deep=True)
+    return task.model_copy(
+        update={"status_payload": {**payload, "error": requested}},
+        deep=True,
+    )
+
+
 def _task_retry_cancellation_requested_task(
     task: Task,
     *,
@@ -481,7 +513,7 @@ def _task_retry_cancellation_requested_task(
             "error",
             "event",
         }:
-            return task.model_copy(deep=True)
+            return _explicit_cancellation_kept(task, payload, error)
         # Cayu 0.3.0 persisted the same fenced cancellation intent before the
         # bounded cancellation event was added. Replaying that exact request is
         # the only supported upgrade path: preserve its original occurrence
@@ -638,25 +670,105 @@ def _validated_task_retry_cancellation(
     )
 
 
+def _lost_task_retry_attempt(
+    task: Task,
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    error: dict[str, Any],
+    committed_at: datetime,
+    event_refusal: TaskRetrySeriesDisposition | None,
+) -> tuple[Task, Task | None]:
+    """Settle a lost attempt as a retryable failure, charging unknown usage as the rest.
+
+    The series' own rules then decide whether it queues the next attempt: it uses up
+    one attempt, and when the lost attempt's usage isn't given, it is counted as all
+    the tokens and cost the series had left, so a series with either cap ends as
+    exhausted rather than spending past it.
+    """
+
+    from cayu.tasks.restart import fenced_by_worker_loss
+
+    series = task.retry_series
+    assert series is not None
+    if not fenced_by_worker_loss(task):
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "Only an attempt fenced by worker loss can be retried; someone asked to cancel it.",
+        )
+    if task.graph_id is not None:
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "A lost attempt of a graph member can't be retried here.",
+        )
+    usage_known = (
+        request.lost_attempt_token_count is not None
+        and request.lost_attempt_estimated_cost is not None
+    )
+    tokens = (
+        request.lost_attempt_token_count
+        if request.lost_attempt_token_count is not None
+        else (series.tokens_remaining or 0)
+    )
+    cost = (
+        request.lost_attempt_estimated_cost
+        if request.lost_attempt_estimated_cost is not None
+        else (series.estimated_cost_remaining or Decimal(0))
+    )
+    unfenced = task.model_copy(update={"status_reason": None, "status_payload": None})
+    return _settled_task_retry_attempt(
+        unfenced,
+        TaskRetrySettlementRequest(
+            task_id=task.id,
+            worker_id=request.original_worker_id,
+            claim_generation=task.claim_generation,
+            idempotency_key=request.cancellation_idempotency_key,
+            causal_budget_id=series.causal_budget_id,
+            disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+            error={**error, "usage_known": usage_known},
+            token_count=tokens,
+            estimated_cost=cost,
+        ),
+        now=committed_at,
+        series_now=committed_at,
+        event_refusal=event_refusal,
+    )
+
+
 def _reconciled_task_retry_cancellation(
     task: Task,
     request: TaskRetryCancellationReconciliationRequest,
     *,
     request_sha256: str,
     committed_at: datetime,
+    event_refusal: TaskRetrySeriesDisposition | None = None,
 ) -> TaskRetrySettlementResult:
-    """Build an ordinary cancelled receipt with bounded reconciliation evidence."""
+    """Build the cancelled (or, to retry, failed) receipt with bounded reconciliation evidence."""
 
     cancellation_error, requested_event = _validated_owner_lost_task_retry_cancellation(
         task,
         request,
         now=committed_at,
     )
-    base = _cancelled_task_retry_settlement(
-        task,
-        error=cancellation_error,
-        committed_at=committed_at,
+    # Once the event the attempt ran for has succeeded (through another task with the
+    # same event key), there is nothing to retry: the lost attempt is cancelled.
+    retried = (
+        request.retry_lost_attempt and event_refusal is not TaskRetrySeriesDisposition.CANCELLED
     )
+    if retried:
+        settled_task, successor = _lost_task_retry_attempt(
+            task,
+            request,
+            error=cancellation_error,
+            committed_at=committed_at,
+            event_refusal=event_refusal,
+        )
+    else:
+        settled_task = _cancelled_task_retry_settlement(
+            task,
+            error=cancellation_error,
+            committed_at=committed_at,
+        ).task
+        successor = None
     durable_actor = copy_resolution_actor(request.reconciled_by)
     if durable_actor is None:  # pragma: no cover - required request invariant
         raise AssertionError("Task retry reconciliation lost actor provenance.")
@@ -683,6 +795,7 @@ def _reconciled_task_retry_cancellation(
         reconciliation_requested_at=request.reconciliation_requested_at,
         reconciled_by=durable_actor,
         evidence=evidence,
+        retried=retried,
         events=(
             requested_event,
             _task_retry_cancellation_reconciliation_event(
@@ -697,12 +810,12 @@ def _reconciled_task_retry_cancellation(
             ),
         ),
     )
-    status_payload = copy_durable_json_object(base.task.status_payload, "status_payload")
+    status_payload = copy_durable_json_object(settled_task.status_payload, "status_payload")
     status_payload["cancellation_reconciliation"] = reconciliation.model_dump(
         mode="json",
         warnings=False,
     )
-    settled = base.task.model_copy(
+    settled = settled_task.model_copy(
         update={"status_payload": status_payload},
         deep=True,
     )
@@ -711,7 +824,7 @@ def _reconciled_task_retry_cancellation(
         idempotency_key=request.cancellation_idempotency_key,
         request_sha256=request_sha256,
         task=settled,
-        successor=None,
+        successor=successor,
         reconciliation=reconciliation,
         events=_task_retry_events(settled, occurred_at=committed_at),
         committed_at=committed_at,
