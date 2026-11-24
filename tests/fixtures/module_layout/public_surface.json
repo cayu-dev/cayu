@@ -4658,6 +4658,16 @@
           "TaskRetryKeyState",
           "TaskRetryKeyStatus"
         ],
+        "cayu.tasks.series": [
+          "TaskRecurrence",
+          "TaskSeries",
+          "last_occurrence",
+          "next_occurrence",
+          "occurrence_task_id",
+          "publish_next_occurrence",
+          "series_task_handler",
+          "task_occurrence"
+        ],
         "cayu.tasks.scheduling": [
           "TaskMisfirePolicy",
           "TaskRescheduleRequest",

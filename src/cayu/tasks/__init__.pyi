@@ -284,6 +284,14 @@ from cayu.tasks.scheduling import TaskSchedulePolicy as TaskSchedulePolicy
 from cayu.tasks.scheduling import TaskScheduleReceipt as TaskScheduleReceipt
 from cayu.tasks.scheduling import TaskScheduleState as TaskScheduleState
 from cayu.tasks.scheduling import TaskScheduleWakeup as TaskScheduleWakeup
+from cayu.tasks.series import TaskRecurrence as TaskRecurrence
+from cayu.tasks.series import TaskSeries as TaskSeries
+from cayu.tasks.series import last_occurrence as last_occurrence
+from cayu.tasks.series import next_occurrence as next_occurrence
+from cayu.tasks.series import occurrence_task_id as occurrence_task_id
+from cayu.tasks.series import publish_next_occurrence as publish_next_occurrence
+from cayu.tasks.series import series_task_handler as series_task_handler
+from cayu.tasks.series import task_occurrence as task_occurrence
 from cayu.tasks.session_wakes import SESSION_WAKE_RETRY_WINDOW as SESSION_WAKE_RETRY_WINDOW
 from cayu.tasks.session_wakes import SESSION_WAKE_TASK_TYPE as SESSION_WAKE_TASK_TYPE
 from cayu.tasks.session_wakes import SessionWakeNotContinued as SessionWakeNotContinued

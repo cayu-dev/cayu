@@ -217,12 +217,81 @@ worker, and inspection commands. It records a local follow-up decision without
 contacting a customer. Stop the worker before the due time and start it again
 against the same database; the task remains pending until the store admits it.
 
-For a next occurrence, the application chooses a durable completion boundary and
-creates a new one-shot with a deterministic occurrence ID and explicit timestamp.
-It owns retrying that publication after crashes, bounded catch-up, approval, and
-spend decisions. There is no automatic cron loop or recurring-series definition.
-This primitive alone does not keep a session asleep or guarantee exactly-once
-external side effects; `sleep_until`, below, builds the session wake on it.
+For a next occurrence, the application can create a new one-shot with a
+deterministic occurrence ID and explicit timestamp itself, or use a recurring
+series, below. Neither keeps a session asleep or guarantees exactly-once external
+side effects; `sleep_until`, below, builds the session wake on the one-shot.
+
+### Recurring series
+
+A `TaskSeries` from `cayu.tasks` queues one managed scheduled task per occurrence
+of a `TaskRecurrence`: a five-field `cron` expression read in an IANA `timezone`,
+or `every_seconds`, from `start_at`. It suits recurring work your users set up at
+run time, such as a review every Monday or a report on the 1st of each month;
+schedules fixed at deploy time can stay host schedules such as Cloud `[[schedules]]`.
+
+```python
+from datetime import UTC, datetime
+
+from cayu.tasks import (
+    TaskCreate,
+    TaskRecurrence,
+    TaskSeries,
+    publish_next_occurrence,
+    run_task_worker,
+    series_task_handler,
+)
+
+series = TaskSeries(
+    series_id="review-owner-42",
+    recurrence=TaskRecurrence(
+        cron="0 9 * * MON", timezone="America/Los_Angeles", start_at=datetime.now(UTC)
+    ),
+    task=TaskCreate(type="review", input={"owner": "42"}, labels={"owner": "42"}),
+)
+await publish_next_occurrence(task_store, series)
+
+async def series_for(task):
+    # The series as the application keeps it now, or None when paused or deleted.
+    return await load_series(task.metadata["cayu_series"]["series_id"])
+
+await run_task_worker(
+    app,
+    task_store,
+    series_task_handler(task_store, review_handler, series_for=series_for),
+    worker_id="worker-1",
+)
+```
+
+The application keeps the series definition, for example beside the owner's
+settings, and Cayu keeps its occurrences:
+
+- Each occurrence's task id is `<series_id>@<UTC time>`, such as
+  `review-owner-42@20270104T170000Z`, and its `metadata["cayu_series"]` names the
+  series and the occurrence time (`task_occurrence(task)` reads both). Publishing the
+  same occurrence again, also from racing callers or after a crash, returns the task
+  already queued.
+- `series_task_handler` publishes the next occurrence before it runs the current
+  one, so the series goes on whether the handler completes, fails or its worker is
+  lost. To repair a series after anything that may have stopped it, call
+  `publish_next_occurrence(task_store, series, after=now)` for each active series
+  when the application starts; it converges on the occurrence already queued.
+- `misfire_policy` says what happens to occurrences missed while nothing published
+  or ran them. `SKIP` (the default) goes on with the next future occurrence, and an
+  occurrence that starts more than `misfire_grace_seconds` (60) late completes with
+  `{"series_skipped": true}` without running the handler. `FIRE_ONCE` runs the latest
+  missed occurrence once.
+- To pause, have `series_for` return `None`: the queued occurrence completes with
+  `{"series_paused": true}` without running the handler, and nothing more is
+  published. To cancel it at once instead, use `cancel_scheduled_task` on it. To
+  resume, call `publish_next_occurrence(task_store, series, after=now)`; it steps
+  over a future occurrence that was cancelled and queues the one after it.
+- The template can't have a `retry_policy`. A failed occurrence ends; the next one
+  still runs.
+- A local time that a daylight-saving change skips doesn't occur that day, and one
+  it repeats occurs once. `next_occurrence` and `last_occurrence` compute times
+  without a store.
+- `cayu task list --type review` and `cayu task show <id>` read the occurrences.
 
 ## Let an agent sleep and continue later
 
@@ -232,7 +301,7 @@ Three kinds of waiting look alike but differ in what survives a crash:
 | --- | --- | --- | --- |
 | Live blocking wait | `exec_command` running `sleep 600`, at most 600 seconds | the worker, runner, command and environment | lost |
 | Durable one-shot self-wake | the `sleep_until` tool | nothing | the same session continues on time |
-| Recurring schedule | the application creates each next one-shot task, or a host schedule such as Cloud `[[schedules]]` | nothing | the application's own publication retry |
+| Recurring schedule | a `TaskSeries`, the application creating each next one-shot task, or a host schedule such as Cloud `[[schedules]]` | nothing | the next occurrence, already queued before the current one ran |
 
 `SleepUntilTool` is opt-in; its wakes run in the application's task worker
 (`cayu worker`, which with PostgreSQL stores needs `cayu[postgres]`, plus
