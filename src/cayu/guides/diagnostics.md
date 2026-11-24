@@ -285,8 +285,9 @@ pauses for the user before anything happens, so it is never reported.
 
 `EXTERNAL_TOOL_COVERAGE_UNKNOWN` means an external-effect tool uses a custom or
 otherwise unrecognized policy whose behavior Cayu cannot verify statically.
-This remains an error rather than an acknowledgment-based bypass: use a
-statically describable enforcing policy. To add application validation, compose
+This is an error, and there is no acknowledgment that silences it: use a
+statically describable enforcing policy, or have the policy name the tools whose
+decision the application owns (below). To add application validation, compose
 `GuardedToolPolicy(guards=(app_guard,), then=AlwaysRequireApprovalToolPolicy(...))`.
 Each guard returns `None` or a denial; invalid results and exceptions deny, so a
 guard cannot bypass the downstream enforcement. Cayu derives coverage from the
@@ -300,6 +301,36 @@ decides. To keep the custom logic for one tool only, route that tool to it with
 coverage then comes from its own route, so only the routed tool stays unknown.
 A setting-driven decision needs no custom policy at all: see
 `tool-policy-setting-invalid`.
+
+When the application itself owns the decision, for example a policy that
+allows a send only after checking a permission the application stored, name the
+tool in the policy's `application_owned_tools`, as described in
+`external-tool-application-owned`. That is a declaration, not a waiver: only the
+tools it names leave this error.
+
+## external-tool-application-owned
+
+`EXTERNAL_TOOL_APPLICATION_OWNED` is information. A custom `ToolPolicy` decides
+an external-effect tool and names it in `application_owned_tools`:
+
+```python
+class SendPermissionPolicy(ToolPolicy):
+    application_owned_tools = frozenset({"send_email"})
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        ...
+```
+
+Cayu enforces whatever the policy returns, as for any policy, but cannot see why
+it allows a call, so coverage stays `unknown` and the report names the policy
+and the tools. The declaration must be an exact set of tool names; anything else
+declares nothing. It is read from the policy that decides the tool, through
+`ToolPolicyRouter`, `GuardedToolPolicy`, `ApprovalFloorToolPolicy` and
+`ToolAuthorizationGrantPolicy`, so routing one tool to the application's policy
+keeps the rest under Cayu's policies. Like an explicit allowlist, it is an
+in-process fact: a manifest read back from JSON reports the tool as
+`EXTERNAL_TOOL_COVERAGE_UNKNOWN`. Keep the application's authorization tested,
+since nothing in Cayu checks its rules.
 
 ## tool-policy-setting-invalid
 

@@ -16,7 +16,10 @@ created the grant is still approved by its own approval.
 | Runtime-enforced controls | Cayu | The runtime | REQUIRE_APPROVAL always pauses; mandatory controls are never granted; a grant never overrides DENY |
 
 Applications that prefer their own grant store and a custom `ToolPolicy` can
-keep doing that. Every part below is usable on its own.
+keep doing that. Every part below is usable on its own. A custom policy that
+decides an external-effect tool names it in `application_owned_tools`, so
+`cayu check` reports it as `EXTERNAL_TOOL_APPLICATION_OWNED` (information)
+rather than `EXTERNAL_TOOL_COVERAGE_UNKNOWN` (`cayu guide diagnostics`).
 
 ## Parts
 

@@ -109,6 +109,10 @@ class _PermissiveApprovalPolicy(AlwaysRequireApprovalToolPolicy):
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
+class _ApplicationSendPolicy(_PermissiveApprovalPolicy):
+    application_owned_tools = frozenset({"send"})
+
+
 class _UncalledEnvironmentFactory(EnvironmentFactory):
     def __init__(self) -> None:
         self.called = False
@@ -134,6 +138,7 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
         "EVALS_PROJECT_STORE_NOT_CONFIGURED",
         "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
+        "EXTERNAL_TOOL_APPLICATION_OWNED",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
         "MODEL_SETTING_DEPRECATED",
@@ -702,6 +707,14 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     )
     unknown_codes = {item.code for item in check_manifest(unknown.describe()).diagnostics}
 
+    owned = CayuApp(enable_logging=False)
+    owned.register_agent(
+        AgentSpec(name="owned", model="model"),
+        tools=[_ExternalTool()],
+        tool_policy=_ApplicationSendPolicy(),
+    )
+    owned_codes = {item.code for item in check_manifest(owned.describe()).diagnostics}
+
     validity = CayuApp(enable_logging=False)
     validity.register_agent(
         AgentSpec(name="validity", model="model"),
@@ -836,6 +849,7 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
 
     assert (
         empty_codes
+        | owned_codes
         | validity_codes
         | remote_schema_codes
         | missing_codes
@@ -1037,6 +1051,72 @@ def test_custom_policy_subclasses_are_not_described_as_trusted_builtins() -> Non
     assert finding.severity == "error"
     assert finding.parameters["coverage"] == "unknown"
     assert "statically describable policy" in finding.hint
+
+
+def test_application_owned_tools_are_reported_as_information_only_when_named() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="sender", model="model"),
+        tools=[
+            _ExternalTool(),
+            _ConfiguredTool("post", effect=ToolEffect.EXTERNAL, content="posted"),
+        ],
+        tool_policy=_ApplicationSendPolicy(),
+    )
+
+    manifest = app.describe()
+    report = check_manifest(manifest)
+
+    # Coverage stays unknown: the declaration says who owns it, not what it does.
+    assert {tool.name: tool.policy_coverage for tool in manifest.agents[0].tools} == {
+        "send": "unknown",
+        "post": "unknown",
+    }
+    findings = {item.code: item for item in report.diagnostics}
+    owned = findings["EXTERNAL_TOOL_APPLICATION_OWNED"]
+    assert owned.severity == "info"
+    assert owned.parameters["tools"] == ("send",)
+    assert owned.parameters["policy"].endswith("_ApplicationSendPolicy")
+    # A tool the policy doesn't name is still an error.
+    unknown = findings["EXTERNAL_TOOL_COVERAGE_UNKNOWN"]
+    assert unknown.severity == "error"
+    assert unknown.parameters["tools"] == ("post",)
+    # The fact is in-process only; a manifest read back from JSON stays conservative.
+    reloaded = type(manifest).model_validate(manifest.model_dump(mode="json"))
+    assert "EXTERNAL_TOOL_APPLICATION_OWNED" not in {
+        item.code for item in check_manifest(reloaded).diagnostics
+    }
+
+
+@pytest.mark.parametrize("declared", ["send", ("send", 1), frozenset({""})])
+def test_application_owned_tools_must_name_tools_exactly(declared: object) -> None:
+    class _Loose(_PermissiveApprovalPolicy):
+        application_owned_tools = declared  # type: ignore[assignment]
+
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="sender", model="model"), tools=[_ExternalTool()], tool_policy=_Loose()
+    )
+    codes = {item.code for item in check_manifest(app.describe()).diagnostics}
+    assert "EXTERNAL_TOOL_COVERAGE_UNKNOWN" in codes
+    assert "EXTERNAL_TOOL_APPLICATION_OWNED" not in codes
+
+
+def test_application_owned_declaration_is_read_through_a_route() -> None:
+    from cayu.tools import ToolPolicyRouter
+
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="sender", model="model"),
+        tools=[_ExternalTool()],
+        tool_policy=ToolPolicyRouter(
+            {"send": _ApplicationSendPolicy()},
+            default=AlwaysRequireApprovalToolPolicy(),
+        ),
+    )
+    codes = [item.code for item in check_manifest(app.describe()).diagnostics]
+    assert "EXTERNAL_TOOL_APPLICATION_OWNED" in codes
+    assert "EXTERNAL_TOOL_COVERAGE_UNKNOWN" not in codes
 
 
 def test_diagnostic_parameters_are_copied_read_only_json() -> None:

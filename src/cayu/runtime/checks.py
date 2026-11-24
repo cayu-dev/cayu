@@ -33,6 +33,7 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "EVALS_PROJECT_IDENTITY_NOT_CONFIGURED",
     "EVALS_PROJECT_STORE_NOT_CONFIGURED",
     "EVALS_SERVICE_FACTORY_CONTEXT_MIGRATION_REQUIRED",
+    "EXTERNAL_TOOL_APPLICATION_OWNED",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
     "MODEL_SETTING_DEPRECATED",
@@ -447,6 +448,7 @@ def check_manifest(
             )
 
         opaque: dict[str, list[str]] = {}
+        owned: dict[str, list[str]] = {}
         for tool in agent.tools:
             if not tool_input_schema_supported(tool.model_dump(mode="json")["input_schema"]):
                 diagnostics.append(
@@ -600,7 +602,10 @@ def check_manifest(
             ):
                 continue
             if tool.policy_coverage == "unknown":
-                opaque.setdefault(tool._opaque_policy or agent.tool_policy, []).append(tool.name)
+                undescribed = owned if tool._application_owned else opaque
+                undescribed.setdefault(tool._opaque_policy or agent.tool_policy, []).append(
+                    tool.name
+                )
                 continue
             diagnostics.append(
                 ProjectDiagnostic(
@@ -625,6 +630,45 @@ def check_manifest(
                         "coverage": tool.policy_coverage,
                     },
                     documentation_anchor="cayu guide diagnostics#external-tool-unguarded",
+                    verification_command="cayu inspect --json && cayu check --deploy --json",
+                )
+            )
+        for policy, tool_names in sorted(owned.items()):
+            tools = ", ".join(f"'{name}'" for name in tool_names)
+            plural = "s" if len(tool_names) > 1 else ""
+            diagnostics.append(
+                ProjectDiagnostic(
+                    code="EXTERNAL_TOOL_APPLICATION_OWNED",
+                    severity=DiagnosticSeverity.INFO,
+                    subject=(
+                        f"tool:{agent.name}/{tool_names[0]}"
+                        if len(tool_names) == 1
+                        else f"agent:{agent.name}"
+                    ),
+                    path=(
+                        f"agents.{agent.name}.tools.{tool_names[0]}.policy_coverage"
+                        if len(tool_names) == 1
+                        else f"agents.{agent.name}.tool_policy"
+                    ),
+                    message=(
+                        f"{policy} declares that it decides external-effect tool{plural} "
+                        f"{tools} by the application's own rules. Cayu enforces what it "
+                        "returns but can't verify those rules."
+                    ),
+                    hint=(
+                        "Keep the application's authorization tested. Remove the tool from "
+                        "application_owned_tools to have Cayu require a describable policy "
+                        "again."
+                    ),
+                    tags=("deploy", "security"),
+                    parameters={
+                        "agent": agent.name,
+                        "tool": tool_names[0],
+                        "tools": list(tool_names),
+                        "policy": policy,
+                        "coverage": "unknown",
+                    },
+                    documentation_anchor="cayu guide diagnostics#external-tool-application-owned",
                     verification_command="cayu inspect --json && cayu check --deploy --json",
                 )
             )

@@ -157,6 +157,13 @@ class ToolPolicy(ABC):
 
         return None
 
+    #: Tools whose calls this policy decides by the application's own rules, named
+    #: one by one. ``cayu check`` can't see inside a custom policy, so an external-effect
+    #: tool it decides is an error unless the policy names that tool here; a named tool
+    #: is reported as information instead. Cayu still enforces whatever the policy
+    #: returns. Empty by default, and never inferred.
+    application_owned_tools: frozenset[str] = frozenset()
+
     @abstractmethod
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         """Return whether this tool call may execute."""

@@ -298,6 +298,9 @@ class ToolManifest(_ManifestModel):
     # that leaves the tool's coverage unknown.
     _setting_policy: SettingPolicyFacts | None = PrivateAttr(default=None)
     _opaque_policy: str | None = PrivateAttr(default=None)
+    # In-process fact for checks, like the ones above: the opaque policy names this
+    # tool in its ``application_owned_tools``.
+    _application_owned: bool = PrivateAttr(default=False)
 
     @field_validator("adapter_identity", mode="before")
     @classmethod
@@ -743,6 +746,12 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         for agent in agents
         for tool in agent.tools
     }
+    application_owned = {
+        (agent.name, tool.name)
+        for agent in agents
+        for tool in agent.tools
+        if tool._application_owned
+    }
     for agent in manifest.agents:
         for tool in agent.tools:
             tool._proposal_only_exposed = (agent.name, tool.name) in proposal_only_exposed
@@ -750,6 +759,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
                 (agent.name, tool.name), (None, None)
             )
             tool._policy_allows_explicitly = (agent.name, tool.name) in explicit
+            tool._application_owned = (agent.name, tool.name) in application_owned
             tool._terminal_payload_bound_undeclared = (agent.name, tool.name) in unbounded
             tool._knowledge_store_unavailable = (agent.name, tool.name) in without_knowledge
     from cayu.runtime._execution_profile_admission import undeclared_execution_identity_components
@@ -1004,6 +1014,7 @@ def _describe_tool(
         )
     if coverage == "unknown":
         manifest._opaque_policy = _type_name(decisive)
+        manifest._application_owned = tool_name in _application_owned_tools(decisive)
     manifest._policy_allows_explicitly = _policy_allows_explicitly(tool_policy, tool_name)
     manifest._terminal_payload_bound_undeclared = application_tool_declares_no_bound(
         tool.tool, execution_contract.max_terminal_payload_bytes
@@ -1012,6 +1023,24 @@ def _describe_tool(
         tool.tool
     )
     return manifest
+
+
+def _application_owned_tools(policy: ToolPolicy) -> frozenset[str]:
+    """The tool names an opaque policy declares it decides by the application's rules.
+
+    Only an exact set of names counts; anything else, or a declaration that
+    raises, declares nothing.
+    """
+
+    try:
+        declared = policy.application_owned_tools
+    except Exception:
+        return frozenset()
+    if not isinstance(declared, (frozenset, set, tuple, list)):
+        return frozenset()
+    if not all(type(name) is str and name for name in declared):
+        return frozenset()
+    return frozenset(declared)
 
 
 def _policy_allows_explicitly(
