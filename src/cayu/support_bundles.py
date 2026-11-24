@@ -137,6 +137,7 @@ _OPTIONAL_DISTRIBUTIONS = (
     "pydantic-settings",
     "pyjwt",
     "pypdf",
+    "python-multipart",
     "sse-starlette",
     "uvicorn",
     "watchfiles",

@@ -6630,6 +6630,16 @@
         "DEFAULT_APP_ERRORS"
       ]
     },
+    "cayu.server.app_files": {
+      "defined_in": {
+        "cayu.server.app_files": [
+          "artifact_download",
+          "read_upload"
+        ]
+      },
+      "identities": {},
+      "present": []
+    },
     "cayu.server.browser_recording": {
       "defined_in": {
         "cayu.server.browser_recording": [

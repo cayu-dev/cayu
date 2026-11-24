@@ -696,6 +696,60 @@ async def summary(request: Request) -> Response:
 The routes every generated web app reads under `/app` (`/app/settings`,
 `/app/overview` and `/app/task-runs`) answer this way.
 
+## Take large uploads and stream downloads
+
+Cayu's `/api` artifact routes carry a file as base64 JSON, at most 4 MiB. For bigger files
+(a workbook, a ZIP), read a multipart upload with `read_upload` and serve the stored file
+back with `artifact_download`:
+
+```python
+from fastapi import APIRouter, Request
+
+from cayu.artifacts import ArtifactScope
+from cayu.server.app_files import artifact_download, read_upload
+
+router = APIRouter(prefix="/app")
+
+
+@router.post("/files", status_code=201)
+async def upload(request: Request) -> dict:
+    upload = await read_upload(request, max_bytes=50 * 1024 * 1024)
+    stored = await files.put_bytes(
+        upload.content,
+        filename=upload.filename,
+        content_type=upload.content_type,
+        scope=ArtifactScope.ENVIRONMENT,
+        environment_name="files",
+    )
+    return {"id": stored.id}
+
+
+@router.get("/files/{artifact_id}")
+async def download(artifact_id: str):
+    return await artifact_download(files, artifact_id)
+```
+
+- **Uploads.** The body is counted as it arrives, so an upload over `max_bytes` gets 413
+  as soon as it passes the limit, also when it has no `Content-Length` (a chunked upload,
+  or one a proxy passed on chunked). The file is spooled to a temporary file while it
+  arrives and comes back as bytes, with its name (the last part of the path a client
+  sent), content type and the form's text fields. A request without the file gets 422.
+- **Downloads.** The file is read a range at a time (`read_range`, 1 MiB by default), never
+  whole. The first range is read before the response starts, so a missing or refused file
+  raises before any byte is sent. The response has `Content-Length`, the stored content
+  type and `Content-Disposition` with the stored name; pass `media_type`, `filename` or
+  `disposition="inline"` to change them. Inline applies only to the types Cayu's own
+  artifact routes show inline (plain text, Markdown, CSV, JSON, PDF, raster images); HTML,
+  SVG or any other type an uploader named is sent as an attachment, so an upload can't run
+  script on the app's origin.
+- **Access.** Here `files` is a raw `ArtifactStore` the app guards itself. The download
+  takes any handle with `read_range`, so with the person's scoped handle
+  (`(await app.access(subject)).artifacts(store, environment_name=...)`) every range it
+  reads is checked; that handle stores the upload with
+  `put_bytes(upload.content, labels=..., filename=..., content_type=...)`.
+
+`read_upload` needs `python-multipart`, which the `server` extra installs.
+
 ## Use usage and cost, not event folds
 
 Do not compute tokens, cost, or other aggregates by folding a session's full
