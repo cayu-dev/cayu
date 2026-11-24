@@ -55,6 +55,7 @@ from cayu.tools.inference import (
 if TYPE_CHECKING:
     from cayu.connections.slots import ConnectionSlot
     from cayu.runners.base import ExecCommand, ExecResult
+    from cayu.tools.agent_runs import AgentRuns
     from cayu.workspaces.references import WorkspaceReferenceBinding
 
 
@@ -1233,6 +1234,7 @@ class ToolContext(BaseModel):
     _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
     _runtime_causal_budget_limits: tuple[Any, ...] = PrivateAttr(default=())
     _runtime_inference: InferenceInvoker | None = PrivateAttr(default=None)
+    _runtime_agents: Any = PrivateAttr(default=None)
     _runtime_clock: Callable[[], datetime] | None = PrivateAttr(default=None)
     _runtime_knowledge_publication_scope: KnowledgePublicationScope | None = PrivateAttr(
         default=None
@@ -1243,6 +1245,20 @@ class ToolContext(BaseModel):
         """Optional runtime-owned inference handle, valid only during this tool call."""
 
         return self._runtime_inference
+
+    @property
+    def agents(self) -> AgentRuns | None:
+        """Runs the agents this tool names in ``Tool.runs_agents``, during this call.
+
+        ``None`` for a tool that names none, and outside the runtime.
+        """
+
+        return self._runtime_agents
+
+    def _bind_runtime_agents(self, agents: AgentRuns) -> None:
+        if self._runtime_agents is not None:
+            raise RuntimeError("Runtime agent runs are already bound.")
+        self._runtime_agents = agents
 
     def _bind_runtime_clock(self, clock: Callable[[], datetime]) -> None:
         if self._runtime_clock is not None:
@@ -1413,6 +1429,9 @@ class Tool(ABC):
     #: tool policy as an ``ApprovalFloorToolPolicy``; None asks for no approval of its own.
     #: Provisional.
     approval_reason: str | Callable[[Mapping[str, Any]], str] | None = None
+    #: The registered agents this tool may run during a call, through ``ctx.agents``
+    #: (``cayu.tools.AgentRuns``). Empty, the default, binds no handle.
+    runs_agents: tuple[str, ...] = ()
 
     def __init__(self, spec: ToolSpec | None = None) -> None:
         if spec is not None:

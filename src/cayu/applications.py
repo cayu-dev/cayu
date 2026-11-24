@@ -1426,6 +1426,7 @@ class CayuApp(
                 else None
             ),
             clock=self._clock,
+            application=self,
         )
 
         tool_admission = ToolInvocationAdmission(

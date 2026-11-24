@@ -1591,6 +1591,53 @@ handle for one bounded auxiliary request. Use an explicit bounded child session
 for work requiring its own transcript, tools, approvals, authority, recursive
 inference, or recovery lifecycle. Do not hide an agent loop inside the handle.
 
+## Running another agent from a tool
+
+A tool that needs a whole agent run, not one model call (a reader agent that
+transcribes an image into structured output under its own budget, say), names
+the registered agents it may run in `Tool.runs_agents`. During its call the
+runtime binds `ctx.agents` to a `cayu.tools.AgentRuns` for those agents; for a
+tool that names none, and outside the runtime, `ctx.agents` is `None`.
+
+```python
+from cayu.tools import AgentFile, Tool, ToolResult
+
+
+class ReadInvoice(Tool):
+    spec = ...
+    runs_agents = ("invoice-reader",)
+
+    async def run(self, ctx, args):
+        outcome = await ctx.agents.run(
+            "invoice-reader",
+            "Transcribe this invoice.",
+            files=[AgentFile(image_bytes, filename="invoice.png", kind="image")],
+            structured_output=READING,
+            budget_limits=(BudgetLimit(scope="session", max_estimated_cost=Decimal("0.20"), pricing=prices),),
+        )
+        ...
+```
+
+`run` takes the agent name, a prompt or messages, and the usual request options
+(`structured_output`, `max_steps`, `limits`, `budget_limits`,
+`environment_name`, `metadata`), and returns the `RunOutcome`. The run is a
+session of its own that stays inside the parent's causal budget: it shares the
+parent's `causal_budget_id` and gets the parent's causal limits ahead of the
+`budget_limits` the call passes. `files` are stored with `CayuApp.attach_file`
+in the environment the run will use (the call's `environment_name`, else the
+agent's registered default, else the application default) as attachments of
+that session, and added to the last user message, so the same file limits
+apply. Asking for
+an agent the tool does not name raises `PermissionError`.
+
+The session id is derived from the tool call's idempotency key, the agent name
+and `key` (default `"run"`; pass different keys for several runs in one call).
+A retried call therefore gets the earlier run back through
+`cayu.sessions.run_once` instead of paying for it again: a finished run returns
+its stored outcome, and one still running raises `RunOnceSessionNotFinished`.
+The session's metadata records `tool_agent_run` with the parent session id, the
+tool call id and the key.
+
 ## ToolPolicy
 
 `GuardedToolPolicy` composes application validation with maintained enforcement:

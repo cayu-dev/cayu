@@ -67,6 +67,7 @@ from cayu.tools._resources import (
 from cayu.tools._runner import (
     invocation_runner_handle,
 )
+from cayu.tools.agent_runs import AgentRuns, declared_agent_runs
 from cayu.tools.base import (
     DurableToolOperationConflict,
     ToolContext,
@@ -141,8 +142,11 @@ class ToolInvocationResources:
         knowledge_publication_scope: KnowledgePublicationScope,
         browser_control_service: BrowserControlService | None,
         clock: Callable[[], datetime],
+        application: Any,
     ) -> None:
         self._session_store = session_store
+        # The application, for tools that run other agents through ctx.agents.
+        self._application = application
         self._image_decode_policy = image_decode_policy
         self._knowledge_publication_scope = knowledge_publication_scope
         self._browser_control_service = browser_control_service
@@ -284,13 +288,20 @@ class ToolInvocationResources:
             metadata=ctx_metadata,
         )
         tool_context._bind_runtime_clock(self._clock)
+        agent_names = declared_agent_runs(registered_tool.tool)
+        if agent_names:
+            tool_context._bind_runtime_agents(
+                AgentRuns(self._application, tool_context, agent_names)
+            )
         tool_context._bind_runtime_causal_budget_limits(
             tuple(
                 _copy_budget_limit_definition(limit)
                 for limit in budget_limits
                 if limit.scope == "causal" and limit.key == session.causal_budget_id
             )
-            if registered_tool.child_session_recovery is not None
+            # A tool's own child sessions, including agents it runs through
+            # ctx.agents, stay inside the parent's causal budget.
+            if registered_tool.child_session_recovery is not None or agent_names
             else ()
         )
         tool_context._bind_runtime_resource_authorities(
