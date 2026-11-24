@@ -10066,6 +10066,16 @@
             }
           ]
         },
+        "task_label_filters": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/OptionalSurfaceCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "task_value_filters": {
           "anyOf": [
             {
@@ -44556,6 +44566,25 @@
                 }
               ],
               "title": "Input"
+            }
+          },
+          {
+            "in": "query",
+            "name": "label",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Label"
             }
           },
           {

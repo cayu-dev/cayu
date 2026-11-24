@@ -326,6 +326,14 @@ def _ilike_contains_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
+def _append_label_clauses(query: TaskQuery, clauses: list[str], params: list[object]) -> None:
+    """``TaskQuery.labels``: each must be one of the task's invocation access labels."""
+
+    if query.labels:
+        clauses.append("COALESCE(invocation->'access_labels', '{}'::jsonb) @> %s::jsonb")
+        params.append(json.dumps(query.labels))
+
+
 @model_store_surface("tasks")
 class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items.
@@ -1854,6 +1862,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         if query.assigned_agent_name is not None:
             clauses.append("assigned_agent_name = %s")
             params.append(query.assigned_agent_name)
+        _append_label_clauses(query, clauses, params)
 
         if query.has_work_contract is not None:
             clauses.append(
@@ -6156,6 +6165,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, postgres_base._PostgresStoreB
         if query.assigned_agent_name is not None:
             clauses.append("assigned_agent_name = %s")
             params.append(query.assigned_agent_name)
+        _append_label_clauses(query, clauses, params)
         return clauses, params
 
     async def _raise_task_active_lease_error(

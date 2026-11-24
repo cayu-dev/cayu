@@ -248,6 +248,7 @@ class ControlPlaneSurfaceCapabilities(_DiagnosticsModel):
     shared_allocations: OptionalSurfaceCapability | None = None
     task_index: OptionalSurfaceCapability | None = None
     task_value_filters: OptionalSurfaceCapability | None = None
+    task_label_filters: OptionalSurfaceCapability | None = None
     task_creation: OptionalSurfaceCapability | None = None
     task_graph_creation: OptionalSurfaceCapability | None = None
     tool_inventory: OptionalSurfaceCapability | None = None

@@ -20,6 +20,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    copy_label_map,
 )
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
 from cayu.budgets.aggregates import AggregateAccuracy, AggregateCount
@@ -39,6 +40,8 @@ class TaskOrder(StrEnum):
 
 # The most task types one query may name.
 MAX_TASK_QUERY_TYPES = 50
+# The most labels one query may require.
+MAX_TASK_QUERY_LABELS = 20
 
 
 class TaskQuery(BaseModel):
@@ -57,6 +60,14 @@ class TaskQuery(BaseModel):
     # True lists only tasks fenced after their worker's lease expired (see
     # ``is_fenced_after_worker_loss``); False leaves them out. Listing only.
     fenced_after_worker_loss: StrictBool | None = None
+    # Only tasks carrying every one of these labels (``TaskCreate.labels``, kept as the
+    # invocation's ``access_labels``; a task created in a session has the session's too).
+    # Listing only.
+    labels: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=MAX_TASK_QUERY_LABELS,
+        exclude_if=lambda value: not value,
+    )
     limit: StrictInt = Field(default=100, ge=1, le=1000)
     offset: StrictInt = Field(default=0, ge=0, le=MAX_DURABLE_JSON_INTEGER)
     order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC
@@ -83,6 +94,11 @@ class TaskQuery(BaseModel):
         if len(set(types)) != len(types):
             raise ValueError("types must not repeat a task type.")
         return types
+
+    @field_validator("labels", mode="before")
+    @classmethod
+    def copy_query_labels(cls, value: object) -> dict[str, str]:
+        return copy_label_map(value, "labels")
 
     @model_validator(mode="after")
     def validate_one_type_filter(self) -> TaskQuery:
@@ -259,6 +275,7 @@ def copy_task_query(query: TaskQuery | None) -> TaskQuery:
         assigned_agent_name=query.assigned_agent_name,
         has_work_contract=query.has_work_contract,
         fenced_after_worker_loss=query.fenced_after_worker_loss,
+        labels=query.labels,
         limit=query.limit,
         offset=query.offset,
         order_by=query.order_by,
@@ -317,10 +334,19 @@ def _task_matches(task: Task, query: TaskQuery) -> bool:
         return False
     if query.parent_task_id is not None and task.parent_task_id != query.parent_task_id:
         return False
+    if not task_has_labels(task, query.labels):
+        return False
     return not (
         query.assigned_agent_name is not None
         and task.assigned_agent_name != query.assigned_agent_name
     )
+
+
+def task_has_labels(task: Task, labels: Mapping[str, str]) -> bool:
+    """Whether ``task`` carries every one of ``labels`` (``TaskQuery.labels``)."""
+
+    carried = task.invocation.access_labels
+    return all(carried.get(key) == value for key, value in labels.items())
 
 
 def _task_matches_search(task: Task, query: str) -> bool:
@@ -364,6 +390,8 @@ def _ensure_claim_query_supported(query: TaskQuery) -> None:
         raise ValueError("Task claim queries do not support session_id.")
     if query.fenced_after_worker_loss is not None:
         raise ValueError("Task claim queries do not support fenced_after_worker_loss.")
+    if query.labels:
+        raise ValueError("Task claim queries do not support labels.")
     if query.limit != TaskQuery.model_fields["limit"].default:
         raise ValueError("Task claim queries do not support limit.")
     if query.offset != TaskQuery.model_fields["offset"].default:

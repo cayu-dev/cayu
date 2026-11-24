@@ -226,15 +226,19 @@ def plan_native_read(
         params.append(query.prerequisite_task_id)
     if filters.q is not None:
         where.append(_text_prefilter(filters.q, dialect, params, search=search))
-    countable = not bounded and all(
-        value is None
-        for value in (
-            filters.q,
-            filters.session_id,
-            filters.parent_task_id,
-            filters.has_work_contract,
-            query.prerequisite_task_id,
+    countable = (
+        not bounded
+        and all(
+            value is None
+            for value in (
+                filters.q,
+                filters.session_id,
+                filters.parent_task_id,
+                filters.has_work_contract,
+                query.prerequisite_task_id,
+            )
         )
+        and not filters.labels
     )
     plan = TaskIndexPlan(query, dialect, where, params, uses_counts_table=countable)
     if countable:

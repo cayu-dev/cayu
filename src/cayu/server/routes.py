@@ -9221,8 +9221,9 @@ def create_router(
         description=(
             "List tasks. `input` and `metadata` filters (repeatable, `key=value`) match a "
             "top-level value of the task's input or metadata as the task detail shows it; "
-            "numbers match by value and booleans as true or false; `ids` alone returns those "
-            "tasks' details. It has a weak `ETag`; a matching `If-None-Match` returns `304`."
+            "numbers match by value and booleans as true or false. `label` filters (repeatable, "
+            "`key=value`) keep tasks created with every one of those labels. `ids` alone returns "
+            "those tasks' details. It has a weak `ETag`; a matching `If-None-Match` returns `304`."
         ),
     )
     async def list_tasks(
@@ -9242,6 +9243,7 @@ def create_router(
         assigned_agent_name: str | None = None,
         input_filter: Annotated[list[str] | None, Query(alias="input")] = None,
         metadata_filter: Annotated[list[str] | None, Query(alias="metadata")] = None,
+        label: Annotated[list[str] | None, Query()] = None,
         order_by: TaskOrder = TaskOrder.UPDATED_AT_DESC,
         limit: int = 50,
         offset: int = 0,
@@ -9251,6 +9253,7 @@ def create_router(
         if ids is not None:
             return await read_tasks_by_ids(cayu_app, http_request, response, ids)
         values = parse_task_value_filters(input_filter, metadata_filter)
+        labels = _parse_session_label_filters(label)
         if task_store is None:
             if include == "counts":
                 raise HTTPException(501, "Task index is unavailable.")
@@ -9264,6 +9267,7 @@ def create_router(
                 session_id=session_id,
                 parent_task_id=parent_task_id,
                 assigned_agent_name=assigned_agent_name,
+                labels=labels,
                 order_by=order_by,
                 limit=limit,
                 offset=offset,

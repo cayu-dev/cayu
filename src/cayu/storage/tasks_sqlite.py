@@ -431,6 +431,18 @@ _UNADMITTED_SCHEDULE_STATUS_SQL = (
 )
 
 
+def _append_label_clauses(query: TaskQuery, clauses: list[str], params: list[object]) -> None:
+    """``TaskQuery.labels``: each must be one of the task's invocation access labels."""
+
+    for key, value in query.labels.items():
+        clauses.append(
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(invocation_json, "
+            "'$.access_labels'), '{}')) AS task_label "
+            "WHERE task_label.key = ? AND task_label.value = ?)"
+        )
+        params.extend([key, value])
+
+
 @model_store_surface("tasks")
 class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
@@ -4394,6 +4406,7 @@ class SQLiteTaskStore(TaskStore):
         if query.assigned_agent_name is not None:
             clauses.append("assigned_agent_name = ?")
             params.append(query.assigned_agent_name)
+        _append_label_clauses(query, clauses, params)
 
         if query.has_work_contract is not None:
             clauses.append(
@@ -8048,6 +8061,7 @@ class SQLiteTaskStore(TaskStore):
         if query.assigned_agent_name is not None:
             clauses.append("assigned_agent_name = ?")
             params.append(query.assigned_agent_name)
+        _append_label_clauses(query, clauses, params)
         return clauses, params
 
     def _raise_task_active_lease_error(

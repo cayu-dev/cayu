@@ -35,6 +35,7 @@ from cayu.cli._task_readers import (
 )
 from cayu.cli.session import _redact_sensitive, print_timing_totals
 from cayu.sessions._event_loop_lag import event_loop_lag_text
+from cayu.sessions._label_filter_syntax import parse_label_filters
 from cayu.sessions._rollup import SessionTiming, add_session_timings
 from cayu.tasks._value_filters import TaskValueFilters
 from cayu.tasks.cancellation import (
@@ -291,6 +292,17 @@ def add_task_parser(subparsers: Any) -> None:
         help="Only tasks of this run: their metadata's `run` (the same as --metadata run=RUN).",
     )
     list_parser.add_argument(
+        "--label",
+        action="append",
+        dest="label_filters",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Only tasks created with this label (TaskCreate.labels, and a session's labels "
+            "for a task created in it). Repeat for several; every one must match."
+        ),
+    )
+    list_parser.add_argument(
         "--limit",
         type=_page_limit,
         default=50,
@@ -484,6 +496,7 @@ def run_task(args: argparse.Namespace) -> int:
             args.metadata_values = _value_filters(metadata, "--metadata (or --run)")
             # At most eight of each, as the server takes.
             TaskValueFilters.of(args.input_values, args.metadata_values)
+            args.labels = parse_label_filters(args.label_filters)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -551,6 +564,7 @@ async def _list_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
             parent_task_id=args.parent,
             input=args.input_values,
             metadata=args.metadata_values,
+            labels=args.labels,
             # One more than asked says whether another page follows.
             limit=args.limit + 1,
             offset=args.offset,

@@ -6090,6 +6090,7 @@ export type ControlPlaneSurfaceCapabilities = {
     task_creation?: OptionalSurfaceCapability | null;
     task_graph_creation?: OptionalSurfaceCapability | null;
     task_index?: OptionalSurfaceCapability | null;
+    task_label_filters?: OptionalSurfaceCapability | null;
     task_value_filters?: OptionalSurfaceCapability | null;
     tasks: OptionalSurfaceCapability;
     tool_authorization_grants?: OptionalSurfaceCapability | null;
@@ -33598,6 +33599,10 @@ export type ListTasksApiTasksGetData = {
          * Metadata
          */
         metadata?: Array<string> | null;
+        /**
+         * Label
+         */
+        label?: Array<string> | null;
         order_by?: TaskOrder;
         /**
          * Limit

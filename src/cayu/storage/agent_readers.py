@@ -241,9 +241,9 @@ class _CloudTaskReader:
         return await read(self._login)
 
     async def list_tasks(self, request: TaskListRequest) -> list[dict[str, Any]]:
-        if request.values:
-            # Filtering by input or metadata first reads the server's contract, which the
-            # route doesn't forward.
+        if request.values or request.labels:
+            # Filtering by input, metadata or labels first reads the server's contract,
+            # which the route doesn't forward.
             return await self._login.list_tasks(request)
         return await self._read(lambda reader: reader.list_tasks(request))
 

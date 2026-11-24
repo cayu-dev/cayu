@@ -148,6 +148,15 @@ status=TaskStatus.COMPLETED), by="input.repository")` returns one task per disti
 repository, newest first, in one query on SQLite and PostgreSQL. `cayu task latest`
 reads the same.
 
+To find the tasks that belong to one person or one job, create them with labels
+(`TaskCreate(type="review", labels={"person": "ana", "job": "close"})`; a task created
+inside a session also carries the session's labels) and list them with
+`TaskQuery(labels={"job": "close"})`, which keeps tasks carrying every label given.
+`list_tasks`, `latest_tasks` and `query_task_index` take it on every store; claims
+refuse it. `cayu task list --label job=close` and `GET /api/tasks?label=job=close` read
+the same; a server says it supports them with the contract's `task_label_filters`
+surface, and the CLI checks that surface before it lists.
+
 `execution_timeout_s` is the longest one handler call may take, grace period
 included, counted from handler start, whether or not its runs are attached to
 the task. It defaults to `None` (no limit). The last `execution_grace_s`

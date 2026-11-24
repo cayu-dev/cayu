@@ -57,6 +57,8 @@ class TaskListRequest:
     # A run's tasks are ``metadata={"run": RUN}``.
     input: Mapping[str, str] = field(default_factory=dict)
     metadata: Mapping[str, str] = field(default_factory=dict)
+    # Only tasks created with every one of these labels (``TaskQuery.labels``).
+    labels: Mapping[str, str] = field(default_factory=dict)
     limit: int = 50
     offset: int = 0
 
@@ -147,6 +149,7 @@ class StoreTaskReader:
             assigned_agent_name=request.agent,
             session_id=request.session_id,
             parent_task_id=request.parent_task_id,
+            labels=dict(request.labels),
             limit=request.limit,
             offset=request.offset,
             order_by=TaskOrder.UPDATED_AT_DESC,
@@ -258,9 +261,14 @@ class ApiTaskReader:
             if value is not None
         }
         if request.values:
-            self._require_value_filters()
+            self._require_surface(
+                "task_value_filters", "can't filter tasks by input, metadata or run"
+            )
             query["input"] = [f"{key}={value}" for key, value in request.values.input]
             query["metadata"] = [f"{key}={value}" for key, value in request.values.metadata]
+        if request.labels:
+            self._require_surface("task_label_filters", "can't filter tasks by label")
+            query["label"] = [f"{key}={value}" for key, value in request.labels.items()]
         body = self._task_list(self._api.get("/tasks", query=query, resource="tasks"))
         if types and any(row["type"] not in types for row in body):
             # A server that predates `types` ignores it and lists every type.
@@ -271,16 +279,15 @@ class ApiTaskReader:
             )
         return body
 
-    def _require_value_filters(self) -> None:
-        # A server without them ignores the filters and lists other tasks.
+    def _require_surface(self, surface: str, missing: str) -> None:
+        # A server without the filters ignores them and lists other tasks.
         capability = self._api.get("/contract", resource="server capabilities")
-        for key in ("capabilities", "surfaces", "task_value_filters", "read", "enabled"):
+        for key in ("capabilities", "surfaces", surface, "read", "enabled"):
             capability = capability.get(key) if isinstance(capability, dict) else None
         if capability is not True:
             raise CayuApiError(
                 "unsupported",
-                f"{self._api.description} can't filter tasks by input, metadata or run; "
-                "its Cayu predates those filters.",
+                f"{self._api.description} {missing}; its Cayu predates those filters.",
             )
 
     async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
