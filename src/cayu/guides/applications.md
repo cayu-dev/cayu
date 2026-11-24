@@ -186,16 +186,26 @@ the check accepts without executing them:
 - `@functools.cache`, `@functools.lru_cache` and `@lru_cache(maxsize=...)` with
   literal options.
 - SQLAlchemy declarative models, as `--with app-database` generates them: a
-  `DeclarativeBase` subclass whose body sets at most `metadata = MetaData(...)`, and
-  models whose bodies hold `__tablename__`, `__table_args__` of literal
-  `UniqueConstraint`, `ForeignKeyConstraint`, `Index` or `CheckConstraint` values, and
-  `Mapped[...]` columns built with `mapped_column(...)` from SQLAlchemy column types and
-  `ForeignKey(...)`, with literal options and `server_default=func.now()`. Undecorated
-  methods, `__repr__` and `__str__` are allowed. Decorated methods (a decorator can make a
-  method a descriptor SQLAlchemy runs while it reads the class), other dunder and `_sa_`
-  methods (`__table_cls__`, `__mapper_cls__`), methods named `metadata`, `registry` or
-  `type_annotation_map`, mixins, `__mapper_args__` and any other call in a model body
+  `DeclarativeBase` subclass whose body sets at most `metadata = MetaData(...)` (literal
+  options; `naming_convention` may also name a module constant of literal strings, under
+  the same augmented-assignment rule as other list, dict and set constants below) and
+  `type_annotation_map = {...}` from annotations to SQLAlchemy column types; plain mixin
+  classes, with no bases, that declare `Mapped[...]` columns; and models whose bodies hold
+  `__tablename__`, `__table_args__` of literal `UniqueConstraint`, `ForeignKeyConstraint`,
+  `Index` or `CheckConstraint` values, and `Mapped[...]` columns built with
+  `mapped_column(...)` from SQLAlchemy column types (including the PostgreSQL ones such as
+  `JSONB` and `ARRAY(Text)`) and `ForeignKey(...)`, with literal options and `func.now()`
+  as a `default`, `onupdate`, `server_default` or `server_onupdate`. A mixin's body follows
+  a model's rules. Undecorated methods, `__repr__` and `__str__` are allowed. Decorated
+  methods (a decorator can make a method a descriptor SQLAlchemy runs while it reads the
+  class, such as `@declared_attr`), other dunder and `_sa_` methods (`__table_cls__`,
+  `__mapper_cls__`, `__init_subclass__`), methods named `metadata`, `registry` or
+  `type_annotation_map`, `__mapper_args__` and any other call in a model or mixin body
   stay unproven.
+- Imports under a module-level `if TYPE_CHECKING:`, with `TYPE_CHECKING` imported from
+  `typing` or `typing_extensions` and never rebound, which Python never runs. Annotate
+  with the application's models from any module that way; the check doesn't follow those
+  imports.
 
 Environment reads at import (`os.environ[...]`, `os.environ.get(...)`,
 `os.getenv(...)`) are deliberately unsupported, with `reason:

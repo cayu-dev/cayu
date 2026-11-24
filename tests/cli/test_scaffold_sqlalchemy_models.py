@@ -103,6 +103,75 @@ class Note(Base):
 """,
 }
 
+_SHARED_COLUMNS = '''from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import DateTime, ForeignKey, Index, MetaData, String, Text, func
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+SCHEMA = "app"
+NAMING = {
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
+class Base(DeclarativeBase):
+    metadata = MetaData(schema=SCHEMA, naming_convention=NAMING)
+    type_annotation_map = {dict[str, Any]: JSONB, list[str]: ARRAY(Text)}
+
+
+class Timestamps:
+    """Columns every table shares."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class Upload(Timestamps, Base):
+    __tablename__ = "uploads"
+    __table_args__ = (Index(None, "owner", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(200), index=True)
+    tags: Mapped[list[str]]
+    details: Mapped[dict[str, Any] | None]
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default="{}")
+
+
+class UploadNote(Base):
+    __tablename__ = "upload_notes"
+
+    upload_id: Mapped[str] = mapped_column(
+        ForeignKey(f"{SCHEMA}.uploads.id", ondelete="CASCADE"), primary_key=True
+    )
+    labels: Mapped[list[str]] = mapped_column(ARRAY(String(40)))
+'''
+_ACCEPTED["mixins_naming_and_type_map"] = _SHARED_COLUMNS
+_ACCEPTED["dialect_module_types"] = (
+    _BASE.replace(
+        "from sqlalchemy.orm import",
+        "from sqlalchemy.dialects import postgresql\nfrom sqlalchemy.orm import",
+    )
+    + """
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    body: Mapped[dict] = mapped_column(postgresql.JSONB)
+    tags: Mapped[list[str]] = mapped_column(postgresql.ARRAY(String(40)))
+"""
+)
+
 _REJECTED = {
     # A column default the proof can't evaluate as data.
     "computed_default": (
@@ -137,6 +206,35 @@ _REJECTED = {
         _BASE + "\n\nclass Audited:\n    pass\n\n\nclass Row(Audited, Base):\n"
         '    __tablename__ = "rows"\n\n'
         "    id: Mapped[int] = mapped_column(primary_key=True)\n",
+        None,
+    ),
+    # A mixin's body is held to a model's rules: no hook SQLAlchemy would run on a subclass.
+    "mixin_hook": (
+        _BASE + "\n\nclass Audited:\n"
+        "    revision: Mapped[int] = mapped_column(default=0)\n\n"
+        "    def __init_subclass__(cls, **kwargs):\n        return None\n\n\n"
+        'class Row(Audited, Base):\n    __tablename__ = "rows"\n\n'
+        "    id: Mapped[int] = mapped_column(primary_key=True)\n",
+        None,
+    ),
+    "mixin_call": (
+        _BASE + "\n\ndef start() -> int:\n    return 1\n\n\nclass Audited:\n"
+        "    revision: Mapped[int] = mapped_column(default=start())\n",
+        "start(...)",
+    ),
+    # The type map names reviewed column types only.
+    "type_map_call": (
+        _BASE + "\n    type_annotation_map = {dict: make_type()}\n\n\n"
+        "def make_type() -> object:\n    return None\n",
+        None,
+    ),
+    # A naming convention changed in place at import no longer holds what it was written with.
+    "augmented_naming_convention": (
+        _BASE.replace(
+            "    metadata = MetaData(schema=SCHEMA)",
+            "    metadata = MetaData(schema=SCHEMA, naming_convention=NAMING)",
+        ).replace('SCHEMA = "app"\n', 'SCHEMA = "app"\nNAMING = {"pk": "pk_%(table_name)s"}\n')
+        + '\n\nNAMING |= {"ix": "ix_%(column_0_label)s"}\n',
         None,
     ),
     # SQLAlchemy calls these while it declares the class.
@@ -235,6 +333,84 @@ def test_an_agent_that_uses_its_tables_passes_cayu_check(
         encoding="utf-8",
     )
     assert "from database.models import Note" in registration.read_text(encoding="utf-8")
+    capsys.readouterr()
+    monkeypatch.chdir(project)
+
+    assert main(["check", "--fail-on", "warning", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["diagnostics"] == []
+
+
+_TYPED_IMPORT = """from __future__ import annotations
+
+{flag}
+
+if TYPE_CHECKING:
+    from database.effectful import Effect
+
+
+def describe(effect: Effect) -> str:
+    return str(effect)
+"""
+
+
+@pytest.mark.parametrize(
+    ("flag", "followed"),
+    [
+        ("from typing import TYPE_CHECKING", False),
+        ("import typing_extensions as typing\nTYPE_CHECKING = typing.TYPE_CHECKING", True),
+        ("from typing import TYPE_CHECKING\n\nTYPE_CHECKING = True", True),
+    ],
+)
+def test_imports_under_type_checking_are_not_followed(
+    project: Path, flag: str, followed: bool
+) -> None:
+    # Outside the application packages, so only an import brings it into the check.
+    effectful = project / "database" / "effectful.py"
+    effectful.write_text(
+        'from pathlib import Path\n\nPath("marker").write_text("x")\n\n\nclass Effect:\n    pass\n',
+        encoding="utf-8",
+    )
+    module = project / "tools" / "candidate.py"
+    module.write_text(_TYPED_IMPORT.format(flag=flag), encoding="utf-8")
+    try:
+        paths = {
+            diagnostic.path.partition(":")[0]
+            for diagnostic in check_declared_scaffold_source(project)
+            if diagnostic.code == "SCAFFOLD_IMPORT_SIDE_EFFECT"
+        }
+    finally:
+        module.unlink()
+        effectful.unlink()
+
+    assert ("database/effectful.py" in paths) is followed
+
+
+def test_typing_with_the_models_from_application_code_passes_cayu_check(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert main(["new", "probe", "--with", "app-database", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "probe"
+    (project / "database" / "models.py").write_text(_SHARED_COLUMNS, encoding="utf-8")
+    (project / "operations" / "uploads.py").write_text(
+        '"""Read uploads."""\n\n'
+        "from __future__ import annotations\n\n"
+        "from typing import TYPE_CHECKING\n\n"
+        "from database.models import Upload\n\n"
+        "if TYPE_CHECKING:\n"
+        "    from database.session import Session\n\n\n"
+        "def owner(db: Session, upload_id: str) -> str | None:\n"
+        "    upload = db.get(Upload, upload_id)\n"
+        "    return None if upload is None else upload.owner\n",
+        encoding="utf-8",
+    )
+    registration = project / "tools" / "registration.py"
+    registration.write_text(
+        registration.read_text(encoding="utf-8").replace(
+            '"""\n\n', '"""\n\nfrom operations.uploads import owner  # noqa: F401\n', 1
+        ),
+        encoding="utf-8",
+    )
+    assert "from operations.uploads import owner" in registration.read_text(encoding="utf-8")
     capsys.readouterr()
     monkeypatch.chdir(project)
 

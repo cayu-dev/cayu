@@ -2322,7 +2322,16 @@ def _assignment_target_binds_name(target: ast.expr, name: str) -> bool:
 class _DeclarativeBinding:
     line: int
     kind: Literal[
-        "class", "model", "table", "enum", "literal", "annotation", "function", "pattern", "module"
+        "class",
+        "model",
+        "table",
+        "enum",
+        "literal",
+        "data",
+        "annotation",
+        "function",
+        "pattern",
+        "module",
     ] = "class"
     enum_members: frozenset[str] | None = None
     metadata_shape: Literal["str", "tuple"] | None = None
@@ -2352,19 +2361,22 @@ def _is_pydantic_base(
 # SQLAlchemy declarative models, the shape `cayu new --with app-database` generates. Declaring
 # one registers its table and mapper in its base's metadata and registry, in memory; nothing
 # connects or reads configuration. Only these shapes are proven: a base whose body sets at most
-# `metadata = MetaData(...)`, and models whose bodies hold `__tablename__`, `__table_args__` of
-# literal constraints, and `Mapped[...]` columns built from the types and helpers below with
-# literal arguments. Mixins, mapper options and any other call stay unproven.
+# `metadata = MetaData(...)` and `type_annotation_map = {...}`, plain mixins of columns, and
+# models whose bodies hold `__tablename__`, `__table_args__` of literal constraints, and
+# `Mapped[...]` columns built from the types and helpers below with literal arguments. Mapper
+# options and any other call stay unproven.
 _SQLALCHEMY_BASE = ("sqlalchemy.orm", "DeclarativeBase")
 _SQLALCHEMY_COLUMN_TYPES = frozenset(
     ("sqlalchemy", name)
     for name in (
+        "ARRAY",
         "BigInteger",
         "Boolean",
         "Date",
         "DateTime",
         "Float",
         "Integer",
+        "Interval",
         "JSON",
         "LargeBinary",
         "Numeric",
@@ -2373,6 +2385,21 @@ _SQLALCHEMY_COLUMN_TYPES = frozenset(
         "Text",
         "Time",
         "Uuid",
+    )
+) | frozenset(
+    ("sqlalchemy.dialects.postgresql", name)
+    for name in (
+        "ARRAY",
+        "BYTEA",
+        "CIDR",
+        "INET",
+        "INTERVAL",
+        "JSON",
+        "JSONB",
+        "MACADDR",
+        "TIMESTAMP",
+        "TSVECTOR",
+        "UUID",
     )
 )
 _SQLALCHEMY_CONSTRAINTS = frozenset(
@@ -2387,6 +2414,9 @@ _SQLALCHEMY_INERT_DUNDERS = frozenset({"__repr__", "__str__"})
 _SQLALCHEMY_DECLARATION_ATTRIBUTES = frozenset({"metadata", "registry", "type_annotation_map"})
 # `func.now()` and the like, which the database evaluates for a server default.
 _SQLALCHEMY_SERVER_FUNCTIONS = frozenset({"current_timestamp", "now"})
+# Column options that may hold such a SQL function: the database evaluates it on insert or
+# update, and building the expression at import runs nothing.
+_SQLALCHEMY_SQL_DEFAULTS = frozenset({"default", "onupdate", "server_default", "server_onupdate"})
 
 
 def _is_sqlalchemy_base(
@@ -2400,6 +2430,129 @@ def _is_sqlalchemy_base(
     )
 
 
+def _sqlalchemy_mapped_annotation(
+    annotation: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> ast.Subscript | None:
+    """`Mapped[...]`, written out or as the string a postponed annotation leaves."""
+
+    if isinstance(annotation, ast.Constant):
+        parsed = _string_annotation(annotation)
+        if parsed is None:
+            return None
+        annotation = parsed
+    if isinstance(annotation, ast.Subscript) and _trusted_symbol(
+        annotation.value, imports, rebound, root
+    ) == ("sqlalchemy.orm", "Mapped"):
+        return annotation
+    return None
+
+
+def _is_sqlalchemy_mixin(
+    definition: ast.ClassDef,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> bool:
+    """A plain class, with no bases, that declares `Mapped[...]` columns for models to share.
+
+    Its body is then held to the same rules as a model's, so it brings no declaration hook.
+    """
+
+    return (
+        not definition.bases
+        and not definition.keywords
+        and not definition.decorator_list
+        and any(
+            isinstance(statement, ast.AnnAssign)
+            and _sqlalchemy_mapped_annotation(statement.annotation, imports, rebound, root)
+            is not None
+            for statement in definition.body
+        )
+    )
+
+
+def _sqlalchemy_type_is_declarative(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """A reviewed column type, or one built from literals and other reviewed types."""
+
+    if _sqlalchemy_symbol(value, imports, rebound, root) in _SQLALCHEMY_COLUMN_TYPES:
+        return True
+    if not _sqlalchemy_call_is(value, _SQLALCHEMY_COLUMN_TYPES, imports, rebound, root):
+        return False
+    assert isinstance(value, ast.Call)
+    return all(
+        _declaration_value_is_inert(argument, proofs)
+        or _sqlalchemy_type_is_declarative(argument, imports, rebound, root, proofs)
+        for argument in value.args
+    ) and all(
+        keyword.arg is not None and _declaration_value_is_inert(keyword.value, proofs)
+        for keyword in value.keywords
+    )
+
+
+def _sqlalchemy_metadata_is_declarative(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """`MetaData(...)` of literal options; the naming convention may be a constant of data."""
+
+    if not _sqlalchemy_call_is(
+        value, frozenset({("sqlalchemy", "MetaData")}), imports, rebound, root
+    ):
+        return False
+    assert isinstance(value, ast.Call)
+
+    def naming_constant(expression: ast.expr) -> bool:
+        if not isinstance(expression, ast.Name):
+            return False
+        proof = proofs.get(expression.id)
+        return proof is not None and proof.kind == "data" and proof.line < expression.lineno
+
+    return all(_declaration_value_is_inert(argument, proofs) for argument in value.args) and all(
+        keyword.arg is not None
+        and (
+            _declaration_value_is_inert(keyword.value, proofs)
+            or (keyword.arg == "naming_convention" and naming_constant(keyword.value))
+        )
+        for keyword in value.keywords
+    )
+
+
+def _sqlalchemy_type_map_is_declarative(
+    value: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+    proofs: Mapping[str, _DeclarativeBinding],
+) -> bool:
+    """`type_annotation_map = {dict[str, Any]: JSONB, ...}`: annotations to reviewed types."""
+
+    return isinstance(value, ast.Dict) and all(
+        key is not None
+        and _pydantic_annotation_is_declarative(
+            key,
+            import_bindings=imports,
+            rebound_names=rebound,
+            project_root=root,
+            declarative_bases=proofs,
+            allow_forward_references=False,
+        )
+        and _sqlalchemy_type_is_declarative(item, imports, rebound, root, proofs)
+        for key, item in zip(value.keys, value.values, strict=True)
+    )
+
+
 def _sqlalchemy_arguments_are_literal(
     call: ast.Call, proofs: Mapping[str, _DeclarativeBinding]
 ) -> bool:
@@ -2407,6 +2560,31 @@ def _sqlalchemy_arguments_are_literal(
         keyword.arg is not None and _declaration_value_is_inert(keyword.value, proofs)
         for keyword in call.keywords
     )
+
+
+def _sqlalchemy_symbol(
+    expression: ast.expr,
+    imports: Mapping[str, tuple[str, str | None]],
+    rebound: frozenset[str],
+    root: Path,
+) -> tuple[str, str | None] | None:
+    """`_trusted_symbol`, plus `postgresql.JSONB` after `from sqlalchemy.dialects import postgresql`."""
+
+    symbol = _trusted_symbol(expression, imports, rebound, root)
+    if symbol is not None or not (
+        isinstance(expression, ast.Attribute) and isinstance(expression.value, ast.Name)
+    ):
+        return symbol
+    name = expression.value.id
+    module, imported = imports.get(name, ("", None))
+    if (
+        imported is None
+        or name in rebound
+        or not module.startswith("sqlalchemy")
+        or _import_binding_is_project_local(root, (module, imported))
+    ):
+        return None
+    return (f"{module}.{imported}", expression.attr)
 
 
 def _sqlalchemy_call_is(
@@ -2417,7 +2595,8 @@ def _sqlalchemy_call_is(
     root: Path,
 ) -> bool:
     return (
-        isinstance(call, ast.Call) and _trusted_symbol(call.func, imports, rebound, root) in symbols
+        isinstance(call, ast.Call)
+        and _sqlalchemy_symbol(call.func, imports, rebound, root) in symbols
     )
 
 
@@ -2438,18 +2617,18 @@ def _sqlalchemy_column_is_declarative(
     for argument in value.args:
         if _sqlalchemy_call_is(
             argument, frozenset({("sqlalchemy", "ForeignKey")}), imports, rebound, root
-        ) or _sqlalchemy_call_is(argument, _SQLALCHEMY_COLUMN_TYPES, imports, rebound, root):
+        ):
             assert isinstance(argument, ast.Call)
             if not _sqlalchemy_arguments_are_literal(argument, proofs):
                 return False
-        elif _trusted_symbol(argument, imports, rebound, root) not in _SQLALCHEMY_COLUMN_TYPES:
+        elif not _sqlalchemy_type_is_declarative(argument, imports, rebound, root, proofs):
             return False
     for keyword in value.keywords:
         if keyword.arg is None:
             return False
         server_function = keyword.value
         if (
-            keyword.arg in {"server_default", "server_onupdate"}
+            keyword.arg in _SQLALCHEMY_SQL_DEFAULTS
             and isinstance(server_function, ast.Call)
             and not server_function.args
             and not server_function.keywords
@@ -2558,27 +2737,30 @@ def _sqlalchemy_model_obstacle(
             if (
                 name == "metadata"
                 and declares_base
-                and _sqlalchemy_call_is(
-                    value,
-                    frozenset({("sqlalchemy", "MetaData")}),
-                    import_bindings,
-                    scope,
-                    project_root,
+                and _sqlalchemy_metadata_is_declarative(
+                    value, import_bindings, scope, project_root, proofs
                 )
-                and isinstance(value, ast.Call)
-                and _sqlalchemy_arguments_are_literal(value, proofs)
             ):
                 values.add(value)
+                continue
+            if (
+                name == "type_annotation_map"
+                and declares_base
+                and _sqlalchemy_type_map_is_declarative(
+                    value, import_bindings, scope, project_root, proofs
+                )
+            ):
+                values.add(value)
+                values.update(_evaluated_calls(value))
                 continue
             return value, frozenset()
         if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
             annotation = statement.annotation
+            mapped = _sqlalchemy_mapped_annotation(annotation, import_bindings, scope, project_root)
             if not (
-                isinstance(annotation, ast.Subscript)
-                and _trusted_symbol(annotation.value, import_bindings, scope, project_root)
-                == ("sqlalchemy.orm", "Mapped")
+                mapped is not None
                 and _pydantic_annotation_is_declarative(
-                    annotation.slice,
+                    mapped.slice,
                     import_bindings=import_bindings,
                     rebound_names=scope,
                     project_root=project_root,
@@ -3278,7 +3460,7 @@ def _unsafe_import_time_expression(
         if any(
             _is_sqlalchemy_base(base, import_bindings, declarative_bases)
             for base in definition.bases
-        ):
+        ) or _is_sqlalchemy_mixin(definition, import_bindings, rebound_names, project_root):
             obstacle, values = _sqlalchemy_model_obstacle(
                 definition,
                 import_bindings=import_bindings,
@@ -4097,7 +4279,7 @@ def _project_declaration_proofs(
         # explicit children and regular parent initializers still enter the graph.
         tree = ast.Module(body=[], type_ignores=[]) if path.is_dir() else _parsed_module(path)
         if tree is not None:
-            tree = _without_postponed_annotations(tree)
+            tree = _without_postponed_annotations(_without_type_checking_blocks(tree))
         if tree is None:
             invalid.add(path)
             continue
@@ -4162,6 +4344,10 @@ def _project_declaration_proofs(
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 names = [alias.asname or alias.name for alias in statement.names]
                 unique[path].difference_update(name for name in names if names.count(name) > 1)
+
+    # A list, dict or set constant holds what it was written with only while nothing
+    # changes one in place at import (`CONFIG |= {...}`, even from another module).
+    mutable_constants_are_data = not _augments_at_import(trees.values())
 
     def prove(
         assumed: Mapping[Path, frozenset[ast.stmt]] | None = None,
@@ -4260,6 +4446,13 @@ def _project_declaration_proofs(
                                         metadata_shape=_metadata_shape(value, proven),
                                         number=_bounded_number(value, proven),
                                     )
+                            elif (
+                                mutable_constants_are_data
+                                and isinstance(value, (ast.Dict, ast.List, ast.Set))
+                                and _literal_collection_is_data_only(value)
+                            ):
+                                # Only `MetaData(naming_convention=...)` accepts this kind.
+                                proven[target.id] = _DeclarativeBinding(node.lineno, kind="data")
                             elif isinstance(value, ast.Call) and _compiled_pattern_call(
                                 value, imports[path], rebounds[path]
                             ):
@@ -4316,9 +4509,7 @@ def _project_declaration_proofs(
         return proofs
 
     proofs = prove()
-    prover = _helper_call_prover(
-        root, mutable_constants_are_data=not _augments_at_import(trees.values())
-    )
+    prover = _helper_call_prover(root, mutable_constants_are_data=mutable_constants_are_data)
     unproven = {
         path: failed
         for path, tree in trees.items()
@@ -4536,7 +4727,9 @@ def _class_binding(
                 for decorator in statement.decorator_list
             )
         )
-    table = any(_is_sqlalchemy_base(base, imports, proven) for base in node.bases)
+    table = any(
+        _is_sqlalchemy_base(base, imports, proven) for base in node.bases
+    ) or _is_sqlalchemy_mixin(node, imports, rebound, root)
     return _DeclarativeBinding(
         node.lineno,
         "model"
@@ -5208,6 +5401,46 @@ def _ordered_class_scopes(body: list[ast.stmt]) -> tuple[frozenset[str], ...]:
     return tuple(scopes)
 
 
+_TYPE_CHECKING_FLAGS = frozenset(
+    {("typing", "TYPE_CHECKING"), ("typing_extensions", "TYPE_CHECKING")}
+)
+
+
+def _without_type_checking_blocks(tree: ast.Module) -> ast.Module:
+    """Empty the body of each module-level `if TYPE_CHECKING:`, which never runs.
+
+    `typing.TYPE_CHECKING` is false at run time, so the imports under it only serve type
+    checkers and annotations. The flag must come straight from `typing` (or
+    `typing_extensions`) and never be rebound in the module; the `else` branch still runs.
+    """
+
+    imports = _import_bindings(tree)
+    rebound = _module_rebound_names(tree)
+
+    def is_flag(test: ast.expr) -> bool:
+        if isinstance(test, ast.Name):
+            return test.id not in rebound and imports.get(test.id) in _TYPE_CHECKING_FLAGS
+        return (
+            isinstance(test, ast.Attribute)
+            and test.attr == "TYPE_CHECKING"
+            and isinstance(test.value, ast.Name)
+            and test.value.id not in rebound
+            and imports.get(test.value.id) in {("typing", None), ("typing_extensions", None)}
+        )
+
+    def strip(statements: list[ast.stmt]) -> None:
+        for statement in statements:
+            if isinstance(statement, ast.If) and is_flag(statement.test):
+                statement.body = [ast.copy_location(ast.Pass(), statement.body[0])]
+                strip(statement.orelse)
+            elif not isinstance(statement, ast.ClassDef):
+                for suite in _import_time_suites(statement):
+                    strip(suite)
+
+    strip(tree.body)
+    return tree
+
+
 def _without_postponed_annotations(tree: ast.Module) -> ast.Module:
     """Drop annotations that Python does not evaluate at import.
 
@@ -5249,6 +5482,23 @@ def _without_postponed_annotations(tree: ast.Module) -> ast.Module:
     return tree
 
 
+def _import_time_suites(statement: ast.stmt) -> tuple[list[ast.stmt], ...]:
+    """The suites of a compound statement at module or class level, which run at import.
+
+    A function's body runs only when it is called, so a function has none.
+    """
+
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return ()
+    return (
+        getattr(statement, "body", []),
+        getattr(statement, "orelse", []),
+        getattr(statement, "finalbody", []),
+        *(handler.body for handler in getattr(statement, "handlers", [])),
+        *(case.body for case in getattr(statement, "cases", [])),
+    )
+
+
 def _postpone_variable_annotations(statements: list[ast.stmt], shadowed: frozenset[str]) -> None:
     """Replace the annotation of each variable that Python leaves unevaluated with its text.
 
@@ -5282,15 +5532,8 @@ def _postpone_variable_annotations(statements: list[ast.stmt], shadowed: frozens
                     statement.body,
                     shadowed | _scope_rebound_names(statement.body, include_imports=True),
                 )
-        elif not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Compound statements at module or class level run their suites at import.
-            for suite in (
-                getattr(statement, "body", []),
-                getattr(statement, "orelse", []),
-                getattr(statement, "finalbody", []),
-                *(handler.body for handler in getattr(statement, "handlers", [])),
-                *(case.body for case in getattr(statement, "cases", [])),
-            ):
+        else:
+            for suite in _import_time_suites(statement):
                 _postpone_variable_annotations(suite, shadowed)
 
 
