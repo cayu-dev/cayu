@@ -63,6 +63,7 @@ from cayu.storage._task_index_schema import (
     SQLITE_TASK_INDEX_DDL,
     TASK_INDEX_REVISION,
 )
+from cayu.storage._task_progress_schema import SQLITE_TASK_PROGRESS_DDL, TASK_PROGRESS_REVISION
 from cayu.storage._task_scheduling_schema import SQLITE_SCHEDULING_DDL
 from cayu.storage._task_step_schema import SQLITE_TASK_STEP_DDL
 from cayu.storage._trace_event_schema import SQLITE_TRACE_EVENTS_DDL, TRACE_EVENTS_REVISION
@@ -845,6 +846,8 @@ CREATE INDEX IF NOT EXISTS idx_cayu_eval_reports_association
     SESSION_LIST_INDEX_REVISION: SQLITE_SESSION_LIST_INDEX_DDL,
     # Environment counts and latest activity read this covering index.
     ENVIRONMENT_ACTIVITY_INDEX_REVISION: SQLITE_ENVIRONMENT_ACTIVITY_INDEX_DDL,
+    # Task progress counters, in a table of their own.
+    TASK_PROGRESS_REVISION: SQLITE_TASK_PROGRESS_DDL,
     128: """CREATE TABLE IF NOT EXISTS cayu_task_retry_keys (
         retry_key TEXT COLLATE BINARY PRIMARY KEY,
         state_json TEXT NOT NULL

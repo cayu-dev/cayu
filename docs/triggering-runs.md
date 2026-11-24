@@ -651,6 +651,35 @@ step's external effect happen only once: the worker can be lost after the
 effect and before the save, so a step that writes to another system still needs
 an idempotency key there, or a claim.
 
+### Report progress
+
+A task that works through many units can say how far it got. Keep a progress
+store beside the task store and report from the handler:
+
+```python
+from cayu.storage.task_progress_sqlite import SQLiteTaskProgressStore
+
+progress = SQLiteTaskProgressStore("app.db")  # the task store's database
+
+
+async def handle_task(app, task, worker_id):
+    cases = task.input["cases"]
+    await progress.set_progress(task.id, total=len(cases))
+    for case in cases:
+        outcome = await review(case)  # such as "approved" or "failed"
+        await progress.add_progress(task.id, done=1, counts={outcome: 1})
+```
+
+`load_progress(task_id)` returns a `TaskProgress` with `done`, `total` (`None`
+until set), `counts` by outcome and `updated_at`, or `None` when nothing was
+reported. `add_progress` adds to the stored values in one transaction, so several
+handlers can report on one task; `set_progress` replaces the fields it is given.
+`delete_progress` removes it. `SQLiteTaskProgressStore` and
+`PostgresTaskProgressStore` keep progress in their own table (storage revision 160),
+`InMemoryTaskProgressStore` is for tests, and `TaskProgressStore` is the contract
+for another backend. Nothing in the worker requires a progress store, and the
+store doesn't check who runs the task.
+
 ### Claiming a step before its effect
 
 When the other system takes no idempotency key (sending a mail, for example),
