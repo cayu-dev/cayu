@@ -394,12 +394,36 @@ class _CloudServicePublicationError(CloudApiError):
                 self.details["acknowledge_sessions"] = sessions
                 everyone = sessions == [_ACKNOWLEDGE_ALL_SESSIONS]
                 if code == "held_tasks":
+                    # `cayu task` takes --context, not the other Cloud flags.
+                    context = [
+                        item
+                        for flag, value in zip(
+                            recovery_arguments[::2], recovery_arguments[1::2], strict=False
+                        )
+                        if flag == "--context"
+                        for item in (flag, value)
+                    ]
+                    settle_command = shlex.join(
+                        [
+                            "cayu",
+                            "task",
+                            "fenced",
+                            "--application",
+                            str(app),
+                            *context,
+                            "--settle",
+                        ]
+                    )
                     parts.append(
                         "Let the tasks finish and retry, or accept that "
                         + ("every task the worker holds is" if everyone else "they are")
                         + f" interrupted with `{retry_command}`, or {wait_step}. "
-                        "Any unfinished sessions named by the retry may not resume on this release."
+                        "Any unfinished sessions named by the retry may not resume on this "
+                        "release. A task held by a worker that has stopped never finishes: "
+                        f"settle those with `{settle_command}` and retry, instead of "
+                        "interrupting them."
                     )
+                    commands["settle_fenced"] = settle_command
                 else:
                     parts.append(
                         (
@@ -5417,7 +5441,7 @@ def _service(
             *(
                 warning
                 for warning in (
-                    fenced_tasks_warning(result),
+                    fenced_tasks_warning(result, application_id),
                     system_change_warning(
                         result,
                         application=application_id,

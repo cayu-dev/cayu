@@ -397,6 +397,25 @@ def add_task_parser(subparsers: Any) -> None:
     add_read_target_options(counts_parser)
     add_output_options(counts_parser, formats=("table", "json"), default="table")
 
+    fenced_parser = commands.add_parser(
+        "fenced",
+        help="List tasks fenced after their worker was lost, and settle them on Cayu Cloud.",
+        description=(
+            "List the tasks still claimed after their worker stopped renewing its lease, "
+            "with whether Cayu Cloud recorded that the worker's run stopped. With --settle, "
+            "settle the ones it did: restartable tasks are requeued, the rest cancelled. "
+            "Settling needs the Agent's own view of Cloud's worker exit record, so use it "
+            "with --application. Only tasks whose worker id came from cloud_worker_id match."
+        ),
+    )
+    fenced_parser.add_argument(
+        "--settle",
+        action="store_true",
+        help="Settle the fenced tasks whose worker run Cayu Cloud recorded as stopped.",
+    )
+    add_read_target_options(fenced_parser)
+    add_output_options(fenced_parser, formats=("table", "json"), default="table")
+
     show_parser = commands.add_parser(
         "show",
         help="Show one task with its result, cancellation and retry series.",
@@ -544,6 +563,8 @@ async def _run_task_command(args: argparse.Namespace, target: ReadTarget) -> int
             return await _latest_tasks(args, reader)
         if args.task_command == "counts":
             return await _task_counts(args, reader)
+        if args.task_command == "fenced":
+            return await _fenced_tasks(args, reader)
         if args.task_command == "wait":
             return await _wait_for_task(args, reader)
         return await _show_task(args, reader)
@@ -696,6 +717,42 @@ async def _task_counts(args: argparse.Namespace, reader: TaskReader) -> int:
                     check["differences"],
                 )
     return 0 if not args.recompute or check["matches"] else 1
+
+
+async def _fenced_tasks(args: argparse.Namespace, reader: TaskReader) -> int:
+    report = await reader.fenced_tasks(settle=args.settle)
+    key = "settled" if args.settle else "tasks"
+    if args.output_format == "json":
+        payload = {"schema_version": CLI_SCHEMA_VERSION, "source": reader.source, **report}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    rows = report[key]
+    columns = (
+        "id",
+        "type",
+        "status",
+        "worker_id",
+        "lease_expires_at",
+        "worker_run_stopped",
+        "settleable",
+    )
+    if rows:
+        print_table(columns, rows)
+    else:
+        print("No fenced task was settled." if args.settle else "No task is fenced.")
+    if report.get("truncated"):
+        print("More fenced tasks exist than are listed.")
+    if report.get("worker_exits") != "read":
+        print(f"Cayu Cloud's worker exit record: {report.get('worker_exits_message')}")
+    elif not args.settle:
+        if any(row.get("settleable") for row in rows):
+            print("Settle the settleable ones with `cayu task fenced --settle`.")
+        if any(row.get("worker_run_stopped") and not row.get("settleable") for row in rows):
+            print(
+                "A session-attached or retry-series task whose worker run stopped needs the "
+                "step `cayu inspect --fenced-tasks` gives."
+            )
+    return 0
 
 
 async def _show_task(args: argparse.Namespace, reader: TaskReader) -> int:

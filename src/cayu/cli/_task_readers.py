@@ -115,6 +115,11 @@ class TaskReader(Protocol):
         """``TaskStore.check_task_counts`` as JSON (``TaskCountsCheck``)."""
         ...
 
+    async def fenced_tasks(self, *, settle: bool) -> dict[str, Any]:
+        """The fenced tasks (``fenced_tasks_report``), or with ``settle`` the ones settled
+        because Cloud recorded their worker's run stopped (``settle_fenced_tasks_report``)."""
+        ...
+
     async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         """The sessions run under the task, oldest first: at most ``MAX_TASK_SESSIONS``,
         and whether more were left out. ``None`` when the source can't list them."""
@@ -254,6 +259,18 @@ class StoreTaskReader:
     async def check_task_counts(self) -> dict[str, Any]:
         return (await self._store.check_task_counts()).model_dump(mode="json")
 
+    async def fenced_tasks(self, *, settle: bool) -> dict[str, Any]:
+        from cayu.tasks.cloud_worker_exits import fenced_tasks_report
+
+        if settle:
+            # Only the Agent can read Cloud's worker exit record for itself.
+            raise CayuApiError(
+                "unsupported",
+                "Settling fenced tasks reads the Agent's worker exit record on Cayu Cloud; "
+                "use `cayu task fenced --application NAME --settle`.",
+            )
+        return dict(await fenced_tasks_report(self._store))
+
     async def latest_tasks(self, request: TaskLatestRequest) -> list[dict[str, Any]]:
         tasks = await self._store.latest_tasks(
             TaskQuery(
@@ -386,6 +403,28 @@ class ApiTaskReader:
             raise CayuApiError(
                 "not_cayu", f"{self._api.description} returned invalid task counts."
             ) from None
+
+    async def fenced_tasks(self, *, settle: bool) -> dict[str, Any]:
+        try:
+            body = (
+                self._api.post("/fenced-tasks/settle", {}, resource="tasks")
+                if settle
+                else self._api.get("/fenced-tasks", resource="tasks")
+            )
+        except CayuApiNotFound:
+            body = None
+        key = "settled" if settle else "tasks"
+        if body is None:
+            raise CayuApiError(
+                "unsupported",
+                f"{self._api.description} can't list or settle fenced tasks; its Cayu "
+                "predates `GET /fenced-tasks`.",
+            )
+        if not isinstance(body, dict) or not isinstance(body.get(key), list):
+            raise CayuApiError(
+                "not_cayu", f"{self._api.description} returned an invalid fenced-task report."
+            )
+        return cast("dict[str, Any]", body)
 
     def _task_list(self, body: object) -> list[dict[str, Any]]:
         if not isinstance(body, list) or not all(_is_task_row(row) for row in body):

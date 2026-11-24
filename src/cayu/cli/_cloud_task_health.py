@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 
-def fenced_tasks_warning(service: Mapping[str, Any]) -> str | None:
+def fenced_tasks_warning(service: Mapping[str, Any], application: str = "AGENT") -> str | None:
     """A warning naming the Agent's fenced tasks and how to settle them, or None.
 
     Cayu Cloud returns ``task_health`` in the service status: the latest count the Agent's
@@ -27,11 +27,11 @@ def fenced_tasks_warning(service: Mapping[str, Any]) -> str | None:
     return (
         f"{tasks} stayed claimed after the worker running them stopped, as when a deploy "
         "replaces the worker during a task that can't be restarted. No worker runs them again "
-        "until the Agent settles them. `cayu inspect --fenced-tasks` lists them with how to "
-        "settle each one. Once the old worker has exited (Cayu Cloud records worker exits at "
-        "CAYU_WORKER_EXITS_URL), an ordinary task without an attached session settles with "
-        "`reconcile_abandoned_task_cancellation`, or a single worker run with "
-        "`cayu worker --reconcile-abandoned-after-seconds` settles such tasks itself. "
-        "A task worker settles most session-attached tasks itself; inspect gives the "
-        "step for the rest."
+        "until the Agent settles them. "
+        f"`cayu task fenced --application {application}` lists them with whether Cayu Cloud "
+        "recorded that their worker's run stopped, and `--settle` settles those (a task "
+        "worker on Cloud also does this itself for workers named with `cloud_worker_id`). "
+        "For the rest, a single worker run with `cayu worker "
+        "--reconcile-abandoned-after-seconds` settles them itself, and `cayu inspect "
+        "--fenced-tasks` gives the step for each."
     )

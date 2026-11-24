@@ -50,7 +50,7 @@ from cayu.tasks.abandoned import (
     cloud_exit_settlement_enabled,
     validate_max_restarts,
 )
-from cayu.tasks.queries import TaskQuery, copy_task_query
+from cayu.tasks.queries import TaskOrder, TaskQuery, copy_task_query
 from cayu.tasks.records import Task, TaskStatus
 from cayu.tasks.restart import DEFAULT_MAX_ABANDONED_RESTARTS
 from cayu.tasks.store import TaskStore
@@ -246,6 +246,18 @@ def _exited_entries(record: WorkerExitRecord, *, accept_gone: bool) -> Iterator[
     return (entry for entry in record.exits if entry.state in states)
 
 
+def worker_run_stopped(
+    task: Task, record: WorkerExitRecord, *, accept_gone: bool = False
+) -> bool | None:
+    """Whether the record shows the run holding ``task`` exited; ``None`` when its
+    ``worker_id`` names no Cloud run (it didn't come from :func:`cloud_worker_id`)."""
+
+    digest = _worker_digest(task.worker_id)
+    if digest is None:
+        return None
+    return digest in _exit_evidence(record, accept_gone=accept_gone)
+
+
 async def reconcile_tasks_of_exited_workers(
     task_store: TaskStore,
     record: WorkerExitRecord,
@@ -396,6 +408,103 @@ def cloud_worker_exit_settler(
     )
 
 
+#: The most fenced tasks :func:`fenced_tasks_report` lists.
+FENCED_TASKS_REPORT_MAX = 100
+
+
+async def fenced_tasks_report(
+    task_store: TaskStore,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, object]:
+    """The fenced tasks, each with whether Cloud recorded its worker's run stopped.
+
+    The shape ``GET /api/fenced-tasks`` serves and ``cayu task fenced`` prints:
+    ``tasks`` (at most 100, oldest first), ``truncated``, and ``worker_exits`` (``read``,
+    ``unsupported`` or ``unavailable``) with ``worker_exits_message``.
+    """
+
+    tasks = await task_store.list_tasks(
+        TaskQuery(
+            fenced_after_worker_loss=True,
+            limit=FENCED_TASKS_REPORT_MAX + 1,
+            order_by=TaskOrder.CREATED_AT_ASC,
+        )
+    )
+    record, state, message = await _record_or_reason(environ, transport)
+    return {
+        "tasks": [
+            _report_item(task, None if record is None else worker_run_stopped(task, record))
+            for task in tasks[:FENCED_TASKS_REPORT_MAX]
+        ],
+        "truncated": len(tasks) > FENCED_TASKS_REPORT_MAX,
+        "worker_exits": state,
+        "worker_exits_message": message,
+    }
+
+
+async def settle_fenced_tasks_report(
+    task_store: TaskStore,
+    *,
+    environ: Mapping[str, str] = os.environ,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, object]:
+    """Settle the fenced tasks whose worker run Cloud recorded as stopped.
+
+    Restartable tasks are requeued when the store can, the rest cancelled. It first runs
+    expired-claim reclamation once, as a task worker would, so a started claim whose
+    fence no worker recorded yet is settled too. The shape
+    ``POST /api/fenced-tasks/settle`` serves: ``settled`` and ``worker_exits``.
+    """
+
+    record, state, message = await _record_or_reason(environ, transport)
+    settled: list[Task] = []
+    if record is not None:
+        await task_store.reclaim_expired()
+        restarts = type(task_store).restart_abandoned_task is not TaskStore.restart_abandoned_task
+        settled = await reconcile_tasks_of_exited_workers(
+            task_store,
+            record,
+            settlement=(
+                AbandonedTaskSettlement.RESTART if restarts else AbandonedTaskSettlement.CANCEL
+            ),
+        )
+    return {
+        "settled": [_report_item(task, True) for task in settled],
+        "worker_exits": state,
+        "worker_exits_message": message,
+    }
+
+
+async def _record_or_reason(
+    environ: Mapping[str, str], transport: httpx.AsyncBaseTransport | None
+) -> tuple[WorkerExitRecord | None, str, str | None]:
+    try:
+        return await read_cloud_worker_exits(environ, transport=transport), "read", None
+    except WorkerExitsUnsupported as exc:
+        return None, "unsupported", str(exc)
+    except WorkerExitsUnavailable as exc:
+        return None, "unavailable", str(exc)
+
+
+def _report_item(task: Task, stopped: bool | None) -> dict[str, object]:
+    # Session-attached and retry-series tasks need the step `cayu inspect --fenced-tasks`
+    # gives, even when Cloud recorded their worker's run stopped.
+    settleable = bool(stopped) and task.session_id is None and task.retry_series is None
+    return {
+        "id": task.id,
+        "type": task.type,
+        "status": task.status.value,
+        "worker_id": task.worker_id,
+        "lease_expires_at": None
+        if task.lease_expires_at is None
+        else task.lease_expires_at.isoformat(),
+        "worker_run_stopped": stopped,
+        "settleable": settleable,
+    }
+
+
 def _exit_evidence(record: WorkerExitRecord, *, accept_gone: bool) -> dict[str, str]:
     # The evidence id per run digest: which state Cloud recorded, and when it stopped.
     evidence: dict[str, str] = {}
@@ -520,8 +629,11 @@ __all__ = [
     "cloud_worker_exit_settler",
     "cloud_worker_id",
     "exited_run_references",
+    "fenced_tasks_report",
     "read_cloud_worker_exits",
     "reconcile_tasks_of_exited_workers",
+    "settle_fenced_tasks_report",
     "worker_id_for_run",
     "worker_run_reference",
+    "worker_run_stopped",
 ]

@@ -1194,6 +1194,82 @@ export type ApiExecutionTopologyEdge = {
 };
 
 /**
+ * ApiFencedTask
+ *
+ * A task still claimed after its worker stopped renewing its lease.
+ */
+export type ApiFencedTask = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Lease Expires At
+     */
+    lease_expires_at: string | null;
+    /**
+     * Settleable
+     */
+    settleable?: boolean;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Worker Id
+     */
+    worker_id: string | null;
+    /**
+     * Worker Run Stopped
+     */
+    worker_run_stopped: boolean | null;
+};
+
+/**
+ * ApiFencedTasks
+ */
+export type ApiFencedTasks = {
+    /**
+     * Tasks
+     */
+    tasks: Array<ApiFencedTask>;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+    /**
+     * Worker Exits
+     */
+    worker_exits: string;
+    /**
+     * Worker Exits Message
+     */
+    worker_exits_message?: string | null;
+};
+
+/**
+ * ApiFencedTasksSettled
+ */
+export type ApiFencedTasksSettled = {
+    /**
+     * Settled
+     */
+    settled: Array<ApiFencedTask>;
+    /**
+     * Worker Exits
+     */
+    worker_exits: string;
+    /**
+     * Worker Exits Message
+     */
+    worker_exits_message?: string | null;
+};
+
+/**
  * ApiInteractionSummary
  */
 export type ApiInteractionSummary = {
@@ -30422,6 +30498,38 @@ export type EventSideEffectHealthApiEventSideEffectsHealthGetResponses = {
 };
 
 export type EventSideEffectHealthApiEventSideEffectsHealthGetResponse = EventSideEffectHealthApiEventSideEffectsHealthGetResponses[keyof EventSideEffectHealthApiEventSideEffectsHealthGetResponses];
+
+export type FencedTasksApiFencedTasksGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/fenced-tasks';
+};
+
+export type FencedTasksApiFencedTasksGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiFencedTasks;
+};
+
+export type FencedTasksApiFencedTasksGetResponse = FencedTasksApiFencedTasksGetResponses[keyof FencedTasksApiFencedTasksGetResponses];
+
+export type SettleFencedTasksApiFencedTasksSettlePostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/fenced-tasks/settle';
+};
+
+export type SettleFencedTasksApiFencedTasksSettlePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ApiFencedTasksSettled;
+};
+
+export type SettleFencedTasksApiFencedTasksSettlePostResponse = SettleFencedTasksApiFencedTasksSettlePostResponses[keyof SettleFencedTasksApiFencedTasksSettlePostResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

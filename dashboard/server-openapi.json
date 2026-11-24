@@ -2218,6 +2218,140 @@
         "title": "ApiExecutionTopologyEdge",
         "type": "object"
       },
+      "ApiFencedTask": {
+        "description": "A task still claimed after its worker stopped renewing its lease.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "settleable": {
+            "default": false,
+            "title": "Settleable",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "worker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Id"
+          },
+          "worker_run_stopped": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Run Stopped"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "status",
+          "worker_id",
+          "lease_expires_at",
+          "worker_run_stopped"
+        ],
+        "title": "ApiFencedTask",
+        "type": "object"
+      },
+      "ApiFencedTasks": {
+        "properties": {
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/ApiFencedTask"
+            },
+            "title": "Tasks",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "worker_exits": {
+            "title": "Worker Exits",
+            "type": "string"
+          },
+          "worker_exits_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Exits Message"
+          }
+        },
+        "required": [
+          "tasks",
+          "truncated",
+          "worker_exits"
+        ],
+        "title": "ApiFencedTasks",
+        "type": "object"
+      },
+      "ApiFencedTasksSettled": {
+        "properties": {
+          "settled": {
+            "items": {
+              "$ref": "#/components/schemas/ApiFencedTask"
+            },
+            "title": "Settled",
+            "type": "array"
+          },
+          "worker_exits": {
+            "title": "Worker Exits",
+            "type": "string"
+          },
+          "worker_exits_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Exits Message"
+          }
+        },
+        "required": [
+          "settled",
+          "worker_exits"
+        ],
+        "title": "ApiFencedTasksSettled",
+        "type": "object"
+      },
       "ApiInteractionSummary": {
         "additionalProperties": false,
         "properties": {
@@ -58225,6 +58359,44 @@
           }
         },
         "summary": "Event Side Effect Health"
+      }
+    },
+    "/api/fenced-tasks": {
+      "get": {
+        "description": "Tasks fenced after their worker was lost, with whether Cayu Cloud recorded that worker's run stopped. `cayu task fenced` reads it.",
+        "operationId": "fenced_tasks_api_fenced_tasks_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFencedTasks"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Fenced Tasks"
+      }
+    },
+    "/api/fenced-tasks/settle": {
+      "post": {
+        "description": "Settle the fenced tasks whose worker run Cayu Cloud recorded as stopped: restartable ones are requeued, the rest cancelled. `cayu task fenced --settle` calls it.",
+        "operationId": "settle_fenced_tasks_api_fenced_tasks_settle_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiFencedTasksSettled"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Settle Fenced Tasks"
       }
     },
     "/api/health": {

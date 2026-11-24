@@ -75,6 +75,38 @@ class TaskBulkCancelBody(BaseModel):
     )
 
 
+class ApiFencedTask(BaseModel):
+    """A task still claimed after its worker stopped renewing its lease."""
+
+    id: str
+    type: str
+    status: str
+    worker_id: str | None
+    lease_expires_at: str | None
+    #: Whether Cayu Cloud's worker exit record shows the worker's run stopped; null when the
+    #: worker id names no Cloud run or the record couldn't be read.
+    worker_run_stopped: bool | None
+    #: Whether ``POST /fenced-tasks/settle`` settles it now. A session-attached or
+    #: retry-series task needs the step ``cayu inspect --fenced-tasks`` gives instead.
+    settleable: bool = False
+
+
+class ApiFencedTasks(BaseModel):
+    tasks: list[ApiFencedTask]
+    #: More fenced tasks exist than were listed.
+    truncated: bool
+    #: ``read``, ``unsupported`` (not on a Cayu Cloud that records worker exits) or
+    #: ``unavailable`` (the read failed).
+    worker_exits: str
+    worker_exits_message: str | None = None
+
+
+class ApiFencedTasksSettled(BaseModel):
+    settled: list[ApiFencedTask]
+    worker_exits: str
+    worker_exits_message: str | None = None
+
+
 def register_task_controls_routes(
     router: APIRouter,
     *,
@@ -152,6 +184,41 @@ def register_task_controls_routes(
             wait_seconds=body.wait_seconds,
             max_tasks=body.max_tasks,
         )
+
+    @router.get(
+        "/fenced-tasks",
+        response_model=ApiFencedTasks,
+        dependencies=protected,
+        description=(
+            "Tasks fenced after their worker was lost, with whether Cayu Cloud recorded "
+            "that worker's run stopped. `cayu task fenced` reads it."
+        ),
+    )
+    async def fenced_tasks():
+        from cayu.tasks.cloud_worker_exits import fenced_tasks_report
+
+        store = cayu_app.task_store
+        if store is None:
+            raise HTTPException(501, "Task store is not configured.")
+        return await fenced_tasks_report(store)
+
+    @router.post(
+        "/fenced-tasks/settle",
+        response_model=ApiFencedTasksSettled,
+        dependencies=protected,
+        description=(
+            "Settle the fenced tasks whose worker run Cayu Cloud recorded as stopped: "
+            "restartable ones are requeued, the rest cancelled. "
+            "`cayu task fenced --settle` calls it."
+        ),
+    )
+    async def settle_fenced_tasks():
+        from cayu.tasks.cloud_worker_exits import settle_fenced_tasks_report
+
+        store = cayu_app.task_store
+        if store is None:
+            raise HTTPException(501, "Task store is not configured.")
+        return await settle_fenced_tasks_report(store)
 
     @router.get(
         "/tasks/{task_id}/progress",

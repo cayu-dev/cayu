@@ -260,6 +260,10 @@ class _CloudTaskReader:
     async def check_task_counts(self) -> dict[str, Any]:
         return await self._login.check_task_counts()
 
+    async def fenced_tasks(self, *, settle: bool) -> dict[str, Any]:
+        # Cloud's read route forwards reads only; settling is the Agent's own action.
+        return await self._login.fenced_tasks(settle=settle)
+
     async def task_session_ids(self, task: dict[str, Any]) -> tuple[list[str], bool] | None:
         return await self._login.task_session_ids(task)
 

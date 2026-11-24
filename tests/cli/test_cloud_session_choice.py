@@ -2473,7 +2473,42 @@ def test_mixed_task_and_consented_session_retry_discloses_both_risks(capsys):
     )
     assert "interrupted" in error["message"]
     assert "unfinished sessions named by the retry may not resume" in error["message"]
+    assert error["commands"]["settle_fenced"] == (
+        "cayu task fenced --application ready-agent --settle"
+    )
+    assert error["commands"]["settle_fenced"] in error["message"]
     assert not any(method != "GET" for method, _, _ in client.requests)
+
+
+def test_held_task_settle_command_keeps_the_context(capsys, tmp_path):
+    refusal = {
+        **_SESSION_REFUSAL,
+        "code": "held_tasks",
+        "message": "A held task prevents publication.",
+        "acknowledge_sessions": ["task1"],
+    }
+    preflight = {**_consented_preflight(), "state": "blocked"}
+    preflight["tasks"] = [{"id": "task1", "blocking": True, "outcome": "interrupted"}]
+    client = _PublicationClient(refusal, session_preflight=preflight)
+    context = tmp_path / "staging.json"
+    arguments = cloud._build_parser().parse_args(
+        [
+            "--context",
+            str(context),
+            "deployment",
+            "wait",
+            _DEPLOYMENT,
+            "--application",
+            "ready-agent",
+            "--live",
+        ]
+    )
+    with pytest.raises(CloudApiError) as raised:
+        cloud._deployment(arguments, client=client)
+    error = _failure_envelope(raised, capsys)
+    assert error["commands"]["settle_fenced"] == (
+        f"cayu task fenced --application ready-agent --context {context} --settle"
+    )
 
 
 @pytest.mark.parametrize("source", [None, True, "future", "default", "explicit"])

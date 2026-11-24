@@ -166,6 +166,27 @@ the deadline. Outside Cayu Cloud, or with a control plane that doesn't answer
 the question, nothing is asked. A worker run by another command can ask the same
 endpoint itself.
 
+On Cayu Cloud a worker whose id comes from
+`cayu.tasks.cloud_worker_exits.cloud_worker_id` can be settled from Cloud's own
+record of which worker runs stopped (`CAYU_WORKER_EXITS_URL`), with any number
+of workers: `run_task_worker` does it on its fenced-task cadence unless
+`settle_cloud_worker_exits=False` or `cayu worker --no-cloud-exit-settlement`
+turns it off ([when a worker dies mid-task](../src/cayu/guides/lost-worker.md)).
+To look and settle by hand:
+
+```bash
+cayu task fenced --application my-agent            # fenced tasks, and whether each worker run stopped
+cayu task fenced --application my-agent --settle   # settle the ones Cloud recorded as stopped
+```
+
+The Agent reads the record itself (`GET /api/fenced-tasks` and `POST
+/api/fenced-tasks/settle`), so settling needs `--application` or
+`--server-url`; against a local store `cayu task fenced` only lists. Restartable
+tasks are requeued and the rest cancelled, and only tasks held under a
+`cloud_worker_id` match. `cayu cloud service status` names the command when the
+Agent reports fenced tasks, and a deploy refused for `held_tasks` offers it, since
+a task its stopped worker holds never finishes.
+
 A worker that `[tool.cayu.evals].worker` names also runs the project's declared
 eval targets' runs, and drains them the same way: it finishes the run it holds
 and takes no new one ([Evals](evals.md)).

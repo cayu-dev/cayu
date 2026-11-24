@@ -281,6 +281,7 @@ def test_service_status_warns_about_tasks_held_by_a_stopped_worker(
     assert warning.startswith(expected)
     assert "`cayu inspect --fenced-tasks`" in warning
     assert "--reconcile-abandoned-after-seconds" in warning
+    assert "`cayu task fenced --application acme-scout`" in warning
 
 
 @pytest.mark.parametrize(

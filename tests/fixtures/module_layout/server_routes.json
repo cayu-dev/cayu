@@ -87,6 +87,8 @@
   "POST /api/tasks/{task_id}/replay name=replay_task class=_BoundedControlPlaneRequestRoute POST=replay_task_api_tasks__task_id__replay_post",
   "POST /api/tasks/{task_id}/cancel name=cancel_task class=_BoundedControlPlaneRequestRoute POST=cancel_task_api_tasks__task_id__cancel_post",
   "POST /api/tasks/cancellations name=cancel_matching_tasks class=_BoundedControlPlaneRequestRoute POST=cancel_matching_tasks_api_tasks_cancellations_post",
+  "GET /api/fenced-tasks name=fenced_tasks class=_BoundedControlPlaneRequestRoute GET=fenced_tasks_api_fenced_tasks_get",
+  "POST /api/fenced-tasks/settle name=settle_fenced_tasks class=_BoundedControlPlaneRequestRoute POST=settle_fenced_tasks_api_fenced_tasks_settle_post",
   "GET /api/tasks/{task_id}/progress name=task_progress class=_BoundedControlPlaneRequestRoute GET=task_progress_api_tasks__task_id__progress_get",
   "GET /api/tasks/counts/check name=check_task_counts class=_BoundedControlPlaneRequestRoute GET=check_task_counts_api_tasks_counts_check_get",
   "GET /api/tasks/{task_id}/dependents name=dependents class=_BoundedControlPlaneRequestRoute GET=dependents_api_tasks__task_id__dependents_get",
