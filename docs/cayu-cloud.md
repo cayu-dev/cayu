@@ -25,7 +25,11 @@ coding agent ([Teaching a coding agent the CLI](#teaching-a-coding-agent-the-cli
 top-level commands are:
 
 - `login`, `logout`, and `whoami` for interactive identity, and `organizations` to
-  [list and choose your Organizations](#organizations);
+  [list and choose your Organizations](#organizations) and, as a Cayu platform administrator,
+  `organizations create|rename|add-member` to [create and staff them](#creating-organizations);
+- `team members|roles|invitations|invite|revoke|set-role|remove` for
+  [the Organization's members and invitations](#members-and-invitations), and
+  `team people|agent-people|set-agent-people` for [who works with each Agent](#an-agents-people);
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `platform` for [which Cayu Cloud revision runs and when it rolled out](#cloud-rollouts);
@@ -1192,6 +1196,82 @@ API key can't act in another Organization: naming another one is refused with
 `organization_mismatch`. The variable applies to `cayu cloud` only; `cayu inbox`, `cayu session`
 and `cayu task` act where the login or context does.
 
+### Members and invitations
+
+`cayu cloud team` manages who is in the Organization the command acts in, so `--organization
+ORG_ID` and `CAYU_CLOUD_ORGANIZATION` choose it as for any other command:
+
+```console
+cayu cloud team members
+cayu cloud team roles
+cayu cloud team invite --email ada@example.com --role developer
+cayu cloud team invitations
+cayu cloud team revoke INVITATION_ID
+cayu cloud team set-role USER_ID --role admin
+cayu cloud team remove USER_ID --membership-id MEMBERSHIP_ID
+```
+
+`members` lists one page of members (`--limit`, 1 to 100) with each one's `user_id`, role and
+`membership_id`; pass the answer's `next_cursor` as `--cursor` for the next page. `roles` lists
+the role slugs that `invite` and `set-role` take. `invite` emails an invitation; inviting an
+email that already has a pending invitation with the same role answers that invitation instead
+of sending another, and one with a different role is refused until it is revoked. `revoke`
+revokes a pending invitation, and revoking it again answers the same. `set-role` and `remove`
+refuse a change to yourself and any change that would leave the Organization without an admin.
+`remove` takes the member off the Organization's Agents too; `--membership-id`, from `members`,
+makes sure the membership removed is the one you listed, and Cloud requires it where removing a
+member also retires their Gateway access. `members` and `roles` need a signed-in member, and the
+rest a signed-in Organization admin (`cayu cloud login`): an Organization API key is refused,
+with `login_required` or `organization_admin_required`. Each change says where it acts first,
+like any other change ([Where an Agent deploys](#where-an-agent-deploys)). Cloud's reason for a
+refusal (a role that doesn't exist, a member it can't find, the last admin) is in the error's
+message.
+
+### An Agent's people
+
+An Agent's people are the members who work with it: they see it, open it and get its approvals
+and questions. They are chosen from the Organization's people:
+
+```console
+cayu cloud team people
+cayu cloud team agent-people --application my-agent
+cayu cloud team set-agent-people --application my-agent --user-id USER_ID --user-id USER_ID
+cayu cloud team set-agent-people --application my-agent --no-one
+```
+
+`people` lists everyone in the Organization who can work with an Agent, with their role.
+`agent-people` lists the Agent's people, whether each is still in the Organization
+(`in_organization`), and whether you may change them (`can_choose`). `set-agent-people` makes
+exactly the given people the Agent's, replacing the ones it had; `--no-one` leaves it with none,
+and one of the two is required so that a forgotten `--user-id` never clears the list. Anyone
+not in the Organization is refused with `person_unknown`, whose message names them, and nothing
+changes; `organization_people_unavailable` means Cloud can't read the Organization's people
+right now, so try again. `set-agent-people` changes an Agent, so it is refused outside the
+Organization the Agent deploys to, like the commands in
+[Where an Agent deploys](#where-an-agent-deploys). An Agent reads the same directory from its
+own code with `cayu.cloud_people` ([The Organization's People](#the-organizations-people)).
+
+### Creating Organizations
+
+A Cayu platform administrator creates Organizations, renames them and adds people to them
+directly:
+
+```console
+cayu cloud organizations create --name "Example Co"
+cayu cloud organizations rename org_01... --name "Example Company"
+cayu cloud organizations add-member org_01... --email ada@example.com --role admin
+```
+
+`create` answers the new Organization's `id` and `name`. `rename` changes the name people see
+when they sign in. `add-member` adds the person whose verified Cayu Cloud account has that email
+at once, with no invitation email, and revokes a pending invitation of theirs
+(`revoked_invitation_id`); someone without an account is refused, so invite them with `team
+invite` instead, and adding someone who is already a member with that role answers their
+membership. `rename` and `add-member` name the Organization they change as `ORG_ID`, and act the
+same whichever Organization the login acts in, since the administrator needn't be a member of
+it. Like the rest of `organizations`, they refuse `--organization` and ignore
+`CAYU_CLOUD_ORGANIZATION`. Anyone else is refused with `platform_admin_required`.
+
 ### Where an Agent deploys
 
 A command that changes something first says, on standard error, which Organization it acts in
@@ -1204,7 +1284,8 @@ are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollb
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
 `compass findings accept|dismiss`, `compass grants propose|approve|reject|revoked|keep`,
 `eval run|baseline`, `eval runs cancel`,
-`api-keys create|revoke`, `gateway keys create|rotate|restrict|revoke`,
+`api-keys create|revoke`, `team invite|revoke|set-role|remove|set-agent-people`,
+`gateway keys create|rotate|restrict|revoke`,
 `gateway models set`, `gateway limits set|alerts` and
 `connections add|authorize|agents|rotate|remove|bind|unbind`. Commands that
 only read say nothing.
@@ -2263,7 +2344,8 @@ reviewer = await find_person(directory, reviewer_user_id)  # a user_id from list
 `on_agent` says whether they are one of the Agent's people. Cloud gives `name` and
 `email` only for the Agent's own people; everyone else has `None` there and is known
 by `user_id` and `role`. Each call reads Cloud afresh, so cache the list if the app
-reads it often.
+reads it often. Who the Agent's people are is chosen with `cayu cloud team
+set-agent-people` ([An Agent's people](#an-agents-people)).
 
 On Cayu Cloud the directory is read at `CAYU_PEOPLE_URL` with
 `CAYU_ATTENTION_HANDOFF_TOKEN`, which Cloud binds on every Agent process. This

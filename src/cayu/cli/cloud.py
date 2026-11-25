@@ -132,6 +132,14 @@ from cayu.cli._cloud_system_agents import (
     system_change_warning,
 )
 from cayu.cli._cloud_task_health import fenced_tasks_warning
+from cayu.cli._cloud_team import (
+    ORGANIZATION_CHANGES,
+    TEAM_CHANGES,
+    add_organization_changes_parsers,
+    add_team_parser,
+    organization_changes_command,
+    team_command,
+)
 from cayu.cli._cloud_writes import CloudWriteError
 from cayu.cli._output import terminal_safe
 
@@ -201,6 +209,8 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("eval", "baseline"): "agent",
     ("api-keys", "create"): "organization",
     ("api-keys", "revoke"): "organization",
+    **{("team", action): "organization" for action in TEAM_CHANGES},
+    ("team", "set-agent-people"): "agent",
     **{("ai-connections", action): "organization" for action in AI_CONNECTION_WRITES},
     # An optional --application names the Agent a Gateway change acts on.
     ("gateway", "keys", "create"): "agent",
@@ -1073,7 +1083,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             "List the Cayu Cloud Organizations you belong to, with your role in each and which "
             "one this login acts in (`current`). `organizations use ORG_ID` makes the login act "
             "in another of them, without a new browser sign-in. Needs `cayu cloud login`; an "
-            "Organization API key belongs to one Organization."
+            "Organization API key belongs to one Organization. A Cayu platform administrator "
+            "also creates and renames Organizations and adds people to them."
         ),
     )
     organization_commands = organizations.add_subparsers(dest="organization_command")
@@ -1083,6 +1094,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description="Make the saved login act in ORG_ID, one of your Organizations.",
     )
     use.add_argument("organization_id", metavar="ORG_ID")
+    add_organization_changes_parsers(organization_commands)
     commands.add_parser(
         "logout",
         help="Delete the local login.",
@@ -1645,6 +1657,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_data_move_parser(commands)
 
     add_api_keys_parser(commands)
+    add_team_parser(commands)
     add_gateway_parser(commands)
     add_ai_connections_parser(commands)
 
@@ -2477,8 +2490,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         raise CloudCommandError(
             "invalid_input",
             f"`--organization` names where a command acts in Cayu Cloud; `cayu cloud "
-            f"{arguments.command}` doesn't. Sign in to an Organization with `cayu cloud login "
-            "--organization ORG_ID` or switch with `cayu cloud organizations use ORG_ID`.",
+            f"{arguments.command}` doesn't. "
+            + (
+                "A platform administrator's `organizations create|rename|add-member` acts the "
+                "same from any Organization; `rename` and `add-member` name the one they "
+                "change as ORG_ID."
+                if getattr(arguments, "organization_command", None) in ORGANIZATION_CHANGES
+                else "Sign in to an Organization with `cayu cloud login --organization ORG_ID` "
+                "or switch with `cayu cloud organizations use ORG_ID`."
+            ),
         )
     arguments._cloud_organization = (
         None
@@ -2754,6 +2774,8 @@ def _client_command(
     deploy_check: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if arguments.command == "organizations":
+        if arguments.organization_command in ORGANIZATION_CHANGES:
+            return organization_changes_command(arguments, client=client)
         return {"operation": "organizations", "result": _organizations(client)}
     if arguments.command == "whoami":
         return {
@@ -2799,6 +2821,16 @@ def _client_command(
         )
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
+    if arguments.command == "team":
+        return team_command(
+            arguments,
+            client=client,
+            application_id=(
+                _application_id(client, arguments.application)
+                if getattr(arguments, "application", None) is not None
+                else None
+            ),
+        )
     if arguments.command == "ai-connections":
         return ai_connections_command(arguments, client=client)
     if arguments.command == "gateway":
@@ -2883,7 +2915,7 @@ def _client_command(
             client=client,
             application_id=(
                 _application_id(client, arguments.application)
-                if getattr(arguments, "application", None)
+                if getattr(arguments, "application", None) is not None
                 else None
             ),
         )

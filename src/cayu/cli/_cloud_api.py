@@ -181,6 +181,10 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "export_not_ready"),
         (409, "target_not_stopped"),
         (503, "agent_data_transfers_unavailable"),
+        # `cayu cloud team set-agent-people|people`: someone chosen who isn't in the
+        # Organization, or its people can't be read right now.
+        (422, "person_unknown"),
+        (503, "organization_people_unavailable"),
         # `cayu cloud connections`: why Cloud refused a connection or a binding.
         (404, "agent_not_found"),
         (404, "connection_not_found"),
