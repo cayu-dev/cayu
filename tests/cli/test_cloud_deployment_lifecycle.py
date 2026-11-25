@@ -68,8 +68,8 @@ class _Clock:
 @pytest.fixture(autouse=True)
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     fake = _Clock()
-    monkeypatch.setattr(_cloud_deployment_lifecycle.time, "monotonic", fake.monotonic)
-    monkeypatch.setattr(_cloud_deployment_lifecycle.time, "sleep", fake.sleep)
+    monkeypatch.setattr(_cloud_deployment_lifecycle, "_monotonic", fake.monotonic)
+    monkeypatch.setattr(_cloud_deployment_lifecycle, "_sleep", fake.sleep)
     return fake
 
 

@@ -370,8 +370,8 @@ class _Clock:
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
     fake = _Clock()
-    monkeypatch.setattr(_cloud_admin_operations.time, "monotonic", fake.monotonic)
-    monkeypatch.setattr(_cloud_admin_operations.time, "sleep", fake.sleep)
+    monkeypatch.setattr(_cloud_admin_operations, "_monotonic", fake.monotonic)
+    monkeypatch.setattr(_cloud_admin_operations, "_sleep", fake.sleep)
     return fake
 
 

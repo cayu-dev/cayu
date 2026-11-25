@@ -184,7 +184,7 @@ def _wait_destroyed(
     transient_limit: int,
 ) -> dict[str, Any]:
     # The clock is looked up at each call, so a test can replace it.
-    deadline = time.monotonic() + arguments.wait_seconds
+    deadline = _monotonic() + arguments.wait_seconds
     failures = 0
     said: object = None
     while True:
@@ -211,7 +211,7 @@ def _wait_destroyed(
                     file=sys.stderr,
                 )
                 said = status
-        remaining = deadline - time.monotonic()
+        remaining = deadline - _monotonic()
         if remaining <= 0:
             raise CloudApiError(
                 "wait_timeout",
@@ -219,7 +219,7 @@ def _wait_destroyed(
                 f"{arguments.wait_seconds:g} seconds; run cleanup again to keep waiting.",
             )
         # The last sleep is cut to what is left of the wait, so the Release is read once more.
-        time.sleep(min(arguments.poll_seconds, remaining))
+        _sleep(min(arguments.poll_seconds, remaining))
 
 
 def _activity_reader(
@@ -246,3 +246,13 @@ def _activity_reader(
             "PUT", path, payload={"action": "restart", "expected_revision": revision}
         )
     return {"operation": f"admin.activity-reader.{action}", "result": result}
+
+
+def _sleep(seconds: float) -> None:
+    """Wait; tests replace this name, never the `time` module other code shares."""
+
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()

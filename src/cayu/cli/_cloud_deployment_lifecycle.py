@@ -128,7 +128,7 @@ def _wait(
     """Read the Release until it reaches ``expected``, riding out brief API outages, and say
     on standard error what it waits for whenever its status changes."""
 
-    deadline = time.monotonic() + arguments.wait_seconds
+    deadline = _monotonic() + arguments.wait_seconds
     name = terminal_safe(arguments.deployment_id)
     failures = 0
     said: object = None
@@ -158,7 +158,7 @@ def _wait(
                     file=sys.stderr,
                 )
                 said = status
-        remaining = deadline - time.monotonic()
+        remaining = deadline - _monotonic()
         if remaining <= 0:
             raise CloudApiError(
                 "wait_timeout",
@@ -166,4 +166,14 @@ def _wait(
                 f"{arguments.wait_seconds:g} seconds (last status: {status}); Cloud keeps "
                 "working on it. Check it with `cayu cloud deployment status`.",
             )
-        time.sleep(min(arguments.poll_seconds, remaining))
+        _sleep(min(arguments.poll_seconds, remaining))
+
+
+def _sleep(seconds: float) -> None:
+    """Wait; tests replace this name, never the `time` module other code shares."""
+
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
