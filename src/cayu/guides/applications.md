@@ -152,6 +152,18 @@ the check accepts without executing them:
   `RunLimits(...)` and `RetryPolicy(...)` as module constants, imported from
   `cayu.tasks`, `cayu.budgets` or `cayu.providers`, with keyword arguments that
   are literals or a literal `Decimal(...)`, and `TaskRetryBudget.unlimited()`.
+- Pure builtins over plain data, for example `LEVELS = tuple(range(3))` or
+  `ORDER = sorted(NAMES, reverse=True)`: `abs`, `all`, `any`, `bool`, `chr`,
+  `dict`, `divmod`, `enumerate`, `float`, `frozenset`, `int`, `len`, `list`,
+  `max`, `min`, `ord`, `repr`, `reversed`, `round`, `set`, `sorted`, `str`,
+  `sum`, `tuple` and `zip`, and `range` over integer literals with at most
+  10,000 items. Every argument must be plain data as described for helper
+  calls below: literals, module constants built from literals, and other such
+  calls. The only keywords are `reverse` for `sorted`, `default` for `min` and
+  `max`, `start` for `enumerate` and `sum`, and `strict` for `zip`; a `key=`
+  callable, `map`, `filter`, `iter`, `next`, `getattr` and other builtins stay
+  unproven. The name must be the builtin: a module that imports, assigns or
+  defines `range`, `sorted` and the like is checked as calling that value.
 - `Path(...)` and `Path(...).resolve()`, for example `Path(__file__).resolve()`.
 - `re.compile(...)` as a module constant, and reading `.pattern`, `.flags`,
   `.groups` or `.groupindex` from such a constant, for example
@@ -237,8 +249,7 @@ comprehensions (a generator expression only when it is passed straight to a call
 that iterates it at once, such as `tuple(...)`, `sorted(...)` or
 `"/".join(...)`, because a stored generator runs later with whatever its
 variables hold then), read-only `str`, `dict`, `tuple` and `set` methods such as
-`strip`, `split`, `join` and `get`, builtins such as `len`, `sorted`, `tuple`
-and `str`, settings read with `os.environ.get(...)`, `os.environ[...]` or
+`strip`, `split`, `join` and `get`, the pure builtins listed above, settings read with `os.environ.get(...)`, `os.environ[...]` or
 `os.getenv(...)`, the reviewed forms above (`AgentSpec(...)`,
 `configured_model()`, `logging.getLogger(...)`), and calls to other functions
 that pass the same proof. Those operations need values the check knows are

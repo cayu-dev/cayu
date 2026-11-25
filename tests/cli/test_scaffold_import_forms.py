@@ -118,6 +118,14 @@ class Probe(Tool):
         "def first(key: str) -> str:\n    return key\n\n\n@lru_cache(maxsize=32)\n"
         "def second(key: str) -> str:\n    return key\n"
     ),
+    # Pure builtins over literals and data constants.
+    "builtin_over_range": "LEVELS = tuple(range(3))\n",
+    "builtins_over_data": (
+        "NAMES = ('b', 'a')\nORDER = sorted(NAMES, reverse=True)\n"
+        "STEPS = frozenset(range(-4, 4, 2))\nCOUNT = len(NAMES) + sum(STEPS)\n"
+        "FIRST = max(NAMES, default='')\nPAIRS = dict(zip(NAMES, range(2), strict=True))\n"
+        "LABELS = tuple(str(name) for name in NAMES)\n"
+    ),
 }
 
 # Both public entry points must preserve the same declaration proof.
@@ -262,6 +270,52 @@ _REJECTED = {
         "        effect=ToolEffect.NONE,\n        execution_profile_identity=_IDENTITY,\n    )\n",
         "unsupported_expression",
         None,
+    ),
+    # Builtins that run a callable, or whose name is not the builtin.
+    "builtin_key_callable": (
+        "NAMES = sorted(('b', 'a'), key=lambda name: name)\n",
+        "unsupported_expression",
+        "sorted(...)",
+    ),
+    "builtin_callable_argument": (
+        "NAMES = tuple(map(str, (1, 2)))\n",
+        "unsupported_expression",
+        "map(...)",
+    ),
+    "builtin_over_object": (
+        "TEXT = str(object())\n",
+        "unsupported_expression",
+        "str(...)",
+    ),
+    "unreviewed_builtin": (
+        "FIRST = next(iter((1, 2)))\n",
+        "unsupported_expression",
+        "next(...)",
+    ),
+    "builtin_imported_name": (
+        "from probe_ranges import range\n\nLEVELS = tuple(range(3))\n",
+        "unsupported_expression",
+        "range(...)",
+    ),
+    "builtin_rebound_name": (
+        "range = list\nLEVELS = tuple(range(3))\n",
+        "unsupported_expression",
+        "range(...)",
+    ),
+    "builtin_shadowed_by_def": (
+        "def sorted(items):\n    print(items)\n    return items\n\n\nNAMES = sorted(('a',))\n",
+        "unsupported_expression",
+        "sorted(...)",
+    ),
+    "range_over_computed_bound": (
+        "LIMIT = 3\nLEVELS = tuple(range(LIMIT))\n",
+        "unsupported_expression",
+        "range(...)",
+    ),
+    "range_too_long": (
+        "LEVELS = tuple(range(1_000_000))\n",
+        "unsupported_expression",
+        "range(...)",
     ),
 }
 

@@ -35,7 +35,9 @@ Inside a proven helper body:
   conditional expressions, subscripts and slices, collection displays and
   comprehensions over data;
 - calls: other proven helpers, the side-effect-free builtins in
-  ``_DATA_BUILTINS``, the read-only ``str``/``dict``/``tuple``/``set``
+  ``_DATA_BUILTINS`` (with only the data keywords in ``_DATA_BUILTIN_KEYWORDS``,
+  never a ``key`` callable), ``range`` over integer literals with at most
+  ``MAX_RANGE_LENGTH`` items, the read-only ``str``/``dict``/``tuple``/``set``
   methods in ``_DATA_METHODS``, settings read with ``os.environ.get(...)``,
   ``os.environ[...]`` or ``os.getenv(...)``, and the calls the import check
   already reviews (for example ``AgentSpec(...)``).
@@ -45,8 +47,12 @@ the call-time form the guide recommends: the generated ``configured_*``
 settings functions read the environment the same way and are called at import
 by the generated agent modules.
 
-Repetition and exponent operators, ``range`` and padding methods are left out
-so that a proven body cannot build an unbounded value from a small input.
+Repetition and exponent operators, ``range`` over computed bounds and padding
+methods are left out so that a proven body cannot build an unbounded value from
+a small input.
+
+The same rules prove a module-level call to one of those builtins
+(``LEVELS = tuple(range(3))``): see ``HelperCallProver.check_builtin``.
 """
 
 from __future__ import annotations
@@ -64,6 +70,8 @@ MAX_HELPER_DEPTH = 4
 # Expression and statement nodes one proof may evaluate, across every helper
 # body and module constant it reads.
 MAX_PROOF_STEPS = 20_000
+# How many items ``range`` over integer literals may yield.
+MAX_RANGE_LENGTH = 10_000
 # How many ``from module import name`` re-exports a name may pass through.
 _MAX_REEXPORTS = 8
 
@@ -78,7 +86,9 @@ _DATA_BUILTINS = frozenset(
         "all",
         "any",
         "bool",
+        "chr",
         "dict",
+        "divmod",
         "enumerate",
         "float",
         "frozenset",
@@ -87,15 +97,28 @@ _DATA_BUILTINS = frozenset(
         "list",
         "max",
         "min",
+        "ord",
         "repr",
         "reversed",
+        "round",
         "set",
         "sorted",
         "str",
+        "sum",
         "tuple",
         "zip",
     }
 )
+# Keywords a data builtin may take, each with a data value. ``key`` is left
+# out on purpose: it names a callable the builtin runs.
+_DATA_BUILTIN_KEYWORDS: dict[str, frozenset[str]] = {
+    "enumerate": frozenset({"start"}),
+    "max": frozenset({"default"}),
+    "min": frozenset({"default"}),
+    "sorted": frozenset({"reverse"}),
+    "sum": frozenset({"start"}),
+    "zip": frozenset({"strict"}),
+}
 # Methods of builtin data types that neither mutate their receiver nor build a
 # value larger than their inputs. No builtin data type has a mutating method
 # with any of these names.
@@ -160,13 +183,15 @@ _DATA_METHODS = frozenset(
 # Builtins and methods that iterate a generator argument before they return,
 # so a generator expression passed straight to one is evaluated where it stands.
 _CONSUMING_BUILTINS = frozenset(
-    {"all", "any", "dict", "frozenset", "list", "max", "min", "set", "sorted", "tuple"}
+    {"all", "any", "dict", "frozenset", "list", "max", "min", "set", "sorted", "sum", "tuple"}
 )
 _CONSUMING_METHODS = frozenset({"join"})
 # Attributes the import system sets on every module: strings or None.
 _MODULE_ATTRIBUTES = frozenset({"__doc__", "__file__", "__name__", "__package__"})
 # Builtins whose result is a str, number or bool.
-_SCALAR_BUILTINS = frozenset({"abs", "bool", "float", "int", "len", "repr", "str"})
+_SCALAR_BUILTINS = frozenset(
+    {"abs", "bool", "chr", "float", "int", "len", "ord", "repr", "round", "str"}
+)
 _DATA_BINARY_OPERATORS = (ast.Add, ast.Sub, ast.BitOr, ast.BitAnd, ast.BitXor)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # ``os`` functions and attributes that read a setting.
@@ -353,6 +378,48 @@ class HelperCallProver:
                 call.func.id, self._obstacle(callee, call, path, "proof_limit")
             )
         return HelperCallVerdict(call.func.id)
+
+    def check_builtin(
+        self,
+        path: Path,
+        call: ast.Call,
+        enclosing: ast.expr,
+        shadowed: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Whether *call*, at module level of *path*, is a pure builtin over data.
+
+        The name must resolve to the builtin itself: an import, assignment,
+        ``def``, ``global`` or ``import *`` of that name in the module, or a
+        class-body binding in *shadowed*, means it may hold something else.
+        Every argument, keyword included, must be data under the rules a
+        helper body follows.
+        """
+        module = self._module(path)
+        if module is None or not isinstance(call.func, ast.Name) or call.func.id in shadowed:
+            return False
+        try:
+            comprehension_names = _enclosing_comprehension_names(enclosing, call)
+        except RecursionError:
+            comprehension_names = None
+        if comprehension_names is None or call.func.id in comprehension_names:
+            return False
+        resolved = self._resolve_global(module, call.func.id)
+        if not (
+            isinstance(resolved, _Builtin)
+            and (resolved.name in _DATA_BUILTINS or resolved.name == "range")
+        ):
+            return False
+        if _names(call) & shadowed:
+            # A class-body name hides the module global the proof would read.
+            return False
+        self._steps = 0
+        frame = _Frame(module, local_names=frozenset())
+        try:
+            frame.env = self._comprehension_env(frame, enclosing, call, shadowed)
+            frame.local_names = frozenset(frame.env)
+            return self._call(frame, call, stack=(), depth=0) == _DATA
+        except (_Unproven, _ProofLimit, RecursionError):
+            return False
 
     @staticmethod
     def _obstacle(
@@ -550,6 +617,9 @@ class HelperCallProver:
             return self._frozen(module, expression.elt, inner)
         if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name):
             resolved = self._resolve_global(module, expression.func.id)
+            if isinstance(resolved, _Builtin) and resolved.name == "range":
+                # A range and the integers it yields are immutable.
+                return True
             if isinstance(resolved, _Builtin) and len(expression.args) == 1:
                 if resolved.name in {"tuple", "frozenset"}:
                     return self._frozen(module, expression.args[0], scope, elements=True)
@@ -1099,9 +1169,16 @@ class HelperCallProver:
         if not isinstance(function, ast.Name) or function.id in frame.local_names:
             raise _Unproven(call, path)
         resolved = self._resolve_global(frame.module, function.id)
-        if isinstance(resolved, _Builtin) and resolved.name in _DATA_BUILTINS:
-            if call.keywords:
+        if isinstance(resolved, _Builtin) and resolved.name == "range":
+            if call.keywords or _literal_range_length(call.args) is None:
                 raise _Unproven(call, path)
+            return _DATA
+        if isinstance(resolved, _Builtin) and resolved.name in _DATA_BUILTINS:
+            allowed = _DATA_BUILTIN_KEYWORDS.get(resolved.name, frozenset())
+            for keyword in call.keywords:
+                if keyword.arg not in allowed:
+                    raise _Unproven(call, path)
+                self._data(frame, keyword.value, stack=stack, depth=depth, at=call)
             for argument in call.args:
                 if resolved.name in _CONSUMING_BUILTINS:
                     self._consumed(frame, argument, stack=stack, depth=depth, at=call)
@@ -1138,6 +1215,27 @@ class HelperCallProver:
                 self._expression(frame, argument, stack=stack, depth=depth)
             return _OPAQUE
         raise _Unproven(call, path)
+
+
+def _literal_range_length(arguments: list[ast.expr]) -> int | None:
+    """How many items ``range(*arguments)`` yields, when every argument is an
+    integer literal and the count is at most ``MAX_RANGE_LENGTH``."""
+    if not 1 <= len(arguments) <= 3:
+        return None
+    values: list[int] = []
+    for argument in arguments:
+        negative = isinstance(argument, ast.UnaryOp) and isinstance(argument.op, ast.USub)
+        literal = argument.operand if isinstance(argument, ast.UnaryOp) and negative else argument
+        if not (isinstance(literal, ast.Constant) and type(literal.value) is int):
+            return None
+        values.append(-literal.value if negative else literal.value)
+    if len(values) == 3 and values[2] == 0:
+        return None
+    try:
+        length = len(range(*values))
+    except OverflowError:
+        return None
+    return length if length <= MAX_RANGE_LENGTH else None
 
 
 def _expression_root(expression: ast.expr) -> ast.Name | None:

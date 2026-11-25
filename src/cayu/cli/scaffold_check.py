@@ -4859,7 +4859,10 @@ def _module_declaration_failures(
     prover = helper_calls
 
     def proven_helper_call(call: ast.Call, enclosing: ast.expr, shadowed: frozenset[str]) -> bool:
-        return prover is not None and prover.check(path, call, enclosing, shadowed).proven
+        return prover is not None and (
+            prover.check(path, call, enclosing, shadowed).proven
+            or prover.check_builtin(path, call, enclosing, shadowed)
+        )
 
     failures: list[tuple[ast.stmt, ast.expr | ast.stmt]] = []
     for statement in tree.body:
