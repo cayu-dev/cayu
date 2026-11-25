@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Never
 from urllib.parse import quote, urlsplit
 
+from cayu.cli._cloud_access_requests import add_access_requests_parser, submit_access_request
 from cayu.cli._cloud_activity import activity_command, add_activity_parser
 from cayu.cli._cloud_admin_operations import CHANGING_COMMANDS as ADMIN_AGENT_CHANGES
 from cayu.cli._cloud_agent_homes import (
@@ -80,6 +81,13 @@ from cayu.cli._cloud_data_transfers import (
     data_transfer_command,
 )
 from cayu.cli._cloud_database_health import add_service_database_arguments, service_database
+from cayu.cli._cloud_deployment_lifecycle import (
+    LIFECYCLE_ACTIONS as DEPLOYMENT_LIFECYCLE_ACTIONS,
+)
+from cayu.cli._cloud_deployment_lifecycle import (
+    add_deployment_lifecycle_parsers,
+    deployment_lifecycle_command,
+)
 from cayu.cli._cloud_diagnostics import CloudDeploymentFailure as _CloudDeploymentFailure
 from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
@@ -188,6 +196,7 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("deployment", "promote"): "agent",
     ("deployment", "discard"): "agent",
     ("deployment", "retry"): "agent",
+    **{("deployment", action): "agent" for action in DEPLOYMENT_LIFECYCLE_ACTIONS},
     ("rollback",): "agent",
     **{
         ("service", action): "agent"
@@ -1390,7 +1399,10 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     deployment = commands.add_parser(
         "deployment",
         help="Inspect or operate an immutable release.",
-        description="Inspect, wait for, promote or discard one immutable Agent release.",
+        description=(
+            "Inspect, wait for, promote, discard, retry, cancel, resume or destroy one "
+            "immutable Agent release."
+        ),
     )
     deployment_commands = deployment.add_subparsers(
         dest="deployment_command",
@@ -1451,6 +1463,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         if action == "retry":
             operation.add_argument("--idempotency-key")
             _add_acknowledge_breaking_argument(operation)
+        if action in {"promote", "retry"}:
             _add_session_choice_arguments(operation)
             operation.set_defaults(_cloud_preflight=_preflight_acknowledgements)
         if action == "source":
@@ -1492,6 +1505,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
             operation.add_argument("--poll-seconds", type=_positive_finite_seconds, default=5.0)
             operation.add_argument("--wait-seconds", type=_positive_finite_seconds, default=1800.0)
             operation.set_defaults(_cloud_preflight=_preflight_wait)
+    add_deployment_lifecycle_parsers(
+        deployment_commands,
+        application_help=APPLICATION_HELP,
+        seconds=_positive_finite_seconds,
+        preflight_wait=_preflight_switch_wait,
+    )
 
     rollback = commands.add_parser(
         "rollback",
@@ -1714,6 +1733,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
     add_compound_parser(commands, seconds=_positive_finite_seconds)
+    add_access_requests_parser(commands)
     add_console_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
     add_inbox_parser(commands)
 
@@ -2496,7 +2516,7 @@ def _requested_storage_acknowledgement(publication_error: dict[str, Any]) -> tup
 # Commands that don't act in one Organization of Cayu Cloud: `--organization` is refused there,
 # and CAYU_CLOUD_ORGANIZATION ignored.
 _COMMANDS_OUTSIDE_AN_ORGANIZATION = frozenset(
-    {"context", "evidence", "init", "login", "logout", "organizations"}
+    {"access-requests", "context", "evidence", "init", "login", "logout", "organizations"}
 )
 
 
@@ -2695,6 +2715,16 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         }
     selected_context = _selected_context_path(arguments.context)
     context = _read_context(selected_context) if selected_context is not None else {}
+    if arguments.command == "access-requests":
+        # Asking for access needs no sign-in, so it sends no credential.
+        api_url = _configured_cloud_api_url(
+            arguments, context=context, context_path=selected_context
+        )
+        return submit_access_request(
+            arguments,
+            api_url=api_url or _PRODUCTION_API_URL,
+            timeout_seconds=arguments.timeout_seconds,
+        )
     client = _cloud_client(
         arguments,
         context=context,
@@ -2841,6 +2871,16 @@ def _client_command(
             recorder=recorder,
             project=project,
             deploy_check=deploy_check,
+        )
+    if arguments.command == "deployment" and (
+        arguments.deployment_command in DEPLOYMENT_LIFECYCLE_ACTIONS
+    ):
+        return deployment_lifecycle_command(
+            arguments,
+            client=client,
+            application_id=_application_id(client, arguments.application),
+            is_transient=_transient_api_error,
+            transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
         )
     if arguments.command == "deployment":
         return _deployment(arguments, client=client)
@@ -5480,7 +5520,11 @@ def _deployment(
         result = client.request(
             "POST",
             base + "/promote",
-            payload={"expected_application_revision": application["revision"]},
+            payload={
+                "expected_application_revision": application["revision"],
+                # Cloud checks the serving release's sessions before it publishes this one.
+                **(_session_choice_payload(arguments) or {}),
+            },
         )
     return {
         "operation": f"deployment.{arguments.deployment_command}",

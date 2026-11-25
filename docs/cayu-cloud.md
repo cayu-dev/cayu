@@ -30,14 +30,16 @@ top-level commands are:
 - `team members|roles|invitations|invite|revoke|set-role|remove` for
   [the Organization's members and invitations](#members-and-invitations), and
   `team people|agent-people|set-agent-people` for [who works with each Agent](#an-agents-people);
+- `access-requests submit` to [ask for access to Cayu Cloud](#access-requests);
 - `applications list|show|archive|archive-status` for Agent discovery and archive;
 - `context use|show|clear` and `doctor` for connection selection and diagnosis;
 - `platform` for [which Cayu Cloud revision runs and when it rolled out](#cloud-rollouts);
 - `init` and `deploy` for local project setup and publication, and for
   [deploying from a repository](#deploying-from-a-repository);
-- `deployment list|logs|status|timeline|wait|source|promote|discard|retry` and `rollback`
-  for immutable releases, including [candidate releases](#candidate-releases) and
-  [downloading a release's source](#downloading-a-releases-source);
+- `deployment list|logs|status|timeline|wait|source|promote|discard|retry|cancel|resume|destroy`
+  and `rollback` for immutable releases, including [candidate releases](#candidate-releases),
+  [downloading a release's source](#downloading-a-releases-source) and
+  [cancelling, resuming and destroying a release](#cancelling-resuming-and-destroying-a-release);
 - `runtimes list|status` for retained runtime artifacts;
 - `service check|credentials|destroy|health|logs|pause|redeploy|restart|resume|sleep|status|wake`
   for Agent infrastructure, [publishing its Release again](#redeploying-an-agents-service),
@@ -1243,11 +1245,30 @@ login is saved back as it was but for its rotated refresh token. ORG_ID's access
 refresh token) is kept beside the login until it is about to expire, so the next commands there
 need no exchange; `logout` deletes it. An empty or malformed `CAYU_CLOUD_ORGANIZATION` is
 refused (`invalid_input`) rather than ignored. Commands about the login itself (`login`,
-`logout`, `organizations`, `context`) ignore the variable and refuse the flag. An Organization
+`logout`, `organizations`, `context`) and `access-requests`, which acts in no one Organization,
+ignore the variable and refuse the flag. An Organization
 API key can't act in another Organization: naming another one is refused with
 `organization_mismatch`. The variable applies to `cayu cloud` only; `cayu inbox`, `cayu session`
 and `cayu task` act where the login or context does.
 
+### Access requests
+
+Someone who isn't in an Organization yet asks for access with `access-requests submit`:
+
+```console
+cayu cloud access-requests submit --name "Ada Lovelace" --email ada@example.com \
+  --company "Example Co" --message "We want to run our support Agents."
+```
+
+It needs no sign-in and sends no credential: the request goes to the Cayu Cloud the CLI is set
+up for (`CAYU_CLOUD_API_URL` or the selected context, else `https://cloud.cayu.dev`), which
+answers `{"status": "received"}` (`POST /v1/access-requests`). A Cayu platform administrator
+approves or rejects it, and the invite goes to the email given. An email without an `@` between
+other characters, an empty name or company, or a value longer than Cloud accepts is refused with
+`invalid_input` before anything is sent.
+
+It acts in no Organization, so `--organization` is refused and `CAYU_CLOUD_ORGANIZATION` is
+ignored.
 ### Members and invitations
 
 `cayu cloud team` manages who is in the Organization the command acts in, so `--organization
@@ -1331,7 +1352,8 @@ and on which Cayu Cloud, for example
 `cayu cloud: acting in Organization Cayu Demo (org_01...) on https://cloud.cayu.dev`, and its JSON
 output carries the same as `organization` (`api_url`, `id`, and `name`, which is null for an
 Organization API key). It asks Cloud (`GET /v1/me`) before it changes anything. These commands
-are `deploy`, `applications archive`, `deployment promote|discard|retry`, `rollback`,
+are `deploy`, `applications archive`, `deployment promote|discard|retry|cancel|resume|destroy`,
+`rollback`,
 `service destroy|pause|redeploy|restart|resume|sleep|wake`, `env set|unset`,
 `settings set|unset`, `schedule run`, `compass enroll|disable|verify|pass`,
 `compass findings accept|dismiss`, `compass grants propose|approve|reject|revoked|keep`,
@@ -1458,6 +1480,44 @@ selected, fails with HTTP 409, Cloud's reason and `error.code` `candidate_expire
 it is never published, and refuses any other release with category `not_a_candidate`. While
 Cloud publishes a promoted candidate, discard fails with HTTP 409 and Cloud's reason; once
 that publication fails or is refused, the candidate can be discarded.
+
+## Cancelling, resuming and destroying a release
+
+```console
+cayu cloud deployment cancel DEPLOYMENT_ID --application AGENT
+cayu cloud deployment resume DEPLOYMENT_ID --application AGENT
+cayu cloud deployment destroy DEPLOYMENT_ID --application AGENT --wait
+```
+
+Each sends Cloud's lifecycle request for one release (`POST
+/v1/applications/AGENT/deployments/DEPLOYMENT_ID/cancel`, `/resume` or `/destroy`) and prints the
+release's workflow as Cloud answers it: `requested_action`, `current_phase`, `completed_phases`,
+`paused_at`, `last_error` and its deadline. Cloud then acts on it in the background.
+
+- `cancel` stops a release that is still being built or checked (`accepted` or one of its build
+  phases, `smoke_tested` included); Cloud retires what it made and the release ends `cancelled`.
+  Cloud refuses a promoted, failed or destroyed release, or one being published to the Agent's
+  service, with HTTP 409 and its reason.
+  A candidate is cancelled with `deployment discard`, which checks first that it is one.
+- `resume` continues a release whose workflow Cloud paused (`paused_at` set), from its current
+  phase. Cloud refuses one that isn't paused, or whose deadline has passed. Follow it with
+  `deployment wait`.
+- `destroy` removes a promoted, failed or cancelled release and its runtime resources for good,
+  and it ends `destroyed`: it can't be promoted or rolled back to afterwards. Cloud refuses the
+  release the Agent selects, any release in another status (cancel one still in progress
+  first), and the releases of an archived Agent, which keeps them. There is no confirmation prompt, so check the id with `deployment list` first.
+
+Asking again for a cancel or destroy Cloud already has does nothing more, so neither takes an
+idempotency key; asking for one while the other is pending is refused with HTTP 409. These
+commands change an Agent, so they say which Organization they act in, like `deployment promote`.
+
+`cancel --wait` and `destroy --wait` follow the release until Cloud reports it `cancelled` or
+`destroyed`, saying on standard error what they wait for whenever its status changes, and riding
+out brief API outages. `--poll-seconds` (default 5) and `--wait-seconds` (default 900) set the
+pace and the limit. A cancel whose release ends `failed`, `destroyed` or `promoted`
+instead stops with category `deployment_not_cancelled`; a wait that runs out stops
+with `wait_timeout` and the last status, while Cloud keeps working on the release. The output
+adds the release as Cloud last read it as `release`.
 
 ## Breaking storage revisions
 
@@ -1599,7 +1659,7 @@ cayu cloud deployment retry DEPLOYMENT_ID --application AGENT_SLUG --acknowledge
 cayu cloud rollback DEPLOYMENT_ID --application AGENT_SLUG --wait --acknowledge-session '*'
 ```
 
-`deploy`, `deployment retry` and `rollback` take the three flags and send them as
+`deploy`, `deployment promote`, `deployment retry` and `rollback` take the three flags and send them as
 `session_policy`, `session_wait_seconds` and `acknowledge_sessions`. An invalid
 combination (`proceed` without sessions, sessions with `wait` or `block`,
 `--session-wait-seconds` without `wait`, more than 200 sessions, or an empty or

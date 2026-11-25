@@ -551,18 +551,7 @@ class CloudApiClient:
     )
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.api_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("A canonical HTTP(S) Cayu Cloud API URL is required.")
-        if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
-            raise ValueError("Cayu Cloud API URL must use HTTPS outside loopback.")
+        _check_api_url(self.api_url)
         if (
             not self.api_key
             or self.api_key != self.api_key.strip()
@@ -804,6 +793,56 @@ class CloudApiClient:
                 f"Local source bundle upload returned HTTP {response.status_code}{suffix}.",
                 status_code=response.status_code,
             )
+
+
+def _check_api_url(api_url: str) -> None:
+    parsed = urlsplit(api_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("A canonical HTTP(S) Cayu Cloud API URL is required.")
+    if parsed.scheme == "http" and not _is_loopback(parsed.hostname):
+        raise ValueError("Cayu Cloud API URL must use HTTPS outside loopback.")
+
+
+def request_without_credentials(
+    api_url: str,
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, object] | None = None,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Send one request with no credential, for a route Cloud serves to anyone (asking for
+    access to Cayu Cloud); its answers and refusals read as `CloudApiClient.request`'s."""
+
+    _check_api_url(api_url)
+    headers = {"Accept": "application/json"}
+    body = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    try:
+        with httpx.Client(follow_redirects=False, timeout=timeout_seconds) as client:
+            response = client.request(
+                method, api_url.rstrip("/") + path, content=body, headers=headers
+            )
+    except httpx.RequestError as exc:
+        raise _unavailable(exc, f"{method} {path}") from None
+    if not 200 <= response.status_code < 300:
+        raise _rejection(response) from None
+    try:
+        result = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        result = None
+    if not isinstance(result, dict):
+        raise CloudApiError("api_response_invalid", "Cayu Cloud API returned invalid JSON.")
+    return result
 
 
 def _rejection(response: httpx.Response) -> CloudApiError:
