@@ -1146,15 +1146,18 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         description=(
             "Archive an Agent: stop its service, schedules and ingress for good and keep its "
             "Releases, configuration, data and history. Requires an organization "
-            "administrator login and can't be undone."
+            "administrator login and can't be undone. Without --expected-revision it shows "
+            "the Agent and asks for its slug at a terminal before archiving."
         ),
     )
     archive.add_argument("application", type=_application_slug, help="The exact Agent slug.")
     archive.add_argument(
         "--expected-revision",
         type=int,
-        required=True,
-        help="The Agent revision the decision was made on (`applications archive-status`).",
+        help=(
+            "The Agent revision the decision was made on (`applications archive-status`); "
+            "archives without asking, as a script needs."
+        ),
     )
     archive.add_argument("--idempotency-key", help="Defaults to one derived from the revision.")
     archive.add_argument("--no-wait", action="store_true", help="Return once requested.")
@@ -5867,14 +5870,15 @@ def _applications(
         }
     if not arguments.no_wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+    revision = arguments.expected_revision
+    if revision is None:
+        revision = _confirm_archive(client.request("GET", path), application_id)
     # One decision, one key: retrying the same revision replays the same archive.
-    idempotency_key = (
-        arguments.idempotency_key or f"archive:{application_id}:{arguments.expected_revision}"
-    )
+    idempotency_key = arguments.idempotency_key or f"archive:{application_id}:{revision}"
     operation = client.request(
         "POST",
         f"{path}/archive",
-        payload={"expected_application_revision": arguments.expected_revision},
+        payload={"expected_application_revision": revision},
         idempotency_key=idempotency_key,
     )
     if not arguments.no_wait:
@@ -5900,6 +5904,42 @@ def _applications(
                     raise
                 transient_failures += 1
     return {"operation": "applications.archive", "result": operation}
+
+
+def _confirm_archive(application: dict[str, Any], application_id: str) -> int:
+    """Show what archiving the Agent does and have the person type its slug, on standard
+    error; the revision read here is the one the decision is made on. Without a terminal
+    to answer, it refuses rather than guess."""
+
+    revision = application.get("revision")
+    lifecycle = application.get("lifecycle")
+    if lifecycle != "active":
+        raise CloudCommandError(
+            "invalid_input",
+            f"The Agent is {lifecycle}, not active; read its archive with "
+            f"`cayu cloud applications archive-status {application_id}`.",
+        )
+    if not isinstance(revision, int) or isinstance(revision, bool):
+        raise CloudCommandError("invalid_response", "Cayu Cloud returned no Agent revision.")
+    if not sys.stdin.isatty():
+        raise CloudCommandError(
+            "confirmation_required",
+            "Archiving needs a decision: run it at a terminal, or pass --expected-revision "
+            f"{revision} (from `cayu cloud applications archive-status {application_id}`). "
+            "Nothing was archived.",
+        )
+    print(
+        f"Archive Agent {application_id} (revision {revision})?\n"
+        "Its service, schedules and ingress stop for good, and it can't be deployed again. "
+        "Cayu Cloud keeps its Releases, configuration, database, /data files and logs; "
+        "there is no undo. To keep a copy of its data elsewhere, run "
+        f"`cayu cloud applications export {application_id}` first.",
+        file=sys.stderr,
+    )
+    print(f"Type {application_id} to archive it: ", end="", file=sys.stderr, flush=True)
+    if sys.stdin.readline().strip() != application_id:
+        raise CloudCommandError("confirmation_refused", "Nothing was archived.")
+    return revision
 
 
 def _shown_application(arguments: argparse.Namespace) -> str:

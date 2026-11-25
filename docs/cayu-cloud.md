@@ -781,20 +781,32 @@ Agent is read only while one of its sessions waits for a person.
 ## Archive an Agent
 
 Archive retires an Agent you no longer use and keeps its Releases, configuration, data and
-history. Unlike `service destroy`, an archived Agent can't be deployed again, and archive
-can't be undone. It requires an organization administrator signed in with `cayu cloud
-login`; an Organization API key is refused with error `code`
-`organization_admin_required`. If Cayu Cloud can't confirm the administrator, the command
-fails with `code` `organization_directory_unavailable` and nothing changes; run it again.
+history. Archive stops the Agent's service itself, so there is no need to run `service
+destroy` first. Unlike `service destroy`, an archived Agent can't be deployed again, and archive
+can't be undone. Cayu Cloud has no command that deletes an Agent or its database; to keep a copy
+of its data elsewhere, export it first (`applications export`, see
+[Export and import an Agent's data](#export-and-import-an-agents-data)).
+
+Archive requires an organization administrator signed in with `cayu cloud login`, or with
+`cayu cloud login --api-url URL` for another install ([Signing in to another
+install](#signing-in-to-another-install)); an Organization API key is refused with error
+`code` `organization_admin_required`. If Cayu Cloud can't confirm the administrator, the
+command fails with `code` `organization_directory_unavailable` and nothing changes; run it
+again.
 
 ```bash
+cayu cloud applications archive my-agent              # at a terminal: shows it, asks for the slug
 cayu cloud applications archive-status my-agent       # read the current revision
-cayu cloud applications archive my-agent --expected-revision 3
+cayu cloud applications archive my-agent --expected-revision 3   # in a script: no question
 cayu cloud applications list --lifecycle archived
 ```
 
-`archive` takes the exact Agent slug, never a display name, and the revision the decision
-was made on; a changed Agent fails with error `code` `application_revision_stale`. The
+`archive` takes the exact Agent slug, never a display name. Without `--expected-revision` it
+reads the Agent, says what archiving does and asks you to type the slug, then archives the
+revision it showed; any other answer archives nothing (`confirmation_refused`). With no
+terminal to ask, it exits `2` with `confirmation_required` and the `--expected-revision` to
+pass. With `--expected-revision`, the revision the decision was made on, it archives without
+asking; a changed Agent fails with error `code` `application_revision_stale`. The
 idempotency key defaults to one derived from the Agent and revision, so repeating the
 command replays the same archive. The command waits until Cayu Cloud observes that nothing
 of the Agent can run; `--no-wait` returns once it is requested. If the local deadline

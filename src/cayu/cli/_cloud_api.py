@@ -42,7 +42,9 @@ _SAFE_API_ERROR_DETAILS = {
         "with its offset, such as 2026-11-19T09:00:00Z."
     ),
     (403, "organization_admin_required"): (
-        "A signed-in organization administrator is required; run `cayu cloud login`."
+        "A signed-in organization administrator is required; run `cayu cloud login` "
+        "(`--api-url URL` for an install other than production). An Organization API key "
+        "can't act as an administrator."
     ),
     (409, "application_archived"): "The Agent is archived; it can't be deployed or changed.",
     (409, "application_revision_stale"): (

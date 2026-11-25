@@ -9,6 +9,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import threading
 import tomllib
@@ -16,6 +17,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -4421,6 +4423,99 @@ def test_application_lists_filter_lifecycle_and_resolution_includes_archived() -
         {"query": None},
         {"query": {"lifecycle": "all"}},
     ]
+
+
+class _ActiveArchiveClient(_ArchiveClient):
+    """An Agent that is still active at revision 7 when the CLI reads it."""
+
+    def request(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+        if path == "/v1/applications/support-desk":
+            self.requests.append((method, path, kwargs))
+            return {"id": "support-desk", "lifecycle": "active", "revision": 7}
+        return super().request(method, path, **kwargs)
+
+
+class _Terminal(io.StringIO):
+    def __init__(self, answer: str, *, tty: bool = True) -> None:
+        super().__init__(answer)
+        self.tty = tty
+
+    def isatty(self) -> bool:
+        return self.tty
+
+
+def _archive_asking(answer: str, *, tty: bool = True, monkeypatch: pytest.MonkeyPatch) -> Any:
+    client = _ActiveArchiveClient(pending=0)
+    monkeypatch.setattr(sys, "stdin", _Terminal(answer, tty=tty))
+    return client, lambda: cloud_cli._applications(
+        _archive_arguments(expected_revision=None),
+        client=client,
+        sleep=lambda _: None,
+        monotonic=lambda: 0.0,
+    )
+
+
+def test_applications_archive_asks_for_the_slug_and_archives_the_revision_it_showed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client, archive = _archive_asking("support-desk\n", monkeypatch=monkeypatch)
+
+    result = archive()
+
+    assert result["result"]["status"] == "completed"
+    assert client.requests[1] == (
+        "POST",
+        "/v1/applications/support-desk/archive",
+        {
+            "payload": {"expected_application_revision": 7},
+            "idempotency_key": "archive:support-desk:7",
+        },
+    )
+    shown = capsys.readouterr()
+    assert shown.out == ""
+    assert "Archive Agent support-desk (revision 7)?" in shown.err
+    assert "cayu cloud applications export support-desk" in shown.err
+
+
+@pytest.mark.parametrize(
+    ("answer", "tty", "category"),
+    [
+        ("yes\n", True, "confirmation_refused"),
+        ("", True, "confirmation_refused"),
+        ("support-desk\n", False, "confirmation_required"),
+    ],
+)
+def test_applications_archive_without_a_revision_archives_nothing_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, answer: str, tty: bool, category: str
+) -> None:
+    client, archive = _archive_asking(answer, tty=tty, monkeypatch=monkeypatch)
+
+    with pytest.raises(cloud_cli.CloudCommandError) as raised:
+        archive()
+
+    assert raised.value.category == category
+    assert "Nothing was archived." in str(raised.value)
+    if not tty:
+        assert "--expected-revision 7" in str(raised.value)
+    assert [request[0] for request in client.requests] == ["GET"]
+
+
+def test_applications_archive_without_a_revision_refuses_an_archiving_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _ArchiveClient()
+    monkeypatch.setattr(sys, "stdin", _Terminal("support-desk\n"))
+
+    with pytest.raises(cloud_cli.CloudCommandError, match="archive-status support-desk"):
+        cloud_cli._applications(_archive_arguments(expected_revision=None), client=client)
+
+    assert [request[0] for request in client.requests] == ["GET"]
+
+
+def test_applications_archive_parses_without_a_revision() -> None:
+    parsed = cloud_cli._build_parser().parse_args(["applications", "archive", "support-desk"])
+
+    assert parsed.expected_revision is None
 
 
 def test_applications_archive_requires_an_exact_slug() -> None:
