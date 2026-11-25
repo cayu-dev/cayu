@@ -184,6 +184,14 @@ def test_the_agent_presets_app_adds_conversations_through_cayus_api() -> None:
     client = (layer / "src/agent/cayu.ts").read_text(encoding="utf-8")
     assert 'new URL("/api/", window.location.origin)' in client
     assert "fetch(`/api/${path}`" in client
+    # A conversation answered in Cayu's inbox shows without a reload: it's read again on
+    # coming back and watched while unsettled, but never while this page streams its reply.
+    page = (layer / "src/agent/conversations.tsx").read_text(encoding="utf-8")
+    assert "refetchOnWindowFocus: !live," in page
+    assert '"interrupted"' in page and "watchUnsettled(query)" in page
+    assert "refetchInterval: live ? false :" in page
+    assert page.index("setStreaming(id, true)") < page.index('stream("resume"')
+    assert "} finally {\n      setStreaming(id, false);" in page
     # The agent preset has knowledge, so its app has the Knowledge area on top.
     files = project_files(PROJECT)
     assert set(web_app_files(PROJECT, layers=(OPERATORS, CONVERSATIONS, KNOWLEDGE))) == {

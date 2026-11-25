@@ -5,7 +5,7 @@ import { AppBackLink, AppDetailHeader, AppDetailPage, AppPageHeader, AppPageTitl
 import { AsyncContent, DataTable } from "@kit/patterns";
 import { Alert, AlertDescription, Button, Card, CardContent, Field, FieldLabel, Input, Skeleton, StatusBadge, Textarea } from "@kit/ui";
 import { formatDateTime, formatRelative } from "@kit/lib";
-import { isApiError, queryContentProps, queryTableProps, type Requester } from "@kit/data";
+import { isApiError, queryContentProps, queryTableProps, type Requester, watchInterval } from "@kit/data";
 import { BubbleChatIcon } from "@kit/icons";
 import { z } from "zod";
 import type { AppArea } from "../app/area";
@@ -52,6 +52,7 @@ const STATUS_TONE: Record<string, "neutral" | "progress" | "success" | "warning"
   completed: "success",
   failed: "danger",
   paused: "warning",
+  interrupted: "warning",
 };
 
 function ConversationsPage() {
@@ -212,20 +213,48 @@ function NewConversationForm({ agent }: { agent: string }) {
   );
 }
 
-const conversationQuery = (id: string) =>
+// The conversations whose reply this page is streaming in, followed live until it ends.
+// Module-wide, so leaving the page and coming back while one streams still knows.
+const streaming = new Set<string>();
+const streamingListeners = new Set<() => void>();
+function setStreaming(id: string, on: boolean) {
+  if (on) streaming.add(id);
+  else streaming.delete(id);
+  streamingListeners.forEach((listener) => listener());
+}
+function subscribeStreaming(listener: () => void) {
+  streamingListeners.add(listener);
+  return () => {
+    streamingListeners.delete(listener);
+  };
+}
+function useStreaming(id: string) {
+  return React.useSyncExternalStore(subscribeStreaming, () => streaming.has(id));
+}
+
+// Statuses that can change without this page: one running elsewhere, or waiting for a person
+// to answer or approve in Cayu's inbox, after which the agent carries on.
+const UNSETTLED = new Set(["pending", "running", "interrupting", "interrupted", "paused"]);
+const watchUnsettled = watchInterval<Awaited<ReturnType<typeof conversations.conversation>>>();
+
+const conversationQuery = (id: string, live = false) =>
   queryOptions({
     queryKey: [...conversationsKey, "one", id],
     queryFn: ({ signal }) => conversations.conversation(id, signal),
-    // A reply that streams in is followed live; the transcript is read again when it ends,
-    // not while it streams, which would show the message being answered twice.
+    // Read again on opening the page, coming back to the tab, and, while it isn't settled,
+    // as Cayu's watches read (`watchInterval`), so an answer given in the inbox shows here.
+    // Not on those while this page streams a reply in: the transcript is read when it ends,
+    // as reading it sooner would show the message being answered twice. A page opened
+    // again meanwhile reads it, since it shows no reply of its own beside it.
     staleTime: 0,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: !live,
+    refetchInterval: live ? false : (query) => (UNSETTLED.has(query.state.data?.conversation.status ?? "") ? watchUnsettled(query) : false),
   });
 
 function ConversationPage() {
   const { id = "" } = useParams();
   const queryClient = useQueryClient();
-  const loaded = useQuery(conversationQuery(id));
+  const loaded = useQuery(conversationQuery(id, useStreaming(id)));
   // What went wrong with the reply that started this conversation, on the page that opened it.
   const started = useLocation().state as { error?: string } | null;
   const agent = useAgent();
@@ -297,6 +326,7 @@ function ConversationView({
     if (following.current) scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
   }, [messages, sent, reply, busy]);
 
+  const queryClient = useQueryClient();
   const author = (role: string) => (role === "user" ? "Operator" : agent);
   const send = async () => {
     if (busy || !text.trim()) return;
@@ -305,12 +335,17 @@ function ConversationView({
     setSent(text);
     setText("");
     following.current = true;
+    setStreaming(id, true);
     try {
+      // A read already on its way could come back with the message in it.
+      await queryClient.cancelQueries({ queryKey: conversationQuery(id).queryKey });
       await stream("resume", { session_id: id, prompt: text }, setReply);
     } catch (caught) {
       // Refused before it started: the message isn't in the conversation, so keep it.
       if (!(caught instanceof ReplyFailed)) setText(text);
       setError(messageOf(caught));
+    } finally {
+      setStreaming(id, false);
     }
     await onReplied();
     setSent("");
