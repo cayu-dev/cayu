@@ -270,6 +270,11 @@ _STORAGE_PUBLICATION_FAILURES = _RETRYABLE_STORAGE_PUBLICATION_FAILURES | {
 _ACKNOWLEDGE_BREAKING_LIST = re.compile(r'"acknowledge_breaking":\s*\[([0-9, ]{1,400})\]')
 _ACKNOWLEDGE_BREAKING_FLAG = re.compile(r"--acknowledge-breaking ([0-9]{1,7})\b")
 _LEGACY_RETRY_REJECTION = "Only paused or failed deployments can be retried."
+# Cloud's refusal to pause or resume an Agent with no service; a Cloud that records a pause for
+# an Agent's next deploy refuses only a resume with nothing to resume this way.
+_NOT_DEPLOYED = "Application service is not deployed."
+# An ISO 8601 time as Cloud answers it, the only form of one shown from a refusal's body.
+_TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?")
 # Cloud's owner choice for the serving release's unfinished sessions.
 _SESSION_POLICIES = ("wait", "block", "proceed")
 _DEFAULT_SESSION_WAIT_SECONDS = 900
@@ -1356,6 +1361,16 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         help=(
             "Upload even when the local `cayu check --deploy` finds problems that stop a "
             "public service starting on Cayu Cloud."
+        ),
+    )
+    deploy.add_argument(
+        "--paused",
+        action="store_true",
+        help=(
+            "Pause the Agent's worker and schedules before uploading, so the release starts "
+            "with them paused while its web process serves; `service resume` starts them. "
+            "Pausing also stops the worker of a release already running. Needs a Cayu Cloud "
+            "that can pause an Agent that isn't deployed."
         ),
     )
     _add_acknowledge_breaking_argument(deploy)
@@ -3883,6 +3898,12 @@ def _deploy(
 ) -> dict[str, Any]:
     reference, name = _deploy_target(arguments, project)
     application = _resolve_application(client, reference=reference, name=name)
+    # Before anything is uploaded, so no worker of the release starts unpaused.
+    paused = (
+        _pause_before_deploy(client, application_id=str(application["id"]))
+        if getattr(arguments, "paused", False)
+        else None
+    )
     # The release the Agent served before this command; a promote below changes `application`.
     selected_before = application.get("current_deployment_id")
     correlation_id = _correlation_id("deploy")
@@ -4286,6 +4307,12 @@ def _deploy(
         result["retry"] = retry
     if unchanged_source is not None:
         result["unchanged_source"] = unchanged_source
+    if paused is not None:
+        result["paused"] = paused
+        result["message"] = (
+            "The Agent's worker and schedules are paused; its web process serves. Start them "
+            f"with `{_resume_command(arguments, str(application['id']))}`."
+        )
     # Without processes there's no publication for the choice to govern.
     check_preflight = promoted_with_choice and has_processes
     if check_preflight and wait_live:
@@ -4349,6 +4376,46 @@ def _deploy(
     else:
         response["evidence_id"] = evidence_path.name
     return response
+
+
+_PAUSE_BEFORE_DEPLOY_UNSUPPORTED = (
+    "This Cayu Cloud can't pause an Agent that isn't deployed, so `--paused` couldn't keep "
+    "the release's worker from starting. Nothing was deployed. Deploy without --paused once "
+    "the Agent's service runs, after `cayu cloud service pause`, or use a Cayu Cloud that "
+    "supports it."
+)
+
+
+def _pause_before_deploy(client: CloudApiClient, *, application_id: str) -> dict[str, Any]:
+    """Pause the Agent's worker and schedules for `deploy --paused`, before any upload.
+
+    Cloud keeps a pause through every later publication, and records one for an Agent with
+    no service (never deployed, or torn down) so its next publication starts paused: the
+    worker is created at zero replicas, never scaled down after starting. A Cloud that
+    can't pause an Agent without a service refuses that with HTTP 409, and one without
+    pausing at all doesn't serve the route; either is refused here, before anything is
+    deployed, rather than deploying a worker that runs.
+    """
+
+    try:
+        answer = _unsupported_when_missing(
+            lambda: client.request("POST", f"/v1/applications/{application_id}/service/pause"),
+            "deploy_paused_unsupported",
+            _PAUSE_BEFORE_DEPLOY_UNSUPPORTED,
+        )
+    except CloudApiError as exc:
+        if exc.status_code == 409 and exc.detail == _NOT_DEPLOYED:
+            raise CloudCommandError(
+                "deploy_paused_unsupported", _PAUSE_BEFORE_DEPLOY_UNSUPPORTED
+            ) from None
+        raise
+    if not isinstance(answer, dict) or answer.get("paused") is not True:
+        raise CloudCommandError("deploy_paused_unsupported", _PAUSE_BEFORE_DEPLOY_UNSUPPORTED)
+    return {
+        key: answer[key]
+        for key in ("status", "paused", "paused_at", "deployment_id")
+        if key in answer
+    }
 
 
 def _deploy_handoff_warnings(
@@ -5537,7 +5604,11 @@ def _service(
         )
 
     if action == "status":
-        result = client.request("GET", path)
+        try:
+            result = client.request("GET", path)
+        except CloudApiError as exc:
+            _raise_paused_without_service(exc, arguments, application_id)
+            raise
         _service_status(result)
         from cayu.cli._cloud_worker_handoff import drain_warnings, worker_exits_report
 
@@ -5615,6 +5686,44 @@ def _service(
                 result = client.request("GET", path)
                 result_status = _service_status(result)
     return {"operation": f"service.{action}", "result": result}
+
+
+def _resume_command(arguments: argparse.Namespace, application_id: str) -> str:
+    """`service resume` for the Agent, naming the context and Organization this command used,
+    so a copied one acts where this one did."""
+
+    return shlex.join(
+        [
+            "cayu",
+            "cloud",
+            *_cloud_recovery_arguments(arguments),
+            "service",
+            "resume",
+            "--application",
+            application_id,
+        ]
+    )
+
+
+def _raise_paused_without_service(
+    exc: CloudApiError, arguments: argparse.Namespace, application_id: str
+) -> None:
+    """Say so when the service status read found no service but a pause recorded for the
+    Agent's next deploy (`service pause` of an Agent that isn't deployed, or `deploy
+    --paused`); otherwise return, leaving ``exc`` to the caller."""
+
+    body = exc.body or {}
+    if exc.code != "service_not_deployed" or body.get("paused") is not True:
+        return
+    since = body.get("paused_at")
+    shown = isinstance(since, str) and _TIMESTAMP.fullmatch(since) is not None
+    raise CloudCommandError(
+        "service_not_deployed",
+        "The Agent's service is not deployed. Its worker and schedules are paused"
+        + (f" (since {since})" if shown else "")
+        + ": the next deploy starts its web process and keeps them paused until "
+        f"`{_resume_command(arguments, application_id)}`.",
+    ) from None
 
 
 def _redeploy(
@@ -7413,7 +7522,13 @@ def _preflight_wait(arguments: argparse.Namespace) -> None:
 def _preflight_deploy_wait(arguments: argparse.Namespace) -> None:
     _acknowledged_revisions(arguments)
     _session_choice(arguments)
-    _requested_candidate(arguments)
+    if _requested_candidate(arguments) is not None and getattr(arguments, "paused", False):
+        raise CloudCommandError(
+            "invalid_input",
+            "--paused pauses the Agent for the release this deploy publishes, and a "
+            "--no-promote candidate publishes nothing. Pause the Agent with `cayu cloud "
+            "service pause` before promoting the candidate.",
+        )
     if not arguments.no_wait:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 

@@ -604,6 +604,22 @@ paused. These need a Cayu Cloud release that supports them; an older one
 answers `service_pause_unsupported` or `schedule_run_unsupported`, and refuses a
 manifest with `input`.
 
+An Agent with no service, never deployed or destroyed, can be paused as well:
+`service pause` prints `status: not_deployed` with `paused: true`, and the next
+deploy starts the web process with the worker and schedules paused from their
+first start, so no worker takes a task until `service resume`. Until then
+`service status` exits `2` with category `service_not_deployed` and says the
+worker is paused; `service resume` ends the pause before any deploy.
+
+`cayu cloud deploy --paused` pauses the Agent this way before it uploads
+anything, then deploys as usual and prints `result.paused` and the `service
+resume` command. Use it when a release needs a step before its worker runs,
+such as copying data into the Agent: deploy with `--paused`, run the step, then
+resume. The pause also stops the worker of a release already running, and stays
+if the deploy fails. A Cayu Cloud that can't pause an Agent without a service
+is refused with category `deploy_paused_unsupported` before anything is
+deployed; `--paused` can't be combined with `--no-promote`.
+
 ### The runtime image
 
 Cloud builds each Release on the official `python:3.13-alpine` image, so the

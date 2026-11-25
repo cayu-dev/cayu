@@ -170,6 +170,9 @@ _REPORTED_API_REFUSALS = frozenset(
         (503, "arena_inventory_unconfigured"),
         (503, "arena_inventory_unsupported"),
         (504, "operator_check_timeout"),
+        # `cayu cloud service status`: an Agent with no service whose next deploy starts with
+        # its worker paused (`paused`, `paused_at`).
+        (404, "service_not_deployed"),
         # `cayu cloud service database`: why Cloud has no database health for the Agent.
         (404, "agent_database_not_found"),
         (503, "agent_database_health_unavailable"),
