@@ -120,6 +120,13 @@ from cayu.cli._cloud_releases import (
     with_last_request_at,
 )
 from cayu.cli._cloud_sandboxes import add_sandboxes_parser, sandboxes_command
+from cayu.cli._cloud_schedule_runs import ScheduleRunsError
+from cayu.cli._cloud_schedule_runs import add_runs_parser as add_schedule_runs_parser
+from cayu.cli._cloud_schedule_runs import (
+    add_wait_for_argument as add_schedule_run_wait_for_argument,
+)
+from cayu.cli._cloud_schedule_runs import runs_command as schedule_runs_command
+from cayu.cli._cloud_schedule_runs import wait_for_run as wait_for_schedule_run
 from cayu.cli._cloud_schedules import DEFAULT_SCHEDULE_TIMEZONE
 from cayu.cli._cloud_service_check import (
     OperatorCheckFailedError,
@@ -994,6 +1001,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             _CloudRetrySubmissionError,
             _CloudSessionChoiceNotAppliedError,
             SbomDownloadError,
+            ScheduleRunsError,
         ),
     ):
         error.update(exc.details)
@@ -1647,7 +1655,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     schedule = commands.add_parser(
         "schedule",
-        help="List an Agent's schedules, or run one now.",
+        help="List an Agent's schedules and their runs, or run one now.",
         description="Read the Agent's [[schedules]], or operate them outside their expressions.",
     )
     schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True)
@@ -1663,9 +1671,11 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         "run",
         description=(
             "Start one run of a deployed schedule now, as its expression would, also while "
-            "the Agent is paused. Its output is in `service logs`."
+            "the Agent is paused. Its output is in `service logs`; `schedule runs` shows "
+            "where it is, and --wait-for waits for it."
         ),
     )
+    add_schedule_runs_parser(schedule_commands)
     schedule_run.add_argument("name", help="The schedule's name in cayu-cloud.toml.")
     schedule_run.add_argument("--application", required=True, help=APPLICATION_HELP)
     schedule_run.add_argument(
@@ -1677,6 +1687,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         ),
     )
     _add_switch_wait_argument(schedule_run)
+    add_schedule_run_wait_for_argument(schedule_run)
     _add_switch_wait_seconds_arguments(schedule_run)
 
     add_settings_parser(commands)
@@ -5823,6 +5834,8 @@ def _schedule(
     application_id = _application_id(client, arguments.application)
     if arguments.schedule_command == "list":
         return {"operation": "schedule.list", "result": _schedules(client, application_id)}
+    if arguments.schedule_command == "runs":
+        return schedule_runs_command(client, application_id, arguments.name)
     name = quote(arguments.name, safe="")
     payload = None if arguments.input is None else {"input": arguments.input}
     result = _unsupported_when_missing(
@@ -5841,6 +5854,22 @@ def _schedule(
         "schedule_run_unsupported",
         "This Cayu Cloud can't run a schedule on demand yet.",
     )
+    wait_for = getattr(arguments, "wait_for", None)
+    if wait_for is not None:
+        result = {
+            **result,
+            "run_state": wait_for_schedule_run(
+                client,
+                application_id=application_id,
+                schedule=arguments.name,
+                run=str(result["run"]),
+                until=wait_for,
+                poll_seconds=arguments.poll_seconds,
+                wait_seconds=arguments.wait_seconds,
+                sleep=sleep,
+                monotonic=monotonic,
+            ),
+        }
     return {"operation": "schedule.run", "result": result}
 
 
@@ -7545,7 +7574,7 @@ def _preflight_rollback_wait(arguments: argparse.Namespace) -> None:
 
 
 def _preflight_switch_wait(arguments: argparse.Namespace) -> None:
-    if arguments.wait:
+    if arguments.wait or getattr(arguments, "wait_for", None) is not None:
         _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
 
 

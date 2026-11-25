@@ -145,6 +145,7 @@ cayu cloud settings list --application support-bot
 cayu cloud --context PATH settings set KEY=VALUE --application support-bot --organization ORG_ID
 cayu cloud schedule list --application support-bot
 cayu cloud --context PATH schedule run NAME --application support-bot --organization ORG_ID
+cayu cloud schedule runs NAME --application support-bot
 ```
 
 `env set` and `env unset` restart the Agent's service (with `--scope eval` they restart
@@ -153,7 +154,10 @@ nothing). A secret goes in with `env set NAME --secret
 `settings` changes the Agent's managed settings without a deploy, and `settings unset`
 gives a setting back to the release. Schedules themselves live in `cayu-cloud.toml`
 (`[[schedules]]`) and change with a deploy; `schedule run` starts one now, and its output is
-in `service logs --process schedule:NAME`.
+in `service logs --process schedule:NAME`. `schedule runs` shows each run's status and why a
+pending one hasn't started (a run no Agent node has room for writes no logs); `schedule run
+--wait-for start|finish` waits for the run and exits 2 with the reason when it fails or stays
+pending.
 
 ### Sessions and tasks
 

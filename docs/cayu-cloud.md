@@ -593,6 +593,22 @@ the schedule's. A Release that declares no such schedule is refused with `code`
 run, and `--wait` sends it again once that finishes ([while the service
 switches](#while-the-service-switches)); so do the `service` changes below.
 
+`cayu cloud schedule runs --application AGENT [NAME]` lists the schedule runs
+Cloud still keeps, newest first, as a table (`--json` prints the JSON envelope):
+each run's status (`pending`, `running`, `succeeded` or `failed`), whether the
+schedule or a `schedule run` started it, when it was created, started and
+finished, and its exit code. A pending or failed run also says why. A run whose
+pod no Agent node has room for stays `pending` and writes no log lines, so this
+is where its reason shows, with the scheduler's own message (such as `0/6 nodes
+are available: 6 Insufficient cpu`). `schedule run --wait-for start` then waits
+until the run's process starts, and `--wait-for finish` until the run finishes,
+for up to `--wait-seconds` (1,800 by default), polling every `--poll-seconds`
+and writing each change of the run's status to standard error. The command
+prints the run with its last state in `run_state`. It exits `2` with category
+`schedule_run_failed` when the run fails, or `schedule_run_wait_timeout` when
+the time runs out first, and the error's message and `run` say why. A Cayu Cloud
+that doesn't list schedule runs answers `schedule_runs_unsupported`.
+
 `cayu cloud service pause --application AGENT` scales the worker to zero and
 stops the schedules starting runs; runs already started finish, and the web
 process keeps serving, so people can still open the Agent and decide what waits

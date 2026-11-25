@@ -148,6 +148,8 @@ _REPORTED_API_REFUSALS = frozenset(
         (409, "proposal_changed"),
         (409, "release_source_unreadable"),
         (409, "service_busy"),
+        # `cayu cloud schedule runs`: an install whose platform can't list schedule runs.
+        (501, "schedule_runs_unsupported"),
         # `cayu cloud eval run`: an evaluation service without isolated corpus runs, or an eval
         # database, on this installation.
         (409, "database_unsupported"),
