@@ -52,6 +52,9 @@ top-level commands are:
   [Compass](#compass);
 - `compound start|readiness|evaluation|approve-plan|list|status|watch|steer|pause|resume|stop|requests|candidates|decisions|changes`
   for [Compound missions](#compound-missions);
+- `console list|insights|activity|create|rename|delete|show|stop|retry|wake|preview|instruct|answer|events|diff|restore|source|pull|push|deploy|pull-request|deploy-merged`
+  for [Console projects](#console-projects), including
+  [working on one with your own coding agent](#working-on-a-console-project-locally);
 - `inbox list|show|approve|deny|answer|dismiss|keep|drop|decisions` for
   [what your Agents are waiting on a person for](#the-organizations-inbox);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
@@ -3939,6 +3942,143 @@ Cloud's `code` and message, for example `compound_disabled`, `no_selected_releas
 `no_improvement_evals`, `invalid_brief`, `mission_not_sealed`, `plan_mismatch`,
 `change_stale` or `compound_unavailable`.
 
+## Console projects
+
+Console is Cayu Cloud's workspace where a person builds an Agent with a coding agent: each
+project holds a conversation, the coding agent's steps, and the revisions of the Agent's source
+it saved. `cayu cloud console` drives projects from the CLI. (`cayu console` is a different
+command: a local Python console for a Runtime.)
+
+```console
+cayu cloud console create --name "Customer health"
+cayu cloud console create --from-agent customer-health [--release RELEASE_ID]
+cayu cloud console instruct PROJECT_ID --message "Build the first version"
+cayu cloud console instruct PROJECT_ID --message "Address my review" \
+  --comment "2:app/main.py:12:Use the shared queue names here"
+cayu cloud console events PROJECT_ID --follow
+cayu cloud console answer PROJECT_ID --message "The billing queue"
+cayu cloud console show PROJECT_ID
+cayu cloud console diff PROJECT_ID REVISION
+cayu cloud console deploy PROJECT_ID --application customer-health
+```
+
+- **Projects.** `list`, `show`, `rename --name`, and `delete` (the project only; its Agent and
+  Releases stay). `create` starts from Console's starting source, or with `--from-agent`
+  opens an Agent's selected Release (or `--release`) as the project's first revision, linked
+  to that Agent. `insights [--tz ZONE]` counts what the Organization built and published by
+  month, and `activity [--limit N] [--cursor C]` pages through what happened in its projects.
+- **Turns.** `instruct` sends the coding agent an instruction (`--message` or
+  `--message-file`), with `--comment REVISION:PATH:LINE:TEXT` review comments; `answer`
+  answers the question it paused on; `stop` stops the running turn and `retry` runs the latest
+  instruction again. `wake` wakes or creates the project's workspace, and `preview` issues a
+  short-lived URL that shows its preview.
+- **Steps and revisions.** `events --after N --limit N` prints a page of the coding agent's
+  steps with the `next_after` to read on from. `--follow` instead prints each new step as one
+  JSON object per line, in order and once each, polling every `--poll-seconds` (1 by default)
+  until the project's turn is no longer active, after its last steps; it rides out brief API
+  outages with a growing backoff, and ends with the usual JSON error and exit `2` for a project
+  that isn't there (`console_project_not_found`) or anything else. `diff PROJECT_ID REVISION`
+  shows the per-file changes a revision made, `restore` makes a revision's source the latest
+  again as a new revision, and `source --output FILE` downloads the latest source as a
+  `.tar.gz`.
+- **Deploying.** `deploy` publishes the latest revision as a Release of the project's Agent
+  (`--application SLUG` names it for a project not yet linked to one; Cloud creates an Agent
+  of that slug when none has it yet). Once built and
+  smoke-tested, Cloud promotes it, so the Agent serves it; `--no-promote` stages it for
+  `cayu cloud deployment promote` instead, and a Cloud that can't stage is reported as
+  `staging_unsupported` with the Release's `deployment_id`. `deploy` takes
+  `--idempotency-key`; without one a fresh key is chosen and printed, on an error too.
+- **Agents built from a repository.** A project opened from such an Agent delivers its changes
+  as a pull request rather than a Release (`deploy` is refused with
+  `delivery_by_pull_request`). `pull-request` commits the latest revision (or `--revision N`)
+  to the project's branch and finds or opens its pull request; delivering the same revision
+  again answers the same pull request, and `--new-branch` starts a new branch from the same
+  base after someone else changed it. `pull-request --status` reads the pull request's state
+  from GitHub. Once it is merged, `deploy-merged` deploys the merge commit as a new Release of
+  the same Agent, built from the repository; Cloud keys that deploy by the pull request, so
+  running it again answers the same Release (`--idempotency-key` gives a key of your own).
+
+Every command but a following `events` prints one JSON document. Changes say which
+Organization they act in, and `--organization` acts in another of yours for one command
+([Organizations](#organizations)). A refusal exits `2` with Cloud's reason, and its `code` for
+coded ones such as `cayu_ai_limit_reached`, `pull_request_not_merged`, `branch_diverged` or
+`connection_required`; where Console is off, every command reports `console_unavailable`.
+
+### Working on a Console project locally
+
+A local coding agent can change a project's source on your machine and record it as the
+project's next revision, with the same history, diff, restore and deploy as a Console turn's:
+
+```console
+cayu cloud console pull PROJECT_ID --dir ./customer-health
+cd customer-health
+claude -p "Add a /health route and a test for it"      # or: codex exec "..."
+cayu cloud console push PROJECT_ID --summary "Add a /health route"
+```
+
+`pull PROJECT_ID [--dir DIR] [--force]` downloads the latest revision and writes it into `DIR`
+(default `.`), creating it when missing, and records the pull in `DIR/.cayu/console-pull.json`
+(`project_id`, `revision`, `source_digest`), written last, so an interrupted pull leaves no
+record to push from. A non-empty directory is refused (`console_directory_not_empty`);
+`--force` replaces the source of an earlier pull of the same project only, removing the files
+a push would record that the revision doesn't hold and leaving what a push leaves out
+(`.git`, `.venv`, `.env` and the rest below). A file already there that a push leaves out,
+such as your own `.env.local` or a file your `.gitignore` lists, is kept as it is even when the
+revision holds one. Names are compared ignoring case, as macOS compares them, so a revision
+that renames `Readme.md` to `README.md` replaces it. A pull never writes a path under a directory a push leaves out, in any
+letter case, nor any path naming `.git` or `.cayu`, also as a filesystem that ignores some
+characters reads it (on HFS+, `.g` U+200C `it` is `.git`): such a path is skipped. Those
+characters are otherwise ordinary in names, such as an emoji's U+FE0F or a Persian U+200C, and
+those files are written. It also refuses (`console_source_unsafe`),
+before writing anything, a revision whose files would make a directory, the root included, a
+bare git repository (a `HEAD` file beside `objects/` and `refs/`, or beside a `commondir`
+file, which points git at another directory's, in any letter case or spelling of the
+directory a filesystem reads as the same one, and counting what the
+directory already holds), since git reads such a repository's `config` and runs the commands it
+names; a lone file named `HEAD` is fine. Every path
+is checked before anything is written: one that would replace a directory, write under a file
+or through a symlink, or that another system reads differently (a drive such as `C:`, a name
+ending in a dot or a space, a short name such as `GIT~1`) is refused
+(`console_directory_invalid`) and the directory is left as it was. The answer lists `skipped`, the revision's paths a pull didn't write for that
+reason, which a push then records deleted, `kept`, the files a forced pull left as they were,
+and `not_pushed`, paths it wrote that a push leaves out, such as a `.env.local`. A revision stored by Console's previous builder can't be pulled
+(`console_pull_unavailable`).
+
+`push PROJECT_ID [--dir DIR] --summary TEXT` records the directory's source:
+
+- What it records is the directory as a Console save reads it: the tree's own `.gitignore`
+  rules apply (git lists the tree against a throwaway repository, so an enclosing repository
+  and your global ignore rules don't change it; `git` must be installed). It leaves out
+  `.git`, `.venv`, `.cayu`, `data`, `__pycache__` and `.pytest_cache` at any depth, local tool
+  directories (`.hg`, `.svn`, `.mypy_cache`, `.ruff_cache`, `node_modules`, `venv`), and
+  `.env`, `.env.*` other than `.env.example`, `.env.sample` and `.env.template`, `.DS_Store`,
+  `*.pyc` and `*.pyo`. Unlike `cayu cloud deploy` it keeps `build/` and `dist/`; list them in
+  `.gitignore` to leave them out. A symlink or other special file is refused
+  (`source_invalid`), and every file is recorded as mode `0644`.
+- The source must fit what a Console workspace can save, at most 4,096 files and 16 MiB as the
+  tar archive a workspace snapshot of it is; a larger one is refused (`source_invalid`) before
+  anything is sent.
+- Before uploading, push reads the project and refuses (`console_push_conflict`) when a turn
+  runs on it or its latest revision is neither the pulled one nor the pushed source. It packs
+  the source as every Console revision is packed (a deterministic gzip tar under `source/`),
+  uploads it as `cayu cloud deploy` uploads its source, and records it on the pulled revision.
+- When the project's workspace is running, Console writes the source into it, restarts its
+  preview and only then records the revision; push waits for that, saying so on standard
+  error, polling every `--poll-seconds` (2) for up to `--wait-seconds` (900), and reports
+  `console_push_pending` with the `job_id` if it hasn't settled by then.
+- It answers `status: "saved"` with the new `revision`, or `"unchanged"` when the source is
+  already the latest revision's. Either way the pull record then names that revision, so the
+  next push continues from it.
+- A refusal exits `2` with the pull record left as it was and the error's `pulled_revision`:
+  `console_push_conflict` when the project changed since the pull (pull again into a fresh
+  directory and reapply the change), a turn runs on it or its workspace is busy;
+  `console_push_rejected` when Cloud refuses the source (its Agent slug, `cayu-cloud.toml`,
+  the size limits); `console_push_refused` when writing it into the workspace failed;
+  `console_checkout_missing` or `console_checkout_mismatch` when the directory holds no pull
+  of that project.
+
+A push runs no tests or evals; to check a change as a Console save would, run `uv run cayu
+check --deploy`, `uv run pytest -q` and `uv run cayu eval run` in the directory first.
 ## The Organization's inbox
 
 `cayu cloud inbox` lists what the Agents you may see are waiting on a person for (approvals,

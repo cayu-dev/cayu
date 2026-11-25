@@ -65,6 +65,9 @@ from cayu.cli._cloud_connections import (
     connectors_command,
     models_command,
 )
+from cayu.cli._cloud_console import PROJECT_WRITES as CONSOLE_PROJECT_WRITES
+from cayu.cli._cloud_console import add_console_parser, console_command
+from cayu.cli._cloud_console_source import ConsoleError
 from cayu.cli._cloud_data import add_data_parser, data_command
 from cayu.cli._cloud_data_moves import add_data_move_parser, data_move_command
 from cayu.cli._cloud_data_transfers import (
@@ -203,6 +206,11 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     **{("compound", action): "organization" for action in COMPOUND_MISSION_WRITES},
     ("compound", "requests", "answer"): "organization",
     **{("compound", "changes", action): "organization" for action in ("approve", "reject")},
+    # A Console project belongs to one Organization. Creating one may open an existing Agent;
+    # a first deploy may name a new Agent's slug, which Cloud creates.
+    **{("console", action): "organization" for action in CONSOLE_PROJECT_WRITES},
+    ("console", "create"): "agent",
+    ("console", "deploy"): "agent_slug",
     # A decision on an inbox item acts on the Agent whose item it is.
     **{("inbox", action): "agent" for action in INBOX_DECISIONS},
     ("eval", "run"): "agent",
@@ -994,6 +1002,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             AgentOrganizationError,
             CompassWriteError,
             CloudWriteError,
+            ConsoleError,
             CloudSettingsError,
             CloudEvalError,
             OperatorCheckFailedError,
@@ -1679,6 +1688,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
     add_compound_parser(commands, seconds=_positive_finite_seconds)
+    add_console_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
     add_inbox_parser(commands)
 
     add_eval_parser(commands, seconds=_positive_finite_seconds)
@@ -2922,6 +2932,14 @@ def _client_command(
                 if getattr(arguments, "application", None) is not None
                 else None
             ),
+            is_transient=_transient_api_error,
+            transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
+            validate_wait=_validate_wait,
+        )
+    if arguments.command == "console":
+        return console_command(
+            arguments,
+            client=client,
             is_transient=_transient_api_error,
             transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
             validate_wait=_validate_wait,

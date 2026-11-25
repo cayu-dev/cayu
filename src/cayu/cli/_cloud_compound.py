@@ -20,7 +20,13 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_compass_findings import DIMENSIONS
-from cayu.cli._cloud_writes import add_idempotency_key_argument, send_write, write_key
+from cayu.cli._cloud_writes import (
+    add_idempotency_key_argument,
+    add_message_arguments,
+    message_text,
+    send_write,
+    write_key,
+)
 from cayu.cli._output import terminal_safe
 
 WATCH_DEFAULT_POLL_SECONDS = 15.0
@@ -184,7 +190,7 @@ def add_compound_parser(
         description="Send the mission's root a durable directive.",
     )
     steer.add_argument("mission_id")
-    _add_message_arguments(steer)
+    add_message_arguments(steer)
     add_idempotency_key_argument(steer)
     for name in ("pause", "resume"):
         command = actions.add_parser(
@@ -216,7 +222,7 @@ def add_compound_parser(
     answer = request_actions.add_parser("answer", description="Answer one request.")
     answer.add_argument("mission_id")
     answer.add_argument("request_id")
-    _add_message_arguments(answer)
+    add_message_arguments(answer)
     add_idempotency_key_argument(answer)
 
     candidates = actions.add_parser(
@@ -344,7 +350,7 @@ def compound_command(
         fingerprint: dict[str, object] = {"plan_fingerprint": arguments.plan_fingerprint}
         return _write(client, arguments, action, "POST", path, fingerprint)
     if action == "steer":
-        directive: dict[str, object] = {"message": _message(arguments)}
+        directive: dict[str, object] = {"message": message_text(arguments)}
         return _write(client, arguments, action, "POST", f"{mission}/steer", directive)
     if action in {"pause", "resume"}:
         reason: dict[str, object] = {} if arguments.reason is None else {"reason": arguments.reason}
@@ -356,7 +362,9 @@ def compound_command(
         if arguments.requests_command == "list":
             return _answer(operation, client.request("GET", f"{mission}/requests"))
         path = f"{mission}/requests/{quote(arguments.request_id, safe='')}/answer"
-        return _write(client, arguments, operation, "POST", path, {"message": _message(arguments)})
+        return _write(
+            client, arguments, operation, "POST", path, {"message": message_text(arguments)}
+        )
     if action == "candidates":
         operation = f"candidates.{arguments.candidates_command}"
         if arguments.candidates_command == "list":
@@ -410,7 +418,7 @@ def _watch(
     """Read the mission until it meets ``--until``, riding out brief API outages, and say on
     standard error what it waits for whenever the mission's status changes."""
 
-    deadline = time.monotonic() + arguments.wait_seconds
+    deadline = _monotonic() + arguments.wait_seconds
     failures = 0
     polls = 0
     said: str | None = None
@@ -435,14 +443,14 @@ def _watch(
                     file=sys.stderr,
                 )
                 said = status
-        remaining = deadline - time.monotonic()
+        remaining = deadline - _monotonic()
         if remaining <= 0:
             raise CloudApiError(
                 "wait_timeout",
                 f"Mission {arguments.mission_id} didn't reach '{arguments.until}' within "
                 f"{arguments.wait_seconds:g} seconds; run watch again to keep waiting.",
             )
-        time.sleep(min(arguments.poll_seconds, remaining))
+        _sleep(min(arguments.poll_seconds, remaining))
 
 
 def _status_line(detail: dict[str, Any]) -> str:
@@ -461,23 +469,6 @@ def _statuses(detail: dict[str, Any]) -> tuple[object, object]:
 
 def _object(value: object) -> dict[str, Any]:
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
-
-
-def _add_message_arguments(parser: argparse.ArgumentParser) -> None:
-    message = parser.add_mutually_exclusive_group(required=True)
-    message.add_argument("--message")
-    message.add_argument("--message-file", type=Path, help="Read the message from this file.")
-
-
-def _message(arguments: argparse.Namespace) -> str:
-    if arguments.message_file is None:
-        return str(arguments.message)
-    try:
-        return arguments.message_file.read_text()
-    except OSError as exc:
-        raise CloudApiError(
-            "invalid_input", f"Could not read the message file {arguments.message_file}."
-        ) from exc
 
 
 def _json_file(path: Path, what: str) -> dict[str, Any]:
@@ -546,3 +537,13 @@ def _integer(value: str) -> int:
         return int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a whole number") from exc
+
+
+def _sleep(seconds: float) -> None:
+    """Wait; tests replace this name, never the `time` module other code shares."""
+
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
