@@ -46,12 +46,18 @@ top-level commands are:
 - `activity status` to [read how Cloud reads an Agent's activity](#clouds-activity-reader);
 - `compass agents|show|enroll|disable|verify|pass|passes|job|missions|findings|grants` for
   [Compass](#compass);
+- `compound start|readiness|evaluation|approve-plan|list|status|watch|steer|pause|resume|stop|requests|candidates|decisions|changes`
+  for [Compound missions](#compound-missions);
+- `inbox list|show|approve|deny|answer|dismiss|keep|drop|decisions` for
+  [what your Agents are waiting on a person for](#the-organizations-inbox);
 - `eval run|runs|compare|baseline` to [run an Agent's evals](#running-an-agents-evals) and
   read its eval runs;
 - `api-keys create|list|revoke` for the Organization's
   [API keys](#organization-api-keys), as a signed-in admin;
 - `gateway keys|models|limits|usage` for the Organization's
   [Gateway keys, model policy, limits and usage](#gateway-keys-models-limits-and-usage);
+- `ai-connections list|connect|complete|default|disconnect|usage|settings|use|use-cayu` for the
+  Organization's [AI connections](#ai-connections) and what its AI runs on;
 - `connectors` and `connections list|show|add|authorize|check|activity|repositories|agents|rotate|remove|bound|bind|unbind` for the
   Organization's [connections](#connections);
 - `models list` for an Agent's [model slots](#model-slots);
@@ -2706,6 +2712,7 @@ the error names its operation and says to read the policy back before changing i
 cayu cloud gateway usage agent --application my-agent
 cayu cloud gateway usage agent --application my-agent --since 2026-11-01T00:00:00Z
 cayu cloud gateway usage request REQUEST_ID
+cayu cloud gateway usage month 2026-10
 ```
 
 `usage agent` lists the Agent's settled requests with their cost, and totals by model, model
@@ -2716,6 +2723,21 @@ only so far: `complete` is false, the text says "Total so far", and `--cursor` g
 evaluation's requests, made with its own key, count apart as `by_evaluation`; Cloud gives them
 no times, so in a time window they still cover every page read (`evaluations_windowed: false`). `usage request` shows one request (`X-Cayu-Request-Id`) and its
 settlement, or with `--evidence` its retained evidence.
+
+`usage month` is the Organization's usage and cost for one UTC calendar month (`YYYY-MM`, the
+current month by default), counted by the time the Gateway received each request. It has one row
+per model and price, and per evaluation for an evaluation's own key, each with its requests,
+input, output and cache tokens, the price it was admitted at, and its cost; then the
+Organization's totals, the part made with evaluations' own keys, and, apart from the total,
+what the Organization's own model connections cost, which it pays its provider for itself. A
+request that reached the model without measured usage is counted in `unmetered_requests`. Every
+number comes from the request's own record, so a past month's report doesn't change. It is
+measured usage, not an invoice (`reconciliation: "not_verified"`). Unlike the rest of `gateway`
+it comes from Cloud's billing routes (`GET /v1/billing/usage`), so it doesn't need Gateway
+management; it needs an Organization admin and covers the Organization the command acts in
+(`cayu cloud --organization ORG_ID gateway usage month` for another one you administer). Cloud
+answers `billing_usage_unavailable` (HTTP 503) when the install doesn't keep monthly usage or
+couldn't read it; run it again later.
 
 ### When Cloud refuses
 
@@ -2732,6 +2754,40 @@ settlement, or with `--evidence` its retained evidence.
   your allowance, or the key is one Cloud keeps. For a key named by id, Cloud refuses a key that
   doesn't exist and one you may not manage alike, so the message says it wasn't found or isn't
   yours to manage.
+
+## AI connections
+
+An Organization's AI (its Console coding agent) runs on Cayu's AI or on a model account of the
+Organization's own, an AI connection. `cayu cloud ai-connections` connects one, chooses what the
+AI runs on and reads its token usage; each command prints one JSON document.
+
+```console
+cayu cloud ai-connections connect
+cayu cloud ai-connections complete CONNECTION_ID
+cayu cloud ai-connections list
+cayu cloud ai-connections use CONNECTION_ID --model gpt-5.4
+cayu cloud ai-connections settings
+cayu cloud ai-connections usage
+cayu cloud ai-connections default CONNECTION_ID
+cayu cloud ai-connections use-cayu
+cayu cloud ai-connections disconnect CONNECTION_ID
+```
+
+Connecting an OpenAI (ChatGPT) subscription is a device sign-in, so no key passes through the
+command. `connect` creates the connection, `pending`, and prints `verification_url` and
+`user_code`: a person opens the address, signs in with the subscription and enters the code.
+`complete` then finishes it; until they have signed in it prints the connection still
+`pending`, so run it again after `poll_interval_seconds`. A finished connection is `ready`, and
+the first one becomes the Organization's default (`default` chooses another). `use` runs the AI
+on a ready connection with a model it serves (`gpt-5.4` by default), `use-cayu` goes back to
+Cayu's AI, and `settings` shows which is chosen. `usage` totals the input, output and total
+tokens the AI has used. `disconnect` removes a connection and the credential Cloud keeps for it.
+
+Reading needs a developer or an admin; `connect`, `complete`, `default`, `disconnect`, `use` and
+`use-cayu` need an Organization admin, and take `--organization` like every change. Cloud
+answers HTTP 409 when `use` names a connection that isn't ready or a model it doesn't serve, or
+`default` a connection that isn't ready, HTTP 404 for a connection that doesn't exist, and HTTP
+503 when the provider's sign-in can't be reached.
 
 ## Connections
 
@@ -3625,6 +3681,127 @@ A refusal exits `2` with Cloud's `code` and message, for example
 `no_objectives`, `invalid_settings`, `not_enrolled`, `fork_controller_conflict`,
 `enrollment_incomplete` (repeat the same enroll, or disable), `agents_required`,
 `agent_not_watched`, `compass_disabled` or `compass_unavailable`.
+
+## Compound missions
+
+A Compound mission improves one of an Agent's Releases against the Release's own evals and
+objectives. It waits for a person to approve its plan before it spends anything, asks a
+person when it needs an answer, and keeps changes a person approves or rejects. Compass
+starts missions on its own ([Missions](#compass)); `cayu cloud compound` starts and runs
+them from the CLI, with a developer or Organization administrator's login.
+
+```console
+cayu cloud compound readiness --application my-agent
+cayu cloud compound start --application my-agent --brief brief.json --budget budget.json
+cayu cloud compound status MISSION_ID
+cayu cloud compound approve-plan MISSION_ID --plan PLAN_FINGERPRINT
+cayu cloud compound watch MISSION_ID
+cayu cloud compound requests list MISSION_ID
+cayu cloud compound requests answer MISSION_ID REQUEST_ID --message "Only EU customers."
+cayu cloud compound changes list MISSION_ID
+cayu cloud compound changes show MISSION_ID CHANGE_ID
+cayu cloud compound changes approve MISSION_ID CHANGE_ID
+```
+
+- **Before starting.** `readiness` says whether a mission can start on the Agent's selected
+  Release: the eval targets it declares, whether the host pauses for plan approval, the
+  install's default spend limits and what would refuse a start. `evaluation show` and
+  `evaluation set --setting NAME=VALUE` (repeated; none clears them) read and replace the
+  plain-text settings every mission on the Agent gives its evaluation, so never a secret.
+- **Starting.** `start` takes the brief as a JSON file and, with `--budget`, the mission's
+  resources merged over the install's defaults (`max_cost_microunits`, `max_total_tokens`,
+  `max_wall_seconds`; at least one stays). `--release` picks another Release than the
+  selected one, `--eval-target` one of several declared targets, and
+  `--acceptance-dimension correctness|cost|time|attention` what it improves. A start whose
+  answer was lost is refused with `start_outcome_unknown` on a later try; `--adopt
+  MISSION_ID` takes over the mission it submitted.
+- **Running.** `status` shows the mission and, while it waits for approval, the plan a
+  person approves (`compound.approval.plan`, with its `plan_fingerprint`); `approve-plan
+  --plan FINGERPRINT` approves that plan, and another fingerprint is refused with
+  `plan_mismatch`. `watch` waits, saying on standard error what the mission is doing, until it needs
+  a person (an open request, an unreviewed change or a pause), or with `--until completed`
+  until it ends; it rides out brief API outages and exits `2` with `wait_timeout` at
+  `--wait-seconds` (6 hours by default), and running it again keeps waiting. `steer` sends a
+  directive, `pause` and `resume` take an optional `--reason`, and `stop` ends the mission
+  for good. `requests list` and `requests answer` read and answer what it asks; `--message`
+  or `--message-file` gives the text.
+- **Reviewing.** `candidates list|show` and `decisions` read what it tried and why it kept
+  or dropped each. `changes list|show` reads the changes it kept; `changes approve` makes a
+  candidate Release of one, promotable for `--expires-in-seconds` (7 days by default) with
+  `cayu cloud deployment promote`, and `changes reject --reason TEXT` turns it down.
+
+Every command prints one JSON document. Writes (`start`, `approve-plan`, `steer`, `pause`,
+`resume`, `requests answer`, `changes approve`) take `--idempotency-key`; without one a fresh
+key is chosen and printed, on an error too, so a write whose answer was lost can be sent
+again with it. Changes say which Organization they act in, and `--organization` acts in
+another of yours for one command ([Organizations](#organizations)). A refusal exits `2` with
+Cloud's `code` and message, for example `compound_disabled`, `no_selected_release`,
+`no_improvement_evals`, `invalid_brief`, `mission_not_sealed`, `plan_mismatch`,
+`change_stale` or `compound_unavailable`.
+
+## The Organization's inbox
+
+`cayu cloud inbox` lists what the Agents you may see are waiting on a person for (approvals,
+questions, recovery items and knowledge proposals), decides an item as you, and reads the
+decisions Cayu Cloud carried. It is the same inbox Cayu Cloud Home shows, read live from each
+Agent's own inbox ([Approvals in Cayu Cloud](#approvals-in-cayu-cloud)); Cloud keeps no copy of
+the items.
+
+```console
+cayu cloud inbox list
+cayu cloud inbox list --application my-agent
+cayu cloud inbox show ITEM_ID --application my-agent
+cayu cloud inbox approve ITEM_ID --application my-agent --reason "Checked the totals."
+cayu cloud inbox approve ITEM_ID --application my-agent --arguments-file changed.json
+cayu cloud inbox deny ITEM_ID --application my-agent --reason "Wrong vendor."
+cayu cloud inbox answer ITEM_ID --application my-agent --answer "It's a split shipment."
+cayu cloud inbox dismiss ITEM_ID --application my-agent --reason "The run ended long ago."
+cayu cloud inbox keep ITEM_ID --application my-agent
+cayu cloud inbox drop ITEM_ID --application my-agent
+cayu cloud inbox decisions --application my-agent --since 2d --outcome failed --outcome refused
+```
+
+- **Listing.** `list` reads every active Agent you may see, oldest first. Each item names its
+  Agent (`application_id`), its `kind` and the `decisions` it takes; `agents` says which
+  Agents were read and why any weren't (`asleep`, `not_serving`, `unavailable` with a reason,
+  or `unsupported`), and `complete` is false when one couldn't be read whole. A sleeping Agent
+  is read only while one of its sessions waits for a person, so listing doesn't wake every
+  Agent. With `--application` it reads that one Agent's inbox, waking it if it sleeps.
+- **Deciding.** `approve`, `deny`, `answer`, `dismiss`, `keep` and `drop` settle one item in
+  the Agent itself, so its own pages show it settled too, with you as the person who decided.
+  `approve --arguments-file` approves with changes: a JSON object of the arguments the tool
+  runs with instead. `answer` takes `--answer` or `--answer-file`, and `dismiss` (for a
+  recovery item whose session won't continue) needs `--reason`, recorded as the session is
+  abandoned. Deciding needs a signed-in person, since the Agent records who decided: an
+  Organization API key can list and read but not decide (`person_required`). Cloud decides
+  only for an Agent on Cayu Cloud sign-in (`agent_sign_in_required` otherwise).
+- **Reading back.** `show` is one item's state wherever it was settled: `pending` with the
+  item, `settled` with who decided and when, `superseded` or `unavailable`. `decisions` lists
+  Cloud's records of the decisions it carried, newest first, and what each Agent answered
+  (`pending`, `settled`, `replayed`, `refused` with its code, or `failed` when Cloud couldn't
+  tell). `--since` and `--until` take a span back from now (`90m`, `2d`) or an ISO 8601 time,
+  `--outcome` repeats, and `--item` and `--session` choose one item's or session's records.
+  It answers one page (`--limit`, 1 to 100); go on with the `next_cursor` it printed as
+  `--cursor`, with the same filters.
+
+Each decision takes `--idempotency-key`; without one a fresh key is chosen and printed, on an
+error too. Sending the same decision again under its key acts once: the Agent answers with the
+decision it recorded (`replayed: true`), so a decision whose outcome is unknown
+(`decision_outcome_unknown`) can be retried safely, and a key reused for another decision is
+refused (`idempotency_key_reused`). Decisions say which Organization they act in and are
+refused outside the Organization the Agent deploys to; `--organization` acts in another of
+yours for one command ([Organizations](#organizations)). A refusal exits `2` with Cloud's
+`code` and message, for example `already_settled`, `superseded`, `conflict`, `agent_refused`,
+`invalid_decision` or `agent_starting`; when the Agent gave the item's current state, the
+error carries it as `item`.
+
+**Which inbox command.** `cayu cloud inbox` works across your Organization's Agents and sends
+each decision as given. `cayu inbox --application NAME` ([Inbox](inbox.md)) works with one
+Agent's inbox in more depth: it pages an inbox of any size, reads an approval's or question's
+protected review and decides with it, remembers an approval as a grant, and settles an
+approval after the Agent's execution profile changed. An Agent with a human-review policy
+refuses an approve, deny or answer that carries no review (`agent_refused`); its items say so
+with `arguments_unavailable_reason: "quarantined"`, so decide those with `cayu inbox`.
 
 ## Tools and knowledge registration
 

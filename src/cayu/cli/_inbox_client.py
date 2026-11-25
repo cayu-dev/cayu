@@ -46,6 +46,11 @@ _CLOUD_PAGE_LIMIT = 50
 _KINDS = ("approval", "question", "recovery", "knowledge")
 #: What Cloud recorded the Agent answering a decision it carried (`GET /v1/inbox/decisions`).
 DECISION_OUTCOMES = ("pending", "settled", "replayed", "refused", "failed")
+#: Why decision records can't be chosen from a Cloud that doesn't echo the filters it applied.
+DECISION_FILTERS_UNSUPPORTED = (
+    "This Cayu Cloud can't choose decision records by time, outcome, item or session yet. List "
+    "them without --since, --until, --outcome, --item or --session."
+)
 #: The most decision records one request to Cloud reads.
 _DECISIONS_PAGE_LIMIT = 100
 #: How many items an older Cloud left out the CLI reads at once, by id.
@@ -606,12 +611,7 @@ class CloudInbox:
             answer = await asyncio.to_thread(self._cloud, "GET", "/v1/inbox/decisions", query=query)
             said = answer.get("filters")
             if filters and not isinstance(said, dict):
-                raise InboxClientError(
-                    "decision_filters_unsupported",
-                    "This Cayu Cloud can't choose decision records by time, outcome, item or "
-                    "session yet. List them without --since, --until, --outcome, --item or "
-                    "--session.",
-                )
+                raise InboxClientError("decision_filters_unsupported", DECISION_FILTERS_UNSUPPORTED)
             applied = said if isinstance(said, dict) else applied
             items.extend(row for row in answer.get("items", []) if isinstance(row, dict))
             cursor = answer.get("next_cursor")

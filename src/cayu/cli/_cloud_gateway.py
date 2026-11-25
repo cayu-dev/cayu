@@ -12,8 +12,9 @@ serves when its operator turns it on (with WorkOS or OIDC sign-in):
   Organization's or an Agent's model policy (`/v1/gateway/policies/{read,edit}`).
 - `limits` reads and sets spending caps at Organization, Agent and key scope, and alert
   budgets (`/v1/gateway/alerts/configurations`).
-- `usage` reads an Agent's settled requests and spend (`/v1/gateway/agents/{id}/usage`) and
-  one request (`/v1/gateway/requests/{id}`).
+- `usage` reads an Agent's settled requests and spend (`/v1/gateway/agents/{id}/usage`),
+  one request (`/v1/gateway/requests/{id}`), and the Organization's month
+  (`_cloud_gateway_month`).
 
 Organization admins manage everything. Personal keys (a developer's own, within an admin's
 allowance) exist only where the install offers them (`/v1/me`'s
@@ -37,6 +38,7 @@ from urllib.parse import quote
 
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_api_keys import new_private_file, write_private_file
+from cayu.cli._cloud_gateway_month import add_month_parser, month_usage
 from cayu.cli._cloud_reference import APPLICATION_HELP
 from cayu.cli._cloud_settings import _table
 from cayu.cli._output import terminal_safe
@@ -383,8 +385,11 @@ def _add_limits_parser(areas: argparse._SubParsersAction[argparse.ArgumentParser
 def _add_usage_parser(areas: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     usage = areas.add_parser(
         "usage",
-        help="Read an Agent's settled requests and spend, or one request.",
-        description="Read Gateway usage: an Agent's settled requests and spend, or one request.",
+        help="Read an Agent's settled requests and spend, one request, or a month's usage.",
+        description=(
+            "Read Gateway usage: an Agent's settled requests and spend, one request, or the "
+            "Organization's usage and cost for one month."
+        ),
     )
     actions = usage.add_subparsers(dest="gateway_usage_command", required=True)
     agent = actions.add_parser(
@@ -418,6 +423,7 @@ def _add_usage_parser(areas: argparse._SubParsersAction[argparse.ArgumentParser]
     request.add_argument(
         "--evidence", action="store_true", help="Show its retained evidence instead."
     )
+    add_month_parser(actions)
 
 
 def _add_models_argument(parser: argparse.ArgumentParser, *, required: bool, help: str) -> None:
@@ -562,6 +568,9 @@ def gateway_command(
 
     area = arguments.gateway_command
     action = getattr(arguments, f"gateway_{area}_command")
+    if (area, action) == ("usage", "month"):
+        # Billing's report, not Gateway management: Cloud's own refusals say why.
+        return {"operation": "gateway.usage.month", "result": month_usage(arguments, client)}
     run, flag = _ACTIONS[(area, action)]
     try:
         result = run(arguments, client, application_id)

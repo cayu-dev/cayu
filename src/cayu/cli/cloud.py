@@ -31,6 +31,8 @@ from cayu.cli._cloud_agent_homes import (
     require_agent_home,
     require_intended_organization,
 )
+from cayu.cli._cloud_ai_connections import WRITES as AI_CONNECTION_WRITES
+from cayu.cli._cloud_ai_connections import add_ai_connections_parser, ai_connections_command
 from cayu.cli._cloud_api import (
     CANDIDATE_REFUSAL_CODES,
     CloudApiClient,
@@ -52,6 +54,8 @@ from cayu.cli._cloud_auth import (
 )
 from cayu.cli._cloud_compass import CompassWriteError, add_compass_parser, compass_command
 from cayu.cli._cloud_compass_grants import WRITES as COMPASS_GRANT_WRITES
+from cayu.cli._cloud_compound import MISSION_WRITES as COMPOUND_MISSION_WRITES
+from cayu.cli._cloud_compound import add_compound_parser, compound_command
 from cayu.cli._cloud_connections import (
     AGENT_ACTIONS,
     add_connections_parsers,
@@ -77,6 +81,8 @@ from cayu.cli._cloud_diagnostics import parse_build_failure, safe_text
 from cayu.cli._cloud_evals import CloudEvalError, add_eval_parser, eval_command
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_gateway import add_gateway_parser, gateway_command
+from cayu.cli._cloud_inbox import DECISIONS as INBOX_DECISIONS
+from cayu.cli._cloud_inbox import add_inbox_parser, inbox_command
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
     CloudSourceInputsError,
@@ -126,6 +132,7 @@ from cayu.cli._cloud_system_agents import (
     system_change_warning,
 )
 from cayu.cli._cloud_task_health import fenced_tasks_warning
+from cayu.cli._cloud_writes import CloudWriteError
 from cayu.cli._output import terminal_safe
 
 _DEPLOYMENT_FAILURES = {"cancelled", "destroyed", "failed"}
@@ -181,11 +188,20 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("compass", "findings", "accept"): "agent_slug",
     ("compass", "findings", "dismiss"): "agent_slug",
     **{("compass", "grants", action): "agent_slug" for action in COMPASS_GRANT_WRITES},
+    ("compound", "start"): "agent",
+    ("compound", "evaluation", "set"): "agent",
+    # A mission belongs to one Organization, which a change to it acts in.
+    **{("compound", action): "organization" for action in COMPOUND_MISSION_WRITES},
+    ("compound", "requests", "answer"): "organization",
+    **{("compound", "changes", action): "organization" for action in ("approve", "reject")},
+    # A decision on an inbox item acts on the Agent whose item it is.
+    **{("inbox", action): "agent" for action in INBOX_DECISIONS},
     ("eval", "run"): "agent",
     ("eval", "runs", "cancel"): "agent",
     ("eval", "baseline"): "agent",
     ("api-keys", "create"): "organization",
     ("api-keys", "revoke"): "organization",
+    **{("ai-connections", action): "organization" for action in AI_CONNECTION_WRITES},
     # An optional --application names the Agent a Gateway change acts on.
     ("gateway", "keys", "create"): "agent",
     **{("gateway", "keys", action): "organization" for action in ("rotate", "restrict", "revoke")},
@@ -964,6 +980,7 @@ def _cloud_failure(exc: Exception, *, render: Callable[[dict[str, Any]], str] | 
             _CloudRepositoryRefusalError,
             AgentOrganizationError,
             CompassWriteError,
+            CloudWriteError,
             CloudSettingsError,
             CloudEvalError,
             OperatorCheckFailedError,
@@ -1629,6 +1646,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     add_api_keys_parser(commands)
     add_gateway_parser(commands)
+    add_ai_connections_parser(commands)
 
     add_connections_parsers(commands, seconds=_positive_finite_seconds)
     add_models_parser(commands)
@@ -1636,6 +1654,8 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_admin_parser(commands, application=_application_slug)
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
+    add_compound_parser(commands, seconds=_positive_finite_seconds)
+    add_inbox_parser(commands)
 
     add_eval_parser(commands, seconds=_positive_finite_seconds)
 
@@ -2779,6 +2799,8 @@ def _client_command(
         )
     if arguments.command == "api-keys":
         return api_keys_command(arguments, client=client)
+    if arguments.command == "ai-connections":
+        return ai_connections_command(arguments, client=client)
     if arguments.command == "gateway":
         return gateway_command(
             arguments,
@@ -2841,6 +2863,29 @@ def _client_command(
             is_transient=_transient_api_error,
             transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
             validate_wait=_validate_wait,
+        )
+    if arguments.command == "compound":
+        return compound_command(
+            arguments,
+            client=client,
+            application_id=(
+                _application_id(client, arguments.application)
+                if getattr(arguments, "application", None) is not None
+                else None
+            ),
+            is_transient=_transient_api_error,
+            transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
+            validate_wait=_validate_wait,
+        )
+    if arguments.command == "inbox":
+        return inbox_command(
+            arguments,
+            client=client,
+            application_id=(
+                _application_id(client, arguments.application)
+                if getattr(arguments, "application", None)
+                else None
+            ),
         )
     if arguments.command == "eval":
         return eval_command(

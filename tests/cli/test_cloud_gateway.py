@@ -1411,6 +1411,82 @@ def test_usage_request_and_model_status_read_their_routes(
     assert len(fake.requests) == 3
 
 
+def test_usage_month_reads_the_organizations_monthly_report(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = {
+        "month": "2026-10",
+        "organization_id": "org_1",
+        "currency": "USD",
+        "rows": [{"model_id": "claude-sonnet", "requests": 3, "cost_usd": "0.42"}],
+        "total": {"requests": 3, "cost_nano_usd": 420_000_000, "cost_usd": "0.42"},
+        "reconciliation": "not_verified",
+        "scope": "gateway_requests",
+    }
+    fake = cloud({("GET", "/v1/billing/usage?month=2026-10"): httpx.Response(200, json=report)})
+
+    code, output = _run(["usage", "month", "2026-10"], capsys)
+
+    assert (code, output["operation"], output["result"]) == (0, "gateway.usage.month", report)
+    # Billing's report: nothing asks whether Gateway management is served.
+    assert [request.url.raw_path.decode() for request in fake.requests] == [
+        "/v1/billing/usage?month=2026-10"
+    ]
+
+
+def test_usage_month_defaults_to_the_current_utc_month(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from datetime import UTC, datetime
+
+    month = datetime.now(UTC).strftime("%Y-%m")
+    fake = cloud(
+        {("GET", f"/v1/billing/usage?month={month}"): httpx.Response(200, json={"rows": []})}
+    )
+
+    code, output = _run(["usage", "month"], capsys)
+
+    assert code == 0, output
+    assert len(fake.requests) == 1
+
+
+def test_usage_month_refuses_a_month_that_is_not_yyyy_mm(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = cloud({})
+
+    code, output = _run(["usage", "month", "2026-13"], capsys)
+
+    assert code != 0
+    assert output["error"]["category"] == "invalid_input"
+    assert "YYYY-MM" in output["error"]["message"]
+    assert fake.requests == []
+
+
+def test_usage_month_reports_cloud_without_monthly_usage(
+    cloud, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cloud(
+        {
+            ("GET", "/v1/billing/usage?month=2026-10"): httpx.Response(
+                503,
+                json={
+                    "detail": {
+                        "code": "billing_usage_unavailable",
+                        "message": "Monthly Gateway usage is not configured on this installation.",
+                    }
+                },
+            ),
+        }
+    )
+
+    code, output = _run(["usage", "month", "2026-10"], capsys)
+
+    assert code != 0
+    assert output["error"]["code"] == "billing_usage_unavailable"
+    assert "not configured" in output["error"]["message"]
+
+
 def test_usage_totals_say_they_are_partial_when_pages_remain(
     cloud, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

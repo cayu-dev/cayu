@@ -111,11 +111,12 @@ CANDIDATE_REFUSAL_CODES = frozenset({"candidate_baseline_changed", "candidate_ex
 
 # Cloud's documented refusals whose code and own message the CLI reports, filtered like a
 # conflict's reason, since the message says what to fix: Compass's (`cayu cloud compass`),
+# Compound's (`cayu cloud compound`),
 # a schedule run's (`cayu cloud schedule run`), a settings change's (`cayu cloud
 # settings`), an environment change's (`cayu cloud env set|unset` with several names), a
 # source or SBOM download's (`cayu cloud deployment source|sbom`) and an inbox decision's
-# (`cayu inbox`), whose structured fields (such as a refused settle's `item`) that command
-# reads from `CloudApiError.body`.
+# (`cayu inbox` and `cayu cloud inbox`), whose structured fields (such as a refused settle's
+# `item`) those commands read from `CloudApiError.body`.
 _REPORTED_API_REFUSALS = frozenset(
     {
         *_INBOX_REFUSALS,
@@ -234,6 +235,67 @@ _REPORTED_API_REFUSALS = frozenset(
         (422, "invalid_model"),
         (503, "models_unavailable"),
         (503, "models_unreadable"),
+        # `cayu cloud gateway usage month`: why Cloud has no monthly usage to send.
+        (503, "billing_usage_unavailable"),
+        # `cayu cloud compound`: why Cloud refused to start, read or change a mission.
+        (403, "compound_disabled"),
+        (403, "unbounded_not_allowed"),
+        (404, "mission_not_found"),
+        (409, "approval_not_required"),
+        (409, "approval_refused"),
+        (409, "candidate_busy"),
+        (409, "candidate_conflict"),
+        (409, "change_approved"),
+        (409, "change_base_mismatch"),
+        (409, "change_busy"),
+        (409, "change_invalid_source"),
+        (409, "change_rejected"),
+        (409, "change_stale"),
+        (409, "command_conflict"),
+        (409, "compound_refused"),
+        (409, "console_busy"),
+        (409, "console_diverged"),
+        (409, "delivery_by_pull_request"),
+        (409, "evaluation_settings_conflict"),
+        (409, "mission_conflict"),
+        (409, "mission_not_sealed"),
+        (409, "mission_not_stoppable"),
+        (409, "plan_mismatch"),
+        (409, "pre_spend_approval_unavailable"),
+        (409, "review_not_approving"),
+        (409, "start_conflict"),
+        (409, "start_outcome_unknown"),
+        (409, "start_in_progress"),
+        (422, "budget_unbounded"),
+        (422, "candidate_invalid"),
+        (422, "cayu_runtime_unsealable"),
+        (422, "dimension_not_declared"),
+        (422, "evaluation_model_unreachable"),
+        (422, "invalid_brief"),
+        (422, "invalid_budget"),
+        (422, "invalid_command"),
+        (422, "invalid_cursor"),
+        (422, "invalid_dimension"),
+        (422, "invalid_evaluation"),
+        (422, "invalid_plan"),
+        (422, "invalid_reason"),
+        (422, "invalid_status"),
+        (422, "mission_budget_required"),
+        (422, "mission_budget_too_large"),
+        (422, "no_improvement_evals"),
+        (502, "invalid_compound_record"),
+        (503, "compound_agent_unavailable"),
+        (503, "compound_unavailable"),
+        (503, "gateway_key_busy"),
+        (503, "gateway_key_pending"),
+        (503, "gateway_key_unavailable"),
+        (503, "staging_unavailable"),
+        (504, "compound_outcome_unknown"),
+        # `cayu cloud inbox`: why Cloud couldn't list, read or carry a decision, beyond the
+        # inbox refusals above.
+        (409, "agent_start_failed"),
+        (422, "invalid_filter"),
+        (503, "not_sent"),
         # `cayu cloud admin runtime-record`: why Cloud refused to read or change the record.
         (404, "runtime_record_not_found"),
         (409, "database_migration_running"),

@@ -41,7 +41,7 @@ _ENROLL_FIELDS = (
 )
 # `findings accept` options, which set the request fields of the same names.
 _ACCEPT_TEXT = ("note", "requirement", "hypothesis", "expected_effect", "risk")
-_MISSION_STATUSES = ("ready", "starting", "started", "failed", "unknown")
+_MISSION_STATUSES = ("ready", "starting", "started", "failed", "unknown", "ended")
 # `withdrawn` and `resolved` are Compass retiring a finding that no longer holds; `findings list`
 # leaves them out unless --status names one.
 _FINDING_STATUSES = ("proposed", "accepted", "dismissed", "withdrawn", "resolved")

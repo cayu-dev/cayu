@@ -641,6 +641,13 @@ through Cloud to the Agent, so the listing isn't bounded by what one request can
 a Cloud that doesn't page answers with its own bounded read, which says whether it is
 complete.
 
+`cayu inbox --application` works with one Agent at a time. To see what every Agent in your
+Organization is waiting on a person for in one listing, decide items there, or read Cloud's
+decision records across Agents, use `cayu cloud inbox` (see
+[The Organization's inbox](cayu-cloud.md#the-organizations-inbox)). It prints JSON and sends
+each decision as given, without a review, so decide the items of an Agent with a
+human-review policy here, with `cayu inbox`.
+
 `show` prints the item and, for a pending approval or question, the
 [human review](human-review.md) the application's policy builds for you: the
 arguments it shows, the calls the decision covers, and its guidance. It never shows
