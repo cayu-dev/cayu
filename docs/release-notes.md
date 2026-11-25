@@ -1,5 +1,143 @@
 # Release notes
 
+## v0.23.0
+
+Upgrade: Run `cayu storage migrate` before starting this release's workers or
+servers. Storage advances from revision 159 to 162 and the compatibility floor
+from 146 to 161, so a v0.22.x binary can't open a migrated store: upgrade every
+process that shares a store together. Server contract advances from 92 to 94;
+upgrade independently deployed clients and dashboards to the matching contract.
+App manifest schema stays 19. The bundled dashboard and parts package already
+match.
+
+### Breaking changes
+
+- Storage revision 161 adds recurring task series and is breaking: every writer
+  that ends an occurrence must queue the next one in the same transaction, which
+  older binaries don't. The compatibility floor is 161, so v0.22.x refuses a
+  migrated store. Revisions 160 (task progress) and 162 (tool-call
+  preauthorizations) are additive.
+- Server contract 93 reports whether a server hosts tool authorization grants
+  (`capabilities.surfaces.tool_authorization_grants`), and contract 94 adds
+  `GET /api/knowledge/pending/clusters`. Regenerate OpenAPI clients and rebuild
+  independently deployed dashboards and applications against the matching
+  contract. Older contract-bound dashboards must not be used with the new
+  server.
+- `cayu cloud --organization ORG` (and `CAYU_CLOUD_ORGANIZATION`) now acts in
+  that Organization for the one command, instead of refusing a command whose
+  login acts in another. The saved login is left as it was.
+- `open_cloud_agent_readers` signs in and finds the Agent when opened; an Agent
+  that is stopped or serves no address now fails on the first read instead.
+
+### Changes
+
+Tasks:
+
+- Recurring task series: cron or interval rules in a time zone, deterministic
+  occurrence ids, pause and resume, kept in the task store and advanced in the
+  transaction that ends an occurrence. `cayu task series` and agent API routes
+  list, show, pause, resume and delete them.
+- Scheduled tasks can be restartable after worker loss; a restart keeps the
+  occurrence it was admitted to.
+- Task steps can be claimed before an effect and settled with a probe on a
+  later run, for calls to systems without idempotency keys.
+- An outbox row written in the application's own transaction queues a task
+  once that transaction commits.
+- `create_task_once` takes a function that chooses task IDs.
+- `TaskQuery` takes `labels`; `cancel_tasks` cancels every match and waits for
+  them to settle. The task API and the CLI serve both.
+- A task progress store keeps done, total and counts by outcome; the task API,
+  `cayu task show` and the Cloud activity contract read it.
+- Applications can hear of a restartable task cancelled at its restart cap.
+- A retry attempt lost with its worker can be settled as a retryable failure.
+- On Cayu Cloud the task worker settles fenced tasks of workers Cloud recorded
+  as stopped, and the Agent's server lists and settles them from the CLI.
+
+Tools and approvals:
+
+- `cayu serve` can host tool authorization grants
+  (`app.host_tool_authorization_grants`). `cayu inbox approve --remember`
+  makes a grant, `cayu grants` lists, shows and revokes them, and
+  `cayu new --with remembered-approvals` generates the wiring.
+- A person can preauthorize one exact tool call for a task. It's kept in
+  SQLite and PostgreSQL, used at most once and never over a denial, and issued
+  through `cayu preauthorizations` or the HTTP routes `cayu serve` mounts.
+- A custom tool policy can name the tools whose decision it owns
+  (`application_owned_tools`).
+- A tool can run another agent on a file through its `ToolContext`.
+- `run_isolated` and `open_isolated_runner` run one fixed command on files in
+  a network-disabled runner.
+- Provider stream capacity failures and oversized tool output carry stable
+  codes.
+
+Knowledge:
+
+- `remember_knowledge(same_as=<id>)` records the calling session as another
+  source of an existing entry instead of writing a near-identical one.
+- A swappable knowledge similarity part, `LexicalKnowledgeSimilarity` by
+  default, and a read-only `find_knowledge` tool that returns titles, statuses
+  and source counts, never an unreviewed proposal's text.
+- `cayu knowledge list --status pending --group` groups the review queue by
+  similarity and orders it by corroboration; `cayu knowledge drop-duplicates`
+  drops a group in one step.
+
+Applications and data:
+
+- Data moves copy and reshape application records with paging, idempotent
+  steps, a dry run and resume from a recorded run. `cayu cloud data-move` runs
+  a deployed Agent's declared moves.
+- A migrated scratch PostgreSQL database for tests and evals, as a library
+  part, a generated fixture and a command.
+- Large multipart uploads and streamed artifact downloads for app routes.
+- App routes map application exceptions to API errors; generated routers use
+  it by default.
+- The generated app runs app-database work off the event loop and adds
+  row-creation locks.
+- `EventQuery` takes `task_id` and `labels`; `delete_sessions` deletes every
+  session a query matches.
+- `canonical_durable_json_bytes` is public from `cayu.storage`.
+- A scaffold can declare capabilities it uses without model tools
+  (`runtime_only`). `cayu check` accepts common SQLAlchemy model forms, skips
+  imports under `TYPE_CHECKING` and accepts pure builtins over plain data at
+  import.
+- The generated conversation page reads a conversation again after it waits
+  for a person.
+
+Cayu Cloud:
+
+- `cayu.storage.agent_health` sums up another Agent's tasks, inbox and service,
+  and `cayu cloud service health` prints it. The readers use Cloud's forwarding
+  route, so a `read`-scoped key is enough where Cloud offers it.
+- An Agent can read its Organization's People directory with its own
+  credential.
+- `cayu cloud deploy OWNER/NAME` deploys from a repository through a GitHub App
+  connection, and `cayu cloud deploy --paused` starts a release paused.
+- New command groups: `cayu cloud gateway`, `compound`, `inbox`,
+  `ai-connections`, `team`, `console`, `compass grants`, and more under
+  `cayu cloud admin`. `cayu cloud schedule runs` and
+  `schedule run --wait-for` follow schedule runs.
+- `cayu cloud applications archive` asks before archiving when run by hand.
+- The Cayu Cloud sign-in docs point webhook paths to the `[webhooks]` table.
+- The bundled model catalog and price book add OpenAI's `gpt-6.2-astra` and
+  `gpt-6.2-sol`, and refresh model and price provenance.
+
+### Fixes
+
+- Registered secrets that Python quotes or escapes in exception messages are
+  redacted from tool results.
+- A fresh governed continuation no longer replays the previous interaction's
+  structured output during recovery.
+- Every task store reports the expiry of scheduled tasks waiting on
+  dependencies or their group in its next wakeup.
+- Broker clients a coding backend creates are closed once every workspace
+  factory sharing them has shut down.
+- A run or budget limit reached during a structured-output submission ends the
+  run interrupted at the limit instead of failing the session.
+- Local artifacts publish on filesystems that refuse `RENAME_NOREPLACE`.
+- Bulk session deletion keeps a refused match's descendants on later pages.
+- With a human-review policy, the grant approve route takes a review reference.
+- Opening the project Evals store says why it failed.
+
 ## v0.22.0
 
 Upgrade: No database migration is needed. Storage revision stays 159 and the

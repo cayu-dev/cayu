@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-11-24",
-  "generated_at": "2026-11-24",
+  "catalog_version": "2026-11-25",
+  "generated_at": "2026-11-25",
   "models": [
     {
       "aliases": [],
@@ -1009,6 +1009,68 @@
       "provider_name": "openai",
       "reasoning": true,
       "release_date": "2026-10-26",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1050000,
+      "deprecated": false,
+      "family": "gpt-6",
+      "hosted_web_search": true,
+      "knowledge_cutoff": "2026-05-18",
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "gpt-6.2-astra",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-11-25",
+        "source": "official",
+        "url": "https://developers.openai.com/api/docs/models/gpt-6.2-astra.md"
+      },
+      "provider_name": "openai",
+      "reasoning": true,
+      "release_date": "2026-11-17",
+      "retirement_date": null,
+      "structured_output": true,
+      "tool_calling": true
+    },
+    {
+      "aliases": [],
+      "context_window": 1050000,
+      "deprecated": false,
+      "family": "gpt-6",
+      "hosted_web_search": true,
+      "knowledge_cutoff": "2026-06-01",
+      "match": "exact",
+      "match_prefixes": [],
+      "max_output_tokens": 128000,
+      "modalities_in": [
+        "text",
+        "image"
+      ],
+      "modalities_out": [
+        "text"
+      ],
+      "model": "gpt-6.2-sol",
+      "prompt_caching": true,
+      "provenance": {
+        "as_of": "2026-11-25",
+        "source": "official",
+        "url": "https://developers.openai.com/api/docs/models/gpt-6.2-sol.md"
+      },
+      "provider_name": "openai",
+      "reasoning": true,
+      "release_date": "2026-11-17",
       "retirement_date": null,
       "structured_output": true,
       "tool_calling": true
