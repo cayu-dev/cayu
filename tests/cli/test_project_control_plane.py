@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,7 @@ from cayu.project_control_plane import resolve_project_control_plane_context
 from cayu.releases import RELEASE_ID_ENV, ReleaseIdentity
 from cayu.storage._diagnostic_inspection import diagnostic_store_inspection
 from cayu.storage.evals_postgres import PostgresEvalStore
-from cayu.storage.migrations import SchemaMode
+from cayu.storage.migrations import LATEST_REVISION, SchemaMode
 from cayu.vaults import SecretRedactor
 
 
@@ -435,6 +437,126 @@ def test_project_context_redacts_store_initialization_failures(
         build_project_control_plane_context(tmp_path, mode="production", environ={})
 
     assert secret not in str(excinfo.value)
+
+
+_SQLITE_STORE = '\n[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"\n'
+
+
+def test_project_context_explains_an_unreadable_local_store(tmp_path: Path) -> None:
+    _project(tmp_path, store=_SQLITE_STORE)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "cayu.db").write_bytes(b"not a sqlite database" * 10)
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    message = str(excinfo.value)
+    assert "Could not initialize project Evals storage (DatabaseError: " in message
+    assert "file is not a database" in message
+    assert "move data/cayu.db and any data/cayu.db-wal and data/cayu.db-shm files" in message
+    assert "discards its local sessions and Evals results" in message
+
+
+def test_project_context_reports_a_store_from_a_newer_schema(tmp_path: Path) -> None:
+    _project(tmp_path, store=_SQLITE_STORE)
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    asyncio.run(context.close())
+    with closing(sqlite3.connect(tmp_path / "data" / "cayu.db")) as connection:
+        connection.execute(
+            "UPDATE cayu_schema_migrations SET compatible_from = ? "
+            "WHERE revision = (SELECT MAX(revision) FROM cayu_schema_migrations)",
+            (LATEST_REVISION + 1,),
+        )
+        connection.commit()
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    message = str(excinfo.value)
+    assert "(SchemaTooNew: Database is at schema revision" in message
+    assert "Upgrade the application." in message
+    assert "move data/cayu.db" in message
+
+
+def test_project_context_gives_no_reset_hint_for_a_locked_store(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _project(tmp_path, store=_SQLITE_STORE)
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    asyncio.run(context.close())
+
+    def locked_store(_target):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(project_control_plane_cli, "_create_eval_store", locked_store)
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    assert str(excinfo.value) == (
+        "Could not initialize project Evals storage (OperationalError: database is locked)."
+    )
+
+
+def test_project_context_shows_why_a_sqlite_store_is_refused(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _project(tmp_path, store=_SQLITE_STORE)
+    context = build_project_control_plane_context(tmp_path, mode="production", environ={})
+    asyncio.run(context.close())
+    monkeypatch.setenv("CAYU_REQUIRE_POSTGRES", "1")
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    message = str(excinfo.value)
+    assert "(PostgresRequiredError: SQLiteEvalStore cannot open because" in message
+    assert "move data/cayu.db" not in message
+
+
+def test_project_context_keeps_the_failure_when_the_store_path_cannot_be_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _project(tmp_path, store=_SQLITE_STORE)
+
+    def unreadable_store(_target):
+        raise sqlite3.DatabaseError("file is not a database")
+
+    def refuse_stat(_self, *args, **kwargs):
+        raise PermissionError("Permission denied")
+
+    monkeypatch.setattr(project_control_plane_cli, "_create_eval_store", unreadable_store)
+    monkeypatch.setattr(Path, "exists", refuse_stat)
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(tmp_path, mode="production", environ={})
+
+    assert str(excinfo.value) == (
+        "Could not initialize project Evals storage (DatabaseError: file is not a database)."
+    )
+
+
+def test_project_context_keeps_unknown_postgres_failure_text_out(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _project(tmp_path)
+    dsn = "postgresql://cayu:do-not-print-password@db.example/cayu"
+
+    def fail_store(_target):
+        raise ValueError(f"invalid dsn: {dsn}")
+
+    monkeypatch.setattr(project_control_plane_cli, "_create_eval_store", fail_store)
+
+    with pytest.raises(ProjectError) as excinfo:
+        build_project_control_plane_context(
+            tmp_path, mode="production", environ={"CAYU_DATABASE_URL": dsn}
+        )
+
+    assert str(excinfo.value) == "Could not initialize project Evals storage (ValueError)."
 
 
 def test_project_context_rejects_identity_colliding_with_a_workload_secret(

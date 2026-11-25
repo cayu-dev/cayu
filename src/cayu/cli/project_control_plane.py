@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sqlite3
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -27,7 +28,7 @@ from cayu.project_control_plane import (
     _create_project_control_plane_context,
 )
 from cayu.runtime.system_diagnostics import DeploymentKind, validate_deployment_kind
-from cayu.storage.targets import configured_database_pool_max
+from cayu.storage.targets import PostgresRequiredError, configured_database_pool_max
 
 _DISTRIBUTION_NAME_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\Z",
@@ -96,9 +97,7 @@ def build_project_control_plane_context(
     except ProjectError:
         raise
     except Exception as exc:
-        raise ProjectError(
-            f"Could not initialize project Evals storage ({type(exc).__name__})."
-        ) from exc
+        raise ProjectError(_eval_store_open_failure(exc, target, root=root)) from exc
     return _create_project_control_plane_context(
         project_root=root,
         deployment_kind=deployment_kind,
@@ -172,8 +171,57 @@ def close_project_control_plane_context(context: ProjectControlPlaneContext | No
             asyncio.run(context.close())
         except Exception as exc:
             raise ProjectError(
-                f"Could not close project Developer dashboard storage ({type(exc).__name__})."
+                f"Could not close project Developer dashboard storage ({_store_error(exc)})."
             ) from exc
+
+
+def _store_error(exc: Exception) -> str:
+    """Name a store failure, with its text only when that text is known to hold no secret.
+
+    Schema, PostgreSQL-required, SQLite and filesystem errors carry Cayu's own advice,
+    SQLite's text or a local path. Anything else may echo a DSN or key material, so only its type is shown.
+    """
+
+    from cayu.storage.migrations import SchemaError
+
+    detail = str(exc).strip()
+    if detail and isinstance(exc, (SchemaError, PostgresRequiredError, sqlite3.Error, OSError)):
+        return f"{type(exc).__name__}: {detail}"
+    return type(exc).__name__
+
+
+def _eval_store_open_failure(
+    exc: Exception,
+    target: SessionStoreTarget | None,
+    *,
+    root: Path,
+) -> str:
+    from cayu.storage.migrations import SchemaError
+
+    message = f"Could not initialize project Evals storage ({_store_error(exc)})."
+    if target is None or target.sqlite_path is None or str(target.sqlite_path) == ":memory:":
+        return message
+    # Only a schema mismatch or a file that isn't a Cayu database is fixed by starting over;
+    # a locked or read-only file, or a refused SQLite store, is not.
+    if not isinstance(exc, SchemaError) and type(exc) is not sqlite3.DatabaseError:
+        return message
+    path = target.sqlite_path
+    try:
+        shown = path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        shown = str(path)
+    try:
+        if not path.exists():
+            return message
+    except OSError:
+        return message
+    return (
+        f"{message} The local store {shown} exists but could not be opened; it may have "
+        "been written by another Cayu version or another setup of this project. If you "
+        f"don't need what it holds, move {shown} and any {shown}-wal and {shown}-shm "
+        "files aside (or delete them) and rerun; that discards its local sessions and "
+        "Evals results."
+    )
 
 
 def _project_metadata(
