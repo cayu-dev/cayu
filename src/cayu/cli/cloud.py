@@ -21,6 +21,7 @@ from typing import Any, Never
 from urllib.parse import quote, urlsplit
 
 from cayu.cli._cloud_activity import activity_command, add_activity_parser
+from cayu.cli._cloud_admin_operations import CHANGING_COMMANDS as ADMIN_AGENT_CHANGES
 from cayu.cli._cloud_agent_homes import (
     ORGANIZATION_ID,
     AgentOrganizationError,
@@ -225,6 +226,8 @@ _CHANGING_COMMANDS: dict[tuple[str, ...], str] = {
     ("connections", "bind"): "agent",
     ("connections", "unbind"): "agent",
     ("connections", "run-tool"): "agent",
+    # `admin runtimes|cleanup|activity-reader` change one Agent of the acting Organization.
+    **{("admin", *path): "agent" for path in ADMIN_AGENT_CHANGES},
 }
 _ORGANIZATION_HELP = (
     "Act in this Organization (its id, one of `cayu cloud organizations`) for this command "
@@ -1664,7 +1667,12 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     add_connections_parsers(commands, seconds=_positive_finite_seconds)
     add_models_parser(commands)
 
-    add_admin_parser(commands, application=_application_slug)
+    add_admin_parser(
+        commands,
+        application=_application_slug,
+        seconds=_positive_finite_seconds,
+        organization_help=_ORGANIZATION_HELP,
+    )
 
     add_compass_parser(commands, application=_application_slug, seconds=_positive_finite_seconds)
     add_compound_parser(commands, seconds=_positive_finite_seconds)
@@ -2868,7 +2876,13 @@ def _client_command(
         )
     if arguments.command == "admin":
         return admin_command(
-            arguments, client=client, recovery_arguments=_cloud_recovery_arguments(arguments)
+            arguments,
+            client=client,
+            recovery_arguments=_cloud_recovery_arguments(arguments),
+            application_id=_application_id,
+            validate_wait=_validate_wait,
+            is_transient=_transient_api_error,
+            transient_limit=_SERVICE_POLL_TRANSIENT_LIMIT,
         )
     if arguments.command == "settings":
         return settings_command(

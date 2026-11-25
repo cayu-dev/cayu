@@ -28,6 +28,16 @@ import shlex
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
+from cayu.cli._cloud_admin_operations import (
+    OPERATION_GROUPS,
+    add_operation_parsers,
+    operation_command,
+)
+from cayu.cli._cloud_admin_platform import (
+    PLATFORM_ADMIN_GROUPS,
+    add_platform_admin_parsers,
+    platform_admin_command,
+)
 from cayu.cli._cloud_api import CloudApiClient, CloudApiError
 from cayu.cli._cloud_arena_enrollments import (
     add_arena_enrollments_parser,
@@ -44,18 +54,25 @@ def add_admin_parser(
     commands: argparse._SubParsersAction[argparse.ArgumentParser],
     *,
     application: Callable[[str], str],
+    seconds: Callable[[str], float],
+    organization_help: str,
 ) -> None:
-    """``application`` checks an Agent slug argument."""
+    """``application`` checks an Agent slug argument, ``seconds`` a wait argument, and
+    ``organization_help`` describes the acting `--organization`."""
 
     admin = commands.add_parser(
         "admin",
-        help="Read the install's own configuration, its Arena case enrollments and any Agent's "
-        "runtime record (Cayu platform administrators).",
+        help="Administer the install: its configuration, platform administrators, access "
+        "requests, and repairs on any Organization's Agents (Cayu platform administrators).",
         description=(
             "Read how this Cayu Cloud install is configured, list its Arena case enrollments "
-            "across Organizations, and read or correct any Organization's Agent's runtime "
-            "record. Needs a signed-in Cayu platform administrator (`cayu cloud login`); an "
-            "Organization admin or an API key can't."
+            "and its Organizations, manage its platform administrators and access requests, "
+            "and read or repair any Organization's Agents: their runtime records, moves, "
+            "leases and archives. These need a signed-in Cayu platform administrator (`cayu "
+            "cloud login`); an Organization admin or an API key can't. The exceptions are "
+            "`runtimes`, `cleanup` and `activity-reader`, which act in one Organization: Cloud "
+            "lets its developers and admins run `runtimes` and `cleanup`, and its admins "
+            "`activity-reader`."
         ),
     )
     actions = admin.add_subparsers(dest="admin_command", required=True)
@@ -73,6 +90,8 @@ def add_admin_parser(
     add_output_argument(system_agents, render_system_agents)
     add_arena_enrollments_parser(actions)
     add_runtime_record_parser(actions, application=application)
+    add_platform_admin_parsers(actions, application=application)
+    add_operation_parsers(actions, seconds=seconds, organization_help=organization_help)
 
 
 def admin_command(
@@ -80,8 +99,13 @@ def admin_command(
     *,
     client: CloudApiClient,
     recovery_arguments: Sequence[str] = (),
+    application_id: Callable[[CloudApiClient, str], str],
+    validate_wait: Callable[[float, float], None],
+    is_transient: Callable[[CloudApiError], bool],
+    transient_limit: int,
 ) -> dict[str, Any]:
-    """``recovery_arguments`` are the command's own ``--context`` and ``--api-key-file``."""
+    """``recovery_arguments`` are the command's own ``--context`` and ``--api-key-file``;
+    ``application_id`` resolves an `--application` in the acting Organization."""
 
     if arguments.admin_command == "system-agents":
         return {"operation": "admin.system-agents", "result": _system_agents(client)}
@@ -90,6 +114,19 @@ def admin_command(
     if arguments.admin_command == "runtime-record":
         return runtime_record_command(
             arguments, client=client, recovery_arguments=recovery_arguments
+        )
+    if arguments.admin_command in PLATFORM_ADMIN_GROUPS:
+        return platform_admin_command(
+            arguments, client=client, recovery_arguments=recovery_arguments
+        )
+    if arguments.admin_command in OPERATION_GROUPS:
+        return operation_command(
+            arguments,
+            client=client,
+            application_id=application_id,
+            validate_wait=validate_wait,
+            is_transient=is_transient,
+            transient_limit=transient_limit,
         )
     raise ValueError(f"Unknown admin command {arguments.admin_command!r}.")
 

@@ -354,6 +354,37 @@ _REPORTED_API_REFUSALS = frozenset(
         (503, "gateway_unavailable"),
         (503, "not_enrolled"),
         (503, "unavailable"),
+        # `cayu cloud admin applications move`: why Cloud didn't move the Agent; nothing moved.
+        (409, "agent_archived"),
+        (409, "agent_busy"),
+        (409, "agent_name_taken"),
+        (409, "agent_named_in_install_configuration"),
+        (409, "compass_enrolled"),
+        (409, "compound_grants_active"),
+        (409, "console_project_linked"),
+        (409, "evaluations_unfinished"),
+        (409, "move_in_progress"),
+        (409, "organization_unknown"),
+        (409, "previous_move_unfinished"),
+        (409, "release_in_progress"),
+        (409, "sandboxes_live"),
+        (409, "service_operation_in_progress"),
+        (503, "agent_moves_unavailable"),
+        # `cayu cloud admin agent-lease|archive confirm-exit`: why Cloud didn't record the exit.
+        (409, "archive_exit_already_stopped"),
+        (409, "archive_exit_not_blocking"),
+        (409, "archive_exit_outside_cluster"),
+        (409, "archive_exit_still_described"),
+        (409, "lease_work_not_open"),
+        (409, "lease_work_still_held"),
+        (503, "archive_exit_unverifiable"),
+        # `cayu cloud admin activity-reader`: the reader changed since it was read, or the
+        # Agent's Runtime couldn't be checked.
+        (409, "activity_reader_changed"),
+        (503, "reader_not_prepared"),
+        (503, "runtime_contract_incompatible"),
+        (503, "runtime_contract_unavailable"),
+        (503, "runtime_unavailable"),
     }
 )
 

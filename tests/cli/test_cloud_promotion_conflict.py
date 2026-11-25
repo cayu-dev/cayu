@@ -264,7 +264,7 @@ def test_conflict_message_carries_a_structured_reason_with_a_cloud_code(
     error = _client_response(
         monkeypatch,
         409,
-        {"detail": {"code": "archive_exit_not_blocking", "message": "The exit is not blocking."}},
+        {"detail": {"code": "undocumented_conflict", "message": "The exit is not blocking."}},
     )
 
     assert str(error) == "Cayu Cloud API returned HTTP 409: The exit is not blocking."

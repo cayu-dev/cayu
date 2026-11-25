@@ -68,8 +68,13 @@ top-level commands are:
 - `admin system-agents` to list [the install's system Agents](#the-installs-system-agents),
   `admin arena-enrollments` to list [Arena case enrollments](#arena-case-enrollments) with each
   Agent's corpus schema, and `admin runtime-record show|forget-migration` to read
-  [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, as a
-  signed-in Cayu platform administrator; and
+  [an Agent's runtime record](#an-agents-runtime-record) and forget a migration note in it, and
+  `admin platform-admin|access-requests|organizations|applications|agent-lease|archive|connections`
+  to [administer the install and repair any Organization's Agents](#platform-administration), all
+  as a signed-in Cayu platform administrator;
+- `admin runtimes|cleanup|activity-reader` for
+  [repairs on one Organization's Agent](#platform-administration), which Cloud allows that
+  Organization's developers and admins (`activity-reader`: its admins); and
 - `evidence list|show|verify` for local content-free command records.
 
 `deployment timeline` shows the release pipeline milestones and whether a failed
@@ -3312,6 +3317,107 @@ again), `service_busy`, `database_migration_running` or `application_archived`. 
 published has no record (`runtime_record_not_found`). Deploy the Agent afterwards to run the
 migration. Cloud refuses anyone but a platform administrator (`platform_admin_required`), and a
 Cloud without these commands gives `runtime_records_unsupported`.
+
+## Platform administration
+
+A signed-in Cayu platform administrator manages the install and repairs any Organization's
+Agents from `cayu cloud admin`. Each command prints one JSON document. Cloud refuses the commands
+below to anyone else, an Organization admin or an Organization API key included (the
+Organization-scoped repairs further down are the exception): the command exits `2` with
+category `platform_admin_required`, saying to sign in with `cayu cloud login` and run it without
+a key file. A Cloud that doesn't serve a command gives `admin_command_unsupported`.
+
+```console
+cayu cloud admin platform-admin list
+cayu cloud admin platform-admin grant user_123
+cayu cloud admin platform-admin revoke user_123
+cayu cloud admin access-requests list [--status pending] [--limit 50 --cursor CURSOR]
+cayu cloud admin access-requests get req_123
+cayu cloud admin organizations list [--query "Example"]
+cayu cloud admin organizations agents org_123
+cayu cloud admin access-requests approve req_123 --organization org_123 --role member
+cayu cloud admin access-requests approve req_123 --new-organization "Example Co"
+cayu cloud admin access-requests reject req_123
+cayu cloud admin applications move my-agent --to-organization org_456
+cayu cloud admin agent-lease show my-agent --organization org_123
+cayu cloud admin agent-lease confirm-exit my-agent --organization org_123 --ref REF \
+  --reason "The Job finished." [--outside-runtime]
+cayu cloud admin archive blocked [--limit 100]
+cayu cloud admin archive show my-agent --organization org_123
+cayu cloud admin archive confirm-exit my-agent --organization org_123 --kind agent_task \
+  --subject TASK --reason "The task's container is gone."
+cayu cloud admin connections move-model-credentials
+```
+
+- `platform-admin list` names each platform administrator with who granted the access and
+  when; `configured` marks one the install's configuration names, which only a change to it
+  revokes. Cloud refuses to revoke your own access.
+- `access-requests list` lists requests for access to the install, newest first, optionally
+  with one `--status` (`pending`, `provisioning`, `invited`, `accepted`, `rejected` or
+  `failed`): every one, or with `--limit` (1 to 100) a page at a time, passing
+  `result.next_cursor` as `--cursor` for the next page. `access-requests get` shows one.
+  `organizations list` lists the install's Organizations with each one's `agent_count`
+  (`--query` keeps those whose name matches; it doesn't page), and `organizations agents`
+  lists one Organization's Agents, archived ones included, so you can choose where to admit a
+  request.
+- `access-requests approve` admits the person to an existing Organization (`--organization`,
+  with `--role admin` or `member`) or to a new one (`--new-organization`); `reject` declines.
+- `applications move` moves an Agent to another Organization, keeping its slug, URL, data,
+  settings, secrets and schedules, and restarts it there. Cloud refuses while anything still
+  runs that the move would cut off, with a code that says what and a message that says what to
+  do, and nothing moves: `release_in_progress`, `service_operation_in_progress`,
+  `sandboxes_live`, `evaluations_unfinished`, `compass_enrolled`, `compound_grants_active`,
+  `console_project_linked`, `agent_busy`, `move_in_progress`, `previous_move_unfinished`,
+  `agent_name_taken`, `agent_archived`, `organization_unknown` or
+  `agent_named_in_install_configuration`. When the records moved but the runtime step didn't
+  finish, `result.status` is `runtime_pending` and `result.commands.finish_move` is the same
+  move, which finishes it; moving an Agent again to the Organization it is in changes nothing.
+- `agent-lease show` lists the lifecycle leases an Agent's publications and service changes
+  hold and the platform work started under them; `agent-lease confirm-exit` records, with your
+  reason, that work Cloud can no longer see has ended. `archive blocked` lists blocked archives
+  in every Organization, `archive show` one Agent's, and `archive confirm-exit` records that the
+  task (`agent_task`) or runtime lease (`runtime_lease`) blocking it has ended. Cloud records
+  nothing and says why when the platform still describes the work
+  (`archive_exit_still_described`), reports it stopped, which needs no confirmation
+  (`archive_exit_already_stopped`), can't answer for it (`archive_exit_outside_cluster`; for
+  lease work, check the platform yourself and pass `--outside-runtime`) or can't be asked now
+  (`archive_exit_unverifiable`, try again later); when the subject doesn't block the archive
+  (`archive_exit_not_blocking`); or when the lease work isn't recorded as possibly running
+  (`lease_work_not_open`) or the operation that started it still runs (`lease_work_still_held`).
+- `connections move-model-credentials` moves the credentials an earlier Cloud kept for model
+  connections with the app's into the model credential store, and prints how many; run again,
+  it moves nothing.
+
+The commands that name another Organization's Agent take its exact slug and `--organization`,
+the Organization that owns it.
+
+Three repairs act in one Organization instead, through its own routes, so they take
+`--application` (the Agent's name, slug or id) and act where the command acts (`--organization`,
+else the login's Organization). Cloud lets that Organization's developers and admins run
+`runtimes` and `cleanup`, and its admins `activity-reader`:
+
+```console
+cayu cloud admin runtimes hold rta_123 --application my-agent --reason "Keep for review."
+cayu cloud admin runtimes release-hold rta_123 --application my-agent
+cayu cloud admin runtimes retire rta_123 --application my-agent
+cayu cloud admin cleanup --application my-agent --deployment dep_123 \
+  [--poll-seconds 5 --wait-seconds 900]
+cayu cloud admin activity-reader show --application my-agent
+cayu cloud admin activity-reader setup --application my-agent
+cayu cloud admin activity-reader restart --application my-agent
+```
+
+- `runtimes` holds a retained runtime artifact so it is never retired, releases the hold, or
+  retires it now (`cayu cloud runtimes list|status` show them).
+- `cleanup` destroys one of the Agent's Releases and reads it until Cloud reports it
+  `destroyed`; it exits `2` with `release_cleanup_failed` when the Release ends another way and
+  `wait_timeout` when `--wait-seconds` runs out, and refuses an unordered wait before it destroys
+  anything.
+- `activity-reader` is the reader Cloud follows the Agent's Runtime activity with, which Cloud
+  sets up itself. `show` prints its configuration and revision, `setup` runs Cloud's setup now,
+  and `restart` reads the Agent's store again from its beginning, as after a restore, at the
+  revision it just read: `activity_reader_changed` means it changed since, so run it again.
+  `result.rollout_required` says when the Agent's next publish binds the reader's credential.
 
 ## Agent settings
 
